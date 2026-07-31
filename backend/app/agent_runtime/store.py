@@ -1249,7 +1249,11 @@ class RunStore:
         with self._lock:
             record = self.get(run_id)
             recovery_state = record.recovery_from_state or record.state
-            if recovery_state not in {LifecycleState.WORKING, LifecycleState.IDLE}:
+            if recovery_state not in {
+                LifecycleState.WORKING,
+                LifecycleState.WAITING_APPROVAL,
+                LifecycleState.IDLE,
+            }:
                 raise StoreConflict(
                     f"state {recovery_state.value} is not eligible for recovery polling"
                 )
@@ -1284,7 +1288,11 @@ class RunStore:
 
         with self._lock:
             record = self.get(run_id)
-            if recovery_state not in {LifecycleState.WORKING, LifecycleState.IDLE}:
+            if recovery_state not in {
+                LifecycleState.WORKING,
+                LifecycleState.WAITING_APPROVAL,
+                LifecycleState.IDLE,
+            }:
                 raise StoreConflict(
                     f"state {recovery_state.value} has no resumable recovery intent"
                 )
@@ -1335,6 +1343,49 @@ class RunStore:
             adapter_status=status,
             guard_automatic_resume=guard_automatic_resume,
         )
+
+    def finalize_handover_detach(
+        self,
+        run_id: str,
+        *,
+        state: LifecycleState,
+        session_id: str,
+        generation: int,
+        transcript_path: str | None,
+        pending_requests: dict[str, dict[str, Any]],
+    ) -> RunRecord:
+        """Commit the pre-stop recovery intent after provider events drain."""
+
+        if state not in {
+            LifecycleState.WORKING,
+            LifecycleState.WAITING_APPROVAL,
+            LifecycleState.IDLE,
+        }:
+            raise StoreConflict(f"handover state {state.value} is not resumable")
+        if not session_id:
+            raise StoreConflict("handover session id is missing")
+        with self._lock:
+            record = self.get(run_id)
+            if record.replaced_by_run_id or not self.is_current(record):
+                raise StoreConflict("handover target is no longer current")
+            record.state = state
+            record.state_reason = None
+            record.recovery_from_state = None
+            record.provider_session_id = session_id
+            record.provider_pid = None
+            record.provider_generation = generation
+            record.active_turn_id = None
+            record.transcript_path = transcript_path
+            record.pending_requests = {
+                key: dict(request) for key, request in pending_requests.items()
+            }
+            self._write_record(record)
+            registry = self._read_registry()
+            current = (registry.get(record.agent_id) or {}).get("current") or {}
+            if current.get("run_id") == record.run_id:
+                registry[record.agent_id]["current"] = self._registry_current(record)
+                self._write_registry(registry)
+            return record
 
     def set_desired_model(self, run_id: str, model: str | None) -> RunRecord:
         with self._lock:
@@ -1473,6 +1524,14 @@ class RunStore:
             self._write_record(record)
             return record
 
+    def clear_pending_request_key(self, run_id: str, key: str) -> RunRecord:
+        """Clear one durable request by its canonical storage key."""
+        with self._lock:
+            record = self.get(run_id)
+            record.pending_requests.pop(key, None)
+            self._write_record(record)
+            return record
+
     def clear_pending_request_by_tool_use_id(
         self,
         run_id: str,
@@ -1501,6 +1560,21 @@ class RunStore:
             if not record.pending_requests:
                 return record
             record.pending_requests.clear()
+            self._write_record(record)
+            return record
+
+    def restore_pending_requests(
+        self,
+        run_id: str,
+        pending_requests: dict[str, dict[str, Any]],
+    ) -> RunRecord:
+        """Restore approval requests after a failed replacement transport."""
+
+        with self._lock:
+            record = self.get(run_id)
+            record.pending_requests = {
+                str(key): dict(request) for key, request in pending_requests.items()
+            }
             self._write_record(record)
             return record
 

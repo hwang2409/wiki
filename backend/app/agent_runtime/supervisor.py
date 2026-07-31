@@ -1,6 +1,9 @@
 from __future__ import annotations
 
 import asyncio
+from contextlib import asynccontextmanager
+import json
+import logging
 import math
 import os
 import re
@@ -10,6 +13,7 @@ from collections import OrderedDict
 from collections.abc import Callable
 from copy import deepcopy
 from datetime import datetime, timezone
+from enum import Enum
 from pathlib import Path
 from typing import Any
 from uuid import UUID, uuid4
@@ -43,6 +47,121 @@ DEFAULT_ADAPTER_DETACH_GRACE_SECONDS = 1.0
 DEFAULT_IDEMPOTENCY_CACHE_SIZE = 256
 DEFAULT_WORKER_SOFT_CAP = 5
 _IDEMPOTENT_METHODS = frozenset({"run/start", "run/send_now", "run/send_on_idle"})
+DEFAULT_APPROVAL_RECOVERY_TIMEOUT_SECONDS = 30.0
+logger = logging.getLogger(__name__)
+
+
+class _HandoverDrainOutcome(str, Enum):
+    SUPERVISOR_INTERRUPTED = "supervisor-interrupted"
+    NATURAL_COMPLETED = "natural-completed"
+    NEW_APPROVAL = "new-approval"
+    CONTROL_CANCEL_REQUEST = "control-cancel-request"
+    USER_RESPONSE = "user-response"
+    NONE = "none"
+
+
+class _HandoverPendingDisposition(str, Enum):
+    PRESERVE_CAPTURED = "preserve-captured"
+    MERGE_CAPTURED_AND_DRAINED = "merge-captured-and-drained"
+    CLEAR = "clear"
+
+
+# This is the complete handover finalization matrix. Keep all 18 cells
+# explicit: provider stop events can be late, reordered, or provider-specific.
+_HANDOVER_FINALIZATION_MATRIX: dict[
+    tuple[LifecycleState, _HandoverDrainOutcome],
+    tuple[LifecycleState, _HandoverPendingDisposition],
+] = {
+    (LifecycleState.WORKING, _HandoverDrainOutcome.SUPERVISOR_INTERRUPTED): (
+        LifecycleState.WORKING,
+        _HandoverPendingDisposition.PRESERVE_CAPTURED,
+    ),
+    (LifecycleState.WORKING, _HandoverDrainOutcome.NATURAL_COMPLETED): (
+        LifecycleState.IDLE,
+        _HandoverPendingDisposition.CLEAR,
+    ),
+    (LifecycleState.WORKING, _HandoverDrainOutcome.NEW_APPROVAL): (
+        LifecycleState.WAITING_APPROVAL,
+        _HandoverPendingDisposition.MERGE_CAPTURED_AND_DRAINED,
+    ),
+    (LifecycleState.WORKING, _HandoverDrainOutcome.CONTROL_CANCEL_REQUEST): (
+        LifecycleState.WORKING,
+        _HandoverPendingDisposition.PRESERVE_CAPTURED,
+    ),
+    (LifecycleState.WORKING, _HandoverDrainOutcome.USER_RESPONSE): (
+        LifecycleState.WORKING,
+        _HandoverPendingDisposition.CLEAR,
+    ),
+    (LifecycleState.WORKING, _HandoverDrainOutcome.NONE): (
+        LifecycleState.WORKING,
+        _HandoverPendingDisposition.PRESERVE_CAPTURED,
+    ),
+    (LifecycleState.WAITING_APPROVAL, _HandoverDrainOutcome.SUPERVISOR_INTERRUPTED): (
+        LifecycleState.WAITING_APPROVAL,
+        _HandoverPendingDisposition.PRESERVE_CAPTURED,
+    ),
+    (LifecycleState.WAITING_APPROVAL, _HandoverDrainOutcome.NATURAL_COMPLETED): (
+        LifecycleState.IDLE,
+        _HandoverPendingDisposition.CLEAR,
+    ),
+    (LifecycleState.WAITING_APPROVAL, _HandoverDrainOutcome.NEW_APPROVAL): (
+        LifecycleState.WAITING_APPROVAL,
+        _HandoverPendingDisposition.MERGE_CAPTURED_AND_DRAINED,
+    ),
+    (LifecycleState.WAITING_APPROVAL, _HandoverDrainOutcome.CONTROL_CANCEL_REQUEST): (
+        LifecycleState.WAITING_APPROVAL,
+        _HandoverPendingDisposition.PRESERVE_CAPTURED,
+    ),
+    (LifecycleState.WAITING_APPROVAL, _HandoverDrainOutcome.USER_RESPONSE): (
+        LifecycleState.WORKING,
+        _HandoverPendingDisposition.CLEAR,
+    ),
+    (LifecycleState.WAITING_APPROVAL, _HandoverDrainOutcome.NONE): (
+        LifecycleState.WAITING_APPROVAL,
+        _HandoverPendingDisposition.PRESERVE_CAPTURED,
+    ),
+    (LifecycleState.IDLE, _HandoverDrainOutcome.SUPERVISOR_INTERRUPTED): (
+        LifecycleState.IDLE,
+        _HandoverPendingDisposition.PRESERVE_CAPTURED,
+    ),
+    (LifecycleState.IDLE, _HandoverDrainOutcome.NATURAL_COMPLETED): (
+        LifecycleState.IDLE,
+        _HandoverPendingDisposition.CLEAR,
+    ),
+    (LifecycleState.IDLE, _HandoverDrainOutcome.NEW_APPROVAL): (
+        LifecycleState.WAITING_APPROVAL,
+        _HandoverPendingDisposition.MERGE_CAPTURED_AND_DRAINED,
+    ),
+    (LifecycleState.IDLE, _HandoverDrainOutcome.CONTROL_CANCEL_REQUEST): (
+        LifecycleState.IDLE,
+        _HandoverPendingDisposition.CLEAR,
+    ),
+    (LifecycleState.IDLE, _HandoverDrainOutcome.USER_RESPONSE): (
+        LifecycleState.IDLE,
+        _HandoverPendingDisposition.CLEAR,
+    ),
+    (LifecycleState.IDLE, _HandoverDrainOutcome.NONE): (
+        LifecycleState.IDLE,
+        _HandoverPendingDisposition.PRESERVE_CAPTURED,
+    ),
+}
+
+
+def _approval_recovery_prompt(record: RunRecord) -> str | None:
+    if not record.pending_requests:
+        return None
+    details: list[str] = []
+    for pending in record.pending_requests.values():
+        payload = pending.get("payload") if isinstance(pending, dict) else None
+        if isinstance(payload, dict):
+            details.append(json.dumps(payload, sort_keys=True))
+    request_details = "\n".join(details) or "the prior approval request"
+    return (
+        "The provider transport restarted while an approval was pending. "
+        "Recreate the exact approval question now and wait for the user's answer. "
+        "Do not continue without that answer. Prior request details:\n"
+        f"{request_details}"
+    )
 
 
 def _validated_pending_id(value: object) -> str | None:
@@ -200,6 +319,7 @@ class Supervisor:
         *,
         pid_alive: Callable[[int | None], bool] = provider_pid_is_alive,
         recovery_stability_seconds: float = 30.0,
+        approval_recovery_timeout_seconds: float | None = None,
         reaper_interval_seconds: float | None = None,
         reaper_grace_seconds: float | None = None,
         adapter_detach_grace_seconds: float = DEFAULT_ADAPTER_DETACH_GRACE_SECONDS,
@@ -213,6 +333,17 @@ class Supervisor:
         self.adapter_factory = adapter_factory
         self.pid_alive = pid_alive
         self.recovery_stability_seconds = recovery_stability_seconds
+        self.approval_recovery_timeout_seconds = _validated_seconds(
+            "approval_recovery_timeout_seconds",
+            (
+                approval_recovery_timeout_seconds
+                if approval_recovery_timeout_seconds is not None
+                else _env_seconds(
+                    "WIKI_APPROVAL_RECOVERY_TIMEOUT_SECONDS",
+                    DEFAULT_APPROVAL_RECOVERY_TIMEOUT_SECONDS,
+                )
+            ),
+        )
         self.reaper_interval_seconds = _validated_seconds(
             "WIKI_REAPER_INTERVAL_SECONDS",
             (
@@ -243,9 +374,20 @@ class Supervisor:
         self.orphan_archive_grace_seconds = orphan_archive_grace_seconds
         self.adapters: dict[str, ProviderAdapter] = {}
         self.event_tasks: dict[str, asyncio.Task[None]] = {}
+        self.event_processing_locks: dict[str, asyncio.Lock] = {}
+        self.event_inflight_counts: dict[str, int] = {}
+        self.event_drain_condition = asyncio.Condition()
         self.event_routes: dict[tuple[int, int], str] = {}
         self.queue_locks: dict[str, asyncio.Lock] = {}
         self.agent_locks: dict[str, asyncio.Lock] = {}
+        self.handover_condition = asyncio.Condition()
+        self.active_run_mutations = 0
+        self.handover_pending = False
+        self.handover_active = False
+        self.handover_result: dict[str, Any] | None = None
+        self.handover_event_queue: dict[
+            str, list[tuple[ProviderAdapter, ProviderEvent]]
+        ] = {}
         self.codex_fleet_lock = asyncio.Lock()
         self.codex_rotation_task: asyncio.Task[dict[str, Any]] | None = None
         self.codex_rotation_operation_id: str | None = None
@@ -319,7 +461,17 @@ class Supervisor:
     ) -> asyncio.Task[Any]:
         task = asyncio.create_task(coro, name=name)
         self.monitor_tasks.add(task)
-        task.add_done_callback(self.monitor_tasks.discard)
+
+        def observe(completed: asyncio.Task[Any]) -> None:
+            self.monitor_tasks.discard(completed)
+            if completed.cancelled():
+                return
+            try:
+                completed.result()
+            except Exception:
+                logger.exception("background monitor task failed: %s", name)
+
+        task.add_done_callback(observe)
         return task
 
     @staticmethod
@@ -352,6 +504,54 @@ class Supervisor:
 
     def _run_lock(self, run_id: str) -> asyncio.Lock:
         return self._agent_lock(self.store.get(run_id).agent_id)
+
+    @asynccontextmanager
+    async def _run_mutation_admission(self, *, wait_for_handover: bool = False):
+        """Coordinate run mutations with the native handover barrier."""
+
+        while True:
+            async with self.handover_condition:
+                while self.handover_pending:
+                    await self.handover_condition.wait()
+                if self.handover_active:
+                    if not wait_for_handover:
+                        raise StoreConflict("supervisor handover is in progress")
+                    await self.handover_condition.wait()
+                    continue
+                self.active_run_mutations += 1
+                break
+        try:
+            yield
+        finally:
+            async with self.handover_condition:
+                self.active_run_mutations -= 1
+                self.handover_condition.notify_all()
+
+    @asynccontextmanager
+    async def _event_mutation_admission(
+        self,
+        run_id: str,
+        adapter: ProviderAdapter,
+        event: ProviderEvent,
+    ):
+        """Defer provider events while a handover owns the run set."""
+
+        async with self.handover_condition:
+            while self.handover_pending:
+                await self.handover_condition.wait()
+            if self.handover_active:
+                self.handover_event_queue.setdefault(run_id, []).append(
+                    (adapter, event)
+                )
+                yield False
+                return
+            self.active_run_mutations += 1
+        try:
+            yield True
+        finally:
+            async with self.handover_condition:
+                self.active_run_mutations -= 1
+                self.handover_condition.notify_all()
 
     async def _orphaned_provider_process(
         self, pid: int | None
@@ -500,12 +700,24 @@ Preserve the same identity, role, worktree, orchestrator grouping, PR gates, and
         stream_key = id(adapter)
         try:
             async for event in adapter.events():
-                event_run_id = self.event_routes.get(
-                    (id(adapter), event.generation),
-                    run_id,
+                # Mark the local slot before the first await. The detach
+                # barrier cannot observe an event between queue removal and
+                # this increment.
+                self.event_inflight_counts[run_id] = (
+                    self.event_inflight_counts.get(run_id, 0) + 1
                 )
                 try:
-                    await self._handle_provider_event(event_run_id, adapter, event)
+                    async with self.event_drain_condition:
+                        self.event_drain_condition.notify_all()
+                    event_run_id = self.event_routes.get(
+                        (id(adapter), event.generation),
+                        run_id,
+                    )
+                    event_lock = self.event_processing_locks.setdefault(
+                        event_run_id, asyncio.Lock()
+                    )
+                    async with event_lock:
+                        await self._handle_provider_event(event_run_id, adapter, event)
                 except asyncio.CancelledError:
                     raise
                 except Exception as exc:
@@ -515,6 +727,14 @@ Preserve the same identity, role, worktree, orchestrator grouping, PR gates, and
                         f"provider event persistence failed: {exc}",
                     )
                     return
+                finally:
+                    remaining = self.event_inflight_counts.get(run_id, 1) - 1
+                    if remaining:
+                        self.event_inflight_counts[run_id] = remaining
+                    else:
+                        self.event_inflight_counts.pop(run_id, None)
+                    async with self.event_drain_condition:
+                        self.event_drain_condition.notify_all()
         except asyncio.CancelledError:
             raise
         except Exception as exc:
@@ -540,23 +760,24 @@ Preserve the same identity, role, worktree, orchestrator grouping, PR gates, and
     ) -> None:
         """Stop an unobservable provider and suppress automatic restart."""
 
-        async with self._run_lock(run_id):
-            self.pipeline_failures[run_id] = reason
-            try:
-                await adapter.close()
-            except Exception:
-                pass
-            try:
-                record = self.store.transition(
-                    run_id, LifecycleState.BLOCKED, reason=reason
-                )
-            except Exception:
-                record = None
-            self._remove_adapter_mapping(run_id, adapter)
-            if record is not None and record.provider_pid is None:
-                self._mark_adapter_loss(run_id)
-            if record is not None:
-                await self._publish_agent_change(record.agent_id)
+        async with self._run_mutation_admission():
+            async with self._run_lock(run_id):
+                self.pipeline_failures[run_id] = reason
+                try:
+                    await adapter.close()
+                except Exception:
+                    pass
+                try:
+                    record = self.store.transition(
+                        run_id, LifecycleState.BLOCKED, reason=reason
+                    )
+                except Exception:
+                    record = None
+                self._remove_adapter_mapping(run_id, adapter)
+                if record is not None and record.provider_pid is None:
+                    self._mark_adapter_loss(run_id)
+                if record is not None:
+                    await self._publish_agent_change(record.agent_id)
 
     async def _record_stream_loss(
         self,
@@ -566,30 +787,49 @@ Preserve the same identity, role, worktree, orchestrator grouping, PR gates, and
     ) -> None:
         """Preserve the last lifecycle state so dead-PID recovery remains eligible."""
 
-        async with self._run_lock(run_id):
-            try:
-                await adapter.close()
-            except Exception:
-                pass
-            try:
-                record = self.store.get(run_id)
-                if record.state in {LifecycleState.DEAD, LifecycleState.COMPLETED}:
+        async with self._run_mutation_admission():
+            async with self._run_lock(run_id):
+                try:
+                    await adapter.close()
+                except Exception:
+                    pass
+                try:
+                    record = self.store.get(run_id)
+                    if record.state in {LifecycleState.DEAD, LifecycleState.COMPLETED}:
+                        record = None
+                    else:
+                        record = self.store.transition(run_id, record.state, reason=reason)
+                except (RunNotFound, ValueError):
                     record = None
-                else:
-                    record = self.store.transition(run_id, record.state, reason=reason)
-            except (RunNotFound, ValueError):
-                record = None
-            self._remove_adapter_mapping(run_id, adapter)
-            if record is not None:
-                self._mark_adapter_loss(run_id)
-            if record is not None:
-                await self._publish_agent_change(record.agent_id)
+                self._remove_adapter_mapping(run_id, adapter)
+                if record is not None:
+                    self._mark_adapter_loss(run_id)
+                if record is not None:
+                    await self._publish_agent_change(record.agent_id)
 
     async def _handle_provider_event(
         self,
         run_id: str,
         adapter: ProviderAdapter,
         event: ProviderEvent,
+    ) -> None:
+        async with self._event_mutation_admission(run_id, adapter, event) as admitted:
+            if not admitted:
+                return
+            await self._handle_provider_event_without_admission(
+                run_id,
+                adapter,
+                event,
+            )
+
+    async def _handle_provider_event_without_admission(
+        self,
+        run_id: str,
+        adapter: ProviderAdapter,
+        event: ProviderEvent,
+        *,
+        update_adapter_snapshot: bool = True,
+        schedule_monitor_actions: bool = True,
     ) -> None:
         prior = self.store.get(run_id)
         raw = self.store.append_raw(
@@ -644,7 +884,7 @@ Preserve the same identity, role, worktree, orchestrator grouping, PR gates, and
         )
 
         record = self.store.get(run_id)
-        if normalized.lifecycle_state is not None:
+        if normalized.lifecycle_state is not None and update_adapter_snapshot:
             try:
                 adapter_status = adapter.snapshot()
                 record = self.store.update_adapter_status(run_id, adapter_status)
@@ -705,15 +945,16 @@ Preserve the same identity, role, worktree, orchestrator grouping, PR gates, and
             if credential_fingerprint is not None:
                 verified_event["credential_fingerprint"] = credential_fingerprint
             await self._publish(verified_event)
-        self._schedule_monitor_actions(
-            run_id,
-            adapter,
-            event,
-            prior_state=prior.state,
-            record=record,
-        )
+        if schedule_monitor_actions:
+            self._schedule_monitor_actions(
+                run_id,
+                adapter,
+                event,
+                prior_state=prior.state,
+                record=record,
+            )
 
-        if (
+        if schedule_monitor_actions and (
             record.state is LifecycleState.IDLE
             and id(adapter) not in self.expected_stream_ends
         ):
@@ -721,6 +962,98 @@ Preserve the same identity, role, worktree, orchestrator grouping, PR gates, and
                 self._deliver_next_queued(run_id, adapter),
                 name=f"agent-idle-boundary-{run_id}",
             )
+
+    async def _flush_handover_events(
+        self, run_id: str, *, schedule_monitor_actions: bool = False
+    ) -> None:
+        """Persist events queued while the handover barrier owned admission."""
+
+        while True:
+            async with self.handover_condition:
+                events = self.handover_event_queue.pop(run_id, [])
+            if not events:
+                return
+            for index, (adapter, event) in enumerate(events):
+                try:
+                    await self._handle_provider_event_without_admission(
+                        run_id,
+                        adapter,
+                        event,
+                        update_adapter_snapshot=False,
+                        schedule_monitor_actions=schedule_monitor_actions,
+                    )
+                except BaseException:
+                    async with self.handover_condition:
+                        self.handover_event_queue.setdefault(run_id, []).extend(
+                            events[index:]
+                        )
+                    raise
+
+    async def _flush_all_handover_events(
+        self, *, schedule_monitor_actions: bool = False
+    ) -> None:
+        """Replay every routed queue before handover continues or releases admission."""
+
+        while True:
+            async with self.handover_condition:
+                run_ids = list(self.handover_event_queue)
+            if not run_ids:
+                return
+            for run_id in run_ids:
+                async with self._run_lock(run_id):
+                    await self._flush_handover_events(
+                        run_id, schedule_monitor_actions=schedule_monitor_actions
+                    )
+
+    async def _capture_live_handover_events(self) -> None:
+        """Move buffered events from live adapters into the handover queue."""
+
+        for run_id, adapter in list(self.adapters.items()):
+            event_lock = self.event_processing_locks.setdefault(
+                run_id, asyncio.Lock()
+            )
+            async with event_lock:
+                for event in await adapter.drain_events():
+                    event_run_id = self.event_routes.get(
+                        (id(adapter), event.generation), run_id
+                    )
+                    async with self.handover_condition:
+                        self.handover_event_queue.setdefault(
+                            event_run_id, []
+                        ).append((adapter, event))
+
+    async def _drain_stopped_adapter(
+        self, run_id: str, adapter: ProviderAdapter
+    ) -> None:
+        """Drain the adapter and every event already taken by its pump."""
+
+        event_lock = self.event_processing_locks.setdefault(
+            run_id, asyncio.Lock()
+        )
+        while True:
+            async with event_lock:
+                for event in await adapter.drain_events():
+                    event_run_id = self.event_routes.get(
+                        (id(adapter), event.generation), run_id
+                    )
+                    async with self.handover_condition:
+                        handover_active = self.handover_active
+                        if handover_active:
+                            self.handover_event_queue.setdefault(
+                                event_run_id, []
+                            ).append((adapter, event))
+                    if not handover_active:
+                        await self._handle_provider_event_without_admission(
+                            event_run_id,
+                            adapter,
+                            event,
+                            update_adapter_snapshot=True,
+                            schedule_monitor_actions=True,
+                        )
+            async with self.event_drain_condition:
+                if not self.event_inflight_counts.get(run_id):
+                    return
+                await self.event_drain_condition.wait()
 
     def _schedule_monitor_actions(
         self,
@@ -874,53 +1207,54 @@ Preserve the same identity, role, worktree, orchestrator grouping, PR gates, and
         failed_reasons: dict[str, str] = {}
         failed_run_ids: dict[str, str] = {}
 
-        async with self._run_lock(run_id):
-            try:
-                record = self.store.get(run_id)
-                if (
-                    not self.store.is_current(record)
-                    or record.replaced_by_run_id
-                    or record.state in TERMINAL_STATES
-                ):
-                    return
-                if self.adapters.get(run_id) is not adapter:
-                    return
-                session_id = record.provider_session_id
-                if not session_id:
-                    raise StoreConflict("run has no provider session id")
-                self.store.mark_quiesce_intent(
-                    run_id,
-                    operation_id,
-                    session_id,
-                    resume_state=prior_state,
-                )
-                await self._close_and_drain_adapter(run_id, adapter)
-                detached = self.store.finish_provider_detached(
-                    run_id,
-                    operation_id,
-                    reason="quiesced for auth-dead recovery",
-                )
-                await self._publish_agent_change(detached.agent_id)
-                await self._resume_run(run_id, automatic=False)
-                revived.append(record.agent_id)
-            except Exception as exc:
+        async with self._run_mutation_admission():
+            async with self._run_lock(run_id):
                 try:
-                    current = self.store.transition(
+                    record = self.store.get(run_id)
+                    if (
+                        not self.store.is_current(record)
+                        or record.replaced_by_run_id
+                        or record.state in TERMINAL_STATES
+                    ):
+                        return
+                    if self.adapters.get(run_id) is not adapter:
+                        return
+                    session_id = record.provider_session_id
+                    if not session_id:
+                        raise StoreConflict("run has no provider session id")
+                    self.store.mark_quiesce_intent(
                         run_id,
-                        LifecycleState.BLOCKED,
-                        reason=f"auth-dead exact-session resume failed: {exc}",
+                        operation_id,
+                        session_id,
+                        resume_state=prior_state,
                     )
-                except Exception:
-                    current = None
-                if current is not None:
-                    await self._publish_agent_change(current.agent_id)
-                    failed.append(current.agent_id)
-                    failed_reasons[current.agent_id] = str(exc)
-                    failed_run_ids[current.agent_id] = current.run_id
-                else:
-                    failed.append(initial.agent_id)
-                    failed_reasons[initial.agent_id] = str(exc)
-                    failed_run_ids[initial.agent_id] = initial.run_id
+                    await self._close_and_drain_adapter(run_id, adapter)
+                    detached = self.store.finish_provider_detached(
+                        run_id,
+                        operation_id,
+                        reason="quiesced for auth-dead recovery",
+                    )
+                    await self._publish_agent_change(detached.agent_id)
+                    await self._resume_run_without_admission(run_id, automatic=False)
+                    revived.append(record.agent_id)
+                except Exception as exc:
+                    try:
+                        current = self.store.transition(
+                            run_id,
+                            LifecycleState.BLOCKED,
+                            reason=f"auth-dead exact-session resume failed: {exc}",
+                        )
+                    except Exception:
+                        current = None
+                    if current is not None:
+                        await self._publish_agent_change(current.agent_id)
+                        failed.append(current.agent_id)
+                        failed_reasons[current.agent_id] = str(exc)
+                        failed_run_ids[current.agent_id] = current.run_id
+                    else:
+                        failed.append(initial.agent_id)
+                        failed_reasons[initial.agent_id] = str(exc)
+                        failed_run_ids[initial.agent_id] = initial.run_id
 
         if revived or failed:
             await self._publish(
@@ -970,8 +1304,9 @@ Preserve the same identity, role, worktree, orchestrator grouping, PR gates, and
         )
 
     async def _deliver_next_queued(self, run_id: str, adapter: ProviderAdapter) -> None:
-        async with self._run_lock(run_id):
-            await self._deliver_next_queued_locked(run_id, adapter)
+        async with self._run_mutation_admission(wait_for_handover=True):
+            async with self._run_lock(run_id):
+                await self._deliver_next_queued_locked(run_id, adapter)
 
     async def _apply_desired_model_locked(
         self,
@@ -998,7 +1333,11 @@ Preserve the same identity, role, worktree, orchestrator grouping, PR gates, and
             old_model=old_model,
             new_model=desired_model,
         )
-        replacement = await self._replace(run_id, prompt, desired_model)
+        replacement = await self._replace_without_admission(
+            run_id,
+            prompt,
+            desired_model,
+        )
         if queued_messages:
             replacement = self.store.replace_queued_messages(
                 replacement.run_id,
@@ -1092,14 +1431,15 @@ Preserve the same identity, role, worktree, orchestrator grouping, PR gates, and
             )
 
     async def queue_model_change(self, run_id: str, model: str) -> dict[str, Any]:
-        if self.store.get(run_id).provider is ProviderKind.CODEX:
-            self._assert_codex_fleet_available()
-            async with self.codex_fleet_lock:
+        async with self._run_mutation_admission():
+            if self.store.get(run_id).provider is ProviderKind.CODEX:
                 self._assert_codex_fleet_available()
-                async with self._run_lock(run_id):
-                    return await self._queue_model_change_locked(run_id, model)
-        async with self._run_lock(run_id):
-            return await self._queue_model_change_locked(run_id, model)
+                async with self.codex_fleet_lock:
+                    self._assert_codex_fleet_available()
+                    async with self._run_lock(run_id):
+                        return await self._queue_model_change_locked(run_id, model)
+            async with self._run_lock(run_id):
+                return await self._queue_model_change_locked(run_id, model)
 
     async def _queue_model_change_locked(
         self,
@@ -1134,13 +1474,14 @@ Preserve the same identity, role, worktree, orchestrator grouping, PR gates, and
         return {"status": "queued", "desired_model": model}
 
     async def cancel_model_change(self, run_id: str) -> dict[str, Any]:
-        async with self._run_lock(run_id):
-            record = self.store.set_desired_model(run_id, None)
-            await self._publish_agent_change(record.agent_id)
-            await self._publish(
-                {"type": "session", "ticket": record.agent_id, "surface": "session"}
-            )
-            return {"status": "canceled", "desired_model": None}
+        async with self._run_mutation_admission():
+            async with self._run_lock(run_id):
+                record = self.store.set_desired_model(run_id, None)
+                await self._publish_agent_change(record.agent_id)
+                await self._publish(
+                    {"type": "session", "ticket": record.agent_id, "surface": "session"}
+                )
+                return {"status": "canceled", "desired_model": None}
 
     def _route_adapter_generation(
         self,
@@ -1269,12 +1610,11 @@ Preserve the same identity, role, worktree, orchestrator grouping, PR gates, and
         stream_key = id(adapter)
         self.expected_stream_ends.add(stream_key)
         try:
-            # Stop the event pump before stopping the provider. The provider
-            # may emit terminal protocol events while it is quiescing; those
-            # events belong to the old run and must not race the ownership
-            # reset or make the old record terminal before the handoff.
-            await self._detach_adapter(run_id, preserve_event_routes=True)
             await adapter.stop()
+            # Keep the pump attached through provider stop. This barrier
+            # covers both its local event and the adapter's buffered queue.
+            await self._drain_stopped_adapter(run_id, adapter)
+            await self._detach_adapter(run_id, preserve_event_routes=True)
         finally:
             self.expected_stream_ends.discard(stream_key)
 
@@ -1434,32 +1774,17 @@ Preserve the same identity, role, worktree, orchestrator grouping, PR gates, and
             status_path=self.store.status_path(record.agent_id),
         )
         record.initial_prompt = prompt
-        if provider is ProviderKind.CODEX:
-            self._assert_codex_fleet_available()
-            async with self.codex_fleet_lock:
+        async with self._run_mutation_admission():
+            if provider is ProviderKind.CODEX:
                 self._assert_codex_fleet_available()
-                async with self._agent_lock(record.agent_id):
-                    return await self._start_run(
-                        record=record,
-                        prompt=prompt,
-                        migrate_legacy=migrate_legacy,
-                    )
-        async with self._agent_lock(record.agent_id):
-            return await self._start_run(
-                record=record,
-                prompt=prompt,
-                migrate_legacy=migrate_legacy,
-            )
-
-    async def _start_run(
-        self,
-        *,
-        record: RunRecord,
-        prompt: str,
-        migrate_legacy: bool = False,
-    ) -> RunRecord:
-        self.store.create(record, migrate_legacy=migrate_legacy)
-        return await self._launch_record(record, prompt)
+                async with self.codex_fleet_lock:
+                    self._assert_codex_fleet_available()
+                    async with self._agent_lock(record.agent_id):
+                        self.store.create(record, migrate_legacy=migrate_legacy)
+                        return await self._launch_record(record, prompt)
+            async with self._agent_lock(record.agent_id):
+                self.store.create(record, migrate_legacy=migrate_legacy)
+                return await self._launch_record(record, prompt)
 
     async def _launch_record(self, record: RunRecord, prompt: str) -> RunRecord:
         adapter = self.adapter_factory(record)
@@ -1492,16 +1817,41 @@ Preserve the same identity, role, worktree, orchestrator grouping, PR gates, and
         return record
 
     async def resume_run(self, run_id: str) -> RunRecord:
-        if self.store.get(run_id).provider is ProviderKind.CODEX:
-            self._assert_codex_fleet_available()
-            async with self.codex_fleet_lock:
+        async with self._run_mutation_admission():
+            if self.store.get(run_id).provider is ProviderKind.CODEX:
                 self._assert_codex_fleet_available()
-                async with self._run_lock(run_id):
-                    return await self._resume_run(run_id, automatic=False)
-        async with self._run_lock(run_id):
-            return await self._resume_run(run_id, automatic=False)
+                async with self.codex_fleet_lock:
+                    self._assert_codex_fleet_available()
+                    async with self._run_lock(run_id):
+                        return await self._resume_run_without_admission(
+                            run_id,
+                            automatic=False,
+                        )
+            async with self._run_lock(run_id):
+                return await self._resume_run_without_admission(
+                    run_id,
+                    automatic=False,
+                )
 
-    async def _resume_run(self, run_id: str, *, automatic: bool) -> RunRecord:
+    async def _resume_run_without_admission(
+        self,
+        run_id: str,
+        *,
+        automatic: bool,
+    ) -> RunRecord:
+        """Resume a run after the caller has acquired mutation admission."""
+
+        return await self._resume_run_without_handover(
+            run_id,
+            automatic=automatic,
+        )
+
+    async def _resume_run_without_handover(
+        self,
+        run_id: str,
+        *,
+        automatic: bool,
+    ) -> RunRecord:
         # Re-read immediately before resume so stale recovery snapshots cannot
         # revive a deregistered, terminal, or replaced run (PR #31 invariant).
         record = self.store.get(run_id)
@@ -1515,7 +1865,11 @@ Preserve the same identity, role, worktree, orchestrator grouping, PR gates, and
         if record.state in {LifecycleState.DEAD, LifecycleState.COMPLETED}:
             raise StoreConflict(f"{record.state.value} runs never resume")
         recovery_state = record.recovery_from_state or record.state
-        if recovery_state not in {LifecycleState.WORKING, LifecycleState.IDLE}:
+        if recovery_state not in {
+            LifecycleState.WORKING,
+            LifecycleState.WAITING_APPROVAL,
+            LifecycleState.IDLE,
+        }:
             raise StoreConflict(
                 f"state {recovery_state.value} is not eligible for exact-session resume"
             )
@@ -1531,23 +1885,61 @@ Preserve the same identity, role, worktree, orchestrator grouping, PR gates, and
         # Request ids belong to the old transport generation. A resumed
         # provider must re-emit any still-actionable request before the UI can
         # answer it through the new adapter.
-        record = self.store.clear_pending_requests(run_id)
+        approval_prompt = (
+            _approval_recovery_prompt(record)
+            if recovery_state is LifecycleState.WAITING_APPROVAL
+            else None
+        )
+        old_pending_requests = deepcopy(record.pending_requests)
 
         adapter = self.adapter_factory(record)
         self._attach_adapter(record.run_id, adapter)
         try:
             status = await adapter.resume(session_id)
+            record = self.store.update_adapter_status(
+                run_id,
+                status,
+                guard_automatic_resume=automatic,
+            )
+            if approval_prompt is not None:
+                status = await adapter.send_now(approval_prompt)
+                record = self.store.update_adapter_status(
+                    run_id,
+                    status,
+                    guard_automatic_resume=automatic,
+                )
+                deadline = time.monotonic() + self.approval_recovery_timeout_seconds
+                while time.monotonic() < deadline:
+                    current = self.store.get(run_id)
+                    if (
+                        current.state is LifecycleState.WAITING_APPROVAL
+                        and current.pending_requests
+                        and current.pending_requests != old_pending_requests
+                    ):
+                        record = current
+                        break
+                    await asyncio.sleep(0.01)
+                else:
+                    raise StoreConflict(
+                        "provider did not re-emit the pending approval after transport recovery"
+                    )
+                for key, pending in old_pending_requests.items():
+                    if (
+                        record.pending_requests.get(key) == pending
+                    ):
+                        record = self.store.clear_pending_request_key(run_id, key)
         except asyncio.CancelledError:
-            await self._cleanup_cancelled_launch(record, adapter)
+            if approval_prompt is not None:
+                await self._close_and_drain_adapter(record.run_id, adapter)
+                self.store.restore_pending_requests(run_id, old_pending_requests)
+            else:
+                await self._cleanup_cancelled_launch(record, adapter)
             raise
         except Exception:
             await self._close_and_drain_adapter(record.run_id, adapter)
+            if approval_prompt is not None:
+                self.store.restore_pending_requests(run_id, old_pending_requests)
             raise
-        record = self.store.update_adapter_status(
-            run_id,
-            status,
-            guard_automatic_resume=automatic,
-        )
         if quiesce_operation_id is not None:
             record = self.store.clear_quiesce_marker(
                 run_id,
@@ -1556,23 +1948,27 @@ Preserve the same identity, role, worktree, orchestrator grouping, PR gates, and
         elif not automatic:
             record = self.store.clear_automatic_resume_suppression(run_id)
         self._route_adapter_generation(run_id, adapter, status.generation)
+        if status.state is LifecycleState.IDLE:
+            await self._deliver_next_queued_locked(run_id, adapter)
+            record = self.store.get(run_id)
         await self._publish_agent_change(record.agent_id)
         return record
 
     async def recover_on_start(self) -> list[dict[str, str]]:
-        async with self.recovery_scan_lock:
-            results = await self._recover_once()
-            if self._reaper_due():
-                by_run_id = {
-                    item["run_id"]: index for index, item in enumerate(results)
-                }
-                for reaped in await self._reap_lost_runs():
-                    index = by_run_id.get(reaped["run_id"])
-                    if index is None:
-                        results.append(reaped)
-                    else:
-                        results[index] = reaped
-            return results
+        async with self._run_mutation_admission():
+            async with self.recovery_scan_lock:
+                results = await self._recover_once()
+                if self._reaper_due():
+                    by_run_id = {
+                        item["run_id"]: index for index, item in enumerate(results)
+                    }
+                    for reaped in await self._reap_lost_runs():
+                        index = by_run_id.get(reaped["run_id"])
+                        if index is None:
+                            results.append(reaped)
+                        else:
+                            results[index] = reaped
+                return results
 
     async def _reap_lost_runs(self) -> list[dict[str, str]]:
         self.last_reaper_at = time.monotonic()
@@ -1653,6 +2049,20 @@ Preserve the same identity, role, worktree, orchestrator grouping, PR gates, and
         return await asyncio.shield(task)
 
     async def _rotate_codex_fleet(
+        self,
+        operation_id: str,
+        force_target: str | None,
+        *,
+        outgoing_reset_at: str | None,
+    ) -> dict[str, Any]:
+        async with self._run_mutation_admission():
+            return await self._rotate_codex_fleet_without_admission(
+                operation_id,
+                force_target,
+                outgoing_reset_at=outgoing_reset_at,
+            )
+
+    async def _rotate_codex_fleet_without_admission(
         self,
         operation_id: str,
         force_target: str | None,
@@ -2039,7 +2449,7 @@ Preserve the same identity, role, worktree, orchestrator grouping, PR gates, and
                     if self.pid_alive(record.provider_pid):
                         pending = True
                         continue
-                    await self._resume_run(run_id, automatic=False)
+                    await self._resume_run_without_admission(run_id, automatic=False)
                     row["resumed"] = True
                     row["failed_reason"] = None
                     revived.append(agent_id)
@@ -2121,6 +2531,260 @@ Preserve the same identity, role, worktree, orchestrator grouping, PR gates, and
                 results.append(await self._recover_run(snapshot.run_id))
         return results
 
+    async def _handover_preflight(self) -> list[str]:
+        """Validate every current provider before any adapter is drained."""
+
+        run_ids: list[str] = []
+        for snapshot in self.store.list_runs():
+            if (
+                snapshot.state in TERMINAL_STATES
+                or snapshot.replaced_by_run_id
+                or not self.store.is_current(snapshot)
+            ):
+                continue
+            try:
+                lock = self._run_lock(snapshot.run_id)
+            except RunNotFound:
+                continue
+            async with lock:
+                try:
+                    record = self.store.get(snapshot.run_id)
+                except RunNotFound:
+                    continue
+                if (
+                    record.state in TERMINAL_STATES
+                    or record.replaced_by_run_id
+                    or not self.store.is_current(record)
+                ):
+                    continue
+                runtime = self._runtime_status(record)
+                provider_alive = bool(runtime["provider_alive"]) or self.pid_alive(
+                    record.provider_pid
+                )
+                if provider_alive and not runtime["control_attached"]:
+                    raise StoreConflict(
+                        f"cannot hand over {record.agent_id}: "
+                        "live provider control is detached"
+                    )
+                if not runtime["control_attached"] and not provider_alive:
+                    continue
+                if runtime.get("state") not in {
+                    LifecycleState.WORKING.value,
+                    LifecycleState.WAITING_APPROVAL.value,
+                    LifecycleState.IDLE.value,
+                }:
+                    raise StoreConflict(
+                        f"cannot hand over {record.agent_id}: state "
+                        f"{runtime.get('state') or 'unknown'} is not resumable"
+                    )
+                if not isinstance(runtime.get("provider_session_id"), str) or not runtime.get(
+                    "provider_session_id"
+                ):
+                    raise StoreConflict(
+                        f"cannot hand over {record.agent_id}: provider session id is missing"
+                    )
+                run_ids.append(record.run_id)
+        return run_ids
+
+    @staticmethod
+    def _classify_handover_finalization(
+        captured_state: LifecycleState,
+        events: list[tuple[ProviderAdapter, ProviderEvent]],
+        captured_pending_requests: dict[str, dict[str, Any]],
+        drained_pending_requests: dict[str, dict[str, Any]],
+    ) -> tuple[LifecycleState, dict[str, dict[str, Any]]]:
+        """Apply the complete captured-state and stop-event matrix."""
+
+        outcome = _HandoverDrainOutcome.NONE
+        for _adapter, event in events:
+            normalized = normalize_provider_event(
+                event.provider,
+                event.payload,
+                direction=event.direction,
+            )
+            if normalized.kind in {"approval_response", "approval_resolved"}:
+                outcome = _HandoverDrainOutcome.USER_RESPONSE
+                continue
+            if event.payload.get("type") == "control_cancel_request":
+                outcome = _HandoverDrainOutcome.CONTROL_CANCEL_REQUEST
+                continue
+            if normalized.lifecycle_state is LifecycleState.WAITING_APPROVAL:
+                outcome = _HandoverDrainOutcome.NEW_APPROVAL
+                continue
+            if normalized.lifecycle_state is LifecycleState.INTERRUPTED:
+                outcome = _HandoverDrainOutcome.SUPERVISOR_INTERRUPTED
+                continue
+            if normalized.lifecycle_state is LifecycleState.IDLE:
+                outcome = _HandoverDrainOutcome.NATURAL_COMPLETED
+                continue
+            if normalized.lifecycle_state in {
+                LifecycleState.COMPLETED,
+                LifecycleState.BLOCKED,
+            }:
+                raise StoreConflict(
+                    "provider produced non-resumable handover state: "
+                    f"{normalized.lifecycle_state.value}"
+                )
+
+        try:
+            final_state, pending_disposition = _HANDOVER_FINALIZATION_MATRIX[
+                (captured_state, outcome)
+            ]
+        except KeyError as exc:
+            raise StoreConflict(
+                f"unsupported handover finalization: {captured_state.value}/{outcome.value}"
+            ) from exc
+        if pending_disposition is _HandoverPendingDisposition.CLEAR:
+            pending_requests: dict[str, dict[str, Any]] = {}
+        elif pending_disposition is _HandoverPendingDisposition.MERGE_CAPTURED_AND_DRAINED:
+            pending_requests = {
+                **captured_pending_requests,
+                **drained_pending_requests,
+            }
+        else:
+            pending_requests = dict(captured_pending_requests)
+        return final_state, pending_requests
+
+    async def prepare_handover(self, _run_ids: list[str] | None = None) -> dict[str, Any]:
+        """Block admission, validate providers, then drain that exact set."""
+
+        async with self.handover_condition:
+            while self.handover_pending:
+                await self.handover_condition.wait()
+            if self.handover_active:
+                if self.handover_result is not None:
+                    return {
+                        "drained_run_ids": list(
+                            self.handover_result["drained_run_ids"]
+                        ),
+                        "runs": [dict(run) for run in self.handover_result["runs"]],
+                    }
+                raise StoreConflict("supervisor handover is already in progress")
+            self.handover_pending = True
+            try:
+                while self.active_run_mutations:
+                    await self.handover_condition.wait()
+                self.handover_pending = False
+                self.handover_active = True
+                self.handover_condition.notify_all()
+            except BaseException:
+                self.handover_pending = False
+                self.handover_condition.notify_all()
+                raise
+        try:
+            run_ids = await self._handover_preflight()
+            drained: list[str] = []
+            runs: list[dict[str, Any]] = []
+            for run_id in run_ids:
+                async with self._run_lock(run_id):
+                    await self._flush_handover_events(run_id)
+                    record = self.store.get(run_id)
+                    runtime = self._runtime_status(record)
+                    if (
+                        record.state in TERMINAL_STATES
+                        or record.replaced_by_run_id
+                        or not self.store.is_current(record)
+                    ):
+                        raise StoreConflict(
+                            f"handover target changed before detach: {run_id}"
+                        )
+                    if runtime.get("state") not in {
+                        LifecycleState.WORKING.value,
+                        LifecycleState.WAITING_APPROVAL.value,
+                        LifecycleState.IDLE.value,
+                    }:
+                        raise StoreConflict(
+                            f"cannot hand over {record.agent_id}: state "
+                            f"{runtime.get('state') or 'unknown'} is not resumable"
+                        )
+                    provider_session_id = runtime.get("provider_session_id")
+                    if not isinstance(provider_session_id, str) or not provider_session_id:
+                        raise StoreConflict(
+                            f"cannot hand over {record.agent_id}: provider session id is missing"
+                        )
+                    captured_state = record.state
+                    if captured_state not in {
+                        LifecycleState.WORKING,
+                        LifecycleState.WAITING_APPROVAL,
+                        LifecycleState.IDLE,
+                    }:
+                        raise StoreConflict(
+                            f"cannot hand over {record.agent_id}: durable state "
+                            f"{captured_state.value} is not resumable"
+                        )
+                    captured_pending_requests = deepcopy(record.pending_requests)
+                    captured_generation = record.provider_generation
+                    captured_transcript_path = record.transcript_path
+                    adapter = self.adapters.get(run_id)
+                    if adapter is None:
+                        raise StoreConflict(
+                            f"provider control detached during handover: {run_id}"
+                        )
+                    await self._quiesce_adapter_for_replacement(run_id, adapter)
+                    async with self.handover_condition:
+                        stop_events = list(self.handover_event_queue.get(run_id, []))
+                    await self._flush_handover_events(run_id)
+                    post_stop = self.store.get(run_id)
+                    final_state, final_pending_requests = (
+                        self._classify_handover_finalization(
+                            captured_state,
+                            stop_events,
+                            captured_pending_requests,
+                            post_stop.pending_requests,
+                        )
+                    )
+                    current = self.store.finalize_handover_detach(
+                        run_id,
+                        state=final_state,
+                        session_id=provider_session_id,
+                        generation=captured_generation,
+                        transcript_path=captured_transcript_path,
+                        pending_requests=final_pending_requests,
+                    )
+                    handover_run = self._runtime_status(self.store.get(run_id))
+                    handover_run.update(
+                        {
+                            "state": current.state.value,
+                            "provider_session_id": provider_session_id,
+                            "provider_pid": None,
+                            "active_turn_id": None,
+                            "control_attached": False,
+                            "provider_alive": False,
+                        }
+                    )
+                    runs.append(handover_run)
+                    drained.append(run_id)
+            await self._flush_all_handover_events()
+            if self.handover_event_queue:
+                raise StoreConflict(
+                    "handover completed with unpersisted provider events"
+                )
+            self.handover_result = {"drained_run_ids": drained, "runs": runs}
+            return {
+                "drained_run_ids": list(drained),
+                "runs": [dict(run) for run in runs],
+            }
+        except BaseException:
+            capture_error: BaseException | None = None
+            try:
+                await self._capture_live_handover_events()
+            except BaseException as exc:
+                capture_error = exc
+            async with self.handover_condition:
+                self.handover_active = False
+                self.handover_pending = False
+                self.handover_result = None
+                self.handover_condition.notify_all()
+            try:
+                await self._flush_all_handover_events(
+                    schedule_monitor_actions=True
+                )
+            except BaseException:
+                raise
+            if capture_error is not None:
+                raise capture_error
+            raise
+
     async def _recover_run(self, run_id: str) -> dict[str, str]:
         # Decision inputs are refreshed per run; no stale list snapshot can
         # override a replacement that happened while recovery was running.
@@ -2186,7 +2850,10 @@ Preserve the same identity, role, worktree, orchestrator grouping, PR gates, and
         if decision.action is RecoveryAction.RESUME:
             recovery_state = record.recovery_from_state or record.state
             try:
-                await self._resume_run(record.run_id, automatic=True)
+                await self._resume_run_without_admission(
+                    record.run_id,
+                    automatic=True,
+                )
             except Exception as exc:
                 try:
                     self.store.mark_automatic_resume_failed(
@@ -2234,10 +2901,11 @@ Preserve the same identity, role, worktree, orchestrator grouping, PR gates, and
         dedupe_key: str | None = None,
         source: str | None = None,
     ) -> dict[str, Any]:
-        async with self._run_lock(run_id):
-            return await self._send_now(
-                run_id, message, pending_id, dedupe_key, source
-            )
+        async with self._run_mutation_admission():
+            async with self._run_lock(run_id):
+                return await self._send_now(
+                    run_id, message, pending_id, dedupe_key, source
+                )
 
     async def _send_now(
         self,
@@ -2309,10 +2977,11 @@ Preserve the same identity, role, worktree, orchestrator grouping, PR gates, and
         dedupe_key: str | None = None,
         source: str | None = None,
     ) -> dict[str, Any]:
-        async with self._run_lock(run_id):
-            return await self._send_on_idle(
-                run_id, message, pending_id, dedupe_key, source
-            )
+        async with self._run_mutation_admission():
+            async with self._run_lock(run_id):
+                return await self._send_on_idle(
+                    run_id, message, pending_id, dedupe_key, source
+                )
 
     async def _send_on_idle(
         self,
@@ -2368,20 +3037,22 @@ Preserve the same identity, role, worktree, orchestrator grouping, PR gates, and
         return response
 
     async def delete_queued(self, run_id: str, index: int) -> dict[str, Any]:
-        async with self._run_lock(run_id):
-            record = self.store.delete_queued_message(run_id, index)
-            await self._publish(
-                {
-                    "type": "session",
-                    "ticket": record.agent_id,
-                    "surface": "queue",
-                }
-            )
-            return {"messages": list(record.queued_messages)}
+        async with self._run_mutation_admission():
+            async with self._run_lock(run_id):
+                record = self.store.delete_queued_message(run_id, index)
+                await self._publish(
+                    {
+                        "type": "session",
+                        "ticket": record.agent_id,
+                        "surface": "queue",
+                    }
+                )
+                return {"messages": list(record.queued_messages)}
 
     async def interrupt(self, run_id: str) -> RunRecord:
-        async with self._run_lock(run_id):
-            return await self._interrupt(run_id)
+        async with self._run_mutation_admission():
+            async with self._run_lock(run_id):
+                return await self._interrupt(run_id)
 
     async def _interrupt(self, run_id: str) -> RunRecord:
         adapter = self.adapters.get(run_id)
@@ -2394,8 +3065,9 @@ Preserve the same identity, role, worktree, orchestrator grouping, PR gates, and
         return record
 
     async def stop(self, run_id: str) -> RunRecord:
-        async with self._run_lock(run_id):
-            return await self._stop(run_id)
+        async with self._run_mutation_admission():
+            async with self._run_lock(run_id):
+                return await self._stop(run_id)
 
     async def _stop(self, run_id: str) -> RunRecord:
         adapter = self.adapters.get(run_id)
@@ -2436,8 +3108,9 @@ Preserve the same identity, role, worktree, orchestrator grouping, PR gates, and
         *,
         outcome: str | None = None,
     ) -> RunRecord:
-        async with self._run_lock(run_id):
-            return await self._archive(run_id, outcome=outcome)
+        async with self._run_mutation_admission():
+            async with self._run_lock(run_id):
+                return await self._archive(run_id, outcome=outcome)
 
     async def _archive(
         self,
@@ -2552,14 +3225,25 @@ Preserve the same identity, role, worktree, orchestrator grouping, PR gates, and
         effort: str | None = None,
         backend_base_url: str | None = None,
     ) -> RunRecord:
-        old = self.store.get(run_id)
-        target_provider = provider or old.provider
-        if ProviderKind.CODEX in {old.provider, target_provider}:
-            self._assert_codex_fleet_available()
-            async with self.codex_fleet_lock:
+        async with self._run_mutation_admission():
+            old = self.store.get(run_id)
+            target_provider = provider or old.provider
+            if ProviderKind.CODEX in {old.provider, target_provider}:
                 self._assert_codex_fleet_available()
+                async with self.codex_fleet_lock:
+                    self._assert_codex_fleet_available()
+                    async with self._run_lock(run_id):
+                        replacement = await self._replace_without_admission(
+                            run_id,
+                            prompt,
+                            model,
+                            target_provider,
+                            effort if provider is not None else old.effort,
+                            backend_base_url,
+                        )
+            else:
                 async with self._run_lock(run_id):
-                    replacement = await self._replace(
+                    replacement = await self._replace_without_admission(
                         run_id,
                         prompt,
                         model,
@@ -2567,16 +3251,6 @@ Preserve the same identity, role, worktree, orchestrator grouping, PR gates, and
                         effort if provider is not None else old.effort,
                         backend_base_url,
                     )
-        else:
-            async with self._run_lock(run_id):
-                replacement = await self._replace(
-                    run_id,
-                    prompt,
-                    model,
-                    target_provider,
-                    effort if provider is not None else old.effort,
-                    backend_base_url,
-                )
         if old.model != replacement.model:
             self._append_model_changed_event(
                 replacement,
@@ -2603,7 +3277,27 @@ Preserve the same identity, role, worktree, orchestrator grouping, PR gates, and
             )
         return replacement
 
-    async def _replace(
+    async def _replace_without_admission(
+        self,
+        run_id: str,
+        prompt: str,
+        model: str | None = None,
+        provider: ProviderKind | None = None,
+        effort: str | None = None,
+        backend_base_url: str | None = None,
+    ) -> RunRecord:
+        """Replace a run after the caller has acquired mutation admission."""
+
+        return await self._replace_without_handover(
+            run_id,
+            prompt,
+            model,
+            provider,
+            effort,
+            backend_base_url,
+        )
+
+    async def _replace_without_handover(
         self,
         run_id: str,
         prompt: str,
@@ -2778,7 +3472,8 @@ Preserve the same identity, role, worktree, orchestrator grouping, PR gates, and
     ) -> RunRecord:
         # Provider questions can arrive before the long-running start/turn RPC
         # returns. Taking the agent operation lock here would deadlock that RPC.
-        return await self._respond(run_id, request_id, response)
+        async with self._run_mutation_admission():
+            return await self._respond(run_id, request_id, response)
 
     async def _respond(
         self,
@@ -3038,6 +3733,14 @@ Preserve the same identity, role, worktree, orchestrator grouping, PR gates, and
             }
         if method == "supervisor/recover":
             return {"runs": await self.recover_on_start()}
+        if method == "supervisor/handover":
+            run_ids = params.get("run_ids")
+            if run_ids is not None and (
+                not isinstance(run_ids, list)
+                or not all(isinstance(run_id, str) and run_id for run_id in run_ids)
+            ):
+                raise ValueError("run_ids must be a list of non-empty strings")
+            return await self.prepare_handover(run_ids)
         raise ValueError(f"unknown supervisor method: {method}")
 
     async def close(self) -> None:
@@ -3071,9 +3774,13 @@ Preserve the same identity, role, worktree, orchestrator grouping, PR gates, and
             await asyncio.gather(*self.event_tasks.values(), return_exceptions=True)
         self.event_tasks.clear()
         if self.monitor_tasks:
+            for task in self.monitor_tasks:
+                task.cancel()
             await asyncio.gather(*self.monitor_tasks, return_exceptions=True)
         self.monitor_tasks.clear()
         self.event_routes.clear()
+        self.event_processing_locks.clear()
+        self.event_inflight_counts.clear()
         self.queue_locks.clear()
         self.agent_locks.clear()
         self.pipeline_failures.clear()

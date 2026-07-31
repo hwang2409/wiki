@@ -2,13 +2,37 @@
 type: log
 tags: [log, done]
 created: 2026-07-06
-updated: 2026-07-30
+updated: 2026-07-31
 ---
 
 # Done
 
+## 2026-07-31
+
+- **phoebe** — PHO-14952 v3 file inspection tools merged via [#13000](https://github.com/phoebe-health/phoebe/pull/13000) (squash beed18398b, 3 rounds — budget-aware streaming reader, row-framing fix; v1 expansion complete)
+- wiki — WIKI-168 daemon-ize backend merged via [#153](https://github.com/hwang2409/wiki/pull/153) (squash 295ba9b, 42 review rounds — launchd daemon w/ authenticated secret handshake, handover finalization state matrix, unified install/runtime codesign trust gate; daemon activation on a real install needs Henry's developer signing identity, ad-hoc builds fall back to sidecar)
+- **phoebe** — PHO-14951 v3 get_shifts tool merged via [#13001](https://github.com/phoebe-health/phoebe/pull/13001) (squash c01e719bd3, 3 rounds — canonical progression-state semantics, v1 expansion tool 1 of 2)
+- **phoebe** — PHO-14880 production voice-call analysis merged via [#12902](https://github.com/phoebe-health/phoebe/pull/12902) (squash f36321e780, 6 rounds incl. omitted-#12986 integrity catch; survived 4 BuildBuddy disk flakes) — admin-automation arc COMPLETE
+- **phoebe** — PHO-14864 bash-recs tooling under v3 agent merged via [#12876](https://github.com/phoebe-health/phoebe/pull/12876) (squash 96f894b971, 9 rounds incl. v3 retarget + facade-port catch + merge-integrity round; behind agent_v3_enabled)
+- **phoebe** — PHO-14942 EHR drift alerts merged via [#12986](https://github.com/phoebe-health/phoebe/pull/12986) (squash 850d832384, 2 rounds, deterministic daily snapshots)
+- **phoebe** — PHO-14844 call-analysis auto-apply tools merged via [#12854](https://github.com/phoebe-health/phoebe/pull/12854) (squash a97b056039, 8 rounds incl. mid-loop no-approval contract change)
+
 ## 2026-07-30
 
+- **phoebe** — PHO-14881 per-org account-health drift watch merged via [#12898](https://github.com/phoebe-health/phoebe/pull/12898) (squash d8706c9379, 6 review rounds converging 4-3-3-1-clean; H1 read-only enforced, EHR metric deferred pending historical source)
+- **phoebe** — PHO-14912 approval-notification caller name + chat link merged via [#12955](https://github.com/phoebe-health/phoebe/pull/12955) (squash 3e8d4f4861, 2 review rounds, customer: Nick Breus RAH Miami)
+- **phoebe** — PR #12926 eval-harness provenance truthfulness merged (squash 627c80437f, 5 review rounds + implementer swap; caller-evidence circularity broken, PHO-14286 arc fully closed)
+- **phoebe** — PHO-14899 outreach approval-card preview merged via [#12933](https://github.com/phoebe-health/phoebe/pull/12933) (squash 41fcbb1769, 3 review rounds, customer: jsall)
+- **phoebe** — PHO-14595 worker archived at both-gates-clean (#12574 parked open @4fb9bcbb, 8 review rounds; Henry rethinking ticket direction, worktree .claude/worktrees/pho-14595 kept)
+- **phoebe** — PR #12892 admin-agent analysis-log read access merged (squash 8ee076041b, Devin PR taken over, 3 review rounds)
+- **phoebe** — PHO-14286 confirmed merged via [#12142](https://github.com/phoebe-health/phoebe/pull/12142) (merged 07-24, gate was stale); post-merge truthfulness commits recovered into follow-up [#12926](https://github.com/phoebe-health/phoebe/pull/12926)
+- **phoebe** — PHO-14881-HOTFIX merged via [#12910](https://github.com/phoebe-health/phoebe/pull/12910)
+- **wiki** — WIKI-218 terminal pane integration polish ([#158](https://github.com/hwang2409/wiki/pull/158) merged 8b5557f83cbba0ba15d50f17d6d8988fac5b8e5c)
+- **wiki** — WIKI-220 rebase-bot durable store isolation ([#155](https://github.com/hwang2409/wiki/pull/155) merged b9bcec6bdd78463673e1931232d8d547fb2da471)
+- **wiki** — WIKI-195 universal fullscreen inspector ([#157](https://github.com/hwang2409/wiki/pull/157) merged 956ef9f4238354513f5a2b482693d502048f216b)
+- **wiki** — WIKI-157 utility-page refinement merged (PR #154, 6 review rounds — false-zero token contract, health/activity/graph states)
+- WIKI-221 fleet-card screencast preview + working diff behind disclosures, default collapsed (PR #156, merged)
+- phoebe — PHO-14845 admin Slack channel + alert tools merged (#12856 squash @ccc75e4fe5, 3 review rounds + conflict-resolution merge)
 - phoebe — PHO-14851 Phoebe Home Care admin_agent_tool_search enable merged (#12855 squash @01d77efe58, 3 review rounds)
 - phoebe — PHO-14843 admin scratchpad hardening merged (#12857 squash @1dd94824d2, 2 review rounds)
 - **wiki-app** — WIKI-152 agent-session chrome merged — PR #152, 3 review rounds; default chrome shows decision-relevant state only, all diagnostics consolidated in Run details disclosure, absence tests guard against noise creep, composer a11y fixed, screenshots on PR (https://github.com/hwang2409/wiki/pull/152)

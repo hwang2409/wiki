@@ -50,6 +50,7 @@ async function main() {
   let messagePayload = null;
   let gatePayload = null;
   let messageCalls = 0;
+  let appSecret = "playwright-wiki-app-secret-fixture";
 
   try {
     await page.route(`**/api/agents/${TICKET}/session?**`, async (route) => {
@@ -183,6 +184,7 @@ async function main() {
       // production build takes; the ACL-enforcement half of the security
       // model is covered by the Rust test at
       // `src-tauri/tests/wiki_app_secret_capability.rs`.
+      window.__WIKI_TEST_APP_SECRET__ = "playwright-wiki-app-secret-fixture";
       window.__TAURI_INTERNALS__ = {
         transformCallback: (cb) => {
           const id = Math.floor(Math.random() * 1_000_000);
@@ -196,7 +198,7 @@ async function main() {
           if (cmd !== "get_wiki_app_secret") {
             throw new Error(`playwright IPC stub: unexpected command "${cmd}"`);
           }
-          return "playwright-wiki-app-secret-fixture";
+          return window.__WIKI_TEST_APP_SECRET__;
         },
       };
     });
@@ -293,6 +295,10 @@ async function main() {
         `X-Wiki-App-Secret header missing/wrong: ${JSON.stringify(provisionPayloads[0])}`
       );
     }
+    appSecret = "playwright-wiki-app-secret-rotated";
+    await page.evaluate((value) => {
+      window.__WIKI_TEST_APP_SECRET__ = value;
+    }, appSecret);
     if (provisionPayloads[0].legacySessionHeader !== null) {
       throw new Error(
         `Legacy X-Wiki-Session-Id header must NOT be sent (H1 spoof surface): ${JSON.stringify(provisionPayloads[0])}`
@@ -335,6 +341,14 @@ async function main() {
     const ccPayload = spawnPayloads[1];
     if (ccPayload.kind !== "cc" || ccPayload.effort !== null) {
       throw new Error(`cc payload wrong: ${JSON.stringify(ccPayload)}`);
+    }
+    if (provisionPayloads.length !== 2) {
+      throw new Error(`expected two provision calls, got ${provisionPayloads.length}`);
+    }
+    if (provisionPayloads[1].appSecretHeader !== appSecret) {
+      throw new Error(
+        `rotated X-Wiki-App-Secret header missing/wrong: ${JSON.stringify(provisionPayloads[1])}`
+      );
     }
 
     // steer command dispatches sendAgentMessage — Meta+Enter from the

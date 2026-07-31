@@ -474,7 +474,11 @@ def refresh(state: dict[str, Any] | None = None) -> dict[str, Any]:
     seen_runs: set[str] = set()
     if root_fd is not None:
         try:
-            with os.scandir(os.dup(root_fd)) as entries:
+            # os.scandir(fd) dups the fd internally and closes only its own
+            # dup — an explicit os.dup() here is owned by nobody and leaks
+            # one runs-dir fd per refresh (wedged the backend at the GUI
+            # 256-fd rlimit; wedge #7, 2026-07-30).
+            with os.scandir(root_fd) as entries:
                 run_ids = [entry.name for entry in entries if not entry.is_symlink() and entry.is_dir(follow_symlinks=False)]
             for run_id in run_ids:
                 seen_runs.add(run_id)

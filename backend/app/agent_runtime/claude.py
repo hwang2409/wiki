@@ -236,6 +236,8 @@ class ClaudeStreamAdapter(ProviderAdapter):
             "stdio",
             "--include-partial-messages",
             "--include-hook-events",
+            "--thinking-display",
+            "summarized",
             "--mcp-config",
             self.artifact_mcp_config,
             # Parity with the codex adapter's approvalPolicy "never" +
@@ -878,6 +880,18 @@ class ClaudeStreamAdapter(ProviderAdapter):
 
     def events(self) -> AsyncIterator[ProviderEvent]:
         return self._event_stream()
+
+    async def drain_events(self) -> list[ProviderEvent]:
+        events: list[ProviderEvent] = []
+        while True:
+            try:
+                event = self._events.get_nowait()
+            except asyncio.QueueEmpty:
+                return events
+            if isinstance(event, _StreamEnd):
+                self._suppress_stream_end.discard(event.generation)
+                continue
+            events.append(event)
 
     async def _event_stream(self) -> AsyncIterator[ProviderEvent]:
         while True:

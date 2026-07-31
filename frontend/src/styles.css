@@ -6372,8 +6372,6 @@ body.is-resizing-panes .pane-cell {
 }
 
 .session-provider-request-actions pre {
-  max-height: 220px;
-  overflow: auto;
   white-space: pre-wrap;
   overflow-wrap: anywhere;
 }
@@ -6388,7 +6386,7 @@ body.is-resizing-panes .pane-cell {
 }
 
 .session-provider-events {
-  max-height: 260px;
+  /* max-height set inline from STREAM_CLAMP_PX (stream-clamp.tsx) */
   overflow: auto;
   border-top: 1px solid var(--background-modifier-border);
 }
@@ -6435,10 +6433,8 @@ body.is-resizing-panes .pane-cell {
 }
 
 .session-provider-event pre {
-  max-height: 220px;
   margin: 0;
   padding: 8px;
-  overflow: auto;
   border-top: 1px dashed var(--background-modifier-border);
   color: var(--text-muted);
   white-space: pre-wrap;
@@ -7256,7 +7252,6 @@ body.is-resizing-panes .pane-cell {
 }
 
 .session-tool-body pre {
-  max-height: 240px;
   margin: 0;
   padding: 8px 10px;
   border-radius: var(--radius-xs);
@@ -7268,7 +7263,6 @@ body.is-resizing-panes .pane-cell {
   line-height: 1.5;
   white-space: pre-wrap;
   overflow-wrap: break-word;
-  overflow-y: auto;
 }
 
 .session-tool-body pre.session-tool-output {
@@ -7288,7 +7282,6 @@ body.is-resizing-panes .pane-cell {
 }
 
 .session-thinking {
-  max-height: 160px;
   padding: 4px 0 4px 10px;
   border-left: 2px dashed var(--background-modifier-border);
   color: var(--text-faint);
@@ -7297,7 +7290,6 @@ body.is-resizing-panes .pane-cell {
   line-height: 1.55;
   white-space: pre-wrap;
   overflow-wrap: break-word;
-  overflow-y: auto;
 }
 
 .session-thinking-chip {
@@ -11477,7 +11469,6 @@ textarea.composer-command-input {
 }
 
 .transcript-preview-body {
-  max-height: 300px;
   margin: 0;
   padding: 8px 10px;
   border: 1px solid var(--background-modifier-border);
@@ -11488,7 +11479,7 @@ textarea.composer-command-input {
   font-weight: var(--font-monospace-weight);
   font-size: var(--font-ui-smaller);
   line-height: 1.5;
-  overflow: auto;
+  overflow-x: auto;
 }
 
 .transcript-preview-body.is-wrap {
@@ -11538,6 +11529,65 @@ textarea.composer-command-input {
 .transcript-preview-body.is-custom.is-nowrap .shiki-block code {
   white-space: pre;
   overflow-wrap: normal;
+}
+
+/* WIKI-222: rendered-height clamp for payloads with long wrapped lines —
+   keep after the .is-custom rules so overflow: hidden wins the cascade. */
+.transcript-preview-body.is-height-clamped {
+  overflow: hidden;
+  -webkit-mask-image: linear-gradient(to bottom, black calc(100% - 48px), transparent);
+  mask-image: linear-gradient(to bottom, black calc(100% - 48px), transparent);
+}
+
+/* WIKI-222: shared stream-output clamp (stream-clamp.tsx) */
+
+.stream-clamp {
+  display: block;
+  min-width: 0;
+}
+
+.stream-clamp.is-clamped .stream-clamp-body {
+  overflow: hidden;
+  -webkit-mask-image: linear-gradient(to bottom, black calc(100% - 48px), transparent);
+  mask-image: linear-gradient(to bottom, black calc(100% - 48px), transparent);
+}
+
+.stream-clamp-toggle {
+  position: relative;
+  display: inline-flex;
+  align-items: center;
+  margin-top: 3px;
+  padding: 1px 7px;
+  border: 1px solid var(--background-modifier-border);
+  border-radius: var(--radius-xs);
+  background: transparent;
+  color: var(--text-faint);
+  font-family: var(--font-monospace);
+  font-weight: var(--font-monospace-weight);
+  font-size: var(--fs-2xs);
+  font-style: normal;
+  letter-spacing: 0.02em;
+  text-transform: lowercase;
+  cursor: pointer;
+  transition-property: color, border-color, background-color, transform;
+  transition-duration: 120ms;
+}
+
+.stream-clamp-toggle:active {
+  transform: scale(0.96);
+}
+
+.stream-clamp-toggle::before {
+  /* extend the hit area beyond the small visual chip */
+  content: "";
+  position: absolute;
+  inset: -6px -8px;
+}
+
+.stream-clamp-toggle:hover {
+  border-color: var(--background-modifier-border-hover, var(--background-modifier-border));
+  background: var(--background-modifier-hover);
+  color: var(--text-normal);
 }
 
 /* WIKI-163: workgraph side panel (graph-engineering D2) */

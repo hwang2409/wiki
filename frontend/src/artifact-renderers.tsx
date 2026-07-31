@@ -19,6 +19,7 @@ import {
 } from "./pdfjs-runtime";
 import { ShikiCode, useCurrentTheme } from "./shiki";
 import { StatusBadge, statusToTone } from "./status-badge";
+import { STREAM_CLAMP_PX, STREAM_CLAMP_SLACK_PX } from "./stream-clamp";
 
 const IMAGE_EXTENSION_PATTERN = /\.(png|jpe?g|gif|webp|svg)(\?.*)?$/i;
 
@@ -27,7 +28,6 @@ export function isImagePath(path: string | undefined | null): boolean {
 }
 
 const TABLE_ROW_HEIGHT = 32;
-const TABLE_VIEWPORT_HEIGHT = 320;
 const TABLE_OVERSCAN = 8;
 
 const SVG_TAGS = [
@@ -539,16 +539,21 @@ function TableRenderer({ artifact }: { artifact: SessionArtifact }) {
       })
       .map(({ row }) => row);
   }, [columns, rows, sort]);
-  const start = Math.max(0, Math.floor(scrollTop / TABLE_ROW_HEIGHT) - TABLE_OVERSCAN);
-  const visibleCount = Math.ceil(TABLE_VIEWPORT_HEIGHT / TABLE_ROW_HEIGHT) + TABLE_OVERSCAN * 2;
+  // WIKI-222: tables under the shared stream threshold flow at full height in
+  // the page; only genuinely tall tables keep the virtualized scroll viewport.
+  const clamped = sortedRows.length * TABLE_ROW_HEIGHT > STREAM_CLAMP_PX + STREAM_CLAMP_SLACK_PX;
+  const start = clamped ? Math.max(0, Math.floor(scrollTop / TABLE_ROW_HEIGHT) - TABLE_OVERSCAN) : 0;
+  const visibleCount = clamped
+    ? Math.ceil(STREAM_CLAMP_PX / TABLE_ROW_HEIGHT) + TABLE_OVERSCAN * 2
+    : sortedRows.length;
   const end = Math.min(sortedRows.length, start + visibleCount);
   const visible = sortedRows.slice(start, end);
 
   return (
     <div
       className="artifact-table-scroll"
-      onScroll={(event) => setScrollTop(event.currentTarget.scrollTop)}
-      style={{ maxHeight: TABLE_VIEWPORT_HEIGHT }}
+      onScroll={clamped ? (event) => setScrollTop(event.currentTarget.scrollTop) : undefined}
+      style={clamped ? { maxHeight: STREAM_CLAMP_PX } : undefined}
     >
       <table className="artifact-table tabular-nums">
         <thead>

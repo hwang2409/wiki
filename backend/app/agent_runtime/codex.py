@@ -931,6 +931,18 @@ class CodexAppServerAdapter(ProviderAdapter):
     def events(self) -> AsyncIterator[ProviderEvent]:
         return self._event_stream()
 
+    async def drain_events(self) -> list[ProviderEvent]:
+        events: list[ProviderEvent] = []
+        while True:
+            try:
+                event = self._events.get_nowait()
+            except asyncio.QueueEmpty:
+                return events
+            if isinstance(event, _StreamEnd):
+                self._suppress_stream_end.discard(event.generation)
+                continue
+            events.append(event)
+
     async def _event_stream(self) -> AsyncIterator[ProviderEvent]:
         while True:
             event = await self._events.get()

@@ -209,6 +209,16 @@ class CodexFixtureAdapter(ProviderAdapter):
     def events(self) -> AsyncIterator[ProviderEvent]:
         return self._event_stream()
 
+    async def drain_events(self) -> list[ProviderEvent]:
+        events: list[ProviderEvent] = []
+        while True:
+            try:
+                event = self._events.get_nowait()
+            except asyncio.QueueEmpty:
+                return events
+            if event is not None:
+                events.append(event)
+
     async def archive(self) -> AdapterStatus:
         await self._emit(self.success, "thread/archive")
         self._status = AdapterStatus(
@@ -379,6 +389,16 @@ class ClaudeFixtureAdapter(ProviderAdapter):
 
     def events(self) -> AsyncIterator[ProviderEvent]:
         return self._event_stream()
+
+    async def drain_events(self) -> list[ProviderEvent]:
+        events: list[ProviderEvent] = []
+        while True:
+            try:
+                event = self._events.get_nowait()
+            except asyncio.QueueEmpty:
+                return events
+            if event is not None:
+                events.append(event)
 
     async def archive(self) -> AdapterStatus:
         self._status = AdapterStatus(

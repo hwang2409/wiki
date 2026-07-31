@@ -6,7 +6,6 @@ import ctypes
 import json
 import os
 import signal
-import shutil
 import sys
 from contextlib import contextmanager
 from pathlib import Path
@@ -113,6 +112,19 @@ def _already_swapped(intent: Path, staged: Path, live: Path) -> bool:
     return False
 
 
+def _exchange_paths(first: Path, second: Path) -> None:
+    if _rename_swap(first, second):
+        return
+    backup = second.with_name(f".{second.name}.previous.{os.getpid()}")
+    os.rename(second, backup)
+    try:
+        os.rename(first, second)
+    except Exception:
+        os.rename(backup, second)
+        raise
+    os.rename(backup, first)
+
+
 def atomic_replace(
     staged: Path,
     live: Path,
@@ -138,20 +150,44 @@ def atomic_replace(
     with _block_swap_signals():
         if not live.exists() and not live.is_symlink():
             os.rename(staged, live)
-        elif not _rename_swap(staged, live):
-            # Non-macOS fallback for tests and development environments. The
-            # old bundle is restored if the second rename fails; macOS uses
-            # the true single-operation exchange above.
-            backup = live.with_name(f".{live.name}.previous.{os.getpid()}")
-            os.rename(live, backup)
-            try:
-                os.rename(staged, live)
-            except Exception:
-                os.rename(backup, live)
-                raise
-            shutil.rmtree(backup)
+        else:
+            _exchange_paths(staged, live)
         if success_sentinel is not None:
             success_sentinel.touch()
+    return True
+
+
+def rollback_replace(
+    staged: Path,
+    live: Path,
+    success_sentinel: Path | None = None,
+    swap_intent: Path | None = None,
+) -> bool:
+    """Restore the pre-swap bundle recorded by the swap intent."""
+
+    if swap_intent is None or not swap_intent.exists():
+        raise RuntimeError("cannot roll back a swap without its intent")
+    payload = _read_intent(swap_intent)
+    if payload.get("staged") != str(staged.resolve()) or payload.get(
+        "live"
+    ) != str(live.resolve()):
+        raise RuntimeError(f"swap intent belongs to a different bundle: {swap_intent}")
+    before_staged = payload.get("staged_identity")
+    before_live = payload.get("live_identity")
+    current_staged = _identity(staged)
+    current_live = _identity(live)
+    if current_staged == before_staged and current_live == before_live:
+        return False
+    if current_live != before_staged or current_staged != before_live:
+        raise RuntimeError(
+            "swap intent does not match the current bundles; refusing an unsafe rollback"
+        )
+    if before_live is None:
+        raise RuntimeError("cannot roll back a swap that had no prior live bundle")
+    with _block_swap_signals():
+        _exchange_paths(staged, live)
+        if success_sentinel is not None:
+            success_sentinel.unlink(missing_ok=True)
     return True
 
 
@@ -185,20 +221,35 @@ if __name__ == "__main__":
         default=os.environ.get("WIKI_NATIVE_ALLOW_MISSING_APP_LOCK", "").lower()
         in {"1", "true", "yes", "on"},
     )
+    parser.add_argument(
+        "--rollback",
+        action="store_true",
+        help="restore the bundle identities recorded in --swap-intent",
+    )
     args = parser.parse_args()
     try:
         with hold_runtime_locks(
             args.runtime_dir,
             allow_missing_app_lock=args.allow_missing_app_lock,
         ):
-            already_swapped = not atomic_replace(
-                args.staged,
-                args.live,
-                args.success_sentinel,
-                args.swap_intent,
-            )
-            if already_swapped:
-                print("swap already applied; refusing to exchange the bundles again")
+            if args.rollback:
+                already_rolled_back = not rollback_replace(
+                    args.staged,
+                    args.live,
+                    args.success_sentinel,
+                    args.swap_intent,
+                )
+                if already_rolled_back:
+                    print("swap already rolled back; refusing to exchange the bundles again")
+            else:
+                already_swapped = not atomic_replace(
+                    args.staged,
+                    args.live,
+                    args.success_sentinel,
+                    args.swap_intent,
+                )
+                if already_swapped:
+                    print("swap already applied; refusing to exchange the bundles again")
     except NativeRuntimeLockError as exc:
         print(
             "REFUSING native bundle swap: "
