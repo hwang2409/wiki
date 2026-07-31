@@ -1151,7 +1151,7 @@ class WatchdogLoopTests(unittest.IsolatedAsyncioTestCase):
             self.assertIn("WIKI-15", emitted[0]["tickets"])
             self.assertEqual(emitted[0]["run_ids"], {"WIKI-15": "run-wiki-15"})
 
-    async def test_legacy_codex_pane_recovery_clears_durable_no_eligible_notice(self) -> None:
+    async def test_legacy_codex_pane_recovery_keeps_durable_no_eligible_notice(self) -> None:
         with _EnvOverride() as paths:
             (paths["accounts"] / "alpha").mkdir()
             (paths["accounts"] / "alpha" / "auth.json").write_text("{}")
@@ -1180,7 +1180,6 @@ class WatchdogLoopTests(unittest.IsolatedAsyncioTestCase):
                 mock.patch.object(accounts, "tmux_live_windows", lambda: {"@42"}),
                 mock.patch.object(accounts, "iter_workers", iter_worker_kind),
                 mock.patch.object(accounts, "tmux_capture", lambda w, lines=60: pane_text),
-                mock.patch.object(accounts, "codex_login_status", lambda: True),
                 mock.patch.object(
                     accounts, "read_state", return_value=accounts.AccountState(active="alpha")
                 ),
@@ -1201,12 +1200,11 @@ class WatchdogLoopTests(unittest.IsolatedAsyncioTestCase):
 
             self.assertEqual(
                 [event["type"] for event in emitted],
-                ["codex_limit_no_eligible", "codex_limit_cleared"],
+                ["codex_limit_no_eligible"],
             )
-            self.assertEqual(emitted[1]["ticket"], "WIKI-15")
-            self.assertEqual(store.snapshot(), [])
+            self.assertEqual(store.snapshot()[0]["tickets"], ["WIKI-15"])
 
-    async def test_legacy_codex_fleet_recovery_clears_every_affected_ticket(self) -> None:
+    async def test_legacy_codex_fleet_recovery_keeps_every_affected_ticket(self) -> None:
         with TemporaryDirectory() as tmp:
             workers = [
                 accounts.WorkerEntry(
@@ -1253,7 +1251,6 @@ class WatchdogLoopTests(unittest.IsolatedAsyncioTestCase):
                 mock.patch.object(
                     accounts, "ensure_state_initialized", side_effect=lambda state: state
                 ),
-                mock.patch.object(accounts, "codex_login_status", return_value=True),
                 mock.patch.object(
                     accounts,
                     "rotate_locked",
@@ -1275,15 +1272,11 @@ class WatchdogLoopTests(unittest.IsolatedAsyncioTestCase):
 
             self.assertEqual(
                 [event["type"] for event in emitted],
-                ["codex_limit_no_eligible", "codex_limit_cleared", "codex_limit_cleared"],
+                ["codex_limit_no_eligible"],
             )
-            self.assertEqual(
-                {event["ticket"] for event in emitted[1:]},
-                {"WIKI-15", "WIKI-16"},
-            )
-            self.assertEqual(store.snapshot(), [])
+            self.assertEqual(store.snapshot()[0]["tickets"], ["WIKI-15", "WIKI-16"])
 
-    async def test_legacy_codex_scrolled_banner_needs_positive_health(self) -> None:
+    async def test_legacy_codex_scrolled_banner_needs_quota_capable_proof(self) -> None:
         with TemporaryDirectory() as tmp:
             store = AccountNoticeStore(path=Path(tmp) / "notices.json")
             worker = accounts.WorkerEntry(
@@ -1309,7 +1302,7 @@ class WatchdogLoopTests(unittest.IsolatedAsyncioTestCase):
                 accounts, "tmux_live_windows", return_value={"@47"}
             ), mock.patch.object(accounts, "iter_workers", side_effect=iter_worker_kind), mock.patch.object(
                 accounts, "tmux_capture", side_effect=lambda window, lines=60: pane
-            ), mock.patch.object(accounts, "codex_login_status", return_value=False), mock.patch.object(
+            ), mock.patch.object(accounts, "codex_login_status", return_value=True), mock.patch.object(
                 accounts, "read_state", return_value=accounts.AccountState()
             ), mock.patch.object(accounts, "ensure_state_initialized", side_effect=lambda state: state), mock.patch.object(
                 accounts,
@@ -1320,14 +1313,14 @@ class WatchdogLoopTests(unittest.IsolatedAsyncioTestCase):
                 await accounts._check_once(watch, emit)
                 self.assertEqual([event["type"] for event in emitted], ["codex_limit_no_eligible"])
 
-                # A redraw hides the banner, but the provider health probe stays negative.
+                # A redraw hides the banner, but no quota-capable proof exists.
                 pane = "old output scrolled above the visible terminal"
                 await accounts._check_once(watch, emit)
 
             self.assertEqual([event["type"] for event in emitted], ["codex_limit_no_eligible"])
             self.assertEqual(store.snapshot()[0]["tickets"], ["WIKI-17"])
 
-    async def test_legacy_codex_recovery_restores_after_restart_and_window_gap(self) -> None:
+    async def test_legacy_codex_recovery_restores_tracking_after_restart_and_window_gap(self) -> None:
         for notice_type in ("codex_limit_no_eligible", "codex_rotation_failed"):
             with TemporaryDirectory() as tmp:
                 store = AccountNoticeStore(path=Path(tmp) / "notices.json")
@@ -1364,7 +1357,7 @@ class WatchdogLoopTests(unittest.IsolatedAsyncioTestCase):
                     accounts, "tmux_live_windows", lambda: live_windows
                 ), mock.patch.object(accounts, "iter_workers", iter_worker_kind), mock.patch.object(
                     accounts, "tmux_capture", lambda window, lines=60: "> working"
-                ), mock.patch.object(accounts, "codex_login_status", lambda: True):
+                ):
                     # A fresh watchdog starts while the legacy window is absent.
                     # Durable tracking must survive that temporary gap.
                     watch = accounts.WatchdogInternalState()
@@ -1374,8 +1367,8 @@ class WatchdogLoopTests(unittest.IsolatedAsyncioTestCase):
                     live_windows.add("@42")
                     await accounts._check_once(watch, emit)
 
-                self.assertEqual([event["ticket"] for event in emitted], ["WIKI-15"])
-                self.assertEqual(store.snapshot(), [])
+                self.assertEqual(emitted, [])
+                self.assertEqual(store.snapshot()[0]["tickets"], ["WIKI-15"])
 
     async def test_no_eligible_lists_every_live_codex_worker(self) -> None:
         workers = [
@@ -1569,7 +1562,7 @@ class WatchdogLoopTests(unittest.IsolatedAsyncioTestCase):
         self.assertNotIn(("WIKI-15", "@44"), watch.claude_limited)
         self.assertNotIn(("WIKI-15", "@44"), watch.last_alert_at)
 
-    async def test_claude_limit_cleared_emitted_when_banner_leaves_pane(self) -> None:
+    async def test_claude_limit_banner_redraw_keeps_notice_without_provider_proof(self) -> None:
         with _EnvOverride() as paths:
             (paths["accounts"] / "alpha").mkdir()
             (paths["accounts"] / "alpha" / "auth.json").write_text("{}")
@@ -1588,10 +1581,12 @@ class WatchdogLoopTests(unittest.IsolatedAsyncioTestCase):
                 }
             }))
 
+            store = AccountNoticeStore(path=paths["root"] / "notices.json")
             emitted: list[dict] = []
 
             async def emit(evt: dict) -> None:
                 emitted.append(evt)
+                store.apply_event(evt)
 
             watch = accounts.WatchdogInternalState()
             pane_text = CLAUDE_LIMIT_STRING
@@ -1600,14 +1595,13 @@ class WatchdogLoopTests(unittest.IsolatedAsyncioTestCase):
                 await accounts._check_once(watch, emit)
                 # Still limited on the next poll: no duplicate events.
                 await accounts._check_once(watch, emit)
-                pane_text = "> working on the next step"
+                # The banner leaves the pane, but the next provider request
+                # still reports the limit. Pane absence is not proof.
+                pane_text = "provider request failed: Claude usage limit reached"
                 await accounts._check_once(watch, emit)
 
-            self.assertEqual(
-                [evt["type"] for evt in emitted],
-                ["claude_limit_hit", "claude_limit_cleared"],
-            )
-            self.assertEqual(emitted[1]["ticket"], "WIKI-15")
+            self.assertEqual([evt["type"] for evt in emitted], ["claude_limit_hit"])
+            self.assertEqual(store.snapshot()[0]["ticket"], "WIKI-15")
 
 
 REAL_AUTH_DEAD_STRING = (

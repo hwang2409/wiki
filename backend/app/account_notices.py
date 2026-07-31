@@ -249,8 +249,11 @@ class AccountNoticeStore:
 
     def _persist(self) -> None:
         try:
-            self._path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
-            self._path.parent.chmod(0o700)
+            parent = self._path.parent
+            parent_existed = parent.is_dir()
+            parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+            if not parent_existed:
+                parent.chmod(0o700)
             tmp = self._path.with_name(f"{self._path.name}.{os.getpid()}.tmp")
             fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
             try:
@@ -569,12 +572,18 @@ class AccountNoticeStore:
             if isinstance(ticket, str) and ticket:
                 set_notice(f"claude:limit:{ticket}", dict(event))
         elif kind == "claude_limit_cleared":
-            # The only Claude recovery proof: the watchdog observed the limit
-            # banner gone from a previously limited worker. Generic session
-            # events (queue edits, model changes) must never resolve limits.
+            # A scoped provider result proves recovery for the same worker.
+            # Legacy events without run_id remain available for explicit
+            # operator resolution of legacy notices.
             ticket = event.get("ticket")
             if isinstance(ticket, str) and ticket:
-                clear(f"claude:limit:{ticket}")
+                key = f"claude:limit:{ticket}"
+                notice = self._notices.get(key)
+                if notice is not None:
+                    stored_run_id = notice.get("run_id")
+                    recovery_run_id = event.get("run_id")
+                    if stored_run_id is None or stored_run_id == recovery_run_id:
+                        clear(key)
 
         return changed
 

@@ -970,6 +970,25 @@ Preserve the same identity, role, worktree, orchestrator grouping, PR gates, and
                 prior_state=prior.state,
                 record=record,
             )
+        if (
+            event.provider is ProviderKind.CLAUDE
+            and event.direction != "stdin"
+            and accounts.claude_turn_succeeded(event.payload)
+            and run_id in self.last_limit_alert_at
+        ):
+            # A successful Claude result is a provider response from this
+            # run. Pane redraws and generic session events are not proof.
+            self.last_limit_alert_at.pop(run_id, None)
+            await self._publish(
+                {
+                    "type": "claude_limit_cleared",
+                    "provider": "claude",
+                    "ticket": record.agent_id,
+                    "run_id": run_id,
+                    "window": "",
+                    "ts": datetime.now(timezone.utc).isoformat(),
+                }
+            )
 
         if schedule_monitor_actions and (
             record.state is LifecycleState.IDLE

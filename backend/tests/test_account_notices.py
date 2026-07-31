@@ -64,6 +64,25 @@ def test_notice_store_files_are_private_on_create_and_replace(tmp_path: Path) ->
         os.umask(previous_umask)
 
 
+def test_notice_store_preserves_existing_override_parent_mode(tmp_path: Path) -> None:
+    parent = tmp_path / "caller-owned"
+    parent.mkdir(mode=0o755)
+    path = parent / "notices.json"
+
+    store = AccountNoticeStore(path=path)
+    store.apply_event(
+        {
+            "type": "codex_limit_no_eligible",
+            "tickets": ["WIKI-1"],
+            "reset_at": None,
+            "ts": "t1",
+        }
+    )
+
+    assert stat.S_IMODE(parent.stat().st_mode) == 0o755
+    assert stat.S_IMODE(path.stat().st_mode) == 0o600
+
+
 def test_many_notices_are_all_retained(tmp_path: Path) -> None:
     store = _store(tmp_path)
     tickets = [f"WIKI-{index}" for index in range(7)]
@@ -460,6 +479,41 @@ def test_claude_limit_cleared_resolves_only_its_ticket(tmp_path: Path) -> None:
     store.apply_event({"type": "claude_limit_cleared", "ticket": "WIKI-4", "window": "@2", "ts": "t3"})
     remaining = store.snapshot()
     assert [entry["ticket"] for entry in remaining] == ["WIKI-5"]
+
+
+def test_claude_limit_cleared_requires_matching_run_id(tmp_path: Path) -> None:
+    store = _store(tmp_path)
+    store.apply_event(
+        {
+            "type": "claude_limit_hit",
+            "ticket": "WIKI-4",
+            "run_id": "run-new",
+            "window": "",
+            "ts": "t1",
+        }
+    )
+
+    store.apply_event(
+        {
+            "type": "claude_limit_cleared",
+            "ticket": "WIKI-4",
+            "run_id": "run-old",
+            "window": "",
+            "ts": "t2",
+        }
+    )
+    assert _by_type(store, "claude_limit_hit")["run_id"] == "run-new"
+
+    store.apply_event(
+        {
+            "type": "claude_limit_cleared",
+            "ticket": "WIKI-4",
+            "run_id": "run-new",
+            "window": "",
+            "ts": "t3",
+        }
+    )
+    assert store.snapshot() == []
 
 
 def test_malformed_and_irrelevant_events_are_ignored(tmp_path: Path) -> None:

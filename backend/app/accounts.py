@@ -178,6 +178,17 @@ def detect_claude_limit(pane: str) -> bool:
     return bool(pane and CLAUDE_LIMIT_PATTERN.search(pane))
 
 
+def claude_turn_succeeded(payload: object) -> bool:
+    """True only for a successful provider result, not terminal redraw text."""
+
+    return (
+        isinstance(payload, dict)
+        and payload.get("type") == "result"
+        and payload.get("subtype") == "success"
+        and payload.get("is_error") is False
+    )
+
+
 def detect_codex_auth_dead(pane: str) -> bool:
     """True when codex's stale-refresh-token error is on-screen. Auth-dead is
     NOT a limit hit — the process just needs to be revived onto the current
@@ -1502,9 +1513,9 @@ class WatchdogInternalState:
     # broken token loops kill+resume every poll cycle forever.
     auth_dead_attempts: dict[str, list[float]] = field(default_factory=dict)
     auth_dead_alert_at: dict[str, float] = field(default_factory=dict)
-    # Tickets whose pane currently shows the Claude usage-limit banner. When
-    # the banner leaves the pane on a later poll, the watchdog emits
-    # claude_limit_cleared — the recovery proof that resolves the notice.
+    # Tickets whose pane currently shows the Claude usage-limit banner. Pane
+    # redraws are not recovery proof, so these notices clear only after a
+    # successful provider result from the headless supervisor.
     claude_limited: set[tuple[str, str]] = field(default_factory=set)
     # Legacy Codex panes have no run_id. Track every ticket named by a fleet
     # notice, with its current window. Ticket scope survives window changes.
@@ -1563,7 +1574,6 @@ async def _check_once(
         for worker in codex_workers
         if worker.window in live and not worker.run_id
     }
-    codex_recovered: list[WorkerEntry] = []
     auth_dead: list[WorkerEntry] = []
     for worker in codex_workers:
         if worker.window not in live:
@@ -1576,28 +1586,10 @@ async def _check_once(
                 if worker.ticket in watch.codex_limited:
                     watch.codex_limited[worker.ticket] = worker.window
         else:
-            if (
-                not worker.run_id
-                and watch.codex_limited.get(worker.ticket) in {"", worker.window}
-                and await asyncio.to_thread(codex_login_status)
-            ):
-                # A pane redraw is not recovery proof. The current legacy
-                # window must be tracked or follow a temporary window gap.
-                # The provider auth probe must also succeed before clearing
-                # a fleet notice.
-                watch.codex_limited.pop(worker.ticket, None)
-                codex_recovered.append(worker)
+            # Legacy tmux transport has no quota-capable provider response.
+            # Keep the notice until rotation, replacement, or operator action.
             if detect_codex_auth_dead(pane):
                 auth_dead.append(worker)
-
-    for worker in codex_recovered:
-        await emit({
-            "type": "codex_limit_cleared",
-            "provider": "codex",
-            "ticket": worker.ticket,
-            "window": worker.window,
-            "ts": datetime.now(timezone.utc).isoformat(),
-        })
 
     # Auth-dead workers get killed + resumed on the CURRENT auth.json — no
     # account swap, so no debounce interaction with the rotation loop below.
@@ -1680,16 +1672,10 @@ async def _check_once(
                 "ts": datetime.now(timezone.utc).isoformat(),
             })
         elif identity in watch.claude_limited:
-            # The limit banner left the pane of a previously limited worker:
-            # the only observable proof that this worker can make progress.
-            watch.claude_limited.discard(identity)
+            # A redraw can hide the banner while the next provider request is
+            # still rate-limited. Legacy tmux has no positive recovery proof.
+            # Keep the notice, but permit a later banner to re-alert.
             watch.last_alert_at.pop(identity, None)
-            await emit({
-                "type": "claude_limit_cleared",
-                "ticket": worker.ticket,
-                "window": worker.window,
-                "ts": datetime.now(timezone.utc).isoformat(),
-            })
 
     if not codex_hits:
         return
