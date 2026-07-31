@@ -1,10 +1,31 @@
 // @vitest-environment jsdom
-import { cleanup, fireEvent, render, screen } from "@testing-library/react";
+import { cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react";
 import { afterEach, beforeAll, describe, expect, test, vi } from "vitest";
 
 import type { SessionEvent } from "../src/api";
 import { ArtifactBlock } from "../src/artifact-block";
 import { VisualDiffRenderer } from "../src/visual-diff-renderer";
+
+// Every ImmediateImage src is tagged so the mock canvas can hand back the
+// distinct pixel buffer that corresponds to that variant.
+const IMAGE_PIXELS = new WeakMap<object, Uint8ClampedArray>();
+
+function solidPixels(width: number, height: number, rgba: [number, number, number, number]): Uint8ClampedArray {
+  const buffer = new Uint8ClampedArray(width * height * 4);
+  for (let i = 0; i < buffer.length; i += 4) {
+    buffer[i] = rgba[0];
+    buffer[i + 1] = rgba[1];
+    buffer[i + 2] = rgba[2];
+    buffer[i + 3] = rgba[3];
+  }
+  return buffer;
+}
+
+const BEFORE_PIXELS = solidPixels(12, 8, [0, 0, 0, 255]);
+// Every after-pixel changes clearly (bright red) so computePixelDiff paints
+// the whole overlay — asserting that pixel data really flowed through the
+// draw / getImageData / diff / putImageData pipeline in jsdom.
+const AFTER_PIXELS = solidPixels(12, 8, [255, 0, 0, 255]);
 
 class ImmediateImage {
   onload: (() => void) | null = null;
@@ -19,15 +40,59 @@ class ImmediateImage {
   }
   set src(value: string) {
     this.#src = value;
+    if (value.includes("variant=before")) IMAGE_PIXELS.set(this, BEFORE_PIXELS);
+    else if (value.includes("variant=after")) IMAGE_PIXELS.set(this, AFTER_PIXELS);
     queueMicrotask(() => this.onload?.());
   }
 }
 
+type PutRecord = { width: number; height: number; alphaCount: number };
+
+const PUT_CALLS: PutRecord[] = [];
+
+function installCanvasMock() {
+  HTMLCanvasElement.prototype.getContext = function (kind: string) {
+    if (kind !== "2d") return null;
+    let currentImage: object | null = null;
+    return {
+      drawImage(image: object, _dx: number, _dy: number, _dw?: number, _dh?: number) {
+        currentImage = image;
+      },
+      getImageData(_x: number, _y: number, width: number, height: number) {
+        const src = currentImage && IMAGE_PIXELS.get(currentImage);
+        const data = new Uint8ClampedArray(width * height * 4);
+        if (src) {
+          // ImmediateImage claims 12x8 for both variants, matching the
+          // pre-baked buffers. Any getImageData at that size returns them
+          // verbatim; anything else returns zeros (never exercised here).
+          if (src.length === data.length) data.set(src);
+        }
+        return { data, width, height, colorSpace: "srgb" as const };
+      },
+      createImageData(width: number, height: number) {
+        return { data: new Uint8ClampedArray(width * height * 4), width, height, colorSpace: "srgb" as const };
+      },
+      putImageData(imageData: { data: Uint8ClampedArray; width: number; height: number }) {
+        let alphaCount = 0;
+        for (let i = 3; i < imageData.data.length; i += 4) {
+          if (imageData.data[i] > 0) alphaCount += 1;
+        }
+        PUT_CALLS.push({ width: imageData.width, height: imageData.height, alphaCount });
+      },
+      clearRect() {},
+    } as unknown as CanvasRenderingContext2D;
+  } as unknown as HTMLCanvasElement["getContext"];
+}
+
 beforeAll(() => {
   (globalThis as { Image?: unknown }).Image = ImmediateImage;
+  installCanvasMock();
 });
 
-afterEach(() => cleanup());
+afterEach(() => {
+  cleanup();
+  PUT_CALLS.length = 0;
+});
 
 function visualDiffEvent(): SessionEvent {
   return {
@@ -70,17 +135,40 @@ describe("visual-diff renderer", () => {
     expect(afterImage.style.opacity).toBe("0");
   });
 
-  test("pixel-diff toggle turns the overlay canvas on and off", async () => {
+  test("pixel-diff toggle drives the draw / diff / overlay / percentage pipeline", async () => {
     render(<VisualDiffRenderer artifact={visualDiffEvent().artifact!} event={visualDiffEvent()} ticket="WIKI-193" />);
     await screen.findByAltText("Login form");
     const toggle = screen.getByRole("button", { name: /pixel diff/i });
     expect(toggle.getAttribute("aria-pressed")).toBe("false");
+    expect(PUT_CALLS.length).toBe(0);
 
     fireEvent.click(toggle);
     expect(toggle.getAttribute("aria-pressed")).toBe("true");
 
+    // The diff effect runs after the click; wait for the overlay put to land.
+    await waitFor(() => expect(PUT_CALLS.length).toBeGreaterThan(0));
+
+    // Every put pushed through the pipeline sits at the bounded diff size
+    // (12x8 in this test), which matches the natural size — the buffer was
+    // real ImageData shaped correctly for the source, not a shape-only stub.
+    const put = PUT_CALLS[PUT_CALLS.length - 1];
+    expect(put.width).toBe(12);
+    expect(put.height).toBe(8);
+    // The AFTER pixels are pure red on a black BEFORE — every pixel changes,
+    // so the overlay is fully painted (alpha > 0 across the full buffer).
+    expect(put.alphaCount).toBe(12 * 8);
+
+    // Percentage readout renders inside the toggle only after the diff
+    // completes without an overlay error.
+    await waitFor(() => expect(toggle.textContent ?? "").toMatch(/100%/));
+
+    // No overlay error surfaced — the pipeline succeeded end-to-end.
+    expect(screen.queryByRole("status")).toBeNull();
+
     fireEvent.click(toggle);
     expect(toggle.getAttribute("aria-pressed")).toBe("false");
+    // Percentage disappears once the toggle turns off.
+    await waitFor(() => expect(toggle.textContent ?? "").not.toMatch(/%/));
   });
 
   test("readOnly hides the slider and toggle", async () => {

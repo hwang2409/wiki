@@ -32,7 +32,7 @@ from copy import deepcopy
 from datetime import datetime, timedelta, timezone
 from pathlib import Path, PurePosixPath
 
-from .image_scrub import ImageScrubError, probe_dimensions
+from .image_scrub import ImageScrubError, probe_normalized_dimensions
 from .wiki_artifacts import (
     ArtifactValidationError,
     IMAGE_TYPES,
@@ -694,7 +694,11 @@ def _artifact_from_structured_result(meta: dict, output: str) -> dict | None:
             except (binascii.Error, ValueError):
                 return None
             try:
-                width, height = probe_dimensions(data, mime)
+                # Match scrub_image: EXIF orientation is baked into pixels at
+                # write time, so the fallback must report the *stored* size,
+                # not the raw header size. A 120x80 Orientation=6 JPEG stores
+                # as 80x120 and must render in a portrait stage.
+                width, height = probe_normalized_dimensions(data, mime)
             except ImageScrubError:
                 return None
             variants[variant] = {

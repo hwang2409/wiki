@@ -62,6 +62,28 @@ def probe_dimensions(data: bytes, mime: str) -> tuple[int, int]:
     raise ImageScrubError(f"unsupported mime: {mime}")
 
 
+_ORIENTATION_SWAPS: Final = {5, 6, 7, 8}
+
+
+def probe_normalized_dimensions(data: bytes, mime: str) -> tuple[int, int]:
+    """Header-probed dimensions with EXIF orientation applied — the (width,
+    height) a viewer sees after scrub_image bakes rotation into the pixels.
+
+    Kept header-only so callers can query dimensions without allocating pixel
+    memory for a 40MP source."""
+    width, height = probe_dimensions(data, mime)
+    probe = _ORIENTATION_PROBES.get(mime)
+    orientation = 1
+    if probe is not None:
+        try:
+            orientation = probe(data)
+        except (struct.error, ValueError, IndexError):
+            orientation = 1
+    if orientation in _ORIENTATION_SWAPS:
+        return height, width
+    return width, height
+
+
 def _probe_png(data: bytes) -> tuple[int, int]:
     if len(data) < 24 or data[:8] != _PNG_SIGNATURE or data[12:16] != b"IHDR":
         raise ImageScrubError("PNG payload missing IHDR")
