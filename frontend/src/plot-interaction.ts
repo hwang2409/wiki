@@ -117,6 +117,64 @@ function encodingField(encoding: Record<string, unknown> | null, channel: ZoomCh
   return typeof def?.field === "string" ? def.field : null;
 }
 
+// Ports Vega-Lite / vega-util's field-path parser: split "a.b" into ["a","b"],
+// "a\\.b" into ["a.b"], "a[0]" into ["a","0"], and "a[0].b" into ["a","0","b"].
+// Inlined so the module stays clear of a runtime vega-util dep (this module is
+// eagerly imported and vega-util would bloat the initial chunk).
+function splitFieldPath(path: string): string[] {
+  const out: string[] = [];
+  const n = path.length;
+  let quote: string | null = null;
+  let bracket = 0;
+  let escaped = "";
+  let i = 0;
+  let j = 0;
+  function push(): void {
+    out.push(escaped + path.substring(i, j));
+    escaped = "";
+    i = j + 1;
+  }
+  for (i = j = 0; j < n; j += 1) {
+    const c = path[j];
+    if (c === "\\") {
+      escaped += path.substring(i, j);
+      j += 1;
+      i = j;
+    } else if (c === quote) {
+      push();
+      quote = null;
+      bracket = -1;
+    } else if (quote) {
+      continue;
+    } else if (i === bracket && (c === '"' || c === "'")) {
+      i = j + 1;
+      quote = c;
+    } else if (c === "." && !bracket) {
+      if (j > i) push();
+      else i = j + 1;
+    } else if (c === "[") {
+      if (j > i) push();
+      bracket = i = j + 1;
+    } else if (c === "]") {
+      if (bracket > 0) push();
+      bracket = 0;
+      i = j + 1;
+    }
+  }
+  if (j > i) {
+    j += 1;
+    push();
+  }
+  return out;
+}
+
+// Builds a Vega expression that reads the given Vega-Lite field path from
+// `datum`. Bracketed with quoted strings so nested (a.b), escaped literal
+// (a\.b), and array-index (a[0]) paths all resolve to the correct value.
+function accessExpression(path: string): string {
+  return "datum" + splitFieldPath(path).map((segment) => `[${JSON.stringify(segment)}]`).join("");
+}
+
 export function buildInteractiveSpec(
   spec: VegaLiteSpec,
   options: {
@@ -154,21 +212,33 @@ export function buildInteractiveSpec(
   ) {
     const originalField = encodingField(encoding, "x")!;
     const priorTransform = Array.isArray(next.transform) ? next.transform : [];
+    // accessExpression handles nested (a.b), array-index (a[0]), and
+    // escaped-dot (a\.b) field paths — a literal datum[originalField] would
+    // fail for those, the aliased value would be undefined for every row,
+    // and Vega would drop the data so the plot renders empty.
     next.transform = [
       ...priorTransform,
-      { calculate: `datum[${JSON.stringify(originalField)}]`, as: Y_ALIAS_FIELD },
+      { calculate: accessExpression(originalField), as: Y_ALIAS_FIELD },
     ];
     const yDef = asRecord(encoding.y)!;
-    const yAxis = asRecord(yDef.axis);
-    encoding.y = {
-      ...yDef,
-      field: Y_ALIAS_FIELD,
-      // Preserve the visible axis title — without this it would default to
-      // the synthetic alias name and leak the workaround to the user.
-      axis: yAxis && "title" in yAxis
-        ? yAxis
-        : { ...(yAxis ?? {}), title: originalField },
-    };
+    if (yDef.axis === null) {
+      // Author explicitly hid the axis (axis:null). Do NOT materialize an
+      // axis object here — that would reveal it and leak the workaround.
+      encoding.y = { ...yDef, field: Y_ALIAS_FIELD };
+    } else {
+      // Title precedence: existing axis.title > encoding-level title > raw
+      // field name. Only add axis.title when neither source already provides
+      // a label; otherwise the alias field name would leak to the user.
+      const yAxis = asRecord(yDef.axis);
+      const hasAxisTitle = yAxis !== null && "title" in yAxis;
+      const hasEncodingTitle = "title" in yDef;
+      const nextAxis = hasAxisTitle || hasEncodingTitle
+        ? (yAxis ?? undefined)
+        : { ...(yAxis ?? {}), title: originalField };
+      encoding.y = nextAxis === undefined
+        ? { ...yDef, field: Y_ALIAS_FIELD }
+        : { ...yDef, field: Y_ALIAS_FIELD, axis: nextAxis };
+    }
   }
 
   if (encoding && domains) {

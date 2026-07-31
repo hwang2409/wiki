@@ -303,6 +303,137 @@ test("runtime: same-field-both-axes brush yields two channel extents on the comp
   await view.finalize();
 });
 
+test("runtime: same-field a[0] aliasing produces real domains (array-index paths)", async () => {
+  // Reviewer regression: a literal datum["a[0]"] in the alias calculate
+  // returns undefined, Vega drops every row, and the resulting scale
+  // domains are [NaN, NaN]. Correct splitFieldPath yields datum["a"]["0"]
+  // and the rows survive.
+  const interactive = transform({
+    mark: "point",
+    width: 400,
+    height: 200,
+    data: { values: [{ a: [5, 6] }, { a: [7, 8] }, { a: [10, 3] }] },
+    encoding: {
+      x: { field: "a[0]", type: "quantitative" },
+      y: { field: "a[0]", type: "quantitative" },
+    },
+  });
+  const compiled = compile(interactive as never).spec;
+  const view = new View(parse(compiled), { renderer: "none" as never });
+  await view.runAsync();
+  const rows = view.data("source_0") as unknown[];
+  assert.ok(rows.length > 0, "aliased rows must survive the calculate transform");
+  const xDomain = view.scale("x").domain() as [number, number];
+  const yDomain = view.scale("y").domain() as [number, number];
+  assert.ok(Number.isFinite(xDomain[0]) && Number.isFinite(xDomain[1]), "x domain must be numeric");
+  assert.ok(Number.isFinite(yDomain[0]) && Number.isFinite(yDomain[1]), "y domain must be numeric");
+  await view.finalize();
+});
+
+test("runtime: same-field escaped-dot aliasing (literal `a.b` key) produces real domains", async () => {
+  // The field name is the literal key "a.b" on the datum, not nested a→b.
+  // Vega-Lite writes that as `a\\.b`. accessExpression must yield
+  // datum["a.b"] rather than datum["a"]["b"] (which would be undefined here).
+  const interactive = transform({
+    mark: "point",
+    width: 400,
+    height: 200,
+    data: { values: [{ "a.b": 5 }, { "a.b": 8 }, { "a.b": 12 }] },
+    encoding: {
+      x: { field: "a\\.b", type: "quantitative" },
+      y: { field: "a\\.b", type: "quantitative" },
+    },
+  });
+  const compiled = compile(interactive as never).spec;
+  const view = new View(parse(compiled), { renderer: "none" as never });
+  await view.runAsync();
+  const xDomain = view.scale("x").domain() as [number, number];
+  const yDomain = view.scale("y").domain() as [number, number];
+  assert.ok(Number.isFinite(xDomain[0]) && Number.isFinite(xDomain[1]), "escaped-dot x domain must be numeric");
+  assert.ok(Number.isFinite(yDomain[0]) && Number.isFinite(yDomain[1]), "escaped-dot y domain must be numeric");
+  await view.finalize();
+});
+
+test("compile: same-field alias preserves axis:null (hidden axes stay hidden)", () => {
+  // Reviewer regression: rewrite must not materialize an axis object where
+  // the author explicitly set axis:null — that would reveal an axis the
+  // author hid, exposing the workaround visually.
+  const interactive = transform({
+    mark: "point",
+    data: { values: [{ v: 0 }, { v: 10 }] },
+    encoding: {
+      x: { field: "v", type: "quantitative" },
+      y: { field: "v", type: "quantitative", axis: null },
+    },
+  }) as Record<string, unknown>;
+  const yEncoding = (interactive.encoding as Record<string, unknown>).y as Record<string, unknown>;
+  assert.strictEqual(yEncoding.axis, null, "axis:null must survive the alias rewrite");
+  assert.equal(yEncoding.field, "__wiki_plot_y_axis__", "field was still aliased");
+});
+
+test("compile: same-field alias preserves an encoding-level custom title", () => {
+  // Reviewer regression: an encoding-level `title` must not be overridden by
+  // an injected `axis.title` of the raw field name. Precedence: existing
+  // axis title > encoding title > raw field name.
+  const interactive = transform({
+    mark: "point",
+    data: { values: [{ v: 0 }, { v: 10 }] },
+    encoding: {
+      x: { field: "v", type: "quantitative" },
+      y: { field: "v", type: "quantitative", title: "Custom Label" },
+    },
+  }) as Record<string, unknown>;
+  const yEncoding = (interactive.encoding as Record<string, unknown>).y as Record<string, unknown>;
+  assert.equal(yEncoding.title, "Custom Label", "encoding title must survive");
+  // No axis was materialized because the encoding title already provides one.
+  assert.equal(yEncoding.axis, undefined, "no axis object added when encoding title exists");
+});
+
+test("compile: same-field alias preserves an existing axis.title", () => {
+  const interactive = transform({
+    mark: "point",
+    data: { values: [{ v: 0 }, { v: 10 }] },
+    encoding: {
+      x: { field: "v", type: "quantitative" },
+      y: { field: "v", type: "quantitative", axis: { title: "Y Axis" } },
+    },
+  }) as Record<string, unknown>;
+  const yEncoding = (interactive.encoding as Record<string, unknown>).y as Record<string, unknown>;
+  const yAxis = yEncoding.axis as Record<string, unknown>;
+  assert.equal(yAxis.title, "Y Axis", "existing axis.title must survive unchanged");
+});
+
+test("compile: same-field alias defaults axis.title to the original field name when none is set", () => {
+  const interactive = transform({
+    mark: "point",
+    data: { values: [{ v: 0 }, { v: 10 }] },
+    encoding: {
+      x: { field: "v", type: "quantitative" },
+      y: { field: "v", type: "quantitative" },
+    },
+  }) as Record<string, unknown>;
+  const yEncoding = (interactive.encoding as Record<string, unknown>).y as Record<string, unknown>;
+  const yAxis = yEncoding.axis as Record<string, unknown>;
+  // Original field name shown, not the synthetic alias.
+  assert.equal(yAxis.title, "v");
+});
+
+test("compile: same-field alias preserves unrelated axis config while adding a title", () => {
+  const interactive = transform({
+    mark: "point",
+    data: { values: [{ v: 0 }, { v: 10 }] },
+    encoding: {
+      x: { field: "v", type: "quantitative" },
+      y: { field: "v", type: "quantitative", axis: { grid: false, labelAngle: 45 } },
+    },
+  }) as Record<string, unknown>;
+  const yEncoding = (interactive.encoding as Record<string, unknown>).y as Record<string, unknown>;
+  const yAxis = yEncoding.axis as Record<string, unknown>;
+  assert.equal(yAxis.grid, false);
+  assert.equal(yAxis.labelAngle, 45);
+  assert.equal(yAxis.title, "v", "title added because none was set on axis or encoding");
+});
+
 test("compile: composite marks (boxplot/errorbar/errorband) never enter full mode", () => {
   for (const mark of ["boxplot", "errorbar", "errorband"] as const) {
     const spec = {
