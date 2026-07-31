@@ -235,7 +235,7 @@ def _rbsp_escape(rbsp: bytes) -> bytes:
 _HIGH_PROFILES = frozenset({
     44, 83, 86, 100, 110, 118, 122, 128, 134, 135, 138, 139, 144, 244,
 })
-_SUPPORTED_PROFILES = frozenset({66, 77}) | _HIGH_PROFILES
+_SUPPORTED_PROFILES = frozenset({66, 77, 88}) | _HIGH_PROFILES
 
 
 def _copy_scaling_list(reader: _BitReader, writer: _BitWriter, size: int) -> None:

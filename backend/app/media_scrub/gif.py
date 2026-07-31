@@ -145,7 +145,9 @@ def scrub_gif(data: bytes) -> MediaScrubResult:
     # contains no metadata surface (colour entries only). It's byte-copied
     # here because the palette is what image_data indexes into; changing
     # any byte would corrupt the pixels.
-    out = bytearray(header)
+    # The canonical loop extension below is a GIF89a Application Extension.
+    # Normalize every accepted output to the matching version header.
+    out = bytearray(_GIF_HEADER89)
     out.extend(struct.pack("<HH", width, height))
     out.append(canonical_packed)
     out.append(canonical_background_color_index)

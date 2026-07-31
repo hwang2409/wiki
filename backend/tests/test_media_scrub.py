@@ -1819,11 +1819,41 @@ class GifRound7ExtensionProbes(unittest.TestCase):
         frame = self._min_gif_image_data()[:-1]
         payload = self._min_gif_prefix() + frame + frame + b"\x3b"
         result = media_scrub.scrub_video(payload, "image/gif")
+        self.assertEqual(result.data[:6], b"GIF89a")
         self.assertEqual(result.data.count(b"NETSCAPE2.0"), 1)
         loop_pos = result.data.find(b"NETSCAPE2.0")
         self.assertEqual(
             struct.unpack("<H", result.data[loop_pos + 13:loop_pos + 15])[0], 0,
         )
+
+    @unittest.skipIf(FFMPEG is None, "ffmpeg not installed")
+    def test_animated_gif87a_normalizes_to_gif89a_and_decodes(self) -> None:
+        prefix = (
+            b"GIF87a" + struct.pack("<HH", 1, 1) + b"\x80\x00\x00"
+            + b"\x00\x00\x00\xff\xff\xff"
+        )
+        frame = b"\x2c" + struct.pack("<HHHH", 0, 0, 1, 1) + b"\x00"
+        frame += b"\x02\x02\x44\x01\x00"
+        payload = prefix + frame + frame + b"\x3b"
+        result = media_scrub.scrub_video(payload, "image/gif")
+        self.assertEqual(result.data[:6], b"GIF89a")
+        self.assertEqual(result.data.count(b"NETSCAPE2.0"), 1)
+        loop_pos = result.data.find(b"NETSCAPE2.0")
+        self.assertEqual(
+            struct.unpack("<H", result.data[loop_pos + 13:loop_pos + 15])[0], 0,
+        )
+        with tempfile.NamedTemporaryFile(suffix=".gif", delete=False) as handle:
+            handle.write(result.data)
+            path = handle.name
+        try:
+            probe = subprocess.run(
+                [FFMPEG, "-v", "error", "-i", path, "-f", "null", "-"],
+                capture_output=True,
+                timeout=30,
+            )
+            self.assertEqual(probe.returncode, 0, probe.stderr.decode(errors="replace"))
+        finally:
+            Path(path).unlink(missing_ok=True)
 
 
 class Mp4Round8SurvivorProbes(unittest.TestCase):
@@ -4662,20 +4692,24 @@ class Review39H264ProfileAndHeaderTests(unittest.TestCase):
 
     @unittest.skipIf(FFMPEG is None, "ffmpeg not installed")
     def test_baseline_main_and_high_profiles_decode(self) -> None:
-        for profile in ("baseline", "main", "high"):
+        for profile in ("baseline", "main", "extended", "high"):
             with self.subTest(profile=profile):
                 source = Path(tempfile.mkdtemp(prefix=f"wiki39-{profile}-")) / "source.mp4"
+                encoder_profile = "baseline" if profile == "extended" else profile
                 generated = subprocess.run(
                     [
                         FFMPEG, "-v", "error", "-y", "-i", str(REAL_MP4),
                         "-an", "-vf", "format=yuv420p", "-c:v", "libx264",
-                        "-profile:v", profile, "-movflags", "+faststart", str(source),
+                        "-profile:v", encoder_profile, "-movflags", "+faststart", str(source),
                     ],
                     capture_output=True,
                     timeout=30,
                 )
                 self.assertEqual(generated.returncode, 0, generated.stderr.decode(errors="replace"))
-                result = media_scrub.scrub_video(source.read_bytes(), "video/mp4")
+                source_payload = source.read_bytes()
+                if profile == "extended":
+                    source_payload = self._replace_sps_profile(source_payload, 88)
+                result = media_scrub.scrub_video(source_payload, "video/mp4")
                 with tempfile.NamedTemporaryFile(suffix=".mp4", delete=False) as handle:
                     handle.write(result.data)
                     path = handle.name
