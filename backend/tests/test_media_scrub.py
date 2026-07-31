@@ -1448,6 +1448,7 @@ class Mp4Round7SurvivorProbes(unittest.TestCase):
         # A well-formed sidx passes reconstruction; the output body is
         # produced by struct.pack, so it must not contain arbitrary bytes.
         real = REAL_MP4.read_bytes()
+        following_mdat = self._wrap(b"mdat", b"\x00" * 0x100)
         sidx_body = (
             b"\x00\x00\x00\x00"
             + struct.pack(">I", 1)
@@ -1455,13 +1456,49 @@ class Mp4Round7SurvivorProbes(unittest.TestCase):
             + struct.pack(">I", 0)
             + struct.pack(">I", 0)
             + struct.pack(">HH", 0, 1)
-            + struct.pack(">III", 0x80000100, 90000, 0x00000000)
+            + struct.pack(">III", len(following_mdat), 90000, 0x00000000)
         )
         sidx_atom = self._wrap(b"sidx", sidx_body)
-        payload = real + sidx_atom
+        payload = real + sidx_atom + following_mdat
         result = media_scrub.scrub_video(payload, "video/mp4")
         # sidx bytes appear (rebuilt from fields).
         self.assertIn(b"sidx", result.data)
+
+    def test_sidx_semantic_fields_reject_for_versions_zero_and_one(self) -> None:
+        real = REAL_MP4.read_bytes()
+        following_mdat = self._wrap(b"mdat", b"segment-target")
+        for version in (0, 1):
+            with self.subTest(version=version):
+                for name, timescale, first_offset, sap in (
+                    ("zero timescale", 0, 8, 0),
+                    (
+                        "past EOF", 90_000,
+                        0xFFFFFFFF if version == 0 else 0xFFFFFFFFFFFFFFFF,
+                        0,
+                    ),
+                    ("reserved SAP", 90_000, 8, 0x70000000),
+                ):
+                    with self.subTest(case=name):
+                        if version == 0:
+                            body = (
+                                b"\x00\x00\x00\x00"
+                                + struct.pack(">II", 1, timescale)
+                                + struct.pack(">II", 0, first_offset)
+                            )
+                        else:
+                            body = (
+                                b"\x01\x00\x00\x00"
+                                + struct.pack(">II", 1, timescale)
+                                + struct.pack(">QQ", 0, first_offset)
+                            )
+                        body += struct.pack(">HH", 0, 1)
+                        body += struct.pack(">III", len(following_mdat) - 8, 1, sap)
+                        payload = real + self._wrap(b"sidx", body) + following_mdat
+                        with self.assertRaisesRegex(
+                            media_scrub.MediaScrubError,
+                            "sidx (timescale|first_offset|SAP)",
+                        ):
+                            media_scrub.scrub_video(payload, "video/mp4")
 
     def test_extended_sidx_preserves_header_and_first_offset_target(self) -> None:
         real = REAL_MP4.read_bytes()
@@ -4592,6 +4629,103 @@ class Review33VuiSarTests(unittest.TestCase):
             media_scrub.MediaScrubError, "pasp and SPS VUI SAR values do not agree"
         ):
             media_scrub.scrub_video(bytes(payload), "video/mp4")
+
+
+class Review39H264ProfileAndHeaderTests(unittest.TestCase):
+    @staticmethod
+    def _replace_sps_profile(real: bytes, profile_idc: int) -> bytes:
+        avcc_pos = real.find(b"avcC")
+        assert avcc_pos > 0
+        atom_size = struct.unpack(">I", real[avcc_pos - 4:avcc_pos])[0]
+        body = bytearray(real[avcc_pos + 4:avcc_pos - 4 + atom_size])
+        body[1] = profile_idc
+        sps_len = struct.unpack(">H", body[6:8])[0]
+        body[8 + 1] = profile_idc
+        assert sps_len > 1
+        return Mp4Round12OwnershipAndH264Probes._replace_avcc(real, bytes(body))
+
+    @staticmethod
+    def _avcc_parameter_set_headers(real: bytes) -> tuple[int, int, int, int]:
+        avcc_pos = real.find(b"avcC")
+        assert avcc_pos > 0
+        atom_size = struct.unpack(">I", real[avcc_pos - 4:avcc_pos])[0]
+        body = real[avcc_pos + 4:avcc_pos - 4 + atom_size]
+        sps_len = struct.unpack(">H", body[6:8])[0]
+        sps_start = 8
+        pps_len_pos = sps_start + sps_len + 1
+        pps_len = struct.unpack(">H", body[pps_len_pos:pps_len_pos + 2])[0]
+        pps_start = pps_len_pos + 2
+        return (
+            avcc_pos + 4 + sps_start, sps_len,
+            avcc_pos + 4 + pps_start, pps_len,
+        )
+
+    @unittest.skipIf(FFMPEG is None, "ffmpeg not installed")
+    def test_baseline_main_and_high_profiles_decode(self) -> None:
+        for profile in ("baseline", "main", "high"):
+            with self.subTest(profile=profile):
+                source = Path(tempfile.mkdtemp(prefix=f"wiki39-{profile}-")) / "source.mp4"
+                generated = subprocess.run(
+                    [
+                        FFMPEG, "-v", "error", "-y", "-i", str(REAL_MP4),
+                        "-an", "-vf", "format=yuv420p", "-c:v", "libx264",
+                        "-profile:v", profile, "-movflags", "+faststart", str(source),
+                    ],
+                    capture_output=True,
+                    timeout=30,
+                )
+                self.assertEqual(generated.returncode, 0, generated.stderr.decode(errors="replace"))
+                result = media_scrub.scrub_video(source.read_bytes(), "video/mp4")
+                with tempfile.NamedTemporaryFile(suffix=".mp4", delete=False) as handle:
+                    handle.write(result.data)
+                    path = handle.name
+                try:
+                    probe = subprocess.run(
+                        [FFMPEG, "-v", "error", "-i", path, "-f", "null", "-"],
+                        capture_output=True,
+                        timeout=30,
+                    )
+                    self.assertEqual(probe.returncode, 0, probe.stderr.decode(errors="replace"))
+                finally:
+                    Path(path).unlink(missing_ok=True)
+
+    def test_reserved_sps_profile_is_rejected_before_storage(self) -> None:
+        payload = self._replace_sps_profile(REAL_MP4.read_bytes(), 0)
+        with self.assertRaisesRegex(media_scrub.MediaScrubError, "profile_idc"):
+            media_scrub.scrub_video(payload, "video/mp4")
+
+    def test_parameter_set_nal_ref_idc_requires_nonzero(self) -> None:
+        real = REAL_MP4.read_bytes()
+        sps_offset, sps_len, pps_offset, pps_len = self._avcc_parameter_set_headers(real)
+        body = bytearray(real)
+        self.assertNotEqual(body[sps_offset] & 0x60, 0)
+        self.assertNotEqual(body[pps_offset] & 0x60, 0)
+        self.assertTrue(
+            h264_scrubber.canonicalise_nal_with_ids(
+                bytes(body[sps_offset:sps_offset + sps_len]), expected_nal_type=7,
+            )[0]
+        )
+        self.assertTrue(
+            h264_scrubber.canonicalise_nal_with_ids(
+                bytes(body[pps_offset:pps_offset + pps_len]), expected_nal_type=8,
+            )[0]
+        )
+        self.assertTrue(media_scrub.scrub_video(real, "video/mp4").data)
+
+        for name, offset in (("SPS", sps_offset), ("PPS", pps_offset)):
+            with self.subTest(nal=name):
+                mutated = bytearray(real)
+                mutated[offset] &= 0x1F
+                nal_length = sps_len if name == "SPS" else pps_len
+                with self.assertRaisesRegex(
+                    media_scrub.MediaScrubError, "zero nal_ref_idc"
+                ):
+                    h264_scrubber.canonicalise_nal_with_ids(
+                        bytes(mutated[offset:offset + nal_length]),
+                        expected_nal_type=7 if name == "SPS" else 8,
+                    )
+                with self.assertRaisesRegex(media_scrub.MediaScrubError, "zero nal_ref_idc"):
+                    media_scrub.scrub_video(bytes(mutated), "video/mp4")
 
 
 if __name__ == "__main__":

@@ -55,6 +55,7 @@ from typing import Final
 
 from .base import MediaScrubError, MediaScrubResult
 from ._h264 import (
+    _validate_nal_header,
     canonicalise_nal_with_ids,
     canonicalise_sps_with_dimensions,
     parse_slice_pps_id,
@@ -734,10 +735,6 @@ def _canonicalise_avc_sample(
         if nal_size == 0 or offset + nal_size > len(sample):
             raise MediaScrubError("mp4 AVC sample NAL length is out of bounds")
         nal = sample[offset:offset + nal_size]
-        if nal[0] & 0x80:
-            raise MediaScrubError(
-                "mp4 AVC sample NAL forbidden_zero_bit is set"
-            )
         nal_type = nal[0] & 0x1F
         if nal_type not in _MP4_AVC_SAMPLE_NAL_TYPES:
             if nal_type in (7, 8):
@@ -747,15 +744,11 @@ def _canonicalise_avc_sample(
             raise MediaScrubError(
                 f"mp4 avc1 sample contains unsupported NAL type {nal_type}"
             )
-        nal_ref_idc = (nal[0] >> 5) & 0x03
-        if nal_type == 5 and nal_ref_idc == 0:
-            raise MediaScrubError(
-                "mp4 AVC IDR NAL has zero nal_ref_idc"
-            )
-        if nal_type == 6 and nal_ref_idc != 0:
-            raise MediaScrubError(
-                "mp4 AVC SEI NAL has non-zero nal_ref_idc"
-            )
+        nal_ref_idc = _validate_nal_header(
+            nal, nal_type,
+            require_nonzero_ref=nal_type == 5,
+            require_zero_ref=nal_type == 6,
+        )
         if nal_type in (1, 5):
             pps_id = parse_slice_pps_id(nal)
             if require_pps and pps_id not in pps_ids:
@@ -942,7 +935,11 @@ def _rebuild_sidx(data: bytes, atom: _Mp4Atom) -> bytes:
     if len(body) < fixed_len:
         raise MediaScrubError("mp4 sidx body shorter than fixed header")
     reference_id = struct.unpack(">I", body[4:8])[0]
+    if reference_id == 0:
+        raise MediaScrubError("mp4 sidx reference_id must be positive")
     timescale = struct.unpack(">I", body[8:12])[0]
+    if timescale == 0:
+        raise MediaScrubError("mp4 sidx timescale must be positive")
     if version == 0:
         earliest_pt = struct.unpack(">I", body[12:16])[0]
         first_offset = struct.unpack(">I", body[16:20])[0]
@@ -968,11 +965,31 @@ def _rebuild_sidx(data: bytes, atom: _Mp4Atom) -> bytes:
         )
     references: list[bytes] = []
     offset = references_start
+    target = atom.body_end + first_offset
+    if target > len(data):
+        raise MediaScrubError("mp4 sidx first_offset points past payload")
     for _ in range(reference_count):
         rt_size = struct.unpack(">I", body[offset:offset + 4])[0]
+        reference_type = (rt_size >> 31) & 1
+        referenced_size = rt_size & 0x7FFFFFFF
+        if reference_type != 0:
+            raise MediaScrubError(
+                "mp4 sidx reference_type 1 is outside the nonfragmented subset"
+            )
+        if referenced_size == 0 or target + referenced_size > len(data):
+            raise MediaScrubError("mp4 sidx reference range exceeds payload")
         sub_duration = struct.unpack(">I", body[offset + 4:offset + 8])[0]
         sap = struct.unpack(">I", body[offset + 8:offset + 12])[0]
+        starts_with_sap = (sap >> 31) & 1
+        sap_type = (sap >> 28) & 0x7
+        sap_delta_time = sap & 0x0FFFFFFF
+        if starts_with_sap:
+            if sap_type not in (1, 2, 3):
+                raise MediaScrubError("mp4 sidx SAP type is reserved")
+        elif sap_type != 0 or sap_delta_time != 0:
+            raise MediaScrubError("mp4 sidx SAP fields are non-canonical")
         references.append(struct.pack(">III", rt_size, sub_duration, sap))
+        target += referenced_size
         offset += 12
     if version == 0:
         header_bytes = (

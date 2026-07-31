@@ -235,6 +235,7 @@ def _rbsp_escape(rbsp: bytes) -> bytes:
 _HIGH_PROFILES = frozenset({
     44, 83, 86, 100, 110, 118, 122, 128, 134, 135, 138, 139, 144, 244,
 })
+_SUPPORTED_PROFILES = frozenset({66, 77}) | _HIGH_PROFILES
 
 
 def _copy_scaling_list(reader: _BitReader, writer: _BitWriter, size: int) -> None:
@@ -392,6 +393,10 @@ def _parse_and_emit_sps_rbsp(
     writer = _BitWriter()
 
     profile_idc = reader.read_bits(8)
+    if profile_idc not in _SUPPORTED_PROFILES:
+        raise MediaScrubError(
+            f"h264 SPS profile_idc {profile_idc} is outside the supported subset"
+        )
     writer.write_bits(profile_idc, 8)
     # 6 constraint_setN_flag bits then 2 reserved_zero bits
     constraint_bits = reader.read_bits(8)
@@ -543,11 +548,8 @@ def canonicalise_sps_with_dimensions(
     nal_bytes: bytes,
 ) -> tuple[bytes, int, tuple[int, int], tuple[int, int] | None]:
     """Canonicalise an SPS and return dimensions plus its VUI SAR."""
-    if len(nal_bytes) < 1:
-        raise MediaScrubError("h264 NAL too short for header")
+    _validate_nal_header(nal_bytes, 7, require_nonzero_ref=True)
     header = nal_bytes[0]
-    if header & 0x80 or header & 0x1F != 7:
-        raise MediaScrubError("h264 NAL is not a valid SPS")
     rbsp = _rbsp_unescape(nal_bytes[1:])
     if not rbsp:
         raise MediaScrubError("h264 SPS RBSP is empty after unescape")
@@ -645,18 +647,11 @@ def canonicalise_nal_with_ids(
     nal_bytes: bytes, expected_nal_type: int,
 ) -> tuple[bytes, int, int | None]:
     """Canonicalise an SPS or PPS and return its parameter-set identifiers."""
-    if len(nal_bytes) < 1:
-        raise MediaScrubError("h264 NAL too short for header")
+    nal_ref_idc = _validate_nal_header(
+        nal_bytes, expected_nal_type, require_nonzero_ref=True,
+    )
     header = nal_bytes[0]
-    forbidden_zero_bit = (header >> 7) & 1
-    nal_ref_idc = (header >> 5) & 0x3
-    nal_type = header & 0x1F
-    if forbidden_zero_bit != 0:
-        raise MediaScrubError("h264 NAL forbidden_zero_bit set")
-    if nal_type != expected_nal_type:
-        raise MediaScrubError(
-            f"h264 NAL type {nal_type} does not match expected {expected_nal_type}"
-        )
+    nal_type = expected_nal_type
     rbsp = _rbsp_unescape(nal_bytes[1:])
     if not rbsp:
         raise MediaScrubError("h264 RBSP is empty after unescape")
@@ -676,6 +671,35 @@ def canonicalise_nal_with_ids(
             sps_id,
         )
     raise MediaScrubError(f"h264 canonicalise: unsupported NAL type {expected_nal_type}")
+
+
+def _validate_nal_header(
+    nal_bytes: bytes,
+    expected_nal_type: int,
+    *,
+    require_nonzero_ref: bool = False,
+    require_zero_ref: bool = False,
+) -> int:
+    if len(nal_bytes) < 1:
+        raise MediaScrubError("h264 NAL too short for header")
+    header = nal_bytes[0]
+    if header & 0x80:
+        raise MediaScrubError("h264 NAL forbidden_zero_bit set")
+    nal_ref_idc = (header >> 5) & 0x3
+    nal_type = header & 0x1F
+    if nal_type != expected_nal_type:
+        raise MediaScrubError(
+            f"h264 NAL type {nal_type} does not match expected {expected_nal_type}"
+        )
+    if require_nonzero_ref and nal_ref_idc == 0:
+        raise MediaScrubError(
+            f"h264 NAL type {expected_nal_type} has zero nal_ref_idc"
+        )
+    if require_zero_ref and nal_ref_idc != 0:
+        raise MediaScrubError(
+            f"h264 NAL type {expected_nal_type} has non-zero nal_ref_idc"
+        )
+    return nal_ref_idc
 
 
 def canonicalise_nal(nal_bytes: bytes, expected_nal_type: int) -> bytes:
