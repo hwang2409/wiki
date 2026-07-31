@@ -3805,19 +3805,29 @@ def _canonical_artifact_id(value: str) -> str | None:
     return value if str(parsed) == value else None
 
 
-def _artifact_file(directory: Path, artifact_id: str) -> tuple[Path, str] | None:
+ARTIFACT_VARIANTS = frozenset({"before", "after"})
+
+
+def _artifact_file(
+    directory: Path, artifact_id: str, variant: str | None = None
+) -> tuple[Path, str] | None:
     if directory.is_symlink() or not directory.is_dir():
         return None
+    stem = f"{artifact_id}.{variant}" if variant else artifact_id
     for extension, media_type in ARTIFACT_MEDIA_TYPES.items():
-        candidate = directory / f"{artifact_id}.{extension}"
+        candidate = directory / f"{stem}.{extension}"
         if candidate.is_file() and not candidate.is_symlink():
             return candidate, media_type
     return None
 
 
 @app.get("/api/agents/{ticket}/artifact/{artifact_id}")
-def get_agent_artifact(ticket: str, artifact_id: str) -> FileResponse:
+def get_agent_artifact(
+    ticket: str, artifact_id: str, variant: str | None = None
+) -> FileResponse:
     if not valid_agent_id(ticket) or _canonical_artifact_id(artifact_id) is None:
+        raise HTTPException(status_code=404, detail="Artifact not found")
+    if variant is not None and variant not in ARTIFACT_VARIANTS:
         raise HTTPException(status_code=404, detail="Artifact not found")
 
     registry_match = _registry_agent(_read_agent_registry(), ticket)
@@ -3835,6 +3845,7 @@ def get_agent_artifact(ticket: str, artifact_id: str) -> FileResponse:
                 / canonical_run_id
                 / "artifacts",
                 artifact_id,
+                variant,
             )
             if live is not None:
                 target, media_type = live
@@ -3848,7 +3859,7 @@ def get_agent_artifact(ticket: str, artifact_id: str) -> FileResponse:
 
     _, _, archive_dir = _archive_hint(canonical_ticket)
     if archive_dir is not None:
-        archived = _artifact_file(archive_dir / "artifacts", artifact_id)
+        archived = _artifact_file(archive_dir / "artifacts", artifact_id, variant)
         if archived is not None:
             target, media_type = archived
             return FileResponse(

@@ -20,6 +20,7 @@ import {
 import { ShikiCode, useCurrentTheme } from "./shiki";
 import { StatusBadge, statusToTone } from "./status-badge";
 import { STREAM_CLAMP_PX, STREAM_CLAMP_SLACK_PX } from "./stream-clamp";
+import { VisualDiffRenderer } from "./visual-diff-renderer";
 
 const IMAGE_EXTENSION_PATTERN = /\.(png|jpe?g|gif|webp|svg)(\?.*)?$/i;
 
@@ -902,6 +903,8 @@ export function ArtifactRenderer(props: ArtifactRendererProps): ReactNode {
       return <CodeRenderer artifact={artifact} />;
     case "pdf":
       return <PdfCompactRenderer event={props.event} ticket={props.ticket} />;
+    case "visual-diff":
+      return <VisualDiffRenderer artifact={artifact} event={props.event} ticket={props.ticket} />;
   }
 }
 
@@ -968,6 +971,9 @@ export function CompactPreview({ artifact, event, onRenderError, ticket }: Artif
   }
   if (effectiveKind === "pdf") {
     return <PdfCompactRenderer event={event} ticket={ticket} />;
+  }
+  if (effectiveKind === "visual-diff") {
+    return <VisualDiffRenderer artifact={artifact} compact event={event} readOnly ticket={ticket} />;
   }
   return <ArtifactRenderer artifact={artifact} event={event} ticket={ticket} />;
 }

@@ -23,6 +23,12 @@ export function textPayload(artifact: SessionArtifact): string {
         : JSON.stringify(artifact.json_data ?? {}, null, 2);
     case "pdf":
       return artifact.ref ?? "";
+    case "visual-diff":
+      return JSON.stringify(
+        { before: artifact.before?.ref ?? "", after: artifact.after?.ref ?? "" },
+        null,
+        2,
+      );
   }
 }
 
@@ -58,12 +64,39 @@ export function downloadName(event: SessionEvent): string {
     "file-list": "txt",
     json: "json",
     pdf: "pdf",
+    "visual-diff": "json",
   }[effectiveKind];
   return `${base}.${extension}`;
 }
 
+function variantExtension(mime: string | undefined): string {
+  if (mime === "image/jpeg") return "jpg";
+  return mime?.split("/")[1] || "png";
+}
+
+async function downloadVariant(url: string, name: string): Promise<void> {
+  const response = await fetch(url);
+  if (!response.ok) throw new Error(`Variant download failed (${response.status})`);
+  const blob = await response.blob();
+  const objectUrl = URL.createObjectURL(blob);
+  const anchor = document.createElement("a");
+  anchor.href = objectUrl;
+  anchor.download = name;
+  anchor.click();
+  window.setTimeout(() => URL.revokeObjectURL(objectUrl), 0);
+}
+
 export async function downloadArtifact(ticket: string, event: SessionEvent): Promise<void> {
   const artifact = event.artifact!;
+  if (artifact.kind === "visual-diff") {
+    const base = artifactUrl(ticket, event);
+    const stem = downloadName(event).replace(/\.json$/, "");
+    const beforeExt = variantExtension(artifact.before?.mime);
+    const afterExt = variantExtension(artifact.after?.mime);
+    await downloadVariant(`${base}?variant=before`, `${stem}.before.${beforeExt}`);
+    await downloadVariant(`${base}?variant=after`, `${stem}.after.${afterExt}`);
+    return;
+  }
   let blob: Blob;
   if (artifact.kind === "pdf") {
     const response = await fetch(artifactUrl(ticket, event));

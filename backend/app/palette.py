@@ -56,6 +56,7 @@ ARTIFACT_KINDS: tuple[str, ...] = (
     "plot",
     "svg",
     "table",
+    "visual-diff",
 )
 
 DEFAULT_LIMIT = 30

@@ -80,6 +80,39 @@ class ArtifactServeTests(unittest.TestCase):
         self.assertEqual(Path(response.path), target)
         self.assertEqual(response.media_type, "image/webp")
 
+    def test_visual_diff_variant_serves_paired_files(self) -> None:
+        self.registry.write_text(
+            json.dumps(
+                {
+                    "WIKI-85": {
+                        "current": {"run_id": RUN_ID, "kind": "cdx"},
+                        "history": [],
+                    }
+                }
+            ),
+            encoding="utf-8",
+        )
+        artifacts_dir = self.runtime / "runs" / RUN_ID / "artifacts"
+        artifacts_dir.mkdir(parents=True)
+        before = artifacts_dir / f"{ARTIFACT_ID}.before.png"
+        after = artifacts_dir / f"{ARTIFACT_ID}.after.webp"
+        before.write_bytes(b"before-bytes")
+        after.write_bytes(b"after-bytes")
+
+        before_response = main.get_agent_artifact("WIKI-85", ARTIFACT_ID, variant="before")
+        self.assertEqual(Path(before_response.path), before)
+        self.assertEqual(before_response.media_type, "image/png")
+
+        after_response = main.get_agent_artifact("WIKI-85", ARTIFACT_ID, variant="after")
+        self.assertEqual(Path(after_response.path), after)
+        self.assertEqual(after_response.media_type, "image/webp")
+
+    def test_unknown_variant_returns_404(self) -> None:
+        self._write_live("WIKI-85")
+        with self.assertRaises(HTTPException) as raised:
+            main.get_agent_artifact("WIKI-85", ARTIFACT_ID, variant="sideways")
+        self.assertEqual(raised.exception.status_code, 404)
+
     def test_ticket_scope_and_unknown_artifact_return_404(self) -> None:
         self._write_live("WIKI-85")
         for ticket, artifact_id in (
