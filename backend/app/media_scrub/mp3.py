@@ -1,6 +1,7 @@
 """MP3 scrubbing — strip ID3v1, ID3v2, and APEv2 tags."""
 from __future__ import annotations
 
+from array import array
 import struct
 from typing import Final
 
@@ -211,6 +212,8 @@ def _mp3_validate_full_frame_stream(data: bytes, start: int, end: int) -> bytes:
     # tuple graphs whose size grew with the frame count. A logical payload is
     # always smaller than the complete input, so this bound is explicit.
     ownership = bytearray(end - start)
+    frame_lengths = array("I")
+    side_info_starts = bytearray()
     has_ownership = False
     logical_payload_bytes = 0
     audio_floor_bytes: int | None = None
@@ -236,6 +239,8 @@ def _mp3_validate_full_frame_stream(data: bytes, start: int, end: int) -> bytes:
                 "mp3 CRC-protected frames are not supported"
             )
         side_info_start = _mp3_side_info_start(header)
+        frame_lengths.append(frame_len)
+        side_info_starts.append(side_info_start)
         canonical_header = _mp3_rebuild_header(header)
         (
             canonical_side_info,
@@ -281,7 +286,13 @@ def _mp3_validate_full_frame_stream(data: bytes, start: int, end: int) -> bytes:
     if frames_seen < 1:
         raise MediaScrubError("mp3 frame stream contains zero frames")
     _mp3_zero_unowned_main_data(
-        rebuilt, data, start, end, ownership, has_ownership,
+        rebuilt,
+        start,
+        end,
+        ownership,
+        has_ownership,
+        frame_lengths,
+        side_info_starts,
     )
     return bytes(rebuilt)
 
@@ -310,21 +321,29 @@ def _mp3_mark_logical_range(ownership: bytearray, start: int, end: int) -> None:
 
 def _mp3_zero_unowned_main_data(
     rebuilt: bytearray,
-    data: bytes,
     start: int,
     end: int,
     ownership: bytearray,
     has_ownership: bool,
+    frame_lengths: array,
+    side_info_starts: bytearray,
 ) -> None:
-    """Rescan frame headers and clear payload bits with no ownership mark."""
+    """Clear unowned payload bits using the bounded frame metadata arrays."""
+    if not has_ownership and frame_lengths:
+        frame_length = frame_lengths[0]
+        side_info_start = side_info_starts[0]
+        if all(
+            length == frame_length and side_start == side_info_start
+            for length, side_start in zip(frame_lengths, side_info_starts)
+        ):
+            for relative_offset in range(side_info_start, frame_length):
+                count = (len(rebuilt) - 1 - relative_offset) // frame_length + 1
+                rebuilt[relative_offset::frame_length] = b"\x00" * count
+            return
     offset = start
     logical_payload_bytes = 0
-    while offset < end:
-        frame_len = _mp3_frame_length(data, offset, end)
-        if frame_len is None:
-            raise MediaScrubError("mp3 frame stream changed during rebuild")
-        header = data[offset:offset + 4]
-        side_info_start = _mp3_side_info_start(header)
+    for frame_index, frame_len in enumerate(frame_lengths):
+        side_info_start = side_info_starts[frame_index]
         payload_length = frame_len - side_info_start
         physical_start = offset - start + side_info_start
         if not has_ownership:
@@ -334,6 +353,8 @@ def _mp3_zero_unowned_main_data(
                 rebuilt[physical_start + index] &= ownership[logical_payload_bytes + index]
         logical_payload_bytes += payload_length
         offset += frame_len
+    if offset != end:
+        raise MediaScrubError("mp3 frame stream changed during rebuild")
 
 
 class _Mp3BitReader:

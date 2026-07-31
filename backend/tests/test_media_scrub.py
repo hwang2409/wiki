@@ -107,40 +107,71 @@ class ScrubMp4RealFixtureTests(unittest.TestCase):
 
     @unittest.skipIf(FFMPEG is None, "ffmpeg not installed")
     def test_non_square_pixel_aspect_ratio_scrubs_and_decodes(self) -> None:
+        matrices = {
+            0: (0x00010000, 0, 0, 0, 0x00010000, 0, 0, 0, 0x40000000),
+            90: (0, 0x00010000, 0, -0x00010000, 0, 0, 0, 0, 0x40000000),
+            180: (-0x00010000, 0, 0, 0, -0x00010000, 0, 0, 0, 0x40000000),
+            270: (0, -0x00010000, 0, 0x00010000, 0, 0, 0, 0, 0x40000000),
+        }
         with tempfile.TemporaryDirectory() as directory:
-            source = Path(directory) / "sar-source.mp4"
-            output = Path(directory) / "sar-2x1.mp4"
-            generated = subprocess.run(
-                [
-                    FFMPEG, "-v", "error", "-y", "-i", str(REAL_MP4),
-                    "-vf", "setsar=2/1", "-an", "-c:v", "libx264",
-                    "-movflags", "+faststart", str(output),
-                ],
-                capture_output=True,
-                timeout=30,
-            )
-            self.assertEqual(generated.returncode, 0, generated.stderr.decode(errors="replace"))
-            source.write_bytes(output.read_bytes())
-            original = source.read_bytes()
-            self.assertIn(b"pasp", original)
-            result = media_scrub.scrub_video(original, "video/mp4")
+            for sar_h, sar_v in ((1, 1), (2, 1)):
+                with self.subTest(sar=(sar_h, sar_v)):
+                    source = Path(directory) / f"sar-{sar_h}-{sar_v}.mp4"
+                    generated = subprocess.run(
+                        [
+                            FFMPEG, "-v", "error", "-y", "-i", str(REAL_MP4),
+                            "-vf", f"setsar={sar_h}/{sar_v}", "-an",
+                            "-c:v", "libx264", "-movflags", "+faststart",
+                            str(source),
+                        ],
+                        capture_output=True,
+                        timeout=30,
+                    )
+                    self.assertEqual(
+                        generated.returncode, 0,
+                        generated.stderr.decode(errors="replace"),
+                    )
+                    original = source.read_bytes()
+                    if (sar_h, sar_v) != (1, 1):
+                        self.assertIn(b"pasp", original)
+                    tkhd_pos = original.find(b"tkhd")
+                    self.assertGreater(tkhd_pos, 0)
+                    for angle, matrix in matrices.items():
+                        with self.subTest(angle=angle):
+                            payload = bytearray(original)
+                            payload[tkhd_pos + 44:tkhd_pos + 80] = struct.pack(">9i", *matrix)
+                            result = media_scrub.scrub_video(bytes(payload), "video/mp4")
+                            if angle in (90, 270):
+                                expected = (
+                                    120, 320 if (sar_h, sar_v) == (2, 1) else 160,
+                                )
+                            else:
+                                expected = (
+                                    320 if (sar_h, sar_v) == (2, 1) else 160, 120,
+                                )
+                            self.assertEqual((result.width, result.height), expected)
 
-            mutated = bytearray(original)
-            tkhd_pos = mutated.find(b"tkhd")
-            self.assertGreater(tkhd_pos, 0)
-            mutated[tkhd_pos + 80:tkhd_pos + 84] = struct.pack(">I", 1234 << 16)
-            mutated[tkhd_pos + 84:tkhd_pos + 88] = struct.pack(">I", 17 << 16)
-            with self.assertRaisesRegex(media_scrub.MediaScrubError, "display dimensions"):
-                media_scrub.scrub_video(bytes(mutated), "video/mp4")
+                            stored = Path(directory) / f"scrubbed-{sar_h}-{sar_v}-{angle}.mp4"
+                            stored.write_bytes(result.data)
+                            probe = subprocess.run(
+                                [FFMPEG, "-v", "error", "-i", str(stored), "-f", "null", "-"],
+                                capture_output=True,
+                                timeout=30,
+                            )
+                            self.assertEqual(
+                                probe.returncode, 0,
+                                probe.stderr.decode(errors="replace"),
+                            )
 
-            stored = Path(directory) / "scrubbed.mp4"
-            stored.write_bytes(result.data)
-            probe = subprocess.run(
-                [FFMPEG, "-v", "error", "-i", str(stored), "-f", "null", "-"],
-                capture_output=True,
-                timeout=30,
-            )
-            self.assertEqual(probe.returncode, 0, probe.stderr.decode(errors="replace"))
+                            if angle in (0, 90):
+                                forged = bytearray(payload)
+                                forged[tkhd_pos + 80:tkhd_pos + 84] = struct.pack(">I", 1234 << 16)
+                                forged[tkhd_pos + 84:tkhd_pos + 88] = struct.pack(">I", 17 << 16)
+                                with self.assertRaisesRegex(
+                                    media_scrub.MediaScrubError,
+                                    "presentation dimensions",
+                                ):
+                                    media_scrub.scrub_video(bytes(forged), "video/mp4")
 
 
 class ScrubMp4MixedAacFixtureTests(unittest.TestCase):

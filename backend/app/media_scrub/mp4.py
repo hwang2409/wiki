@@ -2082,23 +2082,22 @@ def _rebuild_sample_entry(
             raise MediaScrubError(
                 "mp4 avc1 SPS dimensions do not match tkhd track dimensions"
             )
-        tkhd_width, tkhd_height, rotated = track_dimensions
+        # Dimension model:
+        #   - coded dimensions come from the SPS and sample entry;
+        #   - presentation dimensions are coded dimensions adjusted by the
+        #     validated pasp ratio using exact integer cross-products;
+        #   - tkhd width and height store those pre-matrix presentation
+        #     dimensions. The matrix never changes what tkhd stores;
+        #   - the 90/270 matrix swap applies only to artifact dimensions
+        #     reported to the frontend after validation.
+        tkhd_width, tkhd_height, _matrix_swaps_display = track_dimensions
         h_spacing, v_spacing = pasp_ratio or (1, 1)
-        expected_width = sps_dimensions[1] if rotated else sps_dimensions[0]
-        expected_height = sps_dimensions[0] if rotated else sps_dimensions[1]
-        if rotated:
-            display_width_valid = tkhd_width == expected_width
-            display_height_valid = (
-                tkhd_height * v_spacing == expected_height * h_spacing
-            )
-        else:
-            display_width_valid = (
-                tkhd_width * v_spacing == expected_width * h_spacing
-            )
-            display_height_valid = tkhd_height == expected_height
-        if not (display_width_valid and display_height_valid):
+        if not (
+            tkhd_width * v_spacing == sps_dimensions[0] * h_spacing
+            and tkhd_height == sps_dimensions[1]
+        ):
             raise MediaScrubError(
-                "mp4 avc1 display dimensions do not match tkhd after pasp/rotation"
+                "mp4 avc1 presentation dimensions do not match tkhd after pasp"
             )
 
     inner_payload, inner_types = _walk_sample_entry_inner_boxes(
@@ -2562,10 +2561,16 @@ def _tkhd_dims_from_trak(
         dims_at = payload_at + pre_matrix + matrix
         if dims_at + 8 > atom_end:
             return None
+        matrix_at = payload_at + pre_matrix
+        if matrix_at + matrix > atom_end:
+            return None
+        matrix_values = struct.unpack(">9i", source[matrix_at:matrix_at + matrix])
         width_fixed, height_fixed = struct.unpack(">II", source[dims_at:dims_at + 8])
         width = width_fixed >> 16
         height = height_fixed >> 16
         if width > 0 and height > 0:
+            if matrix_values in _MP4_ROTATION_SWAP_MATRICES:
+                return height, width
             return width, height
         return None
     return None
