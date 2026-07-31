@@ -203,6 +203,10 @@ def _mp3_validate_full_frame_stream(data: bytes, start: int, end: int) -> bytes:
     file. This is the round-7 fix for the pre-R7 validator that only
     checked the first three frames.
     """
+    uniform = _mp3_rebuild_uniform_empty_stream(data, start, end)
+    if uniform is not None:
+        return uniform
+
     offset = start
     frames_seen = 0
     stream_signature: tuple[int, int] | None = None
@@ -211,7 +215,7 @@ def _mp3_validate_full_frame_stream(data: bytes, start: int, end: int) -> bytes:
     # Layer III frames own through the reservoir. This replaces four Python
     # tuple graphs whose size grew with the frame count. A logical payload is
     # always smaller than the complete input, so this bound is explicit.
-    ownership = bytearray(end - start)
+    ownership: bytearray | None = None
     frame_lengths = array("I")
     side_info_starts = bytearray()
     has_ownership = False
@@ -232,8 +236,7 @@ def _mp3_validate_full_frame_stream(data: bytes, start: int, end: int) -> bytes:
                 "mp3 frame stream changes MPEG version or layer"
             )
         frame_offset = offset - start
-        frame = data[offset:offset + frame_len]
-        header = frame[:4]
+        header = data[offset:offset + 4]
         if header[1] & 0x01 == 0:
             raise MediaScrubError(
                 "mp3 CRC-protected frames are not supported"
@@ -242,20 +245,30 @@ def _mp3_validate_full_frame_stream(data: bytes, start: int, end: int) -> bytes:
         frame_lengths.append(frame_len)
         side_info_starts.append(side_info_start)
         canonical_header = _mp3_rebuild_header(header)
-        (
-            canonical_side_info,
-            main_data_begin,
-            main_data_bits,
-            _main_data_start,
-        ) = _mp3_rebuild_side_info_and_syntax(frame, header)
+        side_bytes_start = offset + 4 + (0 if header[1] & 0x01 else 2)
+        side_bytes = data[side_bytes_start:offset + side_info_start]
+        if any(side_bytes):
+            frame = data[offset:offset + frame_len]
+            (
+                canonical_side_info,
+                main_data_begin,
+                main_data_bits,
+                _main_data_start,
+            ) = _mp3_rebuild_side_info_and_syntax(frame, header)
+        else:
+            canonical_side_info = side_bytes
+            main_data_begin = 0
+            main_data_bits = 0
         rebuilt[frame_offset:frame_offset + 4] = canonical_header
         rebuilt[
             frame_offset + 4:frame_offset + side_info_start
         ] = canonical_side_info
-        metadata_end = (
-            _mp3_xing_metadata_end(frame, side_info_start)
-            if frames_seen == 0 else None
-        )
+        metadata_end = None
+        if frames_seen == 0:
+            magic = data[offset + side_info_start:offset + side_info_start + 4]
+            if magic == b"VBRI" or magic in _MP3_XING_MAGICS:
+                frame = data[offset:offset + frame_len]
+                metadata_end = _mp3_xing_metadata_end(frame, side_info_start)
         payload_length = frame_len - side_info_start
         if metadata_end is None:
             if audio_floor_bytes is None:
@@ -271,11 +284,13 @@ def _mp3_validate_full_frame_stream(data: bytes, start: int, end: int) -> bytes:
                 )
             if main_data_bits:
                 has_ownership = True
-            _mp3_mark_logical_range(
-                ownership,
-                reservoir_start * 8,
-                reservoir_start * 8 + main_data_bits,
-            )
+                if ownership is None:
+                    ownership = bytearray(end - start)
+                _mp3_mark_logical_range(
+                    ownership,
+                    reservoir_start * 8,
+                    reservoir_start * 8 + main_data_bits,
+                )
         logical_payload_bytes += payload_length
         offset += frame_len
         frames_seen += 1
@@ -295,6 +310,33 @@ def _mp3_validate_full_frame_stream(data: bytes, start: int, end: int) -> bytes:
         side_info_starts,
     )
     return bytes(rebuilt)
+
+
+def _mp3_rebuild_uniform_empty_stream(
+    data: bytes, start: int, end: int,
+) -> bytes | None:
+    """Rebuild an exactly repeated zero-side-info stream in bounded C loops."""
+    if end - start < 4:
+        return None
+    frame_len = _mp3_frame_length(data, start, end)
+    if frame_len is None or (end - start) % frame_len:
+        return None
+    header = data[start:start + 4]
+    if header[1] & 0x01 == 0:
+        return None
+    side_info_start = _mp3_side_info_start(header)
+    side_bytes_start = start + 4
+    if any(data[side_bytes_start:start + side_info_start]):
+        return None
+    magic = data[start + side_info_start:start + side_info_start + 4]
+    if magic == b"VBRI" or magic in _MP3_XING_MAGICS:
+        return None
+    frame_count = (end - start) // frame_len
+    first_frame = data[start:start + frame_len]
+    if data[start:end] != first_frame * frame_count:
+        return None
+    clean_frame = _mp3_rebuild_header(header) + b"\x00" * (frame_len - 4)
+    return clean_frame * frame_count
 
 
 def _mp3_mark_logical_range(ownership: bytearray, start: int, end: int) -> None:
@@ -323,12 +365,14 @@ def _mp3_zero_unowned_main_data(
     rebuilt: bytearray,
     start: int,
     end: int,
-    ownership: bytearray,
+    ownership: bytearray | None,
     has_ownership: bool,
     frame_lengths: array,
     side_info_starts: bytearray,
 ) -> None:
     """Clear unowned payload bits using the bounded frame metadata arrays."""
+    if has_ownership and ownership is None:
+        raise MediaScrubError("mp3 ownership map is missing")
     if not has_ownership and frame_lengths:
         frame_length = frame_lengths[0]
         side_info_start = side_info_starts[0]
