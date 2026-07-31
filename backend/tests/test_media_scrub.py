@@ -2076,6 +2076,66 @@ class Mp4Round8SurvivorProbes(unittest.TestCase):
             media_scrub.scrub_video(bytes(payload), "video/mp4")
 
 
+class Mp4Round46SliceBoundsTests(unittest.TestCase):
+    """A coded slice must start inside the SPS coded picture."""
+
+    def test_impossible_first_mb_in_slice_is_rejected_on_full_mp4(self) -> None:
+        real = REAL_MP4.read_bytes()
+        mdat_pos = real.find(b"mdat")
+        self.assertGreater(mdat_pos, 0)
+        sample_pos = mdat_pos + 4
+        sei_size = struct.unpack(">I", real[sample_pos:sample_pos + 4])[0]
+        idr_size_pos = sample_pos + 4 + sei_size
+        idr_size = struct.unpack(">I", real[idr_size_pos:idr_size_pos + 4])[0]
+        idr_pos = idr_size_pos + 4
+        idr = real[idr_pos:idr_pos + idr_size]
+        self.assertEqual(idr[0] & 0x1F, 5)
+
+        rbsp = h264_scrubber._rbsp_unescape(idr[1:])
+        reader = h264_scrubber._BitReader(rbsp)
+        reader.read_ue()
+        first_field_end = reader._bit_pos
+        impossible = 4_294_967_294
+        code_value = impossible + 1
+        leading_zeroes = code_value.bit_length() - 1
+        replacement = [0] * leading_zeroes + [1]
+        replacement.extend(
+            (code_value >> bit) & 1
+            for bit in range(leading_zeroes - 1, -1, -1)
+        )
+        bits = [
+            (byte >> (7 - bit)) & 1
+            for byte in rbsp
+            for bit in range(8)
+        ]
+        bits = replacement + bits[first_field_end:]
+        bits.extend([0] * (-len(bits) % 8))
+        mutated_rbsp = bytes(
+            sum(bits[offset + bit] << (7 - bit) for bit in range(8))
+            for offset in range(0, len(bits), 8)
+        )
+        mutated_nal = idr[:1] + h264_scrubber._rbsp_escape(mutated_rbsp)
+        delta = len(mutated_nal) - len(idr)
+        payload = bytearray(real)
+        payload[idr_size_pos:idr_size_pos + 4] = struct.pack(">I", len(mutated_nal))
+        payload[idr_pos:idr_pos + idr_size] = mutated_nal
+        if delta:
+            stsz_pos = real.find(b"stsz")
+            self.assertGreater(stsz_pos, 0)
+            first_size_pos = stsz_pos + 4 + 12
+            old_first_size = struct.unpack(">I", real[first_size_pos:first_size_pos + 4])[0]
+            payload[first_size_pos:first_size_pos + 4] = struct.pack(">I", old_first_size + delta)
+            mdat_size_pos = mdat_pos - 4
+            old_mdat_size = struct.unpack(">I", real[mdat_size_pos:mdat_size_pos + 4])[0]
+            payload[mdat_size_pos:mdat_size_pos + 4] = struct.pack(">I", old_mdat_size + delta)
+
+        with self.assertRaisesRegex(
+            media_scrub.MediaScrubError,
+            "first_mb_in_slice is outside the coded picture",
+        ):
+            media_scrub.scrub_video(bytes(payload), "video/mp4")
+
+
 class Mp4Round9SurvivorProbes(unittest.TestCase):
     """Round-9 review found four byte-smuggling / DoS paths:
       1. SPS/PPS NAL bodies inside avcC were copied verbatim after

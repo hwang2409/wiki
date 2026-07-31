@@ -15,7 +15,7 @@ from unittest import mock
 
 from PIL import Image
 
-from backend.app import main, media_scrub, wiki_agent_tools, wiki_artifacts
+from backend.app import binary_artifacts, main, media_scrub, wiki_agent_tools, wiki_artifacts
 from backend.app.agent_runtime import next_review as next_review_runtime
 from backend.app.agent_runtime.autopilot import AutopilotController, AutopilotStore
 from backend.app.agent_runtime.diversity_orchestration import collect_diversity_verdict
@@ -642,6 +642,47 @@ class WikiArtifactsTests(unittest.TestCase):
             event["artifact"],
         )
         self.assertEqual(event["artifact"]["kind"], "mermaid")
+
+    def test_tools_list_describes_every_artifact_payload_contract(self) -> None:
+        response = wiki_artifacts._response(  # noqa: SLF001 - MCP contract test
+            {"jsonrpc": "2.0", "id": 1, "method": "tools/list", "params": {}}
+        )
+        assert response is not None
+        render = next(tool for tool in response["result"]["tools"] if tool["name"] == "render_artifact")
+        schema = render["inputSchema"]
+        self.assertEqual(set(schema["properties"]["kind"]["enum"]), wiki_artifacts.ARTIFACT_KINDS)
+        description = schema["properties"]["payload"]["description"]
+        for kind in sorted(wiki_artifacts.ARTIFACT_KINDS):
+            self.assertIn(f"{kind}:", description, kind)
+        self.assertIn("video/mp4|image/gif", description)
+        self.assertIn("audio/wav|audio/mpeg", description)
+        self.assertIn("40MB", description)
+        self.assertIn("20MB", description)
+        self.assertIn("poster_base64", description)
+        self.assertIn("transcript", description)
+
+    def test_extracted_media_ingest_has_one_normalized_result_boundary(self) -> None:
+        written: list[tuple[str, str, bytes]] = []
+        validated: list[tuple[str, str, dict[str, object]]] = []
+
+        def write_binary(_directory: Path, artifact_id: str, extension: str, data: bytes) -> Path:
+            written.append((artifact_id, extension, data))
+            return self.root / f"{artifact_id}.{extension}"
+
+        for kind in ("video", "audio"):
+            with self.subTest(kind=kind):
+                normalized = binary_artifacts.ingest_binary_artifact(
+                    kind,
+                    _payload(kind),
+                    f"00000000-0000-4000-8000-{kind == 'video' and '000000000101' or '000000000102'}",
+                    read_path=lambda *args, **kwargs: self.fail("base64 fixture should not read a path"),
+                    artifact_dir=lambda: self.root,
+                    write_binary=write_binary,
+                    validate_normalized=lambda k, artifact_id, value: validated.append((k, artifact_id, value)),
+                )
+                self.assertEqual(normalized["kind"] if "kind" in normalized else kind, kind)
+                self.assertEqual(validated[-1][0], kind)
+                self.assertEqual(written[-1][0], validated[-1][1])
 
     def test_orchestrator_lists_native_ops_but_worker_does_not(self) -> None:
         worker = wiki_artifacts._response(  # noqa: SLF001 - MCP contract test

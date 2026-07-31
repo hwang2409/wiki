@@ -56,6 +56,8 @@ ARTIFACT_KINDS: tuple[str, ...] = (
     "plot",
     "svg",
     "table",
+    "video",
+    "audio",
     "visual-diff",
 )
 

@@ -17,10 +17,10 @@ from uuid import UUID, uuid4
 
 from . import knowledge
 from . import wiki_agent_tools
+from .binary_artifacts import ArtifactValidationError, ingest_binary_artifact
 from .image_scrub import ImageScrubError, scrub_image
 from .media_scrub import (
     AUDIO_MIMES,
-    MediaScrubError,
     VIDEO_MIMES,
     scrub_audio,
     scrub_video,
@@ -84,10 +84,6 @@ _BINARY_ARTIFACT_KEYS = {
 }
 
 
-class ArtifactValidationError(ValueError):
-    pass
-
-
 TOOL_DESCRIPTION = (
     "Render a typed artifact inline in the Wiki.app session view. Prefer this over "
     "dumping /tmp file paths: the artifact is inspectable, downloadable, and lives "
@@ -96,7 +92,12 @@ TOOL_DESCRIPTION = (
     "3 columns, use a plain markdown table instead. For visual-diff (paired before/after "
     "screenshots), the payload is {before: {data_base64, mime}, after: {data_base64, mime}}; "
     "each side accepts image/png, image/jpeg, or image/webp up to 5MB, and both sides must "
-    "have identical dimensions and be single-frame (no APNG/animated WebP)."
+    "have identical dimensions and be single-frame (no APNG/animated WebP). "
+    "video payloads use {mime, data_base64|path, poster_base64?, poster_mime?}; mime is "
+    "video/mp4 or image/gif, video bytes are capped at 40MB, and the optional poster "
+    "uses base64 image bytes with poster_mime image/png|jpeg|webp, capped at 5MB. audio payloads use "
+    "{mime, data_base64|path, transcript?}; mime is audio/wav or audio/mpeg, audio bytes "
+    "are capped at 20MB, and transcript is optional text capped at 100KB."
 )
 
 # The payload description is agent-facing — the enclosing schema keeps payload
@@ -115,6 +116,13 @@ _PAYLOAD_DESCRIPTION = (
     "file-list: {files:[{path, label?, size?, status?}]}. "
     "json: {json_data}. "
     "pdf: {data_base64} or {path} — 25MB cap. "
+    "video: {mime, data_base64|path, poster_base64?, poster_mime?} — mime in "
+    "video/mp4|image/gif; data_base64 or path is required; video is capped at 40MB; "
+    "poster_base64 is optional base64 image data; poster_mime is optional and defaults "
+    "to image/png, with image/png|jpeg|webp capped at 5MB. "
+    "audio: {mime, data_base64|path, transcript?} — mime in audio/wav|audio/mpeg; "
+    "data_base64 or path is required; audio is capped at 20MB; transcript is optional "
+    "UTF-8 text capped at 100KB. "
     "visual-diff: {before: {data_base64, mime}, after: {data_base64, mime}} — each side "
     "image/png|jpeg|webp up to 5MB; before and after must share dimensions; multi-frame "
     "sources (APNG, animated WebP) are rejected. "
@@ -585,173 +593,30 @@ def _write_image(payload: dict[str, Any], artifact_id: str) -> dict[str, Any]:
     return normalized
 
 
-def _decode_media_payload(
-    payload: dict[str, Any],
-    *,
-    kind: str,
-    allowed_mimes: dict[str, str],
-    byte_limit: int,
-    limit_label: str,
-    optional_keys: set[str] = frozenset(),
-) -> tuple[bytes, str]:
-    required = {"mime"}
-    optional = optional_keys | {"data_base64", "path"}
-    _require_keys(payload, required=required, optional=optional)
-    mime = payload["mime"]
-    if mime not in allowed_mimes:
-        raise ArtifactValidationError(
-            f"payload.mime must be one of {sorted(allowed_mimes)!s} for {kind}"
-        )
-    has_base64 = "data_base64" in payload
-    has_path = "path" in payload
-    if has_base64 == has_path:
-        raise ArtifactValidationError(
-            f"{kind} payload must include exactly one of data_base64 or path"
-        )
-    if has_base64:
-        encoded = _require_string(payload["data_base64"], "payload.data_base64")
-        if len(encoded) > ((byte_limit + 2) // 3) * 4 + 4:
-            raise ArtifactValidationError(f"{kind} payload exceeds the {limit_label}")
-        try:
-            data = base64.b64decode(encoded, validate=True)
-        except (binascii.Error, ValueError) as exc:
-            raise ArtifactValidationError("payload.data_base64 is not valid base64") from exc
-    else:
-        data = _read_media_path(
-            str(payload["path"]), kind=kind, byte_limit=byte_limit, limit_label=limit_label,
-        )
-    if len(data) > byte_limit:
-        raise ArtifactValidationError(f"{kind} payload exceeds the {limit_label}")
-    return data, mime
-
-
-def _scrub_optional_poster(payload: dict[str, Any]) -> tuple[str, int, int] | None:
-    """Route a caller-provided poster through image_scrub and return full data + dims."""
-    poster = payload.get("poster_base64")
-    if poster is None:
-        return None
-    if not isinstance(poster, str) or not poster:
-        raise ArtifactValidationError("payload.poster_base64 must be a non-empty string")
-    if len(poster) > ((IMAGE_LIMIT + 2) // 3) * 4 + 4:
-        raise ArtifactValidationError("payload.poster_base64 exceeds the 5MB image limit")
-    try:
-        poster_bytes = base64.b64decode(poster, validate=True)
-    except (binascii.Error, ValueError) as exc:
-        raise ArtifactValidationError("payload.poster_base64 is not valid base64") from exc
-    poster_mime = payload.get("poster_mime", "image/png")
-    if poster_mime not in IMAGE_TYPES:
-        raise ArtifactValidationError(
-            "payload.poster_mime must be image/png, image/jpeg, or image/webp"
-        )
-    try:
-        result = scrub_image(poster_bytes, poster_mime)
-    except ImageScrubError as exc:
-        raise ArtifactValidationError(f"video poster rejected: {exc}") from exc
-    if len(result.data) > IMAGE_LIMIT:
-        raise ArtifactValidationError("video poster exceeds the 5MB image limit")
-    full_data_url = (
-        f"data:{result.mime};base64,{base64.b64encode(result.data).decode('ascii')}"
-    )
-    return full_data_url, result.width, result.height
-
-
 def _write_video(payload: dict[str, Any], artifact_id: str) -> dict[str, Any]:
-    data, mime = _decode_media_payload(
+    return ingest_binary_artifact(
+        "video",
         payload,
-        kind="video",
-        allowed_mimes=VIDEO_MIMES,
-        byte_limit=VIDEO_LIMIT,
-        limit_label=f"{VIDEO_LIMIT // (1024 * 1024)}MB video limit",
-        optional_keys={"poster_base64", "poster_mime"},
+        artifact_id,
+        read_path=_read_media_path,
+        artifact_dir=_artifact_run_dir,
+        write_binary=_write_binary,
+        validate_normalized=_validate_normalized_binary_artifact,
+        scrub_video_fn=scrub_video,
     )
-    try:
-        result = scrub_video(data, mime)
-    except MediaScrubError as exc:
-        raise ArtifactValidationError(f"video payload rejected: {exc}") from exc
-    if len(result.data) > VIDEO_LIMIT:
-        raise ArtifactValidationError(
-            f"video payload exceeds the {VIDEO_LIMIT // (1024 * 1024)}MB video limit"
-        )
-    poster = _scrub_optional_poster(payload)
-
-    normalized: dict[str, Any] = {
-        "ref": f"artifact://{artifact_id}",
-        "mime": result.mime,
-        "byte_size": len(result.data),
-    }
-    if result.duration_ms is not None:
-        normalized["duration_ms"] = result.duration_ms
-    if result.width is not None:
-        normalized["width"] = result.width
-    if result.height is not None:
-        normalized["height"] = result.height
-    if poster is not None:
-        poster_b64, poster_w, poster_h = poster
-        normalized["poster_base64"] = poster_b64
-        # Poster dims can be a stable fallback when the container omits its own dims.
-        if result.width is None and poster_w:
-            normalized["width"] = poster_w
-        if result.height is None and poster_h:
-            normalized["height"] = poster_h
-    _validate_normalized_binary_artifact("video", artifact_id, normalized)
-    artifact_dir = _artifact_run_dir()
-    _write_binary(artifact_dir, artifact_id, VIDEO_MIMES[mime], result.data)
-    return normalized
-
-
-def _validate_audio_transcript(payload: dict[str, Any]) -> str | None:
-    transcript = payload.get("transcript")
-    if transcript is None:
-        return None
-    if not isinstance(transcript, str):
-        raise ArtifactValidationError("payload.transcript must be a string")
-    if len(transcript.encode("utf-8")) > TEXT_LIMIT:
-        raise ArtifactValidationError(
-            f"audio transcript exceeds the {TEXT_LIMIT // 1000}KB text limit"
-        )
-    return transcript
 
 
 def _write_audio(payload: dict[str, Any], artifact_id: str) -> dict[str, Any]:
-    data, mime = _decode_media_payload(
+    return ingest_binary_artifact(
+        "audio",
         payload,
-        kind="audio",
-        allowed_mimes=AUDIO_MIMES,
-        byte_limit=AUDIO_LIMIT,
-        limit_label=f"{AUDIO_LIMIT // (1024 * 1024)}MB audio limit",
-        optional_keys={"transcript"},
+        artifact_id,
+        read_path=_read_media_path,
+        artifact_dir=_artifact_run_dir,
+        write_binary=_write_binary,
+        validate_normalized=_validate_normalized_binary_artifact,
+        scrub_audio_fn=scrub_audio,
     )
-    # Validate EVERY field before touching the filesystem. A rejected
-    # transcript (or any other optional field) that fires after
-    # _write_binary would leave an orphaned .wav/.mp3 in the artifact
-    # directory — the write is atomic, so the caller can retry with a
-    # different id but the earlier bytes stay resident until the run's
-    # cleanup path runs.
-    try:
-        result = scrub_audio(data, mime)
-    except MediaScrubError as exc:
-        raise ArtifactValidationError(f"audio payload rejected: {exc}") from exc
-    if len(result.data) > AUDIO_LIMIT:
-        raise ArtifactValidationError(
-            f"audio payload exceeds the {AUDIO_LIMIT // (1024 * 1024)}MB audio limit"
-        )
-    transcript = _validate_audio_transcript(payload)
-
-    normalized: dict[str, Any] = {
-        "ref": f"artifact://{artifact_id}",
-        "mime": result.mime,
-        "byte_size": len(result.data),
-    }
-    if result.duration_ms is not None:
-        normalized["duration_ms"] = result.duration_ms
-    if result.peaks is not None:
-        normalized["peaks"] = result.peaks
-    if transcript is not None:
-        normalized["transcript"] = transcript
-    _validate_normalized_binary_artifact("audio", artifact_id, normalized)
-    artifact_dir = _artifact_run_dir()
-    _write_binary(artifact_dir, artifact_id, AUDIO_MIMES[mime], result.data)
-    return normalized
 
 def _decode_image_payload(payload: dict[str, Any], field: str) -> tuple[bytes, str]:
     if not isinstance(payload, dict):

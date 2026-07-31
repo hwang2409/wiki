@@ -388,7 +388,7 @@ def _copy_vui_parameters(
 
 def _parse_and_emit_sps_rbsp(
     rbsp: bytes,
-) -> tuple[bytes, int, tuple[int, int], tuple[int, int] | None]:
+) -> tuple[bytes, int, tuple[int, int], tuple[int, int] | None, int]:
     reader = _BitReader(rbsp)
     writer = _BitWriter()
 
@@ -541,7 +541,30 @@ def _parse_and_emit_sps_rbsp(
 
     reader.read_rbsp_trailing_bits()
     writer.write_rbsp_trailing_bits()
-    return writer.to_bytes(), sps_id, (display_width, display_height), vui_sar
+    return (
+        writer.to_bytes(), sps_id, (display_width, display_height), vui_sar,
+        frame_mbs,
+    )
+
+
+def canonicalise_sps_with_picture_bounds(
+    nal_bytes: bytes,
+) -> tuple[bytes, int, tuple[int, int], tuple[int, int] | None, int]:
+    """Canonicalise an SPS and return its coded-picture macroblock bound."""
+    _validate_nal_header(nal_bytes, 7, require_nonzero_ref=True)
+    header = nal_bytes[0]
+    rbsp = _rbsp_unescape(nal_bytes[1:])
+    if not rbsp:
+        raise MediaScrubError("h264 SPS RBSP is empty after unescape")
+    new_rbsp, sps_id, dimensions, vui_sar, frame_mbs = _parse_and_emit_sps_rbsp(rbsp)
+    nal_ref_idc = (header >> 5) & 0x3
+    return (
+        bytes([(nal_ref_idc << 5) | 7]) + _rbsp_escape(new_rbsp),
+        sps_id,
+        dimensions,
+        vui_sar,
+        frame_mbs,
+    )
 
 
 def canonicalise_sps_with_dimensions(
@@ -553,7 +576,7 @@ def canonicalise_sps_with_dimensions(
     rbsp = _rbsp_unescape(nal_bytes[1:])
     if not rbsp:
         raise MediaScrubError("h264 SPS RBSP is empty after unescape")
-    new_rbsp, sps_id, dimensions, vui_sar = _parse_and_emit_sps_rbsp(rbsp)
+    new_rbsp, sps_id, dimensions, vui_sar, _frame_mbs = _parse_and_emit_sps_rbsp(rbsp)
     nal_ref_idc = (header >> 5) & 0x3
     return (
         bytes([(nal_ref_idc << 5) | 7]) + _rbsp_escape(new_rbsp),
@@ -657,7 +680,7 @@ def canonicalise_nal_with_ids(
         raise MediaScrubError("h264 RBSP is empty after unescape")
 
     if expected_nal_type == 7:
-        new_rbsp, sps_id, _dimensions, _vui_sar = _parse_and_emit_sps_rbsp(rbsp)
+        new_rbsp, sps_id, _dimensions, _vui_sar, _frame_mbs = _parse_and_emit_sps_rbsp(rbsp)
         return (
             bytes([(nal_ref_idc << 5) | nal_type]) + _rbsp_escape(new_rbsp),
             sps_id,
@@ -736,8 +759,8 @@ def canonicalise_nal(nal_bytes: bytes, expected_nal_type: int) -> bytes:
     return canonical
 
 
-def parse_slice_header(nal_bytes: bytes) -> tuple[int, int]:
-    """Read and validate slice_type and pic_parameter_set_id from a slice."""
+def parse_slice_header_with_first_mb(nal_bytes: bytes) -> tuple[int, int, int]:
+    """Read first_mb_in_slice, slice_type, and PPS id from a coded slice."""
     if not nal_bytes:
         raise MediaScrubError("h264 slice NAL is empty")
     nal_type = nal_bytes[0] & 0x1F
@@ -750,7 +773,14 @@ def parse_slice_header(nal_bytes: bytes) -> tuple[int, int]:
     if slice_type > 9:
         raise MediaScrubError(f"h264 slice_type {slice_type} is out of range")
     pic_parameter_set_id = reader.read_ue()
-    del first_mb_in_slice
+    return first_mb_in_slice, slice_type, pic_parameter_set_id
+
+
+def parse_slice_header(nal_bytes: bytes) -> tuple[int, int]:
+    """Read and validate slice_type and pic_parameter_set_id from a slice."""
+    _first_mb_in_slice, slice_type, pic_parameter_set_id = parse_slice_header_with_first_mb(
+        nal_bytes,
+    )
     return slice_type, pic_parameter_set_id
 
 
