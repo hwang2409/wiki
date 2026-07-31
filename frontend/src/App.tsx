@@ -1362,13 +1362,12 @@ export default function App() {
     error: null,
   });
   const [refreshTick, setRefreshTick] = useState(0);
-  // WIKI-151: dedicated nonce for the file-explorer retry. Bumping the shared
-  // refreshTick to re-run the file effect also re-triggers workspace
-  // discovery, agent listing, note listing, etc., and (per round-2 review)
-  // caused Retry to issue TWO /api/files/tree requests instead of one. This
-  // nonce is only in the file-loading effect's dep list, so a retry is
-  // strictly scoped to the file fetch.
+  // WIKI-151: dedicated nonce for the file-explorer retry. This keeps a file
+  // retry scoped to its fetch instead of changing unrelated refresh state.
   const [filesRetryNonce, setFilesRetryNonce] = useState(0);
+  // Workspace discovery has its own trigger. Background SSE refreshes must
+  // not clear a verified root while a new discovery request is pending.
+  const [workspaceDiscoveryNonce, setWorkspaceDiscoveryNonce] = useState(0);
   // WIKI-157 (round-2 BLOCKING#1): drive HealthView's loading/error/retry
   // from the same boot state so it never renders "empty vault" during boot
   // or hides a boot failure behind an empty list.
@@ -1553,7 +1552,7 @@ export default function App() {
     return () => {
       ignore = true;
     };
-  }, [refreshTick, sidebarTab, switcherOpen, mode]);
+  }, [workspaceDiscoveryNonce, sidebarTab, switcherOpen, mode]);
 
   useEffect(() => {
     localStorage.setItem(
@@ -3863,7 +3862,7 @@ export default function App() {
                   onClick={() => {
                     setWorkspaceDiscoveryError(null);
                     workspaceRefreshVersionRef.current += 1;
-                    setRefreshTick((tick) => tick + 1);
+                    setWorkspaceDiscoveryNonce((nonce) => nonce + 1);
                   }}
                 >
                   <RefreshCw size={12} />

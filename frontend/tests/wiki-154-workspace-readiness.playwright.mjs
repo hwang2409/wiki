@@ -15,9 +15,24 @@ async function runScenario({ failure, customPath }) {
   const discoveryReleased = new Promise((resolve) => {
     releaseDiscovery = resolve;
   });
+  let releaseRefreshDiscovery;
+  const refreshDiscoveryReleased = new Promise((resolve) => {
+    releaseRefreshDiscovery = resolve;
+  });
+  let workspaceRequests = 0;
   let submittedWorkdir = null;
 
+  if (!failure) {
+    await page.route("**/api/events", async (route) => {
+      await route.fulfill({
+        status: 200,
+        headers: { "Content-Type": "text/event-stream", "Cache-Control": "no-cache" },
+        body: 'data: {"type":"session","ticket":"WIKI-REFRESH"}\n\n',
+      });
+    });
+  }
   await page.route("**/api/workspaces", async (route) => {
+    workspaceRequests += 1;
     if (failure) {
       await route.fulfill({
         status: 503,
@@ -26,7 +41,11 @@ async function runScenario({ failure, customPath }) {
       });
       return;
     }
-    await discoveryReleased;
+    if (workspaceRequests === 1) {
+      await discoveryReleased;
+    } else {
+      await refreshDiscoveryReleased;
+    }
     await route.fulfill({
       status: 200,
       contentType: "application/json",
@@ -92,12 +111,23 @@ async function runScenario({ failure, customPath }) {
     const workspaceResponse = page.waitForResponse("**/api/workspaces");
     releaseDiscovery();
     await workspaceResponse;
+    releaseRefreshDiscovery();
     const advanced = page.getByRole("button", { name: /Advanced/ });
     await advanced.click();
     if ((await projectDir.inputValue()) !== customPath) {
       throw new Error("workspace discovery overwrote the user's project directory");
     }
-    await advanced.click();
+
+    const workspaceRequestsBeforeRefresh = workspaceRequests;
+    await page.waitForTimeout(1_000);
+    if (workspaceRequests !== workspaceRequestsBeforeRefresh) {
+      throw new Error(
+        `a session refresh retriggered workspace discovery: before=${workspaceRequestsBeforeRefresh} after=${workspaceRequests}`,
+      );
+    }
+    if ((await projectDir.inputValue()) !== customPath || (await launch.isDisabled())) {
+      throw new Error("workspace root and launch readiness changed during refresh");
+    }
   }
 
   await page.waitForFunction(() => {
@@ -116,6 +146,7 @@ async function runScenario({ failure, customPath }) {
   if (submittedWorkdir === "/Users/henry/me/fun/wiki") {
     throw new Error("Wiki fallback must never be submitted");
   }
+  releaseRefreshDiscovery();
   await context.close();
 }
 

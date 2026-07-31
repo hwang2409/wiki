@@ -769,3 +769,25 @@ def test_reconcile_removes_empty_codex_fleet_notice(tmp_path: Path) -> None:
 
     assert store.reconcile_with_live({}, live_providers={}) is True
     assert store.snapshot() == []
+
+
+def test_codex_fleet_notice_keeps_unresolved_workers_until_each_resolves(tmp_path: Path) -> None:
+    store = _store(tmp_path)
+    store.apply_event(
+        {
+            "type": "codex_limit_no_eligible",
+            "tickets": ["WIKI-15", "WIKI-16"],
+            "run_ids": {"WIKI-15": "run-15", "WIKI-16": "run-16"},
+            "reset_at": None,
+            "ts": "t1",
+        }
+    )
+
+    assert store.reconcile_with_live(
+        {"WIKI-15": "run-15"},
+        live_providers={"WIKI-15": "codex"},
+    ) is True
+    assert _by_type(store, "codex_limit_no_eligible")["tickets"] == ["WIKI-15"]
+
+    assert store.reconcile_with_live({}, live_providers={}) is True
+    assert store.snapshot() == []

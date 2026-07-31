@@ -1150,6 +1150,67 @@ class WatchdogLoopTests(unittest.IsolatedAsyncioTestCase):
             self.assertIn("WIKI-15", emitted[0]["tickets"])
             self.assertEqual(emitted[0]["run_ids"], {"WIKI-15": "run-wiki-15"})
 
+    async def test_no_eligible_lists_every_live_codex_worker(self) -> None:
+        workers = [
+            accounts.WorkerEntry(
+                ticket="WIKI-15",
+                window="@42",
+                worktree="/tmp/wt-15",
+                log="/tmp/cdx-WIKI-15.log",
+                kind="cdx",
+                role="implement",
+                orch=None,
+                run_id="run-wiki-15",
+            ),
+            accounts.WorkerEntry(
+                ticket="WIKI-16",
+                window="@43",
+                worktree="/tmp/wt-16",
+                log="/tmp/cdx-WIKI-16.log",
+                kind="cdx",
+                role="implement",
+                orch=None,
+                run_id="run-wiki-16",
+            ),
+        ]
+        panes = {"@42": REAL_LIMIT_STRING, "@43": "> working"}
+        emitted: list[dict] = []
+
+        async def emit(evt: dict) -> None:
+            emitted.append(evt)
+
+        def iter_worker_kind(kind: str) -> list[accounts.WorkerEntry]:
+            return workers if kind == "cdx" else []
+
+        with mock.patch.object(accounts, "tmux_live_windows", lambda: {"@42", "@43"}), \
+             mock.patch.object(accounts, "iter_workers", iter_worker_kind), \
+             mock.patch.object(accounts, "tmux_capture", lambda window, lines=60: panes[window]), \
+             mock.patch.object(accounts, "read_state", return_value=accounts.AccountState()), \
+             mock.patch.object(accounts, "ensure_state_initialized", side_effect=lambda state: state), \
+             mock.patch.object(
+                 accounts,
+                 "rotate_locked",
+                 side_effect=[
+                     accounts.NoEligibleAccountError("no eligible account"),
+                     accounts.RotationError("rotation failed"),
+                 ],
+             ):
+            watch = accounts.WatchdogInternalState()
+            await accounts._check_once(watch, emit)
+            watch.last_rotation_attempt = 0.0
+            await accounts._check_once(watch, emit)
+
+        self.assertEqual(
+            [event["type"] for event in emitted],
+            ["codex_limit_no_eligible", "codex_rotation_failed"],
+        )
+        for event in emitted:
+            self.assertEqual(event["tickets"], ["WIKI-15", "WIKI-16"])
+            self.assertEqual(
+                event["run_ids"],
+                {"WIKI-15": "run-wiki-15", "WIKI-16": "run-wiki-16"},
+            )
+
     async def test_limit_rotation_pins_fallback_reset_when_parse_missing(self) -> None:
         with _EnvOverride() as paths:
             (paths["accounts"] / "alpha").mkdir()

@@ -1511,10 +1511,12 @@ async def _check_once(
     claude_workers = await asyncio.to_thread(iter_workers, "cc")
 
     codex_hits: list[tuple[WorkerEntry, str]] = []
+    live_codex_workers: list[WorkerEntry] = []
     auth_dead: list[WorkerEntry] = []
     for worker in codex_workers:
         if worker.window not in live:
             continue
+        live_codex_workers.append(worker)
         pane = await asyncio.to_thread(tmux_capture, worker.window, 80)
         if detect_codex_limit(pane):
             codex_hits.append((worker, pane))
@@ -1645,10 +1647,12 @@ async def _check_once(
     except RotationDebouncedError:
         return
     except NoEligibleAccountError:
-        affected_tickets = [worker.ticket for worker, _ in codex_hits]
+        # Rotation affects every live legacy Codex worker, not only workers
+        # whose panes showed the first limit signature.
+        affected_tickets = [worker.ticket for worker in live_codex_workers]
         affected_run_ids = {
             worker.ticket: worker.run_id
-            for worker, _ in codex_hits
+            for worker in live_codex_workers
             if worker.run_id
         }
         if _seconds_since(watch.last_no_eligible_alert) >= 3600:
@@ -1663,10 +1667,11 @@ async def _check_once(
             })
         return
     except RotationError as exc:
-        affected_tickets = [worker.ticket for worker, _ in codex_hits]
+        # Keep the same fleet scope when the account swap itself fails.
+        affected_tickets = [worker.ticket for worker in live_codex_workers]
         affected_run_ids = {
             worker.ticket: worker.run_id
-            for worker, _ in codex_hits
+            for worker in live_codex_workers
             if worker.run_id
         }
         await emit({
