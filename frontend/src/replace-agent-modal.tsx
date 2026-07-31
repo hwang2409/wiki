@@ -1,6 +1,7 @@
 import { useEffect, useState, type FormEvent } from "react";
 import { RefreshCw, X } from "lucide-react";
 import { getAgentModels, replaceAgent } from "./api";
+import { isWorkerRole, presetWorkerModel } from "./role-pipeline";
 import type {
   AgentModelOption,
   ReplaceAgentResult,
@@ -23,6 +24,7 @@ function defaultModel(
   kind: SpawnWorkerKind,
   role: string | null | undefined,
 ) {
+  if (isWorkerRole(role)) return presetWorkerModel(models, kind, role);
   const byKind = models.filter((option) => option.kind === kind);
   const field = role === "orchestrator" ? "default_orchestrator" : "default_worker";
   return byKind.find((option) => option[field])?.id ?? byKind[0]?.id ?? "";
@@ -190,6 +192,23 @@ export function ReplaceAgentModal({
               </select>
             </label>
           ) : null}
+        </div>
+
+        <div className="agent-spawn-preview">
+          <div className="agent-spawn-preview-title">Change</div>
+          <div className="agent-spawn-preview-primary">
+            <code>
+              {target.kind} · {target.model || "unknown"}
+              {target.kind === "cdx" && target.effort ? ` · ${target.effort}` : ""}
+            </code>
+            <span className="agent-replace-arrow" aria-hidden="true">
+              {" → "}
+            </span>
+            <code>
+              {kind} · {model || "…"}
+              {kind === "cdx" ? ` · ${effort}` : ""}
+            </code>
+          </div>
         </div>
 
         <div className="agent-replace-warning">

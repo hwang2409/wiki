@@ -34,6 +34,7 @@ import type {
   SpawnWorkerRole,
 } from "./api";
 import { DisclosureContent } from "./disclosure";
+import { ROLE_PRESETS, defaultWorkerModel, modelsForKind, presetWorkerModel } from "./role-pipeline";
 import { externalLinkProps } from "./external-links";
 import { LoadingPlaceholder } from "./loading";
 import { ReplaceAgentModal, type ReplaceAgentTarget } from "./replace-agent-modal";
@@ -90,15 +91,6 @@ type OrchestratorSpawnNotice = {
 };
 
 type SpawnNotice = WorkerSpawnNotice | OrchestratorSpawnNotice;
-
-function modelsForKind(models: AgentModelOption[], kind: SpawnWorkerKind): AgentModelOption[] {
-  return models.filter((option) => option.kind === kind);
-}
-
-function defaultWorkerModel(models: AgentModelOption[], kind: SpawnWorkerKind): string {
-  const byKind = modelsForKind(models, kind);
-  return byKind.find((option) => option.default_worker)?.id ?? byKind[0]?.id ?? "";
-}
 
 function defaultOrchestratorModel(models: AgentModelOption[], kind: SpawnWorkerKind): string {
   const byKind = modelsForKind(models, kind);
@@ -224,9 +216,22 @@ export function SpawnWorkerModal({
   useEffect(() => {
     const allowed = modelsForKind(models, kind);
     setModel((current) =>
-      allowed.some((option) => option.id === current) ? current : defaultWorkerModel(models, kind)
+      allowed.some((option) => option.id === current)
+        ? current
+        : presetWorkerModel(models, kind, role)
     );
+    // role is read for the preset fallback only; role changes apply their
+    // preset explicitly in the role <select> handler.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [kind, models]);
+
+  function applyRolePreset(nextRole: SpawnWorkerRole) {
+    const preset = ROLE_PRESETS[nextRole];
+    setRole(nextRole);
+    setKind(preset.kind);
+    setModel(presetWorkerModel(models, preset.kind, nextRole));
+    setEffort(preset.effort);
+  }
 
   useEffect(() => {
     if (orchestrators.length === 0) {
@@ -247,7 +252,6 @@ export function SpawnWorkerModal({
   const preludeTooLarge = prelude.length > 4096;
   const ticketValid = SPAWN_TICKET_PATTERN.test(normalizedTicket);
   const workdirValid = workdir.trim().length > 0;
-  const confirmLabel = `spawn ${kind} · ${model} · ${role} in ${workdir.trim()}?`;
   const canSubmit =
     ticketValid &&
     workdirValid &&
@@ -411,13 +415,16 @@ export function SpawnWorkerModal({
                 value={role}
                 onChange={(event) => {
                   resetConfirmation();
-                  setRole(event.target.value as SpawnWorkerRole);
+                  applyRolePreset(event.target.value as SpawnWorkerRole);
                 }}
               >
                 <option value="plan">plan</option>
                 <option value="implement">implement</option>
                 <option value="review">review</option>
               </select>
+              <span className="agent-spawn-hint">
+                Sets the pipeline default kind, model, and effort.
+              </span>
             </label>
           </div>
 
@@ -579,6 +586,31 @@ export function SpawnWorkerModal({
           </label>
         </div>
 
+        <div className="agent-spawn-preview">
+          <div className="agent-spawn-preview-title">This will create</div>
+          <div className="agent-spawn-preview-primary">
+            <code>
+              {kind}:{normalizedTicket || "…"}
+            </code>{" "}
+            · {role} worker · {model || "no model"}
+            {kind === "cdx" ? ` · ${effort} effort` : ""}
+          </div>
+          <div className="agent-spawn-preview-line">
+            {orch ? (
+              <>
+                under orchestrator <code>{orch}</code>
+              </>
+            ) : (
+              "ungrouped — no orchestrator"
+            )}{" "}
+            · in <code>{workdir.trim() || "…"}</code>
+          </div>
+          <div className="agent-spawn-preview-line">
+            kickoff prompt {promptBytes} bytes
+            {contextEnabled ? ` · context prelude ${prelude.length} chars` : ""}
+          </div>
+        </div>
+
         {!ticketValid && normalizedTicket ? (
           <div className="agent-spawn-error">Ticket ids must stay uppercase and match the worker pattern.</div>
         ) : null}
@@ -591,7 +623,7 @@ export function SpawnWorkerModal({
             Cancel
           </button>
           <button className="dialog-button dialog-confirm" disabled={!canSubmit} type="submit">
-            {submitting ? "Spawning…" : confirming ? confirmLabel : "Spawn"}
+            {submitting ? "Spawning…" : confirming ? "Confirm spawn" : "Spawn"}
           </button>
         </div>
       </form>
@@ -649,7 +681,6 @@ function SpawnOrchestratorModal({
   const goalTooLarge = goalBytes >= 20_000;
   const idValid = ORCH_ID_PATTERN.test(normalizedId);
   const projectDirValid = projectDir.trim().length > 0;
-  const confirmLabel = `launch ${kind} · ${normalizedId} · ${model} in ${projectDir.trim()}?`;
   const canSubmit = idValid && projectDirValid && model.length > 0 && !goalTooLarge && !submitting;
 
   async function submit(event: FormEvent<HTMLFormElement>) {
@@ -821,6 +852,22 @@ function SpawnOrchestratorModal({
           </label>
         </div>
 
+        <div className="agent-spawn-preview">
+          <div className="agent-spawn-preview-title">This will create</div>
+          <div className="agent-spawn-preview-primary">
+            <code>{normalizedId || "…"}</code> · {kind} orchestrator · {model || "no model"}
+            {kind === "cdx" ? ` · ${effort} effort` : ""}
+          </div>
+          <div className="agent-spawn-preview-line">
+            in <code>{projectDir.trim() || "…"}</code>
+          </div>
+          <div className="agent-spawn-preview-line">
+            {goal.trim().length > 0
+              ? `initial goal ${goalBytes} bytes`
+              : "no initial goal — reports ready and waits"}
+          </div>
+        </div>
+
         {!idValid && normalizedId ? (
           <div className="agent-spawn-error">
             Orchestrator ids must start with a letter or number and only use letters, numbers, dashes, or underscores.
@@ -834,7 +881,7 @@ function SpawnOrchestratorModal({
             Cancel
           </button>
           <button className="dialog-button dialog-confirm" disabled={!canSubmit} type="submit">
-            {submitting ? "Launching…" : confirming ? confirmLabel : "Launch"}
+            {submitting ? "Launching…" : confirming ? "Confirm launch" : "Launch"}
           </button>
         </div>
       </form>
@@ -886,34 +933,59 @@ function failedReasonsSuffix(reasons?: Record<string, string>): string {
   if (!reasons) return "";
   const entries = Object.entries(reasons);
   if (entries.length === 0) return "";
-  return ` — ${entries.map(([ticket, reason]) => `${ticket}: ${reason}`).join("; ")}`;
+  return ` (${entries.map(([ticket, reason]) => `${ticket}: ${reason}`).join("; ")})`;
 }
 
-function accountBannerLine(event: AccountEvent): string {
+function countWorkers(count: number): string {
+  return `${count} worker${count === 1 ? "" : "s"}`;
+}
+
+// Impact-first copy: what happened to the fleet, then the next action.
+function accountBannerCopy(event: AccountEvent): { impact: string; action: string | null } {
   switch (event.type) {
     case "codex_rotation": {
       const from = event.from ? event.from : "(unset)";
-      const revived = event.revived.length;
       const failed = event.failed.length;
-      const tail = failed > 0 ? `, ${failed} failed to revive` : "";
-      return `rotated codex account ${from} → ${event.to}, revived ${revived} worker${revived === 1 ? "" : "s"}${tail}${failedReasonsSuffix(event.failed_reasons)}`;
+      return {
+        impact: `Codex account switched ${from} → ${event.to}; ${countWorkers(event.revived.length)} resumed automatically.`,
+        action:
+          failed > 0
+            ? `${countWorkers(failed)} did not resume${failedReasonsSuffix(event.failed_reasons)} — revive or replace them from their cards.`
+            : null,
+      };
     }
     case "codex_limit_no_eligible":
-      return event.reset_at
-        ? `codex usage limit hit, no eligible account until ${event.reset_at}`
-        : "codex usage limit hit, no eligible account";
+      return {
+        impact: `Codex usage limit reached on every account — ${event.tickets.length > 0 ? `${event.tickets.join(", ")} are` : "Codex workers are"} paused.`,
+        action: event.reset_at
+          ? `They resume when the limit resets at ${event.reset_at}. To keep moving now, replace them with Claude workers.`
+          : "To keep moving now, replace them with Claude workers.",
+      };
     case "codex_rotation_failed":
-      return `codex rotation failed: ${event.error}`;
+      return {
+        impact: "Codex account rotation failed — paused Codex workers stay paused.",
+        action: `Fix Codex auth, then revive workers from their cards. (${event.error})`,
+      };
     case "codex_auth_dead_revival": {
-      const revived = event.revived.length;
       const failed = event.failed.length;
-      const tail = failed > 0 ? `, ${failed} failed` : "";
-      return `codex auth-dead: revived ${revived} worker${revived === 1 ? "" : "s"}${tail}${failedReasonsSuffix(event.failed_reasons)}`;
+      return {
+        impact: `Codex sign-in recovered; ${countWorkers(event.revived.length)} restarted.`,
+        action:
+          failed > 0
+            ? `${countWorkers(failed)} did not restart${failedReasonsSuffix(event.failed_reasons)} — replace them from their cards.`
+            : null,
+      };
     }
     case "codex_auth_dead_exhausted":
-      return `codex auth-dead: revival cap hit on ${event.tickets.join(", ")} — manual attention needed`;
+      return {
+        impact: `Codex sign-in is dead and automatic restarts ran out for ${event.tickets.join(", ")}.`,
+        action: "Sign in to Codex again, then replace these workers.",
+      };
     case "claude_limit_hit":
-      return `claude usage limit hit on ${event.ticket}`;
+      return {
+        impact: `Claude usage limit hit — ${event.ticket} is paused.`,
+        action: "It resumes when the limit resets, or replace it with a Codex worker.",
+      };
   }
 }
 
@@ -926,16 +998,44 @@ function bannerTone(event: AccountEvent): "info" | "warn" | "danger" {
   return "danger";
 }
 
+function TechDetails({ rows }: { rows: Array<[string, ReactNode] | null | false> }) {
+  const visible = rows.filter(Boolean) as Array<[string, ReactNode]>;
+  if (visible.length === 0) {
+    return <div className="agent-tech-empty">No technical details recorded.</div>;
+  }
+  return (
+    <dl className="agent-tech">
+      {visible.map(([term, value]) => (
+        <div className="agent-tech-row" key={term}>
+          <dt>{term}</dt>
+          <dd>{value}</dd>
+        </div>
+      ))}
+    </dl>
+  );
+}
+
 function AccountEventsBanner({ events }: { events: AccountEvent[] }) {
   if (events.length === 0) return null;
   return (
     <div aria-live="polite" className="agents-account-banner">
-      {events.map((event, index) => (
-        <div className={`agents-account-banner-row is-${bannerTone(event)}`} key={`${event.ts}-${index}`}>
-          <AlertTriangle size={13} />
-          <span>{accountBannerLine(event)}</span>
-        </div>
-      ))}
+      {events.map((event, index) => {
+        const copy = accountBannerCopy(event);
+        return (
+          <div
+            className={`agents-account-banner-row is-${bannerTone(event)}`}
+            key={`${event.ts}-${index}`}
+          >
+            <AlertTriangle size={13} />
+            <span className="agents-account-banner-copy">
+              <span className="agents-account-banner-impact">{copy.impact}</span>
+              {copy.action ? (
+                <span className="agents-account-banner-action">{copy.action}</span>
+              ) : null}
+            </span>
+          </div>
+        );
+      })}
     </div>
   );
 }
@@ -989,6 +1089,16 @@ export function AgentsView({
   const [expandedScreencasts, setExpandedScreencasts] = useState<Set<string>>(
     readStoredExpandedScreencasts
   );
+  const [expandedDetails, setExpandedDetails] = useState<Set<string>>(new Set());
+
+  function toggleDetails(id: string) {
+    setExpandedDetails((prev) => {
+      const next = new Set(prev);
+      if (next.has(id)) next.delete(id);
+      else next.add(id);
+      return next;
+    });
+  }
 
   useEffect(() => {
     localStorage.setItem(SCREENCAST_EXPANDED_KEY, JSON.stringify([...expandedScreencasts]));
@@ -1264,8 +1374,18 @@ export function AgentsView({
     const state = stateLabel(worker);
     const isOpen = openTicket === worker.ticket;
     const previewOpen = expandedScreencasts.has(worker.ticket);
+    const detailsOpen = expandedDetails.has(worker.ticket);
     return (
-      <article className={`agent-card${isOpen ? " is-selected" : ""}`} key={worker.ticket}>
+      <article
+        className={`agent-card${isOpen ? " is-selected" : ""}`}
+        key={worker.ticket}
+        onClick={(event) => {
+          const target = event.target as HTMLElement;
+          if (target.closest("button, a, input, textarea, select, .agent-screencast, .agent-tech"))
+            return;
+          onOpenTicket(isOpen ? null : worker.ticket);
+        }}
+      >
         <header className="agent-card-header">
           <a
             className="agent-ticket"
@@ -1303,24 +1423,6 @@ export function AgentsView({
         ) : null}
 
         <div className="agent-meta">
-          {worker.window ? (
-            <span className={`agent-window${worker.window_alive ? "" : " is-dead"}`}>
-              tmux {worker.window}
-            </span>
-          ) : null}
-          {worker.run_id ? (
-            <span className={`agent-window${worker.control_attached ? "" : " is-dead"}`}>
-              run {worker.run_id.slice(0, 8)} · {worker.runtime_state ?? "unknown"}
-            </span>
-          ) : null}
-          {worker.session && worker.history.length > 0 ? (
-            <span className="agent-chain">
-              session {worker.session} · prev:{" "}
-              {worker.history
-                .map((s) => `${s.role ?? "?"} (${s.kind ?? "?"}, ${s.outcome ?? "?"})`)
-                .join(" → ")}
-            </span>
-          ) : null}
           {worker.worktree ? (
             <BranchPill
               branch={worker.worktree.split("/").slice(-1)[0] ?? worker.worktree}
@@ -1369,7 +1471,7 @@ export function AgentsView({
               onClick={() => onOpenTicket(isOpen ? null : worker.ticket)}
             >
               <ScrollText size={13} />
-              log
+              session
             </button>
             {worker.run_id ? (
               <button
@@ -1385,8 +1487,48 @@ export function AgentsView({
                 output
               </button>
             ) : null}
+            <button
+              aria-expanded={detailsOpen}
+              className={`agent-log-toggle${detailsOpen ? " is-active" : ""}`}
+              type="button"
+              onClick={() => toggleDetails(worker.ticket)}
+            >
+              <ChevronDown
+                className={`disclosure-chevron${detailsOpen ? "" : " is-collapsed"}`}
+                size={13}
+              />
+              details
+            </button>
           </span>
         </div>
+
+        <DisclosureContent open={detailsOpen}>
+          <TechDetails
+            rows={[
+              worker.run_id
+                ? [
+                    "run",
+                    `${worker.run_id} · ${worker.runtime_state ?? "unknown"} · control ${worker.control_attached ? "attached" : "detached"}`,
+                  ]
+                : null,
+              worker.window
+                ? ["tmux", `${worker.window}${worker.window_alive ? "" : " · window gone"}`]
+                : null,
+              worker.session !== null
+                ? [
+                    "session",
+                    worker.history.length > 0
+                      ? `${worker.session} · prev: ${worker.history
+                          .map((s) => `${s.role ?? "?"} (${s.kind ?? "?"}, ${s.outcome ?? "?"})`)
+                          .join(" → ")}`
+                      : `${worker.session}`,
+                  ]
+                : null,
+              worker.worktree ? ["worktree", worker.worktree] : null,
+              worker.log ? ["log", worker.log] : null,
+            ]}
+          />
+        </DisclosureContent>
 
         {worker.run_id ? (
           <DisclosureContent open={previewOpen}>
@@ -1416,8 +1558,15 @@ export function AgentsView({
       </div>
     );
   } else {
+    const activeCount = orchestrators.length + liveWorkers.length;
     body = (
       <>
+        {activeCount > 0 ? (
+          <div className="agents-section-head is-primary" data-testid="agents-section-active">
+            <span className="agents-section-title">Active</span>
+            <span className="agents-section-count tabular-nums">{activeCount}</span>
+          </div>
+        ) : null}
         {grouped.map(({ orch, owned }) => {
           const deadRun = isDeadRun(orch);
           return (
@@ -1439,11 +1588,6 @@ export function AgentsView({
                       state={orch.runtime_state ?? "unknown"}
                     />
                   )
-                ) : null}
-                {orch.run_id ? (
-                  <span className={`agent-window${orch.control_attached ? "" : " is-dead"}`}>
-                    run {orch.run_id.slice(0, 8)} · {orch.runtime_state ?? "unknown"}
-                  </span>
                 ) : null}
                 {orch.window && !orch.window_alive ? (
                   <span className="agents-orch-dead">window gone</span>
@@ -1472,10 +1616,39 @@ export function AgentsView({
                     onClick={() => onOpenTicket(openTicket === orch.id ? null : orch.id)}
                   >
                     <ScrollText size={13} />
-                    log
+                    session
+                  </button>
+                  <button
+                    aria-expanded={expandedDetails.has(orch.id)}
+                    className={`agent-log-toggle${expandedDetails.has(orch.id) ? " is-active" : ""}`}
+                    type="button"
+                    onClick={() => toggleDetails(orch.id)}
+                  >
+                    <ChevronDown
+                      className={`disclosure-chevron${expandedDetails.has(orch.id) ? "" : " is-collapsed"}`}
+                      size={13}
+                    />
+                    details
                   </button>
                 </span>
               </div>
+              <DisclosureContent open={expandedDetails.has(orch.id)}>
+                <TechDetails
+                  rows={[
+                    orch.run_id
+                      ? [
+                          "run",
+                          `${orch.run_id} · ${orch.runtime_state ?? "unknown"} · control ${orch.control_attached ? "attached" : "detached"}`,
+                        ]
+                      : null,
+                    orch.window
+                      ? ["tmux", `${orch.window}${orch.window_alive ? "" : " · window gone"}`]
+                      : null,
+                    orch.cwd ? ["project dir", orch.cwd] : null,
+                    orch.log ? ["log", orch.log] : null,
+                  ]}
+                />
+              </DisclosureContent>
               {archiveErrors[orch.id] ? (
                 <div className="agent-inline-error">{archiveErrors[orch.id]}</div>
               ) : null}
@@ -1488,15 +1661,16 @@ export function AgentsView({
         })}
 
         {ungrouped.length > 0 && grouped.length > 0 ? (
-          <div className="agents-section-head">workers</div>
+          <div className="agents-section-head">unassigned workers</div>
         ) : null}
         {ungrouped.map(renderWorker)}
 
         {archived.length > 0 ? (
           <>
-            <div className="agents-section-head">
+            <div className="agents-section-head is-primary" data-testid="agents-section-history">
               <Archive size={13} />
-              archived
+              <span className="agents-section-title">History</span>
+              <span className="agents-section-count tabular-nums">{archived.length}</span>
             </div>
             {archived.map((entry) => {
               const key = `${entry.ticket}-${entry.archived_at}`;
@@ -1505,6 +1679,11 @@ export function AgentsView({
                 <article
                   className={`agent-card is-archived${isOpen ? " is-selected" : ""}`}
                   key={key}
+                  onClick={(event) => {
+                    const target = event.target as HTMLElement;
+                    if (target.closest("button, a")) return;
+                    onOpenTicket(isOpen ? null : entry.ticket);
+                  }}
                 >
                   <header className="agent-card-header">
                     <a
@@ -1542,7 +1721,7 @@ export function AgentsView({
                       onClick={() => onOpenTicket(isOpen ? null : entry.ticket)}
                     >
                       <ScrollText size={13} />
-                      log
+                      session
                     </button>
                   </div>
                 </article>
@@ -1560,10 +1739,11 @@ export function AgentsView({
       <div className="agents-view">
         <div className="agents-toolbar">
           <div>
-            <div className="agents-toolbar-title">Workers</div>
+            <div className="agents-toolbar-title">Runs</div>
             <div className="agents-toolbar-meta">
               {orchestrators.length} orchestrator{orchestrators.length === 1 ? "" : "s"} ·{" "}
-              {liveWorkers.length} live worker{liveWorkers.length === 1 ? "" : "s"}
+              {liveWorkers.length} live worker{liveWorkers.length === 1 ? "" : "s"} ·{" "}
+              {archived.length} in history
             </div>
           </div>
           <div className="dialog-actions">
