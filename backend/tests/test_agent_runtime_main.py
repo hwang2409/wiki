@@ -1586,6 +1586,28 @@ class BackendSupervisorEndToEndTests(unittest.IsolatedAsyncioTestCase):
             1,
         )
 
+    async def test_context_spawn_retry_keeps_implicit_id_when_context_changes(self) -> None:
+        request = main.SpawnWorkerIn(
+            ticket="WIKI-CONTEXT-RETRY",
+            kind="cdx",
+            role="implement",
+            model="gpt-5.4",
+            effort="high",
+            workdir=str(self.worktree),
+            prompt="Retry-safe context spawn.",
+            context_prelude=True,
+        )
+        with mock.patch.object(
+            main,
+            "_contextual_prompt",
+            side_effect=["context from first attempt", "context after live changes"],
+        ):
+            first = await asyncio.to_thread(main.spawn_agent, request)
+            second = await asyncio.to_thread(main.spawn_agent, request)
+
+        self.assertEqual(second, first)
+        self.assertEqual(second["request_id"], first["request_id"])
+
 
 class DetachedHeadlessAcceptanceTests(unittest.TestCase):
     def setUp(self) -> None:

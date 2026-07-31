@@ -1010,6 +1010,56 @@ class RunStoreTests(unittest.TestCase):
             self.assertEqual(legacy["outcome"], "handoff")
             self.assertEqual(legacy["migration"], "headless-supervisor")
 
+    def test_create_rejects_oversized_status_before_registry_mutation(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            paths = _paths(root)
+            original_registry = {
+                "WIKI-42": {
+                    "history": [],
+                    "current": {"window": "@9999", "kind": "cdx"},
+                }
+            }
+            paths.registry_path.parent.mkdir(parents=True)
+            paths.registry_path.write_text(json.dumps(original_registry), encoding="utf-8")
+            paths.status_dir.mkdir(parents=True)
+            status_path = paths.status_dir / "WIKI-42.json"
+            oversized = b"x" * (store_module.MAX_START_STATUS_BYTES + 1)
+            status_path.write_bytes(oversized)
+            store = RunStore(paths)
+
+            with self.assertRaisesRegex(StoreError, "status file exceeds"):
+                store.create(_record(root), migrate_legacy=True)
+
+            self.assertEqual(json.loads(paths.registry_path.read_text()), original_registry)
+            self.assertEqual(status_path.read_bytes(), oversized)
+
+    def test_create_rejects_symlink_status_before_registry_mutation(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            paths = _paths(root)
+            original_registry = {
+                "WIKI-42": {
+                    "history": [],
+                    "current": {"window": "@9999", "kind": "cdx"},
+                }
+            }
+            paths.registry_path.parent.mkdir(parents=True)
+            paths.registry_path.write_text(json.dumps(original_registry), encoding="utf-8")
+            paths.status_dir.mkdir(parents=True)
+            outside = root / "outside-status.json"
+            outside.write_text('{"state":"working"}\n', encoding="utf-8")
+            status_path = paths.status_dir / "WIKI-42.json"
+            status_path.symlink_to(outside)
+            store = RunStore(paths)
+
+            with self.assertRaisesRegex(StoreError, "symlink status file"):
+                store.create(_record(root), migrate_legacy=True)
+
+            self.assertEqual(json.loads(paths.registry_path.read_text()), original_registry)
+            self.assertTrue(status_path.is_symlink())
+            self.assertEqual(outside.read_text(encoding="utf-8"), '{"state":"working"}\n')
+
     def test_create_rejects_malformed_legacy_orchestrator_registry(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)

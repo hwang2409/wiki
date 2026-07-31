@@ -4606,13 +4606,7 @@ def spawn_agent(
         raise HTTPException(status_code=400, detail="Kickoff prompt must be smaller than 100KB")
 
     workdir_path = resolve_existing_dir(body.workdir, field_name="Working directory")
-    try:
-        prompt = _contextual_prompt(body, repo_root=workdir_path)
-    except context_prelude.PreludeError as exc:
-        raise HTTPException(status_code=400, detail=str(exc)) from exc
-    if len(prompt.encode("utf-8")) >= MAX_SPAWN_PROMPT_BYTES:
-        raise HTTPException(status_code=400, detail="Kickoff prompt must be smaller than 100KB")
-
+    orch = (body.orch or "").strip()
     implicit_request_id = body.implicit_request_id or body.request_id is None
     request_id = body.request_id or _stable_spawn_request_id(
         {
@@ -4622,13 +4616,22 @@ def spawn_agent(
             "model": model,
             "effort": effort,
             "worktree": str(workdir_path),
-            "prompt": prompt,
-            "orchestrator_id": (body.orch or "").strip() or None,
+            "prompt": body.prompt,
+            "title": body.title,
+            "context_prelude": body.context_prelude,
+            "include_context": body.include_context,
+            "context_prelude_override": body.context_prelude_override,
+            "orchestrator_id": orch or None,
         }
     )
+    try:
+        prompt = _contextual_prompt(body, repo_root=workdir_path)
+    except context_prelude.PreludeError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    if len(prompt.encode("utf-8")) >= MAX_SPAWN_PROMPT_BYTES:
+        raise HTTPException(status_code=400, detail="Kickoff prompt must be smaller than 100KB")
 
     registry = _read_agent_registry()
-    orch = (body.orch or "").strip()
     if orch:
         if not ORCH_ID_PATTERN.fullmatch(orch):
             raise HTTPException(status_code=400, detail="Orchestrator id is invalid")

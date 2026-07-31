@@ -27,6 +27,9 @@ from .types import (
 )
 
 
+MAX_START_STATUS_BYTES = 64 * 1024
+
+
 class StoreError(RuntimeError):
     pass
 
@@ -468,6 +471,47 @@ def _atomic_write_bytes(path: Path, value: bytes) -> None:
             pass
         tmp.unlink(missing_ok=True)
         raise
+
+
+def _read_start_status(path: Path) -> tuple[bool, bytes | None]:
+    try:
+        initial = os.lstat(path)
+    except FileNotFoundError:
+        return False, None
+    except OSError as exc:
+        raise StoreError(f"could not inspect status file: {path}") from exc
+    if stat.S_ISLNK(initial.st_mode):
+        raise StoreError(f"refusing symlink status file: {path}")
+    if not stat.S_ISREG(initial.st_mode):
+        raise StoreError(f"refusing non-regular status file: {path}")
+    if initial.st_size > MAX_START_STATUS_BYTES:
+        raise StoreError(f"status file exceeds {MAX_START_STATUS_BYTES} bytes: {path}")
+    flags = os.O_RDONLY
+    if hasattr(os, "O_NOFOLLOW"):
+        flags |= os.O_NOFOLLOW
+    try:
+        fd = os.open(path, flags)
+    except FileNotFoundError:
+        return False, None
+    except OSError as exc:
+        raise StoreError(f"could not open status file: {path}") from exc
+    try:
+        opened = os.fstat(fd)
+        if stat.S_ISLNK(opened.st_mode) or not stat.S_ISREG(opened.st_mode):
+            raise StoreError(f"refusing non-regular status file: {path}")
+        if opened.st_size > MAX_START_STATUS_BYTES:
+            raise StoreError(f"status file exceeds {MAX_START_STATUS_BYTES} bytes: {path}")
+        content = bytearray()
+        while len(content) <= MAX_START_STATUS_BYTES:
+            chunk = os.read(fd, MAX_START_STATUS_BYTES + 1 - len(content))
+            if not chunk:
+                break
+            content.extend(chunk)
+        if len(content) > MAX_START_STATUS_BYTES:
+            raise StoreError(f"status file exceeds {MAX_START_STATUS_BYTES} bytes: {path}")
+        return True, bytes(content)
+    finally:
+        os.close(fd)
 
 
 def _append_json_line(path: Path, value: Any) -> None:
@@ -1135,8 +1179,7 @@ class RunStore:
             # supervisor calls create() while holding the per-agent lock.
             status_path = self.status_path(record.agent_id)
             _ensure_parent_dir(status_path.parent)
-            status_present = status_path.is_file()
-            status_content = status_path.read_bytes() if status_present else None
+            status_present, status_content = _read_start_status(status_path)
             status_path.unlink(missing_ok=True)
             legacy_orchestrators = registry.get("_orchestrators")
             legacy_entry = (
