@@ -5090,6 +5090,36 @@ body.is-resizing-panes .pane-cell {
   opacity: 0.85;
 }
 
+.agents-account-banner-details-toggle {
+  display: inline-flex;
+  align-items: center;
+  gap: 3px;
+  align-self: flex-start;
+  margin-top: 2px;
+  color: var(--text-faint);
+  font-family: var(--font-monospace);
+  font-weight: var(--font-monospace-weight);
+  font-size: var(--font-ui-smaller);
+  transition-property: color;
+  transition-duration: 100ms;
+  transition-timing-function: ease-out;
+}
+
+.agents-account-banner-details-toggle:hover {
+  color: var(--text-normal);
+}
+
+.agents-account-banner-diagnostics {
+  margin: 4px 0 0;
+  padding: 6px 10px 6px 24px;
+  border-left: 2px solid var(--background-modifier-border);
+  color: var(--text-muted);
+  font-family: var(--font-monospace);
+  font-weight: var(--font-monospace-weight);
+  font-size: var(--font-ui-smaller);
+  overflow-wrap: anywhere;
+}
+
 .agent-card {
   padding: 12px 14px;
   border: 1px solid var(--background-modifier-border);

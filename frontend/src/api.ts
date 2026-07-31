@@ -215,11 +215,52 @@ export type Orchestrator = {
   log?: string | null;
 };
 
+export type AccountEvent =
+  | {
+      type: "codex_rotation";
+      from: string | null;
+      to: string;
+      revived: string[];
+      failed: string[];
+      failed_reasons?: Record<string, string>;
+      ts: string;
+    }
+  | {
+      type: "codex_limit_no_eligible";
+      tickets: string[];
+      reset_at: string | null;
+      ts: string;
+    }
+  | {
+      type: "codex_rotation_failed";
+      error: string;
+      ts: string;
+    }
+  | {
+      type: "codex_auth_dead_revival";
+      revived: string[];
+      failed: string[];
+      failed_reasons?: Record<string, string>;
+      ts: string;
+    }
+  | {
+      type: "codex_auth_dead_exhausted";
+      tickets: string[];
+      ts: string;
+    }
+  | {
+      type: "claude_limit_hit";
+      ticket: string;
+      window: string;
+      ts: string;
+    };
+
 export function getAgents() {
   return request<{
     workers: AgentWorker[];
     orchestrators: Orchestrator[];
     archived: ArchivedWorker[];
+    account_notices?: AccountEvent[];
   }>("/api/agents");
 }
 

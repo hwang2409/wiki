@@ -28,6 +28,7 @@ from fastapi.responses import FileResponse, JSONResponse, StreamingResponse
 from pydantic import BaseModel, Field, ValidationError, model_validator
 
 from . import (
+    account_notices,
     accounts,
     backend_runtime,
     context_prelude,
@@ -100,6 +101,7 @@ IGNORED_FILE_PARTS = {
 VAULT_DIR.mkdir(parents=True, exist_ok=True)
 
 PROVIDER_HEALTH = provider_health.ProviderHealthTracker()
+ACCOUNT_NOTICES = account_notices.AccountNoticeStore()
 UNKNOWN_KIND_TELEMETRY: UnknownKindTelemetry | None = None
 logger = logging.getLogger(__name__)
 
@@ -2122,6 +2124,7 @@ def agents() -> dict[str, object]:
         "orchestrators": orchestrators,
         "archived": list_archived(),
         "supervisor": supervisor_health,
+        "account_notices": ACCOUNT_NOTICES.snapshot(),
     }
 
 
@@ -5451,6 +5454,7 @@ _event_subscribers: set[asyncio.Queue[dict]] = set()
 
 async def publish_agent_event(event: dict) -> None:
     _consume_provider_health_signal(event)
+    ACCOUNT_NOTICES.apply_event(event)
     dead: list[asyncio.Queue[dict]] = []
     for queue_ in list(_event_subscribers):
         try:

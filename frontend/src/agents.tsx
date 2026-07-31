@@ -22,6 +22,7 @@ import {
   spawnAgentWorker,
 } from "./api";
 import type {
+  AccountEvent,
   AgentModelOption,
   AgentControlAction,
   AgentControlResult,
@@ -889,52 +890,7 @@ function SpawnOrchestratorModal({
   );
 }
 
-export type AccountEvent =
-  | {
-      type: "codex_rotation";
-      from: string | null;
-      to: string;
-      revived: string[];
-      failed: string[];
-      failed_reasons?: Record<string, string>;
-      ts: string;
-    }
-  | {
-      type: "codex_limit_no_eligible";
-      tickets: string[];
-      reset_at: string | null;
-      ts: string;
-    }
-  | {
-      type: "codex_rotation_failed";
-      error: string;
-      ts: string;
-    }
-  | {
-      type: "codex_auth_dead_revival";
-      revived: string[];
-      failed: string[];
-      failed_reasons?: Record<string, string>;
-      ts: string;
-    }
-  | {
-      type: "codex_auth_dead_exhausted";
-      tickets: string[];
-      ts: string;
-    }
-  | {
-      type: "claude_limit_hit";
-      ticket: string;
-      window: string;
-      ts: string;
-    };
-
-function failedReasonsSuffix(reasons?: Record<string, string>): string {
-  if (!reasons) return "";
-  const entries = Object.entries(reasons);
-  if (entries.length === 0) return "";
-  return ` (${entries.map(([ticket, reason]) => `${ticket}: ${reason}`).join("; ")})`;
-}
+export type { AccountEvent } from "./api";
 
 function countWorkers(count: number): string {
   return `${count} worker${count === 1 ? "" : "s"}`;
@@ -950,7 +906,7 @@ function accountBannerCopy(event: AccountEvent): { impact: string; action: strin
         impact: `Codex account switched ${from} → ${event.to}; ${countWorkers(event.revived.length)} resumed automatically.`,
         action:
           failed > 0
-            ? `${countWorkers(failed)} did not resume${failedReasonsSuffix(event.failed_reasons)} — revive or replace them from their cards.`
+            ? `${countWorkers(failed)} did not resume — revive or replace them from their cards.`
             : null,
       };
     }
@@ -964,7 +920,7 @@ function accountBannerCopy(event: AccountEvent): { impact: string; action: strin
     case "codex_rotation_failed":
       return {
         impact: "Codex account rotation failed — paused Codex workers stay paused.",
-        action: `Fix Codex auth, then revive workers from their cards. (${event.error})`,
+        action: "Fix Codex auth, then revive workers from their cards.",
       };
     case "codex_auth_dead_revival": {
       const failed = event.failed.length;
@@ -972,7 +928,7 @@ function accountBannerCopy(event: AccountEvent): { impact: string; action: strin
         impact: `Codex sign-in recovered; ${countWorkers(event.revived.length)} restarted.`,
         action:
           failed > 0
-            ? `${countWorkers(failed)} did not restart${failedReasonsSuffix(event.failed_reasons)} — replace them from their cards.`
+            ? `${countWorkers(failed)} did not restart — replace them from their cards.`
             : null,
       };
     }
@@ -1015,22 +971,72 @@ function TechDetails({ rows }: { rows: Array<[string, ReactNode] | null | false>
   );
 }
 
+// Raw diagnostics (backend exception text, per-worker failure reasons) stay
+// out of the default banner and render only inside the details disclosure.
+function bannerDiagnostics(event: AccountEvent): string[] {
+  const lines: string[] = [];
+  if (event.type === "codex_rotation_failed" && event.error) {
+    lines.push(event.error);
+  }
+  if (event.type === "codex_rotation" || event.type === "codex_auth_dead_revival") {
+    const reasons = event.failed_reasons ?? {};
+    for (const ticket of event.failed) {
+      lines.push(reasons[ticket] ? `${ticket}: ${reasons[ticket]}` : ticket);
+    }
+  }
+  return lines;
+}
+
 function AccountEventsBanner({ events }: { events: AccountEvent[] }) {
+  const [openDiagnostics, setOpenDiagnostics] = useState<Set<string>>(new Set());
   if (events.length === 0) return null;
   return (
     <div aria-live="polite" className="agents-account-banner">
       {events.map((event, index) => {
         const copy = accountBannerCopy(event);
+        const diagnostics = bannerDiagnostics(event);
+        const key = `${event.ts}-${event.type}-${index}`;
+        const open = openDiagnostics.has(key);
         return (
           <div
             className={`agents-account-banner-row is-${bannerTone(event)}`}
-            key={`${event.ts}-${index}`}
+            key={key}
           >
             <AlertTriangle size={13} />
             <span className="agents-account-banner-copy">
               <span className="agents-account-banner-impact">{copy.impact}</span>
               {copy.action ? (
                 <span className="agents-account-banner-action">{copy.action}</span>
+              ) : null}
+              {diagnostics.length > 0 ? (
+                <>
+                  <button
+                    aria-expanded={open}
+                    className="agents-account-banner-details-toggle"
+                    type="button"
+                    onClick={() =>
+                      setOpenDiagnostics((prev) => {
+                        const next = new Set(prev);
+                        if (next.has(key)) next.delete(key);
+                        else next.add(key);
+                        return next;
+                      })
+                    }
+                  >
+                    <ChevronDown
+                      className={`disclosure-chevron${open ? "" : " is-collapsed"}`}
+                      size={12}
+                    />
+                    Technical details
+                  </button>
+                  <DisclosureContent open={open}>
+                    <ul className="agents-account-banner-diagnostics">
+                      {diagnostics.map((line, lineIndex) => (
+                        <li key={lineIndex}>{line}</li>
+                      ))}
+                    </ul>
+                  </DisclosureContent>
+                </>
               ) : null}
             </span>
           </div>
@@ -1046,23 +1052,23 @@ export function AgentsView({
   refreshTick,
   openTicket,
   onOpenTicket,
-  accountEvents = [],
 }: {
   data?: {
     workers: AgentWorker[] | null;
     orchestrators: Orchestrator[];
     archived: ArchivedWorker[];
     error: string | null;
+    account_notices?: AccountEvent[];
   };
   onOpenAgent: (ticket: string, panel?: "review") => void;
   refreshTick: number;
   openTicket: string | null;
   onOpenTicket: (ticket: string | null) => void;
-  accountEvents?: AccountEvent[];
 }) {
   const [fetchedWorkers, setFetchedWorkers] = useState<AgentWorker[] | null>(null);
   const [fetchedOrchestrators, setFetchedOrchestrators] = useState<Orchestrator[]>([]);
   const [fetchedArchived, setFetchedArchived] = useState<ArchivedWorker[]>([]);
+  const [fetchedNotices, setFetchedNotices] = useState<AccountEvent[]>([]);
   const [fetchedError, setFetchedError] = useState<string | null>(null);
   const [availableModels, setAvailableModels] = useState<AgentModelOption[]>([]);
   const [modelsError, setModelsError] = useState<string | null>(null);
@@ -1085,6 +1091,7 @@ export function AgentsView({
     orchestrators: Orchestrator[];
     archived: ArchivedWorker[];
     error: string | null;
+    account_notices?: AccountEvent[];
   } | null>(null);
   const [expandedScreencasts, setExpandedScreencasts] = useState<Set<string>>(
     readStoredExpandedScreencasts
@@ -1122,6 +1129,7 @@ export function AgentsView({
           setFetchedWorkers(result.workers);
           setFetchedOrchestrators(result.orchestrators ?? []);
           setFetchedArchived(result.archived ?? []);
+          setFetchedNotices(result.account_notices ?? []);
           setFetchedError(null);
         }
       })
@@ -1161,6 +1169,8 @@ export function AgentsView({
   const workers = overrideData?.workers ?? data?.workers ?? fetchedWorkers;
   const orchestrators = overrideData?.orchestrators ?? data?.orchestrators ?? fetchedOrchestrators;
   const archived = overrideData?.archived ?? data?.archived ?? fetchedArchived;
+  const accountNotices =
+    overrideData?.account_notices ?? data?.account_notices ?? fetchedNotices;
   const error = overrideData?.error ?? data?.error ?? fetchedError;
 
   useEffect(() => {
@@ -1264,6 +1274,7 @@ export function AgentsView({
         workers: result.workers,
         orchestrators: result.orchestrators ?? [],
         archived: result.archived ?? [],
+        account_notices: result.account_notices ?? [],
         error: null,
       });
     } catch (err) {
@@ -1773,7 +1784,7 @@ export function AgentsView({
             </button>
           </div>
         </div>
-        <AccountEventsBanner events={accountEvents} />
+        <AccountEventsBanner events={accountNotices} />
         {spawnNotice ? (
           spawnNotice.kind === "worker" ? (
             <div className="agents-notice">

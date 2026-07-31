@@ -131,19 +131,91 @@ test("clicking the card body opens the session preview; buttons do not", () => {
   expect(onOpenTicket).not.toHaveBeenCalled();
 });
 
-test("account banners state impact and next action instead of raw events", () => {
+test("account banners render persisted notices from the agents payload", () => {
   const view = renderView({
-    accountEvents: [
-      {
-        type: "codex_limit_no_eligible",
-        tickets: ["WIKI-9"],
-        reset_at: "18:00",
-        ts: "2026-07-31T00:00:00Z",
-      },
-    ],
+    data: {
+      ...data,
+      account_notices: [
+        {
+          type: "codex_limit_no_eligible",
+          tickets: ["WIKI-9"],
+          reset_at: "18:00",
+          ts: "2026-07-31T00:00:00Z",
+        },
+      ],
+    },
   });
   expect(view.getByText(/Codex usage limit reached/)).toBeTruthy();
   expect(view.getByText(/replace them with Claude workers/)).toBeTruthy();
+});
+
+test("codex_rotation_failed keeps the raw error behind the details disclosure", async () => {
+  const view = renderView({
+    data: {
+      ...data,
+      account_notices: [
+        {
+          type: "codex_rotation_failed",
+          error: "RotationError: /Users/henry/.codex-accounts/b/auth.json: permission denied",
+          ts: "2026-07-31T00:00:00Z",
+        },
+      ],
+    },
+  });
+  expect(view.getByText(/rotation failed/)).toBeTruthy();
+  expect(view.queryByText(/permission denied/)).toBeNull();
+  fireEvent.click(view.getByRole("button", { name: /Technical details/ }));
+  await waitFor(() => {
+    expect(view.getByText(/permission denied/)).toBeTruthy();
+  });
+});
+
+test("codex_rotation failures keep failed_reasons behind the details disclosure", async () => {
+  const view = renderView({
+    data: {
+      ...data,
+      account_notices: [
+        {
+          type: "codex_rotation",
+          from: "a",
+          to: "b",
+          revived: ["WIKI-2"],
+          failed: ["WIKI-3"],
+          failed_reasons: { "WIKI-3": "tmux window @99 gone: server exited" },
+          ts: "2026-07-31T00:00:00Z",
+        },
+      ],
+    },
+  });
+  expect(view.getByText(/did not resume/)).toBeTruthy();
+  expect(view.queryByText(/server exited/)).toBeNull();
+  fireEvent.click(view.getByRole("button", { name: /Technical details/ }));
+  await waitFor(() => {
+    expect(view.getByText(/WIKI-3: tmux window @99 gone: server exited/)).toBeTruthy();
+  });
+});
+
+test("codex_auth_dead_revival failures keep failed_reasons behind the details disclosure", async () => {
+  const view = renderView({
+    data: {
+      ...data,
+      account_notices: [
+        {
+          type: "codex_auth_dead_revival",
+          revived: [],
+          failed: ["WIKI-4"],
+          failed_reasons: { "WIKI-4": "Traceback: OSError [Errno 24]" },
+          ts: "2026-07-31T00:00:00Z",
+        },
+      ],
+    },
+  });
+  expect(view.getByText(/did not restart/)).toBeTruthy();
+  expect(view.queryByText(/Errno 24/)).toBeNull();
+  fireEvent.click(view.getByRole("button", { name: /Technical details/ }));
+  await waitFor(() => {
+    expect(view.getByText(/WIKI-4: Traceback: OSError \[Errno 24\]/)).toBeTruthy();
+  });
 });
 
 const models: AgentModelOption[] = [

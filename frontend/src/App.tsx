@@ -202,6 +202,7 @@ type AgentsSnapshot = {
   orchestrators: Orchestrator[];
   archived: ArchivedWorker[];
   error: string | null;
+  account_notices?: AccountEvent[];
 };
 
 type FleetItem = {
@@ -1449,7 +1450,6 @@ export default function App() {
     };
   }, [contextMenu]);
 
-  const [accountEvents, setAccountEvents] = useState<AccountEvent[]>([]);
   const sessionRefreshTimeoutRef = useRef<number | null>(null);
   useEffect(() => {
     const source = new EventSource("/api/events");
@@ -1483,16 +1483,8 @@ export default function App() {
         ) {
           setRefreshTick((tick) => tick + 1);
         }
-        if (
-          payload.type === "codex_rotation" ||
-          payload.type === "codex_limit_no_eligible" ||
-          payload.type === "codex_rotation_failed" ||
-          payload.type === "codex_auth_dead_revival" ||
-          payload.type === "codex_auth_dead_exhausted" ||
-          payload.type === "claude_limit_hit"
-        ) {
-          setAccountEvents((prior) => [payload as AccountEvent, ...prior].slice(0, 4));
-        }
+        // Account events refresh /api/agents (above); the durable notice list
+        // rides in that payload, so no in-memory event accumulation here.
       } catch {
         /* ignore malformed frames */
       }
@@ -1587,6 +1579,7 @@ export default function App() {
           workers: result.workers,
           orchestrators: result.orchestrators ?? [],
           archived: result.archived ?? [],
+          account_notices: result.account_notices ?? [],
           error: null,
         });
       })
@@ -3508,7 +3501,6 @@ export default function App() {
     if (mode === "agents") {
       return (
         <AgentsView
-          accountEvents={accountEvents}
           data={agentsState}
           onOpenAgent={openAgent}
           onOpenTicket={setAgentsOpenTicket}
