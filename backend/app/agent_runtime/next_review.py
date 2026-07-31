@@ -679,6 +679,22 @@ def _is_archived(
     )
 
 
+def _registry_reviewer_entry(
+    registry: Mapping[str, Any], reviewer_id: str
+) -> tuple[str, Mapping[str, Any]] | None:
+    """Resolve reviewer rows across legacy and canonical case forms."""
+
+    canonical = reviewer_id.upper()
+    for candidate in (canonical, reviewer_id):
+        entry = registry.get(candidate)
+        if isinstance(entry, Mapping):
+            return candidate, entry
+    for candidate, entry in registry.items():
+        if str(candidate).upper() == canonical and isinstance(entry, Mapping):
+            return str(candidate), entry
+    return None
+
+
 def _implicit_result_is_current(
     result: Mapping[str, Any],
     *,
@@ -707,7 +723,10 @@ def _implicit_result_is_current(
     for reviewer_id, expected_run_id in reviewers:
         if _is_archived(reviewer_id, archived=archived, main=main):
             continue
-        entry = registry_data.get(reviewer_id)
+        resolved = _registry_reviewer_entry(registry_data, reviewer_id)
+        registry_id, entry = (
+            resolved if resolved is not None else (reviewer_id.upper(), None)
+        )
         current = entry.get("current") if isinstance(entry, Mapping) else None
         if not isinstance(current, Mapping) or current.get("run_id") != expected_run_id:
             continue
@@ -717,9 +736,9 @@ def _implicit_result_is_current(
         if state in _TERMINAL_STATES:
             continue
         status = (
-            status_reader(reviewer_id)
+            status_reader(registry_id)
             if status_reader is not None
-            else main.read_agent_status(reviewer_id)
+            else main.read_agent_status(registry_id)
         )
         status_state = status.get("state") if isinstance(status, Mapping) else None
         if str(status_state or "").lower() in _TERMINAL_STATES:

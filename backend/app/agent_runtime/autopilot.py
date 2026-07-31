@@ -921,9 +921,24 @@ class AutopilotController:
         }
 
     @staticmethod
+    def _default_backend_base_url() -> str | None:
+        from .. import backend_runtime
+
+        configured = os.environ.get("WIKI_BACKEND_URL")
+        if configured:
+            try:
+                return backend_runtime.normalize_loopback_url(configured)
+            except ValueError:
+                pass
+        return backend_runtime.read_backend_url()
+
+    @staticmethod
     def _default_next_review(**kwargs: Any) -> Mapping[str, Any]:
         from .next_review import next_review
 
+        kwargs.setdefault(
+            "backend_base_url", AutopilotController._default_backend_base_url()
+        )
         return next_review(**kwargs)
 
     def _default_record_verdict(

@@ -19,6 +19,7 @@ from fastapi import BackgroundTasks, HTTPException, Request
 
 from backend.app import main
 from backend.app.agent_runtime import next_review as next_review_module
+from backend.app.agent_runtime.autopilot import AutopilotController
 from backend.app.agent_runtime.client import (
     SupervisorClient,
     SupervisorRemoteError,
@@ -1686,6 +1687,73 @@ class BackendSupervisorEndToEndTests(unittest.IsolatedAsyncioTestCase):
                 self.store.current_run_id(reviewer["reviewer"].upper()),
                 reviewer["run_id"],
             )
+
+    async def test_implicit_diversity_active_round_replays_one_batch(self) -> None:
+        self.paths.registry_path.write_text(
+            json.dumps({"_orchestrators": {"wiki": {"kind": "cc"}}}),
+            encoding="utf-8",
+        )
+
+        def worktree(**values: object) -> Path:
+            path = self.root / f"active-{values['lens']}-{values['round_number']}"
+            path.mkdir(parents=True, exist_ok=True)
+            return path
+
+        kwargs = {
+            "ticket": "WIKI-226-ACTIVE",
+            "pr_number": 226,
+            "expected_sha": "c" * 40,
+            "orch": "wiki",
+            "diversity": ["correctness", "security"],
+            "gate": lambda _pr, _sha: {"verdict": "pass"},
+            "resolve_root": lambda _orch: self.root,
+            "worktree": worktree,
+            "archived": lambda: [],
+            "registry": lambda: main._read_agent_registry(),  # noqa: SLF001
+            "status_reader": lambda _reviewer: None,
+        }
+        first = await asyncio.to_thread(next_review_module.next_review, **kwargs)
+        second = await asyncio.to_thread(next_review_module.next_review, **kwargs)
+
+        self.assertEqual(second, first)
+        self.assertEqual(
+            {item["reviewer"] for item in first["reviewers"]},
+            {
+                "WIKI-226-ACTIVE-REVIEW1-correctness",
+                "WIKI-226-ACTIVE-REVIEW1-security",
+            },
+        )
+
+    async def test_autopilot_default_next_review_pins_backend_url(self) -> None:
+        self.paths.registry_path.write_text(
+            json.dumps({"_orchestrators": {"wiki": {"kind": "cc"}}}),
+            encoding="utf-8",
+        )
+
+        def worktree(**values: object) -> Path:
+            path = self.root / f"autopilot-{values['round_number']}"
+            path.mkdir(parents=True, exist_ok=True)
+            return path
+
+        backend_url = "http://127.0.0.1:43123"
+        with mock.patch.dict(os.environ, {"WIKI_BACKEND_URL": backend_url}):
+            result = await asyncio.to_thread(
+                AutopilotController._default_next_review,
+                ticket="WIKI-226-AUTOPILOT",
+                pr_number=226,
+                expected_sha="d" * 40,
+                orch="wiki",
+                gate=lambda _pr, _sha: {"verdict": "pass"},
+                resolve_root=lambda _orch: self.root,
+                worktree=worktree,
+                archived=lambda: [],
+                registry=lambda: main._read_agent_registry(),  # noqa: SLF001
+                status_reader=lambda _reviewer: None,
+            )
+
+        record = self.store.get(result["run_id"])
+        self.assertEqual(record.backend_base_url, backend_url)
+        self.assertIn(f"backend: {backend_url}", record.initial_prompt or "")
 
 
 class DetachedHeadlessAcceptanceTests(unittest.TestCase):
