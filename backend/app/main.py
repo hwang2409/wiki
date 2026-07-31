@@ -61,6 +61,7 @@ from .agent_runtime.client import (
     SupervisorUnavailable,
     replacement_prompt,
 )
+from .agent_runtime.command_log import AgentCommand
 from .agent_runtime import costs
 from .agent_runtime import graph_health
 from .agent_runtime.loop_state import derive_loop_state
@@ -4159,6 +4160,8 @@ def _supervisor_request(method: str, params: dict | None = None) -> Any:
             "ProviderBusy": 409,
             "ProviderProcessError": 409,
             "ProviderProtocolError": 409,
+            "CommandConflict": 409,
+            "CommandReceiptError": 409,
         }.get(exc.error_type, 502)
         raise HTTPException(status_code=status_code, detail=str(exc)) from exc
 
@@ -4202,6 +4205,15 @@ def _stable_spawn_request_id(payload: dict[str, Any]) -> str:
     return f"spawn-{hashlib.sha256(canonical.encode('utf-8')).hexdigest()}"
 
 
+def _command_hash(
+    method: str,
+    agent_id: str,
+    request_id: str,
+    payload: dict[str, Any],
+) -> str:
+    return AgentCommand(method, agent_id, request_id, payload).command_hash
+
+
 def resolve_window(ticket: str) -> str | None:
     """Live tmux window for a worker ticket or orchestrator id."""
     registry = _read_agent_registry()
@@ -4241,9 +4253,17 @@ def _control_headless_agent(
         raise HTTPException(status_code=400, detail="Bad agent id")
 
     if action == "archive" and request_id is not None:
+        binding = {"outcome": outcome}
         status = _supervisor_request(
             "idempotency/status",
-            {"method": "run/archive", "request_id": request_id},
+            {
+                "method": "run/archive",
+                "request_id": request_id,
+                "agent_id": raw_id,
+                "command_hash": _command_hash(
+                    "run/archive", raw_id, request_id, {"command_hash_payload": binding}
+                ),
+            },
         )
         receipt = status.get("receipt") if isinstance(status, dict) else None
         prior_result = receipt.get("result") if isinstance(receipt, dict) else None
@@ -4279,6 +4299,8 @@ def _control_headless_agent(
         params["outcome"] = outcome
     if request_id is not None:
         params["request_id"] = request_id
+    if action == "archive":
+        params["command_hash_payload"] = {"outcome": outcome}
     result = _supervisor_request(f"run/{action}", params)
     if not isinstance(result, dict):
         raise HTTPException(
@@ -4383,9 +4405,24 @@ def replace_agent(
         raise HTTPException(status_code=400, detail="Bad agent id")
     request_id = body.request_id if body is not None else None
     if request_id is not None:
+        binding = {
+            "kind": (body.kind or "") if body is not None else "",
+            "model": (body.model or "") if body is not None else "",
+            "effort": (body.effort or "") if body is not None else "",
+        }
         status = _supervisor_request(
             "idempotency/status",
-            {"method": "run/replace", "request_id": request_id},
+            {
+                "method": "run/replace",
+                "request_id": request_id,
+                "agent_id": raw_id,
+                "command_hash": _command_hash(
+                    "run/replace",
+                    raw_id,
+                    request_id,
+                    {"command_hash_payload": binding},
+                ),
+            },
         )
         receipt = status.get("receipt") if isinstance(status, dict) else None
         if isinstance(receipt, dict):
@@ -4480,6 +4517,11 @@ def replace_agent(
             "effort": effort,
             "backend_base_url": backend_base_url,
             "request_id": request_id,
+            "command_hash_payload": {
+                "kind": requested_kind,
+                "model": requested_model,
+                "effort": requested_effort,
+            },
         },
     )
     if not isinstance(result, dict):

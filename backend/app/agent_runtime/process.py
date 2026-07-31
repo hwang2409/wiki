@@ -236,6 +236,8 @@ def provider_process_group_members_sync(
     for process in psutil.process_iter(["pid", "create_time", "exe"]):
         try:
             pid = int(process.info["pid"])
+            if pid <= 1:
+                continue
             if os.getpgid(pid) != process_group_id:
                 continue
             members.append(
@@ -331,15 +333,23 @@ def terminate_verified_provider_group(
             return False
         return all(
             (
-                int(item["pid"]),
-                float(item["created_at"]),
-                item.get("executable"),
+                (
+                    int(item["pid"]),
+                    float(item["created_at"]),
+                    item.get("executable"),
+                )
+                in expected
+                or (
+                    item.get("executable") == executable
+                    and float(item["created_at"]) >= created_at
+                )
             )
-            in expected
             for item in current
         )
 
     def kill_group_and_wait() -> bool:
+        if not group_verified():
+            return False
         try:
             os.killpg(process_group_id, signal.SIGKILL)
         except ProcessLookupError:
@@ -361,6 +371,8 @@ def terminate_verified_provider_group(
             return False
         return kill_group_and_wait()
     if identity is not True:
+        return False
+    if not group_verified():
         return False
 
     try:
@@ -393,6 +405,8 @@ def terminate_verified_provider_group(
     if identity is None:
         return False
     if identity is True:
+        if not group_verified():
+            return False
         try:
             os.killpg(process_group_id, signal.SIGKILL)
         except ProcessLookupError:

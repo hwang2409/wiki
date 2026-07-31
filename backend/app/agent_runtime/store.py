@@ -701,10 +701,14 @@ class RunStore:
 
         with self._lock:
             projected = self.command_log.projection_for(agent_id)
+            if projected:
+                return deepcopy(projected)
             entry = self._read_registry().get(agent_id)
-            if entry is not None or not projected:
-                return {agent_id: deepcopy(entry)}
-            return {agent_id: None}
+            if entry is None:
+                return {agent_id: None}
+            seeded = {agent_id: deepcopy(entry)}
+            self.command_log.seed_projection(agent_id, seeded)
+            return seeded
 
     def find_start_request(self, request_id: str) -> RunRecord | None:
         """Find a durable successful start after cache eviction or restart."""
@@ -776,6 +780,12 @@ class RunStore:
             self.paths.registry_path.unlink(missing_ok=True)
         else:
             self._write_registry(registry)
+        self.command_log.replace_projection(
+            record.agent_id,
+            {record.agent_id: registry.get(record.agent_id)}
+            if record.agent_id in registry
+            else {},
+        )
 
     def _abort_uncommitted_starts(self) -> None:
         """Abort fresh starts that were published before provider commit."""
@@ -1334,6 +1344,7 @@ class RunStore:
             self.command_log.forget_implicit_for_run(run_id)
             registry.pop(record.agent_id, None)
             self._write_registry(registry)
+            self.command_log.replace_projection(record.agent_id, {})
             return record, session_dir
 
     def create(
@@ -1633,6 +1644,10 @@ class RunStore:
             if current.get("run_id") == record.run_id:
                 registry[record.agent_id]["current"] = self._registry_current(record)
                 self._write_registry(registry)
+                self.command_log.replace_projection(
+                    record.agent_id,
+                    {record.agent_id: registry[record.agent_id]},
+                )
             return record
 
     def mark_recovery_blocked(self, run_id: str, *, reason: str) -> RunRecord:
@@ -1667,6 +1682,10 @@ class RunStore:
             if current.get("run_id") == record.run_id:
                 registry[record.agent_id]["current"] = self._registry_current(record)
                 self._write_registry(registry)
+                self.command_log.replace_projection(
+                    record.agent_id,
+                    {record.agent_id: registry[record.agent_id]},
+                )
             return record
 
     def mark_automatic_resume_failed(
@@ -1735,6 +1754,39 @@ class RunStore:
             adapter_status=status,
             guard_automatic_resume=guard_automatic_resume,
         )
+
+    def record_provider_process_created(self, run_id: str, pid: int) -> RunRecord:
+        """Persist process identity before provider startup can do more work."""
+
+        if not isinstance(pid, int) or isinstance(pid, bool) or pid <= 1:
+            raise StoreConflict("provider process id is invalid")
+        with self._lock:
+            record = self.get(run_id)
+            identity = provider_process_status_sync(pid)
+            record.provider_pid = pid
+            if identity is None or identity.executable is None:
+                record.provider_pid_started_at = None
+                record.provider_executable = None
+                record.provider_process_group_id = None
+                record.provider_process_group_members = []
+            else:
+                record.provider_pid_started_at = identity.created_at
+                record.provider_executable = identity.executable
+                record.provider_process_group_id = identity.process_group_id
+                record.provider_process_group_members = (
+                    provider_process_group_members_sync(identity.process_group_id)
+                )
+            self._write_record(record)
+            registry = self._read_registry()
+            current = (registry.get(record.agent_id) or {}).get("current") or {}
+            if current.get("run_id") == record.run_id:
+                registry[record.agent_id]["current"] = self._registry_current(record)
+                self._write_registry(registry)
+                self.command_log.replace_projection(
+                    record.agent_id,
+                    {record.agent_id: registry[record.agent_id]},
+                )
+            return record
 
     def finalize_handover_detach(
         self,
@@ -2177,6 +2229,26 @@ class RunStore:
                     return dict(message)
             return None
 
+    def steer_delivery_observed(self, run_id: str, pending_id: str) -> bool:
+        """Check durable composer state before retrying an uncertain delivery."""
+
+        with self._lock:
+            record = self.get(run_id)
+            if any(
+                message.get("pending_id") == pending_id
+                for message in record.composer_messages
+            ):
+                return True
+            try:
+                events = self.read_normalized_events(run_id)
+            except RunNotFound:
+                return False
+            return any(
+                isinstance(event.get("payload"), dict)
+                and event["payload"].get("pending_id") == pending_id
+                for event in events
+            )
+
     def discard_pending_user_message(
         self,
         run_id: str,
@@ -2351,6 +2423,10 @@ class RunStore:
                 "current": self._registry_current(new_record),
             }
             self._write_registry(registry)
+            self.command_log.replace_projection(
+                old.agent_id,
+                {old.agent_id: registry[old.agent_id]},
+            )
             return old, new_record
 
     def abort_replace(

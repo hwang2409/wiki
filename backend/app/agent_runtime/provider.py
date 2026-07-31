@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from abc import ABC, abstractmethod
-from collections.abc import AsyncIterator
+from collections.abc import AsyncIterator, Callable
 from dataclasses import dataclass, field
 from typing import Any
 
@@ -58,6 +58,11 @@ class ProviderAdapter(ABC):
     """Provider-neutral control surface owned by the durable supervisor."""
 
     provider: ProviderKind
+
+    def set_process_created_callback(self, callback: Callable[[int], None]) -> None:
+        """Install a callback for the first durable process identity boundary."""
+
+        del callback
 
     @abstractmethod
     async def start(self, request: StartRequest) -> AdapterStatus:

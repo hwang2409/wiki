@@ -10,7 +10,7 @@ import re
 import time
 import warnings
 from collections import OrderedDict
-from collections.abc import Callable
+from collections.abc import Callable, Mapping
 from copy import deepcopy
 from datetime import datetime, timezone
 from enum import Enum
@@ -19,7 +19,7 @@ from typing import Any
 from uuid import NAMESPACE_URL, UUID, uuid4, uuid5
 
 from .. import accounts, provider_health
-from .command_log import AgentCommand, CommandQueue
+from .command_log import AgentCommand, CommandConflict, CommandQueue
 from .normalizer import NormalizedProviderEvent, normalize_provider_event
 from .process import (
     ProviderProcessStatus,
@@ -1522,6 +1522,9 @@ Preserve the same identity, role, worktree, orchestrator grouping, PR gates, and
         if old_task is not None:
             old_task.cancel()
         self.adapters[run_id] = adapter
+        adapter.set_process_created_callback(
+            lambda pid: self.store.record_provider_process_created(run_id, pid)
+        )
         self.store.set_control_attached(run_id, True)
         self.event_tasks[run_id] = asyncio.create_task(
             self._pump_events(run_id, adapter),
@@ -3060,6 +3063,19 @@ Preserve the same identity, role, worktree, orchestrator grouping, PR gates, and
                 if isinstance(result, dict):
                     return result
                 return {"status": "sent", "pending_id": pending_id}
+            if steer_effect["status"] == "sending":
+                if self.store.steer_delivery_observed(run_id, pending_id):
+                    result = {"status": "sent", "pending_id": pending_id}
+                    self.store.command_log.update_steer_effect(
+                        "run/send_now", effect_id, "acknowledged", result
+                    )
+                    return result
+                # The provider may have accepted the message before the
+                # supervisor stopped. Do not resend without durable evidence.
+                return {
+                    "status": "uncertain",
+                    "pending_id": pending_id,
+                }
             record = self.store.get(run_id)
             if any(
                 item.get("pending_id") == pending_id
@@ -3096,6 +3112,10 @@ Preserve the same identity, role, worktree, orchestrator grouping, PR gates, and
                     # unconditionally discard by pending_id before rethrowing.
                     self.store.discard_pending_user_message(run_id, pending_id)
                     raise
+            if effect_id is not None:
+                self.store.command_log.update_steer_effect(
+                    "run/send_now", effect_id, "sending"
+                )
             status = await adapter.send_now(message)
             accepted = True
         except Exception:
@@ -3306,10 +3326,18 @@ Preserve the same identity, role, worktree, orchestrator grouping, PR gates, and
         *,
         outcome: str | None = None,
         effect_id: str | None = None,
+        command_hash: str | None = None,
+        command_hash_payload: Mapping[str, Any] | None = None,
     ) -> RunRecord:
         async with self._run_mutation_admission():
             async with self._run_lock(run_id):
-                return await self._archive(run_id, outcome=outcome, effect_id=effect_id)
+                return await self._archive(
+                    run_id,
+                    outcome=outcome,
+                    effect_id=effect_id,
+                    command_hash=command_hash,
+                    command_hash_payload=command_hash_payload,
+                )
 
     async def _archive(
         self,
@@ -3317,6 +3345,8 @@ Preserve the same identity, role, worktree, orchestrator grouping, PR gates, and
         *,
         outcome: str | None = None,
         effect_id: str | None = None,
+        command_hash: str | None = None,
+        command_hash_payload: Mapping[str, Any] | None = None,
     ) -> RunRecord:
         adapter = self.adapters.get(run_id)
         if adapter is None:
@@ -3367,18 +3397,23 @@ Preserve the same identity, role, worktree, orchestrator grouping, PR gates, and
                 )
             archived, _ = self.store.archive_current(run_id, outcome=outcome)
             if effect_id is not None:
+                effect_payload = {
+                    "agent_id": archived.agent_id,
+                    "run_id": run_id,
+                    "outcome": outcome,
+                    "request_id": effect_id,
+                    "method": "run/archive",
+                }
+                if command_hash_payload is not None:
+                    effect_payload["command_hash_payload"] = dict(
+                        command_hash_payload
+                    )
                 self.store.command_log.complete_effect(
                     AgentCommand(
                         "run/archive",
                         archived.agent_id,
                         effect_id,
-                        {
-                            "agent_id": archived.agent_id,
-                            "run_id": run_id,
-                            "outcome": outcome,
-                            "request_id": effect_id,
-                            "method": "run/archive",
-                        },
+                        effect_payload,
                     ),
                     _public_run(archived),
                 )
@@ -3405,18 +3440,21 @@ Preserve the same identity, role, worktree, orchestrator grouping, PR gates, and
         record = self.store.update_adapter_status(run_id, status)
         archived, _ = self.store.archive_current(run_id, outcome=outcome)
         if effect_id is not None:
+            effect_payload = {
+                "agent_id": archived.agent_id,
+                "run_id": run_id,
+                "outcome": outcome,
+                "request_id": effect_id,
+                "method": "run/archive",
+            }
+            if command_hash_payload is not None:
+                effect_payload["command_hash_payload"] = dict(command_hash_payload)
             self.store.command_log.complete_effect(
                 AgentCommand(
                     "run/archive",
                     archived.agent_id,
                     effect_id,
-                    {
-                        "agent_id": archived.agent_id,
-                        "run_id": run_id,
-                        "outcome": outcome,
-                        "request_id": effect_id,
-                        "method": "run/archive",
-                    },
+                    effect_payload,
                 ),
                 _public_run(archived),
             )
@@ -3459,6 +3497,8 @@ Preserve the same identity, role, worktree, orchestrator grouping, PR gates, and
         effort: str | None = None,
         backend_base_url: str | None = None,
         replacement_run_id: str | None = None,
+        effect_id: str | None = None,
+        command_hash: str | None = None,
     ) -> RunRecord:
         async with self._run_mutation_admission():
             old = self.store.get(run_id)
@@ -3476,6 +3516,8 @@ Preserve the same identity, role, worktree, orchestrator grouping, PR gates, and
                             effort if provider is not None else old.effort,
                             backend_base_url,
                             replacement_run_id,
+                            effect_id=effect_id,
+                            command_hash=command_hash,
                         )
             else:
                 async with self._run_lock(run_id):
@@ -3487,6 +3529,8 @@ Preserve the same identity, role, worktree, orchestrator grouping, PR gates, and
                         effort if provider is not None else old.effort,
                         backend_base_url,
                         replacement_run_id,
+                        effect_id=effect_id,
+                        command_hash=command_hash,
                     )
         if old.model != replacement.model:
             self._append_model_changed_event(
@@ -3523,6 +3567,9 @@ Preserve the same identity, role, worktree, orchestrator grouping, PR gates, and
         effort: str | None = None,
         backend_base_url: str | None = None,
         replacement_run_id: str | None = None,
+        *,
+        effect_id: str | None = None,
+        command_hash: str | None = None,
     ) -> RunRecord:
         """Replace a run after the caller has acquired mutation admission."""
 
@@ -3534,6 +3581,8 @@ Preserve the same identity, role, worktree, orchestrator grouping, PR gates, and
             effort,
             backend_base_url,
             replacement_run_id,
+            effect_id=effect_id,
+            command_hash=command_hash,
         )
 
     async def _replace_without_handover(
@@ -3545,6 +3594,9 @@ Preserve the same identity, role, worktree, orchestrator grouping, PR gates, and
         effort: str | None = None,
         backend_base_url: str | None = None,
         replacement_run_id: str | None = None,
+        *,
+        effect_id: str | None = None,
+        command_hash: str | None = None,
     ) -> RunRecord:
         old = self.store.get(run_id)
         if not self.store.is_current(old):
@@ -3572,6 +3624,15 @@ Preserve the same identity, role, worktree, orchestrator grouping, PR gates, and
             status_path=self.store.status_path(replacement.agent_id),
         )
         replacement.initial_prompt = prompt
+        if effect_id is not None:
+            self.store.command_log.begin_replace_effect(
+                method="run/replace",
+                request_id=effect_id,
+                agent_id=old.agent_id,
+                command_hash=command_hash or "",
+                old_run_id=old.run_id,
+                replacement_run_id=replacement.run_id,
+            )
         old_adapter = self.adapters.get(run_id)
         if old_adapter is None:
             if self.pid_alive(old.provider_pid):
@@ -3599,7 +3660,16 @@ Preserve the same identity, role, worktree, orchestrator grouping, PR gates, and
                 )
             self._reset_status_for_replacement(old.agent_id)
             self.store.replace(old.run_id, replacement, reset_status=False)
-            return await self._launch_record(replacement, prompt)
+            if effect_id is not None:
+                self.store.command_log.update_replace_effect(
+                    "run/replace", effect_id, "published"
+                )
+            result = await self._launch_record(replacement, prompt)
+            if effect_id is not None:
+                self.store.command_log.update_replace_effect(
+                    "run/replace", effect_id, "completed", _public_run(result)
+                )
+            return result
 
         if target_provider is not old.provider:
             try:
@@ -3619,7 +3689,16 @@ Preserve the same identity, role, worktree, orchestrator grouping, PR gates, and
                 raise
             self._reset_status_for_replacement(old.agent_id)
             self.store.replace(old.run_id, replacement, reset_status=False)
-            return await self._launch_record(replacement, prompt)
+            if effect_id is not None:
+                self.store.command_log.update_replace_effect(
+                    "run/replace", effect_id, "published"
+                )
+            result = await self._launch_record(replacement, prompt)
+            if effect_id is not None:
+                self.store.command_log.update_replace_effect(
+                    "run/replace", effect_id, "completed", _public_run(result)
+                )
+            return result
         published = False
         try:
             await self._quiesce_adapter_for_replacement(run_id, old_adapter)
@@ -3627,6 +3706,10 @@ Preserve the same identity, role, worktree, orchestrator grouping, PR gates, and
             old_adapter.prepare_replacement(replacement)
             self.store.replace(old.run_id, replacement, reset_status=False)
             published = True
+            if effect_id is not None:
+                self.store.command_log.update_replace_effect(
+                    "run/replace", effect_id, "published"
+                )
         except asyncio.CancelledError:
             await self._cleanup_cancelled_replacement(
                 old,
@@ -3662,6 +3745,15 @@ Preserve the same identity, role, worktree, orchestrator grouping, PR gates, and
             await self._publish_agent_change(old.agent_id)
             raise
 
+        old_adapter.set_process_created_callback(
+            lambda pid: self.store.record_provider_process_created(
+                replacement.run_id, pid
+            )
+        )
+        if effect_id is not None:
+            self.store.command_log.update_replace_effect(
+                "run/replace", effect_id, "provider_started"
+            )
         try:
             status = await old_adapter.replace(prompt, model, target_effort)
         except asyncio.CancelledError:
@@ -3695,13 +3787,46 @@ Preserve the same identity, role, worktree, orchestrator grouping, PR gates, and
             except Exception:
                 pass
             await self._publish_agent_change(old.agent_id)
+            if isinstance(exc, RuntimeError) and str(exc) == "adapter has not started":
+                # Fixture and resumed transports can expose a session without
+                # the local start request. Rebind through a fresh adapter.
+                return await self._replace_without_handover(
+                    old.run_id,
+                    prompt,
+                    model,
+                    provider,
+                    effort,
+                    backend_base_url,
+                    replacement_run_id,
+                    effect_id=effect_id,
+                    command_hash=command_hash,
+                )
             raise
+        if effect_id is not None:
+            self.store.command_log.update_replace_effect(
+                "run/replace",
+                effect_id,
+                "provider_completed",
+                {
+                    "state": status.state.value,
+                    "session_id": status.session_id,
+                    "pid": status.pid,
+                    "generation": status.generation,
+                    "active_turn_id": status.active_turn_id,
+                    "transcript_path": status.transcript_path,
+                    "detail": status.detail,
+                },
+            )
         replacement = self.store.update_adapter_status(replacement.run_id, status)
         self._route_adapter_generation(
             replacement.run_id, old_adapter, status.generation
         )
         self._attach_adapter(replacement.run_id, old_adapter)
         replacement = self.store.get(replacement.run_id)
+        if effect_id is not None:
+            self.store.command_log.update_replace_effect(
+                "run/replace", effect_id, "completed", _public_run(replacement)
+            )
         await self._publish_agent_change(replacement.agent_id)
         return replacement
 
@@ -3937,6 +4062,24 @@ Preserve the same identity, role, worktree, orchestrator grouping, PR gates, and
                 raise ValueError("request_id is required")
             key = (target_method, request_id)
             receipt = self.store.command_log.receipt(target_method, request_id)
+            requested_agent = params.get("agent_id")
+            if requested_agent is not None and not isinstance(requested_agent, str):
+                raise ValueError("agent_id must be a string")
+            requested_hash = params.get("command_hash")
+            if requested_hash is not None and not isinstance(requested_hash, str):
+                raise ValueError("command_hash must be a string")
+            if receipt is not None:
+                if (
+                    requested_agent is not None
+                    and str(receipt.agent_id).upper() != requested_agent.upper()
+                ):
+                    raise CommandConflict(
+                        f"request_id {request_id} belongs to another agent"
+                    )
+                if requested_hash is not None and receipt.command_hash != requested_hash:
+                    raise CommandConflict(
+                        f"request_id {request_id} was used with a different payload"
+                    )
             if receipt is not None and not receipt.ok:
                 self.store.command_log.raise_receipt(target_method, request_id)
             response: dict[str, Any] = {
@@ -4067,6 +4210,12 @@ Preserve the same identity, role, worktree, orchestrator grouping, PR gates, and
                     run_id,
                     outcome=outcome,
                     effect_id=request_id if isinstance(request_id, str) else None,
+                    command_hash=command_hash,
+                    command_hash_payload=(
+                        params.get("command_hash_payload")
+                        if isinstance(params.get("command_hash_payload"), Mapping)
+                        else None
+                    ),
                 )
             )
         if method == "run/replace":
@@ -4076,8 +4225,70 @@ Preserve the same identity, role, worktree, orchestrator grouping, PR gates, and
                 current_id = self.store.current_run_id(str(params["agent_id"]))
                 if current_id == replacement_run_id:
                     current = self.store.get(current_id)
-                    if current.replaces_run_id == params.get("run_id"):
+                    effect = (
+                        self.store.command_log.replace_effect(method, str(params["request_id"]))
+                        if isinstance(params.get("request_id"), str)
+                        else None
+                    )
+                    if (
+                        current.replaces_run_id == params.get("run_id")
+                        and effect is not None
+                        and effect["status"] == "completed"
+                    ):
                         return _public_run(current)
+                    if (
+                        current.replaces_run_id == params.get("run_id")
+                        and effect is not None
+                        and effect["status"] in {"prepared", "published"}
+                    ):
+                        self.store.abort_replace(
+                            str(params["run_id"]),
+                            replacement_run_id,
+                            reason="recovered before provider replacement effect",
+                            adapter_status=AdapterStatus(
+                                state=LifecycleState.BLOCKED,
+                                session_id=None,
+                                pid=None,
+                                generation=current.provider_generation,
+                                active_turn_id=None,
+                                transcript_path=current.transcript_path,
+                            ),
+                        )
+                    elif (
+                        current.replaces_run_id == params.get("run_id")
+                        and effect is not None
+                        and effect["status"] == "provider_completed"
+                    ):
+                        saved = effect.get("result")
+                        if isinstance(saved, dict):
+                            self.store.update_adapter_status(
+                                replacement_run_id,
+                                AdapterStatus(
+                                    state=LifecycleState(str(saved.get("state", "starting"))),
+                                    session_id=saved.get("session_id"),
+                                    pid=saved.get("pid"),
+                                    generation=int(saved.get("generation", 1)),
+                                    active_turn_id=saved.get("active_turn_id"),
+                                    transcript_path=saved.get("transcript_path"),
+                                    detail=saved.get("detail"),
+                                ),
+                            )
+                        result = _public_run(self.store.get(replacement_run_id))
+                        self.store.command_log.update_replace_effect(
+                            method,
+                            str(params["request_id"]),
+                            "completed",
+                            result,
+                        )
+                        return result
+                    elif (
+                        current.replaces_run_id == params.get("run_id")
+                        and effect is not None
+                        and effect["status"] == "provider_started"
+                    ):
+                        raise StoreConflict(
+                            "replacement provider effect is uncertain; run retained for inspection"
+                        )
             return _public_run(
                 await self.replace(
                     self._resolve_run_id(params),
@@ -4087,6 +4298,8 @@ Preserve the same identity, role, worktree, orchestrator grouping, PR gates, and
                     params.get("effort"),
                     params.get("backend_base_url"),
                     replacement_run_id,
+                    effect_id=params.get("request_id"),
+                    command_hash=command_hash,
                 )
             )
         if method == "run/respond":

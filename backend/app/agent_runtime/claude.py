@@ -177,6 +177,7 @@ class ClaudeStreamAdapter(ProviderAdapter):
         self._state = record.state
         self._session_id = record.provider_session_id
         self._provider_pid: int | None = None
+        self._process_created_callback: Callable[[int], None] | None = None
         self._transcript_path = record.transcript_path
         self._detail: str | None = None
         self._request: StartRequest | None = None
@@ -208,6 +209,9 @@ class ClaudeStreamAdapter(ProviderAdapter):
 
     def prepare_replacement(self, record: RunRecord) -> None:
         self._configure_runtime(record)
+
+    def set_process_created_callback(self, callback: Callable[[int], None]) -> None:
+        self._process_created_callback = callback
 
     def _status(self) -> AdapterStatus:
         return AdapterStatus(
@@ -287,6 +291,8 @@ class ClaudeStreamAdapter(ProviderAdapter):
                 f"could not start Claude stream process: {exc}"
             ) from exc
         self._process = process
+        if self._process_created_callback is not None:
+            self._process_created_callback(process.pid)
         self._generation = generation
         self._session_id = session_id
         self._session_generations[session_id] = generation

@@ -7,7 +7,6 @@ durable receipt and event source for retries.
 
 from __future__ import annotations
 
-import asyncio
 import hashlib
 import importlib
 import json
@@ -15,7 +14,7 @@ import sqlite3
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Awaitable, Callable, Mapping
+from typing import Any, Mapping
 from uuid import uuid4
 
 
@@ -39,7 +38,7 @@ def _canonical_command_hash(command: "AgentCommand") -> str:
     value = json.dumps(
         {
             "method": command.method,
-            "agent_id": command.agent_id,
+            "agent_id": command.agent_id.upper(),
             "payload": payload,
         },
         separators=(",", ":"),
@@ -357,6 +356,19 @@ class CommandLog:
                     created_at TEXT NOT NULL,
                     PRIMARY KEY(method, request_id)
                 );
+                CREATE TABLE IF NOT EXISTS replace_effects (
+                    method TEXT NOT NULL,
+                    request_id TEXT NOT NULL,
+                    agent_id TEXT NOT NULL,
+                    command_hash TEXT NOT NULL,
+                    old_run_id TEXT NOT NULL,
+                    replacement_run_id TEXT NOT NULL,
+                    status TEXT NOT NULL,
+                    result_json TEXT,
+                    created_at TEXT NOT NULL,
+                    updated_at TEXT NOT NULL,
+                    PRIMARY KEY(method, request_id)
+                );
                 CREATE TABLE IF NOT EXISTS steer_effects (
                     method TEXT NOT NULL,
                     request_id TEXT NOT NULL,
@@ -545,6 +557,28 @@ class CommandLog:
         if receipt is not None and not receipt.ok:
             raise _restore_receipt_error(receipt)
 
+    def validate_receipt_binding(
+        self,
+        method: str,
+        request_id: str,
+        *,
+        agent_id: str | None = None,
+        command_hash: str | None = None,
+    ) -> CommandReceipt | None:
+        """Validate replay identity before exposing a saved command result."""
+
+        receipt = self.receipt(method, request_id)
+        if receipt is not None:
+            if agent_id not in {None, "", receipt.agent_id}:
+                raise CommandConflict(
+                    f"request_id {request_id} belongs to another agent"
+                )
+            if command_hash not in {None, "", receipt.command_hash}:
+                raise CommandConflict(
+                    f"request_id {request_id} was used with a different payload"
+                )
+        return receipt
+
     def effect_result(self, method: str, request_id: str) -> Any | None:
         with self._connect() as connection:
             row = connection.execute(
@@ -557,6 +591,104 @@ class CommandLog:
         if row is None or row["status"] != "completed":
             return None
         return json.loads(row["result_json"]) if row["result_json"] is not None else None
+
+    def replace_effect(
+        self, method: str, request_id: str
+    ) -> dict[str, Any] | None:
+        with self._connect() as connection:
+            row = connection.execute(
+                "SELECT * FROM replace_effects WHERE method = ? AND request_id = ?",
+                (method, request_id),
+            ).fetchone()
+        if row is None:
+            return None
+        result = dict(row)
+        result["result"] = (
+            json.loads(result["result_json"])
+            if result["result_json"] is not None
+            else None
+        )
+        return result
+
+    def begin_replace_effect(
+        self,
+        *,
+        method: str,
+        request_id: str,
+        agent_id: str,
+        command_hash: str,
+        old_run_id: str,
+        replacement_run_id: str,
+    ) -> None:
+        with self._connect() as connection:
+            row = connection.execute(
+                "SELECT * FROM replace_effects WHERE method = ? AND request_id = ?",
+                (method, request_id),
+            ).fetchone()
+            if row is not None:
+                if row["agent_id"] != agent_id:
+                    raise CommandConflict(
+                        f"request_id {request_id} belongs to another agent"
+                    )
+                if row["command_hash"] != command_hash:
+                    raise CommandConflict(
+                        f"request_id {request_id} was used with a different payload"
+                    )
+                connection.commit()
+                return
+            now = _now()
+            connection.execute(
+                """
+                INSERT INTO replace_effects
+                (method, request_id, agent_id, command_hash, old_run_id,
+                 replacement_run_id, status, result_json, created_at, updated_at)
+                VALUES (?, ?, ?, ?, ?, ?, 'prepared', NULL, ?, ?)
+                """,
+                (
+                    method,
+                    request_id,
+                    agent_id,
+                    command_hash,
+                    old_run_id,
+                    replacement_run_id,
+                    now,
+                    now,
+                ),
+            )
+            connection.commit()
+
+    def update_replace_effect(
+        self,
+        method: str,
+        request_id: str,
+        status: str,
+        result: Any | None = None,
+    ) -> None:
+        if status not in {
+            "prepared",
+            "published",
+            "provider_started",
+            "provider_completed",
+            "completed",
+            "failed",
+        }:
+            raise ValueError("invalid replace effect status")
+        with self._connect() as connection:
+            connection.execute(
+                """
+                UPDATE replace_effects
+                SET status = ?, result_json = COALESCE(?, result_json), updated_at = ?
+                WHERE method = ? AND request_id = ?
+                """,
+                (
+                    status,
+                    self._json(result) if result is not None else None,
+                    _now(),
+                    method,
+                    request_id,
+                ),
+            )
+            connection.commit()
 
     def begin_effect(self, command: AgentCommand) -> None:
         """Persist the reactor checkpoint before an external effect starts."""
@@ -669,16 +801,22 @@ class CommandLog:
         status: str,
         result: Any | None = None,
     ) -> None:
-        if status not in {"queued", "sent", "acknowledged"}:
+        if status not in {"queued", "sending", "sent", "acknowledged"}:
             raise ValueError("invalid steer effect status")
         with self._connect() as connection:
             connection.execute(
                 """
                 UPDATE steer_effects
-                SET status = ?, result_json = COALESCE(?, result_json), updated_at = ?
+                SET status = CASE
+                        WHEN status = 'acknowledged' AND ? <> 'acknowledged'
+                        THEN status
+                        ELSE ?
+                    END,
+                    result_json = COALESCE(?, result_json), updated_at = ?
                 WHERE method = ? AND request_id = ?
                 """,
                 (
+                    status,
                     status,
                     self._json(result) if result is not None else None,
                     _now(),
@@ -694,7 +832,8 @@ class CommandLog:
                 """
                 UPDATE steer_effects
                 SET status = 'acknowledged', updated_at = ?
-                WHERE run_id = ? AND pending_id = ? AND status IN ('queued', 'sent')
+                WHERE run_id = ? AND pending_id = ?
+                    AND status IN ('queued', 'sending', 'sent')
                 """,
                 (_now(), run_id, pending_id),
             )
@@ -929,6 +1068,30 @@ class CommandLog:
         if row is None:
             return {}
         return {agent_id: json.loads(row["state_json"])}
+
+    def seed_projection(self, agent_id: str, state: Mapping[str, Any]) -> None:
+        """Seed one missing projection from the legacy registry read model."""
+
+        value = state.get(agent_id)
+        if value is None:
+            return
+        with self._connect() as connection:
+            connection.execute(
+                """
+                INSERT INTO command_projection(agent_id, state_json, sequence)
+                VALUES (?, ?, 0)
+                ON CONFLICT(agent_id) DO NOTHING
+                """,
+                (agent_id, self._json(value)),
+            )
+            connection.commit()
+
+    def replace_projection(self, agent_id: str, state: Mapping[str, Any]) -> None:
+        """Synchronize one projection after a store-level rollback."""
+
+        with self._connect() as connection:
+            self._write_agent_projection(connection, agent_id, state, 0)
+            connection.commit()
 
     def append_intent(
         self,
@@ -1208,181 +1371,11 @@ class CommandLog:
         ]
 
 
-CommandExecutor = Callable[[], Awaitable[Any]]
-AgentStateProvider = Callable[[str], Mapping[str, Any]]
-RecoveryExecutorFactory = Callable[[AgentCommand], CommandExecutor]
+def __getattr__(name: str) -> Any:
+    """Load queue execution lazily after persistence types are initialized."""
 
+    if name == "CommandQueue":
+        from .command_queue import CommandQueue
 
-@dataclass
-class _QueuedCommand:
-    command: AgentCommand
-    execute: CommandExecutor
-    future: asyncio.Future[Any]
-
-
-class CommandQueue:
-    """Run durable provider effects in one global FIFO reactor."""
-
-    def __init__(
-        self,
-        log: CommandLog,
-        state_provider: Callable[[], Mapping[str, Any]],
-        agent_state_provider: AgentStateProvider | None = None,
-        recovery_factory: RecoveryExecutorFactory | None = None,
-    ):
-        self.log = log
-        self.state_provider = state_provider
-        self.agent_state_provider = agent_state_provider
-        self.recovery_factory = recovery_factory
-        self._queue: asyncio.Queue[_QueuedCommand] = asyncio.Queue()
-        self._worker: asyncio.Task[None] | None = None
-        self._append_lock = asyncio.Lock()
-        self._commit_lock = asyncio.Lock()
-        self._recovery_lock = asyncio.Lock()
-        self._recovered = False
-        self._inflight: dict[
-            tuple[str, str], tuple[AgentCommand, asyncio.Future[Any]]
-        ] = {}
-        self._closed = False
-
-    def _start_worker(self) -> None:
-        if self._worker is None or self._worker.done():
-            self._worker = asyncio.create_task(
-                self._run(),
-                name="global-command-reactor",
-            )
-
-    @staticmethod
-    def _same_binding(left: AgentCommand, right: AgentCommand) -> bool:
-        return (
-            left.agent_id == right.agent_id
-            and left.command_hash == right.command_hash
-        )
-
-    async def _ensure_recovered(self) -> list[asyncio.Future[Any]]:
-        if self._recovered:
-            return []
-        async with self._recovery_lock:
-            if self._recovered:
-                return []
-            pending = await asyncio.to_thread(self.log.pending)
-            if pending and self.recovery_factory is None:
-                raise CommandError("pending command intents need a recovery executor")
-            futures: list[asyncio.Future[Any]] = []
-            loop = asyncio.get_running_loop()
-            for command in pending:
-                key = (command.method, command.request_id)
-                existing = self._inflight.get(key)
-                if existing is not None:
-                    if not self._same_binding(command, existing[0]):
-                        raise CommandConflict(
-                            f"request_id {command.request_id} has a conflicting intent"
-                        )
-                    futures.append(existing[1])
-                    continue
-                future: asyncio.Future[Any] = loop.create_future()
-                self._inflight[key] = (command, future)
-                futures.append(future)
-                assert self.recovery_factory is not None
-                await self._queue.put(
-                    _QueuedCommand(command, self.recovery_factory(command), future)
-                )
-            self._recovered = True
-            if pending:
-                self._start_worker()
-            return futures
-
-    async def recover_pending(self) -> None:
-        """Replay all pending intents before startup accepts new mutations."""
-
-        futures = await self._ensure_recovered()
-        if futures:
-            await asyncio.gather(*(asyncio.shield(future) for future in futures))
-
-    async def submit(self, command: AgentCommand, execute: CommandExecutor) -> Any:
-        if self._closed:
-            raise CommandError("command queue is closed")
-        await self._ensure_recovered()
-        key = (command.method, command.request_id)
-        existing = self._inflight.get(key)
-        if existing is not None:
-            if not self._same_binding(command, existing[0]):
-                raise CommandConflict(
-                    f"request_id {command.request_id} has a conflicting command"
-                )
-            return await asyncio.shield(existing[1])
-        loop = asyncio.get_running_loop()
-        future: asyncio.Future[Any] = loop.create_future()
-        self._inflight[key] = (command, future)
-        try:
-            async with self._append_lock:
-                state = (
-                    self.agent_state_provider(command.agent_id)
-                    if self.agent_state_provider is not None
-                    else self.state_provider()
-                )
-                intent = await asyncio.to_thread(
-                    self.log.append_intent, command, state
-                )
-            if intent.replay:
-                future.set_result(intent.result)
-                self._inflight.pop(key, None)
-                return await asyncio.shield(future)
-            self._start_worker()
-            await self._queue.put(_QueuedCommand(command, execute, future))
-        except BaseException as exc:
-            if self._inflight.get(key, (None, None))[1] is future:
-                self._inflight.pop(key, None)
-            if not future.done():
-                future.set_exception(exc)
-
-        return await future
-
-    async def _run(self) -> None:
-        while True:
-            item = await self._queue.get()
-            command, execute, future = item.command, item.execute, item.future
-            try:
-                try:
-                    await asyncio.to_thread(self.log.begin_effect, command)
-                    result = await execute()
-                except BaseException as exc:
-                    async with self._commit_lock:
-                        state = (
-                            self.agent_state_provider(command.agent_id)
-                            if self.agent_state_provider is not None
-                            else self.state_provider()
-                        )
-                        await asyncio.to_thread(self.log.fail, command, exc, state)
-                        if command.payload.get("implicit_request_id") is True:
-                            await asyncio.to_thread(
-                                self.log.forget, command.method, command.request_id
-                            )
-                    if not future.done():
-                        future.set_exception(exc)
-                else:
-                    async with self._commit_lock:
-                        state = (
-                            self.agent_state_provider(command.agent_id)
-                            if self.agent_state_provider is not None
-                            else self.state_provider()
-                        )
-                        await asyncio.to_thread(self.log.complete, command, result, state)
-                    if not future.done():
-                        future.set_result(result)
-            except BaseException as exc:
-                if not future.done():
-                    future.set_exception(exc)
-            finally:
-                key = (command.method, command.request_id)
-                if self._inflight.get(key, (None, None))[1] is future:
-                    self._inflight.pop(key, None)
-                self._queue.task_done()
-
-    async def close(self) -> None:
-        self._closed = True
-        await self._queue.join()
-        if self._worker is not None:
-            self._worker.cancel()
-            await asyncio.gather(self._worker, return_exceptions=True)
-        self._worker = None
+        return CommandQueue
+    raise AttributeError(name)
