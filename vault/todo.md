@@ -75,12 +75,12 @@ In Progress:
 - [P1] [PHO-14972](https://linear.app/phoebework/issue/PHO-14972): v3 workspace service and spill middleware — cdx:PHO-14972
 - [P1] [PHO-14973](https://linear.app/phoebework/issue/PHO-14973): implement v3 retrieve and domain registry — cdx:PHO-14973
 - [P1] [PHO-14975](https://linear.app/phoebework/issue/PHO-14975): implement v3 write registry and diff-first flow — cdx:PHO-14975
-- [P1] [PHO-14976](https://linear.app/phoebework/issue/PHO-14976): build v3 V2-parity inventory and split plan — cdx:PHO-14976
 - [P1] [PHO-14977](https://linear.app/phoebework/issue/PHO-14977): implement v3 read-only helpers and eval scaffolding — cdx:PHO-14977
 
 Backlog:
 
 - [PHO-14974](https://linear.app/phoebework/issue/PHO-14974): implement the planned v3 describe catalog after retrieve and write registry interfaces land
+- [PHO-14976](https://linear.app/phoebework/issue/PHO-14976): implement the planned V3 parity batches from the 123-row inventory after registry interfaces stabilize
 - [PHO-11469](https://linear.app/phoebework/issue/PHO-11469): re-triage Slack-thread alert investigation
 - [PHO-12425](https://linear.app/phoebework/issue/PHO-12425), 12426: sandboxed outreach start + e2e dogfood
 - [PHO-11256](https://linear.app/phoebework/issue/PHO-11256)–11260: texQL series
