@@ -13,6 +13,10 @@ approved direction, fully experimental. All work stays on an umbrella branch
 with implementation; no PRs to `main` until then. Linear project: **Phoebe
 Agent V3** (one ticket per build step, all scoped to Henry).
 
+## Implementation status
+
+- 2026-07-31: PHO-14977 helper bin and eval scaffolding passed final review at `66b3cd5da7` on `henry/phoebe-v3-agent-helpers`; no PR opened.
+
 ## Problem
 
 The v2 general agent grows by adding scoped, atomic tools for every
