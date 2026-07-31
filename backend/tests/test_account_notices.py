@@ -307,6 +307,58 @@ def test_reconcile_clears_claude_limit_on_archive(tmp_path: Path) -> None:
     assert [entry["ticket"] for entry in remaining] == ["WIKI-H"]
 
 
+def test_reconcile_bails_when_revision_advanced_after_snapshot(tmp_path: Path) -> None:
+    # TOCTOU guard: if any event landed between the caller's snapshot and
+    # this reconcile, the live_runs map may be stale and would drop a
+    # freshly published notice. Preserving notices is always safe.
+    store = _store(tmp_path)
+    store.apply_event(
+        {
+            "type": "codex_auth_dead_exhausted",
+            "tickets": ["WIKI-Z"],
+            "run_ids": {"WIKI-Z": "run-z"},
+            "ts": "t1",
+        }
+    )
+    snapshot_revision = store.revision
+    # A new failure event lands before reconcile runs — this simulates the
+    # race between /api/agents reading the registry and reaching reconcile.
+    store.apply_event(
+        {
+            "type": "codex_auth_dead_exhausted",
+            "tickets": ["WIKI-NEW"],
+            "run_ids": {"WIKI-NEW": "run-new"},
+            "ts": "t2",
+        }
+    )
+    # live_runs was built from the pre-race registry and only has WIKI-Z.
+    # Without the revision guard, WIKI-NEW would be dropped as "archived".
+    changed = store.reconcile_with_live(
+        {"WIKI-Z": "run-z"},
+        expected_revision=snapshot_revision,
+    )
+    assert changed is False
+    tickets = _by_type(store, "codex_auth_dead_exhausted")["tickets"]
+    assert tickets == ["WIKI-NEW", "WIKI-Z"]
+
+
+def test_reconcile_bumps_revision_when_it_actually_changes_state(tmp_path: Path) -> None:
+    store = _store(tmp_path)
+    store.apply_event(
+        {
+            "type": "codex_auth_dead_exhausted",
+            "tickets": ["WIKI-Y"],
+            "run_ids": {"WIKI-Y": "run-y"},
+            "ts": "t1",
+        }
+    )
+    rev_before = store.revision
+    # Archive WIKI-Y — a real reconcile change.
+    changed = store.reconcile_with_live({}, expected_revision=rev_before)
+    assert changed is True
+    assert store.revision == rev_before + 1
+
+
 def test_reconcile_leaves_fleet_wide_notices_alone(tmp_path: Path) -> None:
     store = _store(tmp_path)
     store.apply_event({"type": "codex_limit_no_eligible", "tickets": ["WIKI-I"], "reset_at": None, "ts": "t1"})

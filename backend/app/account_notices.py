@@ -68,6 +68,12 @@ class AccountNoticeStore:
         self._path = path or _default_path()
         self._lock = threading.Lock()
         self._notices: dict[str, dict] = self._load()
+        # Monotonic counter that bumps on every state-changing event. The
+        # /api/agents flow captures this revision BEFORE reading the
+        # registry, then passes it to reconcile_with_live so that a notice
+        # published between the registry read and the reconcile is not
+        # silently deleted. See main.py agents().
+        self._revision: int = 0
 
     def _load(self) -> dict[str, dict]:
         try:
@@ -92,6 +98,13 @@ class AccountNoticeStore:
             # Persistence is best-effort; in-memory state stays authoritative.
             pass
 
+    @property
+    def revision(self) -> int:
+        """Monotonic snapshot marker of the notice store (see __init__)."""
+
+        with self._lock:
+            return self._revision
+
     def apply_event(self, event: dict) -> bool:
         """Set or resolve notices from one SSE event. True when state changed."""
 
@@ -100,6 +113,7 @@ class AccountNoticeStore:
         with self._lock:
             changed = self._apply_locked(event)
             if changed:
+                self._revision += 1
                 self._persist()
             return changed
 
@@ -247,8 +261,24 @@ class AccountNoticeStore:
 
         return changed
 
-    def reconcile_with_live(self, live_runs: dict[str, str | None]) -> bool:
+    def reconcile_with_live(
+        self,
+        live_runs: dict[str, str | None],
+        *,
+        expected_revision: int | None = None,
+    ) -> bool:
         """Drop worker-scoped notice tickets that no longer match a live run.
+
+        ``expected_revision`` guards against a TOCTOU race between the
+        registry snapshot and this call: publish_agent_event may apply a new
+        failure notice for a run that started or was replaced during that
+        window. That fresh notice carries the new run_id, but the caller's
+        ``live_runs`` was built before it landed and would treat the ticket
+        as absent (or under the wrong run_id) and drop the notice. When the
+        caller captures ``self.revision`` before the registry read and passes
+        it here, a mismatch means at least one event landed after the
+        snapshot — bail and let the next /api/agents refresh reconcile from
+        a consistent pair.
 
         ``live_runs`` maps every live ticket to its current run_id (or None
         for legacy tmux entries without a run_id). A notice ticket clears
@@ -278,6 +308,11 @@ class AccountNoticeStore:
             return True
 
         with self._lock:
+            if expected_revision is not None and self._revision != expected_revision:
+                # Something landed after the caller's snapshot. Preserving
+                # notices is always safe; the next refresh reconciles from
+                # a paired revision.
+                return False
             changed = False
             existing = self._notices.get(_EXHAUSTED_KEY)
             if existing is not None:
@@ -344,6 +379,7 @@ class AccountNoticeStore:
                 self._notices.pop(key, None)
                 changed = True
             if changed:
+                self._revision += 1
                 self._persist()
             return changed
 

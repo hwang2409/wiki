@@ -3,7 +3,7 @@ import { act, cleanup, fireEvent, render, waitFor } from "@testing-library/react
 import { afterEach, beforeEach, expect, test, vi } from "vitest";
 import { useEffect, useState } from "react";
 
-import { AgentsView, SpawnWorkerModal } from "../src/agents";
+import { AgentsView, SpawnOrchestratorModal, SpawnWorkerModal } from "../src/agents";
 import { ReplaceAgentModal } from "../src/replace-agent-modal";
 import { isAgentRefreshEvent } from "../src/agent-events";
 import { getAgents } from "../src/api";
@@ -38,7 +38,7 @@ const worker = {
   last_viewed_at: null,
   last_viewed_seq: null,
   run_id: "run-1234-full-id",
-  runtime_state: "running",
+  runtime_state: "working",
   control_attached: true,
   kind: "cc",
   role: "implement",
@@ -114,12 +114,12 @@ test("run id, tmux, worktree path, and log path live behind the details disclosu
   expect(view.queryByText(/@42/)).toBeNull();
   expect(view.queryByText("/tmp/logs/wiki-1.jsonl")).toBeNull();
 
-  const toggle = view.getByRole("button", { name: /details/ });
+  const toggle = view.getAllByRole("button", { name: /details/ })[0];
   expect(toggle.getAttribute("aria-expanded")).toBe("false");
   fireEvent.click(toggle);
   expect(toggle.getAttribute("aria-expanded")).toBe("true");
   await waitFor(() => {
-    expect(view.getByText(/run-1234-full-id · running · control attached/)).toBeTruthy();
+    expect(view.getByText(/run-1234-full-id · working · control attached/)).toBeTruthy();
     expect(view.getByText("@42")).toBeTruthy();
     expect(view.getByText("/tmp/worktrees/wiki-1")).toBeTruthy();
     expect(view.getByText("/tmp/logs/wiki-1.jsonl")).toBeTruthy();
@@ -132,7 +132,7 @@ test("clicking the card body opens the session preview; buttons do not", () => {
   fireEvent.click(view.getByText("doing things"));
   expect(onOpenTicket).toHaveBeenCalledWith("WIKI-1");
   onOpenTicket.mockClear();
-  fireEvent.click(view.getByRole("button", { name: /details/ }));
+  fireEvent.click(view.getAllByRole("button", { name: /details/ })[0]);
   expect(onOpenTicket).not.toHaveBeenCalled();
 });
 
@@ -440,10 +440,148 @@ test("worker card default hides role, model, and technical actions; menu reveals
   expect(view.getByRole("menuitem", { name: /Review PR/ })).toBeTruthy();
 });
 
+test("primary action tracks runtime_state, not the manual worker state", () => {
+  // A Claude worker can keep the manual status file at state=working
+  // while its adapter is idle. Keying Interrupt off state would send the
+  // idle adapter an interrupt for no reason — primary must key off
+  // runtime_state.
+  const divergent = { ...worker, state: "working", runtime_state: "idle" };
+  const view = renderView({
+    data: { ...data, workers: [divergent as unknown as AgentWorker] },
+  });
+  expect(view.queryByRole("button", { name: /^Interrupt$/ })).toBeNull();
+  // Idle attached workers get no transport primary (Complete/Stop are
+  // destructive-secondary), so there is no primary action button.
+});
+
+test("merge-ready card shows Review as primary and does not duplicate it in the menu", async () => {
+  const mergeReady = { ...worker, state: "merge-ready", runtime_state: "idle" };
+  const view = renderView({
+    data: { ...data, workers: [mergeReady as unknown as AgentWorker] },
+  });
+  // Primary is Review (task-state driven).
+  expect(view.getByRole("button", { name: /^Review$/ })).toBeTruthy();
+  // Open the overflow menu — Review PR must NOT appear again.
+  fireEvent.click(view.getByRole("button", { name: /More actions for WIKI-1/ }));
+  await waitFor(() => {
+    expect(view.getByRole("menu")).toBeTruthy();
+  });
+  expect(view.queryByRole("menuitem", { name: /Review PR/ })).toBeNull();
+});
+
+test("orchestrator row default hides kind/model/cwd; details disclosure reveals them", async () => {
+  const orch: Orchestrator = {
+    id: "wiki-lead",
+    window: null,
+    window_alive: false,
+    run_id: "orch-run-1",
+    runtime_state: "working",
+    control_attached: true,
+    kind: "cc",
+    model: "opus",
+    effort: null,
+    cwd: "/tmp/projects/lead",
+  } as unknown as Orchestrator;
+  const workerUnderOrch = { ...worker, orch: "wiki-lead" };
+  const view = renderView({
+    data: {
+      workers: [workerUnderOrch as AgentWorker],
+      orchestrators: [orch],
+      archived: [],
+      error: null,
+    },
+  });
+  // Default surface must not surface raw kind/model/cwd on the orch row.
+  const orchHead = view.container.querySelector(".agents-orch-head")!;
+  expect(orchHead).toBeTruthy();
+  expect(orchHead.textContent).not.toContain("opus");
+  expect(orchHead.textContent).not.toContain("/tmp/projects/lead");
+  // Replace + secondary lifecycle controls live in the overflow menu.
+  expect(orchHead.querySelector("button.agent-replace-button")).toBeNull();
+  // Open the orch overflow menu — Replace shows up.
+  fireEvent.click(
+    view.getByRole("button", { name: /More actions for wiki-lead/ }),
+  );
+  await waitFor(() => {
+    expect(view.getByRole("menuitem", { name: /^Replace$/ })).toBeTruthy();
+  });
+});
+
+test("history row is a quiet outcome/date summary with View transcript", async () => {
+  const view = renderView({
+    data: { ...data, workers: [], orchestrators: [], error: null },
+  });
+  const historyRow = view.container.querySelector(".agent-card.is-archived");
+  expect(historyRow).toBeTruthy();
+  // No kind/role/model badges on the default surface.
+  expect(historyRow!.textContent).not.toContain("cdx");
+  expect(historyRow!.textContent).not.toContain("review");
+  expect(historyRow!.textContent).not.toContain("gpt-5.6-sol");
+  // Outcome + View transcript ARE surfaced.
+  expect(historyRow!.textContent).toContain("merged");
+  expect(view.getByRole("button", { name: /View transcript/ })).toBeTruthy();
+  // Details disclosure reveals the technical fields.
+  fireEvent.click(view.getByRole("button", { name: /details/ }));
+  await waitFor(() => {
+    expect(view.getByText(/Codex \(cdx\)/)).toBeTruthy();
+    expect(view.getByText("review")).toBeTruthy();
+    expect(view.getByText("gpt-5.6-sol")).toBeTruthy();
+  });
+});
+
+test("spawn orchestrator dialog leads with name and goal; provider/model live under Advanced", async () => {
+  const view = render(
+    <SpawnOrchestratorModal
+      models={models}
+      onClose={() => undefined}
+      onSpawn={() => undefined}
+    />,
+  );
+  // Default view: only Name + Initial goal. Project dir / provider / model /
+  // effort are hidden. Advanced summary shows current preset (friendly).
+  expect(view.queryByLabelText("Provider")).toBeNull();
+  expect(view.queryByLabelText("Model")).toBeNull();
+  expect(view.queryByPlaceholderText("/tmp/project")).toBeNull();
+  const advanced = view.getByRole("button", { name: /Advanced/ });
+  expect(advanced.textContent).toMatch(/Claude/);
+
+  // Open Advanced.
+  fireEvent.click(advanced);
+  await waitFor(() => {
+    expect(view.getByLabelText("Provider")).toBeTruthy();
+    expect(view.getByLabelText("Model")).toBeTruthy();
+    expect(view.getByPlaceholderText("/tmp/project")).toBeTruthy();
+  });
+
+  // Provider options render friendly labels.
+  const providerSelect = view.getByLabelText("Provider") as HTMLSelectElement;
+  const providerOptions = Array.from(providerSelect.options).map((o) => o.text);
+  expect(providerOptions).toEqual(expect.arrayContaining(["Claude", "Codex"]));
+});
+
+test("spawn orchestrator dialog hides goal byte count until it nears 20KB", () => {
+  const view = render(
+    <SpawnOrchestratorModal
+      models={models}
+      onClose={() => undefined}
+      onSpawn={() => undefined}
+    />,
+  );
+  const goalField = view.container.querySelector(
+    "textarea.agent-spawn-textarea",
+  ) as HTMLTextAreaElement;
+  fireEvent.change(goalField, { target: { value: "short goal" } });
+  expect(view.container.textContent).not.toMatch(/\bbytes\b/);
+  fireEvent.change(goalField, { target: { value: "y".repeat(12_000) } });
+  expect(view.container.textContent).not.toMatch(/nearing the 20KB limit/);
+  fireEvent.change(goalField, { target: { value: "y".repeat(17_000) } });
+  expect(view.container.textContent).toMatch(/nearing the 20KB limit/);
+});
+
 test("worker card technical details expose provider/role/model when opened", async () => {
   const view = renderView();
   expect(view.queryByText(/Claude/)).toBeNull();
-  fireEvent.click(view.getByRole("button", { name: /details/ }));
+  fireEvent.click(view.getAllByRole("button", { name: /details/ })[0]);
   await waitFor(() => {
     expect(view.getByText(/Claude \(cc\)/)).toBeTruthy();
     expect(view.getByText("implement")).toBeTruthy();

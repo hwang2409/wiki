@@ -145,7 +145,13 @@ async function main() {
   try {
     await page.goto(`${backend.baseUrl}/#/agents`, { waitUntil: "domcontentloaded" });
     await page.locator(".agents-orch-group").waitFor();
-    await page.locator(".agents-orch-group").getByRole("button", { name: "Replace" }).click();
+    // Replace lives inside the row overflow menu after the WIKI-154 round-5
+    // orchestrator-row density sweep. Open it first, then click Replace.
+    await page
+      .locator(".agents-orch-group")
+      .getByRole("button", { name: new RegExp(`More actions for ${ORCH}`) })
+      .click();
+    await page.getByRole("menuitem", { name: "Replace" }).click();
     const dialog = page.getByRole("dialog", { name: `Replace ${ORCH}` });
     await dialog.waitFor();
     // Provider/model/effort now live inside Advanced; open it to interact

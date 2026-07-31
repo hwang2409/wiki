@@ -892,6 +892,39 @@ class HeadlessMainRouteTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(len(exhausted), 1)
         self.assertEqual(exhausted[0]["tickets"], ["WIKI-42"])
 
+    async def test_agents_reconcile_preserves_notice_published_after_registry_read(
+        self,
+    ) -> None:
+        # TOCTOU guard: publish_agent_event may apply a new-run failure
+        # notice between the registry snapshot and the reconcile call. That
+        # fresh notice's ticket may not appear in live_runs at all, and
+        # without the revision guard reconcile would drop it as archived.
+        self._seed_headless()
+        notices = self._isolate_account_notices()
+        original_viewed = main._read_viewed_map
+
+        def viewed_and_publish_between(*args: object, **kwargs: object):
+            # Simulate a failure event landing after the registry snapshot
+            # but before reconcile. _read_viewed_map runs mid-agents(),
+            # after the registry read and before reconcile_with_live.
+            notices.apply_event(
+                {
+                    "type": "codex_auth_dead_exhausted",
+                    "tickets": ["WIKI-NEW"],
+                    "run_ids": {"WIKI-NEW": "run-new"},
+                    "ts": "t1",
+                }
+            )
+            return original_viewed(*args, **kwargs)  # type: ignore[misc]
+
+        with mock.patch.object(main, "_read_viewed_map", side_effect=viewed_and_publish_between):
+            payload = main.agents()
+
+        surfaced = cast(list[dict[str, Any]], payload["account_notices"])
+        exhausted = [entry for entry in surfaced if entry["type"] == "codex_auth_dead_exhausted"]
+        self.assertEqual(len(exhausted), 1)
+        self.assertEqual(exhausted[0]["tickets"], ["WIKI-NEW"])
+
     async def test_agents_does_not_reconcile_when_registry_is_not_an_object(self) -> None:
         # A registry that parses as JSON but is not an object (e.g. a bare
         # list from a partial write) must preserve notices.

@@ -1916,6 +1916,14 @@ def list_workspaces() -> WorkspaceList:
 def agents() -> dict[str, object]:
     registry: dict = {}
     registry_refreshed_at: str | None = None
+    # Capture the notice revision BEFORE reading the registry. A failure
+    # event that lands between the registry snapshot and the reconcile
+    # call would otherwise carry a run_id or ticket that live_runs does
+    # not know about, and reconcile_with_live would delete the fresh
+    # notice. Passing this revision to reconcile makes it a no-op when
+    # something landed after the snapshot; the next refresh reconciles
+    # from a paired pair.
+    notice_revision = ACCOUNT_NOTICES.revision
     # Notice reconciliation compares against live registry identity, but the
     # registry file may be transiently missing (backend/supervisor startup
     # race), unreadable, or a non-object payload. On any of those failure
@@ -2150,7 +2158,10 @@ def agents() -> dict[str, object]:
     # forever. WIKI-228 will drive this from durable supervisor events
     # instead of an ambient snapshot check.
     if registry_loaded:
-        ACCOUNT_NOTICES.reconcile_with_live(live_runs)
+        ACCOUNT_NOTICES.reconcile_with_live(
+            live_runs,
+            expected_revision=notice_revision,
+        )
 
     return {
         "workers": workers,
