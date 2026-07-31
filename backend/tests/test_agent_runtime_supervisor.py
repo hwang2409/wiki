@@ -1876,6 +1876,85 @@ class SupervisorTests(unittest.IsolatedAsyncioTestCase):
         finally:
             await restarted.close()
 
+    async def test_recovery_retries_uncommitted_start_cleanup_after_pid_exit(
+        self,
+    ) -> None:
+        request_id = "start-retry-after-pid-exit"
+        record = RunRecord.new(
+            agent_id="WIKI-START-RETRY-AFTER-EXIT",
+            provider=ProviderKind.CODEX,
+            role="implement",
+            model="fixture-codex",
+            worktree=str(self.worktree),
+            prompt="retry uncommitted start after provider exit",
+            run_id=str(uuid4()),
+            start_request_id=request_id,
+        )
+        command = AgentCommand.spawn(
+            agent_id=record.agent_id,
+            request_id=request_id,
+            payload={
+                "agent_id": record.agent_id,
+                "provider": record.provider.value,
+                "role": record.role,
+                "model": record.model,
+                "worktree": record.worktree,
+                "prompt": record.initial_prompt or "retry uncommitted start after provider exit",
+                "run_id": record.run_id,
+            },
+        )
+        self.store.command_log.append_intent(command, {record.agent_id: None})
+        self.store.create(record, transactional_start=True)
+        provider = subprocess.Popen(
+            [sys.executable, "-c", "import time; time.sleep(30)"],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+        )
+        restarted: Supervisor | None = None
+        try:
+            record = self.store.get(record.run_id)
+            record.provider_pid = provider.pid
+            self.store._write_record(record)  # noqa: SLF001 - uncertain live provider fixture
+            self.store.transition(
+                record.run_id,
+                LifecycleState.BLOCKED,
+                reason="provider identity is uncertain after restart",
+            )
+
+            restarted_store = RunStore(self.paths)
+            restarted = Supervisor(
+                restarted_store,
+                FixtureAdapterFactory(FIXTURES, pid=os.getpid()),
+            )
+            first = await restarted.recover_on_start()
+            self.assertEqual(first[0]["action"], "block")
+            self.assertIsNotNone(restarted_store.get(record.run_id).start_transaction)
+            self.assertEqual(restarted_store.command_log.pending(), [command])
+            self.assertIsNone(
+                restarted_store.command_log.receipt("run/start", request_id)
+            )
+
+            provider.terminate()
+            provider.wait(timeout=5)
+            second = await restarted.recover_on_start()
+
+            self.assertEqual(restarted_store.list_runs(), [restarted_store.get(record.run_id)])
+            current = restarted_store.get(record.run_id)
+            self.assertEqual(current.run_id, record.run_id)
+            self.assertIsNone(current.start_transaction)
+            self.assertEqual(second, [])
+            self.assertEqual(restarted_store.command_log.pending(), [])
+            receipt = restarted_store.command_log.receipt("run/start", request_id)
+            self.assertIsNotNone(receipt)
+            assert receipt is not None
+            self.assertTrue(receipt.ok)
+        finally:
+            if provider.poll() is None:
+                provider.kill()
+                provider.wait(timeout=5)
+            if restarted is not None:
+                await restarted.close()
+
     async def test_replace_cancellation_during_quiesce_terminalizes_old_run(self) -> None:
         old = await self.supervisor.start_run(
             agent_id="WIKI-REPLACE-CANCEL-STOP",

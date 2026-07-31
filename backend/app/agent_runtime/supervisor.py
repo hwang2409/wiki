@@ -2086,6 +2086,7 @@ Preserve the same identity, role, worktree, orchestrator grouping, PR gates, and
     async def recover_on_start(self) -> list[dict[str, str]]:
         async with self._run_mutation_admission():
             async with self.recovery_scan_lock:
+                self.store.abort_uncommitted_starts()
                 results = await self._recover_once()
                 await self.command_queue.recover_pending()
                 if self._reaper_due():

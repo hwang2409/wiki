@@ -909,25 +909,35 @@ class RunStore:
     def _abort_uncommitted_starts(self) -> None:
         """Abort fresh starts that were published before provider commit."""
 
-        for path in sorted(self.paths.runs_dir.glob("*/run.json")):
-            try:
-                value = _read_json(path)
-                if not isinstance(value, dict):
+        self.abort_uncommitted_starts()
+
+    def abort_uncommitted_starts(self) -> list[str]:
+        """Abort safe uncommitted starts and return the removed run ids."""
+
+        aborted: list[str] = []
+        with self._lock:
+            for path in sorted(self.paths.runs_dir.glob("*/run.json")):
+                try:
+                    value = _read_json(path)
+                    if not isinstance(value, dict):
+                        continue
+                    record = RunRecord.from_dict(value)
+                    if not record.start_transaction:
+                        continue
+                    if record.provider_pid is None:
+                        record = self.discover_provider_process(record.run_id)
+                    if not self._terminate_recorded_provider_pid(record):
+                        continue
+                    self._restore_start_snapshot(record, record.start_transaction)
+                    if record.start_request_id:
+                        self.command_log.remove_start_request(record.start_request_id)
+                    self._start_registry_snapshots.pop(record.run_id, None)
+                    shutil.rmtree(self.run_dir(record.run_id), ignore_errors=True)
+                    aborted.append(record.run_id)
+                except (OSError, StoreError, TypeError, ValueError):
+                    # Leave damaged metadata for the normal inspector path.
                     continue
-                record = RunRecord.from_dict(value)
-                if not record.start_transaction:
-                    continue
-                if record.provider_pid is None:
-                    record = self.discover_provider_process(record.run_id)
-                if not self._terminate_recorded_provider_pid(record):
-                    continue
-                self._restore_start_snapshot(record, record.start_transaction)
-                if record.start_request_id:
-                    self.command_log.remove_start_request(record.start_request_id)
-                shutil.rmtree(self.run_dir(record.run_id), ignore_errors=True)
-            except (OSError, StoreError, TypeError, ValueError):
-                # Leave damaged metadata for the normal inspector path.
-                continue
+        return aborted
 
     @staticmethod
     def _terminate_recorded_provider_pid(

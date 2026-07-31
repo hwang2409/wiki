@@ -318,6 +318,8 @@ def terminate_verified_provider_group(
                 os.kill(pid, 0)
             except ProcessLookupError:
                 return False
+            except psutil.NoSuchProcess:
+                return False
             except PermissionError:
                 return None
             return None
