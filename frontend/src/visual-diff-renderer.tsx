@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { useEffect, useId, useMemo, useRef, useState } from "react";
 import { Columns2, ScanSearch } from "lucide-react";
 import type { SessionArtifact, SessionEvent } from "./api";
 import { ArtifactError, ArtifactPlaceholder } from "./artifact-state";
@@ -179,7 +179,11 @@ export function VisualDiffRenderer({
   }
 
   const opacity = blendOpacity(slider);
-  const sliderId = `visual-diff-slider-${event.artifact_id ?? "artifact"}`;
+  // useId gives every mounted copy its own value, so an inline + inspector +
+  // panel triple of the same artifact does not collide on DOM ids or bind a
+  // label to the wrong slider.
+  const reactId = useId();
+  const sliderId = `visual-diff-slider-${reactId}`;
   const aspectStyle = aspect ? { aspectRatio: `${aspect}` } : undefined;
   const stageContent = state.status === "ready" ? (
     <>

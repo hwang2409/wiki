@@ -469,6 +469,28 @@ def _generate_preview(scrubbed: bytes, mime: str, width: int, height: int) -> st
     return "data:image/jpeg;base64," + base64.b64encode(buffer.getvalue()).decode("ascii")
 
 
+def _verify_container_integrity(data: bytes, expected_format: str) -> None:
+    """Confirm the payload really is a complete, well-formed container of the
+    declared format. Header probing is O(bytes-of-header) — that is fast, but
+    it accepts a PNG whose signature and IHDR are valid while a later chunk
+    CRC is corrupt, or a JPEG that is truncated after the SOF. verify() walks
+    the chunk / marker structure and CRC-checks PNG chunks; combined with the
+    format cross-check it rejects both classes before we hand the browser
+    bytes it cannot decode. verify() invalidates the Image, so we read .format
+    inside the same context and never touch the object again."""
+    try:
+        with Image.open(io.BytesIO(data)) as source:
+            if source.format != expected_format:
+                raise ImageScrubError(
+                    f"payload does not decode as {expected_format} (got {source.format})"
+                )
+            source.verify()
+    except ImageScrubError:
+        raise
+    except Exception as exc:  # noqa: BLE001 — normalise Pillow's many exceptions
+        raise ImageScrubError(f"image container failed integrity check: {exc}") from exc
+
+
 def scrub_image(data: bytes, mime: str) -> ScrubResult:
     """Validate + strip metadata from image bytes. Rotates pixels if the source
     was tagged with a non-upright EXIF orientation, otherwise keeps the original
@@ -492,6 +514,8 @@ def scrub_image(data: bytes, mime: str) -> ScrubResult:
         raise ImageScrubError(
             f"image exceeds {MAX_PIXELS // 1_000_000}MP pixel limit ({width}x{height})"
         )
+
+    _verify_container_integrity(data, expected)
 
     orientation = 1
     probe = _ORIENTATION_PROBES.get(mime)

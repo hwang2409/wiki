@@ -4,6 +4,7 @@ import { afterEach, beforeAll, describe, expect, test, vi } from "vitest";
 
 import type { SessionEvent } from "../src/api";
 import { ArtifactBlock } from "../src/artifact-block";
+import { ArtifactPanel } from "../src/artifact-panel";
 import { VisualDiffRenderer } from "../src/visual-diff-renderer";
 
 // Every ImmediateImage src is tagged so the mock canvas can hand back the
@@ -214,5 +215,117 @@ describe("visual-diff compact preview in ArtifactBlock", () => {
     // The whole compact body remains a single expand affordance. onOpen fires
     // only from an explicit body click, never mid-gesture on live controls.
     expect(onOpen).not.toHaveBeenCalled();
+  });
+
+  test("compact body click forwards to onOpen so the panel can pick it up", async () => {
+    const onOpen = vi.fn();
+    const event: SessionEvent = {
+      id: 1,
+      kind: "artifact",
+      ts: null,
+      text: "",
+      disposition: "rendered",
+      artifact_id: "big",
+      title: "Screenshot pair",
+      artifact: {
+        kind: "visual-diff",
+        before: { mime: "image/png", width: 1280, height: 720 },
+        after: { mime: "image/png", width: 1280, height: 720 },
+      },
+    };
+    render(<ArtifactBlock event={event} onOpen={onOpen} ticket="WIKI-193" />);
+    await screen.findByAltText("Screenshot pair");
+    const compactBody = document.querySelector('[data-artifact-compact] .artifact-body') as HTMLElement | null;
+    expect(compactBody).toBeTruthy();
+    fireEvent.click(compactBody!);
+    expect(onOpen).toHaveBeenCalledTimes(1);
+  });
+});
+
+describe("visual-diff in ArtifactPanel", () => {
+  test("panel renders both variants and controls for a focused visual-diff tab", async () => {
+    const event: SessionEvent = {
+      id: 1,
+      kind: "artifact",
+      ts: null,
+      text: "",
+      disposition: "rendered",
+      artifact_id: "big",
+      title: "Screenshot pair",
+      artifact: {
+        kind: "visual-diff",
+        before: { mime: "image/png", width: 1280, height: 720 },
+        after: { mime: "image/png", width: 1280, height: 720 },
+      },
+    };
+    render(
+      <ArtifactPanel
+        artifacts={new Map([[event.artifact_id!, event]])}
+        onClosePanel={() => {}}
+        onCloseTab={() => {}}
+        onFocusTab={() => {}}
+        onReopen={() => {}}
+        onResizeStart={() => {}}
+        onUpdateViewState={() => {}}
+        state={{
+          tabs: [event.artifact_id!],
+          focusedTab: event.artifact_id!,
+          recentlyClosed: [],
+          viewState: {},
+        }}
+        ticket="WIKI-193"
+        width={640}
+      />,
+    );
+    const before = await screen.findByAltText("Screenshot pair");
+    expect(before.getAttribute("src")).toBe(
+      "/api/agents/WIKI-193/artifact/big?variant=before",
+    );
+    const after = before.parentElement?.querySelector("img.is-after") as HTMLImageElement | null;
+    expect(after?.getAttribute("src")).toBe(
+      "/api/agents/WIKI-193/artifact/big?variant=after",
+    );
+    // Live controls surface — regression against the "Artifact unavailable"
+    // fallback the panel was showing before the visual-diff case was added.
+    expect(screen.getByRole("slider")).toBeTruthy();
+    expect(screen.getByRole("button", { name: /pixel diff/i })).toBeTruthy();
+    expect(screen.queryByText(/artifact unavailable/i)).toBeNull();
+  });
+});
+
+describe("visual-diff renderer id uniqueness", () => {
+  test("mounting two renderers for the same artifact produces distinct slider ids and local htmlFor bindings", async () => {
+    const event: SessionEvent = {
+      id: 1,
+      kind: "artifact",
+      ts: null,
+      text: "",
+      disposition: "rendered",
+      artifact_id: "shared",
+      title: "Screenshot pair",
+      artifact: {
+        kind: "visual-diff",
+        before: { mime: "image/png", width: 12, height: 8 },
+        after: { mime: "image/png", width: 12, height: 8 },
+      },
+    };
+    render(
+      <>
+        <VisualDiffRenderer artifact={event.artifact!} event={event} ticket="WIKI-193" />
+        <VisualDiffRenderer artifact={event.artifact!} event={event} ticket="WIKI-193" />
+      </>,
+    );
+    await screen.findAllByAltText("Screenshot pair");
+    const sliders = screen.getAllByRole("slider") as HTMLInputElement[];
+    expect(sliders).toHaveLength(2);
+    // Ids differ across copies.
+    expect(sliders[0].id).not.toBe(sliders[1].id);
+    // Each label's htmlFor binds to its own local slider — a click on a
+    // label focuses the matching slider, not the sibling copy.
+    for (const slider of sliders) {
+      const label = document.querySelector(`label[for="${slider.id}"]`) as HTMLLabelElement | null;
+      expect(label).toBeTruthy();
+      expect(label!.getAttribute("for")).toBe(slider.id);
+    }
   });
 });

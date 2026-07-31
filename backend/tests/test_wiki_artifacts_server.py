@@ -282,6 +282,59 @@ class WikiArtifactsTests(unittest.TestCase):
                 }
             )
 
+    def test_visual_diff_rejects_valid_header_corrupt_crc_per_side(self) -> None:
+        # PNG structure: 8-byte signature, then chunks each shaped
+        # length(4) + type(4) + data(length) + crc(4). The IHDR chunk sits at
+        # offset 8 with a 13-byte payload and a CRC at bytes 29..33.
+        def _corrupt_ihdr_crc() -> bytes:
+            corrupted = bytearray(FIXTURE_PNG_BYTES)
+            for i in range(29, 33):
+                corrupted[i] ^= 0xFF
+            return bytes(corrupted)
+
+        corrupt = _corrupt_ihdr_crc()
+        upright = FIXTURE_PNG_BYTES
+
+        # Corrupt on the 'before' side.
+        with self.assertRaisesRegex(
+            wiki_artifacts.ArtifactValidationError, "payload.before rejected"
+        ):
+            wiki_artifacts.render_artifact(
+                {
+                    "kind": "visual-diff",
+                    "payload": {
+                        "before": {
+                            "data_base64": base64.b64encode(corrupt).decode(),
+                            "mime": "image/png",
+                        },
+                        "after": {
+                            "data_base64": base64.b64encode(upright).decode(),
+                            "mime": "image/png",
+                        },
+                    },
+                }
+            )
+
+        # Corrupt on the 'after' side.
+        with self.assertRaisesRegex(
+            wiki_artifacts.ArtifactValidationError, "payload.after rejected"
+        ):
+            wiki_artifacts.render_artifact(
+                {
+                    "kind": "visual-diff",
+                    "payload": {
+                        "before": {
+                            "data_base64": base64.b64encode(upright).decode(),
+                            "mime": "image/png",
+                        },
+                        "after": {
+                            "data_base64": base64.b64encode(corrupt).decode(),
+                            "mime": "image/png",
+                        },
+                    },
+                }
+            )
+
     def test_visual_diff_rejects_non_image_bytes(self) -> None:
         with self.assertRaisesRegex(
             wiki_artifacts.ArtifactValidationError, "payload.after rejected"
