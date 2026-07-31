@@ -135,27 +135,48 @@ class ApprovalRecoveryAdapter(CodexFixtureAdapter):
 class HandoverStopEventCodexAdapter(CodexFixtureAdapter):
     """Replay the Codex interrupt completion emitted while handover stops it."""
 
+    stop_result = "interrupted"
+
     async def stop(self) -> AdapterStatus:
         status = self.snapshot()
         if status.state in {
             LifecycleState.WORKING,
             LifecycleState.WAITING_APPROVAL,
         }:
-            await self._events.put(  # noqa: SLF001 - stop-event handover fixture
-                ProviderEvent(
-                    ProviderKind.CODEX,
-                    {
-                        "method": "turn/completed",
-                        "params": {
-                            "turn": {
-                                "id": status.active_turn_id or "handover-turn",
-                                "status": "interrupted",
-                            }
+            if self.stop_result in {"approval", "approval_then_completed"}:
+                await self.emit_approval()
+                if self.stop_result == "approval_then_completed":
+                    await self._events.put(  # noqa: SLF001 - stop-event fixture
+                        ProviderEvent(
+                            ProviderKind.CODEX,
+                            {
+                                "method": "turn/completed",
+                                "params": {
+                                    "turn": {
+                                        "id": status.active_turn_id or "handover-turn",
+                                        "status": "completed",
+                                    }
+                                },
+                            },
+                            generation=status.generation,
+                        )
+                    )
+            else:
+                await self._events.put(  # noqa: SLF001 - stop-event fixture
+                    ProviderEvent(
+                        ProviderKind.CODEX,
+                        {
+                            "method": "turn/completed",
+                            "params": {
+                                "turn": {
+                                    "id": status.active_turn_id or "handover-turn",
+                                    "status": self.stop_result,
+                                }
+                            },
                         },
-                    },
-                    generation=status.generation,
+                        generation=status.generation,
+                    )
                 )
-            )
         return await super().stop()
 
     async def emit_approval(self) -> None:
@@ -191,14 +212,26 @@ class HandoverStopEventCodexAdapter(CodexFixtureAdapter):
 
 
 class HandoverCodexFactory(FixtureAdapterFactory):
+    def __init__(
+        self,
+        fixture_dir: Path,
+        *,
+        pid: int | None = None,
+        stop_result: str = "interrupted",
+    ):
+        super().__init__(fixture_dir, pid=pid)
+        self.stop_result = stop_result
+
     def __call__(self, record: RunRecord) -> ProviderAdapter:
         if record.provider is ProviderKind.CODEX:
-            return HandoverStopEventCodexAdapter(
+            adapter = HandoverStopEventCodexAdapter(
                 self.fixture_dir / "codex_app_server_success.jsonl",
                 self.fixture_dir / "codex_app_server_control.jsonl",
                 pid=self.pid,
                 generation=record.provider_generation,
             )
+            adapter.stop_result = self.stop_result
+            return adapter
         return super().__call__(record)
 
 
@@ -1977,6 +2010,87 @@ class SupervisorTests(unittest.IsolatedAsyncioTestCase):
                     if state is LifecycleState.WAITING_APPROVAL:
                         self.assertEqual(current.state, state)
                         self.assertTrue(current.pending_requests)
+                finally:
+                    await replacement.close()
+
+    async def test_codex_handover_classifies_natural_stop_results(self) -> None:
+        for stop_result, expected_state in (
+            ("completed", LifecycleState.IDLE),
+            ("approval", LifecycleState.WAITING_APPROVAL),
+            ("approval_then_completed", LifecycleState.WAITING_APPROVAL),
+        ):
+            with self.subTest(stop_result=stop_result), tempfile.TemporaryDirectory() as tmp:
+                root = Path(tmp)
+                worktree = root / "worktree"
+                worktree.mkdir()
+                paths = _paths(root)
+                store = RunStore(paths)
+                supervisor = Supervisor(
+                    store,
+                    HandoverCodexFactory(
+                        FIXTURES,
+                        pid=os.getpid(),
+                        stop_result=stop_result,
+                    ),
+                    pid_alive=lambda _pid: False,
+                )
+                record = await supervisor.start_run(
+                    agent_id=f"WIKI-CODEX-NATURAL-{stop_result}",
+                    provider=ProviderKind.CODEX,
+                    role="implement",
+                    model="fixture-codex",
+                    effort="high",
+                    worktree=str(worktree),
+                    prompt="natural handover result",
+                )
+                adapter = supervisor.adapters[record.run_id]
+                assert isinstance(adapter, HandoverStopEventCodexAdapter)
+                status = await adapter.send_now("start the active turn")
+                store.update_adapter_status(record.run_id, status)
+                before = store.get(record.run_id)
+                session_id = before.provider_session_id
+                self.assertIsNotNone(session_id)
+
+                await supervisor.prepare_handover()
+                detached = store.get(record.run_id)
+                self.assertEqual(detached.state, expected_state)
+                if expected_state is LifecycleState.WAITING_APPROVAL:
+                    self.assertTrue(detached.pending_requests)
+                else:
+                    self.assertFalse(detached.pending_requests)
+                await supervisor.close()
+
+                replacement_adapter_factory = HandoverCodexFactory(
+                    FIXTURES,
+                    pid=os.getpid(),
+                    stop_result="interrupted",
+                )
+                replacement = Supervisor(
+                    RunStore(paths),
+                    replacement_adapter_factory,
+                    pid_alive=lambda _pid: False,
+                )
+                try:
+                    recovered = await replacement.recover_on_start()
+                    self.assertEqual(recovered[0]["action"], "resume")
+                    current = replacement.store.get(record.run_id)
+                    self.assertEqual(current.provider_session_id, session_id)
+                    recovered_adapter = replacement.adapters[record.run_id]
+                    assert isinstance(
+                        recovered_adapter, HandoverStopEventCodexAdapter
+                    )
+                    self.assertNotIn("turn/start", recovered_adapter.replayed_methods)
+                    if expected_state is LifecycleState.WAITING_APPROVAL:
+                        self.assertEqual(current.state, expected_state)
+                        self.assertTrue(current.pending_requests)
+                        await replacement.respond(
+                            record.run_id,
+                            "handover-approval",
+                            {"answers": [{"id": "surface", "answer": "Wiki"}]},
+                        )
+                        self.assertFalse(
+                            replacement.store.get(record.run_id).pending_requests
+                        )
                 finally:
                     await replacement.close()
 

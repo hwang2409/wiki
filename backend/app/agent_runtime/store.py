@@ -1376,16 +1376,9 @@ class RunStore:
             record.provider_generation = generation
             record.active_turn_id = None
             record.transcript_path = transcript_path
-            merged_pending_requests = {
-                key: dict(request) for key, request in record.pending_requests.items()
+            record.pending_requests = {
+                key: dict(request) for key, request in pending_requests.items()
             }
-            merged_pending_requests.update(
-                {
-                    key: dict(request)
-                    for key, request in pending_requests.items()
-                }
-            )
-            record.pending_requests = merged_pending_requests
             self._write_record(record)
             registry = self._read_registry()
             current = (registry.get(record.agent_id) or {}).get("current") or {}

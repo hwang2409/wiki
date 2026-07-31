@@ -2449,6 +2449,63 @@ Preserve the same identity, role, worktree, orchestrator grouping, PR gates, and
                 run_ids.append(record.run_id)
         return run_ids
 
+    @staticmethod
+    def _handover_state_after_stop(
+        captured_state: LifecycleState,
+        events: list[tuple[ProviderAdapter, ProviderEvent]],
+    ) -> tuple[LifecycleState, bool]:
+        """Choose the final intent from lifecycle results emitted during stop."""
+
+        state = captured_state
+        approval_seen = False
+        natural_completion_seen = False
+        for _adapter, event in events:
+            normalized = normalize_provider_event(
+                event.provider,
+                event.payload,
+                direction=event.direction,
+            )
+            candidate = normalized.lifecycle_state
+            if candidate is None or candidate is LifecycleState.INTERRUPTED:
+                # An interrupted completion is the expected result of the
+                # supervisor's own stop request. It must not replace intent.
+                continue
+            params = event.payload.get("params")
+            turn = params.get("turn") if isinstance(params, dict) else None
+            completed_turn = (
+                event.payload.get("method") == "turn/completed"
+                and isinstance(turn, dict)
+                and turn.get("status") == "completed"
+            )
+            if completed_turn:
+                state = LifecycleState.IDLE
+                natural_completion_seen = True
+                continue
+            if candidate is LifecycleState.COMPLETED:
+                method = event.payload.get("method")
+                if method == "turn/completed":
+                    state = LifecycleState.IDLE
+                    natural_completion_seen = True
+                    continue
+                raise StoreConflict(
+                    "provider completed the run during handover without a resumable result"
+                )
+            if candidate in {
+                LifecycleState.WORKING,
+                LifecycleState.WAITING_APPROVAL,
+                LifecycleState.IDLE,
+            }:
+                if candidate is LifecycleState.WAITING_APPROVAL:
+                    approval_seen = True
+                state = candidate
+                continue
+            raise StoreConflict(
+                f"provider produced non-resumable handover state: {candidate.value}"
+            )
+        if approval_seen:
+            state = LifecycleState.WAITING_APPROVAL
+        return state, natural_completion_seen
+
     async def prepare_handover(self, _run_ids: list[str] | None = None) -> dict[str, Any]:
         """Block admission, validate providers, then drain that exact set."""
 
@@ -2525,14 +2582,30 @@ Preserve the same identity, role, worktree, orchestrator grouping, PR gates, and
                             f"provider control detached during handover: {run_id}"
                         )
                     await self._quiesce_adapter_for_replacement(run_id, adapter)
+                    async with self.handover_condition:
+                        stop_events = list(self.handover_event_queue.get(run_id, []))
                     await self._flush_handover_events(run_id)
+                    final_state, natural_completion_seen = self._handover_state_after_stop(
+                        captured_state,
+                        stop_events,
+                    )
+                    post_stop = self.store.get(run_id)
+                    if final_state is LifecycleState.WAITING_APPROVAL:
+                        final_pending_requests = {
+                            **post_stop.pending_requests,
+                            **captured_pending_requests,
+                        }
+                    elif natural_completion_seen:
+                        final_pending_requests = {}
+                    else:
+                        final_pending_requests = captured_pending_requests
                     current = self.store.finalize_handover_detach(
                         run_id,
-                        state=captured_state,
+                        state=final_state,
                         session_id=provider_session_id,
                         generation=captured_generation,
                         transcript_path=captured_transcript_path,
-                        pending_requests=captured_pending_requests,
+                        pending_requests=final_pending_requests,
                     )
                     handover_run = self._runtime_status(self.store.get(run_id))
                     handover_run.update(
