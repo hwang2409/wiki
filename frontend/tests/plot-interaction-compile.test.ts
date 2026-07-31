@@ -275,7 +275,7 @@ test("runtime: selected non-round brush domains override nice and padding", asyn
 
 test("runtime: named unit controls resolve named scales and preserve partial descending brushes", async () => {
   const spec = {
-    name: "named_unit",
+    name: "named-unit",
     mark: "point",
     width: 400,
     height: 200,

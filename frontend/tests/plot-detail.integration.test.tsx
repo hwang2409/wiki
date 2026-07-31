@@ -6,28 +6,44 @@ import { afterEach, describe, expect, test, vi } from "vitest";
 type MockView = {
   toImageURL: () => Promise<string>;
   scale: (channel: string) => { domain: () => number[] };
+  scaleNames?: { x?: string; y?: string };
+  signal: (name: string, value: unknown) => MockView;
+  run: () => MockView;
 };
 
 let mockLiveDomain: [number, number] = [0, 10];
+let mockScaleCalls: string[] = [];
 
 vi.mock("../src/artifact-renderers", () => ({
   PlotRenderer: ({
     domains,
     onBrush,
     onView,
+    spec,
   }: {
     domains?: Record<string, unknown>;
     onBrush?: (domains: Record<string, [number, number]>) => void;
     onView?: (view: MockView | null) => void;
+    spec?: Record<string, unknown>;
   }) => {
     const [, rerender] = useState(0);
     useEffect(() => {
       mockLiveDomain = [0, 10];
+      mockScaleCalls = [];
       const view: MockView = {
         toImageURL: async () => {
           throw new Error("PNG encoder unavailable");
         },
-        scale: (channel) => ({ domain: () => channel === "y" ? [20, 40] : mockLiveDomain }),
+        scaleNames: typeof spec?.name === "string" ? { x: "named_unit_x", y: "named_unit_y" } : undefined,
+        scale: (channel) => {
+          mockScaleCalls.push(channel);
+          return { domain: () => channel === "y" || channel === "named_unit_y" ? [20, 40] : mockLiveDomain };
+        },
+        signal: (_name, value) => {
+          if (typeof value === "number" && value < 1) mockLiveDomain = [1, 9];
+          return view;
+        },
+        run: () => view,
       };
       const timer = window.setTimeout(() => onView?.(view), 0);
       return () => {
@@ -97,9 +113,15 @@ const USER_SCALE_BINDING_SPEC = {
   params: [{ name: "user_pan", select: { type: "interval" }, bind: "scales" }],
 };
 
+const NAMED_UNIT_SPEC = {
+  ...FULL_SPEC,
+  name: "named-unit",
+};
+
 afterEach(() => {
   cleanup();
   vi.clearAllMocks();
+  mockScaleCalls = [];
 });
 
 describe("PlotArtifactDetail export feedback", () => {
@@ -154,5 +176,21 @@ describe("PlotArtifactDetail keyboard controls", () => {
     await waitFor(() => expect(screen.getByTestId("mock-live-domain").textContent).toBe("[2,8]"));
     fireEvent.click(reset);
     await waitFor(() => expect(screen.getByTestId("mock-live-domain").textContent).toBe("[0,10]"));
+  });
+
+  test("named units use normalized scales for toolbar zoom and partial brushes", async () => {
+    render(<PlotArtifactDetail spec={NAMED_UNIT_SPEC} />);
+    await waitFor(() => expect((screen.getByRole("button", { name: "Save as PNG" }) as HTMLButtonElement).disabled).toBe(false));
+
+    fireEvent.click(screen.getByRole("button", { name: "Zoom in" }));
+    expect(mockScaleCalls).toContain("named_unit_x");
+    expect(mockScaleCalls).toContain("named_unit_y");
+
+    fireEvent.click(screen.getByTestId("emit-brush"));
+    await waitFor(() => {
+      const domains = screen.getByTestId("plot-domains").textContent ?? "";
+      expect(domains).toContain('"x":[2,4]');
+      expect(domains).toContain('"y":[20,40]');
+    });
   });
 });

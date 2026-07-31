@@ -9,6 +9,7 @@ import {
   makeBrushBuffer,
   plotInteractivity,
   plotPngFilename,
+  plotScaleNames,
   tupleDomains,
   zoomParamName,
 } from "../src/plot-interaction.ts";
@@ -137,6 +138,11 @@ test("plotInteractivity: piecewise axis leaves only the valid channel interactiv
     },
   };
   assert.deepEqual(plotInteractivity(spec), { mode: "full", channels: ["y"] });
+});
+
+test("plotScaleNames: normalizes named unit identifiers like Vega-Lite", () => {
+  assert.deepEqual(plotScaleNames({ name: "named-unit" }), { x: "named_unit_x", y: "named_unit_y" });
+  assert.deepEqual(plotScaleNames({ name: "123 chart" }), { x: "_123_chart_x", y: "_123_chart_y" });
 });
 
 test("plotInteractivity: all-scale-null degrades to tooltip", () => {

@@ -37,7 +37,7 @@ function logStep(message) {
 // so the inspector arms wiki_zoom_x, wiki_zoom_y, and wiki_brush.
 const CONTINUOUS_SPEC = {
   $schema: "https://vega.github.io/schema/vega-lite/v5.json",
-  name: "named_unit",
+  name: "named-unit",
   width: 480,
   height: 280,
   data: {

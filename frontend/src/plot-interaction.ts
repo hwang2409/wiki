@@ -56,6 +56,14 @@ function asRecord(value: unknown): Record<string, unknown> | null {
     : null;
 }
 
+// Keep this in sync with Vega-Lite's varName helper. Unit names become part
+// of compiled Vega identifiers, so raw names such as `named-unit` do not
+// address the generated `named_unit_x` and `named_unit_y` scales.
+function vegaLiteVarName(value: string): string {
+  const normalized = value.replace(/\W/g, "_");
+  return /^\d+/.test(value) ? `_${normalized}` : normalized;
+}
+
 function isReservedName(name: string): boolean {
   return RESERVED_PARAM_PREFIXES.some((prefix) => name === prefix || name.startsWith(`${prefix}_`));
 }
@@ -95,7 +103,8 @@ function continuousChannel(encoding: Record<string, unknown>, channel: ZoomChann
 export function plotScaleNames(spec: unknown): PlotScaleNames {
   const record = asRecord(spec);
   const name = typeof record?.name === "string" && record.name.length > 0 ? record.name : null;
-  return name ? { x: `${name}_x`, y: `${name}_y` } : {};
+  const normalized = name ? vegaLiteVarName(name) : null;
+  return normalized ? { x: `${normalized}_x`, y: `${normalized}_y` } : {};
 }
 
 function paramNameCollision(spec: Record<string, unknown>): boolean {
