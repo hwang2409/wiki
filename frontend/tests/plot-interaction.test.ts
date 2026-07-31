@@ -124,6 +124,21 @@ test("plotInteractivity: domainRaw on every axis degrades to tooltip", () => {
   assert.deepEqual(plotInteractivity(spec), { mode: "tooltip" });
 });
 
+test("plotInteractivity: piecewise axis leaves only the valid channel interactive", () => {
+  const spec = {
+    mark: "point",
+    encoding: {
+      x: {
+        field: "x",
+        type: "quantitative",
+        scale: { domain: [0, 5, 10], range: [0, 200, 400] },
+      },
+      y: { field: "y", type: "quantitative" },
+    },
+  };
+  assert.deepEqual(plotInteractivity(spec), { mode: "full", channels: ["y"] });
+});
+
 test("plotInteractivity: all-scale-null degrades to tooltip", () => {
   const spec = {
     mark: "point",
@@ -390,7 +405,7 @@ test("buildInteractiveSpec: full but unarmed omits params (inline tooltip mode)"
   assert.deepEqual(out.mark, { type: "point", tooltip: true });
 });
 
-test("buildInteractiveSpec: applies persistent zoom domains to encoding scales", () => {
+test("buildInteractiveSpec: applies temporary zoom domains to encoding scales", () => {
   const spec = {
     mark: "point",
     encoding: {
@@ -405,7 +420,7 @@ test("buildInteractiveSpec: applies persistent zoom domains to encoding scales",
   });
   const encoding = out.encoding as Record<string, Record<string, unknown>>;
   assert.deepEqual((encoding.x.scale as Record<string, unknown>).domain, [10, 20]);
-  assert.equal((encoding.x.scale as Record<string, unknown>).padding, 4);
+  assert.equal((encoding.x.scale as Record<string, unknown>).padding, undefined);
   assert.deepEqual((encoding.y.scale as Record<string, unknown>).domain, [0, 5]);
 });
 

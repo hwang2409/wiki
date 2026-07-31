@@ -12,7 +12,7 @@ const HINT_BY_MODE: Record<string, string> = {
 export type KeyboardAction = "zoom-in" | "zoom-out" | "pan-left" | "pan-right" | "pan-up" | "pan-down";
 
 function scaleDomain(view: PlotView, channel: ZoomChannel): [number, number] | null {
-  const values = view.scale?.(channel).domain() ?? [];
+  const values = view.scale?.(view.scaleNames?.[channel] ?? channel).domain() ?? [];
   if (values.length !== 2) return null;
   const low = Number(values[0]);
   const high = Number(values[1]);
@@ -21,7 +21,7 @@ function scaleDomain(view: PlotView, channel: ZoomChannel): [number, number] | n
 }
 
 function scaleAnchor(view: PlotView, channel: ZoomChannel, domain: [number, number]): number {
-  const scale = view.scale?.(channel);
+  const scale = view.scale?.(view.scaleNames?.[channel] ?? channel);
   const range = scale?.range?.() ?? [];
   if (range.length === 2 && scale?.invert) {
     const first = Number(range[0]);

@@ -22,6 +22,7 @@ export type VegaLiteSpec = Record<string, unknown>;
 export type ZoomChannel = "x" | "y";
 export type PlotDomains = Partial<Record<ZoomChannel, [number, number]>>;
 export type PlotDomainDirection = "ascending" | "descending";
+export type PlotScaleNames = Partial<Record<ZoomChannel, string>>;
 
 export type PlotInteractivity =
   | { mode: "static" }
@@ -78,7 +79,23 @@ function continuousChannel(encoding: Record<string, unknown>, channel: ZoomChann
   // second injected bind:scales domainRaw binding on the same scale, so this
   // axis must not advertise controls that cannot move it.
   if (scale && "domainRaw" in scale) return false;
+  // Vega-Lite supports piecewise scales with explicit breakpoints. The
+  // injected zoom signal only supplies two bounds and would corrupt the
+  // breakpoint mapping, so keep these channels out of full interaction.
+  if (scale) {
+    if (Array.isArray(scale.domain) && scale.domain.length > 2) return false;
+    if (Array.isArray(scale.range) && scale.range.length > 2) return false;
+  }
   return typeof def.field === "string" && def.field.length > 0;
+}
+
+// Named Vega-Lite units prefix their compiled positional scales with the
+// unit name. PlotRenderer attaches these names to the live view so all
+// controls use the same lookup rather than assuming `x` and `y`.
+export function plotScaleNames(spec: unknown): PlotScaleNames {
+  const record = asRecord(spec);
+  const name = typeof record?.name === "string" && record.name.length > 0 ? record.name : null;
+  return name ? { x: `${name}_x`, y: `${name}_y` } : {};
 }
 
 function paramNameCollision(spec: Record<string, unknown>): boolean {
@@ -225,6 +242,8 @@ export function buildInteractiveSpec(
       delete temporaryScale.domainMin;
       delete temporaryScale.domainMax;
       delete temporaryScale.zero;
+      delete temporaryScale.nice;
+      delete temporaryScale.padding;
       encoding[channel] = { ...def, scale: { ...temporaryScale, domain } };
     }
   }

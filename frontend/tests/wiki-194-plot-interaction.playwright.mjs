@@ -37,6 +37,7 @@ function logStep(message) {
 // so the inspector arms wiki_zoom_x, wiki_zoom_y, and wiki_brush.
 const CONTINUOUS_SPEC = {
   $schema: "https://vega.github.io/schema/vega-lite/v5.json",
+  name: "named_unit",
   width: 480,
   height: 280,
   data: {
@@ -180,7 +181,7 @@ async function scaleDomain(page, selector, channel) {
   return page.evaluate(
     ({ sel, ch }) => {
       const view = document.querySelector(sel).__wikiVegaView;
-      const domain = view.scale(ch).domain();
+      const domain = view.scale(view.scaleNames?.[ch] ?? ch).domain();
       return [Number(domain[0]), Number(domain[1])];
     },
     { sel: selector, ch: channel },

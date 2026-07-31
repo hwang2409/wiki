@@ -5,8 +5,10 @@ import {
   buildInteractiveSpec,
   makeBrushBuffer,
   plotInteractivity,
+  plotScaleNames,
   type PlotDomains,
   type PlotDomainDirection,
+  type PlotScaleNames,
   type ZoomChannel,
 } from "./plot-interaction";
 import { useCurrentTheme } from "./shiki";
@@ -22,6 +24,7 @@ export type PlotView = {
   run?: () => PlotView;
   width?: () => number;
   height?: () => number;
+  scaleNames?: PlotScaleNames;
 };
 
 // Attached to the plot container element so browser tests (and devtools
@@ -70,6 +73,7 @@ export function PlotRenderer({
     const accent = styles.getPropertyValue("--accent-primary").trim();
     const font = styles.getPropertyValue("--font-monospace").trim();
     const interactivity = plotInteractivity(spec);
+    const scaleNames = plotScaleNames(spec);
     const interactiveSpec = buildInteractiveSpec(spec, {
       interactivity,
       armed: interactive,
@@ -111,15 +115,31 @@ export function PlotRenderer({
         }
         setError(null);
         setReady(true);
-        (target as PlotContainerElement).__wikiVegaView = result.view;
-        viewRef.current?.(result.view as PlotView);
+        const rawView = result.view;
+        const plotView: PlotView = {
+          toImageURL: rawView.toImageURL.bind(rawView),
+          scale: rawView.scale.bind(rawView),
+          signal: (name, value) => {
+            rawView.signal(name, value);
+            return plotView;
+          },
+          run: () => {
+            rawView.run();
+            return plotView;
+          },
+          width: rawView.width.bind(rawView),
+          height: rawView.height.bind(rawView),
+          scaleNames,
+        };
+        (target as PlotContainerElement).__wikiVegaView = plotView;
+        viewRef.current?.(plotView);
         if (interactive && interactivity.mode === "full") {
           const buffer = makeBrushBuffer(
             interactivity.channels,
             (domainsFromBrush) => brushRef.current?.(domainsFromBrush),
             (channel: ZoomChannel): PlotDomainDirection | undefined => {
               try {
-                const domain = result.view.scale(channel).domain();
+                const domain = result.view.scale(scaleNames[channel] ?? channel).domain();
                 const first = Number(domain[0]);
                 const second = Number(domain[1]);
                 if (!Number.isFinite(first) || !Number.isFinite(second) || first === second) return undefined;

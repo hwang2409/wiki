@@ -13,6 +13,7 @@ import {
   ZOOM_PARAM_PREFIX,
   buildInteractiveSpec,
   plotInteractivity,
+  plotScaleNames,
   tupleDomains,
   zoomParamName,
 } from "../src/plot-interaction.ts";
@@ -108,6 +109,26 @@ test("compile: all domainRaw axes inject no plot controls", () => {
     (signal: Record<string, unknown>) => typeof signal.name === "string" && signal.name.startsWith("wiki_"),
   );
   assert.equal(injected.length, 0);
+});
+
+test("runtime: piecewise scale keeps its breakpoints without x interaction", async () => {
+  const spec = {
+    mark: "point",
+    data: { values: [{ x: 0, y: 0 }, { x: 5, y: 5 }, { x: 10, y: 10 }] },
+    encoding: {
+      x: {
+        field: "x",
+        type: "quantitative",
+        scale: { domain: [0, 5, 10], range: [0, 200, 400] },
+      },
+      y: { field: "y", type: "quantitative" },
+    },
+  };
+  assert.deepEqual(plotInteractivity(spec), { mode: "full", channels: ["y"] });
+  const view = await renderHeadless(transform(spec));
+  assert.deepEqual(view.scale("x").domain(), [0, 5, 10]);
+  assert.deepEqual(view.scale("x").range(), [0, 200, 400]);
+  await view.finalize();
 });
 
 test("compile: row and column facets stay out of full interaction mode", () => {
@@ -227,6 +248,59 @@ test("runtime: selected brush domains override domainMin, domainMax, and zero", 
     assert.deepEqual(view.scale("x").domain(), [2, 8], `${modifier} must not override the selected domain`);
     await view.finalize();
   }
+});
+
+test("runtime: selected non-round brush domains override nice and padding", async () => {
+  for (const scale of [{ nice: true }, { padding: 20 }]) {
+    const spec = {
+      mark: "point",
+      width: 400,
+      height: 200,
+      data: { values: [{ x: 0, y: 0 }, { x: 10, y: 10 }] },
+      encoding: {
+        x: { field: "x", type: "quantitative", scale },
+        y: { field: "y", type: "quantitative" },
+      },
+    };
+    const interactive = buildInteractiveSpec(spec, {
+      interactivity: plotInteractivity(spec),
+      armed: true,
+      domains: { x: [2.3, 7.7] },
+    }) as Record<string, unknown>;
+    const view = await renderHeadless(interactive);
+    assert.deepEqual(view.scale("x").domain(), [2.3, 7.7]);
+    await view.finalize();
+  }
+});
+
+test("runtime: named unit controls resolve named scales and preserve partial descending brushes", async () => {
+  const spec = {
+    name: "named_unit",
+    mark: "point",
+    width: 400,
+    height: 200,
+    data: { values: [{ x: 1, y: 20 }, { x: 10, y: 40 }] },
+    encoding: {
+      x: { field: "x", type: "quantitative", scale: { domain: [10, 1] } },
+      y: { field: "y", type: "quantitative" },
+    },
+  };
+  assert.deepEqual(plotInteractivity(spec), { mode: "full", channels: ["x", "y"] });
+  assert.deepEqual(plotScaleNames(spec), { x: "named_unit_x", y: "named_unit_y" });
+  const initialView = await renderHeadless(transform(spec));
+  const initialY = initialView.scale("named_unit_y").domain();
+  await initialView.finalize();
+  const rebound = buildInteractiveSpec(spec, {
+    interactivity: plotInteractivity(spec),
+    armed: true,
+    domains: { x: [8, 2] },
+  }) as Record<string, unknown>;
+  const compiled = compile(rebound as never).spec;
+  assert.ok((compiled.scales ?? []).some((scale: Record<string, unknown>) => scale.name === "named_unit_x"));
+  const view = await renderHeadless(rebound);
+  assert.deepEqual(view.scale("named_unit_x").domain(), [8, 2]);
+  assert.deepEqual(view.scale("named_unit_y").domain(), initialY);
+  await view.finalize();
 });
 
 test("runtime: repeated toolbar zoom updates move the domain every time", async () => {
