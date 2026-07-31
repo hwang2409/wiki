@@ -446,6 +446,30 @@ def _atomic_write_json(path: Path, value: Any) -> None:
         raise
 
 
+def _atomic_write_bytes(path: Path, value: bytes) -> None:
+    _ensure_parent_dir(path.parent)
+    if path.is_symlink():
+        raise StoreError(f"refusing symlink file: {path}")
+    fd, raw_tmp = tempfile.mkstemp(prefix=f".{path.name}.", dir=path.parent)
+    tmp = Path(raw_tmp)
+    try:
+        os.fchmod(fd, 0o600)
+        with os.fdopen(fd, "wb") as handle:
+            handle.write(value)
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(tmp, path)
+        path.chmod(0o600)
+        _fsync_directory(path.parent)
+    except Exception:
+        try:
+            os.close(fd)
+        except OSError:
+            pass
+        tmp.unlink(missing_ok=True)
+        raise
+
+
 def _append_json_line(path: Path, value: Any) -> None:
     _ensure_parent_dir(path.parent)
     if path.is_symlink():
@@ -1109,7 +1133,10 @@ class RunStore:
             # A status file belongs to the run that creates it. Clear any
             # orphan from a prior run before this record becomes current; the
             # supervisor calls create() while holding the per-agent lock.
-            self.status_path(record.agent_id).unlink(missing_ok=True)
+            status_path = self.status_path(record.agent_id)
+            status_present = status_path.is_file()
+            status_content = status_path.read_bytes() if status_present else None
+            status_path.unlink(missing_ok=True)
             legacy_orchestrators = registry.get("_orchestrators")
             legacy_entry = (
                 legacy_orchestrators.get(record.agent_id)
@@ -1122,6 +1149,8 @@ class RunStore:
                 "legacy_present": isinstance(legacy_orchestrators, dict)
                 and record.agent_id in legacy_orchestrators,
                 "legacy_entry": deepcopy(legacy_entry),
+                "status_present": status_present,
+                "status_content": status_content,
             }
             self._create_run_files(record)
             history = (
@@ -1203,6 +1232,11 @@ class RunStore:
                 legacy_orchestrators.pop(record.agent_id, None)
                 if not legacy_orchestrators:
                     registry.pop("_orchestrators", None)
+            status_path = self.status_path(record.agent_id)
+            if snapshot is not None and snapshot["status_present"]:
+                _atomic_write_bytes(status_path, snapshot["status_content"])
+            else:
+                status_path.unlink(missing_ok=True)
             self._control_attached_run_ids.discard(run_id)
             shutil.rmtree(self.run_dir(run_id))
             self._write_registry(registry)

@@ -1702,6 +1702,8 @@ Preserve the same identity, role, worktree, orchestrator grouping, PR gates, and
         self,
         record: RunRecord,
         adapter: ProviderAdapter,
+        *,
+        rollback_start: bool = False,
     ) -> None:
         """Abort a cancelled provider start/resume without leaving controlless state."""
 
@@ -1711,6 +1713,19 @@ Preserve the same identity, role, worktree, orchestrator grouping, PR gates, and
             pass
         finally:
             await self._await_cleanup(self._detach_adapter(record.run_id))
+        if rollback_start:
+            try:
+                self.store.abort_start(
+                    record.run_id,
+                    reason="provider launch cancelled",
+                )
+            except BaseException:
+                pass
+            try:
+                await self._publish_agent_change(record.agent_id)
+            except BaseException:
+                pass
+            return
         terminal_status = AdapterStatus(
             state=LifecycleState.DEAD,
             session_id=None,
@@ -1798,7 +1813,11 @@ Preserve the same identity, role, worktree, orchestrator grouping, PR gates, and
             record = self.store.update_adapter_status(record.run_id, status)
             self._route_adapter_generation(record.run_id, adapter, status.generation)
         except asyncio.CancelledError:
-            await self._cleanup_cancelled_launch(record, adapter)
+            await self._cleanup_cancelled_launch(
+                record,
+                adapter,
+                rollback_start=rollback_start,
+            )
             raise
         except Exception as exc:
             await self._close_and_drain_adapter(record.run_id, adapter)

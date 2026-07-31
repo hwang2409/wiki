@@ -174,6 +174,40 @@ each finding must include severity, path, line, problem, and fix.
         self.assertEqual(first, second)
         self.assertEqual(counts, {"gate": 1, "worktree": 1, "spawn": 1, "archive": 0})
 
+    def test_implicit_request_retries_after_reviewer_becomes_terminal(self) -> None:
+        registry: dict[str, dict[str, dict[str, str]]] = {}
+        spawned: list[str] = []
+
+        def spawn(request: SpawnWorkerIn) -> dict[str, str]:
+            run_id = f"run-{len(spawned) + 1}"
+            spawned.append(request.ticket)
+            registry[request.ticket] = {
+                "current": {"run_id": run_id, "state": "working"}
+            }
+            return {"run_id": run_id}
+
+        kwargs = dict(
+            ticket="WIKI-171",
+            pr_number=171,
+            expected_sha="c" * 40,
+            orch="wiki",
+            gate=lambda _pr, _sha: {"verdict": "pass"},
+            resolve_root=lambda _orch: Path("/repo"),
+            worktree=lambda **_kwargs: Path("/repo/review"),
+            spawn=spawn,
+            archive=lambda _reviewer: {"outcome": "closed"},
+            archived=lambda: [],
+            registry=lambda: registry,
+            status_reader=lambda _reviewer: None,
+        )
+        first = next_review_module.next_review(**kwargs)
+        registry[first["reviewer"]]["current"]["state"] = "completed"
+        second = next_review_module.next_review(**kwargs)
+
+        self.assertEqual(first["reviewer"], "WIKI-171-REVIEW1")
+        self.assertEqual(second["reviewer"], "WIKI-171-REVIEW2")
+        self.assertEqual(spawned, ["WIKI-171-REVIEW1", "WIKI-171-REVIEW2"])
+
     def test_merge_ready_previous_reviewer_is_archived(self) -> None:
         archived: list[str] = []
         (self.status_dir / "WIKI-171-REVIEW2.json").write_text(

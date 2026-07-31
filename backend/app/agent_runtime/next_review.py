@@ -431,7 +431,17 @@ def next_review(
         _load_request_state()
         previous_result = _REQUEST_RESULTS.get(request_id)
         if previous_result is not None:
-            return dict(previous_result)
+            if not implicit_request_id or _implicit_result_is_current(
+                previous_result,
+                archived=archived,
+                registry=registry,
+                status_reader=status_reader,
+                main=_main(),
+            ):
+                return dict(previous_result)
+            _REQUEST_RESULTS.pop(request_id, None)
+            _REQUEST_STAGES.pop(request_id, None)
+            _persist_request_state()
 
         main = _main()
         staged = _REQUEST_STAGES.get(request_id)
@@ -656,6 +666,57 @@ def _is_archived(
         for row in rows
         if isinstance(row, Mapping)
     )
+
+
+def _implicit_result_is_current(
+    result: Mapping[str, Any],
+    *,
+    archived: Callable[[], list[Mapping[str, Any]]] | None,
+    registry: Callable[[], Mapping[str, Any]] | None,
+    status_reader: Callable[[str], Mapping[str, Any] | None] | None,
+    main: Any,
+) -> bool:
+    reviewers: list[tuple[str, str]] = []
+    reviewer = result.get("reviewer")
+    run_id = result.get("run_id")
+    if isinstance(reviewer, str) and isinstance(run_id, str):
+        reviewers.append((reviewer, run_id))
+    diversity_reviewers = result.get("reviewers")
+    if isinstance(diversity_reviewers, list):
+        reviewers = [
+            (item["reviewer"], item["run_id"])
+            for item in diversity_reviewers
+            if isinstance(item, Mapping)
+            and isinstance(item.get("reviewer"), str)
+            and isinstance(item.get("run_id"), str)
+        ]
+    if not reviewers:
+        return False
+    if any(
+        _is_archived(reviewer_id, archived=archived, main=main)
+        for reviewer_id, _run_id in reviewers
+    ):
+        return False
+    registry_data = dict((registry or main._read_agent_registry)())  # noqa: SLF001
+    for reviewer_id, expected_run_id in reviewers:
+        entry = registry_data.get(reviewer_id)
+        current = entry.get("current") if isinstance(entry, Mapping) else None
+        if not isinstance(current, Mapping) or current.get("run_id") != expected_run_id:
+            return False
+        state = str(
+            current.get("state") or current.get("runtime_state") or ""
+        ).lower()
+        if state in _TERMINAL_STATES:
+            return False
+        status = (
+            status_reader(reviewer_id)
+            if status_reader is not None
+            else main.read_agent_status(reviewer_id)
+        )
+        status_state = status.get("state") if isinstance(status, Mapping) else None
+        if str(status_state or "").lower() in _TERMINAL_STATES:
+            return False
+    return True
 
 
 def _staged_result(

@@ -50,7 +50,7 @@ from backend.app.agent_runtime.provider import (
     ProviderProcessError,
     StartRequest,
 )
-from backend.app.agent_runtime.store import RunStore, RuntimePaths, StoreConflict
+from backend.app.agent_runtime.store import RunNotFound, RunStore, RuntimePaths, StoreConflict
 from backend.app.agent_runtime.supervisor import Supervisor, resolve_safe_worktree
 from backend.app.agent_runtime.types import (
     MAX_MESSAGE_DEDUPE_KEYS,
@@ -1528,6 +1528,38 @@ class SupervisorTests(unittest.IsolatedAsyncioTestCase):
             )
         )
 
+    async def test_start_failure_removes_status_written_during_provider_start(self) -> None:
+        status_path = self.store.status_path("WIKI-STATUS-ROLLBACK")
+        original_factory = self.supervisor.adapter_factory
+
+        def factory(record: RunRecord):
+            adapter = original_factory(record)
+            assert isinstance(adapter, CodexFixtureAdapter)
+
+            async def write_status_then_fail(request: StartRequest) -> AdapterStatus:
+                del request
+                status_path.parent.mkdir(parents=True, exist_ok=True)
+                status_path.write_text('{"state":"working"}\n', encoding="utf-8")
+                raise RuntimeError("status-writing fixture failure")
+
+            adapter.start = write_status_then_fail  # type: ignore[method-assign]
+            return adapter
+
+        self.supervisor.adapter_factory = factory
+        with self.assertRaisesRegex(ProviderProcessError, "status-writing fixture failure"):
+            await self.supervisor.start_run(
+                agent_id="WIKI-STATUS-ROLLBACK",
+                provider=ProviderKind.CODEX,
+                role="implement",
+                model="fixture-codex",
+                effort="high",
+                worktree=str(self.worktree),
+                prompt="status must roll back with the failed start",
+            )
+
+        self.assertIsNone(self.store.current_run_id("WIKI-STATUS-ROLLBACK"))
+        self.assertFalse(status_path.exists())
+
     async def test_replace_creates_new_run_and_stale_run_never_recovers(self) -> None:
         old = await self.supervisor.start_run(
             agent_id="WIKI-42",
@@ -1711,9 +1743,12 @@ class SupervisorTests(unittest.IsolatedAsyncioTestCase):
             await start_task
 
         assert run_id is not None
-        current = self.store.get(run_id)
-        self.assertEqual(current.state, LifecycleState.DEAD)
-        self.assertIsNone(current.provider_pid)
+        with self.assertRaises(RunNotFound):
+            self.store.get(run_id)
+        self.assertIsNone(self.store.current_run_id("WIKI-REPLACE-CANCEL-SPAWN"))
+        self.assertFalse(
+            self.store.status_path("WIKI-REPLACE-CANCEL-SPAWN").exists()
+        )
         self.assertNotIn(run_id, self.supervisor.adapters)
         self.assertNotIn(run_id, self.supervisor.event_tasks)
         self.assertTrue(captured[0].closed)
