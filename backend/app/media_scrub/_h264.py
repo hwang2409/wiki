@@ -721,7 +721,7 @@ def canonicalise_filler_nal(nal_bytes: bytes) -> bytes:
     """Validate and rebuild a filler-data NAL emitted by the scrubber."""
     _validate_nal_header(nal_bytes, 12, require_zero_ref=True)
     rbsp = _rbsp_unescape(nal_bytes[1:])
-    if len(rbsp) < 2 or rbsp[-1] != 0x80 or any(byte != 0xFF for byte in rbsp[:-1]):
+    if not rbsp or rbsp[-1] != 0x80 or any(byte != 0xFF for byte in rbsp[:-1]):
         raise MediaScrubError("h264 filler-data NAL is not canonical")
     return b"\x0c" + b"\xff" * (len(rbsp) - 1) + b"\x80"
 

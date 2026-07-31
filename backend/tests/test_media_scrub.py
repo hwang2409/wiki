@@ -2966,6 +2966,48 @@ class Review15MediaProbeTests(unittest.TestCase):
         self.assertEqual(rebuilt[4:], b"\x0c\xff\xff\x80")
         self.assertNotIn(b"\x00\x00\x00", rebuilt[4:])
 
+    def test_zero_byte_filler_nal_is_canonical(self) -> None:
+        sample = struct.pack(">I", 2) + b"\x0c\x80"
+        rebuilt = mp4_scrubber._canonicalise_avc_sample(sample, 4, set(), False)
+        self.assertEqual(rebuilt, sample)
+
+    @unittest.skipIf(FFMPEG is None, "ffmpeg not installed")
+    def test_zero_byte_filler_nal_scrubs_and_decodes_in_mp4(self) -> None:
+        payload = bytearray(REAL_MP4.read_bytes())
+        mdat_pos = payload.find(b"mdat")
+        self.assertGreater(mdat_pos, 0)
+        mdat_start = mdat_pos - 4
+        mdat_size = struct.unpack(">I", payload[mdat_start:mdat_pos])[0]
+        first_nal_size = struct.unpack(">I", payload[mdat_pos + 4:mdat_pos + 8])[0]
+        nal_start = mdat_pos + 8
+        self.assertEqual(payload[nal_start] & 0x1F, 6)
+        self.assertGreater(first_nal_size, 2)
+        removed = first_nal_size - 2
+        del payload[nal_start + 2:nal_start + first_nal_size]
+        payload[mdat_pos + 4:mdat_pos + 8] = struct.pack(">I", 2)
+        payload[nal_start:nal_start + 2] = b"\x0c\x80"
+        payload[mdat_start:mdat_start + 4] = struct.pack(">I", mdat_size - removed)
+        stsz_pos = payload.find(b"stsz")
+        self.assertGreater(stsz_pos, 0)
+        first_size_pos = stsz_pos + 16
+        first_size = struct.unpack(">I", payload[first_size_pos:first_size_pos + 4])[0]
+        payload[first_size_pos:first_size_pos + 4] = struct.pack(">I", first_size - removed)
+
+        result = media_scrub.scrub_video(bytes(payload), "video/mp4")
+        self.assertIn(b"\x0c\x80", result.data)
+        with tempfile.NamedTemporaryFile(suffix=".mp4", delete=False) as handle:
+            handle.write(result.data)
+            path = handle.name
+        try:
+            probe = subprocess.run(
+                [FFMPEG, "-v", "error", "-i", path, "-f", "null", "-"],
+                capture_output=True,
+                timeout=30,
+            )
+            self.assertEqual(probe.returncode, 0, probe.stderr.decode(errors="replace"))
+        finally:
+            Path(path).unlink(missing_ok=True)
+
     def test_one_byte_sei_is_rejected_before_rebuild(self) -> None:
         sample = struct.pack(">I", 1) + b"\x06"
         with self.assertRaisesRegex(
