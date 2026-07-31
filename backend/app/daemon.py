@@ -45,10 +45,26 @@ HEALTH_TIMEOUT_SECONDS = 15.0
 HEALTH_POLL_SECONDS = 0.2
 DAEMON_TRANSACTION_LOCK_NAME = "daemon.transaction.lock"
 DAEMON_SETTINGS_NAME = "daemon-settings.json"
+_SAFE_LAUNCHD_LABEL = re.compile(
+    r"^[A-Za-z0-9](?:[A-Za-z0-9-]*[A-Za-z0-9])?"
+    r"(?:\.[A-Za-z0-9](?:[A-Za-z0-9-]*[A-Za-z0-9])?)+$"
+)
 
 
 class DaemonError(RuntimeError):
     """Raised when a launchd operation cannot complete safely."""
+
+
+def _validate_launchd_label(label: object) -> str:
+    if (
+        not isinstance(label, str)
+        or len(label) > 253
+        or _SAFE_LAUNCHD_LABEL.fullmatch(label) is None
+    ):
+        raise DaemonError(
+            "daemon label must be a safe reverse-DNS launchd label"
+        )
+    return label
 
 
 @dataclass(frozen=True)
@@ -63,9 +79,25 @@ class DaemonConfig:
     log_path: Path
     launch_agents_dir: Path
 
+    def __post_init__(self) -> None:
+        _validate_launchd_label(self.label)
+        launch_agents_dir = self.launch_agents_dir.expanduser().resolve()
+        plist_path = (launch_agents_dir / f"{self.label}.plist").resolve()
+        if plist_path.parent != launch_agents_dir:
+            raise DaemonError(
+                "daemon plist path must remain inside the LaunchAgents directory"
+            )
+
     @property
     def plist_path(self) -> Path:
-        return self.launch_agents_dir / f"{self.label}.plist"
+        label = _validate_launchd_label(self.label)
+        launch_agents_dir = self.launch_agents_dir.expanduser().resolve()
+        plist_path = (launch_agents_dir / f"{label}.plist").resolve()
+        if plist_path.parent != launch_agents_dir:
+            raise DaemonError(
+                "daemon plist path must remain inside the LaunchAgents directory"
+            )
+        return plist_path
 
     @property
     def domain(self) -> str:
@@ -190,9 +222,12 @@ def config_from_env(*, overrides: dict[str, str | None] | None = None) -> Daemon
         raise DaemonError("WIKI_BACKEND_PORT must be an integer") from exc
     if not 1 <= port <= 65535:
         raise DaemonError("backend port must be between 1 and 65535")
+    label = _validate_launchd_label(
+        values.get("WIKI_DAEMON_LABEL")
+        or (stored_label if isinstance(stored_label, str) else DEFAULT_LABEL)
+    )
     return DaemonConfig(
-        label=values.get("WIKI_DAEMON_LABEL")
-        or (stored_label if isinstance(stored_label, str) else DEFAULT_LABEL),
+        label=label,
         port=(
             port
             if values.get("WIKI_BACKEND_PORT")

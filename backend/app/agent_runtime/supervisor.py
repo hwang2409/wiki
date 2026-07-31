@@ -1816,6 +1816,9 @@ Preserve the same identity, role, worktree, orchestrator grouping, PR gates, and
         elif not automatic:
             record = self.store.clear_automatic_resume_suppression(run_id)
         self._route_adapter_generation(run_id, adapter, status.generation)
+        if status.state is LifecycleState.IDLE:
+            await self._deliver_next_queued_locked(run_id, adapter)
+            record = self.store.get(run_id)
         await self._publish_agent_change(record.agent_id)
         return record
 

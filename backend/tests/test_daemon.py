@@ -67,6 +67,35 @@ class LaunchAgentConfigTests(unittest.TestCase):
             self.assertEqual(config.port, 19321)
             self.assertIn("19321", daemon.render_plist(config))
 
+    def test_config_rejects_absolute_traversal_and_control_labels(self) -> None:
+        with TemporaryDirectory() as tmp:
+            runtime = Path(tmp) / "runtime"
+            launch_agents = Path(tmp) / "LaunchAgents"
+            for label in ("/tmp/wiki-review31.plist", "../outside", "com.example.\nwiki"):
+                with self.subTest(label=repr(label)):
+                    with self.assertRaisesRegex(
+                        daemon.DaemonError, "safe reverse-DNS"
+                    ):
+                        daemon.config_from_env(
+                            overrides={
+                                "WIKI_DAEMON_LABEL": label,
+                                "WIKI_AGENT_RUNTIME_DIR": str(runtime),
+                                "WIKI_LAUNCH_AGENTS_DIR": str(launch_agents),
+                            }
+                        )
+            runtime.mkdir()
+            daemon.daemon_settings_path(runtime).write_text(
+                '{"label":"../../outside","port":19321}\n',
+                encoding="utf-8",
+            )
+            with self.assertRaisesRegex(daemon.DaemonError, "safe reverse-DNS"):
+                daemon.config_from_env(
+                    overrides={
+                        "WIKI_AGENT_RUNTIME_DIR": str(runtime),
+                        "WIKI_LAUNCH_AGENTS_DIR": str(launch_agents),
+                    }
+                )
+
     def test_service_absence_matches_captured_macos_output(self) -> None:
         config = self._config(Path("/tmp/LaunchAgents"))
         captured = subprocess.CompletedProcess(
@@ -1312,6 +1341,58 @@ class DaemonCliTests(unittest.TestCase):
                 ],
             )
             self.assertFalse((root / "LaunchAgents" / f"{daemon.DEFAULT_LABEL}.plist").exists())
+
+    def test_cli_rejects_unsafe_and_corrupt_labels_for_all_operations(self) -> None:
+        repo_root = Path(__file__).resolve().parents[2]
+        wiki_cli = repo_root / "wiki"
+        with TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            runtime = root / "runtime"
+            launch_agents = root / "LaunchAgents"
+            base_env = {
+                **os.environ,
+                "WIKI_AGENT_RUNTIME_DIR": str(runtime),
+                "WIKI_LAUNCH_AGENTS_DIR": str(launch_agents),
+            }
+            for label in ("/tmp/wiki-review31.plist", "../outside"):
+                for operation in ("install", "status", "uninstall"):
+                    with self.subTest(label=label, operation=operation):
+                        result = subprocess.run(
+                            [
+                                sys.executable,
+                                str(wiki_cli),
+                                "daemon",
+                                operation,
+                                "--label",
+                                label,
+                                "--json",
+                            ],
+                            capture_output=True,
+                            text=True,
+                            env=base_env,
+                            check=False,
+                            timeout=5,
+                        )
+                        self.assertNotEqual(result.returncode, 0)
+                        self.assertIn("safe reverse-DNS", result.stderr)
+
+            runtime.mkdir(parents=True)
+            daemon.daemon_settings_path(runtime).write_text(
+                '{"label":"../../outside","port":8213}\n',
+                encoding="utf-8",
+            )
+            for operation in ("install", "status", "uninstall"):
+                with self.subTest(corrupt_settings=True, operation=operation):
+                    result = subprocess.run(
+                        [sys.executable, str(wiki_cli), "daemon", operation, "--json"],
+                        capture_output=True,
+                        text=True,
+                        env=base_env,
+                        check=False,
+                        timeout=5,
+                    )
+                    self.assertNotEqual(result.returncode, 0)
+                    self.assertIn("safe reverse-DNS", result.stderr)
 
 
 if __name__ == "__main__":

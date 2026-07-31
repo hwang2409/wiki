@@ -1734,6 +1734,41 @@ class SupervisorTests(unittest.IsolatedAsyncioTestCase):
         # Keep tearDown from closing the already-closed original twice.
         self.supervisor = Supervisor(self.store, FixtureAdapterFactory(FIXTURES))
 
+    async def test_idle_recovery_delivers_queued_message_once_after_handover(self) -> None:
+        await self.supervisor.close()
+        store = RunStore(self.paths)
+        worktree = self.root / "recovery-idle-queued"
+        worktree.mkdir()
+        record = RunRecord.new(
+            agent_id="WIKI-IDLE-QUEUED-RECOVERY",
+            provider=ProviderKind.CODEX,
+            role="implement",
+            model="fixture-codex",
+            worktree=str(worktree),
+            prompt="idle queued recovery",
+        )
+        record.state = LifecycleState.IDLE
+        record.provider_session_id = "idle-queued-session"
+        record.provider_pid = 999_123
+        store.create(record)
+        store.queue_message(record.run_id, "deliver after recovery")
+        supervisor = Supervisor(
+            store,
+            FixtureAdapterFactory(FIXTURES, pid=os.getpid()),
+            pid_alive=lambda _pid: False,
+        )
+        try:
+            results = await supervisor.recover_on_start()
+            self.assertEqual(results[0]["action"], "resume")
+            adapter = supervisor.adapters[record.run_id]
+            self.assertIsInstance(adapter, CodexFixtureAdapter)
+            assert isinstance(adapter, CodexFixtureAdapter)
+            self.assertEqual(adapter.replayed_methods.count("turn/start"), 1)
+            self.assertEqual(store.queued_messages(record.run_id), [])
+        finally:
+            await supervisor.close()
+        self.supervisor = Supervisor(self.store, FixtureAdapterFactory(FIXTURES))
+
     async def test_handover_preserves_working_idle_waiting_runs_and_sessions(self) -> None:
         records: list[RunRecord] = []
         for index, state in enumerate(
