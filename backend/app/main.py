@@ -3,6 +3,8 @@ from __future__ import annotations
 import asyncio
 import errno
 import fcntl
+import hashlib
+import hmac
 import json
 import logging
 import os
@@ -65,6 +67,7 @@ from .agent_runtime.loop_state import derive_loop_state
 from .agent_runtime.store import RuntimePaths
 from .agent_runtime.ticket import base_ticket
 from .agent_runtime.unknown_kind_telemetry import UnknownKindTelemetry
+from .agent_runtime.version import RUNTIME_FINGERPRINT
 from .frontend_static import mount_frontend_static
 from .next_review_schema import NextReviewIn
 from .rebase_schema import RebaseDirtyPrIn
@@ -244,23 +247,13 @@ async def lifespan(_app: FastAPI):
 
 # --- Wiki.app origin secret (WIKI-148 round 6 — Path B) ---------------------
 # Per-startup random secret proving a request came from the Wiki.app main
-# process. The backend prints it once to stdout with a distinctive marker;
-# the Tauri Rust host captures that line via its sidecar rx channel, keeps
-# it in Rust memory only, and exposes it to the webview through an invoke
-# command (`get_wiki_app_secret`). Worker CLI sessions (Claude Code / Codex)
-# run outside Tauri's IPC bridge and never receive the secret, so a curl
-# straight to `/api/composer/*` from a worker fails with 403.
-#
-# Design points:
-#   - The secret is minted here at module-import time. `native_server.py`
-#     emits it to stdout before uvicorn starts serving so Tauri's log stream
-#     receives it deterministically.
-#   - The marker prefix `[[WIKI_APP_SECRET_BOOT]]=` is what Tauri matches on
-#     and strips before logging.
-#   - Tests override the secret via `set_wiki_app_secret(...)` so they don't
-#     depend on scraping stdout.
+# process. Sidecars receive it through their private process environment.
+# Launchd backends serve it through a private runtime socket for the Tauri
+# process. It never travels through stdout or a daemon log.
+_WIKI_APP_SECRET_HOLDER: dict[str, str] = {
+    "value": os.environ.get("WIKI_APP_SECRET") or secrets.token_urlsafe(32)
+}
 _WIKI_APP_SECRET_MARKER = "[[WIKI_APP_SECRET_BOOT]]="
-_WIKI_APP_SECRET_HOLDER: dict[str, str] = {"value": secrets.token_urlsafe(32)}
 
 
 def wiki_app_secret() -> str:
@@ -274,7 +267,7 @@ def set_wiki_app_secret(value: str) -> None:
 
 
 def wiki_app_secret_boot_line() -> str:
-    """The line the backend prints on startup for Tauri to capture."""
+    """Return the legacy marker for compatibility with older test callers."""
 
     return f"{_WIKI_APP_SECRET_MARKER}{wiki_app_secret()}"
 
@@ -925,8 +918,21 @@ def normalize_content(title: str, content: str) -> str:
 
 
 @app.get("/health")
-def health() -> dict[str, str]:
-    return {"status": "ok"}
+def health(request: Request = None) -> dict[str, object]:  # type: ignore[assignment]
+    request_nonce = request.headers.get("X-Wiki-Daemon-Nonce") if request else None
+    payload: dict[str, object] = {
+        "status": "ok",
+        "daemon_managed": os.environ.get("WIKI_BACKEND_DAEMON") == "launchd",
+        "backend_fingerprint": RUNTIME_FINGERPRINT,
+        "process_id": os.getpid(),
+    }
+    if request_nonce is not None:
+        payload["daemon_proof"] = hmac.new(
+            wiki_app_secret().encode("utf-8"),
+            request_nonce.encode("utf-8"),
+            hashlib.sha256,
+        ).hexdigest()
+    return payload
 
 
 def _unknown_kind_telemetry_service() -> UnknownKindTelemetry:

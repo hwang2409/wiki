@@ -5,16 +5,22 @@ import sys
 from pathlib import Path
 
 
+def frozen_runtime_fingerprint(executable: Path) -> str:
+    """Return the content fingerprint used by frozen backend processes."""
+
+    return hashlib.sha256(executable.read_bytes()).hexdigest()
+
+
 def _runtime_fingerprint() -> str:
     """Identify the supervisor code loaded by this process."""
 
     digest = hashlib.sha256()
     if getattr(sys, "frozen", False):
         executable = Path(sys.executable)
-        stat = executable.stat()
-        digest.update(
-            f"{stat.st_dev}:{stat.st_ino}:{stat.st_size}:{stat.st_mtime_ns}".encode()
-        )
+        # Content identity survives the app bundle copying the executable to
+        # its final path. It still changes when a detached old binary runs
+        # after an app update, so the supervisor swap guard remains effective.
+        return frozen_runtime_fingerprint(executable)
     else:
         runtime_dir = Path(__file__).resolve().parent
         sources = [

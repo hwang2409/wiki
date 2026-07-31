@@ -45,6 +45,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 from backend.app import backend_runtime, knowledge, vaultops  # noqa: E402
 from wiki_cli import graph_lint  # noqa: E402
 from wiki_cli import workgraph_templates  # noqa: E402
+from backend.app import daemon as backend_daemon  # noqa: E402
 
 VAULT = Path(
     os.environ.get("WIKI_VAULT_DIR") or Path(__file__).resolve().parent / "vault"
@@ -257,6 +258,52 @@ def cmd_todo_complete(args: argparse.Namespace) -> None:
 def cmd_log_done(args: argparse.Namespace) -> None:
     entry = append_done_line(args.text.strip())
     print(f"logged: {entry}")
+
+
+def _daemon_config(args: argparse.Namespace) -> backend_daemon.DaemonConfig:
+    overrides = {
+        "WIKI_DAEMON_LABEL": getattr(args, "label", None),
+        "WIKI_BACKEND_PORT": str(args.port) if getattr(args, "port", None) else None,
+        "WIKI_REPO_DIR": getattr(args, "repo_dir", None),
+        "WIKI_VAULT_DIR": getattr(args, "vault_dir", None),
+        "WIKI_AGENT_RUNTIME_DIR": getattr(args, "runtime_dir", None),
+        "WIKI_BACKEND_EXECUTABLE": getattr(args, "backend_executable", None),
+        "WIKI_DAEMON_LOG_PATH": getattr(args, "log_path", None),
+        "WIKI_LAUNCH_AGENTS_DIR": getattr(args, "launch_agents_dir", None),
+    }
+    return backend_daemon.config_from_env(overrides=overrides)
+
+
+def _print_daemon_result(result: dict[str, object], *, as_json: bool = False) -> None:
+    if as_json:
+        print(json.dumps(result, sort_keys=True))
+        return
+    for key, value in result.items():
+        print(f"{key}: {value}")
+
+
+def cmd_daemon_install(args: argparse.Namespace) -> None:
+    try:
+        result = backend_daemon.install(_daemon_config(args))
+    except backend_daemon.DaemonError as exc:
+        fail(str(exc))
+    _print_daemon_result(result, as_json=args.json)
+
+
+def cmd_daemon_uninstall(args: argparse.Namespace) -> None:
+    try:
+        result = backend_daemon.uninstall(_daemon_config(args))
+    except backend_daemon.DaemonError as exc:
+        fail(str(exc))
+    _print_daemon_result(result, as_json=args.json)
+
+
+def cmd_daemon_status(args: argparse.Namespace) -> None:
+    try:
+        result = backend_daemon.status(_daemon_config(args))
+    except backend_daemon.DaemonError as exc:
+        fail(str(exc))
+    _print_daemon_result(result, as_json=args.json)
 
 
 def map_insert(slug: str, topic: str, hook: str) -> None:
@@ -1737,6 +1784,32 @@ def main() -> None:
     log_done = sub.add_parser("log-done", help="append a dated line to log/done.md")
     log_done.add_argument("text")
     log_done.set_defaults(func=cmd_log_done, refresh_knowledge=True)
+
+    daemon = sub.add_parser("daemon", help="manage the persistent macOS backend LaunchAgent")
+    daemon_sub = daemon.add_subparsers(dest="daemon_command", required=True)
+
+    def add_daemon_options(command: argparse.ArgumentParser) -> None:
+        command.add_argument("--label", default=None)
+        command.add_argument("--port", type=int, default=None)
+        command.add_argument("--repo-dir", dest="repo_dir", default=None)
+        command.add_argument("--vault-dir", dest="vault_dir", default=None)
+        command.add_argument("--runtime-dir", dest="runtime_dir", default=None)
+        command.add_argument("--backend-executable", default=None)
+        command.add_argument("--log-path", dest="log_path", default=None)
+        command.add_argument("--launch-agents-dir", dest="launch_agents_dir", default=None)
+        command.add_argument("--json", action="store_true")
+
+    daemon_install = daemon_sub.add_parser("install", help="install and load the LaunchAgent")
+    add_daemon_options(daemon_install)
+    daemon_install.set_defaults(func=cmd_daemon_install)
+
+    daemon_uninstall = daemon_sub.add_parser("uninstall", help="unload and remove the LaunchAgent")
+    add_daemon_options(daemon_uninstall)
+    daemon_uninstall.set_defaults(func=cmd_daemon_uninstall)
+
+    daemon_status = daemon_sub.add_parser("status", help="show LaunchAgent and backend health")
+    add_daemon_options(daemon_status)
+    daemon_status.set_defaults(func=cmd_daemon_status)
 
     note = sub.add_parser("note", help="note operations")
     note_sub = note.add_subparsers(dest="note_command", required=True)

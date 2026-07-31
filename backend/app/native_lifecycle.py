@@ -41,11 +41,30 @@ def _release_lock(handle: BinaryIO) -> None:
 
 
 @contextmanager
-def hold_app_lock(runtime_dir: Path | str) -> Iterator[BinaryIO]:
+def hold_app_lock(
+    runtime_dir: Path | str,
+    *,
+    allow_missing_app_lock: bool = False,
+) -> Iterator[BinaryIO]:
     """Model the GUI-owned app-lifetime lock in tests and native helpers."""
 
     path = Path(runtime_dir).expanduser() / APP_LOCK_NAME
+    if allow_missing_app_lock and not path.exists():
+        path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+        path.touch(mode=0o600)
     handle = _acquire_lock(path, "Wiki app")
+    try:
+        yield handle
+    finally:
+        _release_lock(handle)
+
+
+@contextmanager
+def hold_supervisor_lock(runtime_dir: Path | str) -> Iterator[BinaryIO]:
+    """Hold the supervisor lock after its owner has stopped."""
+
+    path = Path(runtime_dir).expanduser() / SUPERVISOR_LOCK_NAME
+    handle = _acquire_lock(path, "supervisor")
     try:
         yield handle
     finally:
@@ -68,21 +87,15 @@ def hold_runtime_locks(
 
     runtime = Path(runtime_dir).expanduser()
     app_path = runtime / APP_LOCK_NAME
-    supervisor_path = runtime / SUPERVISOR_LOCK_NAME
     if not app_path.exists() and not allow_missing_app_lock:
         raise NativeRuntimeLockError(
             f"app lock is missing: {app_path}; the installed sidecar may be old. "
             "Quit Wiki.app and pass ALLOW_MISSING_APP_LOCK=1 for the one-time upgrade."
         )
 
-    app_handle = _acquire_lock(app_path, "Wiki app")
-    try:
-        supervisor_handle = _acquire_lock(supervisor_path, "supervisor")
-    except Exception:
-        _release_lock(app_handle)
-        raise
-    try:
-        yield app_handle, supervisor_handle
-    finally:
-        _release_lock(supervisor_handle)
-        _release_lock(app_handle)
+    with hold_app_lock(
+        runtime,
+        allow_missing_app_lock=allow_missing_app_lock,
+    ) as app_handle:
+        with hold_supervisor_lock(runtime) as supervisor_handle:
+            yield app_handle, supervisor_handle

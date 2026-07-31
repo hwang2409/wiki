@@ -8,6 +8,7 @@ import fcntl
 import os
 import shutil
 import subprocess
+import json
 from pathlib import Path
 
 
@@ -20,8 +21,20 @@ def build_and_copy(stage_src: Path, cargo_target: Path, staged_bundle: Path) -> 
         fcntl.flock(lock.fileno(), fcntl.LOCK_EX)
         env = os.environ.copy()
         env["CARGO_TARGET_DIR"] = str(cargo_target)
+        command = ["cargo", "tauri", "build", "--bundles", "app"]
+        signing_identity = env.get("WIKI_NATIVE_SIGNING_IDENTITY")
+        if signing_identity:
+            command.extend(
+                [
+                    "--config",
+                    json.dumps(
+                        {"bundle": {"macOS": {"signingIdentity": signing_identity}}},
+                        separators=(",", ":"),
+                    ),
+                ]
+            )
         subprocess.run(
-            ["cargo", "tauri", "build", "--bundles", "app"],
+            command,
             cwd=stage_src,
             env=env,
             check=True,

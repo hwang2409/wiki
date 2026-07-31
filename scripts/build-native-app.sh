@@ -19,6 +19,7 @@ fi
 stage_parent="${WIKI_NATIVE_STAGE_PARENT:-$ROOT/.native-build-staging}"
 mkdir -p "$stage_parent"
 shopt -s nullglob
+# native_swap_transaction.py writes this only after daemon health and handover.
 for completed_stage in "$stage_parent"/*/.swap-complete; do
   rm -rf "$(dirname "$completed_stage")"
 done
@@ -44,6 +45,7 @@ cleanup() {
 trap cleanup EXIT
 
 mkdir -p "$stage_root"
+chmod 700 "$stage_root"
 frontend_dist="$stage_root/frontend-dist"
 pyinstaller_dist="$stage_root/dist"
 pyinstaller_work="$stage_root/build"
@@ -73,6 +75,9 @@ fi
 mkdir -p "$stage_root/src-tauri/binaries"
 cp "$backend_output_dir"/* "$stage_root/src-tauri/binaries/"
 
+backend_binary="$pyinstaller_dist/wiki-backend-sidecar/wiki-backend"
+backend_fingerprint="$(python3 "$ROOT/scripts/native_backend_fingerprint.py" "$backend_binary")"
+
 python3 - "$stage_root/src-tauri/tauri.conf.json" <<'PY'
 import json
 import sys
@@ -89,6 +94,7 @@ config_path.write_text(json.dumps(config, indent=2) + "\n", encoding="utf-8")
 PY
 
 staged_bundle="$stage_root/target/release/bundle/macos/Wiki.app"
+WIKI_EXPECTED_BACKEND_FINGERPRINT="$backend_fingerprint" \
 python3 "$ROOT/scripts/build-native-cargo.py" \
   "$stage_root/src-tauri" \
   "${WIKI_NATIVE_CARGO_TARGET_DIR:-$ROOT/.native-cargo-target}" \

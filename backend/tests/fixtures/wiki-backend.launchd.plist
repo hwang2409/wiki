@@ -1,0 +1,52 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+	<key>Label</key>
+	<string>com.example.wiki.test</string>
+	<key>ProgramArguments</key>
+	<array>
+		<string>/usr/bin/python3</string>
+		<string>-m</string>
+		<string>backend.native_server</string>
+		<string>--host</string>
+		<string>127.0.0.1</string>
+		<string>--port</string>
+		<string>18213</string>
+		<string>--repo-dir</string>
+		<string>/tmp/wiki-repo</string>
+		<string>--vault-dir</string>
+		<string>/tmp/wiki-vault</string>
+		<string>--daemon</string>
+		<string>--log-path</string>
+		<string>/tmp/wiki-log/wiki-backend-daemon.log</string>
+	</array>
+	<key>WorkingDirectory</key>
+	<string>/tmp/wiki-repo</string>
+	<key>EnvironmentVariables</key>
+	<dict>
+		<key>PATH</key>
+		<string>/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin</string>
+		<key>WIKI_AGENT_RUNTIME_DIR</key>
+		<string>/tmp/wiki-runtime</string>
+		<key>WIKI_BACKEND_DAEMON</key>
+		<string>launchd</string>
+		<key>WIKI_BACKEND_URL</key>
+		<string>http://127.0.0.1:18213</string>
+		<key>WIKI_SUPERVISOR_AUTOSTART</key>
+		<string>on</string>
+	</dict>
+	<key>RunAtLoad</key>
+	<true/>
+	<key>KeepAlive</key>
+	<true/>
+	<key>ThrottleInterval</key>
+	<integer>5</integer>
+	<key>ProcessType</key>
+	<string>Background</string>
+	<key>StandardOutPath</key>
+	<string>/tmp/wiki-log/wiki-backend-daemon.log</string>
+	<key>StandardErrorPath</key>
+	<string>/tmp/wiki-log/wiki-backend-daemon.log</string>
+</dict>
+</plist>

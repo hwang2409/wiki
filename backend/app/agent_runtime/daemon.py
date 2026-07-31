@@ -5,6 +5,7 @@ import asyncio
 import fcntl
 import os
 import signal
+import time
 import traceback
 from pathlib import Path
 from typing import BinaryIO
@@ -43,11 +44,17 @@ def _acquire_single_instance(paths: RuntimePaths) -> BinaryIO:
     paths.runtime_dir.chmod(0o700)
     handle = paths.lock_path.open("a+b")
     os.chmod(paths.lock_path, 0o600)
-    try:
-        fcntl.flock(handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
-    except BlockingIOError as exc:
-        handle.close()
-        raise RuntimeError("wiki supervisor is already running") from exc
+    handover = os.environ.get("WIKI_SUPERVISOR_HANDOVER") == "1"
+    deadline = time.monotonic() + 20.0
+    while True:
+        try:
+            fcntl.flock(handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+            break
+        except BlockingIOError as exc:
+            if not handover or time.monotonic() >= deadline:
+                handle.close()
+                raise RuntimeError("wiki supervisor is already running") from exc
+            time.sleep(0.05)
     paths.pid_path.write_text(f"{os.getpid()}\n", encoding="utf-8")
     paths.pid_path.chmod(0o600)
     return handle

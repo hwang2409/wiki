@@ -123,6 +123,11 @@ class ProviderAdapter(ABC):
     def events(self) -> AsyncIterator[ProviderEvent]:
         raise NotImplementedError
 
+    async def drain_events(self) -> list[ProviderEvent]:
+        """Return events buffered after the provider has stopped."""
+
+        return []
+
     @abstractmethod
     async def archive(self) -> AdapterStatus:
         raise NotImplementedError

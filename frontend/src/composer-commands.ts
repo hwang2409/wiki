@@ -46,8 +46,9 @@ const EFFORTS = ["low", "medium", "high"] as const;
 // --- Wiki.app origin secret (WIKI-148 round 7, Path B) ---------------------
 // Composer endpoints (`/api/composer/*`) require an `X-Wiki-App-Secret`
 // header that only the Wiki.app main process can produce. The secret is
-// minted per-startup by the backend, handed to the Tauri Rust host via a
-// marker line on stdout, and exposed to the webview through the
+// minted per-startup by the backend. A sidecar receives it through a private
+// stdin pipe. A daemon sends it only to the code-identity-authenticated Tauri
+// host. The value is exposed to the webview through the
 // `get_wiki_app_secret` invoke command (authorized by a runtime-registered
 // remote ACL capability restricted to the loopback origin — see
 // `register_wiki_app_secret_capability` in `src-tauri/src/backend.rs`).
@@ -63,10 +64,7 @@ type WindowWithComposerSecret = Window & {
   __TAURI_INTERNALS__?: unknown;
 };
 
-let cachedWikiAppSecret: string | null = null;
-
 async function getWikiAppSecret(): Promise<string> {
-  if (cachedWikiAppSecret) return cachedWikiAppSecret;
   if (typeof window === "undefined") {
     throw new Error("Wiki.app origin secret unavailable outside a browser context");
   }
@@ -81,7 +79,6 @@ async function getWikiAppSecret(): Promise<string> {
   if (typeof value !== "string" || !value) {
     throw new Error("Wiki.app origin secret is empty");
   }
-  cachedWikiAppSecret = value;
   return value;
 }
 

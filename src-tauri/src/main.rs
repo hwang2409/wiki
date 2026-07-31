@@ -1,6 +1,8 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
 mod backend;
+mod daemon_handshake;
+mod persistent_daemon;
 
 // The Tauri app entry point embeds resources (`generate_context!`) that can
 // only be linked once per binary. Tests inside the `backend` module also

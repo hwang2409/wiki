@@ -21,6 +21,7 @@ from .version import RUNTIME_FINGERPRINT, RUNTIME_FROZEN
 DEFAULT_SWAP_DRAIN_SECONDS = 10.0
 DEFAULT_FAST_READ_TIMEOUT = 1.0
 DEFAULT_SLOW_OPERATION_TIMEOUT = 30.0
+_HANDOVER_STATES = frozenset({"working", "waiting-approval", "idle"})
 
 _FAST_READ_METHODS = frozenset(
     {
@@ -256,8 +257,7 @@ class SupervisorClient:
                 raise SupervisorUnavailable(
                     "supervisor runtime does not match this backend and autostart is disabled"
                 )
-            active_runs = self._active_runs_for_swap()
-            self._prepare_runs_for_swap(active_runs)
+            active_runs = self.prepare_for_handover()
             replacement = self._stop_stale_supervisor(health, timeout=timeout)
             if replacement is not None:
                 self._replace_runs_after_swap(active_runs)
@@ -280,75 +280,25 @@ class SupervisorClient:
                 time.sleep(0.05)
         raise SupervisorUnavailable(f"supervisor did not become ready: {last_error}")
 
-    def _active_runs_for_swap(self) -> list[dict[str, Any]]:
-        """Snapshot current runs whose provider transport must cross the swap."""
+    def prepare_for_handover(self) -> list[dict[str, Any]]:
+        """Ask the supervisor to atomically snapshot and drain its providers."""
 
-        try:
-            result = self.request("run/list")
-        except (SupervisorRemoteError, SupervisorUnavailable) as exc:
-            raise SupervisorUnavailable(
-                f"cannot enumerate runs before supervisor replacement: {exc}"
-            ) from exc
+        result = self.request(
+            "supervisor/handover",
+            {},
+        )
+        drained = result.get("drained_run_ids") if isinstance(result, dict) else None
         runs = result.get("runs") if isinstance(result, dict) else None
-        if not isinstance(runs, list):
+        if not isinstance(runs, list) or not all(isinstance(run, dict) for run in runs):
             raise SupervisorUnavailable(
-                "cannot enumerate runs before supervisor replacement: bad run list"
+                "supervisor handover did not return its complete run snapshot"
             )
-
-        active: list[dict[str, Any]] = []
-        for candidate in runs:
-            if not isinstance(candidate, dict):
-                continue
-            agent_id = candidate.get("agent_id")
-            run_id = candidate.get("run_id")
-            if not isinstance(agent_id, str) or not isinstance(run_id, str):
-                continue
-            try:
-                current = self.request("run/status", {"agent_id": agent_id})
-            except SupervisorRemoteError:
-                continue
-            except SupervisorUnavailable as exc:
-                raise SupervisorUnavailable(
-                    f"cannot inspect {agent_id} before supervisor replacement: {exc}"
-                ) from exc
-            if not isinstance(current, dict) or current.get("run_id") != run_id:
-                continue
-            if current.get("control_attached") or _pid_alive(
-                current.get("provider_pid")
-            ):
-                active.append(dict(current))
-        return active
-
-    def _prepare_runs_for_swap(self, runs: list[dict[str, Any]]) -> None:
-        """Quiesce providers while the old daemon still owns their control pipes."""
-
-        for run in runs:
-            run_id = str(run["run_id"])
-            if run.get("state") == "working":
-                try:
-                    self.request("run/interrupt", {"run_id": run_id})
-                    self._drain_interrupted_run(run_id)
-                except (SupervisorRemoteError, SupervisorUnavailable):
-                    # v1 permits losing an in-flight turn. The new supervisor's
-                    # verified orphan cleanup is the fallback if graceful
-                    # interruption cannot complete before the daemon exits.
-                    pass
-            try:
-                self.request("run/stop", {"run_id": run_id})
-            except (SupervisorRemoteError, SupervisorUnavailable):
-                # Continue the swap: run/replace on the new daemon verifies and
-                # terminates any provider process left behind by the old one.
-                pass
-
-    def _drain_interrupted_run(self, run_id: str) -> None:
-        deadline = time.monotonic() + self.swap_drain_seconds
-        while time.monotonic() < deadline:
-            status = self.request("run/status", {"run_id": run_id})
-            if not isinstance(status, dict):
-                return
-            if status.get("state") != "working" or not status.get("active_turn_id"):
-                return
-            time.sleep(0.05)
+        expected = {str(run["run_id"]) for run in runs}
+        if not isinstance(drained, list) or set(drained) != expected:
+            raise SupervisorUnavailable(
+                "supervisor handover did not drain every active provider"
+            )
+        return [dict(run) for run in runs]
 
     def _replace_runs_after_swap(self, runs: list[dict[str, Any]]) -> None:
         failures: list[str] = []
