@@ -219,6 +219,7 @@ class GraphHealthMonitor:
             for run_id, cursor in self._event_activity.items()
             if run_id in current_run_ids
         }
+        activity_by_run = await self._refresh_event_activity(views)
         for ticket, view in by_ticket.items():
             ticket_views = views_by_ticket[ticket]
             graph = self.load_graph(ticket)
@@ -241,7 +242,7 @@ class GraphHealthMonitor:
                 state.last_graph_unavailable_alarm_at = None
             try:
                 result = await self._maybe_graph_health(
-                    ticket, view, ticket_views, graph, now
+                    ticket, view, ticket_views, graph, now, activity_by_run
                 )
             except Exception:
                 logger.exception("fleet_monitor: graph health scan failed for %s", ticket)
@@ -385,7 +386,10 @@ class GraphHealthMonitor:
 
     @staticmethod
     def _read_incremental_event_rows(
-        path: Any, cursor: EventFileCursor
+        path: Any,
+        cursor: EventFileCursor,
+        on_rows: Callable[[list[dict[str, Any]]], None] | None = None,
+        on_reset: Callable[[], None] | None = None,
     ) -> tuple[list[dict[str, Any]], bool]:
         try:
             size = path.stat().st_size
@@ -397,74 +401,103 @@ class GraphHealthMonitor:
             cursor.offset = max(0, size - MAX_EVENT_READ_BYTES)
             cursor.pending = b""
             cursor.initialized = True
+            if on_reset is not None:
+                on_reset()
+        rows: list[dict[str, Any]] = []
+        scan_boundary = size
         try:
             with path.open("rb") as handle:
                 handle.seek(cursor.offset)
-                chunk = handle.read(MAX_EVENT_READ_BYTES)
+                while cursor.offset < scan_boundary:
+                    chunk = handle.read(MAX_EVENT_READ_BYTES)
+                    if not chunk:
+                        break
+                    cursor.offset += len(chunk)
+                    combined = cursor.pending + chunk
+                    newline = combined.rfind(b"\n")
+                    if newline < 0:
+                        if len(combined) <= MAX_EVENT_ROW_BYTES:
+                            cursor.pending = combined
+                        else:
+                            cursor.pending = b""
+                        continue
+                    complete = combined[: newline + 1]
+                    cursor.pending = combined[newline + 1 :]
+                    if len(cursor.pending) > MAX_EVENT_ROW_BYTES:
+                        cursor.pending = b""
+                    chunk_rows: list[dict[str, Any]] = []
+                    for line in complete.splitlines():
+                        if not line:
+                            continue
+                        try:
+                            row = json.loads(line.decode("utf-8"))
+                        except (UnicodeDecodeError, TypeError, ValueError):
+                            continue
+                        if isinstance(row, dict):
+                            chunk_rows.append(row)
+                    if on_rows is not None:
+                        on_rows(chunk_rows)
+                    else:
+                        rows.extend(chunk_rows)
         except OSError:
-            return [], reset
-        cursor.offset += len(chunk)
-        combined = cursor.pending + chunk
-        newline = combined.rfind(b"\n")
-        if newline < 0:
-            if len(combined) <= MAX_EVENT_ROW_BYTES:
-                cursor.pending = combined
-            else:
-                cursor.pending = b""
-            return [], reset
-        complete = combined[: newline + 1]
-        cursor.pending = combined[newline + 1 :]
-        if len(cursor.pending) > MAX_EVENT_ROW_BYTES:
-            cursor.pending = b""
-        rows: list[dict[str, Any]] = []
-        for line in complete.splitlines():
-            if not line:
-                continue
-            try:
-                row = json.loads(line.decode("utf-8"))
-            except (UnicodeDecodeError, TypeError, ValueError):
-                continue
-            if isinstance(row, dict):
-                rows.append(row)
+            return rows, reset
         return rows, reset
 
     @classmethod
     def _meaningful_event_timestamp(
         cls, view: Any, store: Any, cursor: EventActivityCursor
     ) -> float | None:
-        raw_rows, raw_reset = cls._read_incremental_event_rows(
-            store.raw_events_path(view.record.run_id), cursor.raw
-        )
-        normalized_rows, normalized_reset = cls._read_incremental_event_rows(
-            store.normalized_events_path(view.record.run_id), cursor.normalized
-        )
-        if raw_reset or normalized_reset:
+        def reset_raw() -> None:
             cursor.raw_directions.clear()
             cursor.latest_meaningful_activity = None
-        for row in raw_rows:
-            sequence = row.get("seq")
-            direction = row.get("direction")
-            if sequence is None or not isinstance(direction, str):
-                continue
-            cursor.raw_directions[sequence] = direction
-            while len(cursor.raw_directions) > MAX_RAW_DIRECTIONS:
-                cursor.raw_directions.pop(next(iter(cursor.raw_directions)))
-        graph_module = _workgraph_module()
-        for row in normalized_rows:
-            direction = cursor.raw_directions.get(row.get("raw_seq"))
-            if direction not in MEANINGFUL_EVENT_DIRECTIONS:
-                continue
-            if row.get("disposition") not in {"rendered", "summarized"}:
-                continue
-            kind = row.get("kind")
-            if not isinstance(kind, str) or cls._is_stall_event_noise(kind):
-                continue
-            timestamp = graph_module._parse_ts(row.get("normalized_at"))  # noqa: SLF001
-            if timestamp is not None and (
-                cursor.latest_meaningful_activity is None
-                or timestamp > cursor.latest_meaningful_activity
-            ):
-                cursor.latest_meaningful_activity = timestamp
+
+        def reset_normalized() -> None:
+            cursor.latest_meaningful_activity = None
+
+        def consume_raw(rows: list[dict[str, Any]]) -> None:
+            for row in rows:
+                sequence = row.get("seq")
+                direction = row.get("direction")
+                if sequence is None or not isinstance(direction, str):
+                    continue
+                cursor.raw_directions[sequence] = direction
+                while len(cursor.raw_directions) > MAX_RAW_DIRECTIONS:
+                    cursor.raw_directions.pop(next(iter(cursor.raw_directions)))
+
+        def consume_normalized(rows: list[dict[str, Any]]) -> None:
+            graph_module = _workgraph_module()
+            for row in rows:
+                direction = cursor.raw_directions.get(row.get("raw_seq"))
+                if direction not in MEANINGFUL_EVENT_DIRECTIONS:
+                    continue
+                if row.get("disposition") not in {"rendered", "summarized"}:
+                    continue
+                kind = row.get("kind")
+                if not isinstance(kind, str) or cls._is_stall_event_noise(kind):
+                    continue
+                timestamp = graph_module._parse_ts(  # noqa: SLF001
+                    row.get("normalized_at")
+                )
+                if timestamp is not None and (
+                    cursor.latest_meaningful_activity is None
+                    or timestamp > cursor.latest_meaningful_activity
+                ):
+                    cursor.latest_meaningful_activity = timestamp
+
+        raw_rows, raw_reset = cls._read_incremental_event_rows(
+            store.raw_events_path(view.record.run_id),
+            cursor.raw,
+            on_rows=consume_raw,
+            on_reset=reset_raw,
+        )
+        normalized_rows, normalized_reset = cls._read_incremental_event_rows(
+            store.normalized_events_path(view.record.run_id),
+            cursor.normalized,
+            on_rows=consume_normalized,
+            on_reset=reset_normalized,
+        )
+        del raw_rows, normalized_rows
+        del raw_reset, normalized_reset
         return cursor.latest_meaningful_activity
 
     async def _refresh_event_activity(
@@ -534,13 +567,15 @@ class GraphHealthMonitor:
         for view in views:
             views_by_worker.setdefault(view.record.agent_id, []).append(view)
         activity_markers: list[str] = []
+        any_stale = False
         for node_id in stalled_nodes:
             matching_views = views_by_worker.get(node_id)
             # A graph node without a current run is not observable. Treat it
             # as stale instead of borrowing activity from a sibling worker.
             if not matching_views:
                 activity_markers.append(f"{node_id}:orphan")
-                return False, "|".join(activity_markers)
+                any_stale = True
+                continue
             node_fresh = False
             node_activity: list[float] = []
             for view in matching_views:
@@ -553,12 +588,13 @@ class GraphHealthMonitor:
             if past_activity:
                 latest_activity = max(past_activity)
                 node_fresh = cls._recent(latest_activity, now, threshold)
-                activity_markers.append(f"{node_id}:{latest_activity:.6f}")
+                if not node_fresh:
+                    activity_markers.append(f"{node_id}:{latest_activity:.6f}")
             else:
                 activity_markers.append(f"{node_id}:none")
             if not node_fresh:
-                return False, "|".join(activity_markers)
-        return True, "|".join(activity_markers)
+                any_stale = True
+        return not any_stale, "|".join(activity_markers) if activity_markers else "none"
 
     @classmethod
     def _stall_activity_is_fresh(
@@ -618,6 +654,7 @@ class GraphHealthMonitor:
         views: list[Any],
         graph: dict[str, Any],
         now: float,
+        activity_by_run: dict[str, float | None],
     ) -> list[Any]:
         graph_module = _workgraph_module()
         state = self.snapshots.setdefault(ticket, GraphHealthSnapshot())
@@ -684,7 +721,6 @@ class GraphHealthMonitor:
             state.stall_notification_sent = False
         else:
             marker = self._episode_marker(graph, "stall", cap)
-            activity_by_run = await self._refresh_event_activity(views)
             stall_activity_fresh, activity_marker = self._stall_activity_state(
                 graph,
                 views,

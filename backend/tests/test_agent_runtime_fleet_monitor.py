@@ -524,11 +524,12 @@ class FleetMonitorTests(unittest.IsolatedAsyncioTestCase):
                         "step": f"coding-{index}",
                         "blocker": None,
                     },
-                    mtime=self.clock.now - 10,
+                    mtime=self.clock.now - 10 + index,
                 )
                 notes.extend(await self.monitor.tick())
 
-        self.assertIn("graph-health-stall", {note.event_type for note in notes})
+        stall_notes = [note for note in notes if note.event_type == "graph-health-stall"]
+        self.assertEqual(len(stall_notes), 1)
         self.assertEqual(record_escalation.call_count, 1)
 
     async def test_graph_health_stall_does_not_borrow_sibling_activity_for_orphan(self) -> None:
@@ -762,6 +763,74 @@ class FleetMonitorTests(unittest.IsolatedAsyncioTestCase):
             max(len(cursor.raw.pending), len(cursor.normalized.pending)),
             graph_health.MAX_EVENT_ROW_BYTES,
         )
+
+    async def test_graph_health_stall_fast_forwards_event_cursor_after_edge_clear(self) -> None:
+        await self._spawn("WIKI-ORCH", role="orchestrator", orch=None)
+        worker = await self._spawn("WIKI-930", role="implement", orch="WIKI-ORCH")
+        self.clock.now = time.time()
+        stale_edge = self.clock.now - 1801
+        _set_created_at(self.store, worker, stale_edge - 1)
+        _write_status(
+            self.store,
+            worker.agent_id,
+            {"state": "working", "pr": None, "step": "coding", "blocker": None},
+            mtime=stale_edge,
+        )
+        for path in (
+            self.store.raw_events_path(worker.run_id),
+            self.store.normalized_events_path(worker.run_id),
+        ):
+            path.write_text("")
+        graph = self._graph(
+            "WIKI-930",
+            edges=[self._graph_edge("spawn", stale_edge, to=worker.agent_id)],
+        )
+        escalations: list[dict] = []
+
+        def record_escalation(**payload):
+            escalations.append(payload)
+            ack = Future()
+            ack.set_result(None)
+            return ack
+
+        with self._patch_graph(graph), mock.patch(
+            "backend.app.workgraph_service.record_escalation",
+            side_effect=record_escalation,
+        ):
+            first = await self.monitor.tick()
+            graph["edges"] = [
+                self._graph_edge("steer", self.clock.now, to=worker.agent_id)
+            ]
+            cleared = await self.monitor.tick()
+            self.clock.advance(1801)
+            padding = b"{}\n" * (graph_health.MAX_EVENT_READ_BYTES * 5 // 3)
+            for path in (
+                self.store.raw_events_path(worker.run_id),
+                self.store.normalized_events_path(worker.run_id),
+            ):
+                with path.open("ab") as handle:
+                    handle.write(padding)
+            _append_event_rows(
+                self.store,
+                worker,
+                direction="server",
+                disposition="rendered",
+                kind="item_completed",
+                timestamp=self.clock.now - 10,
+            )
+            final = await self.monitor.tick()
+            self.assertAlmostEqual(
+                self.monitor._graph_health._event_activity[worker.run_id]  # noqa: SLF001
+                .latest_meaningful_activity,
+                self.clock.now - 10,
+                places=5,
+            )
+
+        first_stalls = [note for note in first if note.event_type == "graph-health-stall"]
+        self.assertEqual(len(first_stalls), 1)
+        self.assertNotIn("graph-health-stall", {note.event_type for note in cleared})
+        self.assertNotIn("graph-health-stall", {note.event_type for note in final})
+        self.assertEqual(len(escalations), 1)
 
 
     async def test_escalation_append_failure_retries_before_notification(self) -> None:
