@@ -11,6 +11,7 @@ import { useCurrentTheme } from "./shiki";
 
 export type PlotView = {
   toImageURL: (type: string, scaleFactor?: number) => Promise<string>;
+  scale?: (name: string) => { domain: () => unknown[] };
 };
 
 // Attached to the plot container element so browser tests (and devtools

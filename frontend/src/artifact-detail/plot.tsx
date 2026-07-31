@@ -1,23 +1,58 @@
 import { useCallback, useMemo, useRef, useState } from "react";
-import { Download, RotateCcw } from "lucide-react";
-import { plotInteractivity, plotPngFilename, type PlotDomains } from "../plot-interaction";
+import { ArrowDown, ArrowLeft, ArrowRight, ArrowUp, Download, Minus, Plus, RotateCcw } from "lucide-react";
+import { plotInteractivity, plotPngFilename, type PlotDomains, type ZoomChannel } from "../plot-interaction";
 import { PlotRenderer, type PlotView } from "../artifact-renderers";
 
 const HINT_BY_MODE: Record<string, string> = {
-  full: "Drag to pan · wheel to zoom · shift-drag to select · double-click to reset",
+  full: "Drag to pan · wheel to zoom · shift-drag to select · toolbar buttons also work by keyboard",
   tooltip: "Hover for values",
   static: "Static plot",
 };
 
+type KeyboardAction = "zoom-in" | "zoom-out" | "pan-left" | "pan-right" | "pan-up" | "pan-down";
+
+function scaleDomain(view: PlotView, channel: ZoomChannel): [number, number] | null {
+  const values = view.scale?.(channel).domain() ?? [];
+  if (values.length !== 2) return null;
+  const low = Number(values[0]);
+  const high = Number(values[1]);
+  if (!Number.isFinite(low) || !Number.isFinite(high) || low === high) return null;
+  return low < high ? [low, high] : [high, low];
+}
+
+function adjustDomain(domain: [number, number], action: KeyboardAction, channel: ZoomChannel): [number, number] | null {
+  const [low, high] = domain;
+  const span = high - low;
+  const center = (low + high) / 2;
+  if (action === "zoom-in" || action === "zoom-out") {
+    const factor = action === "zoom-in" ? 0.4 : 0.625;
+    const nextSpan = span * factor;
+    return [center - nextSpan, center + nextSpan];
+  }
+  if (channel === "x" && (action === "pan-left" || action === "pan-right")) {
+    const delta = span * (action === "pan-left" ? -0.2 : 0.2);
+    return [low + delta, high + delta];
+  }
+  if (channel === "y" && (action === "pan-up" || action === "pan-down")) {
+    const delta = span * (action === "pan-up" ? 0.2 : -0.2);
+    return [low + delta, high + delta];
+  }
+  return null;
+}
+
 export function PlotArtifactDetail({ spec, title }: { spec: Record<string, unknown>; title?: string | null }) {
   const [domains, setDomains] = useState<PlotDomains | null>(null);
   const [renderKey, setRenderKey] = useState(0);
+  const [viewReady, setViewReady] = useState(false);
+  const [exportStatus, setExportStatus] = useState<string | null>(null);
   const viewRef = useRef<PlotView | null>(null);
   const interactivity = useMemo(() => plotInteractivity(spec), [spec]);
   const canInteract = interactivity.mode === "full";
 
   const onView = useCallback((view: PlotView | null) => {
     viewRef.current = view;
+    setViewReady(view !== null);
+    if (view) setExportStatus(null);
   }, []);
   const onBrush = useCallback((next: PlotDomains) => {
     setDomains(next);
@@ -30,9 +65,25 @@ export function PlotArtifactDetail({ spec, title }: { spec: Record<string, unkno
     setDomains(null);
     setRenderKey((key) => key + 1);
   }, []);
+  const onKeyboardControl = useCallback((action: KeyboardAction) => {
+    const view = viewRef.current;
+    if (!view || !canInteract) return;
+    const next: PlotDomains = { ...(domains ?? {}) };
+    for (const channel of interactivity.channels) {
+      const current = scaleDomain(view, channel);
+      if (!current) continue;
+      const adjusted = adjustDomain(current, action, channel);
+      if (adjusted) next[channel] = adjusted;
+      else if (!next[channel]) next[channel] = current;
+    }
+    if (Object.keys(next).length > 0) setDomains(next);
+  }, [canInteract, domains, interactivity]);
   const onSavePng = useCallback(async () => {
     const view = viewRef.current;
-    if (!view) return;
+    if (!view) {
+      setExportStatus("PNG export is not ready.");
+      return;
+    }
     try {
       const url = await view.toImageURL("png", 2);
       const anchor = document.createElement("a");
@@ -41,8 +92,9 @@ export function PlotArtifactDetail({ spec, title }: { spec: Record<string, unkno
       document.body.appendChild(anchor);
       anchor.click();
       anchor.remove();
+      setExportStatus("PNG saved.");
     } catch {
-      // Silent — the reset button is still available if the export fails.
+      setExportStatus("PNG export failed. Try again when the plot is ready.");
     }
   }, [title]);
 
@@ -58,9 +110,32 @@ export function PlotArtifactDetail({ spec, title }: { spec: Record<string, unkno
         >
           <RotateCcw size={12} /> Reset zoom
         </button>
-        <button type="button" onClick={onSavePng} aria-label="Save as PNG">
+        {canInteract ? (
+          <>
+            <button type="button" disabled={!viewReady} onClick={() => onKeyboardControl("zoom-in")} aria-label="Zoom in" title="Zoom in">
+              <Plus size={12} /> Zoom in
+            </button>
+            <button type="button" disabled={!viewReady} onClick={() => onKeyboardControl("zoom-out")} aria-label="Zoom out" title="Zoom out">
+              <Minus size={12} /> Zoom out
+            </button>
+            <button type="button" disabled={!viewReady} onClick={() => onKeyboardControl("pan-left")} aria-label="Pan left" title="Pan left">
+              <ArrowLeft size={12} /> Pan left
+            </button>
+            <button type="button" disabled={!viewReady} onClick={() => onKeyboardControl("pan-right")} aria-label="Pan right" title="Pan right">
+              <ArrowRight size={12} /> Pan right
+            </button>
+            <button type="button" disabled={!viewReady} onClick={() => onKeyboardControl("pan-up")} aria-label="Pan up" title="Pan up">
+              <ArrowUp size={12} /> Pan up
+            </button>
+            <button type="button" disabled={!viewReady} onClick={() => onKeyboardControl("pan-down")} aria-label="Pan down" title="Pan down">
+              <ArrowDown size={12} /> Pan down
+            </button>
+          </>
+        ) : null}
+        <button type="button" disabled={!viewReady} onClick={() => void onSavePng()} aria-label="Save as PNG">
           <Download size={12} /> Save PNG
         </button>
+        <span aria-live="polite" className="artifact-plot-status" role="status">{exportStatus}</span>
         <span className="artifact-plot-hint">{HINT_BY_MODE[interactivity.mode] ?? ""}</span>
       </div>
       <div

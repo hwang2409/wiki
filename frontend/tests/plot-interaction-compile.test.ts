@@ -71,6 +71,45 @@ test("compile: per-channel zoom signals carry panLinear and zoomLinear updates",
   }
 });
 
+test("compile: mixed domainRaw axis keeps its binding while the other axis gets zoom", () => {
+  const spec = {
+    ...CONTINUOUS,
+    encoding: {
+      x: { field: "x", type: "quantitative", scale: { domainRaw: { signal: "[2, 8]" } } },
+      y: { field: "y", type: "quantitative" },
+    },
+  };
+  const interactive = transform(spec);
+  const output = compile(interactive as never);
+  const scales = (output.spec.scales ?? []) as Array<Record<string, unknown>>;
+  const xScale = scales.find((scale) => scale.name === "x")!;
+  const yScale = scales.find((scale) => scale.name === "y")!;
+  assert.deepEqual(xScale.domainRaw, { signal: "[2, 8]" });
+  assert.equal(
+    (yScale.domainRaw as Record<string, unknown>).signal,
+    `${zoomParamName("y")}["y"]`,
+  );
+  const injectedSignals = (output.spec.signals ?? []) as Array<Record<string, unknown>>;
+  assert.equal(injectedSignals.some((signal) => signal.name === `${zoomParamName("x")}_x`), false);
+  assert.equal(injectedSignals.some((signal) => signal.name === `${zoomParamName("y")}_y`), true);
+});
+
+test("compile: all domainRaw axes inject no plot controls", () => {
+  const spec = {
+    ...CONTINUOUS,
+    encoding: {
+      x: { field: "x", type: "quantitative", scale: { domainRaw: { signal: "[2, 8]" } } },
+      y: { field: "y", type: "quantitative", scale: { domainRaw: { signal: "[1, 9]" } } },
+    },
+  };
+  assert.deepEqual(plotInteractivity(spec), { mode: "tooltip" });
+  const compiled = compile(transform(spec) as never).spec;
+  const injected = (compiled.signals ?? []).filter(
+    (signal: Record<string, unknown>) => typeof signal.name === "string" && signal.name.startsWith("wiki_"),
+  );
+  assert.equal(injected.length, 0);
+});
+
 test("compile: single visible 2D brush for distinct-field x+y — mark spans BOTH bounds", () => {
   // R8F2: two 1D brushes rendered a cross while the applied zoom was the
   // intersection box. One 2D brush must both compile AND draw a rectangle
@@ -142,6 +181,31 @@ test("runtime: wheel on wiki_zoom_x shrinks x domain independently of y", async 
   const afterY = view.scale("y").domain() as [number, number];
   assert.notDeepEqual(afterX, initialX);
   assert.deepEqual(afterY, initialY, "wheel on x must NOT touch y");
+  await view.finalize();
+});
+
+test("runtime: mixed domainRaw axis stays fixed while the other axis zooms", async () => {
+  const spec = {
+    ...CONTINUOUS,
+    width: 400,
+    height: 200,
+    data: { values: [{ x: 0, y: 0 }, { x: 10, y: 10 }] },
+    encoding: {
+      x: { field: "x", type: "quantitative", scale: { domainRaw: { signal: "[2, 8]" } } },
+      y: { field: "y", type: "quantitative" },
+    },
+  };
+  const interactive = transform(spec);
+  assert.deepEqual(plotInteractivity(spec), { mode: "full", channels: ["y"] });
+  const view = await renderHeadless(interactive);
+  const initialX = view.scale("x").domain() as [number, number];
+  const initialY = view.scale("y").domain() as [number, number];
+  view
+    .signal(`${zoomParamName("y")}_zoom_anchor`, { x: 5, y: 5 })
+    .signal(`${zoomParamName("y")}_zoom_delta`, 2)
+    .run();
+  assert.deepEqual(view.scale("x").domain(), initialX);
+  assert.notDeepEqual(view.scale("y").domain(), initialY);
   await view.finalize();
 });
 

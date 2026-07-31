@@ -9962,6 +9962,14 @@ textarea.composer-command-input {
   white-space: nowrap;
 }
 
+.artifact-plot-status {
+  color: var(--accent-danger);
+  font-family: var(--font-monospace);
+  font-weight: var(--font-monospace-weight);
+  font-size: var(--fs-2xs);
+  white-space: nowrap;
+}
+
 .artifact-table-toolbar {
   flex-wrap: wrap;
 }

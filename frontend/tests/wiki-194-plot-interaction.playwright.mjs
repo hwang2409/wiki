@@ -60,6 +60,18 @@ function artifactInputs() {
       caption: "Continuous x/y — full-mode fixture for WIKI-194 interaction tests",
       payload: { spec_vega_lite: CONTINUOUS_SPEC },
     },
+    {
+      kind: "plot",
+      title: "Compact continuous scatter",
+      caption: "Oversized inline plot for wheel passthrough",
+      payload: {
+        spec_vega_lite: {
+          ...CONTINUOUS_SPEC,
+          width: 700,
+          height: 500,
+        },
+      },
+    },
   ];
 }
 
@@ -223,23 +235,41 @@ async function main() {
     await page.goto(`${backend.baseUrl}/#/agent/${TICKET}`, { waitUntil: "domcontentloaded" });
     await page.locator(".session-scroll").waitFor({ state: "visible" });
 
-    // ─── inline plot never consumes page wheel scroll ────────────────────
-    logStep("inline plot renders and does NOT arm interaction (page wheel passthrough)");
-    const inlinePlot = page.locator('[data-artifact-kind="plot"] .artifact-plot').first();
+    // ─── inline plots never consume page wheel scroll ────────────────────
+    logStep("normal and compact inline plots do NOT trap page wheel scrolling");
+    const inlineBlocks = page.locator('[data-artifact-kind="plot"]');
+    const inlinePlot = inlineBlocks.nth(0).locator(".artifact-plot");
+    const compactInlinePlot = inlineBlocks.nth(1).locator(".artifact-plot");
     await inlinePlot.waitFor({ state: "visible" });
-    await waitForVegaView(page, '[data-artifact-kind="plot"] .artifact-plot');
-    const inlineDomainBefore = await scaleDomain(page, '[data-artifact-kind="plot"] .artifact-plot', "x");
-    // Wheel over the inline plot. Since armed=false, wiki_zoom_x isn't
-    // injected, so wheel bubbles to the page scroll (not consumed by Vega).
-    const inlineBox = await inlinePlot.boundingBox();
-    await page.mouse.move(inlineBox.x + inlineBox.width / 2, inlineBox.y + inlineBox.height / 2);
-    await page.mouse.wheel(0, 200);
-    const inlineDomainAfter = await scaleDomain(page, '[data-artifact-kind="plot"] .artifact-plot', "x");
-    if (domainsChanged(inlineDomainBefore, inlineDomainAfter)) {
-      throw new Error(
-        `inline plot consumed wheel (x domain moved from ${inlineDomainBefore} to ${inlineDomainAfter})`,
-      );
+    await compactInlinePlot.waitFor({ state: "visible" });
+    if (await inlineBlocks.nth(0).getAttribute("data-artifact-compact")) {
+      throw new Error("normal inline plot was unexpectedly compacted");
     }
+    if ((await inlineBlocks.nth(1).getAttribute("data-artifact-compact")) !== "true") {
+      throw new Error("oversized inline plot did not enter compact mode");
+    }
+    await waitForVegaView(page, '[data-artifact-kind="plot"] .artifact-plot');
+
+    async function assertInlineWheelBubbles(plot, label) {
+      const scroll = page.locator(".session-scroll");
+      await plot.scrollIntoViewIfNeeded();
+      const direction = await scroll.evaluate((element) => {
+        const max = element.scrollHeight - element.clientHeight;
+        return element.scrollTop < max - 1 ? 200 : -200;
+      });
+      const before = await scroll.evaluate((element) => element.scrollTop);
+      const box = await plot.boundingBox();
+      await page.mouse.move(box.x + box.width / 2, box.y + box.height / 2);
+      await page.mouse.wheel(0, direction);
+      await page.waitForTimeout(80);
+      const after = await scroll.evaluate((element) => element.scrollTop);
+      if (direction > 0 ? after <= before : after >= before) {
+        throw new Error(`${label} inline plot trapped wheel (scrollTop ${before} → ${after})`);
+      }
+    }
+
+    await assertInlineWheelBubbles(inlinePlot, "normal");
+    await assertInlineWheelBubbles(compactInlinePlot, "compact");
 
     // ─── open the inspector: full-mode interaction is armed ──────────────
     logStep("open plot in the artifact inspector (full mode: pan/wheel/brush live)");
@@ -252,6 +282,21 @@ async function main() {
     const inspectorSelector = ".artifact-inspector .artifact-plot";
     const xBefore = await scaleDomain(page, inspectorSelector, "x");
     const yBefore = await scaleDomain(page, inspectorSelector, "y");
+
+    // ─── keyboard toolbar control changes the x scale ────────────────────
+    logStep("keyboard activation of Zoom in changes the x scale");
+    const xBeforeKeyboard = await scaleDomain(page, inspectorSelector, "x");
+    const zoomInButton = page.getByRole("button", { name: "Zoom in" });
+    if (await zoomInButton.count() === 0) {
+      throw new Error(`interactive toolbar missing: ${await page.locator(".artifact-inspector .artifact-detail-toolbar").textContent()}`);
+    }
+    await zoomInButton.focus();
+    await page.keyboard.press("Enter");
+    await page.waitForTimeout(220);
+    const xAfterKeyboard = await scaleDomain(page, inspectorSelector, "x");
+    if (!domainsChanged(xBeforeKeyboard, xAfterKeyboard)) {
+      throw new Error(`keyboard Zoom in did not move x domain (still ${xAfterKeyboard})`);
+    }
 
     // ─── real wheel gesture zooms the x scale ────────────────────────────
     logStep("wheel over the inspector plot moves x scale (armed)");

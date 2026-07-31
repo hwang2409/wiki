@@ -72,6 +72,11 @@ function continuousChannel(encoding: Record<string, unknown>, channel: ZoomChann
   if (def.aggregate) return false;
   if (def.timeUnit) return false;
   if ("scale" in def && def.scale === null) return false;
+  const scale = asRecord(def.scale);
+  // Vega-Lite preserves an author-owned domainRaw binding. It then ignores a
+  // second injected bind:scales domainRaw binding on the same scale, so this
+  // axis must not advertise controls that cannot move it.
+  if (scale && "domainRaw" in scale) return false;
   return typeof def.field === "string" && def.field.length > 0;
 }
 

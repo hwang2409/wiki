@@ -100,6 +100,30 @@ test("plotInteractivity: scale:null encodings drop out of full mode", () => {
   if (result.mode === "full") assert.deepEqual(result.channels, ["y"]);
 });
 
+test("plotInteractivity: domainRaw encodings drop out of full mode", () => {
+  const spec = {
+    mark: "point",
+    encoding: {
+      x: { field: "x", type: "quantitative", scale: { domainRaw: { signal: "[2, 8]" } } },
+      y: { field: "y", type: "quantitative" },
+    },
+  };
+  const result = plotInteractivity(spec);
+  assert.equal(result.mode, "full");
+  if (result.mode === "full") assert.deepEqual(result.channels, ["y"]);
+});
+
+test("plotInteractivity: domainRaw on every axis degrades to tooltip", () => {
+  const spec = {
+    mark: "point",
+    encoding: {
+      x: { field: "x", type: "quantitative", scale: { domainRaw: { signal: "[2, 8]" } } },
+      y: { field: "y", type: "quantitative", scale: { domainRaw: { signal: "[1, 9]" } } },
+    },
+  };
+  assert.deepEqual(plotInteractivity(spec), { mode: "tooltip" });
+});
+
 test("plotInteractivity: all-scale-null degrades to tooltip", () => {
   const spec = {
     mark: "point",
