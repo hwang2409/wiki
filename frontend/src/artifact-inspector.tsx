@@ -22,6 +22,7 @@ import { PdfArtifactDetail } from "./artifact-detail/pdf";
 import { PlotArtifactDetail } from "./artifact-detail/plot";
 import { SvgArtifactDetail } from "./artifact-detail/svg";
 import { TableArtifactDetail } from "./artifact-detail/table";
+import { VisualDiffArtifactDetail } from "./artifact-detail/visual-diff";
 import { classifyArtifact, humanizeArtifactKind } from "./artifact-kind";
 import { downloadArtifact, imageBase64, textPayload } from "./artifact-payload";
 import { artifactUrl } from "./artifact-renderers";
@@ -400,6 +401,7 @@ export function ArtifactInspector({
       case "json": return <JsonArtifactDetail artifact={artifact} />;
       case "code": return <CodeArtifactDetail artifact={artifact} onChange={onViewChange} state={viewState} />;
       case "pdf": return <PdfArtifactDetail artifact={artifact} event={active} onChange={onViewChange} state={viewState} ticket={ticket} />;
+      case "visual-diff": return <VisualDiffArtifactDetail artifact={artifact} event={active} ticket={ticket} />;
     }
   })() : null;
 

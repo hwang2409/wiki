@@ -24,13 +24,15 @@ from backend.app.next_review_schema import NextReviewIn, mcp_input_schema
 RUN_ID = "00000000-0000-4000-8000-000000000085"
 
 
-def _fixture_png_bytes() -> bytes:
+def _fixture_png_bytes(color: tuple[int, int, int] = (255, 128, 0), size: tuple[int, int] = (2, 2)) -> bytes:
     buffer = io.BytesIO()
-    Image.new("RGB", (2, 2), color=(255, 128, 0)).save(buffer, format="PNG")
+    Image.new("RGB", size, color=color).save(buffer, format="PNG")
     return buffer.getvalue()
 
 
 FIXTURE_PNG_BYTES = _fixture_png_bytes()
+FIXTURE_PNG_BYTES_ALT = _fixture_png_bytes(color=(0, 128, 255))
+FIXTURE_PNG_BYTES_LARGER = _fixture_png_bytes(color=(0, 128, 255), size=(4, 4))
 
 
 def _payload(kind: str) -> dict:
@@ -88,6 +90,16 @@ def _payload(kind: str) -> dict:
         "pdf": {
             "data_base64": base64.b64encode(b"%PDF-1.4\n%fixture bytes\n").decode(),
         },
+        "visual-diff": {
+            "before": {
+                "data_base64": base64.b64encode(FIXTURE_PNG_BYTES).decode(),
+                "mime": "image/png",
+            },
+            "after": {
+                "data_base64": base64.b64encode(FIXTURE_PNG_BYTES_ALT).decode(),
+                "mime": "image/png",
+            },
+        },
     }[kind]
 
 
@@ -143,6 +155,30 @@ class WikiArtifactsTests(unittest.TestCase):
                         reopened.load()
                         self.assertEqual(reopened.size, (2, 2))
                     self.assertEqual(image.stat().st_mode & 0o777, 0o600)
+                elif kind == "visual-diff":
+                    for variant in ("before", "after"):
+                        self.assertNotIn("data_base64", event["artifact"][variant])
+                        image = (
+                            self.root
+                            / "runtime"
+                            / "runs"
+                            / RUN_ID
+                            / "artifacts"
+                            / f"{event['id']}.{variant}.png"
+                        )
+                        stored = image.read_bytes()
+                        self.assertTrue(stored.startswith(b"\x89PNG\r\n\x1a\n"))
+                        with Image.open(io.BytesIO(stored)) as reopened:
+                            reopened.load()
+                            self.assertEqual(reopened.size, (2, 2))
+                        self.assertEqual(image.stat().st_mode & 0o777, 0o600)
+                        self.assertEqual(event["artifact"][variant]["mime"], "image/png")
+                        self.assertEqual(event["artifact"][variant]["width"], 2)
+                        self.assertEqual(event["artifact"][variant]["height"], 2)
+                        self.assertEqual(
+                            event["artifact"][variant]["ref"],
+                            f"artifact://{event['id']}/{variant}",
+                        )
                 elif kind == "pdf":
                     self.assertNotIn("data_base64", event["artifact"])
                     self.assertNotIn("path", event["artifact"])
@@ -176,6 +212,13 @@ class WikiArtifactsTests(unittest.TestCase):
             "file-list": {"files": [{"label": "missing path"}]},
             "json": {},
             "pdf": {"data_base64": base64.b64encode(b"not a pdf").decode()},
+            "visual-diff": {
+                "before": {
+                    "data_base64": base64.b64encode(FIXTURE_PNG_BYTES).decode(),
+                    "mime": "image/png",
+                },
+                # missing 'after'
+            },
         }
         for kind, payload in malformed.items():
             with self.subTest(kind=kind), self.assertRaises(
@@ -214,6 +257,89 @@ class WikiArtifactsTests(unittest.TestCase):
                 {
                     "kind": "image",
                     "payload": {"data_base64": image, "mime": "image/png"},
+                }
+            )
+
+    def test_visual_diff_rejects_dimension_mismatch(self) -> None:
+        with self.assertRaisesRegex(
+            wiki_artifacts.ArtifactValidationError, "identical dimensions"
+        ):
+            wiki_artifacts.render_artifact(
+                {
+                    "kind": "visual-diff",
+                    "payload": {
+                        "before": {
+                            "data_base64": base64.b64encode(FIXTURE_PNG_BYTES).decode(),
+                            "mime": "image/png",
+                        },
+                        "after": {
+                            "data_base64": base64.b64encode(
+                                FIXTURE_PNG_BYTES_LARGER
+                            ).decode(),
+                            "mime": "image/png",
+                        },
+                    },
+                }
+            )
+
+    def test_visual_diff_rejects_non_image_bytes(self) -> None:
+        with self.assertRaisesRegex(
+            wiki_artifacts.ArtifactValidationError, "payload.after rejected"
+        ):
+            wiki_artifacts.render_artifact(
+                {
+                    "kind": "visual-diff",
+                    "payload": {
+                        "before": {
+                            "data_base64": base64.b64encode(FIXTURE_PNG_BYTES).decode(),
+                            "mime": "image/png",
+                        },
+                        "after": {
+                            "data_base64": base64.b64encode(b"not an image").decode(),
+                            "mime": "image/png",
+                        },
+                    },
+                }
+            )
+
+    def test_visual_diff_rejects_unsupported_mime(self) -> None:
+        with self.assertRaisesRegex(
+            wiki_artifacts.ArtifactValidationError, "payload.before.mime"
+        ):
+            wiki_artifacts.render_artifact(
+                {
+                    "kind": "visual-diff",
+                    "payload": {
+                        "before": {
+                            "data_base64": base64.b64encode(FIXTURE_PNG_BYTES).decode(),
+                            "mime": "image/gif",
+                        },
+                        "after": {
+                            "data_base64": base64.b64encode(FIXTURE_PNG_BYTES).decode(),
+                            "mime": "image/png",
+                        },
+                    },
+                }
+            )
+
+    def test_visual_diff_enforces_per_variant_size_cap(self) -> None:
+        oversize = base64.b64encode(b"x" * (wiki_artifacts.IMAGE_LIMIT + 1)).decode()
+        with self.assertRaisesRegex(
+            wiki_artifacts.ArtifactValidationError, "payload.after exceeds"
+        ):
+            wiki_artifacts.render_artifact(
+                {
+                    "kind": "visual-diff",
+                    "payload": {
+                        "before": {
+                            "data_base64": base64.b64encode(FIXTURE_PNG_BYTES).decode(),
+                            "mime": "image/png",
+                        },
+                        "after": {
+                            "data_base64": oversize,
+                            "mime": "image/png",
+                        },
+                    },
                 }
             )
 

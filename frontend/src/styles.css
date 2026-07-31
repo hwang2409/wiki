@@ -13854,3 +13854,196 @@ textarea.composer-command-input {
   margin: 0;
   color: var(--text-muted);
 }
+
+/* WIKI-193 visual-diff artifact ------------------------------------------- */
+.visual-diff {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  width: 100%;
+  min-width: 0;
+}
+
+.visual-diff-stage {
+  position: relative;
+  width: 100%;
+  border-radius: var(--radius-xs);
+  overflow: hidden;
+  background:
+    repeating-conic-gradient(
+      color-mix(in srgb, var(--background-primary) 92%, transparent) 0% 25%,
+      var(--background-secondary) 0% 50%
+    );
+  background-size: 16px 16px;
+  border: 1px solid var(--background-modifier-border);
+  box-shadow: 0 1px 0 color-mix(in srgb, var(--background-primary) 60%, transparent) inset;
+}
+
+.visual-diff.is-compact .visual-diff-stage {
+  max-height: 240px;
+}
+
+.visual-diff-image {
+  position: absolute;
+  inset: 0;
+  width: 100%;
+  height: 100%;
+  object-fit: contain;
+  display: block;
+}
+
+.visual-diff-image.is-after {
+  transition: opacity 90ms cubic-bezier(0.2, 0, 0, 1);
+}
+
+.visual-diff-overlay {
+  position: absolute;
+  inset: 0;
+  width: 100%;
+  height: 100%;
+  object-fit: contain;
+  pointer-events: none;
+  mix-blend-mode: normal;
+  filter: drop-shadow(0 0 1px rgba(0, 0, 0, 0.4));
+}
+
+.visual-diff-controls {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 12px;
+  padding: 6px 8px;
+  border: 1px solid var(--background-modifier-border);
+  border-radius: var(--radius-xs);
+  background: var(--background-secondary);
+}
+
+.visual-diff-slider {
+  display: grid;
+  grid-template-columns: auto 1fr auto;
+  grid-template-areas:
+    "label terminals readout"
+    "input input input";
+  align-items: center;
+  gap: 4px 10px;
+  flex: 1 1 260px;
+  min-width: 200px;
+  color: var(--text-normal);
+  font-size: var(--fs-2xs);
+}
+
+.visual-diff-slider-label {
+  grid-area: label;
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  color: var(--text-muted);
+  letter-spacing: 0.04em;
+  text-transform: uppercase;
+  font-size: 10px;
+}
+
+.visual-diff-slider-terminals {
+  grid-area: terminals;
+  display: flex;
+  justify-content: space-between;
+  color: var(--text-faint);
+  font-family: var(--font-monospace);
+  font-weight: var(--font-monospace-weight);
+  font-size: 10px;
+  letter-spacing: 0.02em;
+}
+
+.visual-diff-slider-readout {
+  grid-area: readout;
+  color: var(--text-muted);
+  font-family: var(--font-monospace);
+  font-weight: var(--font-monospace-weight);
+  min-width: 3ch;
+  text-align: right;
+}
+
+.visual-diff-slider-input {
+  grid-area: input;
+  width: 100%;
+  margin: 0;
+  accent-color: var(--accent-primary);
+  cursor: pointer;
+}
+
+.visual-diff-slider-input:disabled {
+  cursor: not-allowed;
+  opacity: 0.5;
+}
+
+.visual-diff-toggle {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  padding: 4px 10px;
+  border-radius: var(--radius-xs);
+  border: 1px solid var(--background-modifier-border);
+  background: var(--background-primary);
+  color: var(--text-muted);
+  font-size: var(--fs-2xs);
+  font-weight: 500;
+  cursor: pointer;
+  transition:
+    border-color 120ms cubic-bezier(0.2, 0, 0, 1),
+    color 120ms cubic-bezier(0.2, 0, 0, 1),
+    background 120ms cubic-bezier(0.2, 0, 0, 1);
+}
+
+.visual-diff-toggle:hover:not(:disabled) {
+  color: var(--text-normal);
+  border-color: color-mix(in srgb, var(--accent-primary) 40%, var(--background-modifier-border));
+}
+
+.visual-diff-toggle:disabled {
+  cursor: not-allowed;
+  opacity: 0.5;
+}
+
+.visual-diff-toggle.is-on {
+  color: var(--accent-primary);
+  border-color: color-mix(in srgb, var(--accent-primary) 55%, var(--background-modifier-border));
+  background: color-mix(in srgb, var(--accent-primary) 8%, var(--background-primary));
+}
+
+.visual-diff-toggle-readout {
+  color: var(--text-faint);
+  font-family: var(--font-monospace);
+  font-weight: var(--font-monospace-weight);
+  padding-left: 4px;
+  border-left: 1px solid color-mix(in srgb, var(--background-modifier-border) 80%, transparent);
+}
+
+.visual-diff-toggle.is-on .visual-diff-toggle-readout {
+  color: var(--accent-primary);
+  border-left-color: color-mix(in srgb, var(--accent-primary) 50%, transparent);
+}
+
+.visual-diff-overlay-error {
+  color: var(--text-muted);
+  font-size: var(--fs-2xs);
+  padding: 4px 8px;
+}
+
+.visual-diff-detail {
+  display: flex;
+  flex-direction: column;
+  height: 100%;
+  min-height: 0;
+  padding: 12px;
+  gap: 12px;
+}
+
+.visual-diff-detail .visual-diff {
+  height: 100%;
+  min-height: 0;
+}
+
+.visual-diff-detail .visual-diff-stage {
+  flex: 1 1 0;
+  min-height: 0;
+}

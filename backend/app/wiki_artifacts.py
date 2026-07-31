@@ -28,7 +28,8 @@ PDF_MAGIC = b"%PDF-"
 MAX_REQUEST_BYTES = ((PDF_LIMIT + 2) // 3) * 4 + 64 * 1024
 SENTINEL_START = "<<wiki-artifact:v1>>"
 SENTINEL_END = "<<end>>"
-ARTIFACT_KINDS = {"mermaid", "svg", "image", "table", "plot", "code", "diff", "file-list", "json", "pdf"}
+ARTIFACT_KINDS = {"mermaid", "svg", "image", "table", "plot", "code", "diff", "file-list", "json", "pdf", "visual-diff"}
+VISUAL_DIFF_VARIANTS = ("before", "after")
 IMAGE_TYPES = {
     "image/png": "png",
     "image/jpeg": "jpg",
@@ -429,6 +430,78 @@ def _write_image(payload: dict[str, Any], artifact_id: str) -> dict[str, Any]:
     return normalized
 
 
+def _decode_image_payload(payload: dict[str, Any], field: str) -> tuple[bytes, str]:
+    if not isinstance(payload, dict):
+        raise ArtifactValidationError(f"payload.{field} must be an object")
+    _require_keys(payload, required={"data_base64", "mime"})
+    encoded = _require_string(payload["data_base64"], f"payload.{field}.data_base64")
+    mime = payload["mime"]
+    if mime not in IMAGE_TYPES:
+        raise ArtifactValidationError(
+            f"payload.{field}.mime must be image/png, image/jpeg, or image/webp"
+        )
+    if len(encoded) > ((IMAGE_LIMIT + 2) // 3) * 4 + 4:
+        raise ArtifactValidationError(
+            f"payload.{field} exceeds the 5MB image limit"
+        )
+    try:
+        data = base64.b64decode(encoded, validate=True)
+    except (binascii.Error, ValueError) as exc:
+        raise ArtifactValidationError(
+            f"payload.{field}.data_base64 is not valid base64"
+        ) from exc
+    if len(data) > IMAGE_LIMIT:
+        raise ArtifactValidationError(
+            f"payload.{field} exceeds the 5MB image limit"
+        )
+    return data, mime
+
+
+def _write_visual_diff(payload: dict[str, Any], artifact_id: str) -> dict[str, Any]:
+    _require_keys(payload, required={"before", "after"})
+    scrubbed: dict[str, Any] = {}
+    for variant in VISUAL_DIFF_VARIANTS:
+        data, mime = _decode_image_payload(payload[variant], variant)
+        try:
+            result = scrub_image(data, mime)
+        except ImageScrubError as exc:
+            raise ArtifactValidationError(
+                f"payload.{variant} rejected: {exc}"
+            ) from exc
+        if len(result.data) > IMAGE_LIMIT:
+            raise ArtifactValidationError(
+                f"payload.{variant} exceeds the 5MB image limit"
+            )
+        scrubbed[variant] = result
+    if scrubbed["before"].width != scrubbed["after"].width or (
+        scrubbed["before"].height != scrubbed["after"].height
+    ):
+        raise ArtifactValidationError(
+            "visual-diff before and after images must have identical dimensions"
+        )
+    artifact_dir = _artifact_run_dir()
+    normalized: dict[str, Any] = {}
+    for variant in VISUAL_DIFF_VARIANTS:
+        result = scrubbed[variant]
+        _write_binary(
+            artifact_dir,
+            f"{artifact_id}.{variant}",
+            IMAGE_TYPES[result.mime],
+            result.data,
+        )
+        entry: dict[str, Any] = {
+            "ref": f"artifact://{artifact_id}/{variant}",
+            "mime": result.mime,
+            "byte_size": len(result.data),
+            "width": result.width,
+            "height": result.height,
+        }
+        if result.preview_base64:
+            entry["preview_base64"] = result.preview_base64
+        normalized[variant] = entry
+    return normalized
+
+
 def render_artifact(arguments: Any) -> dict[str, Any]:
     if not isinstance(arguments, dict):
         raise ArtifactValidationError("tool input must be an object")
@@ -455,6 +528,8 @@ def render_artifact(arguments: Any) -> dict[str, Any]:
         artifact.update(_write_image(payload, artifact_id))
     elif kind == "pdf":
         artifact.update(_write_pdf(payload, artifact_id))
+    elif kind == "visual-diff":
+        artifact.update(_write_visual_diff(payload, artifact_id))
     else:
         artifact.update(_validate_text_payload(kind, payload))
     event: dict[str, Any] = {
@@ -502,7 +577,7 @@ def artifact_from_text(value: Any) -> dict[str, Any] | None:
         ):
             return None
     kind = artifact["kind"]
-    if kind not in {"image", "pdf"}:
+    if kind not in {"image", "pdf", "visual-diff"}:
         payload = {key: item for key, item in artifact.items() if key != "kind"}
         try:
             _validate_text_payload(kind, payload)
