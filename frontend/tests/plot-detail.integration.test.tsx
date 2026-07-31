@@ -100,6 +100,22 @@ const Y_ONLY_SPEC = {
   },
 };
 
+const SHARED_ENCODING_FACET_SPEC = {
+  mark: "point",
+  data: { values: [{ x: 1, y: 1, facet: "a" }, { x: 2, y: 2, facet: "b" }] },
+  encoding: {
+    facet: { field: "facet", type: "nominal" },
+    x: { field: "x", type: "quantitative" },
+    y: { field: "y", type: "quantitative" },
+  },
+  resolve: { scale: { x: "shared", y: "shared" } },
+};
+
+const INDEPENDENT_ENCODING_FACET_SPEC = {
+  ...SHARED_ENCODING_FACET_SPEC,
+  resolve: { scale: { x: "independent", y: "independent" } },
+};
+
 const SAME_FIELD_SPEC = {
   mark: "point",
   encoding: {
@@ -164,6 +180,16 @@ describe("PlotArtifactDetail keyboard controls", () => {
     await waitFor(() => expect((screen.getByRole("button", { name: "Save as PNG" }) as HTMLButtonElement).disabled).toBe(false));
     expect(screen.getByRole("button", { name: "Pan up" })).toBeTruthy();
     expect(screen.queryByRole("button", { name: "Pan left" })).toBeNull();
+  });
+
+  test.each([
+    ["shared", SHARED_ENCODING_FACET_SPEC],
+    ["independent", INDEPENDENT_ENCODING_FACET_SPEC],
+  ])("%s encoding.facet plots show no toolbar controls", async (_label, spec) => {
+    render(<PlotArtifactDetail spec={spec} />);
+    await waitFor(() => expect((screen.getByRole("button", { name: "Save as PNG" }) as HTMLButtonElement).disabled).toBe(false));
+    expect(screen.queryByRole("button", { name: "Zoom in" })).toBeNull();
+    expect(screen.queryByRole("button", { name: "Zoom out" })).toBeNull();
   });
 
   test("preserved user scale bindings keep Reset zoom available", async () => {

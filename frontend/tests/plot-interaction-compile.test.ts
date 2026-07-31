@@ -149,6 +149,38 @@ test("compile: row and column facets stay out of full interaction mode", () => {
   }
 });
 
+test("compile: shared-scale encoding.facet stays static with no injected interaction", () => {
+  const spec = {
+    mark: "point",
+    data: { values: [{ x: 1, y: 1, facet: "a" }, { x: 2, y: 2, facet: "b" }] },
+    encoding: {
+      facet: { field: "facet", type: "nominal" },
+      x: { field: "x", type: "quantitative" },
+      y: { field: "y", type: "quantitative" },
+    },
+    resolve: { scale: { x: "shared", y: "shared" } },
+  };
+  assert.deepEqual(plotInteractivity(spec), { mode: "static" });
+  const compiled = compile(transform(spec) as never).spec;
+  assert.equal((compiled.signals ?? []).some((signal: Record<string, unknown>) => String(signal.name).startsWith("wiki_")), false);
+});
+
+test("compile: independent-scale encoding.facet stays static with no injected interaction", () => {
+  const spec = {
+    mark: "point",
+    data: { values: [{ x: 1, y: 1, facet: "a" }, { x: 2, y: 2, facet: "b" }] },
+    encoding: {
+      facet: { field: "facet", type: "nominal" },
+      x: { field: "x", type: "quantitative" },
+      y: { field: "y", type: "quantitative" },
+    },
+    resolve: { scale: { x: "independent", y: "independent" } },
+  };
+  assert.deepEqual(plotInteractivity(spec), { mode: "static" });
+  const compiled = compile(transform(spec) as never).spec;
+  assert.equal((compiled.signals ?? []).some((signal: Record<string, unknown>) => String(signal.name).startsWith("wiki_")), false);
+});
+
 test("compile: single visible 2D brush for distinct-field x+y — mark spans BOTH bounds", () => {
   // R8F2: two 1D brushes rendered a cross while the applied zoom was the
   // intersection box. One 2D brush must both compile AND draw a rectangle

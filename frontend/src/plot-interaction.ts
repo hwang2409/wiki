@@ -200,7 +200,7 @@ export function plotInteractivity(spec: unknown): PlotInteractivity {
   if (COMPOSITE_KEYS.some((key) => key in record)) return { mode: "static" };
   const encoding = asRecord(record.encoding);
   if (!encoding) return { mode: "static" };
-  if ("row" in encoding || "column" in encoding) return { mode: "static" };
+  if ("row" in encoding || "column" in encoding || "facet" in encoding) return { mode: "static" };
   const channels: ZoomChannel[] = [];
   for (const channel of ["x", "y"] as const) {
     if (continuousChannel(encoding, channel)) channels.push(channel);
