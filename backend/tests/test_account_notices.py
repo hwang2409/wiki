@@ -138,13 +138,58 @@ def test_rotation_revival_also_clears_auth_revive_failures(tmp_path: Path) -> No
     assert store.snapshot() == []
 
 
-def test_verified_auth_clears_exhaustion(tmp_path: Path) -> None:
+def test_verified_auth_clears_only_the_ticket_that_completed_a_turn(tmp_path: Path) -> None:
     store = _store(tmp_path)
-    store.apply_event({"type": "codex_auth_dead_exhausted", "tickets": ["WIKI-3"], "ts": "t1"})
+    store.apply_event(
+        {
+            "type": "codex_auth_dead_exhausted",
+            "tickets": ["WIKI-A"],
+            "run_ids": {"WIKI-A": "run-a"},
+            "ts": "t1",
+        }
+    )
+    store.apply_event(
+        {
+            "type": "codex_auth_dead_exhausted",
+            "tickets": ["WIKI-B"],
+            "run_ids": {"WIKI-B": "run-b"},
+            "ts": "t2",
+        }
+    )
+    # WIKI-A completed a Codex turn: only its ticket clears from the roll-up.
+    store.apply_event(
+        {
+            "type": "codex_auth_verified",
+            "success": True,
+            "credential_source": "current",
+            "ticket": "WIKI-A",
+            "ts": "t3",
+        }
+    )
+    notice = _by_type(store, "codex_auth_dead_exhausted")
+    assert notice["tickets"] == ["WIKI-B"]
+    assert notice["run_ids"] == {"WIKI-B": "run-b"}
+
+    store.apply_event(
+        {
+            "type": "codex_auth_verified",
+            "success": True,
+            "credential_source": "current",
+            "ticket": "WIKI-B",
+            "ts": "t4",
+        }
+    )
+    assert store.snapshot() == []
+
+
+def test_verified_auth_without_ticket_does_not_clear_others(tmp_path: Path) -> None:
+    # Legacy events without a ticket must not clear another worker's failure.
+    store = _store(tmp_path)
+    store.apply_event({"type": "codex_auth_dead_exhausted", "tickets": ["WIKI-A"], "ts": "t1"})
     store.apply_event(
         {"type": "codex_auth_verified", "success": True, "credential_source": "current", "ts": "t2"}
     )
-    assert store.snapshot() == []
+    assert _by_type(store, "codex_auth_dead_exhausted")["tickets"] == ["WIKI-A"]
 
 
 def test_generic_session_events_never_resolve_claude_limits(tmp_path: Path) -> None:
@@ -180,3 +225,92 @@ def test_snapshot_orders_newest_first(tmp_path: Path) -> None:
     store.apply_event({"type": "claude_limit_hit", "ticket": "WIKI-6", "window": "@1", "ts": "2026-07-31T01:00:00Z"})
     store.apply_event({"type": "codex_limit_no_eligible", "tickets": [], "reset_at": None, "ts": "2026-07-31T02:00:00Z"})
     assert _types(store) == ["codex_limit_no_eligible", "claude_limit_hit"]
+
+
+def test_reconcile_clears_archived_tickets_but_keeps_live_ones(tmp_path: Path) -> None:
+    store = _store(tmp_path)
+    store.apply_event(
+        {
+            "type": "codex_auth_dead_exhausted",
+            "tickets": ["WIKI-A"],
+            "run_ids": {"WIKI-A": "run-a"},
+            "ts": "t1",
+        }
+    )
+    store.apply_event(
+        {
+            "type": "codex_auth_dead_exhausted",
+            "tickets": ["WIKI-B"],
+            "run_ids": {"WIKI-B": "run-b"},
+            "ts": "t2",
+        }
+    )
+    # WIKI-A archived (absent from live registry); WIKI-B still live.
+    assert store.reconcile_with_live({"WIKI-B": "run-b"}) is True
+    assert _by_type(store, "codex_auth_dead_exhausted")["tickets"] == ["WIKI-B"]
+
+
+def test_reconcile_clears_replaced_ticket_by_run_id(tmp_path: Path) -> None:
+    store = _store(tmp_path)
+    store.apply_event(
+        {
+            "type": "codex_auth_dead_revival",
+            "revived": [],
+            "failed": ["WIKI-C", "WIKI-D"],
+            "failed_reasons": {"WIKI-C": "spawn failed", "WIKI-D": "window gone"},
+            "failed_run_ids": {"WIKI-C": "run-c-old", "WIKI-D": "run-d"},
+            "ts": "t1",
+        }
+    )
+    # WIKI-C was replaced (same ticket, new run_id); WIKI-D untouched.
+    assert store.reconcile_with_live({"WIKI-C": "run-c-new", "WIKI-D": "run-d"}) is True
+    notice = _by_type(store, "codex_auth_dead_revival")
+    assert notice["failed"] == ["WIKI-D"]
+    assert notice["failed_reasons"] == {"WIKI-D": "window gone"}
+    assert notice["failed_run_ids"] == {"WIKI-D": "run-d"}
+
+
+def test_reconcile_is_a_noop_when_run_ids_still_match(tmp_path: Path) -> None:
+    store = _store(tmp_path)
+    store.apply_event(
+        {
+            "type": "codex_auth_dead_exhausted",
+            "tickets": ["WIKI-E"],
+            "run_ids": {"WIKI-E": "run-e"},
+            "ts": "t1",
+        }
+    )
+    assert store.reconcile_with_live({"WIKI-E": "run-e"}) is False
+    assert _by_type(store, "codex_auth_dead_exhausted")["tickets"] == ["WIKI-E"]
+
+
+def test_reconcile_keeps_legacy_notice_without_run_id_when_ticket_live(tmp_path: Path) -> None:
+    # Notices raised before per-ticket run_ids existed have no stored run_id;
+    # ticket-membership alone must not clear them or replace semantics would
+    # flip and legacy notices would silently disappear.
+    store = _store(tmp_path)
+    store.apply_event({"type": "codex_auth_dead_exhausted", "tickets": ["WIKI-F"], "ts": "t1"})
+    assert store.reconcile_with_live({"WIKI-F": "run-f-new"}) is False
+    assert _by_type(store, "codex_auth_dead_exhausted")["tickets"] == ["WIKI-F"]
+    # But archive still clears legacy notices — the ticket is gone.
+    assert store.reconcile_with_live({}) is True
+    assert store.snapshot() == []
+
+
+def test_reconcile_clears_claude_limit_on_archive(tmp_path: Path) -> None:
+    store = _store(tmp_path)
+    store.apply_event({"type": "claude_limit_hit", "ticket": "WIKI-G", "window": "@1", "ts": "t1"})
+    store.apply_event({"type": "claude_limit_hit", "ticket": "WIKI-H", "window": "@2", "ts": "t2"})
+    # WIKI-G archived; WIKI-H still live.
+    assert store.reconcile_with_live({"WIKI-H": None}) is True
+    remaining = store.snapshot()
+    assert [entry["ticket"] for entry in remaining] == ["WIKI-H"]
+
+
+def test_reconcile_leaves_fleet_wide_notices_alone(tmp_path: Path) -> None:
+    store = _store(tmp_path)
+    store.apply_event({"type": "codex_limit_no_eligible", "tickets": ["WIKI-I"], "reset_at": None, "ts": "t1"})
+    store.apply_event({"type": "codex_rotation_failed", "error": "boom", "ts": "t2"})
+    # No ticket is live; fleet-wide notices are not per-ticket and must remain.
+    assert store.reconcile_with_live({}) is False
+    assert sorted(_types(store)) == ["codex_limit_no_eligible", "codex_rotation_failed"]

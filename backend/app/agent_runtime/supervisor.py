@@ -695,6 +695,11 @@ Preserve the same identity, role, worktree, orchestrator grouping, PR gates, and
                 "provider": "codex",
                 "credential_source": "current",
                 "success": True,
+                # Per-ticket proof: only THIS worker made a Codex turn, so the
+                # notice store must clear only this ticket from the exhausted /
+                # revive-failed rollups. A ticketless event proves nothing
+                # about any other worker still awaiting recovery.
+                "ticket": record.agent_id,
                 "ts": datetime.now(timezone.utc).isoformat(),
             }
             if credential_fingerprint is not None:
@@ -856,10 +861,10 @@ Preserve the same identity, role, worktree, orchestrator grouping, PR gates, and
             if now_mono - ts < accounts.AUTH_DEAD_WINDOW_SECONDS
         ]
         if history and now_mono - history[-1] < accounts.AUTH_DEAD_COOLDOWN_SECONDS:
-            await self._publish_auth_dead_exhausted(initial.agent_id, now_mono)
+            await self._publish_auth_dead_exhausted(initial.agent_id, initial.run_id, now_mono)
             return
         if len(history) >= accounts.AUTH_DEAD_MAX_ATTEMPTS:
-            await self._publish_auth_dead_exhausted(initial.agent_id, now_mono)
+            await self._publish_auth_dead_exhausted(initial.agent_id, initial.run_id, now_mono)
             return
         history.append(now_mono)
 
@@ -867,6 +872,7 @@ Preserve the same identity, role, worktree, orchestrator grouping, PR gates, and
         revived: list[str] = []
         failed: list[str] = []
         failed_reasons: dict[str, str] = {}
+        failed_run_ids: dict[str, str] = {}
 
         async with self._run_lock(run_id):
             try:
@@ -910,9 +916,11 @@ Preserve the same identity, role, worktree, orchestrator grouping, PR gates, and
                     await self._publish_agent_change(current.agent_id)
                     failed.append(current.agent_id)
                     failed_reasons[current.agent_id] = str(exc)
+                    failed_run_ids[current.agent_id] = current.run_id
                 else:
                     failed.append(initial.agent_id)
                     failed_reasons[initial.agent_id] = str(exc)
+                    failed_run_ids[initial.agent_id] = initial.run_id
 
         if revived or failed:
             await self._publish(
@@ -924,6 +932,11 @@ Preserve the same identity, role, worktree, orchestrator grouping, PR gates, and
                     "revived": revived,
                     "failed": failed,
                     "failed_reasons": failed_reasons,
+                    # Per-ticket run_id lets the notice store reconcile
+                    # against the live registry: a replaced ticket has a new
+                    # run_id and its notice can then be dropped. See
+                    # AccountNoticeStore.reconcile_with_live and WIKI-228.
+                    "failed_run_ids": failed_run_ids,
                     "ts": datetime.now(timezone.utc).isoformat(),
                 }
             )
@@ -931,6 +944,7 @@ Preserve the same identity, role, worktree, orchestrator grouping, PR gates, and
     async def _publish_auth_dead_exhausted(
         self,
         agent_id: str,
+        run_id: str,
         now_mono: float,
     ) -> None:
         if (
@@ -947,6 +961,10 @@ Preserve the same identity, role, worktree, orchestrator grouping, PR gates, and
                 "credential_source": "current",
                 "exhausted": True,
                 "tickets": [agent_id],
+                # Per-ticket run_id lets the notice store recognize a
+                # replaced worker (same ticket, different run_id) and drop
+                # the stale notice on reconciliation. See WIKI-228.
+                "run_ids": {agent_id: run_id},
                 "ts": datetime.now(timezone.utc).isoformat(),
             }
         )

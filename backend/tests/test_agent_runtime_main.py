@@ -713,6 +713,88 @@ class HeadlessMainRouteTests(unittest.IsolatedAsyncioTestCase):
         self.assertFalse(worker["window_alive"])
         self.assertEqual(self.client.calls, [])
 
+    def _isolate_account_notices(self) -> Any:
+        # main.ACCOUNT_NOTICES is process-global; swap in a fresh store
+        # backed by this test's tmpdir so tests never share notice state.
+        from backend.app import account_notices as notice_module
+
+        fresh = notice_module.AccountNoticeStore(path=self.root / "notices.json")
+        patcher = mock.patch.object(main, "ACCOUNT_NOTICES", fresh)
+        patcher.start()
+        self.addCleanup(patcher.stop)
+        return fresh
+
+    async def test_agents_reconciles_archived_ticket_notices_against_registry(self) -> None:
+        # WIKI-42 stays live; WIKI-GONE has a notice but no registry entry
+        # (archived). One /api/agents refresh must drop only WIKI-GONE.
+        self._seed_headless()
+        notices = self._isolate_account_notices()
+        notices.apply_event(
+            {
+                "type": "codex_auth_dead_exhausted",
+                "tickets": ["WIKI-42"],
+                "run_ids": {"WIKI-42": RUN_ID},
+                "ts": "t1",
+            }
+        )
+        notices.apply_event(
+            {
+                "type": "codex_auth_dead_exhausted",
+                "tickets": ["WIKI-GONE"],
+                "run_ids": {"WIKI-GONE": "run-gone"},
+                "ts": "t2",
+            }
+        )
+
+        payload = main.agents()
+
+        surfaced = cast(list[dict[str, Any]], payload["account_notices"])
+        exhausted = [entry for entry in surfaced if entry["type"] == "codex_auth_dead_exhausted"]
+        self.assertEqual(len(exhausted), 1)
+        self.assertEqual(exhausted[0]["tickets"], ["WIKI-42"])
+
+    async def test_agents_reconciles_replaced_ticket_notices_by_run_id(self) -> None:
+        # A worker was replaced under the same ticket. The notice recorded
+        # the old run_id; the live registry now shows a new run_id. The
+        # notice for that ticket must clear.
+        self._seed_headless()
+        notices = self._isolate_account_notices()
+        notices.apply_event(
+            {
+                "type": "codex_auth_dead_revival",
+                "revived": [],
+                "failed": ["WIKI-42"],
+                "failed_reasons": {"WIKI-42": "spawn failed"},
+                "failed_run_ids": {"WIKI-42": "old-run-id"},
+                "ts": "t1",
+            }
+        )
+
+        payload = main.agents()
+
+        surfaced = cast(list[dict[str, Any]], payload["account_notices"])
+        self.assertEqual(surfaced, [])
+
+    async def test_agents_reconciles_leaves_matching_run_id_alone(self) -> None:
+        # Notice recorded the live run_id; nothing to reconcile away.
+        self._seed_headless()
+        notices = self._isolate_account_notices()
+        notices.apply_event(
+            {
+                "type": "codex_auth_dead_exhausted",
+                "tickets": ["WIKI-42"],
+                "run_ids": {"WIKI-42": RUN_ID},
+                "ts": "t1",
+            }
+        )
+
+        payload = main.agents()
+
+        surfaced = cast(list[dict[str, Any]], payload["account_notices"])
+        exhausted = [entry for entry in surfaced if entry["type"] == "codex_auth_dead_exhausted"]
+        self.assertEqual(len(exhausted), 1)
+        self.assertEqual(exhausted[0]["tickets"], ["WIKI-42"])
+
     async def test_session_prefers_supervisor_transcript_and_runtime_state(
         self,
     ) -> None:

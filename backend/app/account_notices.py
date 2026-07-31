@@ -10,6 +10,17 @@ per ticket inside one aggregated notice per failure kind: new events merge
 their tickets in, and a recovery event removes only the tickets it proves
 revived. Fleet-wide conditions (usage-limit deadlock, rotation failure)
 stay single-keyed.
+
+Two lifecycle gaps remain, both tracked as WIKI-228 (durable provider-health
+lifecycle in the supervisor): (a) the headless supervisor never emits
+``claude_limit_cleared``, so a Claude usage-limit notice only clears when
+this store reconciles it away against the live registry (replaced/archived
+ticket) — automatic reset detection lives in WIKI-228; (b) failure events
+that fire while the native backend is offline never reach the SSE bridge,
+so events during that window are lost. WIKI-228 will own state in the
+supervisor and replay from a cursor on reconnect. Reconciliation here is
+the near-term truthful behavior: a notice for a ticket that no longer
+matches a live run is dropped on the next ``/api/agents`` refresh.
 """
 
 from __future__ import annotations
@@ -113,8 +124,12 @@ class AccountNoticeStore:
                 set(_ticket_list(existing.get("tickets")) if existing else [])
                 | set(tickets)
             )
+            run_ids = dict(_reason_map(existing.get("run_ids")) if existing else {})
+            run_ids.update(_reason_map(event.get("run_ids")))
+            run_ids = {ticket: rid for ticket, rid in run_ids.items() if ticket in set(merged)}
             payload = dict(event)
             payload["tickets"] = merged
+            payload["run_ids"] = run_ids
             set_notice(_EXHAUSTED_KEY, payload)
 
         def remove_revived(revived: list[str]) -> None:
@@ -135,6 +150,11 @@ class AccountNoticeStore:
                     if remaining:
                         updated = dict(existing)
                         updated["tickets"] = remaining
+                        updated["run_ids"] = {
+                            ticket: rid
+                            for ticket, rid in _reason_map(existing.get("run_ids")).items()
+                            if ticket in remaining
+                        }
                         set_notice(_EXHAUSTED_KEY, updated)
                     else:
                         clear(_EXHAUSTED_KEY)
@@ -157,6 +177,11 @@ class AccountNoticeStore:
                         for ticket, reason in _reason_map(notice.get("failed_reasons")).items()
                         if ticket in remaining
                     }
+                    updated["failed_run_ids"] = {
+                        ticket: rid
+                        for ticket, rid in _reason_map(notice.get("failed_run_ids")).items()
+                        if ticket in remaining
+                    }
                     set_notice(key, updated)
                 else:
                     clear(key)
@@ -168,13 +193,20 @@ class AccountNoticeStore:
             existing = self._notices.get(key)
             prior_failed = _ticket_list(existing.get("failed")) if existing else []
             prior_reasons = _reason_map(existing.get("failed_reasons")) if existing else {}
+            prior_run_ids = _reason_map(existing.get("failed_run_ids")) if existing else {}
             merged_failed = sorted(set(prior_failed) | set(failed))
             merged_reasons = {**prior_reasons, **_reason_map(event.get("failed_reasons"))}
+            merged_run_ids = {**prior_run_ids, **_reason_map(event.get("failed_run_ids"))}
             payload = dict(event)
             payload["failed"] = merged_failed
             payload["failed_reasons"] = {
                 ticket: reason
                 for ticket, reason in merged_reasons.items()
+                if ticket in set(merged_failed)
+            }
+            payload["failed_run_ids"] = {
+                ticket: rid
+                for ticket, rid in merged_run_ids.items()
                 if ticket in set(merged_failed)
             }
             set_notice(key, payload)
@@ -193,8 +225,14 @@ class AccountNoticeStore:
             remove_revived(_ticket_list(event.get("revived")))
             merge_revive_failures(_REVIVE_FAILED_KEYS[kind])
         elif kind == "codex_auth_verified":
+            # Per-ticket recovery only: a successful Codex turn proves the run
+            # that emitted it can authenticate, not that every exhausted or
+            # failed worker recovered. A missing ticket (legacy events) is
+            # ignored so we never clear another worker's unresolved failure.
             if event.get("success") is True and event.get("credential_source") == "current":
-                clear(_EXHAUSTED_KEY)
+                ticket = event.get("ticket")
+                if isinstance(ticket, str) and ticket:
+                    remove_revived([ticket])
         elif kind == "claude_limit_hit":
             ticket = event.get("ticket")
             if isinstance(ticket, str) and ticket:
@@ -208,6 +246,106 @@ class AccountNoticeStore:
                 clear(f"claude:limit:{ticket}")
 
         return changed
+
+    def reconcile_with_live(self, live_runs: dict[str, str | None]) -> bool:
+        """Drop worker-scoped notice tickets that no longer match a live run.
+
+        ``live_runs`` maps every live ticket to its current run_id (or None
+        for legacy tmux entries without a run_id). A notice ticket clears
+        when the ticket is absent from ``live_runs`` (archived) or when the
+        notice recorded a run_id that no longer matches the live run_id
+        (replaced). Notices without a recorded run_id — e.g. legacy events
+        emitted before this contract — are only cleared on the archive
+        path; without the run_id we can't distinguish replace from steady
+        state.
+
+        Successful replace and archive flows publish only session/agents
+        events, and those events are (correctly) ignored by ``apply_event``.
+        Without reconciliation the operator would follow the stated fix and
+        the banner would remain forever. This runs on every ``/api/agents``
+        refresh so replaced or archived tickets clear promptly. Fleet-wide
+        notices (limit deadlock, rotation failure) are not per-ticket, so
+        they are untouched. See WIKI-228 for the durable event-driven
+        lifecycle that will supersede this reconciliation.
+        """
+
+        def _ticket_matches_live(ticket: str, stored_run_id: str | None) -> bool:
+            if ticket not in live_runs:
+                return False
+            live_run_id = live_runs[ticket]
+            if stored_run_id and live_run_id and stored_run_id != live_run_id:
+                return False
+            return True
+
+        with self._lock:
+            changed = False
+            existing = self._notices.get(_EXHAUSTED_KEY)
+            if existing is not None:
+                current_tickets = _ticket_list(existing.get("tickets"))
+                stored_run_ids = _reason_map(existing.get("run_ids"))
+                remaining = [
+                    t
+                    for t in current_tickets
+                    if _ticket_matches_live(t, stored_run_ids.get(t))
+                ]
+                if remaining != current_tickets:
+                    changed = True
+                    if remaining:
+                        updated = dict(existing)
+                        updated["tickets"] = remaining
+                        updated["run_ids"] = {
+                            ticket: rid
+                            for ticket, rid in stored_run_ids.items()
+                            if ticket in remaining
+                        }
+                        self._notices[_EXHAUSTED_KEY] = updated
+                    else:
+                        self._notices.pop(_EXHAUSTED_KEY, None)
+            for key in _REVIVE_FAILED_KEYS.values():
+                notice = self._notices.get(key)
+                if notice is None:
+                    continue
+                current_failed = _ticket_list(notice.get("failed"))
+                stored_run_ids = _reason_map(notice.get("failed_run_ids"))
+                remaining = [
+                    t
+                    for t in current_failed
+                    if _ticket_matches_live(t, stored_run_ids.get(t))
+                ]
+                if remaining == current_failed:
+                    continue
+                changed = True
+                if remaining:
+                    updated = dict(notice)
+                    updated["failed"] = remaining
+                    updated["failed_reasons"] = {
+                        ticket: reason
+                        for ticket, reason in _reason_map(notice.get("failed_reasons")).items()
+                        if ticket in remaining
+                    }
+                    updated["failed_run_ids"] = {
+                        ticket: rid
+                        for ticket, rid in stored_run_ids.items()
+                        if ticket in remaining
+                    }
+                    self._notices[key] = updated
+                else:
+                    self._notices.pop(key, None)
+            # Claude limit notices are ticket-only (the tmux watchdog has no
+            # run_id concept; the headless supervisor does not emit these at
+            # all yet — WIKI-228). Reconcile on ticket-membership: archive
+            # clears, replace does not.
+            for key in list(self._notices.keys()):
+                if not key.startswith("claude:limit:"):
+                    continue
+                ticket = key.split(":", 2)[2]
+                if ticket in live_runs:
+                    continue
+                self._notices.pop(key, None)
+                changed = True
+            if changed:
+                self._persist()
+            return changed
 
     def snapshot(self) -> list[dict]:
         """Unresolved notices, newest first."""

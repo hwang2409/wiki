@@ -1960,7 +1960,12 @@ def agents() -> dict[str, object]:
     viewed_map = _read_viewed_map()
     workers = []
     orchestrators = []
-    seen_tickets = set()
+    seen_tickets: set[str] = set()
+    # Live-run identity for notice reconciliation: ticket -> current run_id
+    # (None for legacy tmux entries). A notice recorded against a different
+    # run_id belongs to a replaced worker and clears; an absent ticket was
+    # archived. See AccountNoticeStore.reconcile_with_live and WIKI-228.
+    live_runs: dict[str, str | None] = {}
 
     for ticket, entry in sorted(registry.items()):
         if ticket.startswith("_") or not isinstance(entry, dict):
@@ -1978,6 +1983,7 @@ def agents() -> dict[str, object]:
         )
         status = read_agent_status(ticket)
         seen_tickets.add(ticket)
+        live_runs[ticket] = current.get("run_id") if isinstance(current.get("run_id"), str) else None
         window_alive = (
             control_attached if headless else current.get("window") in live_windows
         )
@@ -2118,6 +2124,13 @@ def agents() -> dict[str, object]:
                 "log": orch.get("log"),
             }
         )
+
+    # Reconcile worker-scoped notices against the live registry. Replace and
+    # archive flows publish only session/agents events, which the notice
+    # store correctly ignores; without this, banners for removed tickets
+    # would remain forever. WIKI-228 will drive this from durable supervisor
+    # events instead of an ambient snapshot check.
+    ACCOUNT_NOTICES.reconcile_with_live(live_runs)
 
     return {
         "workers": workers,
