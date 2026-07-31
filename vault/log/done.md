@@ -9,6 +9,7 @@ updated: 2026-07-31
 
 ## 2026-07-31
 
+- **phoebe** — PHO-14989 controlled audit execution restored for account-health drift via [#13059](https://github.com/phoebe-health/phoebe/pull/13059) (squash 97904d9a73)
 - **wiki** — WIKI-194 interactive plot controls ([#163](https://github.com/hwang2409/wiki/pull/163) merged 34fb7fc)
 - **wiki** — visual-diff artifact mode with image comparison controls ([#164](https://github.com/hwang2409/wiki/pull/164) merged 367a0f7)
 - wiki — WIKI-226 spawn-verification hardening merged via [#161](https://github.com/hwang2409/wiki/pull/161) (squash a65a469, 11 rounds — load-tolerant provider verification, scoped atomic rollback w/ status-file ownership, backend-URL propagation across all callers, canonical reviewer identity w/ legacy-key compat, server-side implicit ids w/ bounded dedupe; restart-durability descoped to WIKI-219)
