@@ -15,7 +15,11 @@ from collections.abc import Callable, Mapping
 from pathlib import Path
 from typing import Any, Sequence
 
-from .ticket import parse_reviewer_id, reviewer_id as canonical_reviewer_id
+from .ticket import (
+    parse_reviewer_id,
+    reviewer_id as canonical_reviewer_id,
+    reviewer_id_candidates,
+)
 from .diversity_orchestration import run_diverse_review
 from .reviewer_diversity import (
     DEFAULT_DIVERSITY_LENSES,
@@ -166,6 +170,19 @@ def _reviewer_round(value: str) -> int | None:
     return parsed.round if parsed is not None else None
 
 
+def _reviewer_status(
+    reviewer: str,
+    status_reader: Callable[[str], Mapping[str, Any] | None],
+) -> Mapping[str, Any] | None:
+    """Read status by exact key, then canonical and legacy keys."""
+
+    for candidate in reviewer_id_candidates(reviewer):
+        status = status_reader(candidate)
+        if isinstance(status, Mapping):
+            return status
+    return None
+
+
 def _next_round(
     ticket: str,
     archived: list[Mapping[str, Any]],
@@ -196,10 +213,9 @@ def _previous_terminal_reviewer(
         candidate_reviewer = canonical_reviewer_id(
             parsed.ticket, parsed.round, parsed.lens
         )
-        status = (
-            status_reader(candidate_reviewer)
-            if status_reader is not None
-            else _main().read_agent_status(candidate_reviewer)
+        status = _reviewer_status(
+            str(value),
+            status_reader or _main().read_agent_status,
         )
         status_state = status.get("state") if isinstance(status, Mapping) else None
         state = str(
@@ -234,7 +250,10 @@ def _previous_terminal_reviewers(
         current = entry.get("current")
         if not isinstance(current, Mapping):
             continue
-        status = status_reader(reviewer) if status_reader is not None else _main().read_agent_status(reviewer)
+        status = _reviewer_status(
+            str(value),
+            status_reader or _main().read_agent_status,
+        )
         status_state = status.get("state") if isinstance(status, Mapping) else None
         state = str(status_state or current.get("state") or current.get("runtime_state") or "").lower()
         if state in _TERMINAL_STATES:
@@ -687,11 +706,11 @@ def _registry_reviewer_entry(
 ) -> tuple[str, Mapping[str, Any]] | None:
     """Resolve reviewer rows across legacy and canonical case forms."""
 
-    canonical = reviewer_id.upper()
-    for candidate in (canonical, reviewer_id):
+    for candidate in reviewer_id_candidates(reviewer_id):
         entry = registry.get(candidate)
         if isinstance(entry, Mapping):
             return candidate, entry
+    canonical = reviewer_id.upper()
     for candidate, entry in registry.items():
         if str(candidate).upper() == canonical and isinstance(entry, Mapping):
             return str(candidate), entry

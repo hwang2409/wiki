@@ -1071,6 +1071,45 @@ class HeadlessMainRouteTests(unittest.IsolatedAsyncioTestCase):
             [method for method, _ in self.client.calls], ["idempotency/status"]
         )
 
+    async def test_canonical_reviewer_spawn_reuses_legacy_uppercase_live_row(self) -> None:
+        legacy_id = "WIKI-226-REVIEW1-SECURITY"
+        current = {
+            "ticket": legacy_id,
+            "run_id": RUN_ID,
+            "kind": "cdx",
+            "role": "review",
+            "model": "gpt-5.4",
+            "state": "working",
+            "window": None,
+        }
+        self.registry.write_text(
+            json.dumps({legacy_id: {"history": [], "current": current}}),
+            encoding="utf-8",
+        )
+
+        with self.assertRaises(HTTPException) as blocked:
+            main.spawn_agent(
+                main.SpawnWorkerIn(
+                    ticket="WIKI-226-REVIEW1-security",
+                    kind="cdx",
+                    role="review",
+                    model="gpt-5.4",
+                    effort="high",
+                    workdir=str(self.worktree),
+                    prompt="retry the security review",
+                    request_id="legacy-review-retry",
+                )
+            )
+
+        self.assertEqual(blocked.exception.status_code, 409)
+        self.assertEqual(
+            json.loads(self.registry.read_text(encoding="utf-8")),
+            {legacy_id: {"history": [], "current": current}},
+        )
+        self.assertEqual(
+            [method for method, _ in self.client.calls], ["idempotency/status"]
+        )
+
     async def test_replace_accepts_model_kind_and_effort_overrides(self) -> None:
         self._seed_headless(provider="claude")
 

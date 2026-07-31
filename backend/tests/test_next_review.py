@@ -274,6 +274,32 @@ each finding must include severity, path, line, problem, and fix.
         self.assertEqual(result["reviewer"], "WIKI-171-REVIEW3")
         self.assertEqual(archived, ["WIKI-171-REVIEW2"])
 
+    def test_legacy_uppercase_lens_status_is_archived_before_next_round(self) -> None:
+        reviewer = "WIKI-226-REVIEW1-SECURITY"
+        (self.status_dir / f"{reviewer}.json").write_text(
+            json.dumps({"state": "merge-ready"}), encoding="utf-8"
+        )
+        archived: list[str] = []
+
+        result = next_review_module.next_review(
+            "WIKI-226",
+            226,
+            "d" * 40,
+            orch="wiki",
+            gate=lambda _pr, _sha: {"verdict": "pass"},
+            resolve_root=lambda _orch: Path("/repo"),
+            worktree=lambda **_kwargs: Path("/repo/review2"),
+            spawn=lambda _request: {"run_id": "run-2"},
+            archive=lambda value: archived.append(value) or {"outcome": "closed"},
+            archived=lambda: [],
+            registry=lambda: {
+                reviewer: {"current": {"state": "working"}},
+            },
+        )
+
+        self.assertEqual(result["reviewer"], "WIKI-226-REVIEW2")
+        self.assertEqual(archived, ["WIKI-226-REVIEW1-security"])
+
     def test_archive_failure_stages_spawn_and_retry_does_not_respawn(self) -> None:
         spawn_count = 0
         archive_count = 0

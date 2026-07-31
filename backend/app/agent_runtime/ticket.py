@@ -43,6 +43,19 @@ def reviewer_id(ticket: str, round_number: int, lens: str | None = None) -> str:
     return f"{ticket.upper()}-REVIEW{round_number}{suffix}"
 
 
+def reviewer_id_candidates(agent_id: str) -> tuple[str, ...]:
+    """Return exact, canonical, and legacy-uppercase reviewer keys."""
+
+    raw = str(agent_id).strip()
+    parsed = parse_reviewer_id(raw)
+    if parsed is None:
+        values = (raw, raw.upper())
+    else:
+        canonical = reviewer_id(parsed.ticket, parsed.round, parsed.lens)
+        values = (raw, canonical, raw.upper())
+    return tuple(dict.fromkeys(value for value in values if value))
+
+
 def base_ticket(agent_id: str) -> str:
     """Return the workgraph ticket shared by a worker and its role siblings."""
 

@@ -69,6 +69,7 @@ from .agent_runtime.ticket import (
     base_ticket,
     parse_reviewer_id,
     reviewer_id as canonical_reviewer_id,
+    reviewer_id_candidates,
 )
 from .agent_runtime.unknown_kind_telemetry import UnknownKindTelemetry
 from .agent_runtime.version import RUNTIME_FINGERPRINT
@@ -1221,13 +1222,15 @@ def tmux_live_windows() -> set[str]:
 
 
 def read_agent_status(ticket: str) -> dict | None:
-    path = AGENT_STATUS_DIR / f"{ticket}.json"
-    try:
-        data = json.loads(path.read_text(encoding="utf-8"))
-        data["_mtime"] = path.stat().st_mtime
-        return data
-    except (OSError, ValueError):
-        return None
+    for candidate in reviewer_id_candidates(ticket):
+        path = AGENT_STATUS_DIR / f"{candidate}.json"
+        try:
+            data = json.loads(path.read_text(encoding="utf-8"))
+            data["_mtime"] = path.stat().st_mtime
+            return data
+        except (OSError, ValueError):
+            continue
+    return None
 
 
 def _agent_status_paths() -> Iterator[Path]:
@@ -4666,7 +4669,9 @@ def spawn_agent(
         ):
             raise HTTPException(status_code=400, detail="Orchestrator id is not registered")
 
-    current = (registry.get(ticket) or {}).get("current") or {}
+    resolved = _registry_agent(registry, ticket)
+    registry_ticket = resolved[0] if resolved is not None else ticket
+    current = resolved[2] if resolved is not None else {}
     current_is_headless = isinstance(current, dict) and _is_headless(current)
     replaying = False
     if current_is_headless:
@@ -4683,7 +4688,7 @@ def spawn_agent(
     if current_is_headless and not replaying:
         raise HTTPException(
             status_code=409,
-            detail=f"{ticket} already has a supervisor-owned run; use Replace",
+            detail=f"{registry_ticket} already has a supervisor-owned run; use Replace",
         )
     live_window = current.get("window")
     if isinstance(live_window, str) and live_window in tmux_live_windows():
