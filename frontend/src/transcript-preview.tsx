@@ -1,8 +1,8 @@
-import { useCallback, useMemo, useState } from "react";
+import { useCallback, useMemo, useRef, useState } from "react";
 import type { ReactNode } from "react";
 
 import { hasAnsi, renderAnsi } from "./ansi";
-import { STREAM_CLAMP_LINES } from "./stream-clamp";
+import { STREAM_CLAMP_LINES, STREAM_CLAMP_PX, useStreamHeightOverflow } from "./stream-clamp";
 
 function byteLength(text: string): number {
   if (typeof TextEncoder !== "undefined") return new TextEncoder().encode(text).length;
@@ -93,10 +93,15 @@ export function BoundedPreview({
   const [expanded, setExpanded] = useState(false);
   const [wrap, setWrap] = useState(true);
   const [copied, setCopied] = useState(false);
+  const bodyRef = useRef<HTMLElement | null>(null);
+  // Line clipping alone misses payloads with few newlines but long wrapped
+  // lines; the shared rendered-height threshold catches those (WIKI-222 R1-01).
+  const heightOverflow = useStreamHeightOverflow(bodyRef, expandable);
 
   const lines = useMemo(() => (text.length === 0 ? [] : text.split("\n")), [text]);
   const totalLines = lines.length;
   const shouldClip = expandable && !expanded && totalLines > previewLines;
+  const heightClamped = expandable && !expanded && heightOverflow;
   const shownLines = shouldClip ? lines.slice(0, previewLines) : lines;
   const hiddenCount = totalLines - shownLines.length;
   const summary = showSummary ? summaryLabel(text) : null;
@@ -151,11 +156,17 @@ export function BoundedPreview({
               onClick={() => setWrap((value) => !value)}
             />
           ) : null}
-          {expandable && totalLines > previewLines ? (
+          {expandable && (totalLines > previewLines || heightOverflow) ? (
             <ChipButton
               active={expanded}
               label={expanded ? "collapse" : "expand"}
-              title={expanded ? "Collapse preview" : `Show all ${totalLines} lines`}
+              title={
+                expanded
+                  ? "Collapse preview"
+                  : totalLines > previewLines
+                    ? `Show all ${totalLines} lines`
+                    : "Show full output"
+              }
               onClick={() => setExpanded((value) => !value)}
             />
           ) : null}
@@ -169,12 +180,20 @@ export function BoundedPreview({
         </span>
       </div>
       {custom ? (
-        <div className={`transcript-preview-body is-custom${wrap ? " is-wrap" : " is-nowrap"}`}>
+        <div
+          className={`transcript-preview-body is-custom${wrap ? " is-wrap" : " is-nowrap"}${heightClamped ? " is-height-clamped" : ""}`}
+          ref={(el) => { bodyRef.current = el; }}
+          style={heightClamped ? { maxHeight: STREAM_CLAMP_PX } : undefined}
+        >
           {custom}
           {moreHint}
         </div>
       ) : (
-        <pre className={`transcript-preview-body${wrap ? " is-wrap" : " is-nowrap"}`}>
+        <pre
+          className={`transcript-preview-body${wrap ? " is-wrap" : " is-nowrap"}${heightClamped ? " is-height-clamped" : ""}`}
+          ref={(el) => { bodyRef.current = el; }}
+          style={heightClamped ? { maxHeight: STREAM_CLAMP_PX } : undefined}
+        >
           {defaultBody}
           {moreHint ? <>{"\n"}{moreHint}</> : null}
         </pre>

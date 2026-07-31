@@ -11353,6 +11353,14 @@ textarea.composer-command-input {
   overflow-wrap: normal;
 }
 
+/* WIKI-222: rendered-height clamp for payloads with long wrapped lines —
+   keep after the .is-custom rules so overflow: hidden wins the cascade. */
+.transcript-preview-body.is-height-clamped {
+  overflow: hidden;
+  -webkit-mask-image: linear-gradient(to bottom, black calc(100% - 48px), transparent);
+  mask-image: linear-gradient(to bottom, black calc(100% - 48px), transparent);
+}
+
 /* WIKI-222: shared stream-output clamp (stream-clamp.tsx) */
 
 .stream-clamp {

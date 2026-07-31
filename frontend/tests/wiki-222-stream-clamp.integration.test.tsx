@@ -105,6 +105,31 @@ test("BoundedPreview clips past the threshold and expands to full flow", () => {
   expect(bodyText).toContain(`line ${total}`);
 });
 
+test("BoundedPreview height-clamps a long single-line payload that wraps past the threshold", () => {
+  // R1-01: 1 logical line, but narrow panes wrap it to far more rendered
+  // height than STREAM_CLAMP_PX (simulated via the mocked scrollHeight).
+  mockScrollHeight(STREAM_CLAMP_PX + STREAM_CLAMP_SLACK_PX + 800);
+  const text = "x".repeat(3000);
+  const { container, getByText } = render(<BoundedPreview label="output" text={text} />);
+  const body = container.querySelector<HTMLElement>(".transcript-preview-body");
+  expect(body?.classList.contains("is-height-clamped")).toBe(true);
+  expect(body?.style.maxHeight).toBe(`${STREAM_CLAMP_PX}px`);
+  expect(container.querySelector(".transcript-preview-more")).toBeNull();
+
+  fireEvent.click(getByText("expand"));
+  const expandedBody = container.querySelector<HTMLElement>(".transcript-preview-body");
+  expect(expandedBody?.classList.contains("is-height-clamped")).toBe(false);
+  expect(expandedBody?.style.maxHeight).toBe("");
+});
+
+test("BoundedPreview does not height-clamp short single-line payloads", () => {
+  mockScrollHeight(120);
+  const { container, queryByText } = render(<BoundedPreview label="output" text="one short line" />);
+  const body = container.querySelector<HTMLElement>(".transcript-preview-body");
+  expect(body?.classList.contains("is-height-clamped")).toBe(false);
+  expect(queryByText("expand")).toBeNull();
+});
+
 function tableArtifact(rowCount: number): SessionArtifact {
   return {
     kind: "table",

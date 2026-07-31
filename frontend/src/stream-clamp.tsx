@@ -1,5 +1,5 @@
 import { useLayoutEffect, useRef, useState } from "react";
-import type { ReactNode } from "react";
+import type { ReactNode, RefObject } from "react";
 
 // WIKI-222: single source for "when does stream output stop flowing at full
 // height". Line-based renderers (BoundedPreview) clip past STREAM_CLAMP_LINES;
@@ -11,20 +11,14 @@ export const STREAM_CLAMP_PX = 640;
 // hides a few pixels reads as a rendering bug, not an affordance.
 export const STREAM_CLAMP_SLACK_PX = 96;
 
-export function StreamClamp({
-  children,
-  className,
-}: {
-  children: ReactNode;
-  className?: string;
-}) {
-  const wrapRef = useRef<HTMLDivElement | null>(null);
-  const bodyRef = useRef<HTMLDivElement | null>(null);
-  const [expanded, setExpanded] = useState(false);
+export function useStreamHeightOverflow(
+  ref: RefObject<HTMLElement | null>,
+  enabled: boolean = true,
+): boolean {
   const [overflowing, setOverflowing] = useState(false);
-
   useLayoutEffect(() => {
-    const el = bodyRef.current;
+    if (!enabled) return;
+    const el = ref.current;
     if (!el) return;
     const measure = () => {
       setOverflowing(el.scrollHeight > STREAM_CLAMP_PX + STREAM_CLAMP_SLACK_PX);
@@ -36,7 +30,21 @@ export function StreamClamp({
     // quiet even as streamed content keeps growing inside it. That is fine:
     // overflowing is already true and can only flip back via re-mount.
     return () => observer.disconnect();
-  }, []);
+  }, [enabled, ref]);
+  return overflowing;
+}
+
+export function StreamClamp({
+  children,
+  className,
+}: {
+  children: ReactNode;
+  className?: string;
+}) {
+  const wrapRef = useRef<HTMLDivElement | null>(null);
+  const bodyRef = useRef<HTMLDivElement | null>(null);
+  const [expanded, setExpanded] = useState(false);
+  const overflowing = useStreamHeightOverflow(bodyRef);
 
   const toggle = () => {
     // Collapsing a tall block from its bottom edge would teleport the
