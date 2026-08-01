@@ -2047,6 +2047,244 @@ class SupervisorTests(unittest.IsolatedAsyncioTestCase):
                     task.cancel()
                     await asyncio.gather(task, return_exceptions=True)
 
+    async def test_recovery_aborts_uncommitted_start_when_pid_dies_mid_scan(
+        self,
+    ) -> None:
+        """PID exit between abort scan and _recover_once must not RESUME."""
+
+        request_id = "start-race-scan-then-exit"
+        record = RunRecord.new(
+            agent_id="WIKI-START-RACE-SCAN-EXIT",
+            provider=ProviderKind.CODEX,
+            role="implement",
+            model="fixture-codex",
+            worktree=str(self.worktree),
+            prompt="uncommitted start with post-scan PID exit",
+            run_id=str(uuid4()),
+            start_request_id=request_id,
+        )
+        command = AgentCommand.spawn(
+            agent_id=record.agent_id,
+            request_id=request_id,
+            payload={
+                "agent_id": record.agent_id,
+                "provider": record.provider.value,
+                "role": record.role,
+                "model": record.model,
+                "worktree": record.worktree,
+                "prompt": record.initial_prompt or "uncommitted start with post-scan PID exit",
+                "run_id": record.run_id,
+            },
+        )
+        self.store.command_log.append_intent(command, {record.agent_id: None})
+        self.store.create(record, transactional_start=True)
+        provider = subprocess.Popen(
+            [sys.executable, "-c", "import time; time.sleep(30)"],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+        )
+        restarted: Supervisor | None = None
+        try:
+            record = self.store.get(record.run_id)
+            record.provider_pid = provider.pid
+            # Simulate a crash between adapter.start() and commit_start(): the
+            # provider is durably attributed, state is IDLE, session id is
+            # visible — every RESUME predicate is satisfied except the
+            # uncommitted start_transaction we own here.
+            record.provider_session_id = "codex-race-session"
+            record.state = LifecycleState.IDLE
+            self.store._write_record(record)  # noqa: SLF001 - restore crash-time snapshot
+
+            restarted_store = RunStore(self.paths)
+            restarted = Supervisor(
+                restarted_store,
+                FixtureAdapterFactory(FIXTURES, pid=os.getpid()),
+            )
+
+            original_abort = restarted_store.abort_uncommitted_starts
+
+            def abort_then_kill() -> list[str]:
+                aborted = original_abort()
+                # Force the PID to exit strictly between the abort scan
+                # (which sees live-unverifiable identity and skips) and
+                # _recover_once (which now sees a dead PID).
+                if provider.poll() is None:
+                    provider.terminate()
+                    provider.wait(timeout=5)
+                return aborted
+
+            restarted_store.abort_uncommitted_starts = abort_then_kill  # type: ignore[method-assign]
+
+            results = await restarted.recover_on_start()
+
+            self.assertEqual(len(results), 1)
+            self.assertEqual(results[0]["run_id"], record.run_id)
+            self.assertEqual(results[0]["action"], "skip")
+            self.assertEqual(results[0]["reason"], "uncommitted start aborted")
+            # The command intent replays cleanly: the aborted record is
+            # recreated as a fresh, committed start; no start_transaction
+            # remains and the receipt is durable.
+            self.assertEqual(restarted_store.command_log.pending(), [])
+            receipt = restarted_store.command_log.receipt("run/start", request_id)
+            self.assertIsNotNone(receipt)
+            assert receipt is not None
+            self.assertTrue(receipt.ok)
+            current = restarted_store.get(record.run_id)
+            self.assertEqual(current.run_id, record.run_id)
+            self.assertIsNone(current.start_transaction)
+            self.assertIn(record.run_id, restarted.adapters)
+        finally:
+            if provider.poll() is None:
+                provider.kill()
+                provider.wait(timeout=5)
+            if restarted is not None:
+                await restarted.close()
+
+    async def _crash_replace_with_published_effect(
+        self,
+        *,
+        agent_id: str,
+        request_id: str,
+        cross_provider: bool,
+    ) -> tuple[RunRecord, RunRecord, AgentCommand, dict[str, Any]]:
+        """Drive one fresh/cross-provider replace to a durably committed
+        replacement, then rewind the effect to "published" to simulate a
+        crash between _launch_record and the completed marker."""
+
+        old = await self.supervisor.start_run(
+            agent_id=agent_id,
+            provider=ProviderKind.CLAUDE if cross_provider else ProviderKind.CODEX,
+            role="implement",
+            model="fixture-claude" if cross_provider else "fixture-codex",
+            effort=None if cross_provider else "high",
+            worktree=str(self.worktree),
+            prompt="original prompt",
+        )
+        if not cross_provider:
+            # Force the fresh replacement branch: detach and drop the old PID
+            # so _replace_without_admission sees old_adapter is None with no
+            # orphan handling required.
+            old_adapter = self.supervisor.adapters[old.run_id]
+            await self.supervisor._detach_adapter(old.run_id)  # noqa: SLF001
+            await old_adapter.close()
+            old = self.store.transition(
+                old.run_id,
+                LifecycleState.DEAD,
+                reason="prepare fresh replace",
+            )
+            record = self.store.get(old.run_id)
+            record.provider_pid = None
+            self.store._write_record(record)  # noqa: SLF001 - clear PID for fresh path
+
+        replacement_id = str(uuid4())
+        target_provider = ProviderKind.CODEX if cross_provider else ProviderKind.CODEX
+        payload: dict[str, Any] = {
+            "agent_id": old.agent_id,
+            "run_id": old.run_id,
+            "replacement_run_id": replacement_id,
+            "prompt": "replacement prompt",
+        }
+        if cross_provider:
+            payload["provider"] = target_provider.value
+            payload["model"] = "fixture-codex"
+        command = AgentCommand.replace(
+            agent_id=old.agent_id,
+            request_id=request_id,
+            payload=payload,
+        )
+
+        replacement = await self.supervisor.replace(
+            old.run_id,
+            payload["prompt"],
+            provider=target_provider if cross_provider else None,
+            replacement_run_id=replacement_id,
+            effect_id=command.request_id,
+            command_hash=command.command_hash,
+        )
+        self.assertIn(replacement.run_id, self.supervisor.adapters)
+        self.assertIsNone(self.store.get(replacement.run_id).start_transaction)
+
+        # Rewind the effect status to "published" — simulates a crash after
+        # store.replace()+publish and inside _launch_record's window.
+        self.store.command_log.update_replace_effect(
+            "run/replace", command.request_id, "published"
+        )
+        effect = self.store.command_log.replace_effect(
+            "run/replace",
+            command.request_id,
+            agent_id=old.agent_id,
+            command_hash=command.command_hash,
+        )
+        self.assertIsNotNone(effect)
+        assert effect is not None
+        self.assertEqual(effect["status"], "published")
+        return old, replacement, command, payload
+
+    async def _replay_published_replace_and_assert_promoted(
+        self,
+        *,
+        old: RunRecord,
+        replacement: RunRecord,
+        command: AgentCommand,
+        payload: dict[str, Any],
+    ) -> None:
+        # The supervisor still owns the replacement adapter — the reviewer's
+        # crash-recovery invariant is that a durably committed replacement
+        # must be promoted, not killed. Replay the command via _dispatch to
+        # exercise the exact code path recover_pending would drive.
+        self.assertIn(replacement.run_id, self.supervisor.adapters)
+
+        replayed = await self.supervisor._dispatch(  # noqa: SLF001
+            "run/replace",
+            {**payload, "request_id": command.request_id},
+            command_hash=command.command_hash,
+        )
+        self.assertEqual(replayed["run_id"], replacement.run_id)
+        self.assertIn(replacement.run_id, self.supervisor.adapters)
+        current = self.store.get(replacement.run_id)
+        self.assertNotEqual(current.state, LifecycleState.BLOCKED)
+        self.assertEqual(
+            self.store.current_run_id(old.agent_id), replacement.run_id
+        )
+        effect = self.store.command_log.replace_effect(
+            "run/replace",
+            command.request_id,
+            agent_id=old.agent_id,
+            command_hash=command.command_hash,
+        )
+        self.assertIsNotNone(effect)
+        assert effect is not None
+        self.assertEqual(effect["status"], "completed")
+        self.assertTrue(self.store.run_dir(replacement.run_id).exists())
+
+    async def test_replace_replay_promotes_published_effect_fresh_path(self) -> None:
+        old, replacement, command, payload = await self._crash_replace_with_published_effect(
+            agent_id="WIKI-PUBLISHED-FRESH-CRASH",
+            request_id="published-fresh-crash",
+            cross_provider=False,
+        )
+        await self._replay_published_replace_and_assert_promoted(
+            old=old,
+            replacement=replacement,
+            command=command,
+            payload=payload,
+        )
+
+    async def test_replace_replay_promotes_published_effect_cross_provider_path(
+        self,
+    ) -> None:
+        old, replacement, command, payload = await self._crash_replace_with_published_effect(
+            agent_id="WIKI-PUBLISHED-CROSS-CRASH",
+            request_id="published-cross-crash",
+            cross_provider=True,
+        )
+        await self._replay_published_replace_and_assert_promoted(
+            old=old,
+            replacement=replacement,
+            command=command,
+            payload=payload,
+        )
+
     async def test_replace_cancellation_during_quiesce_terminalizes_old_run(self) -> None:
         old = await self.supervisor.start_run(
             agent_id="WIKI-REPLACE-CANCEL-STOP",

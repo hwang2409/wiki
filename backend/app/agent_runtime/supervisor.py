@@ -2961,6 +2961,24 @@ Preserve the same identity, role, worktree, orchestrator grouping, PR gates, and
                 "action": RecoveryAction.BLOCK.value,
                 "reason": "provider control channel recently detached",
             }
+        if record.start_transaction is not None:
+            # An uncommitted start must never be resumed by general session
+            # recovery. The scan-time abort skips a live-unverifiable PID; if
+            # that PID exits between the scan and this call, retry the abort
+            # now so command replay can start fresh. When abort still cannot
+            # run — PID stays live-unverifiable — leave the start intent
+            # retryable so the next scan can converge.
+            if self.store.abort_uncommitted_start(record.run_id):
+                return {
+                    "run_id": record.run_id,
+                    "action": RecoveryAction.SKIP.value,
+                    "reason": "uncommitted start aborted",
+                }
+            return {
+                "run_id": record.run_id,
+                "action": RecoveryAction.BLOCK.value,
+                "reason": "uncommitted start pending abort",
+            }
         if record.automatic_resume_suppressed:
             return {
                 "run_id": record.run_id,
@@ -3023,6 +3041,33 @@ Preserve the same identity, role, worktree, orchestrator grouping, PR gates, and
             if current:
                 return current
         raise RunNotFound("no current run")
+
+    def _record_launched_replacement_effect(
+        self, effect_id: str, record: RunRecord
+    ) -> None:
+        """Persist a provider_completed checkpoint before marking completed.
+
+        The fresh and cross-provider replacement paths call _launch_record and
+        then mark the effect completed. A crash between those two writes would
+        leave the effect at "published" while the replacement provider is
+        durably started; recovery must promote such effects rather than kill
+        the running replacement.
+        """
+
+        self.store.command_log.update_replace_effect(
+            "run/replace",
+            effect_id,
+            "provider_completed",
+            {
+                "state": record.state.value,
+                "session_id": record.provider_session_id,
+                "pid": record.provider_pid,
+                "generation": record.provider_generation,
+                "active_turn_id": record.active_turn_id,
+                "transcript_path": record.transcript_path,
+                "detail": record.state_reason,
+            },
+        )
 
     async def _require_replacement_control(self, run_id: str) -> RunRecord:
         """Require live replacement state and attached provider control."""
@@ -3734,6 +3779,7 @@ Preserve the same identity, role, worktree, orchestrator grouping, PR gates, and
                 )
             result = await self._launch_record(replacement, prompt)
             if effect_id is not None:
+                self._record_launched_replacement_effect(effect_id, result)
                 self.store.command_log.update_replace_effect(
                     "run/replace", effect_id, "completed", _public_run(result)
                 )
@@ -3763,6 +3809,7 @@ Preserve the same identity, role, worktree, orchestrator grouping, PR gates, and
                 )
             result = await self._launch_record(replacement, prompt)
             if effect_id is not None:
+                self._record_launched_replacement_effect(effect_id, result)
                 self.store.command_log.update_replace_effect(
                     "run/replace", effect_id, "completed", _public_run(result)
                 )
@@ -4346,7 +4393,52 @@ Preserve the same identity, role, worktree, orchestrator grouping, PR gates, and
                     if (
                         current.replaces_run_id == params.get("run_id")
                         and effect is not None
-                        and effect["status"] in {"prepared", "published"}
+                        and effect["status"] == "published"
+                    ):
+                        # Fresh/cross-provider replace publishes the effect
+                        # before _launch_record. A crash inside _launch_record
+                        # can leave the effect at "published" while the
+                        # provider actually committed. Reconcile against the
+                        # durable replacement: if the start committed
+                        # (start_transaction cleared and provider_session_id
+                        # set), promote the effect instead of killing the
+                        # live replacement.
+                        replacement_record = self.store.get(replacement_run_id)
+                        if (
+                            replacement_record.start_transaction is None
+                            and replacement_record.provider_session_id
+                            and replacement_record.state not in TERMINAL_STATES
+                        ):
+                            self._record_launched_replacement_effect(
+                                str(params["request_id"]),
+                                replacement_record,
+                            )
+                            await self._require_replacement_control(replacement_run_id)
+                            result = _public_run(self.store.get(replacement_run_id))
+                            self.store.command_log.update_replace_effect(
+                                method,
+                                str(params["request_id"]),
+                                "completed",
+                                result,
+                            )
+                            return result
+                        self.store.abort_replace(
+                            str(params["run_id"]),
+                            replacement_run_id,
+                            reason="recovered before provider replacement effect",
+                            adapter_status=AdapterStatus(
+                                state=LifecycleState.BLOCKED,
+                                session_id=None,
+                                pid=None,
+                                generation=current.provider_generation,
+                                active_turn_id=None,
+                                transcript_path=current.transcript_path,
+                            ),
+                        )
+                    elif (
+                        current.replaces_run_id == params.get("run_id")
+                        and effect is not None
+                        and effect["status"] == "prepared"
                     ):
                         self.store.abort_replace(
                             str(params["run_id"]),

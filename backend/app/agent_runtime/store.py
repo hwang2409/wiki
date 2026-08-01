@@ -932,22 +932,41 @@ class RunStore:
                     record = RunRecord.from_dict(value)
                     if not record.start_transaction:
                         continue
-                    if record.run_id in self._control_attached_run_ids:
-                        continue
-                    if record.provider_pid is None:
-                        record = self.discover_provider_process(record.run_id)
-                    if not self._terminate_recorded_provider_pid(record):
-                        continue
-                    self._restore_start_snapshot(record, record.start_transaction)
-                    if record.start_request_id:
-                        self.command_log.remove_start_request(record.start_request_id)
-                    self._start_registry_snapshots.pop(record.run_id, None)
-                    shutil.rmtree(self.run_dir(record.run_id), ignore_errors=True)
-                    aborted.append(record.run_id)
+                    if self._try_abort_uncommitted_start_locked(record):
+                        aborted.append(record.run_id)
                 except (OSError, StoreError, TypeError, ValueError):
                     # Leave damaged metadata for the normal inspector path.
                     continue
         return aborted
+
+    def abort_uncommitted_start(self, run_id: str) -> bool:
+        """Abort one uncommitted start; retry recovery when the PID exits."""
+
+        with self._lock:
+            try:
+                record = self.get(run_id)
+            except RunNotFound:
+                return False
+            if not record.start_transaction:
+                return False
+            try:
+                return self._try_abort_uncommitted_start_locked(record)
+            except (OSError, StoreError, TypeError, ValueError):
+                return False
+
+    def _try_abort_uncommitted_start_locked(self, record: RunRecord) -> bool:
+        if record.run_id in self._control_attached_run_ids:
+            return False
+        if record.provider_pid is None:
+            record = self.discover_provider_process(record.run_id)
+        if not self._terminate_recorded_provider_pid(record):
+            return False
+        self._restore_start_snapshot(record, record.start_transaction)
+        if record.start_request_id:
+            self.command_log.remove_start_request(record.start_request_id)
+        self._start_registry_snapshots.pop(record.run_id, None)
+        shutil.rmtree(self.run_dir(record.run_id), ignore_errors=True)
+        return True
 
     @staticmethod
     def _terminate_recorded_provider_pid(
