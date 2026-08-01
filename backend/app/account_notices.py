@@ -563,6 +563,91 @@ class AccountNoticeStore:
             ticket = event.get("ticket")
             if isinstance(ticket, str) and ticket:
                 remove_codex_fleet_ticket(ticket, None, allow_legacy=True)
+        elif kind == "codex_worker_replaced":
+            # A legacy-to-headless migration replaces the current registry row
+            # with a new run_id while keeping the ticket live. Reconciliation
+            # then holds any ticket-only legacy notice for that ticket in
+            # place forever: it has no stored run_id to compare against, and
+            # the first codex_auth_verified from the new run refuses to clear
+            # a ticket-only notice (per the run-scoped contract). Publish
+            # this event from the spawn/replace path on a successful legacy
+            # migration to clear only the ticket-only entries for that
+            # replaced identity. Never touches entries that recorded a
+            # run_id — those stay bound to their originating run.
+            if event.get("provider") != "codex":
+                pass
+            else:
+                ticket = event.get("ticket")
+                if isinstance(ticket, str) and ticket:
+                    for key in ("codex:limit", "codex:rotation-failed"):
+                        notice = self._notices.get(key)
+                        if notice is None or "tickets" not in notice:
+                            continue
+                        stored_run_ids = _reason_map(notice.get("run_ids"))
+                        if stored_run_ids.get(ticket) is not None:
+                            continue
+                        current_tickets = _ticket_list(notice.get("tickets"))
+                        if ticket not in current_tickets:
+                            continue
+                        remaining = [t for t in current_tickets if t != ticket]
+                        if remaining:
+                            updated = dict(notice)
+                            updated["tickets"] = remaining
+                            updated["run_ids"] = {
+                                t: rid
+                                for t, rid in stored_run_ids.items()
+                                if t in remaining
+                            }
+                            set_notice(key, updated)
+                        else:
+                            clear(key)
+
+                    existing = self._notices.get(_EXHAUSTED_KEY)
+                    if existing is not None:
+                        stored_run_ids = _reason_map(existing.get("run_ids"))
+                        if stored_run_ids.get(ticket) is None:
+                            current_tickets = _ticket_list(existing.get("tickets"))
+                            if ticket in current_tickets:
+                                remaining = [t for t in current_tickets if t != ticket]
+                                if remaining:
+                                    updated = dict(existing)
+                                    updated["tickets"] = remaining
+                                    updated["run_ids"] = {
+                                        t: rid
+                                        for t, rid in stored_run_ids.items()
+                                        if t in remaining
+                                    }
+                                    set_notice(_EXHAUSTED_KEY, updated)
+                                else:
+                                    clear(_EXHAUSTED_KEY)
+
+                    for key in _REVIVE_FAILED_KEYS.values():
+                        notice = self._notices.get(key)
+                        if notice is None:
+                            continue
+                        stored_run_ids = _reason_map(notice.get("failed_run_ids"))
+                        if stored_run_ids.get(ticket) is not None:
+                            continue
+                        current_failed = _ticket_list(notice.get("failed"))
+                        if ticket not in current_failed:
+                            continue
+                        remaining = [t for t in current_failed if t != ticket]
+                        if remaining:
+                            updated = dict(notice)
+                            updated["failed"] = remaining
+                            updated["failed_reasons"] = {
+                                t: reason
+                                for t, reason in _reason_map(notice.get("failed_reasons")).items()
+                                if t in remaining
+                            }
+                            updated["failed_run_ids"] = {
+                                t: rid
+                                for t, rid in stored_run_ids.items()
+                                if t in remaining
+                            }
+                            set_notice(key, updated)
+                        else:
+                            clear(key)
         elif kind == "claude_limit_hit":
             ticket = event.get("ticket")
             if isinstance(ticket, str) and ticket:

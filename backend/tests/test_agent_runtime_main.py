@@ -1233,6 +1233,161 @@ class HeadlessMainRouteTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(replace_call["model"], "gpt-5.4")
         self.assertEqual(replace_call["effort"], "high")
 
+    async def test_legacy_to_headless_codex_migration_clears_ticket_only_fleet_notice(
+        self,
+    ) -> None:
+        # A legacy tmux Codex worker for WIKI-42 owns a ticket-only entry in
+        # the codex_limit_no_eligible fleet notice. Migrating that ticket to
+        # a headless run (migrate_legacy=True) must clear the WIKI-42 entry
+        # while leaving unrelated notice tickets intact — the first
+        # codex_auth_verified from the new run cannot clear a ticket-only
+        # entry, so without the migration event the durable banner would
+        # persist forever.
+        registry = {
+            "WIKI-42": {
+                "history": [],
+                "current": {
+                    "ticket": "WIKI-42",
+                    "provider": "codex",
+                    "kind": "cdx",
+                    "role": "implement",
+                    "model": "gpt-5.4",
+                    "state": "working",
+                    "window": None,
+                    "worktree": str(self.worktree),
+                    "orch": None,
+                    "log": str(self.raw),
+                },
+            }
+        }
+        self.registry.write_text(json.dumps(registry), encoding="utf-8")
+
+        notices = self._isolate_account_notices()
+        notices.apply_event(
+            {
+                "type": "codex_limit_no_eligible",
+                "tickets": ["WIKI-42", "WIKI-OTHER"],
+                # WIKI-42 stays ticket-only (legacy); WIKI-OTHER has a
+                # run-scoped entry from a still-live headless worker.
+                "run_ids": {"WIKI-OTHER": "run-other"},
+                "reset_at": None,
+                "ts": "t-limit",
+            }
+        )
+        notices.apply_event(
+            {
+                "type": "codex_auth_dead_exhausted",
+                "tickets": ["WIKI-42", "WIKI-OTHER"],
+                "run_ids": {"WIKI-OTHER": "run-other"},
+                "ts": "t-exhausted",
+            }
+        )
+        notices.apply_event(
+            {
+                "type": "codex_auth_dead_revival",
+                "revived": [],
+                "failed": ["WIKI-42", "WIKI-OTHER"],
+                "failed_reasons": {
+                    "WIKI-42": "revive failed",
+                    "WIKI-OTHER": "revive failed",
+                },
+                "failed_run_ids": {"WIKI-OTHER": "run-other"},
+                "ts": "t-revive",
+            }
+        )
+
+        with mock.patch.object(main, "tmux_live_windows", return_value=set()):
+            spawned = main.spawn_agent(
+                main.SpawnWorkerIn(
+                    ticket="WIKI-42",
+                    kind="cdx",
+                    role="implement",
+                    model="gpt-5.4",
+                    effort="high",
+                    workdir=str(self.worktree),
+                    orch=None,
+                    prompt="Implement WIKI-42",
+                    request_id="spawn-migrate-1",
+                )
+            )
+        self.assertEqual(spawned["run_id"], RUN_ID)
+        start = next(
+            params for method, params in self.client.calls if method == "run/start"
+        )
+        self.assertTrue(start["migrate_legacy"])
+
+        limit = next(entry for entry in notices.snapshot() if entry["type"] == "codex_limit_no_eligible")
+        self.assertEqual(limit["tickets"], ["WIKI-OTHER"])
+        self.assertEqual(limit["run_ids"], {"WIKI-OTHER": "run-other"})
+        exhausted = next(
+            entry for entry in notices.snapshot() if entry["type"] == "codex_auth_dead_exhausted"
+        )
+        self.assertEqual(exhausted["tickets"], ["WIKI-OTHER"])
+        self.assertEqual(exhausted["run_ids"], {"WIKI-OTHER": "run-other"})
+        revive = next(
+            entry for entry in notices.snapshot() if entry["type"] == "codex_auth_dead_revival"
+        )
+        self.assertEqual(revive["failed"], ["WIKI-OTHER"])
+        self.assertEqual(revive["failed_run_ids"], {"WIKI-OTHER": "run-other"})
+
+    async def test_legacy_to_headless_codex_migration_preserves_run_scoped_entry(
+        self,
+    ) -> None:
+        # The migration event must NOT drop the WIKI-42 ticket from a fleet
+        # notice that already stores a run_id for it — that entry belongs to
+        # a specific headless run and only its own codex_auth_verified may
+        # clear it.
+        registry = {
+            "WIKI-42": {
+                "history": [],
+                "current": {
+                    "ticket": "WIKI-42",
+                    "provider": "codex",
+                    "kind": "cdx",
+                    "role": "implement",
+                    "model": "gpt-5.4",
+                    "state": "working",
+                    "window": None,
+                    "worktree": str(self.worktree),
+                    "orch": None,
+                    "log": str(self.raw),
+                },
+            }
+        }
+        self.registry.write_text(json.dumps(registry), encoding="utf-8")
+
+        notices = self._isolate_account_notices()
+        notices.apply_event(
+            {
+                "type": "codex_limit_no_eligible",
+                "tickets": ["WIKI-42"],
+                "run_ids": {"WIKI-42": "run-pinned"},
+                "reset_at": None,
+                "ts": "t-limit-pinned",
+            }
+        )
+
+        with mock.patch.object(main, "tmux_live_windows", return_value=set()):
+            main.spawn_agent(
+                main.SpawnWorkerIn(
+                    ticket="WIKI-42",
+                    kind="cdx",
+                    role="implement",
+                    model="gpt-5.4",
+                    effort="high",
+                    workdir=str(self.worktree),
+                    orch=None,
+                    prompt="Implement WIKI-42",
+                    request_id="spawn-migrate-preserve-1",
+                )
+            )
+
+        limit = next(
+            entry for entry in notices.snapshot() if entry["type"] == "codex_limit_no_eligible"
+        )
+        self.assertEqual(limit["tickets"], ["WIKI-42"])
+        self.assertEqual(limit["run_ids"], {"WIKI-42": "run-pinned"})
+
     async def test_http_spawn_route_passes_the_live_backend_port(self) -> None:
         request = Request(
             {

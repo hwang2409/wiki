@@ -4776,6 +4776,7 @@ def spawn_agent(
     if isinstance(live_window, str) and live_window in tmux_live_windows():
         raise HTTPException(status_code=409, detail=f"{ticket} already has a live worker window")
 
+    migrate_legacy_flag = bool(current) and not current_is_headless
     result = _supervisor_request(
         "run/start",
         {
@@ -4787,7 +4788,7 @@ def spawn_agent(
             "worktree": str(workdir_path),
             "prompt": prompt,
             "orchestrator_id": orch or None,
-            "migrate_legacy": bool(current) and not current_is_headless,
+            "migrate_legacy": migrate_legacy_flag,
             "request_id": request_id,
             "implicit_request_id": implicit_request_id,
             "backend_base_url": backend_base_url,
@@ -4795,6 +4796,8 @@ def spawn_agent(
     )
     if not isinstance(result, dict):
         raise HTTPException(status_code=502, detail="Agent supervisor returned a bad run")
+    if migrate_legacy_flag and kind == "cdx":
+        _publish_codex_worker_replaced(ticket)
     # Recorded on supervisor replays too: append_edge dedupes by request id
     # across the full edge history, so a replay whose first append failed
     # heals the graph while a successful one stays a no-op.
@@ -5035,6 +5038,8 @@ def spawn_orchestrator(
     )
     if not isinstance(result, dict):
         raise HTTPException(status_code=502, detail="Agent supervisor returned a bad run")
+    if migrate_legacy and kind == "cdx":
+        _publish_codex_worker_replaced(orch_id)
     refreshed = _registry_agent(_read_agent_registry(), orch_id)
     registration = refreshed[2] if refreshed is not None else {}
 
@@ -5609,6 +5614,25 @@ async def publish_agent_event(event: dict) -> None:
             dead.append(queue_)
     for queue_ in dead:
         _event_subscribers.discard(queue_)
+
+
+def _publish_codex_worker_replaced(ticket: str) -> None:
+    """Clear ticket-only legacy Codex notices after a legacy-to-headless commit.
+
+    The spawn and orchestrator routes are synchronous, so the store is
+    updated directly; the next /api/agents refresh reflects the cleared
+    notice. Only ticket-only entries (no stored run_id) are affected — the
+    apply_event handler leaves headless run-scoped entries alone.
+    """
+
+    ACCOUNT_NOTICES.apply_event(
+        {
+            "type": "codex_worker_replaced",
+            "provider": "codex",
+            "ticket": ticket,
+            "ts": datetime.now(timezone.utc).isoformat(),
+        }
+    )
 
 
 def _subscribe_agent_events() -> asyncio.Queue[dict]:
