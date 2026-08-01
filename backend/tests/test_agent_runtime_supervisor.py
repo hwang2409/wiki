@@ -4136,9 +4136,29 @@ class SupervisorTests(unittest.IsolatedAsyncioTestCase):
         notice_store.apply_event(cleared)
         self.assertEqual(cleared["ticket"], "WIKI-CLAUDE-RECOVERY")
         self.assertEqual(cleared["run_id"], record.run_id)
-        with self.assertRaises(TimeoutError):
-            await _wait_for_published(queue, "claude_limit_hit", timeout=0.1)
         self.assertEqual(notice_store.snapshot(), [])
+
+        # A successful turn clears the per-run throttle so a later limit on
+        # the same run produces a fresh actionable notice.
+        self.assertNotIn(record.run_id, self.supervisor.last_limit_alert_at)
+        await self.supervisor._handle_provider_event(  # noqa: SLF001
+            record.run_id,
+            adapter,
+            ProviderEvent(
+                ProviderKind.CLAUDE,
+                {
+                    "type": "result",
+                    "subtype": "error",
+                    "is_error": True,
+                    "result": "Claude usage limit reached after recovery.",
+                },
+            ),
+        )
+        second_hit = await _wait_for_published(queue, "claude_limit_hit")
+        notice_store.apply_event(second_hit)
+        self.assertEqual(second_hit["run_id"], record.run_id)
+        self.assertIn(record.run_id, self.supervisor.last_limit_alert_at)
+        self.assertEqual(notice_store.snapshot()[0]["type"], "claude_limit_hit")
         self.supervisor.unsubscribe(queue)
 
     async def test_claude_limit_clear_survives_supervisor_restart(self) -> None:

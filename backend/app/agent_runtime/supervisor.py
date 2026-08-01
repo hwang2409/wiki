@@ -980,6 +980,7 @@ Preserve the same identity, role, worktree, orchestrator grouping, PR gates, and
             # run. Pane redraws and generic session events are not proof.
             # Emit a run-scoped clear even after supervisor restart; the
             # durable notice store owns whether this run has a notice.
+            self.last_limit_alert_at.pop(run_id, None)
             await self._publish(
                 {
                     "type": "claude_limit_cleared",
