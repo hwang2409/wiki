@@ -2,7 +2,7 @@
 type: decision
 tags: [phoebe, agent-v3, design]
 created: 2026-07-31
-updated: 2026-07-31
+updated: 2026-08-01
 ---
 
 # Phoebe Agent V3 harness design
@@ -155,3 +155,16 @@ the sandbox contains nothing to escalate with.
 
 [[admin-agent]], [[admin-agent-audit-2026-07-30]],
 [[admin-agent-tool-discovery]], [[admin-db-reads-generated-catalog]]
+
+Integration note (2026-07-31, review10): the retrieve branch's activity
+lease is a plain 300s Redis lock (no generation, renewal, or fencing);
+the workspace branch carries the stronger generation-fenced lease. At
+integration the workspace fencing model wins, and durable seed recovery
+must move inside the fenced critical section.
+
+Integration complete (2026-08-01): PHO-14973 was folded into
+`henry/phoebe-v3-agent` with the workspace generation-fenced, renewable lease
+model, atomic advance-only seeding, and workspace-identity durable activity
+query. Final branch SHA: `da184279d4560c3e0b8ae3d2e7b0c69289d6cf35`.
+Verification: Bazel v3 agent 12/12, agent sandbox 15/15, workspace spill 2/2,
+LLM framework 33/33, worker 1/1; ty passed on touched packages.

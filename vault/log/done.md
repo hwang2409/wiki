@@ -2,10 +2,15 @@
 type: log
 tags: [log, done]
 created: 2026-07-06
-updated: 2026-07-31
+updated: 2026-08-01
 ---
 
 # Done
+
+## 2026-08-01
+
+- v3 harness: workspace step (PHO-14972) folded into henry/phoebe-v3-agent at 964d1027f3; bazel 59/59 + ty clean
+- v3 harness: retrieve step (PHO-14973) folded into henry/phoebe-v3-agent at da184279d456; bazel v3 12/12, sandbox 15/15, spill 2/2, llm 33/33, worker 1/1 + ty clean
 
 ## 2026-07-31
 
