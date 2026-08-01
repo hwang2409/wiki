@@ -1951,14 +1951,6 @@ def list_workspaces() -> WorkspaceList:
 def agents() -> dict[str, object]:
     registry: dict = {}
     registry_refreshed_at: str | None = None
-    # Capture the notice revision BEFORE reading the registry. A failure
-    # event that lands between the registry snapshot and the reconcile
-    # call would otherwise carry a run_id or ticket that live_runs does
-    # not know about, and reconcile_with_live would delete the fresh
-    # notice. Passing this revision to reconcile makes it a no-op when
-    # something landed after the snapshot; the next refresh reconciles
-    # from a paired pair.
-    notice_revision = ACCOUNT_NOTICES.revision
     # Notice reconciliation compares against live registry identity, but the
     # registry file may be transiently missing (backend/supervisor startup
     # race), unreadable, or a non-object payload. On any of those failure
@@ -1977,6 +1969,32 @@ def agents() -> dict[str, object]:
             ).isoformat()
     except (OSError, ValueError):
         pass
+    # Consume the durable legacy-migration marker before capturing the notice
+    # revision. If the backend crashed between supervisor commit and the spawn
+    # route's synchronous _publish_codex_worker_replaced call, the ticket-only
+    # Codex notice would remain forever without this self-heal. The publish
+    # is idempotent (apply_event returns False when there is nothing to
+    # clear), so a marked ticket that already had its notice cleared incurs
+    # no work and does not emit a refresh event. Running before we capture
+    # notice_revision keeps the revision guard aligned with a snapshot that
+    # already reflects the self-heal.
+    if registry_loaded:
+        for ticket, entry in registry.items():
+            if ticket.startswith("_") or not isinstance(entry, dict):
+                continue
+            current = entry.get("current")
+            if not isinstance(current, dict):
+                continue
+            if current.get("replaced_legacy_provider") == "codex":
+                _publish_codex_worker_replaced(ticket)
+    # Capture the notice revision BEFORE reading the registry. A failure
+    # event that lands between the registry snapshot and the reconcile
+    # call would otherwise carry a run_id or ticket that live_runs does
+    # not know about, and reconcile_with_live would delete the fresh
+    # notice. Passing this revision to reconcile makes it a no-op when
+    # something landed after the snapshot; the next refresh reconciles
+    # from a paired pair.
+    notice_revision = ACCOUNT_NOTICES.revision
 
     legacy_windows: set[str] = set()
     headless_ids: set[str] = set()
@@ -4799,9 +4817,10 @@ def spawn_agent(
         raise HTTPException(status_code=502, detail="Agent supervisor returned a bad run")
     # Key the ticket-only Codex-notice cleanup off the REPLACED legacy identity
     # (persisted in the supervisor result), not the new destination kind. A
-    # cdx-to-cc migration still needs to clear the Codex banner for the ticket,
-    # and the supervisor stamps the flag inside store.create so idempotent
-    # replays after a post-commit crash reapply cleanup on every retry.
+    # cdx-to-cc migration still needs to clear the Codex banner for the ticket.
+    # The supervisor stamps the flag inside store.create and projects it into
+    # the registry snapshot, so /api/agents self-heals on the next refresh
+    # even without a spawn retry.
     if result.get("replaced_legacy_provider") == "codex":
         _publish_codex_worker_replaced(ticket)
     # Recorded on supervisor replays too: append_edge dedupes by request id
@@ -5630,24 +5649,28 @@ async def publish_agent_event(event: dict) -> None:
         _event_subscribers.discard(queue_)
 
 
-def _publish_codex_worker_replaced(ticket: str) -> None:
+def _publish_codex_worker_replaced(ticket: str) -> bool:
     """Clear ticket-only legacy Codex notices after a legacy-to-headless commit.
 
     Runs on every /api/agents/spawn (and /spawn-orchestrator) invocation whose
-    supervisor result carries ``replaced_legacy_provider == "codex"``, including
-    idempotent replays: the flag rides on the cached RunRecord, so a post-commit
-    backend crash still triggers cleanup when the operator retries with the same
-    request_id. Only ticket-only entries (no stored run_id) are affected — the
-    apply_event handler leaves headless run-scoped entries alone.
+    supervisor result carries ``replaced_legacy_provider == "codex"``, and on
+    every /api/agents refresh whose registry current entry projects the same
+    marker (so a post-commit backend crash heals without a spawn replay).
+    Only ticket-only entries (no stored run_id) are affected — the apply_event
+    handler leaves headless run-scoped entries alone.
 
     Emits an ``agents`` SSE refresh AFTER the notice mutation lands so the
     frontend refetches ``/api/agents`` and sees the cleared notice. Without
     this the only "agents changed" event fires when the supervisor commits
     (BEFORE cleanup), and the frontend can settle on the stale pre-clean
-    snapshot.
+    snapshot. Gated on ``apply_event`` returning True so the /api/agents
+    self-heal loop is one-shot per marked ticket instead of re-firing a
+    refresh on every subsequent poll.
+
+    Returns True when the notice store actually changed.
     """
 
-    ACCOUNT_NOTICES.apply_event(
+    changed = ACCOUNT_NOTICES.apply_event(
         {
             "type": "codex_worker_replaced",
             "provider": "codex",
@@ -5655,7 +5678,9 @@ def _publish_codex_worker_replaced(ticket: str) -> None:
             "ts": datetime.now(timezone.utc).isoformat(),
         }
     )
-    _schedule_agents_refresh({ticket})
+    if changed:
+        _schedule_agents_refresh({ticket})
+    return changed
 
 
 def _schedule_agents_refresh(tickets: set[str]) -> None:

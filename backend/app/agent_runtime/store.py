@@ -712,6 +712,12 @@ class RunStore:
             "window": None,
             "spawned_at": record.created_at,
             "updated_at": record.updated_at,
+            # Projected so /api/agents can clear ticket-only legacy Codex
+            # notices without needing a spawn replay (round 27 completion of
+            # the round-26 migration marker). The value survives supervisor
+            # restarts because it's persisted on the RunRecord and re-written
+            # into the registry on every current-entry refresh.
+            "replaced_legacy_provider": record.replaced_legacy_provider,
         }
 
     def _write_record(self, record: RunRecord) -> None:

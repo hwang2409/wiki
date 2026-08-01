@@ -99,7 +99,13 @@ class FakeSupervisorClient:
             return "claude"
         return None
 
-    def _write_current(self, run_id: str, params: dict) -> dict:
+    def _write_current(
+        self,
+        run_id: str,
+        params: dict,
+        *,
+        replaced_legacy_provider: str | None = None,
+    ) -> dict:
         registry = self._registry()
         agent_id = params["agent_id"]
         previous = registry.get(agent_id) or {}
@@ -127,6 +133,10 @@ class FakeSupervisorClient:
             "log": str(self.raw_path),
             "window": None,
             "spawned_at": "2026-07-09T12:00:00+00:00",
+            # Mirror store._registry_current: the replaced-legacy marker rides
+            # on the projected registry entry so /api/agents can self-heal
+            # ticket-only Codex notices without a spawn replay.
+            "replaced_legacy_provider": replaced_legacy_provider,
         }
         registry[agent_id] = {"history": history, "current": current}
         self.registry_path.write_text(json.dumps(registry), encoding="utf-8")
@@ -173,7 +183,11 @@ class FakeSupervisorClient:
             return {"runs": rows}
         if method == "run/start":
             replaced_legacy_provider = self._replaced_legacy_provider(registry, values)
-            row = self._write_current(RUN_ID, values)
+            row = self._write_current(
+                RUN_ID,
+                values,
+                replaced_legacy_provider=replaced_legacy_provider,
+            )
             return {
                 **row,
                 "agent_id": values["agent_id"],
@@ -1747,6 +1761,106 @@ class HeadlessMainRouteTests(unittest.IsolatedAsyncioTestCase):
                 "expected a post-cleanup agents refresh so the frontend refetches",
             )
             self.assertIn("WIKI-42", agents_events[-1].get("tickets") or [])
+        finally:
+            main._event_subscribers.discard(subscriber)  # noqa: SLF001
+
+    async def test_agents_self_heals_committed_migration_marker_without_spawn_replay(
+        self,
+    ) -> None:
+        # Reviewer's post-commit crash regression (round 26 HIGH): the
+        # supervisor committed the legacy-to-headless migration and stamped
+        # replaced_legacy_provider on the RunRecord, but the backend exited
+        # before main.py's synchronous _publish_codex_worker_replaced call
+        # ran. The projected registry entry carries the durable marker; a
+        # normal /api/agents refresh (no spawn retry, no idempotency replay)
+        # must consume the marker and clear the ticket-only Codex notice.
+        registry = {
+            "WIKI-42": {
+                "history": [],
+                "current": {
+                    "ticket": "WIKI-42",
+                    "run_id": RUN_ID,
+                    "provider": "claude",
+                    "kind": "cc",
+                    "role": "implement",
+                    "model": "sonnet",
+                    "state": "working",
+                    "worktree": str(self.worktree),
+                    "orch": None,
+                    "log": str(self.raw),
+                    "provider_session_id": "session-42",
+                    "provider_pid": 4242,
+                    "control_attached": True,
+                    "replaced_legacy_provider": "codex",
+                },
+            }
+        }
+        self.registry.write_text(json.dumps(registry), encoding="utf-8")
+
+        notices = self._isolate_account_notices()
+        notices.apply_event(
+            {
+                "type": "codex_auth_dead_exhausted",
+                "tickets": ["WIKI-42"],
+                "run_ids": {},
+                "ts": "t-crash",
+            }
+        )
+
+        subscriber = main._subscribe_agent_events()  # noqa: SLF001 - test only
+        try:
+            payload = main.agents()
+            await asyncio.sleep(0)
+
+            surfaced = cast(list[dict[str, Any]], payload["account_notices"])
+            self.assertEqual(
+                [entry for entry in surfaced if entry["type"] == "codex_auth_dead_exhausted"],
+                [],
+                "ticket-only Codex notice must clear from the same /api/agents call",
+            )
+            # Persisted store also reflects the clear so a second refresh
+            # would return an empty snapshot.
+            self.assertEqual(
+                [
+                    entry
+                    for entry in notices.snapshot()
+                    if entry["type"] == "codex_auth_dead_exhausted"
+                ],
+                [],
+            )
+            # No spawn replay: the supervisor is untouched by /api/agents.
+            self.assertEqual(self.client.calls, [])
+
+            events: list[dict[str, Any]] = []
+            while True:
+                try:
+                    events.append(subscriber.get_nowait())
+                except asyncio.QueueEmpty:
+                    break
+            agents_events = [event for event in events if event.get("type") == "agents"]
+            self.assertTrue(
+                agents_events,
+                "self-heal must emit an agents refresh so the frontend refetches",
+            )
+            self.assertIn("WIKI-42", agents_events[-1].get("tickets") or [])
+
+            # Second refresh is a no-op: no supervisor calls, no fresh refresh
+            # event, mutation-sensitive proof that the gate on apply_event's
+            # `changed` return prevents a feedback loop.
+            main.agents()
+            await asyncio.sleep(0)
+            replay_events: list[dict[str, Any]] = []
+            while True:
+                try:
+                    replay_events.append(subscriber.get_nowait())
+                except asyncio.QueueEmpty:
+                    break
+            self.assertEqual(
+                [event for event in replay_events if event.get("type") == "agents"],
+                [],
+                "second refresh must not re-emit an agents event once notices are clear",
+            )
+            self.assertEqual(self.client.calls, [])
         finally:
             main._event_subscribers.discard(subscriber)  # noqa: SLF001
 
