@@ -1955,6 +1955,98 @@ class SupervisorTests(unittest.IsolatedAsyncioTestCase):
             if restarted is not None:
                 await restarted.close()
 
+    async def test_recovery_poll_skips_in_flight_local_start(self) -> None:
+        release_start = asyncio.Event()
+        start_entered = asyncio.Event()
+
+        class PausedStartClaudeAdapter(ClaudeFixtureAdapter):
+            async def start(self, request: StartRequest) -> AdapterStatus:
+                start_entered.set()
+                await release_start.wait()
+                return await super().start(request)
+
+        class PausedStartFactory(FixtureAdapterFactory):
+            def __call__(self, record: RunRecord) -> ProviderAdapter:
+                if record.provider is ProviderKind.CLAUDE:
+                    return PausedStartClaudeAdapter(
+                        self.fixture_dir / "claude_stream_native_surfaces.jsonl",
+                        pid=self.pid,
+                        generation=record.provider_generation,
+                    )
+                return super().__call__(record)
+
+        await self.supervisor.close()
+        self.supervisor = Supervisor(
+            self.store,
+            PausedStartFactory(FIXTURES, pid=os.getpid()),
+        )
+
+        start_task = asyncio.create_task(
+            self.supervisor.start_run(
+                agent_id="WIKI-PAUSED-START-INFLIGHT",
+                provider=ProviderKind.CLAUDE,
+                role="implement",
+                model="fixture-claude",
+                effort=None,
+                worktree=str(self.worktree),
+                prompt="paused start survives recovery poll",
+            )
+        )
+        recovery_task: asyncio.Task[list[dict[str, str]]] | None = None
+        try:
+            await asyncio.wait_for(start_entered.wait(), timeout=2)
+
+            runs = self.store.list_runs()
+            self.assertEqual(len(runs), 1)
+            in_flight = runs[0]
+            self.assertIsNotNone(in_flight.start_transaction)
+            self.assertIn(in_flight.run_id, self.supervisor.adapters)
+            run_dir = self.store.run_dir(in_flight.run_id)
+            self.assertTrue(run_dir.exists())
+
+            abort_called = asyncio.Event()
+            original_abort = self.store.abort_uncommitted_starts
+
+            def instrumented_abort() -> list[str]:
+                result = original_abort()
+                abort_called.set()
+                return result
+
+            self.store.abort_uncommitted_starts = instrumented_abort  # type: ignore[method-assign]
+
+            recovery_task = asyncio.create_task(self.supervisor.recover_on_start())
+            await asyncio.wait_for(abort_called.wait(), timeout=2)
+
+            # The periodic recovery must not race the launch it does not own.
+            self.assertIn(in_flight.run_id, self.supervisor.adapters)
+            self.assertTrue(run_dir.exists())
+            persisted = self.store.get(in_flight.run_id)
+            self.assertIsNotNone(persisted.start_transaction)
+            self.assertEqual(
+                self.store.current_run_id(in_flight.agent_id),
+                in_flight.run_id,
+            )
+            self.assertIsNone(self.store.command_log.receipt("run/start", None))
+
+            # Release the paused provider start; commit_start must still succeed.
+            release_start.set()
+            record = await asyncio.wait_for(start_task, timeout=5)
+            await asyncio.wait_for(recovery_task, timeout=5)
+
+            self.assertIsNone(self.store.get(record.run_id).start_transaction)
+            self.assertIn(record.run_id, self.supervisor.adapters)
+            self.assertTrue(self.store.run_dir(record.run_id).exists())
+        finally:
+            release_start.set()
+            for task in (start_task, recovery_task):
+                if task is None or task.done():
+                    continue
+                try:
+                    await asyncio.wait_for(task, timeout=2)
+                except Exception:
+                    task.cancel()
+                    await asyncio.gather(task, return_exceptions=True)
+
     async def test_replace_cancellation_during_quiesce_terminalizes_old_run(self) -> None:
         old = await self.supervisor.start_run(
             agent_id="WIKI-REPLACE-CANCEL-STOP",

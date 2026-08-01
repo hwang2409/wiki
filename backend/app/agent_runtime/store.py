@@ -912,7 +912,15 @@ class RunStore:
         self.abort_uncommitted_starts()
 
     def abort_uncommitted_starts(self) -> list[str]:
-        """Abort safe uncommitted starts and return the removed run ids."""
+        """Abort safe uncommitted starts and return the removed run ids.
+
+        Skips runs whose adapter this supervisor owns — such runs are between
+        create() and commit_start() in an in-flight local launch. Aborting one
+        of those would race the launching coroutine, terminating the verified
+        provider group and deleting the run directory before commit_start().
+        A restarted supervisor's set is empty, so the constructor pass still
+        cleans up starts that crashed before commit.
+        """
 
         aborted: list[str] = []
         with self._lock:
@@ -923,6 +931,8 @@ class RunStore:
                         continue
                     record = RunRecord.from_dict(value)
                     if not record.start_transaction:
+                        continue
+                    if record.run_id in self._control_attached_run_ids:
                         continue
                     if record.provider_pid is None:
                         record = self.discover_provider_process(record.run_id)
