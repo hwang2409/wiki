@@ -170,6 +170,7 @@ class RunRecord:
     automatic_resume_guarded_at: str | None = None
     replaces_run_id: str | None = None
     replaced_by_run_id: str | None = None
+    replaced_legacy_provider: str | None = None
     outcome: str | None = None
     raw_event_count: int = 0
     normalized_event_count: int = 0
@@ -255,6 +256,7 @@ class RunRecord:
             "updated_at": self.updated_at,
             "replaces_run_id": self.replaces_run_id,
             "replaced_by_run_id": self.replaced_by_run_id,
+            "replaced_legacy_provider": self.replaced_legacy_provider,
             "outcome": self.outcome,
             "raw_event_count": self.raw_event_count,
             "normalized_event_count": self.normalized_event_count,
@@ -317,6 +319,7 @@ class RunRecord:
             updated_at=str(value.get("updated_at") or utc_now()),
             replaces_run_id=value.get("replaces_run_id"),
             replaced_by_run_id=value.get("replaced_by_run_id"),
+            replaced_legacy_provider=value.get("replaced_legacy_provider"),
             outcome=value.get("outcome"),
             raw_event_count=int(value.get("raw_event_count", 0)),
             normalized_event_count=int(value.get("normalized_event_count", 0)),

@@ -71,6 +71,34 @@ class FakeSupervisorClient:
         except FileNotFoundError:
             return {}
 
+    @staticmethod
+    def _replaced_legacy_provider(registry: dict, params: dict) -> str | None:
+        """Mirror store.create: only migrate_legacy runs stamp the replaced kind."""
+
+        if not params.get("migrate_legacy"):
+            return None
+        agent_id = params.get("agent_id")
+        entry = registry.get(agent_id) if isinstance(agent_id, str) else None
+        prior_current = entry.get("current") if isinstance(entry, dict) else None
+        prior_kind: str | None = None
+        if isinstance(prior_current, dict):
+            raw = prior_current.get("kind")
+            if isinstance(raw, str):
+                prior_kind = raw
+        if prior_kind is None:
+            orchestrators = registry.get("_orchestrators")
+            if isinstance(orchestrators, dict):
+                legacy = orchestrators.get(agent_id)
+                if isinstance(legacy, dict):
+                    raw = legacy.get("kind")
+                    if isinstance(raw, str):
+                        prior_kind = raw
+        if prior_kind == "cdx":
+            return "codex"
+        if prior_kind == "cc":
+            return "claude"
+        return None
+
     def _write_current(self, run_id: str, params: dict) -> dict:
         registry = self._registry()
         agent_id = params["agent_id"]
@@ -144,8 +172,13 @@ class FakeSupervisorClient:
                     rows.append(row)
             return {"runs": rows}
         if method == "run/start":
+            replaced_legacy_provider = self._replaced_legacy_provider(registry, values)
             row = self._write_current(RUN_ID, values)
-            return {**row, "agent_id": values["agent_id"]}
+            return {
+                **row,
+                "agent_id": values["agent_id"],
+                "replaced_legacy_provider": replaced_legacy_provider,
+            }
         if method == "run/replace":
             agent_id = next(
                 key
@@ -1387,6 +1420,335 @@ class HeadlessMainRouteTests(unittest.IsolatedAsyncioTestCase):
         )
         self.assertEqual(limit["tickets"], ["WIKI-42"])
         self.assertEqual(limit["run_ids"], {"WIKI-42": "run-pinned"})
+
+    async def test_cdx_to_cc_worker_migration_clears_ticket_only_codex_notices(
+        self,
+    ) -> None:
+        # Cross-provider replacement: legacy tmux Codex worker for WIKI-42 gets
+        # replaced by a Claude headless run. The reviewer flagged round 25 for
+        # gating cleanup on the destination kind — which meant this exact path
+        # (kind == "cc") NEVER cleared the WIKI-42 ticket-only Codex notice.
+        # Round 26 keys the cleanup off the REPLACED legacy provider identity,
+        # so the notice must clear even though the new run is Claude.
+        registry = {
+            "WIKI-42": {
+                "history": [],
+                "current": {
+                    "ticket": "WIKI-42",
+                    "provider": "codex",
+                    "kind": "cdx",
+                    "role": "implement",
+                    "model": "gpt-5.4",
+                    "state": "working",
+                    "window": None,
+                    "worktree": str(self.worktree),
+                    "orch": None,
+                    "log": str(self.raw),
+                },
+            }
+        }
+        self.registry.write_text(json.dumps(registry), encoding="utf-8")
+
+        notices = self._isolate_account_notices()
+        notices.apply_event(
+            {
+                "type": "codex_limit_no_eligible",
+                "tickets": ["WIKI-42", "WIKI-OTHER"],
+                "run_ids": {"WIKI-OTHER": "run-other"},
+                "reset_at": None,
+                "ts": "t-limit",
+            }
+        )
+        notices.apply_event(
+            {
+                "type": "codex_auth_dead_exhausted",
+                "tickets": ["WIKI-42", "WIKI-OTHER"],
+                "run_ids": {"WIKI-OTHER": "run-other"},
+                "ts": "t-exhausted",
+            }
+        )
+        notices.apply_event(
+            {
+                "type": "codex_auth_dead_revival",
+                "revived": [],
+                "failed": ["WIKI-42", "WIKI-OTHER"],
+                "failed_reasons": {
+                    "WIKI-42": "revive failed",
+                    "WIKI-OTHER": "revive failed",
+                },
+                "failed_run_ids": {"WIKI-OTHER": "run-other"},
+                "ts": "t-revive",
+            }
+        )
+
+        with mock.patch.object(main, "tmux_live_windows", return_value=set()):
+            main.spawn_agent(
+                main.SpawnWorkerIn(
+                    ticket="WIKI-42",
+                    kind="cc",
+                    role="implement",
+                    model="sonnet",
+                    workdir=str(self.worktree),
+                    orch=None,
+                    prompt="Take over WIKI-42 on Claude",
+                    request_id="spawn-cdx-to-cc-1",
+                )
+            )
+        start = next(
+            params for method, params in self.client.calls if method == "run/start"
+        )
+        self.assertTrue(start["migrate_legacy"])
+        self.assertEqual(start["provider"], "claude")
+
+        limit = next(
+            entry for entry in notices.snapshot() if entry["type"] == "codex_limit_no_eligible"
+        )
+        self.assertEqual(limit["tickets"], ["WIKI-OTHER"])
+        self.assertEqual(limit["run_ids"], {"WIKI-OTHER": "run-other"})
+        exhausted = next(
+            entry for entry in notices.snapshot() if entry["type"] == "codex_auth_dead_exhausted"
+        )
+        self.assertEqual(exhausted["tickets"], ["WIKI-OTHER"])
+        revive = next(
+            entry for entry in notices.snapshot() if entry["type"] == "codex_auth_dead_revival"
+        )
+        self.assertEqual(revive["failed"], ["WIKI-OTHER"])
+
+    async def test_cdx_to_cc_orchestrator_migration_clears_ticket_only_codex_notices(
+        self,
+    ) -> None:
+        # Same cross-provider failure at main.py:5041 for orchestrators: a legacy
+        # `_orchestrators` cdx row replaced by a Claude headless orchestrator
+        # must clear the ticket-only Codex notice; gating on kind == "cdx"
+        # skipped this path entirely.
+        registry = {
+            "_orchestrators": {
+                "wiki_cross": {
+                    "id": "wiki_cross",
+                    "kind": "cdx",
+                    "role": "orchestrator",
+                    "model": "gpt-5.4",
+                    "worktree": str(self.worktree),
+                    "window": None,
+                }
+            }
+        }
+        self.registry.write_text(json.dumps(registry), encoding="utf-8")
+
+        notices = self._isolate_account_notices()
+        notices.apply_event(
+            {
+                "type": "codex_auth_dead_exhausted",
+                "tickets": ["wiki_cross", "WIKI-OTHER"],
+                "run_ids": {"WIKI-OTHER": "run-other"},
+                "ts": "t-orch-exhausted",
+            }
+        )
+        notices.apply_event(
+            {
+                "type": "codex_auth_dead_revival",
+                "revived": [],
+                "failed": ["wiki_cross", "WIKI-OTHER"],
+                "failed_reasons": {
+                    "wiki_cross": "revive failed",
+                    "WIKI-OTHER": "revive failed",
+                },
+                "failed_run_ids": {"WIKI-OTHER": "run-other"},
+                "ts": "t-orch-revive",
+            }
+        )
+
+        with mock.patch.object(main, "tmux_live_windows", return_value=set()):
+            main.spawn_orchestrator(
+                main.SpawnOrchestratorIn(
+                    id="wiki_cross",
+                    workdir=str(self.worktree),
+                    kind="cc",
+                    model="sonnet",
+                    goal="Cross-provider orchestrator migration.",
+                    request_id="spawn-orch-cdx-to-cc-1",
+                )
+            )
+        start = next(
+            params for method, params in self.client.calls if method == "run/start"
+        )
+        self.assertTrue(start["migrate_legacy"])
+        self.assertEqual(start["provider"], "claude")
+
+        exhausted = next(
+            entry for entry in notices.snapshot() if entry["type"] == "codex_auth_dead_exhausted"
+        )
+        self.assertEqual(exhausted["tickets"], ["WIKI-OTHER"])
+        revive = next(
+            entry for entry in notices.snapshot() if entry["type"] == "codex_auth_dead_revival"
+        )
+        self.assertEqual(revive["failed"], ["WIKI-OTHER"])
+
+    async def test_post_commit_replay_reapplies_notice_cleanup(self) -> None:
+        # Reviewer's non-atomic-side-effect regression: supervisor committed the
+        # legacy migration and returned replaced_legacy_provider="codex", but the
+        # backend crashed before publish. On retry, the registry is now headless
+        # so the CALLER's migrate_legacy_flag is false — yet the supervisor's
+        # idempotent replay returns the cached RunRecord that still carries
+        # replaced_legacy_provider="codex", so cleanup must run again.
+        registry = {
+            "WIKI-42": {
+                "history": [],
+                "current": {
+                    "ticket": "WIKI-42",
+                    "run_id": RUN_ID,
+                    "provider": "claude",
+                    "kind": "cc",
+                    "role": "implement",
+                    "model": "sonnet",
+                    "state": "working",
+                    "worktree": str(self.worktree),
+                    "orch": None,
+                    "log": str(self.raw),
+                    "provider_session_id": "session-42",
+                    "provider_pid": 4242,
+                    "control_attached": True,
+                },
+            }
+        }
+        self.registry.write_text(json.dumps(registry), encoding="utf-8")
+
+        notices = self._isolate_account_notices()
+        notices.apply_event(
+            {
+                "type": "codex_auth_dead_exhausted",
+                "tickets": ["WIKI-42"],
+                "run_ids": {},
+                "ts": "t-crash",
+            }
+        )
+
+        replay_response = {
+            "run_id": RUN_ID,
+            "agent_id": "WIKI-42",
+            "provider": "claude",
+            "kind": "cc",
+            "role": "implement",
+            "model": "sonnet",
+            "worktree": str(self.worktree),
+            "log": str(self.raw),
+            "window": None,
+            "replaced_legacy_provider": "codex",
+        }
+
+        original_request = self.client.request
+
+        def replay_request(method, params=None):
+            if method == "run/start":
+                self.client.calls.append((method, dict(params or {})))
+                return dict(replay_response)
+            if method == "idempotency/status":
+                self.client.calls.append((method, dict(params or {})))
+                return {"known": True}
+            return original_request(method, params)
+
+        with mock.patch.object(self.client, "request", side_effect=replay_request):
+            with mock.patch.object(main, "tmux_live_windows", return_value=set()):
+                main.spawn_agent(
+                    main.SpawnWorkerIn(
+                        ticket="WIKI-42",
+                        kind="cc",
+                        role="implement",
+                        model="sonnet",
+                        workdir=str(self.worktree),
+                        orch=None,
+                        prompt="Retry after crash",
+                        request_id="spawn-cdx-to-cc-1",
+                    )
+                )
+
+        start = next(
+            params for method, params in self.client.calls if method == "run/start"
+        )
+        # Caller could not see the legacy row anymore, so it sends
+        # migrate_legacy=False. The response still carries the cached flag.
+        self.assertFalse(start["migrate_legacy"])
+        surfaced = [
+            entry for entry in notices.snapshot() if entry["type"] == "codex_auth_dead_exhausted"
+        ]
+        self.assertEqual(surfaced, [])
+
+    async def test_cdx_to_cc_migration_emits_agents_refresh_after_notice_cleanup(
+        self,
+    ) -> None:
+        # Reviewer's event-order regression: the supervisor's commit-time
+        # `agents` event can arrive before the notice mutation lands. If no
+        # later event is emitted, the frontend settles on the pre-clean snapshot
+        # forever. Round 26 fires a second `agents` SSE refresh AFTER the notice
+        # store changes so the next refetch sees the cleared banner.
+        registry = {
+            "WIKI-42": {
+                "history": [],
+                "current": {
+                    "ticket": "WIKI-42",
+                    "provider": "codex",
+                    "kind": "cdx",
+                    "role": "implement",
+                    "model": "gpt-5.4",
+                    "state": "working",
+                    "window": None,
+                    "worktree": str(self.worktree),
+                    "orch": None,
+                    "log": str(self.raw),
+                },
+            }
+        }
+        self.registry.write_text(json.dumps(registry), encoding="utf-8")
+
+        notices = self._isolate_account_notices()
+        notices.apply_event(
+            {
+                "type": "codex_auth_dead_exhausted",
+                "tickets": ["WIKI-42"],
+                "run_ids": {},
+                "ts": "t-order",
+            }
+        )
+
+        # Subscribe BEFORE spawning so the SSE emission lands on this queue.
+        subscriber = main._subscribe_agent_events()  # noqa: SLF001 - test only
+        try:
+            with mock.patch.object(main, "tmux_live_windows", return_value=set()):
+                main.spawn_agent(
+                    main.SpawnWorkerIn(
+                        ticket="WIKI-42",
+                        kind="cc",
+                        role="implement",
+                        model="sonnet",
+                        workdir=str(self.worktree),
+                        orch=None,
+                        prompt="Migrate for event order",
+                        request_id="spawn-event-order-1",
+                    )
+                )
+            # The helper schedules the emission on the running loop; give it a
+            # tick so the coroutine actually enqueues the event.
+            await asyncio.sleep(0)
+
+            surfaced = [
+                entry for entry in notices.snapshot() if entry["type"] == "codex_auth_dead_exhausted"
+            ]
+            self.assertEqual(surfaced, [], "notice must clear before the refresh event fires")
+
+            events: list[dict[str, Any]] = []
+            while True:
+                try:
+                    events.append(subscriber.get_nowait())
+                except asyncio.QueueEmpty:
+                    break
+            agents_events = [event for event in events if event.get("type") == "agents"]
+            self.assertTrue(
+                agents_events,
+                "expected a post-cleanup agents refresh so the frontend refetches",
+            )
+            self.assertIn("WIKI-42", agents_events[-1].get("tickets") or [])
+        finally:
+            main._event_subscribers.discard(subscriber)  # noqa: SLF001
 
     async def test_http_spawn_route_passes_the_live_backend_port(self) -> None:
         request = Request(

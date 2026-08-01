@@ -167,7 +167,8 @@ def _rebase_bot_notification_sender(
 
 @asynccontextmanager
 async def lifespan(_app: FastAPI):
-    global UNKNOWN_KIND_TELEMETRY
+    global UNKNOWN_KIND_TELEMETRY, _MAIN_EVENT_LOOP
+    _MAIN_EVENT_LOOP = asyncio.get_running_loop()
     runtime_paths = RuntimePaths.from_env()
     from .agent_runtime import rebase_bot
 
@@ -4796,7 +4797,12 @@ def spawn_agent(
     )
     if not isinstance(result, dict):
         raise HTTPException(status_code=502, detail="Agent supervisor returned a bad run")
-    if migrate_legacy_flag and kind == "cdx":
+    # Key the ticket-only Codex-notice cleanup off the REPLACED legacy identity
+    # (persisted in the supervisor result), not the new destination kind. A
+    # cdx-to-cc migration still needs to clear the Codex banner for the ticket,
+    # and the supervisor stamps the flag inside store.create so idempotent
+    # replays after a post-commit crash reapply cleanup on every retry.
+    if result.get("replaced_legacy_provider") == "codex":
         _publish_codex_worker_replaced(ticket)
     # Recorded on supervisor replays too: append_edge dedupes by request id
     # across the full edge history, so a replay whose first append failed
@@ -5038,7 +5044,11 @@ def spawn_orchestrator(
     )
     if not isinstance(result, dict):
         raise HTTPException(status_code=502, detail="Agent supervisor returned a bad run")
-    if migrate_legacy and kind == "cdx":
+    # Orchestrator migrations follow the same replaced-identity rule as workers:
+    # gate off the supervisor's persisted flag so cross-provider cdx-to-cc
+    # replacements clear the legacy Codex notice and idempotent replays reapply
+    # cleanup after a post-commit crash.
+    if result.get("replaced_legacy_provider") == "codex":
         _publish_codex_worker_replaced(orch_id)
     refreshed = _registry_agent(_read_agent_registry(), orch_id)
     registration = refreshed[2] if refreshed is not None else {}
@@ -5601,6 +5611,10 @@ def agent_queue_delete(ticket: str, index: int) -> dict[str, object]:
 # Agent event broker: watchdog + manual endpoints push, /api/events streams.
 # ---------------------------------------------------------------------------
 _event_subscribers: set[asyncio.Queue[dict]] = set()
+# Captured in `lifespan` so sync route handlers (spawn_agent lives in the
+# FastAPI thread pool) can schedule loop-bound work — asyncio.Queue is
+# single-loop, so a bare put_nowait from the thread pool is unsafe.
+_MAIN_EVENT_LOOP: asyncio.AbstractEventLoop | None = None
 
 
 async def publish_agent_event(event: dict) -> None:
@@ -5619,10 +5633,18 @@ async def publish_agent_event(event: dict) -> None:
 def _publish_codex_worker_replaced(ticket: str) -> None:
     """Clear ticket-only legacy Codex notices after a legacy-to-headless commit.
 
-    The spawn and orchestrator routes are synchronous, so the store is
-    updated directly; the next /api/agents refresh reflects the cleared
-    notice. Only ticket-only entries (no stored run_id) are affected — the
+    Runs on every /api/agents/spawn (and /spawn-orchestrator) invocation whose
+    supervisor result carries ``replaced_legacy_provider == "codex"``, including
+    idempotent replays: the flag rides on the cached RunRecord, so a post-commit
+    backend crash still triggers cleanup when the operator retries with the same
+    request_id. Only ticket-only entries (no stored run_id) are affected — the
     apply_event handler leaves headless run-scoped entries alone.
+
+    Emits an ``agents`` SSE refresh AFTER the notice mutation lands so the
+    frontend refetches ``/api/agents`` and sees the cleared notice. Without
+    this the only "agents changed" event fires when the supervisor commits
+    (BEFORE cleanup), and the frontend can settle on the stale pre-clean
+    snapshot.
     """
 
     ACCOUNT_NOTICES.apply_event(
@@ -5633,6 +5655,52 @@ def _publish_codex_worker_replaced(ticket: str) -> None:
             "ts": datetime.now(timezone.utc).isoformat(),
         }
     )
+    _schedule_agents_refresh({ticket})
+
+
+def _schedule_agents_refresh(tickets: set[str]) -> None:
+    """Push an ``agents`` invalidation onto SSE subscribers from any thread.
+
+    FastAPI runs sync ``def`` route handlers in a thread pool, but asyncio.Queue
+    is loop-bound. Route the emission through ``run_coroutine_threadsafe`` when
+    a main loop is registered; fall back to a direct in-loop schedule for tests
+    that call from the running loop directly.
+    """
+
+    ticket_list = sorted(t for t in tickets if isinstance(t, str) and t)
+    if not ticket_list:
+        return
+    event = {"type": "agents", "surface": "agents", "tickets": ticket_list[:20]}
+
+    async def _emit() -> None:
+        _invalidate_session_paths(set(ticket_list))
+        dead: list[asyncio.Queue[dict]] = []
+        for queue_ in list(_event_subscribers):
+            try:
+                queue_.put_nowait(event)
+            except asyncio.QueueFull:
+                dead.append(queue_)
+        for queue_ in dead:
+            _event_subscribers.discard(queue_)
+
+    loop = _MAIN_EVENT_LOOP
+    running: asyncio.AbstractEventLoop | None
+    try:
+        running = asyncio.get_running_loop()
+    except RuntimeError:
+        running = None
+    if loop is None or not loop.is_running():
+        loop = running
+    if loop is not None and loop.is_running():
+        if running is loop:
+            loop.create_task(_emit())
+        else:
+            asyncio.run_coroutine_threadsafe(_emit(), loop)
+        return
+    # No loop at all — session cache still invalidates so the next in-process
+    # refresh reads the cleared notice. Purely-synchronous callers (offline
+    # scripts) take this path.
+    _invalidate_session_paths(set(ticket_list))
 
 
 def _subscribe_agent_events() -> asyncio.Queue[dict]:

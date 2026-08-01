@@ -1200,6 +1200,31 @@ class RunStore:
                 "status_present": status_present,
                 "status_content": status_content,
             }
+            # The replaced-legacy provider identity travels back on the record so
+            # main.py's ticket-only Codex-notice cleanup can key off the legacy
+            # kind (worker "current" or "_orchestrators" entry), not the new
+            # provider. This is the whole point of the fix: a cdx-to-cc migration
+            # replaces a Codex worker and must still clear its notice ticket.
+            replaced_kind: str | None = None
+            if isinstance(current, dict) and current:
+                raw = current.get("kind")
+                if isinstance(raw, str):
+                    replaced_kind = raw
+            if replaced_kind is None and isinstance(legacy_orchestrator, dict):
+                raw = legacy_orchestrator.get("kind")
+                if isinstance(raw, str):
+                    replaced_kind = raw
+                else:
+                    # Match the history-archive default at ~line 1229: a legacy
+                    # `_orchestrators` row without an explicit kind is treated
+                    # as Claude, so a missing kind means the replaced identity
+                    # is Claude (not "unknown"). Keeps the notice cleanup
+                    # decision aligned with how the row is recorded.
+                    replaced_kind = "cc"
+            if replaced_kind == "cdx":
+                record.replaced_legacy_provider = "codex"
+            elif replaced_kind == "cc":
+                record.replaced_legacy_provider = "claude"
             run_dir_was_absent = not self.run_dir(record.run_id).exists()
             try:
                 self._create_run_files(record)

@@ -1009,6 +1009,12 @@ class RunStoreTests(unittest.TestCase):
             self.assertEqual(legacy["window"], "@9999")
             self.assertEqual(legacy["outcome"], "handoff")
             self.assertEqual(legacy["migration"], "headless-supervisor")
+            # The replaced legacy provider identity rides on the returned
+            # record so the caller (main.py's spawn route) can clear the
+            # right ticket-only notice regardless of the destination kind.
+            self.assertEqual(record.replaced_legacy_provider, "codex")
+            persisted = store.get(record.run_id)
+            self.assertEqual(persisted.replaced_legacy_provider, "codex")
 
     def test_create_rejects_oversized_status_before_registry_mutation(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -1116,6 +1122,10 @@ class RunStoreTests(unittest.TestCase):
             self.assertEqual(legacy["kind"], "cc")
             self.assertEqual(legacy["migration"], "headless-supervisor")
             self.assertNotIn("wiki_dev", registry["_orchestrators"])
+            # Legacy `_orchestrators` migration reports the replaced provider
+            # so cross-provider (cdx-to-cc, cc-to-cdx) orchestrator swaps can
+            # drive the right notice cleanup.
+            self.assertEqual(created.replaced_legacy_provider, "claude")
             self.assertIn("keep-me", registry["_orchestrators"])
 
     def test_restart_finishes_legacy_orchestrator_migration_after_registry_crash(
