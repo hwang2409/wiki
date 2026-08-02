@@ -1,8 +1,8 @@
 // @vitest-environment jsdom
-import { cleanup, fireEvent, render, screen, within } from "@testing-library/react";
+import { cleanup, render, screen, within } from "@testing-library/react";
 import { afterEach, describe, expect, test } from "vitest";
 
-import { ProviderActionRequired, SessionRunDetails } from "../src/session";
+import { ProviderActionRequired } from "../src/session";
 import { WorkerStatePill } from "../src/agent-session-surface";
 import type { ProviderEventInspector, ProviderPendingRequest } from "../src/api";
 
@@ -32,110 +32,6 @@ function pending(overrides: Partial<ProviderPendingRequest> = {}): ProviderPendi
 }
 
 afterEach(() => cleanup());
-
-describe("WIKI-152 default chrome — no diagnostic noise", () => {
-  test("SessionRunDetails collapsed summary shows label only and leaks no telemetry", () => {
-    render(
-      <SessionRunDetails
-        inspector={inspector()}
-        format="msg/v1"
-        tokens={3200}
-        thinkingTokens={800}
-        dispositions={null}
-      />,
-    );
-    const details = screen.getByTestId("session-run-details") as HTMLDetailsElement;
-    expect(details.open).toBe(false);
-    // Summary label reads "Run details" — nothing more.
-    expect(screen.getByText("Run details")).toBeTruthy();
-    // R1-01: the collapsed summary must not surface provider, state, tokens,
-    // format, or disposition strings — a leak makes the disclosure the noise
-    // it was meant to hide.
-    const summary = details.querySelector("summary");
-    const summaryText = summary?.textContent ?? "";
-    for (const leak of ["Provider stream", "codex", "working", "tok", "msg/v1", "Unknown"]) {
-      expect(summaryText).not.toContain(leak);
-    }
-    // Screen-level: none of the demoted labels render outside the collapsed body.
-    expect(screen.queryByText("Provider stream")).toBeNull();
-  });
-
-  test("opening SessionRunDetails reveals raw→normalized and disposition counts", () => {
-    render(<SessionRunDetails inspector={inspector({ raw_count: 4, normalized_count: 4 })} format={null} tokens={null} thinkingTokens={null} dispositions={null} />);
-    const summary = screen.getByText("Run details");
-    fireEvent.click(summary);
-    const details = screen.getByTestId("session-run-details") as HTMLDetailsElement;
-    expect(details.open).toBe(true);
-    expect(within(details).getByText("raw 4 → normalized 4")).toBeTruthy();
-    const meta = details.querySelector(".session-run-details-meta");
-    expect(meta?.textContent ?? "").toContain("provider");
-    expect(meta?.textContent ?? "").toContain("codex");
-  });
-
-  test("R2-01: prefers inspector dispositions over session-level fallback", () => {
-    // Divergent counts: inspector saw real events, session-level fallback
-    // is zeroed (the headless-fallback case that used to resurrect
-    // "Unknown 0" in real live provider streams).
-    render(
-      <SessionRunDetails
-        inspector={inspector({
-          dispositions: { rendered: 5, summarized: 1, ignored: 0, unknown: 3 },
-        })}
-        format={null}
-        tokens={null}
-        thinkingTokens={null}
-        dispositions={{ rendered: 0, summarized: 0, ignored: 0, unknown: 0 }}
-      />,
-    );
-    const details = screen.getByTestId("session-run-details") as HTMLDetailsElement;
-    details.setAttribute("open", "");
-    const meta = details.querySelector(".session-run-details-meta");
-    expect(meta?.textContent ?? "").toContain("Unknown 3");
-    expect(meta?.textContent ?? "").not.toContain("Unknown 0");
-  });
-
-  test("R2-02: pending requests render inside Run details even with an empty event log", () => {
-    render(
-      <SessionRunDetails
-        inspector={inspector({
-          events: [],
-          pending_requests: [
-            {
-              request_id: 0,
-              request_kind: "item/tool/requestUserInput",
-              received_at: "2026-07-30T00:00:00Z",
-              raw_seq: 1,
-              payload: { method: "item/tool/requestUserInput", params: {} },
-            },
-          ],
-        })}
-        format={null}
-        tokens={null}
-        thinkingTokens={null}
-        dispositions={null}
-      />,
-    );
-    const details = screen.getByTestId("session-run-details") as HTMLDetailsElement;
-    details.setAttribute("open", "");
-    const pending = screen.getByTestId("run-details-pending-requests");
-    expect(pending.textContent).toContain("pending");
-    // request_id 0 must be visible — the falsy check that used to swallow
-    // it in the action-required card cannot leave it invisible everywhere.
-    expect(pending.textContent).toContain("id #0");
-    expect(pending.textContent).toContain("item/tool/requestUserInput");
-    // The "no normalized provider events yet" empty-state should be
-    // suppressed when a pending request is showing (otherwise it reads
-    // as broken).
-    expect(details.querySelector(".session-provider-empty")).toBeNull();
-  });
-
-  test("SessionRunDetails returns null when there is nothing to show", () => {
-    const { container } = render(
-      <SessionRunDetails inspector={null} format={null} tokens={null} thinkingTokens={null} dispositions={null} />,
-    );
-    expect(container.querySelector(".session-run-details")).toBeNull();
-  });
-});
 
 describe("WIKI-152 action-required panel", () => {
   test("renders pending requests outside the diagnostics disclosure", () => {

@@ -4,6 +4,7 @@ import {
   Archive,
   Bot,
   ChevronDown,
+  ChevronRight,
   ExternalLink,
   GitPullRequest,
   MoreHorizontal,
@@ -109,10 +110,22 @@ function ageLabel(seconds: number | null): string {
   return `${Math.floor(seconds / 3600)}h ago`;
 }
 
+function navAgeLabel(seconds: number | null): string {
+  if (seconds === null) return "—";
+  if (seconds < 60) return `${seconds}s`;
+  if (seconds < 3600) return `${Math.floor(seconds / 60)}m`;
+  return `${Math.floor(seconds / 3600)}h`;
+}
+
 function stateLabel(worker: AgentWorker): string {
   if (!worker.state) return "unknown";
   if (worker.state === "merge-ready" && worker.role === "plan") return "plan ready";
   return worker.state;
+}
+
+function navStateLabel(worker: AgentWorker): string {
+  if (worker.state === "merge-ready" && worker.role !== "plan") return "ready";
+  return stateLabel(worker);
 }
 
 function stateValueLabel(state: string | null | undefined): string {
@@ -196,6 +209,34 @@ function readStoredExpandedScreencasts(): Set<string> {
     );
   } catch {
     return new Set();
+  }
+}
+
+// WIKI-235: sidebar orchestrator groups collapse by default; expansion
+// survives reloads.
+const NAV_ORCH_EXPANDED_KEY = "wiki-nav-orch-expanded";
+
+function readExpandedOrchs(): Record<string, boolean> {
+  try {
+    const raw = localStorage.getItem(NAV_ORCH_EXPANDED_KEY);
+    const parsed: unknown = raw ? JSON.parse(raw) : [];
+    if (!Array.isArray(parsed)) return {};
+    return Object.fromEntries(
+      parsed.filter((p): p is string => typeof p === "string").map((id) => [id, true])
+    );
+  } catch {
+    return {};
+  }
+}
+
+function writeExpandedOrchs(expanded: Record<string, boolean>) {
+  try {
+    localStorage.setItem(
+      NAV_ORCH_EXPANDED_KEY,
+      JSON.stringify(Object.keys(expanded).filter((id) => expanded[id]))
+    );
+  } catch {
+    /* localStorage unavailable — expansion stays session-local */
   }
 }
 
@@ -2407,7 +2448,7 @@ export function AgentsSidebar({
   data?: {
     workers: AgentWorker[] | null;
     orchestrators: Orchestrator[];
-    archived: ArchivedWorker[];
+    archived?: ArchivedWorker[];
     error: string | null;
   };
   refreshTick: number;
@@ -2418,16 +2459,15 @@ export function AgentsSidebar({
 }) {
   const [fetchedWorkers, setFetchedWorkers] = useState<AgentWorker[] | null>(null);
   const [fetchedOrchestrators, setFetchedOrchestrators] = useState<Orchestrator[]>([]);
-  const [fetchedArchived, setFetchedArchived] = useState<ArchivedWorker[]>([]);
+  const [expandedOrchs, setExpandedOrchs] = useState<Record<string, boolean>>(readExpandedOrchs);
   // Keyed by run_id (durable). Value is the observed seq we tried to mark
   // viewed at — comparing seqs (monotonic int) sidesteps timestamp-format
   // and wall-clock issues from the round 1 implementation.
   const [viewedOverrides, setViewedOverrides] = useState<Record<string, number>>({});
-  // Runs whose mark-viewed request permanently failed (all retries exhausted).
-  // Bounded to prevent the round 2 H1 request loop: on failure we keep the
-  // optimistic override intact AND set this flag so the effect stops firing;
-  // the row renders a distinct failed indicator so the user can see why.
-  const [viewedFailed, setViewedFailed] = useState<Record<string, boolean>>({});
+  // Last event seq whose mark-viewed request exhausted all retries. This
+  // blocks loops for that seq while allowing a later event to retry and clear
+  // the failure after persistence recovers.
+  const [viewedFailed, setViewedFailed] = useState<Record<string, number>>({});
   // One controller per run kept alive across backoff. `targetSeq` coalesces
   // the HIGHEST seq observed while inflight (bursts collapse to a single
   // additional post); `attempts` counts total requests within this chain and
@@ -2445,7 +2485,6 @@ export function AgentsSidebar({
         if (!ignore) {
           setFetchedWorkers(result.workers);
           setFetchedOrchestrators(result.orchestrators ?? []);
-          setFetchedArchived(result.archived ?? []);
         }
       })
       .catch(() => {
@@ -2458,7 +2497,47 @@ export function AgentsSidebar({
 
   const workers = data?.workers ?? fetchedWorkers;
   const orchestrators = data?.orchestrators ?? fetchedOrchestrators;
-  const archived = data?.archived ?? fetchedArchived;
+  // Agent refreshes replace both arrays. Reduce the selected owner to a
+  // primitive so a refresh cannot undo a later manual collapse.
+  const selectedWorkerOwner = (() => {
+    if (!activeTicket || workers === null) return null;
+    const owner = workers.find((worker) => worker.ticket === activeTicket)?.orch;
+    if (!owner || !orchestrators.some((orch) => orch.id === owner)) return null;
+    return owner;
+  })();
+
+  const toggleOrch = (id: string) => {
+    setExpandedOrchs((current) => {
+      const next = { ...current, [id]: !current[id] };
+      writeExpandedOrchs(next);
+      return next;
+    });
+  };
+
+  useEffect(() => {
+    if (!selectedWorkerOwner) return;
+    setExpandedOrchs((current) => {
+      if (current[selectedWorkerOwner]) return current;
+      const next = { ...current, [selectedWorkerOwner]: true };
+      writeExpandedOrchs(next);
+      return next;
+    });
+  }, [activeTicket, selectedWorkerOwner]);
+
+  useEffect(() => {
+    if (workers === null || Object.keys(viewedFailed).length === 0) return;
+    setViewedFailed((current) => {
+      let next = current;
+      for (const worker of workers) {
+        if (!worker.run_id || worker.last_viewed_seq === null) continue;
+        const failedSeq = current[worker.run_id];
+        if (failedSeq === undefined || worker.last_viewed_seq < failedSeq) continue;
+        if (next === current) next = { ...current };
+        delete next[worker.run_id];
+      }
+      return next;
+    });
+  }, [viewedFailed, workers]);
 
   useEffect(() => {
     if (!activeTicket || workers === null) return;
@@ -2467,19 +2546,19 @@ export function AgentsSidebar({
     const observedSeq = worker?.latest_event_seq ?? null;
     if (!runId || observedSeq === null) return;
 
-    // Round 2 H1: once a run's mark-viewed has permanently failed, do not
-    // keep firing new requests each render. The optimistic override remains
-    // (so the row still visually reflects the user's action) and the failed
-    // badge tells them the server didn't persist the state.
-    if (viewedFailed[runId]) return;
+    const priorServer = worker?.last_viewed_seq ?? -1;
+    const failedSeq = viewedFailed[runId];
+    // Do not retry the same failed seq on every render. The independent
+    // reconciliation effect clears exact server-confirmed failures for all
+    // workers, while a later event starts one new bounded write chain.
+    if (failedSeq !== undefined && failedSeq >= observedSeq) return;
 
     // Skip if we (or the server) have already recorded a viewed seq that
     // covers everything visible in this refresh. Prevents the effect from
     // POSTing on every /api/agents refresh (the round 1 regression), while
     // still re-POSTing when the active session's seq advances.
     const priorOverride = viewedOverrides[runId];
-    const priorServer = worker?.last_viewed_seq ?? null;
-    const priorSeq = Math.max(priorOverride ?? -1, priorServer ?? -1);
+    const priorSeq = Math.max(priorOverride ?? -1, priorServer);
     if (priorSeq >= observedSeq) return;
 
     setViewedOverrides((current) => {
@@ -2518,10 +2597,11 @@ export function AgentsSidebar({
     viewedInflight.current.set(runId, controller);
 
     const markFailed = () => {
+      const failedSeq = viewedInflight.current.get(runId)?.targetSeq ?? observedSeq;
       viewedInflight.current.delete(runId);
       setViewedFailed((current) => {
-        if (current[runId]) return current;
-        return { ...current, [runId]: true };
+        if ((current[runId] ?? -1) >= failedSeq) return current;
+        return { ...current, [runId]: failedSeq };
       });
     };
 
@@ -2532,6 +2612,12 @@ export function AgentsSidebar({
       const seq = state.targetSeq;
       markRunViewed(runId, seq)
         .then((result) => {
+          setViewedFailed((current) => {
+            if (current[runId] === undefined) return current;
+            const next = { ...current };
+            delete next[runId];
+            return next;
+          });
           setViewedOverrides((current) => {
             const prior = current[runId] ?? -1;
             const next = Math.max(prior, result.last_viewed_seq, seq);
@@ -2589,10 +2675,10 @@ export function AgentsSidebar({
       </div>
     );
   }
-  if (workers.length === 0 && archived.length === 0 && orchestrators.length === 0) {
+  if (workers.length === 0 && orchestrators.length === 0) {
     return (
       <div className="nav-empty-cta" data-testid="nav-agents-empty">
-        <div className="nav-empty-title">No runs yet</div>
+        <div className="nav-empty-title">No active runs</div>
         <div className="nav-empty-body">Runs you spawn will appear here.</div>
         <button
           className="nav-empty-primary"
@@ -2635,10 +2721,15 @@ export function AgentsSidebar({
     return latest > viewed;
   };
 
-  const workerRow = (worker: AgentWorker, owned: boolean, num?: number) => {
+  const hasViewedFailure = (worker: AgentWorker): boolean =>
+    worker.run_id ? viewedFailed[worker.run_id] !== undefined : false;
+
+  const workerRow = (worker: AgentWorker, owned: boolean) => {
     const unread = hasUnread(worker);
-    const failed = worker.run_id ? viewedFailed[worker.run_id] === true : false;
+    const failed = hasViewedFailure(worker);
     const stateKey = worker.state ?? "unknown";
+    const stateText = navStateLabel(worker);
+    const stateTitle = stateLabel(worker);
     return (
       <button
         className={`nav-agent${owned ? " is-owned" : ""}${activeTicket === worker.ticket ? " is-active" : ""}${unread ? " has-unread" : ""}${failed ? " has-viewed-failure" : ""}`}
@@ -2649,11 +2740,6 @@ export function AgentsSidebar({
         title={failed ? "Failed to persist read state to the server" : undefined}
         {...dragProps(worker.ticket)}
       >
-        {num !== undefined ? (
-          <span aria-hidden="true" className="nav-agent-num tabular-nums">
-            {num}
-          </span>
-        ) : null}
         {unread ? (
           <>
             <span aria-hidden="true" className="nav-agent-unread" data-testid="nav-agent-unread" />
@@ -2670,36 +2756,92 @@ export function AgentsSidebar({
           </>
         ) : null}
         <span className="nav-agent-ticket">{worker.ticket}</span>
-        <span className="nav-agent-meta" data-state={stateKey}>{stateLabel(worker)}</span>
+        <span className="nav-agent-meta" data-state={stateKey} title={stateTitle}>{stateText}</span>
         {!owned && worker.orch ? (
           <span className="nav-agent-orch-chip" title={`Coordinator: ${worker.orch}`}>
             {worker.orch}
           </span>
         ) : null}
-        <span className="nav-agent-age tabular-nums">{ageLabel(worker.status_age_seconds)}</span>
+        <span className="nav-agent-age tabular-nums" title={ageLabel(worker.status_age_seconds)}>
+          {navAgeLabel(worker.status_age_seconds)}
+        </span>
       </button>
     );
   };
 
-  const orchestratorRow = (orch: Orchestrator) => {
+  const orchestratorRow = (orch: Orchestrator, ownedWorkers: AgentWorker[]) => {
     const meta = orch.run_id
       ? orch.runtime_state ?? "orchestrator"
       : orch.window && !orch.window_alive
         ? "window gone"
         : "orchestrator";
+    const expanded = expandedOrchs[orch.id] === true;
+    const workerCount = ownedWorkers.length;
+    const unread = ownedWorkers.some(hasUnread);
+    const failed = ownedWorkers.some(hasViewedFailure);
+    const attentionContent = (
+      <>
+        {unread || failed ? (
+          <span
+            aria-hidden="true"
+            className={`nav-orch-attention${failed ? " is-failed" : ""}`}
+          />
+        ) : null}
+        {unread ? (
+          <span className="sr-only" data-testid="nav-orch-unread">
+            workers have unread updates
+          </span>
+        ) : null}
+        {failed ? (
+          <span className="sr-only" data-testid="nav-orch-viewed-failed">
+            worker read state failed to save
+          </span>
+        ) : null}
+      </>
+    );
+    if (workerCount === 0) {
+      return (
+        <button
+          className={`nav-agent is-orch is-empty${activeTicket === orch.id ? " is-active" : ""}`}
+          data-state="orchestrator"
+          key={orch.id}
+          type="button"
+          onClick={() => onOpen(orch.id)}
+          title={`${orch.id} has no active workers`}
+          {...dragProps(orch.id)}
+        >
+          <ChevronRight aria-hidden="true" className="nav-orch-chevron" size={12} />
+          <span className="nav-agent-ticket">{orch.id}</span>
+          <span className="nav-agent-meta" data-state="orchestrator">{meta}</span>
+        </button>
+      );
+    }
     return (
-      <button
-        className={`nav-agent is-orch${activeTicket === orch.id ? " is-active" : ""}`}
-        data-state="orchestrator"
-        key={orch.id}
-        type="button"
-        onClick={() => onOpen(orch.id)}
-        {...dragProps(orch.id)}
-      >
-        <Bot size={12} />
-        <span className="nav-agent-ticket">{orch.id}</span>
-        <span className="nav-agent-meta" data-state="orchestrator">{meta}</span>
-      </button>
+      <div className="nav-orch-row" key={orch.id}>
+        <button
+          aria-controls={`nav-orch-workers-${orch.id}`}
+          aria-expanded={expanded}
+          aria-label={`${expanded ? "Collapse" : "Expand"} ${orch.id} workers`}
+          className="nav-orch-toggle"
+          type="button"
+          onClick={() => toggleOrch(orch.id)}
+          title={`${expanded ? "Collapse" : "Expand"} ${orch.id} workers`}
+        >
+          <ChevronRight aria-hidden="true" className="nav-orch-chevron" size={12} />
+        </button>
+        <button
+          className={`nav-agent is-orch${expanded ? " is-expanded" : ""}${activeTicket === orch.id ? " is-active" : ""}${unread ? " has-unread" : ""}${failed ? " has-viewed-failure" : ""}`}
+          data-state="orchestrator"
+          type="button"
+          onClick={() => onOpen(orch.id)}
+          title={`Open ${orch.id} session`}
+          {...dragProps(orch.id)}
+        >
+          {attentionContent}
+          <span className="nav-agent-ticket">{orch.id}</span>
+          <span className="nav-agent-meta" data-state="orchestrator">{meta}</span>
+        </button>
+      </div>
     );
   };
 
@@ -2737,43 +2879,6 @@ export function AgentsSidebar({
   );
   const hasActive = orderedOrchestrators.length > 0 || workers.length > 0;
 
-  // opencode-style gutter numbers: one running sequence over session rows
-  // (workers then archived), skipping orchestrator parent rows.
-  let seq = 0;
-  const workerNumbers = new Map<string, number>();
-  for (const orch of orderedOrchestrators) {
-    for (const worker of ownedByOrch.get(orch.id) ?? []) {
-      workerNumbers.set(worker.ticket, ++seq);
-    }
-  }
-  for (const worker of ungrouped) workerNumbers.set(worker.ticket, ++seq);
-  const archivedNumbers = new Map<string, number>();
-  for (const entry of archived) {
-    archivedNumbers.set(`${entry.ticket}-${entry.archived_at}`, ++seq);
-  }
-
-  const historyGroups: { label: string; entries: ArchivedWorker[] }[] = [];
-  {
-    const now = new Date();
-    const startOfDay = (offsetDays: number) =>
-      new Date(now.getFullYear(), now.getMonth(), now.getDate() - offsetDays).getTime();
-    const today = startOfDay(0);
-    const yesterday = startOfDay(1);
-    for (const entry of archived) {
-      const at = Date.parse(entry.archived_at);
-      const label = Number.isNaN(at)
-        ? "Earlier"
-        : at >= today
-          ? "Today"
-          : at >= yesterday
-            ? "Yesterday"
-            : "Earlier";
-      const group = historyGroups.find((candidate) => candidate.label === label);
-      if (group) group.entries.push(entry);
-      else historyGroups.push({ label, entries: [entry] });
-    }
-  }
-
   return (
     <div className="nav-agents">
       {hasActive ? (
@@ -2782,47 +2887,27 @@ export function AgentsSidebar({
           data-testid="nav-agents-group-active"
         >
           <span>Active</span>
-          <span className="nav-agents-group-count tabular-nums">
-            {orderedOrchestrators.length + workers.length}
-          </span>
         </div>
       ) : null}
-      {orderedOrchestrators.map((orch) => (
-        <div key={orch.id}>
-          {orchestratorRow(orch)}
-          {(ownedByOrch.get(orch.id) ?? []).map((worker) =>
-            workerRow(worker, true, workerNumbers.get(worker.ticket))
-          )}
-        </div>
-      ))}
-      {ungrouped.map((worker) => workerRow(worker, false, workerNumbers.get(worker.ticket)))}
-      {historyGroups.map((group, groupIndex) => (
-        <Fragment key={group.label}>
-          <div
-            className="nav-agents-group-title"
-            data-testid={groupIndex === 0 ? "nav-agents-group-history" : undefined}
-          >
-            <span>{group.label}</span>
-            <span className="nav-agents-group-count tabular-nums">{group.entries.length}</span>
+      {orderedOrchestrators.map((orch) => {
+        const owned = ownedByOrch.get(orch.id) ?? [];
+        const expanded = expandedOrchs[orch.id] === true;
+        return (
+          <div className="nav-orch-group" key={orch.id}>
+            {orchestratorRow(orch, owned)}
+            {expanded && owned.length > 0 ? (
+              <div
+                className="nav-orch-workers"
+                id={`nav-orch-workers-${orch.id}`}
+                data-testid={`nav-orch-workers-${orch.id}`}
+              >
+                {owned.map((worker) => workerRow(worker, true))}
+              </div>
+            ) : null}
           </div>
-          {group.entries.map((entry) => (
-            <button
-              className={`nav-agent is-archived${activeTicket === entry.ticket ? " is-active" : ""}`}
-              data-state="archived"
-              key={`${entry.ticket}-${entry.archived_at}`}
-              type="button"
-              onClick={() => onOpen(entry.ticket)}
-            >
-              <span aria-hidden="true" className="nav-agent-num tabular-nums">
-                {archivedNumbers.get(`${entry.ticket}-${entry.archived_at}`)}
-              </span>
-              <span className="nav-agent-ticket">{entry.ticket}</span>
-              <span className="nav-agent-meta" data-state="archived">{entry.outcome ?? entry.state ?? ""}</span>
-              <span className="nav-agent-age tabular-nums">{archivedAge(entry.archived_at)}</span>
-            </button>
-          ))}
-        </Fragment>
-      ))}
+        );
+      })}
+      {ungrouped.map((worker) => workerRow(worker, false))}
     </div>
   );
 }

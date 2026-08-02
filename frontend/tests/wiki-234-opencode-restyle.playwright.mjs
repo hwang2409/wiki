@@ -1,8 +1,6 @@
-// WIKI-234: opencode-inspired restyle. Asserts the terminal-native language
-// holds at the structural level: opencode is the default theme, session rows
-// carry gutter numbers, history splits into time groups, user turns render as
-// left-accent-bar blocks, and the composer strip exposes the model line plus
-// keybinding hints.
+// WIKI-234/235: asserts that the terminal-native language survives the runs
+// declutter: orchestrators disclose active workers, archive groups stay out of
+// the sidebar, and session chrome stays flat and rectangular.
 import fs from "node:fs/promises";
 import { mkdirSync } from "node:fs";
 import path from "node:path";
@@ -17,7 +15,7 @@ import {
 } from "../scripts/wiki32-harness.mjs";
 
 const HERE = path.dirname(new URL(import.meta.url).pathname);
-const OUT_DIR = process.env.WIKI_PLAYWRIGHT_OUT_DIR || path.join(HERE, "evidence", "wiki-234");
+const OUT_DIR = process.env.WIKI_PLAYWRIGHT_OUT_DIR || path.join(HERE, "evidence", "wiki-235");
 mkdirSync(OUT_DIR, { recursive: true });
 
 function assert(condition, message) {
@@ -26,6 +24,28 @@ function assert(condition, message) {
 
 function logStep(message) {
   console.error(`[wiki-234-playwright] ${message}`);
+}
+
+async function waitForStableRunsLayout(page) {
+  await page.evaluate(() => document.fonts.ready);
+  await page.waitForFunction(() => {
+    const sidebar = document.querySelector(".workspace-sidebar");
+    const runsTitle = document.querySelector('.sidebar-mode[data-mode="agents"] .sidebar-mode-title');
+    const activeTitle = document.querySelector('[data-testid="nav-agents-group-active"]');
+    const sessionHeader = document.querySelector(".agent-session-surface.is-full .session-header");
+    const sessionTicket = sessionHeader?.querySelector(".session-ticket");
+    const sessionUser = document.querySelector(".agent-session-surface.is-full .session-user");
+    if (!(sidebar instanceof HTMLElement) || !(sessionHeader instanceof HTMLElement)) return false;
+    return runsTitle?.textContent?.includes("Runs")
+      && activeTitle?.textContent?.includes("Active")
+      && sessionTicket?.textContent?.includes("wiki")
+      && sessionUser?.textContent?.includes("hey wiki, adopt the opencode look")
+      && sessionHeader.getBoundingClientRect().left >= sidebar.getBoundingClientRect().right;
+  });
+  await page.evaluate(() => new Promise((resolve) => {
+    requestAnimationFrame(() => requestAnimationFrame(resolve));
+  }));
+  await page.waitForTimeout(250);
 }
 
 function isoAtStartOfDayOffset(offsetDays, plusSeconds) {
@@ -74,21 +94,40 @@ try {
     window: null,
     spawned_at: "2026-07-22T15:00:00Z",
   };
+  const unreadRunId = "00000000-0000-4000-8000-000000000235";
   const registry = {
     _orchestrators: {
+      phoebe: {
+        window: "@9998",
+        spawned_at: "2026-07-22T13:00:00Z",
+        transcript,
+      },
       wiki: {
         window: "@9999",
         spawned_at: "2026-07-22T14:00:00Z",
         transcript,
       },
     },
-    "WIKI-301": { history: [], current: { ...workerBase, ticket: "WIKI-301" } },
-    "WIKI-302": { history: [], current: { ...workerBase, ticket: "WIKI-302", state: "idle" } },
+    "WIKI-301": { history: [], current: { ...workerBase, ticket: "WIKI-301", run_id: unreadRunId } },
+    "WIKI-302": { history: [], current: { ...workerBase, ticket: "WIKI-302", state: "blocked" } },
+    "WIKI-303": { history: [], current: { ...workerBase, ticket: "WIKI-303", state: "merge-ready" } },
     "FREE-1": { history: [], current: { ...workerBase, ticket: "FREE-1", orch: null } },
   };
   await fs.writeFile(fixtures.registryPath, JSON.stringify(registry, null, 2));
+  await fs.writeFile(path.join(fixtures.root, "deploy-timestamp.txt"), "2026-07-22T14:00:00.000Z");
+  const unreadRunDir = path.join(fixtures.runtimeDir, "runs", unreadRunId);
+  await fs.mkdir(unreadRunDir, { recursive: true });
+  await fs.writeFile(
+    path.join(unreadRunDir, "run.json"),
+    JSON.stringify({
+      run_id: unreadRunId,
+      normalized_event_count: 1,
+      created_at: "2026-07-22T15:00:00.000Z",
+      updated_at: "2026-07-22T15:00:05.000Z",
+    }),
+  );
   writeQueue(fixtures.queuePath, "WIKI-301", []);
-  for (const ticket of ["WIKI-301", "WIKI-302", "FREE-1"]) {
+  for (const ticket of ["WIKI-301", "WIKI-302", "WIKI-303", "FREE-1"]) {
     await fs.writeFile(
       path.join(fixtures.statusDir, `${ticket}.json`),
       JSON.stringify({ state: registry[ticket].current.state, pr: null, step: "seeded", blocker: null }),
@@ -129,46 +168,100 @@ try {
   const page = await browser.newPage({ viewport: { width: 1440, height: 900 } });
 
   logStep("state 1: default theme is opencode");
-  await page.goto(`${backend.baseUrl}/`, { waitUntil: "domcontentloaded" });
+  // Start on a different worker so the viewed effect cannot clear WIKI-301
+  // before the collapsed parent assertion runs.
+  await page.goto(`${backend.baseUrl}/#/agent/FREE-1`, { waitUntil: "domcontentloaded" });
   await page.waitForSelector("#root > *");
   const theme = await page.evaluate(() => document.documentElement.dataset.theme);
   assert(theme === "opencode", `default theme must be opencode, got ${theme}`);
   const bodyFont = await page.evaluate(() => getComputedStyle(document.body).fontFamily);
   assert(/mono/i.test(bodyFont), `opencode chrome must be mono, got ${bodyFont}`);
 
-  logStep("state 2: numbered sidebar with time-grouped history");
+  logStep("state 2: orchestrator-first sidebar with persisted disclosure");
   await page.click('[data-testid="workspace-ribbon"] [aria-label="Agent list"]');
   await page.waitForSelector('[data-testid="nav-agents-group-active"]');
-  await page.waitForSelector('[data-testid="nav-agents-group-history"]');
-  const groups = await page.evaluate(() =>
-    Array.from(document.querySelectorAll(".nav-agents-group-title")).map((el) => ({
-      label: (el.firstElementChild?.textContent ?? "").trim(),
-      count: (el.querySelector(".nav-agents-group-count")?.textContent ?? "").trim(),
-    })),
-  );
-  const labels = groups.map((group) => group.label);
-  assert(
-    JSON.stringify(labels) === JSON.stringify(["Active", "Today", "Yesterday", "Earlier"]),
-    `expected Active/Today/Yesterday/Earlier groups, got ${labels.join("/")}`,
-  );
-  const counts = Object.fromEntries(groups.map((group) => [group.label, group.count]));
-  assert(counts.Active === "4", `Active count must include orch + workers (4), got ${counts.Active}`);
-  assert(counts.Today === "1" && counts.Yesterday === "1" && counts.Earlier === "1",
-    `each history group must count 1, got ${JSON.stringify(counts)}`);
-  const nums = await page.evaluate(() =>
-    Array.from(document.querySelectorAll(".nav-agent .nav-agent-num")).map((el) =>
-      (el.textContent ?? "").trim(),
+  const initialRows = await page.evaluate(() =>
+    Array.from(document.querySelectorAll(".nav-agent")).map((el) =>
+      el.querySelector(".nav-agent-ticket")?.textContent?.trim() ?? "",
     ),
   );
   assert(
-    JSON.stringify(nums) === JSON.stringify(["1", "2", "3", "4", "5", "6"]),
-    `gutter numbers must run 1..6 across workers then history, got ${nums.join(",")}`,
+    JSON.stringify(initialRows) === JSON.stringify(["phoebe", "wiki", "FREE-1"]),
+    `collapsed sidebar must show orchestrators then ungrouped workers, got ${initialRows.join("/")}`,
   );
-  const orchHasNum = await page.evaluate(
-    () => document.querySelector(".nav-agent.is-orch .nav-agent-num") !== null,
+  const sidebarText = await page.locator(".nav-agents").innerText();
+  for (const removed of ["Today", "Yesterday", "Earlier", "ARC-TODAY", "ARC-YDAY", "ARC-OLD"]) {
+    assert(!sidebarText.includes(removed), `archived sidebar chrome must omit ${removed}`);
+  }
+  assert((await page.locator(".nav-agent-num").count()) === 0, "session gutter numbers must be removed");
+
+  const emptyOrchRow = page.locator(".nav-agent.is-orch.is-empty", { hasText: "phoebe" });
+  const emptyChevronVisibility = await emptyOrchRow.locator(".nav-orch-chevron").evaluate(
+    (el) => getComputedStyle(el).visibility,
   );
-  assert(!orchHasNum, "orchestrator rows must not carry gutter numbers");
-  await page.screenshot({ path: path.join(OUT_DIR, "01-sidebar-groups.png") });
+  assert(emptyChevronVisibility === "hidden", `empty orchestrator chevron must be hidden, got ${emptyChevronVisibility}`);
+
+  const wikiRow = page.locator('.nav-agent.is-orch', { hasText: "wiki" });
+  const wikiDisclosure = page.locator('.nav-orch-toggle[aria-controls="nav-orch-workers-wiki"]');
+  assert((await wikiDisclosure.getAttribute("aria-expanded")) === "false", "wiki workers must start collapsed");
+  const unreadWorkerPayload = await page.evaluate(async () => {
+    const response = await fetch("/api/agents", { cache: "no-store" });
+    const payload = await response.json();
+    return payload.workers.find((worker) => worker.ticket === "WIKI-301");
+  });
+  assert((await wikiRow.locator('[data-testid="nav-orch-unread"]').count()) === 1,
+    `collapsed wiki row must expose owned-worker unread attention; payload=${JSON.stringify(unreadWorkerPayload)}`);
+  assert((await wikiRow.innerText()).includes("workers have unread updates"),
+    "collapsed wiki row must name unread worker attention for assistive technology");
+  await page.screenshot({ path: path.join(OUT_DIR, "00-sidebar-collapsed-unread.png") });
+  await wikiRow.click();
+  await page.waitForURL(/#\/agent\/wiki$/);
+  assert((await page.locator('[data-testid="nav-orch-workers-wiki"]').count()) === 0,
+    "opening the orchestrator session must not expand workers");
+  await waitForStableRunsLayout(page);
+  await page.screenshot({ path: path.join(OUT_DIR, "05-orchestrator-navigation.png") });
+  await wikiDisclosure.click();
+  const wikiWorkers = page.locator('[data-testid="nav-orch-workers-wiki"]');
+  await wikiWorkers.waitFor();
+  const expandedTickets = await wikiWorkers.locator(".nav-agent-ticket").allInnerTexts();
+  assert(
+    JSON.stringify(expandedTickets) === JSON.stringify(["WIKI-302", "WIKI-303", "WIKI-301"]),
+    `attention order must be blocked, merge-ready, working; got ${expandedTickets.join("/")}`,
+  );
+  const unreadWorkerRow = wikiWorkers.locator(".nav-agent", { hasText: "WIKI-301" });
+  assert((await unreadWorkerRow.locator('[data-testid="nav-agent-unread"]').count()) === 1,
+    "expanded unread worker must keep its child marker");
+  assert((await wikiRow.locator('[data-testid="nav-orch-unread"]').count()) === 1,
+    "expanded orchestrator must retain its aggregate unread marker");
+  const disclosureStyle = await wikiDisclosure.evaluate((el) => ({
+    radius: Number.parseFloat(getComputedStyle(el).borderRadius),
+    height: el.getBoundingClientRect().height,
+    chevron: el.querySelector(".nav-orch-chevron") !== null,
+  }));
+  assert(disclosureStyle.radius <= 2, `orchestrator row radius must be <=2px, got ${disclosureStyle.radius}`);
+  assert(disclosureStyle.height >= 40, `orchestrator row hit area must be >=40px, got ${disclosureStyle.height}`);
+  assert(disclosureStyle.chevron, "orchestrator disclosure needs a visible chevron");
+
+  await waitForStableRunsLayout(page);
+  await page.screenshot({ path: path.join(OUT_DIR, "01-sidebar-normal.png") });
+  await page.setViewportSize({ width: 1000, height: 760 });
+  const narrowLayout = await page.locator(".nav-agents").evaluate((el) => ({
+    clientWidth: el.clientWidth,
+    scrollWidth: el.scrollWidth,
+  }));
+  assert(
+    narrowLayout.scrollWidth <= narrowLayout.clientWidth,
+    `narrow sidebar must not overflow: ${narrowLayout.scrollWidth} > ${narrowLayout.clientWidth}`,
+  );
+  await page.screenshot({ path: path.join(OUT_DIR, "02-sidebar-narrow.png") });
+  await page.setViewportSize({ width: 1440, height: 900 });
+
+  await wikiDisclosure.click();
+  assert((await page.locator('[data-testid="nav-orch-workers-wiki"]').count()) === 0, "second click must collapse workers");
+  await wikiDisclosure.click();
+  await wikiWorkers.waitFor();
+  await page.reload({ waitUntil: "domcontentloaded" });
+  await page.waitForSelector('[data-testid="nav-orch-workers-wiki"]');
 
   logStep("state 3: accent-bar user block + quiet composer strip");
   // The "wiki" orchestrator shares the native transcript fixture, which the
@@ -205,7 +298,15 @@ try {
   for (const key of ["enter", "shift+enter", "esc"]) {
     assert(hints.includes(key), `footer hints must include ${key}, got ${hints}`);
   }
-  await page.screenshot({ path: path.join(OUT_DIR, "02-session-surface.png") });
+  const composerRadius = await page.locator(".session-composer-row").evaluate((el) =>
+    Number.parseFloat(getComputedStyle(el).borderRadius),
+  );
+  assert(composerRadius <= 2, `session composer radius must be <=2px, got ${composerRadius}`);
+  assert((await page.locator('[data-testid="session-run-details"]').count()) === 0,
+    "Run details must not render");
+  assert((await page.locator(".ticket-cost-strip").count()) === 0,
+    "ticket cost strip must not render");
+  await page.screenshot({ path: path.join(OUT_DIR, "03-session-surface.png") });
 
   logStep("state 4: shift+enter hint mirrors composer behavior (working vs idle)");
   // The backend derives `working` from transcript mtime (< 30s) when no
@@ -256,7 +357,7 @@ try {
       `hint [${hint.left}, ${hint.right}] must sit inside footer [${layout.footer.left}, ${layout.footer.right}]`,
     );
   }
-  await page.screenshot({ path: path.join(OUT_DIR, "03-narrow-footer.png") });
+  await page.screenshot({ path: path.join(OUT_DIR, "04-narrow-footer.png") });
 
   logStep("PASS");
 } finally {

@@ -273,6 +273,11 @@ try {
   );
   assert(groupTexts.includes("Active"), `expected Active group, got ${groupTexts.join("/")}`);
 
+  // WIKI-235: orchestrator children start collapsed. Expand the wiki group
+  // before checking WIKI-151 row anatomy and attention ordering.
+  await page.getByRole("button", { name: "Expand wiki workers" }).click();
+  await page.waitForSelector('[data-testid="nav-orch-workers-wiki"]');
+
   const rowOrder = await page.evaluate(() =>
     Array.from(document.querySelectorAll(".nav-agent"))
       .filter((el) => !el.classList.contains("is-orch"))
@@ -419,17 +424,28 @@ try {
     `Retry must issue exactly ONE additional /api/files/tree — before=${callsBeforeRetry} after=${treeCalls}`,
   );
 
-  // 8. Empty-state CTA: seed a fixture with ZERO agents to prove the empty
-  // sidebar CTA renders. Reuse the same page — remove the registry entries
-  // by rewriting registry.json + hitting /api/agents. But agents are cached
-  // per component, so easier to just intercept /api/agents.
+  // 8. Archived-only state: no active rows render, but the copy must not say
+  // the user has never had a run. Archived sessions remain available outside
+  // this sidebar.
   await page.route("**/api/agents", async (route) => {
     await route.fulfill({
       status: 200,
       contentType: "application/json",
       body: JSON.stringify({
         workers: [],
-        archived: [],
+        archived: [
+          {
+            ticket: "WIKI-ARCHIVED",
+            archived_at: "2026-07-20T12:00:00Z",
+            kind: "cdx",
+            role: "implement",
+            model: "sol",
+            outcome: "completed",
+            state: "completed",
+            pr: null,
+            step: "done",
+          },
+        ],
         orchestrators: [],
         deploy_timestamp: null,
       }),
@@ -440,7 +456,7 @@ try {
   await page.waitForSelector('.sidebar-mode[data-mode="agents"]');
   await page.waitForSelector('[data-testid="nav-agents-empty"]', { timeout: 10_000 });
   const emptyTitle = await page.locator(".nav-empty-title").textContent();
-  assert(emptyTitle?.trim() === "No runs yet", `empty state title expected "No runs yet", got ${emptyTitle}`);
+  assert(emptyTitle?.trim() === "No active runs", `empty state title expected "No active runs", got ${emptyTitle}`);
   const primary = await page.locator('[data-testid="nav-agents-empty-primary"]').count();
   assert(primary === 1, `expected 1 primary CTA, got ${primary}`);
   const secondary = await page.locator('[data-testid="nav-agents-empty-secondary"]').count();
