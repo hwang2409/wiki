@@ -184,8 +184,7 @@ def _validated_movie_duration(data: bytes, moov: _Mp4Atom) -> int:
         minf_atoms = [atom for atom in mdia_children if atom.type == b"minf"]
         if len(mdhd_atoms) != 1 or len(hdlr_atoms) != 1 or len(minf_atoms) != 1:
             raise MediaScrubError("mp4 mdia timing chain is incomplete")
-        handler = _handler_type(data, hdlr_atoms[0])
-        if handler not in (b"vide", b"soun"):
+        if _handler_type(data, hdlr_atoms[0]) != b"vide":
             continue
         mdhd_timescale, mdhd_duration = _parse_mdhd_timing(data, mdhd_atoms[0])
         minf_children = _parse_container(data, minf_atoms[0].body_start, minf_atoms[0].body_end)
@@ -211,15 +210,11 @@ def _validated_movie_duration(data: bytes, moov: _Mp4Atom) -> int:
         if abs(tkhd_duration - expected_movie_duration) > 1:
             raise MediaScrubError("mp4 track duration does not match stts and edits")
         expected_ms = round(expected_movie_duration * 1000 / movie_timescale)
-        # Prefer the video track's duration when both are present — a
-        # visible playback length is what users see. Audio-only files
-        # fall back to the audio timing.
-        if handler == b"vide":
-            validated_duration = expected_ms
-        elif validated_duration is None:
-            validated_duration = expected_ms
+        if validated_duration is not None and abs(validated_duration - expected_ms) > 1:
+            raise MediaScrubError("mp4 video tracks have inconsistent durations")
+        validated_duration = expected_ms
     if validated_duration is None:
-        raise MediaScrubError("mp4 moov has no supported vide/soun track timing")
+        raise MediaScrubError("mp4 moov has no vide track timing")
     return validated_duration
 
 def _tkhd_dimensions_from_atom(

@@ -57,10 +57,6 @@ from ._mp4_primitives import (
     pack_with_header as _pack_with_header,
     parse_container as _parse_container,
 )
-from ._mp4_aac import (
-    Mp4AacConfig as _Mp4AacConfig,
-    _canonicalise_aac_sample,
-)
 from ._mp4_avc import (
     _canonicalise_avc_sample,
 )
@@ -87,22 +83,18 @@ _MP4_TOPLEVEL_PLAYBACK: Final = {
 # fall to strict-subset reject.
 # avc3 has in-band parameter sets, and other codecs need separate parsers.
 _MP4_VISUAL_ENTRIES: Final = {b"avc1"}
-_MP4_AUDIO_ENTRIES: Final = {b"mp4a"}
 # Inner boxes inside a sample entry that we accept. Each one gets its
 # Every sample-entry inner box in this allowlist has a field-level
 # rebuild via struct.pack — no raw body copy path remains for anything
 # the scrubber claims to support (round-8 review). Codec configurations
 # for containers we do not fully field-decode yet (hvcC/vpcC/av1C
 # and the encryption tree sinf/schm/schi/tenc) are OUT — files using
-# them are rejected under strict-subset acceptance. WIKI-225 adds
-# esds for AAC-LC mp4a entries; the rebuilder in ``_mp4_aac.py``
-# validates the AudioSpecificConfig field-by-field.
+# them are rejected under strict-subset acceptance.
 _MP4_SAMPLE_ENTRY_INNER_ALLOWED: Final = {
-    b"avcC", b"btrt", b"pasp", b"colr", b"esds",
+    b"avcC", b"btrt", b"pasp", b"colr",
 }
 _MP4_SAMPLE_ENTRY_REQUIRED_CONFIG: Final = {
     b"avc1": b"avcC",
-    b"mp4a": b"esds",
 }
 _MP4_MAX_SAMPLES: Final = 16_777_216
 _MP4_AVC_SAMPLE_NAL_TYPES: Final = {1, 5, 6, 9, 12}
@@ -174,7 +166,7 @@ def scrub_mp4(data: bytes) -> MediaScrubResult:
     # errors for malformed moov children before sample ownership checks.
     for atom in top_atoms:
         if atom.type == b"moov":
-            _rebuilt, _trak, _mvhd, stsd_ok, track_ok = _rebuild_moov(
+            _rebuilt, _trak, _mvhd, stsd_ok, video_ok = _rebuild_moov(
                 data, atom.body_start, atom.body_end,
             )
             duration_ms = _validated_movie_duration(data, atom)
@@ -182,10 +174,8 @@ def scrub_mp4(data: bytes) -> MediaScrubResult:
                 raise MediaScrubError("mp4 moov missing trak")
             if not stsd_ok:
                 raise MediaScrubError("mp4 stbl/stsd has no valid sample entry")
-            if not track_ok:
-                raise MediaScrubError(
-                    "mp4 payload requires at least one supported vide/avc1 or soun/mp4a track"
-                )
+            if not video_ok:
+                raise MediaScrubError("mp4 payload requires a vide/avc1 track")
     for atom in top_atoms:
         if atom.type == b"mdat" and atom.body_start == atom.body_end:
             raise MediaScrubError("mp4 mdat body is empty")
@@ -205,7 +195,7 @@ def scrub_mp4(data: bytes) -> MediaScrubResult:
     trak_seen = False
     mvhd_seen = False
     stsd_ok = False
-    track_ok = False
+    video_ok = False
     mdat_non_empty = False
     mdat_index = 0
     dims: tuple[int, int] | None = None
@@ -219,13 +209,13 @@ def scrub_mp4(data: bytes) -> MediaScrubResult:
             moov_seen = True
             moov_body = data[atom.body_start:atom.body_end]
             dims = _display_dims_from_moov(data, atom)
-            rebuilt_body, tr, mv, st, track = _rebuild_moov(
+            rebuilt_body, tr, mv, st, video = _rebuild_moov(
                 data, atom.body_start, atom.body_end,
             )
             trak_seen |= tr
             mvhd_seen |= mv
             stsd_ok |= st
-            track_ok |= track
+            video_ok |= video
             rebuilt = _pack(b"moov", rebuilt_body)
             delta = atom.size - len(rebuilt)
             if delta < 0:
@@ -250,11 +240,7 @@ def scrub_mp4(data: bytes) -> MediaScrubResult:
                 start = sample_start - atom.body_start
                 end = sample_end - atom.body_start
                 sample = data[sample_start:sample_end]
-                if isinstance(sample_range.codec_config, _Mp4AacConfig):
-                    sample = _canonicalise_aac_sample(
-                        sample, sample_range.codec_config,
-                    )
-                elif sample_range.codec_config is not None:
+                if sample_range.codec_config is not None:
                     sample = _canonicalise_avc_sample(
                         sample, *sample_range.codec_config,
                     )
@@ -307,10 +293,8 @@ def scrub_mp4(data: bytes) -> MediaScrubResult:
         raise MediaScrubError(
             "mp4 trak missing valid stbl/stsd sample entry (full chain required)"
         )
-    if not track_ok:
-        raise MediaScrubError(
-            "mp4 payload requires at least one supported vide/avc1 or soun/mp4a track"
-        )
+    if not video_ok:
+        raise MediaScrubError("mp4 payload requires a vide/avc1 track")
     if not mdat_non_empty:
         raise MediaScrubError("mp4 payload missing non-empty mdat box")
 
@@ -1056,9 +1040,7 @@ def _rebuild_stbl(
             if stsd_body is not None:
                 parts.append(_pack(b"stsd", stsd_body))
                 stsd_ok = True
-                # ``track_ok`` in the caller: at least one supported
-                # video or audio track has a full rebuild.
-                video_ok = handler_type in (b"vide", b"soun")
+                video_ok = handler_type == b"vide"
         elif atom.type in _MP4_STBL_TABLE_TYPES:
             parts.append(_rebuild_stbl_table(atom.type, data, atom))
         else:
