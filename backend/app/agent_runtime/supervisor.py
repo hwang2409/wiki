@@ -3767,6 +3767,13 @@ Preserve the same identity, role, worktree, orchestrator grouping, PR gates, and
         if decision.action is RecoveryAction.RESUME:
             recovery_state = record.recovery_from_state or record.state
             try:
+                # RESUME is selected only when the detached provider PID is
+                # dead. That is the safe upgrade boundary for legacy records
+                # that exceed the matcher cap: clear them before the resumed
+                # transport can emit an echo into a reused text slot.
+                self.store.retire_overbound_pending_user_messages(
+                    record.run_id
+                )
                 await self._resume_run_without_admission(
                     record.run_id,
                     automatic=True,

@@ -35,6 +35,7 @@ from backend.app.agent_runtime.store import (
 from backend.app.agent_runtime.types import (
     EventDisposition,
     LifecycleState,
+    MAX_PENDING_USER_MESSAGES,
     ProviderKind,
     RecoveryAction,
     RunRecord,
@@ -763,6 +764,32 @@ class RunStoreTests(unittest.TestCase):
                 second,
             )
             self.assertEqual(reloaded.get(record.run_id).composer_messages[0]["seq"], 1)
+
+    def test_pending_user_message_store_rejects_overbound_append(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            store = RunStore(_paths(root))
+            record = store.create(_record(root))
+            for index in range(MAX_PENDING_USER_MESSAGES):
+                store.track_pending_user_message(
+                    record.run_id,
+                    f"pending-{index}",
+                    "same text",
+                )
+
+            with self.assertRaisesRegex(
+                StoreConflict, "pending user message limit reached"
+            ):
+                store.track_pending_user_message(
+                    record.run_id,
+                    "pending-overflow",
+                    "same text",
+                )
+
+            self.assertEqual(
+                len(store.get(record.run_id).pending_user_messages),
+                MAX_PENDING_USER_MESSAGES,
+            )
 
     def test_event_inspector_pages_from_cursor_or_bounded_tail(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

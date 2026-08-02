@@ -61,6 +61,7 @@ from backend.app.agent_runtime.types import (
     MAX_PENDING_USER_MESSAGES,
     LifecycleState,
     ProviderKind,
+    RecoveryAction,
     RunRecord,
     restart_recovery_decision,
 )
@@ -2449,7 +2450,85 @@ class SupervisorTests(unittest.IsolatedAsyncioTestCase):
         message = "bounded recurring alarm"
         send_count = MAX_PENDING_USER_MESSAGES + 5
         results: list[dict[str, Any]] = []
-        for index in range(send_count):
+        for index in range(MAX_PENDING_USER_MESSAGES):
+            results.append(
+                await self.supervisor.dispatch(
+                    "run/send_now",
+                    {
+                        "run_id": record.run_id,
+                        "text": message,
+                        "source": f"source-{index}",
+                        "request_id": f"review21-bound-{index}",
+                    },
+                )
+            )
+
+        old_adapter = self.supervisor.adapters[record.run_id]
+        for _ in range(200):
+            if (
+                old_adapter._events.empty()  # noqa: SLF001 - pump fixture
+                and not self.supervisor.event_inflight_counts.get(record.run_id)
+            ):
+                break
+            await asyncio.sleep(0.01)
+        else:
+            self.fail("provider pump did not drain before the bound fixture")
+
+        old_pending_id = results[0].get("pending_id")
+        old_generation = old_adapter.snapshot().generation
+        event_lock = self.supervisor.event_processing_locks.setdefault(
+            record.run_id, asyncio.Lock()
+        )
+        await event_lock.acquire()
+        overflow_task: asyncio.Task[dict[str, Any]] | None = None
+        try:
+            await old_adapter._events.put(  # noqa: SLF001 - pump fixture
+                ProviderEvent(
+                    ProviderKind.CODEX,
+                    {
+                        "method": "item/completed",
+                        "params": {
+                            "item": {
+                                "type": "userMessage",
+                                "content": [{"type": "text", "text": message}],
+                            }
+                        },
+                    },
+                    generation=old_generation,
+                )
+            )
+            for _ in range(200):
+                if self.supervisor.event_inflight_counts.get(record.run_id):
+                    break
+                await asyncio.sleep(0.01)
+            else:
+                self.fail("old-generation echo did not enter the production pump")
+
+            overflow_task = asyncio.create_task(
+                self.supervisor.dispatch(
+                    "run/send_now",
+                    {
+                        "run_id": record.run_id,
+                        "text": message,
+                        "source": f"source-{MAX_PENDING_USER_MESSAGES}",
+                        "request_id": (
+                            f"review21-bound-{MAX_PENDING_USER_MESSAGES}"
+                        ),
+                    },
+                )
+            )
+            for _ in range(200):
+                if old_adapter.snapshot().state is LifecycleState.DEAD:
+                    break
+                await asyncio.sleep(0.01)
+            else:
+                self.fail("matcher overflow did not stop the old transport")
+        finally:
+            event_lock.release()
+        assert overflow_task is not None
+        results.append(await overflow_task)
+
+        for index in range(MAX_PENDING_USER_MESSAGES + 1, send_count):
             results.append(
                 await self.supervisor.dispatch(
                     "run/send_now",
@@ -2475,6 +2554,12 @@ class SupervisorTests(unittest.IsolatedAsyncioTestCase):
             retained_sources,
             [f"source-{index}" for index in range(send_count - 5, send_count)],
         )
+        old_correlated = [
+            (item.get("pending_id"), item.get("source"))
+            for item in self.store.get(record.run_id).composer_messages
+            if item.get("pending_id") == old_pending_id
+        ]
+        self.assertEqual(old_correlated, [(old_pending_id, "source-0")])
         self.assertEqual(provider_calls, [message] * send_count)
         self.assertTrue(all(result["status"] == "sent" for result in results))
         self.assertEqual(self.store.command_log.pending(), [])
@@ -2531,12 +2616,16 @@ class SupervisorTests(unittest.IsolatedAsyncioTestCase):
         correlated = [
             (item.get("pending_id"), item.get("source"))
             for item in recovered.composer_messages
-            if item.get("pending_id") in set(retained_ids)
+            if item.get("pending_id") in {old_pending_id, *retained_ids}
         ]
         self.assertEqual(
             correlated,
-            list(zip(retained_ids, retained_sources, strict=True)),
+            [
+                (old_pending_id, "source-0"),
+                *list(zip(retained_ids, retained_sources, strict=True)),
+            ],
         )
+        self.assertEqual(len(correlated), len(set(correlated)))
 
         final = await restarted.dispatch(
             "run/send_now",
@@ -2557,6 +2646,156 @@ class SupervisorTests(unittest.IsolatedAsyncioTestCase):
         assert final_receipt is not None
         self.assertTrue(final_receipt.ok)
         self.assertEqual(final_receipt.result, final)
+
+    async def test_recover_on_start_retires_legacy_overbound_matchers(
+        self,
+    ) -> None:
+        """REVIEW22 H1: migrate overflow only after the old transport dies."""
+
+        record = await self.supervisor.start_run(
+            agent_id="WIKI-232-R22-UPGRADE-BOUND",
+            provider=ProviderKind.CODEX,
+            role="orchestrator",
+            model="fixture-codex",
+            effort="high",
+            worktree=str(self.worktree),
+            prompt="migrate legacy matcher overflow",
+        )
+        await self.supervisor.close()
+
+        message = "same alarm after upgrade"
+        legacy = self.store.get(record.run_id).to_dict()
+        legacy["pending_user_messages"] = [
+            {
+                "pending_id": f"legacy-pending-{index}",
+                "text": message,
+                "sent_at": "2026-08-02T12:00:00+00:00",
+                "source": f"legacy-source-{index}",
+            }
+            for index in range(MAX_PENDING_USER_MESSAGES + 5)
+        ]
+        self.store.run_path(record.run_id).write_text(
+            json.dumps(legacy),
+            encoding="utf-8",
+        )
+
+        provider_calls: list[str] = []
+        base_factory = FixtureAdapterFactory(FIXTURES, pid=os.getpid())
+
+        def tracking_factory(run_record: RunRecord) -> ProviderAdapter:
+            adapter = base_factory(run_record)
+            original_send = adapter.send_now
+
+            async def tracked_send(text: str) -> AdapterStatus:
+                provider_calls.append(text)
+                return await original_send(text)
+
+            adapter.send_now = tracked_send  # type: ignore[method-assign]
+            return adapter
+
+        restarted_store = RunStore(self.paths)
+        self.assertEqual(
+            len(restarted_store.get(record.run_id).pending_user_messages),
+            MAX_PENDING_USER_MESSAGES + 5,
+        )
+        restarted = Supervisor(
+            restarted_store,
+            tracking_factory,
+            pid_alive=lambda _pid: False,
+        )
+        self.store = restarted_store
+        self.supervisor = restarted
+
+        recovery = await restarted.recover_on_start()
+        recovered = restarted_store.get(record.run_id)
+        self.assertEqual(
+            [item["action"] for item in recovery if item["run_id"] == record.run_id],
+            [RecoveryAction.RESUME.value],
+        )
+        self.assertEqual(recovered.pending_user_messages, [])
+        self.assertLessEqual(
+            len(recovered.pending_user_messages), MAX_PENDING_USER_MESSAGES
+        )
+
+        result = await restarted.dispatch(
+            "run/send_now",
+            {
+                "run_id": record.run_id,
+                "text": message,
+                "source": "current-source",
+                "request_id": "review22-upgrade-current",
+            },
+        )
+        pending_id = result.get("pending_id")
+        self.assertIsInstance(pending_id, str)
+        self.assertEqual(result["status"], "sent")
+        self.assertEqual(provider_calls, [message])
+        self.assertEqual(
+            [
+                (item.get("pending_id"), item.get("source"))
+                for item in restarted_store.get(
+                    record.run_id
+                ).pending_user_messages
+            ],
+            [(pending_id, "current-source")],
+        )
+
+        restarted_adapter = restarted.adapters[record.run_id]
+        await asyncio.sleep(0)
+        await restarted_adapter._events.put(  # noqa: SLF001 - event pump fixture
+            ProviderEvent(
+                ProviderKind.CODEX,
+                {
+                    "method": "item/completed",
+                    "params": {
+                        "item": {
+                            "type": "userMessage",
+                            "content": [{"type": "text", "text": message}],
+                        }
+                    },
+                },
+                generation=restarted_adapter.snapshot().generation,
+            )
+        )
+        for _ in range(200):
+            if not restarted_store.get(record.run_id).pending_user_messages:
+                break
+            await asyncio.sleep(0.01)
+        else:
+            self.fail("current-generation echo did not drain the upgraded matcher")
+
+        final_record = restarted_store.get(record.run_id)
+        correlated = [
+            (item.get("pending_id"), item.get("source"))
+            for item in final_record.composer_messages
+            if item.get("pending_id") == pending_id
+        ]
+        self.assertEqual(correlated, [(pending_id, "current-source")])
+        self.assertFalse(
+            any(
+                str(item.get("pending_id", "")).startswith("legacy-pending-")
+                for item in final_record.composer_messages
+            )
+        )
+        receipt = restarted_store.command_log.receipt(
+            "run/send_now", "review22-upgrade-current"
+        )
+        self.assertIsNotNone(receipt)
+        assert receipt is not None
+        self.assertTrue(receipt.ok)
+        self.assertEqual(receipt.result, result)
+        replay = await restarted.dispatch(
+            "run/send_now",
+            {
+                "run_id": record.run_id,
+                "text": message,
+                "source": "current-source",
+                "request_id": "review22-upgrade-current",
+            },
+        )
+        self.assertEqual(replay, result)
+        self.assertEqual(provider_calls, [message])
+        self.assertEqual(restarted_store.command_log.pending(), [])
 
     async def test_recover_on_start_reconciles_wedged_sending_effect(self) -> None:
         """WIKI-232 H2: an on-idle effect stuck at 'sending' after a daemon

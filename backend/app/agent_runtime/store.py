@@ -30,6 +30,7 @@ from .types import (
     ProviderKind,
     RunRecord,
     MAX_MESSAGE_DEDUPE_KEYS,
+    MAX_PENDING_USER_MESSAGES,
     TERMINAL_STATES,
     utc_now,
     validate_transition,
@@ -2398,6 +2399,8 @@ class RunStore:
                 if existing.get("text") != text:
                     raise StoreConflict("pending message id was reused with different text")
                 return record
+            if len(record.pending_user_messages) >= MAX_PENDING_USER_MESSAGES:
+                raise StoreConflict("pending user message limit reached")
             entry: dict[str, Any] = {
                 "pending_id": pending_id,
                 "text": text,
@@ -2488,6 +2491,17 @@ class RunStore:
             record.pending_user_messages = []
             self._write_record(record)
             return record
+
+    def retire_overbound_pending_user_messages(self, run_id: str) -> bool:
+        """Clear legacy overflow only at a caller-proven transport boundary."""
+
+        with self._lock:
+            record = self.get(run_id)
+            if len(record.pending_user_messages) <= MAX_PENDING_USER_MESSAGES:
+                return False
+            record.pending_user_messages = []
+            self._write_record(record)
+            return True
 
     def composer_messages_for_run(self, run_id: str) -> list[dict[str, Any]]:
         """Read one canonical composer journal across a replacement chain."""
