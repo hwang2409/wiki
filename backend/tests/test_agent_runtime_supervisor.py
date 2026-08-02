@@ -2810,15 +2810,13 @@ class SupervisorTests(unittest.IsolatedAsyncioTestCase):
                 await asyncio.sleep(0.01)
             self.fail("provider echo did not pass through the production pump")
 
-        first = await restarted.dispatch(
-            "run/send_now",
-            {
-                "run_id": record.run_id,
-                "text": message,
-                "source": "current-source",
-                "request_id": "review22-upgrade-current",
-            },
-        )
+        first_params = {
+            "run_id": record.run_id,
+            "text": message,
+            "source": "current-source",
+            "request_id": "review22-upgrade-current",
+        }
+        first = await restarted.dispatch("run/send_now", first_params)
         first_pending_id = first.get("pending_id")
         self.assertIsInstance(first_pending_id, str)
         self.assertEqual(first["status"], "sent")
@@ -2842,15 +2840,13 @@ class SupervisorTests(unittest.IsolatedAsyncioTestCase):
         await pump_echo(current_generation)
         self.assertEqual(pending_pairs(), [])
 
-        second = await restarted.dispatch(
-            "run/send_now",
-            {
-                "run_id": record.run_id,
-                "text": message,
-                "source": "later-source",
-                "request_id": "review23-upgrade-later",
-            },
-        )
+        second_params = {
+            "run_id": record.run_id,
+            "text": message,
+            "source": "later-source",
+            "request_id": "review23-upgrade-later",
+        }
+        second = await restarted.dispatch("run/send_now", second_params)
         second_pending_id = second.get("pending_id")
         self.assertIsInstance(second_pending_id, str)
         self.assertEqual(second["status"], "sent")
@@ -2891,8 +2887,235 @@ class SupervisorTests(unittest.IsolatedAsyncioTestCase):
             assert receipt is not None
             self.assertTrue(receipt.ok)
             self.assertEqual(receipt.result, result)
+        composer_before_replay = [
+            dict(item) for item in final_record.composer_messages
+        ]
+        replayed_first = await restarted.dispatch(
+            "run/send_now", dict(first_params)
+        )
+        replayed_second = await restarted.dispatch(
+            "run/send_now", dict(second_params)
+        )
+        self.assertEqual(replayed_first, first)
+        self.assertEqual(replayed_second, second)
         self.assertEqual(provider_calls, [message, message])
+        self.assertEqual(
+            restarted_store.get(record.run_id).composer_messages,
+            composer_before_replay,
+        )
         self.assertEqual(restarted_store.command_log.pending(), [])
+        self.assertEqual(
+            restarted_store.command_log.sending_steer_effects(), []
+        )
+
+    async def test_unsuppressed_startup_retires_overflow_before_resume_echo(
+        self,
+    ) -> None:
+        """REVIEW24: startup resume retires overflow before provider events."""
+
+        record = await self.supervisor.start_run(
+            agent_id="WIKI-232-R24-STARTUP-RESUME",
+            provider=ProviderKind.CODEX,
+            role="orchestrator",
+            model="fixture-codex",
+            effort="high",
+            worktree=str(self.worktree),
+            prompt="resume an unsuppressed legacy matcher journal",
+        )
+        await self.supervisor.close()
+
+        message = "same alarm during startup resume"
+        legacy = self.store.get(record.run_id).to_dict()
+        legacy["pending_user_messages"] = [
+            {
+                "pending_id": f"startup-pending-{index}",
+                "text": message,
+                "sent_at": "2026-08-02T12:04:00+00:00",
+                "source": f"startup-source-{index}",
+            }
+            for index in range(MAX_PENDING_USER_MESSAGES + 5)
+        ]
+        legacy["automatic_resume_suppressed"] = False
+        legacy["automatic_resume_guarded_at"] = None
+        legacy["state_reason"] = None
+        self.store.run_path(record.run_id).write_text(
+            json.dumps(legacy),
+            encoding="utf-8",
+        )
+
+        provider_calls: list[str] = []
+        resume_pending_counts: list[int] = []
+        resume_echo_raw_seqs: list[int] = []
+        base_factory = FixtureAdapterFactory(FIXTURES, pid=os.getpid())
+
+        def tracking_factory(run_record: RunRecord) -> ProviderAdapter:
+            adapter = base_factory(run_record)
+            original_resume = adapter.resume
+            original_send = adapter.send_now
+
+            async def resume_with_echo(session_id: str) -> AdapterStatus:
+                pending_before = restarted_store.get(
+                    run_record.run_id
+                ).pending_user_messages
+                resume_pending_counts.append(len(pending_before))
+                self.assertLessEqual(
+                    len(pending_before), MAX_PENDING_USER_MESSAGES
+                )
+                status = await original_resume(session_id)
+                payload = {
+                    "method": "item/completed",
+                    "params": {
+                        "item": {
+                            "type": "userMessage",
+                            "content": [{"type": "text", "text": message}],
+                        }
+                    },
+                }
+                await adapter._events.put(  # noqa: SLF001 - resume race fixture
+                    ProviderEvent(
+                        ProviderKind.CODEX,
+                        payload,
+                        generation=status.generation,
+                    )
+                )
+                for _ in range(200):
+                    raw_match = next(
+                        (
+                            item
+                            for item in reversed(
+                                restarted_store.read_raw_events(
+                                    run_record.run_id
+                                )
+                            )
+                            if item.get("payload") == payload
+                            and item.get("generation") == status.generation
+                        ),
+                        None,
+                    )
+                    if raw_match is not None and any(
+                        int(item.get("raw_seq", 0)) == int(raw_match["seq"])
+                        for item in restarted_store.read_normalized_events(
+                            run_record.run_id
+                        )
+                    ):
+                        resume_echo_raw_seqs.append(int(raw_match["seq"]))
+                        break
+                    await asyncio.sleep(0.01)
+                else:
+                    self.fail("resume echo did not normalize before resume returned")
+                self.assertLessEqual(
+                    len(
+                        restarted_store.get(
+                            run_record.run_id
+                        ).pending_user_messages
+                    ),
+                    MAX_PENDING_USER_MESSAGES,
+                )
+                return status
+
+            async def tracked_send(text: str) -> AdapterStatus:
+                provider_calls.append(text)
+                return await original_send(text)
+
+            adapter.resume = resume_with_echo  # type: ignore[method-assign]
+            adapter.send_now = tracked_send  # type: ignore[method-assign]
+            return adapter
+
+        restarted_store = RunStore(self.paths)
+        self.assertEqual(
+            len(restarted_store.get(record.run_id).pending_user_messages),
+            MAX_PENDING_USER_MESSAGES + 5,
+        )
+        restarted = Supervisor(
+            restarted_store,
+            tracking_factory,
+            pid_alive=lambda _pid: False,
+        )
+        self.store = restarted_store
+        self.supervisor = restarted
+
+        recovery = await restarted.recover_on_start()
+        self.assertEqual(
+            [item["action"] for item in recovery if item["run_id"] == record.run_id],
+            [RecoveryAction.RESUME.value],
+        )
+        self.assertEqual(resume_pending_counts, [0])
+        self.assertEqual(len(resume_echo_raw_seqs), 1)
+        self.assertEqual(
+            restarted_store.get(record.run_id).pending_user_messages,
+            [],
+        )
+        resume_echo = next(
+            item
+            for item in restarted_store.read_normalized_events(record.run_id)
+            if int(item.get("raw_seq", 0)) == resume_echo_raw_seqs[0]
+        )
+        self.assertEqual(resume_echo["kind"], "item_completed")
+        self.assertNotIn("pending_id", resume_echo["payload"])
+        self.assertNotIn("source", resume_echo["payload"])
+
+        params = {
+            "run_id": record.run_id,
+            "text": message,
+            "source": "post-resume-source",
+            "request_id": "review24-unsuppressed-later",
+        }
+        result = await restarted.dispatch("run/send_now", params)
+        pending_id = result.get("pending_id")
+        self.assertIsInstance(pending_id, str)
+        self.assertEqual(result["status"], "sent")
+        self.assertEqual(provider_calls, [message])
+        pending = restarted_store.get(record.run_id).pending_user_messages
+        self.assertLessEqual(len(pending), MAX_PENDING_USER_MESSAGES)
+        self.assertEqual(
+            [(item.get("pending_id"), item.get("source")) for item in pending],
+            [(pending_id, "post-resume-source")],
+        )
+
+        current_adapter = restarted.adapters[record.run_id]
+        await current_adapter._events.put(  # noqa: SLF001 - event pump fixture
+            ProviderEvent(
+                ProviderKind.CODEX,
+                {
+                    "method": "item/completed",
+                    "params": {
+                        "item": {
+                            "type": "userMessage",
+                            "content": [{"type": "text", "text": message}],
+                        }
+                    },
+                },
+                generation=current_adapter.snapshot().generation,
+            )
+        )
+        for _ in range(200):
+            if not restarted_store.get(record.run_id).pending_user_messages:
+                break
+            await asyncio.sleep(0.01)
+        else:
+            self.fail("post-resume echo left the current matcher wedged")
+
+        current = restarted_store.get(record.run_id)
+        self.assertLessEqual(
+            len(current.pending_user_messages), MAX_PENDING_USER_MESSAGES
+        )
+        correlated = [
+            (item.get("pending_id"), item.get("source"))
+            for item in current.composer_messages
+            if item.get("pending_id") == pending_id
+        ]
+        self.assertEqual(correlated, [(pending_id, "post-resume-source")])
+        receipt = restarted_store.command_log.receipt(
+            "run/send_now", "review24-unsuppressed-later"
+        )
+        self.assertIsNotNone(receipt)
+        assert receipt is not None
+        self.assertTrue(receipt.ok)
+        self.assertEqual(receipt.result, result)
+        self.assertEqual(restarted_store.command_log.pending(), [])
+        self.assertEqual(
+            restarted_store.command_log.sending_steer_effects(), []
+        )
 
     async def test_recover_on_start_reconciles_wedged_sending_effect(self) -> None:
         """WIKI-232 H2: an on-idle effect stuck at 'sending' after a daemon
