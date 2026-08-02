@@ -367,6 +367,97 @@ describe("WIKI-235 runs sidebar", () => {
     expect(within(confirmedWorker!).queryByTestId("nav-agent-viewed-failed")).toBeNull();
   });
 
+  test("keeps the latest failure until the server confirms that exact sequence", async () => {
+    vi.useFakeTimers();
+    const postedSeqs: number[] = [];
+    const fetchMock = vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
+      postedSeqs.push(expectWikiWorkViewedRequest(input, init));
+      return new Response(JSON.stringify({ detail: "response lost" }), {
+        status: 500,
+        headers: { "Content-Type": "application/json" },
+      });
+    });
+    vi.stubGlobal("fetch", fetchMock);
+
+    const withViewedState = (latestEventSeq: number, lastViewedSeq: number) =>
+      workers.map((item) =>
+        item.ticket === "WIKI-WORK"
+          ? {
+              ...item,
+              latest_event_seq: latestEventSeq,
+              last_viewed_seq: lastViewedSeq,
+            }
+          : { ...item },
+      );
+    const view = render(
+      <AgentsSidebar
+        activeTicket="WIKI-WORK"
+        data={{ workers: withViewedState(2, 1), orchestrators, error: null }}
+        refreshTick={0}
+        onOpen={() => {}}
+      />,
+    );
+
+    await act(async () => {
+      await vi.runAllTimersAsync();
+    });
+    expect(postedSeqs).toEqual([2, 2, 2]);
+
+    view.rerender(
+      <AgentsSidebar
+        activeTicket="WIKI-WORK"
+        data={{ workers: withViewedState(3, 1), orchestrators, error: null }}
+        refreshTick={1}
+        onOpen={() => {}}
+      />,
+    );
+    await act(async () => {
+      await vi.runAllTimersAsync();
+    });
+    expect(postedSeqs).toEqual([2, 2, 2, 3, 3, 3]);
+
+    const failedWorker = screen.getByText("WIKI-WORK").closest("button");
+    expect(within(failedWorker!).getByTestId("nav-agent-viewed-failed")).toBeTruthy();
+    fireEvent.click(screen.getByRole("button", { name: "Collapse wiki workers" }));
+    const wiki = screen.getByText("wiki").closest("button");
+    expect(within(wiki!).getByTestId("nav-orch-viewed-failed")).toBeTruthy();
+
+    await act(async () => {
+      view.rerender(
+        <AgentsSidebar
+          activeTicket="WIKI-WORK"
+          data={{ workers: withViewedState(3, 2), orchestrators, error: null }}
+          refreshTick={2}
+          onOpen={() => {}}
+        />,
+      );
+    });
+
+    expect(postedSeqs).toEqual([2, 2, 2, 3, 3, 3]);
+    expect(within(wiki!).getByTestId("nav-orch-viewed-failed")).toBeTruthy();
+    fireEvent.click(screen.getByRole("button", { name: "Expand wiki workers" }));
+    const partiallyConfirmedWorker = screen.getByText("WIKI-WORK").closest("button");
+    expect(
+      within(partiallyConfirmedWorker!).getByTestId("nav-agent-viewed-failed"),
+    ).toBeTruthy();
+
+    await act(async () => {
+      view.rerender(
+        <AgentsSidebar
+          activeTicket="WIKI-WORK"
+          data={{ workers: withViewedState(3, 3), orchestrators, error: null }}
+          refreshTick={3}
+          onOpen={() => {}}
+        />,
+      );
+    });
+
+    expect(postedSeqs).toEqual([2, 2, 2, 3, 3, 3]);
+    expect(within(wiki!).queryByTestId("nav-orch-viewed-failed")).toBeNull();
+    const confirmedWorker = screen.getByText("WIKI-WORK").closest("button");
+    expect(within(confirmedWorker!).queryByTestId("nav-agent-viewed-failed")).toBeNull();
+  });
+
   test("persists expanded orchestrators across remounts", () => {
     const props = {
       activeTicket: null,
