@@ -8464,6 +8464,8 @@ body.is-resizing-panes .pane-cell {
   min-height: 0;
   min-width: 0;
   overflow: hidden;
+  container-name: agent-session-row;
+  container-type: inline-size;
 }
 
 .agent-session-surface {
@@ -14160,6 +14162,33 @@ textarea.composer-command-input {
 
 .agent-session-head-secondary :where(button):focus-visible {
   outline-width: 2px;
+}
+
+@container agent-session-row (max-width: 720px) {
+  .session-side-panel,
+  .agent-pane .session-side-panel {
+    width: 100%;
+    min-width: 0;
+    max-width: 100%;
+    border-left: 0;
+  }
+
+  .workgraph-toolbar,
+  .replay-scrubber-row {
+    flex-wrap: wrap;
+  }
+
+  .workgraph-updated {
+    width: 100%;
+    margin-left: 0;
+    overflow-wrap: anywhere;
+  }
+
+  .replay-track {
+    order: 2;
+    flex-basis: 100%;
+    min-width: 0;
+  }
 }
 
 @container agent-session (max-width: 720px) {
