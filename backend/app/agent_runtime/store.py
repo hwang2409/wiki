@@ -1156,12 +1156,48 @@ class RunStore:
                     (int(event.get("seq", 0)) for event in normalized_events),
                     default=0,
                 )
+                record_dirty = False
                 if (
                     record.raw_event_count != raw_count
                     or record.normalized_event_count != normalized_count
                 ):
                     record.raw_event_count = raw_count
                     record.normalized_event_count = normalized_count
+                    record_dirty = True
+                # WIKI-232 REVIEW12 H1: legacy snapshots (schema_version < 2)
+                # were written before ``last_causal_raw_seq`` existed, so
+                # ``from_dict`` defaults it to 0. Left unseeded, the
+                # rebuild below would treat every historical lifecycle
+                # row as "not yet applied" and replay it — a run that
+                # was persisted as BLOCKED (via ``store.transition`` or
+                # ``mark_automatic_resume_failed``) after a prior
+                # ``turn/completed`` -> IDLE and ``turn/started`` ->
+                # WORKING would get its BLOCKED, ``state_reason``, and
+                # ``recovery_from_state`` wiped when the walk re-applied
+                # the pre-BLOCKED lifecycle history. Derive the boundary
+                # from the legacy ``last_lifecycle_event_seq`` marker
+                # (still persisted in the old schema) by mapping it to
+                # the max raw_seq of any normalized event at or below
+                # that normalized checkpoint. Anything past the boundary
+                # is genuinely new and still applies.
+                if (
+                    "last_causal_raw_seq" not in value
+                    and record.last_lifecycle_event_seq > 0
+                    and record.last_causal_raw_seq == 0
+                ):
+                    legacy_boundary = max(
+                        (
+                            int(event.get("raw_seq", 0))
+                            for event in normalized_events
+                            if int(event.get("seq", 0))
+                            <= record.last_lifecycle_event_seq
+                        ),
+                        default=0,
+                    )
+                    if legacy_boundary > 0:
+                        record.last_causal_raw_seq = legacy_boundary
+                        record_dirty = True
+                if record_dirty:
                     self._write_record(record)
                 # Rebuild every event-derived projection from scratch in
                 # raw_seq order so a post-recovery boot cannot resurrect
@@ -2061,25 +2097,31 @@ class RunStore:
                 record.disposition_counts.get(disposition.value, 0) + 1
             )
             # A stale-order recovery (``_normalize_orphan_raw_events``
-            # replaying a raw row whose raw_seq sits below the max
-            # already applied) must not mutate any order-sensitive
+            # replaying a raw row whose raw_seq sits strictly below the
+            # max already applied) must not mutate any order-sensitive
             # projection. Applying it would let a raw_seq=1 orphan
             # approval re-add a pending_request that raw_seq=2
             # serverRequest/resolved already cleared, or flip an idle
             # run back to working after turn/completed already landed.
             # The suppression covers every later causal event, not just
-            # lifecycle (WIKI-232 REVIEW11 H1). The durable JSONL row
-            # and disposition tally still land unconditionally so
+            # lifecycle (WIKI-232 REVIEW11 H1). Same-raw_seq additional
+            # normalized rows (one raw event can fan out into several
+            # normalized surfaces — see unread-sequence tests) are
+            # applied in normalized order so live and rebuild agree
+            # (WIKI-232 REVIEW12 M2). The durable JSONL row and
+            # disposition tally still land unconditionally so
             # observability and replay are complete.
-            if raw_seq > record.last_causal_raw_seq:
-                record.last_causal_raw_seq = raw_seq
+            if raw_seq >= record.last_causal_raw_seq:
+                if raw_seq > record.last_causal_raw_seq:
+                    record.last_causal_raw_seq = raw_seq
                 # Unread advances only on genuinely worker-authored surface
                 # events (see _is_unread_worthy). Synthetic supervisor wakes,
                 # outbound client_message rows, provider-lifecycle
                 # boundaries, and user inbound echoes all leave the counter
                 # alone.
                 if _is_unread_worthy(kind, payload, disposition.value):
-                    record.unread_event_seq = int(envelope["seq"])
+                    if int(envelope["seq"]) > record.unread_event_seq:
+                        record.unread_event_seq = int(envelope["seq"])
                 changed, snapshot = _current_turn_diff_update(record, envelope)
                 if changed:
                     self._write_current_turn_diff_snapshot(run_id, snapshot)

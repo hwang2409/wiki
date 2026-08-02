@@ -1411,6 +1411,213 @@ class FleetMonitorTests(unittest.IsolatedAsyncioTestCase):
             receipt_after_replay.command_hash, receipt.command_hash
         )
 
+    async def test_journal_write_failure_blocks_dispatch_until_durable(
+        self,
+    ) -> None:
+        """WIKI-232 REVIEW12 M1: ``_persist_pending_messages`` used to
+        swallow disk-write failures, letting ``_emit`` dispatch a
+        time-dependent staleness / graph-health payload whose only
+        stable copy lived in memory. After a daemon restart, the fresh
+        monitor rebuilds a different elapsed-time text under the same
+        ``fleet_monitor_request_id`` and the command log rejects every
+        retry with ``CommandConflict``. Persistence MUST be part of
+        the dispatch commit boundary: if the journal write fails, skip
+        ``send_now`` until the payload is durable, then let a later
+        tick (or restart) build a fresh entry and retry.
+
+        Inject an ``_atomic_write_json`` failure on the first tick,
+        verify no provider delivery lands and no conflicting intent
+        gets recorded. Advance the clock so the recomputed staleness
+        text would differ. Bring up a fresh ``FleetMonitor`` (the
+        journal file was never written on the first tick), tick again
+        with the write path restored, and prove exactly one provider
+        delivery lands under a single, terminal-ok receipt with no
+        ``CommandConflict``."""
+
+        from backend.app.agent_runtime import fleet_monitor as fm_module
+        from backend.app.agent_runtime.command_log import CommandConflict
+
+        await self._spawn("WIKI-ORCH", role="orchestrator", orch=None)
+        await self._spawn("WIKI-232-M1", role="implement", orch="WIKI-ORCH")
+
+        mtime = self.clock.now - 1900.0
+        _write_status(
+            self.store,
+            "WIKI-232-M1",
+            {"state": "working", "pr": None, "step": "coding", "blocker": None},
+            mtime=mtime,
+        )
+
+        supervisor = self.supervisor
+        dispatched: list[tuple[str, str, str | None]] = []
+
+        async def dispatch_send(
+            run_id: str,
+            message: str,
+            dedupe_key: str | None,
+            source: str | None = None,
+        ):
+            dispatched.append((run_id, message, dedupe_key))
+            return await supervisor.dispatch(
+                "run/send_now",
+                {
+                    "run_id": run_id,
+                    "text": message,
+                    "dedupe_key": fleet_monitor_message_dedupe_key(
+                        run_id, dedupe_key
+                    ),
+                    "source": source,
+                    "request_id": fleet_monitor_request_id(run_id, dedupe_key),
+                },
+            )
+
+        original_atomic_write = fm_module._atomic_write_json
+
+        first_monitor = FleetMonitor(
+            self.store,
+            dispatch_send,
+            clock=self.clock,
+            interval=0.01,
+            unrouted_verdict_realarm=300.0,
+            review_gap_threshold=300.0,
+            review_gap_realarm=600.0,
+            staleness_threshold=1800.0,
+            ownership_lock=self.supervisor._agent_lock,  # noqa: SLF001
+        )
+        journal_path = first_monitor._pending_messages_path  # noqa: SLF001
+        self.assertFalse(journal_path.exists())
+
+        write_attempts: list[Path] = []
+
+        def failing_atomic_write(path: Path, value: Any) -> None:
+            write_attempts.append(Path(path))
+            raise OSError(28, "no space left on device", str(path))
+
+        with mock.patch.object(
+            fm_module, "_atomic_write_json", side_effect=failing_atomic_write
+        ):
+            first_notes = await first_monitor.tick()
+
+        # The failing write attempted persistence but returned no
+        # notification: dispatch must NOT run if the payload is not
+        # durable.
+        self.assertTrue(write_attempts, "persist must attempt the atomic write")
+        self.assertEqual(
+            [n for n in first_notes if n.event_type == "staleness"],
+            [],
+            "no staleness notification is dispatched when the journal "
+            "write fails",
+        )
+        self.assertEqual(
+            dispatched,
+            [],
+            "run/send_now must not fire until the pending journal is durable",
+        )
+        self.assertFalse(
+            journal_path.exists(),
+            "atomic_write failure must leave the journal untouched",
+        )
+        # In-memory add is rolled back so a same-process retry starts
+        # fresh with the current clock (no divergence from disk).
+        self.assertEqual(first_monitor._pending_messages, {})  # noqa: SLF001
+
+        worker_run_id = self.store.current_run_id("WIKI-232-M1")
+        assert worker_run_id is not None
+        # Verify the command log carries no conflicting intent for the
+        # request_id that the failed tick would have used.
+        expected_dedupe = f"staleness:{worker_run_id}:{int(mtime)}:1800"
+        orch_run_id = self.store.current_run_id("WIKI-ORCH")
+        assert orch_run_id is not None
+        request_id = fleet_monitor_request_id(orch_run_id, expected_dedupe)
+        self.assertIsNone(
+            self.store.command_log.receipt("run/send_now", request_id),
+            "no receipt should exist when the journal write failed",
+        )
+
+        # Advance the clock so the recomputed staleness text (in
+        # elapsed-minutes) would differ from any payload the failed
+        # tick had assembled. If the failed tick had leaked a payload
+        # into the command log, the restart would hit CommandConflict.
+        self.clock.advance(600)
+
+        # Fresh FleetMonitor (simulates a daemon restart). The journal
+        # file does not exist, so the restart cannot replay a stale
+        # payload from a prior successful tick either.
+        restarted_monitor = FleetMonitor(
+            self.store,
+            dispatch_send,
+            clock=self.clock,
+            interval=0.01,
+            unrouted_verdict_realarm=300.0,
+            review_gap_threshold=300.0,
+            review_gap_realarm=600.0,
+            staleness_threshold=1800.0,
+            ownership_lock=self.supervisor._agent_lock,  # noqa: SLF001
+        )
+        self.assertEqual(
+            restarted_monitor._pending_messages, {}  # noqa: SLF001
+        )
+
+        # Journal writes work again; the retry succeeds and dispatches
+        # exactly once with the freshly-computed message.
+        dispatched.clear()
+        try:
+            retry_notes = await restarted_monitor.tick()
+        except CommandConflict as exc:  # pragma: no cover - regression witness
+            self.fail(
+                "restarted monitor raised CommandConflict on retry after "
+                f"a failed journal write: {exc}"
+            )
+
+        staleness_notes = [n for n in retry_notes if n.event_type == "staleness"]
+        self.assertEqual(
+            len(staleness_notes),
+            1,
+            f"restarted tick must produce exactly one staleness dispatch: {staleness_notes}",
+        )
+        # Isolate the staleness-driven dispatches from unrelated
+        # notifications the same tick may fire (graph-health, unrouted-
+        # verdict). The invariant that must hold: for the staleness
+        # dedupe key the failed tick would have used, exactly one
+        # provider delivery lands.
+        staleness_dispatches = [
+            call for call in dispatched if call[2] == staleness_notes[0].dedupe_key
+        ]
+        self.assertEqual(
+            len(staleness_dispatches),
+            1,
+            "exactly one provider delivery for the staleness dedupe key "
+            "after the durable retry",
+        )
+        # The delivered message is the one the RESTARTED monitor
+        # computed from the current clock, not any leaked payload from
+        # the failed first tick.
+        self.assertEqual(
+            staleness_dispatches[0][1], staleness_notes[0].message
+        )
+
+        # The persisted journal now exists.
+        self.assertTrue(journal_path.exists())
+
+        # Terminal, ok receipt for the retry request_id — no conflict.
+        retry_request_id = fleet_monitor_request_id(
+            staleness_notes[0].orch_run_id, staleness_notes[0].dedupe_key
+        )
+        receipt = self.store.command_log.receipt(
+            "run/send_now", retry_request_id
+        )
+        self.assertIsNotNone(
+            receipt,
+            "durable retry must produce a terminal command-log receipt",
+        )
+        assert receipt is not None
+        self.assertTrue(
+            receipt.ok,
+            f"receipt for durable retry must be ok, got {receipt}",
+        )
+        # Sanity: original_atomic_write is untouched.
+        self.assertIs(fm_module._atomic_write_json, original_atomic_write)
+
     async def test_pending_message_survives_monitor_restart(self) -> None:
         """WIKI-232 REVIEW8 H2: an in-memory ``_pending_messages`` dict
         loses the original retry payload on monitor restart. The next

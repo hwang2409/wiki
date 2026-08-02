@@ -210,8 +210,10 @@ class RunRecord:
     # record. Any later ``append_normalized`` — including
     # ``_normalize_orphan_raw_events`` replaying a stale-order recovery
     # — writes the durable normalized row for observability but only
-    # mutates projections when ``raw_seq > last_causal_raw_seq``. This
-    # stops a raw_seq=1 orphan approval from re-adding a
+    # mutates projections when ``raw_seq >= last_causal_raw_seq``. Equal
+    # values let one raw event fan out into normalized rows in stable
+    # normalized-sequence order. This stops a raw_seq=1 orphan approval
+    # from re-adding a
     # pending_request that raw_seq=2 serverRequest/resolved already
     # cleared, and a raw_seq=1 orphan turn/started from flipping IDLE
     # back to WORKING after raw_seq=2 turn/completed already landed

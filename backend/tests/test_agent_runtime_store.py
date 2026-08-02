@@ -944,6 +944,133 @@ class RunStoreTests(unittest.TestCase):
             )
             self.assertEqual(restarted.get(record.run_id).pending_requests, {})
 
+    def test_legacy_snapshot_migration_preserves_external_blocked_state(
+        self,
+    ) -> None:
+        """WIKI-232 REVIEW12 H1: pre-``last_causal_raw_seq`` snapshots
+        lack the checkpoint. Without seeding it from the legacy
+        ``last_lifecycle_event_seq`` marker on load, the boot rebuild
+        replays every historical lifecycle event and destroys an
+        externally-driven BLOCKED state — the exact case is a run that
+        went WORKING -> IDLE via turn events, was then transitioned to
+        BLOCKED with a ``state_reason`` and ``recovery_from_state`` by
+        the recovery watcher (or ``mark_automatic_resume_failed``), and
+        is expected to stay BLOCKED after the daemon restarts. The
+        legacy migration must derive the applied raw boundary and
+        replay only rows past it."""
+
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            paths = _paths(root)
+            store = RunStore(paths)
+            record = store.create(_record(root))
+            # Seed the lifecycle history the review requires: prior
+            # WORKING (turn/started) then IDLE (turn/completed) — both
+            # legal for a run before the operator/watcher pins BLOCKED.
+            started = store.append_raw(
+                record.run_id,
+                provider="codex",
+                direction="provider",
+                payload={
+                    "method": "turn/started",
+                    "params": {"turn": {"turnId": "legacy-1"}},
+                },
+            )
+            store.append_normalized(
+                record.run_id,
+                raw_seq=started["seq"],
+                disposition=EventDisposition.RENDERED,
+                kind="turn_started",
+                payload={"method": "turn/started"},
+                lifecycle_state=LifecycleState.WORKING,
+            )
+            completed = store.append_raw(
+                record.run_id,
+                provider="codex",
+                direction="provider",
+                payload={
+                    "method": "turn/completed",
+                    "params": {
+                        "turn": {"turnId": "legacy-1", "status": "completed"}
+                    },
+                },
+            )
+            store.append_normalized(
+                record.run_id,
+                raw_seq=completed["seq"],
+                disposition=EventDisposition.RENDERED,
+                kind="turn_completed",
+                payload={"status": "completed"},
+                lifecycle_state=LifecycleState.IDLE,
+            )
+            # External transition after the events — pins BLOCKED with
+            # state_reason and recovery_from_state.
+            store.transition(
+                record.run_id,
+                LifecycleState.BLOCKED,
+                reason="provider identity is uncertain after restart",
+            )
+            # Set recovery_from_state directly to mirror what
+            # ``mark_provider_pid_recovery_pending`` / ``mark_automatic_resume_failed``
+            # persist alongside the BLOCKED transition.
+            live = store.get(record.run_id)
+            live.recovery_from_state = LifecycleState.IDLE
+            store._write_record(live)  # noqa: SLF001 - external-transition fixture
+            live = store.get(record.run_id)
+            self.assertEqual(live.state, LifecycleState.BLOCKED)
+            self.assertEqual(
+                live.state_reason,
+                "provider identity is uncertain after restart",
+            )
+            self.assertEqual(
+                live.recovery_from_state, LifecycleState.IDLE
+            )
+
+            # Simulate the legacy on-disk shape: strip
+            # ``last_causal_raw_seq`` so the migration path has to
+            # derive it from ``last_lifecycle_event_seq``. Keep
+            # ``last_lifecycle_event_seq`` as the legacy schema wrote
+            # it (the normalized seq of the last applied lifecycle
+            # event — here the turn/completed row).
+            metadata = json.loads(
+                store.run_path(record.run_id).read_text(encoding="utf-8")
+            )
+            self.assertGreater(metadata.get("last_lifecycle_event_seq", 0), 0)
+            metadata.pop("last_causal_raw_seq", None)
+            store.run_path(record.run_id).write_text(
+                json.dumps(metadata),
+                encoding="utf-8",
+            )
+
+            restarted = RunStore(paths)
+            recovered = restarted.get(record.run_id)
+            # (a) External BLOCKED survives the migration.
+            self.assertEqual(
+                recovered.state,
+                LifecycleState.BLOCKED,
+                "legacy migration must not replay pre-BLOCKED lifecycle "
+                "history and overwrite the externally-pinned state",
+            )
+            # (b) state_reason survives.
+            self.assertEqual(
+                recovered.state_reason,
+                "provider identity is uncertain after restart",
+            )
+            # (c) recovery_from_state survives.
+            self.assertEqual(
+                recovered.recovery_from_state, LifecycleState.IDLE
+            )
+            # (d) The migration seeded last_causal_raw_seq from the
+            # legacy marker so future stale-order recoveries are still
+            # guarded — anything at or below the last applied raw_seq
+            # is treated as already-applied causal history.
+            self.assertGreaterEqual(
+                recovered.last_causal_raw_seq,
+                int(completed["seq"]),
+                "migration must seed last_causal_raw_seq from the "
+                "legacy last_lifecycle_event_seq boundary",
+            )
+
     def test_store_files_are_private_and_registry_keeps_legacy_shape(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)

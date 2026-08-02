@@ -246,6 +246,15 @@ class FleetMonitor:
         return loaded
 
     def _persist_pending_messages(self) -> None:
+        """Write the in-memory pending journal atomically.
+
+        Raises on failure so the caller can decide whether a durable
+        commit boundary depends on it (``_emit`` MUST skip dispatch
+        when this raises — WIKI-232 REVIEW12 M1) or whether the write
+        is best-effort cleanup (``_reconcile_worker_state`` and
+        ``_reset_agent_state`` catch and log).
+        """
+
         entries = [
             {
                 "agent_id": identity[0],
@@ -260,17 +269,25 @@ class FleetMonitor:
                 self._pending_messages_path.unlink()
             except FileNotFoundError:
                 return
-            except OSError:
-                logger.exception(
-                    "fleet_monitor: failed to remove pending messages file %s",
-                    self._pending_messages_path,
-                )
             return
+        _atomic_write_json(self._pending_messages_path, {"entries": entries})
+
+    def _persist_pending_messages_best_effort(self) -> None:
+        """Cleanup-path persist: log and swallow write failures.
+
+        Reconcile-driven persists (archived-run purge, replacement
+        agent reset) prune stale entries. Losing that write is a
+        cleanup hygiene issue, not a commit-boundary violation, so it
+        must not crash the tick or interfere with subsequent dispatch
+        attempts.
+        """
+
         try:
-            _atomic_write_json(self._pending_messages_path, {"entries": entries})
+            self._persist_pending_messages()
         except Exception:
             logger.exception(
-                "fleet_monitor: failed to persist pending messages to %s",
+                "fleet_monitor: best-effort persist of pending messages "
+                "to %s failed; retrying next reconcile",
                 self._pending_messages_path,
             )
 
@@ -345,7 +362,7 @@ class FleetMonitor:
             if current_run_ids.get(identity[0]) == identity[1]
         }
         if pending_before.keys() != self._pending_messages.keys():
-            self._persist_pending_messages()
+            self._persist_pending_messages_best_effort()
 
     def _reset_agent_state(
         self, agent_id: str, *, keep_run_id: str | None = None
@@ -368,7 +385,7 @@ class FleetMonitor:
             if identity[0] != agent_id or identity[1] == keep_run_id
         }
         if pending_before.keys() != self._pending_messages.keys():
-            self._persist_pending_messages()
+            self._persist_pending_messages_best_effort()
 
     def _collect_views(self) -> list[_WorkerView]:
         views: list[_WorkerView] = []
@@ -704,8 +721,32 @@ class FleetMonitor:
                 return None
             existing_pending = self._pending_messages.get(dedupe_identity)
             if existing_pending is None:
+                # The message payload MUST be durable before dispatch:
+                # ``fleet_monitor_request_id`` is time-independent, but
+                # staleness / graph-health text depends on ``wall_now``.
+                # If the journal write fails and dispatch runs anyway, a
+                # restart or later tick rebuilds a different text under
+                # the SAME request_id and the command log rejects every
+                # retry with ``CommandConflict``. Persist first, and
+                # skip dispatch until the payload is durable. The next
+                # tick rebuilds a fresh entry from the current clock and
+                # retries the persist (WIKI-232 REVIEW12 M1).
                 self._pending_messages[dedupe_identity] = message
-                self._persist_pending_messages()
+                try:
+                    self._persist_pending_messages()
+                except Exception:
+                    logger.exception(
+                        "fleet_monitor: pending message journal write "
+                        "for %s failed; skipping dispatch until the "
+                        "payload is durable",
+                        dedupe_identity,
+                    )
+                    # Roll the in-memory add back so the next tick
+                    # starts fresh with the current clock; leaving it
+                    # in memory would let a same-process retry dispatch
+                    # a payload the restart path cannot reproduce.
+                    self._pending_messages.pop(dedupe_identity, None)
+                    return None
                 stable_message = message
             else:
                 stable_message = existing_pending
