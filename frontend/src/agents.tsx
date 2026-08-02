@@ -1,4 +1,4 @@
-import { useEffect, useRef, useState, type FormEvent, type ReactNode } from "react";
+import { Fragment, useEffect, useRef, useState, type FormEvent, type ReactNode } from "react";
 import {
   AlertTriangle,
   Archive,
@@ -2635,7 +2635,7 @@ export function AgentsSidebar({
     return latest > viewed;
   };
 
-  const workerRow = (worker: AgentWorker, owned: boolean) => {
+  const workerRow = (worker: AgentWorker, owned: boolean, num?: number) => {
     const unread = hasUnread(worker);
     const failed = worker.run_id ? viewedFailed[worker.run_id] === true : false;
     const stateKey = worker.state ?? "unknown";
@@ -2649,6 +2649,11 @@ export function AgentsSidebar({
         title={failed ? "Failed to persist read state to the server" : undefined}
         {...dragProps(worker.ticket)}
       >
+        {num !== undefined ? (
+          <span aria-hidden="true" className="nav-agent-num tabular-nums">
+            {num}
+          </span>
+        ) : null}
         {unread ? (
           <>
             <span aria-hidden="true" className="nav-agent-unread" data-testid="nav-agent-unread" />
@@ -2719,13 +2724,55 @@ export function AgentsSidebar({
       return ageA - ageB;
     });
   const orderedOrchestrators = [...orchestrators].sort((a, b) => a.id.localeCompare(b.id));
+  const ownedByOrch = new Map(
+    orderedOrchestrators.map((orch) => [
+      orch.id,
+      attentionOrder(workers.filter((worker) => worker.orch === orch.id)),
+    ])
+  );
   const ungrouped = attentionOrder(
     workers.filter(
       (worker) => !worker.orch || !orchestrators.some((orch) => orch.id === worker.orch)
     )
   );
   const hasActive = orderedOrchestrators.length > 0 || workers.length > 0;
-  const hasHistory = archived.length > 0;
+
+  // opencode-style gutter numbers: one running sequence over session rows
+  // (workers then archived), skipping orchestrator parent rows.
+  let seq = 0;
+  const workerNumbers = new Map<string, number>();
+  for (const orch of orderedOrchestrators) {
+    for (const worker of ownedByOrch.get(orch.id) ?? []) {
+      workerNumbers.set(worker.ticket, ++seq);
+    }
+  }
+  for (const worker of ungrouped) workerNumbers.set(worker.ticket, ++seq);
+  const archivedNumbers = new Map<string, number>();
+  for (const entry of archived) {
+    archivedNumbers.set(`${entry.ticket}-${entry.archived_at}`, ++seq);
+  }
+
+  const historyGroups: { label: string; entries: ArchivedWorker[] }[] = [];
+  {
+    const now = new Date();
+    const startOfDay = (offsetDays: number) =>
+      new Date(now.getFullYear(), now.getMonth(), now.getDate() - offsetDays).getTime();
+    const today = startOfDay(0);
+    const yesterday = startOfDay(1);
+    for (const entry of archived) {
+      const at = Date.parse(entry.archived_at);
+      const label = Number.isNaN(at)
+        ? "Earlier"
+        : at >= today
+          ? "Today"
+          : at >= yesterday
+            ? "Yesterday"
+            : "Earlier";
+      const group = historyGroups.find((candidate) => candidate.label === label);
+      if (group) group.entries.push(entry);
+      else historyGroups.push({ label, entries: [entry] });
+    }
+  }
 
   return (
     <div className="nav-agents">
@@ -2743,33 +2790,38 @@ export function AgentsSidebar({
       {orderedOrchestrators.map((orch) => (
         <div key={orch.id}>
           {orchestratorRow(orch)}
-          {attentionOrder(workers.filter((worker) => worker.orch === orch.id)).map(
-            (worker) => workerRow(worker, true)
+          {(ownedByOrch.get(orch.id) ?? []).map((worker) =>
+            workerRow(worker, true, workerNumbers.get(worker.ticket))
           )}
         </div>
       ))}
-      {ungrouped.map((worker) => workerRow(worker, false))}
-      {hasHistory ? (
-        <div
-          className="nav-agents-group-title"
-          data-testid="nav-agents-group-history"
-        >
-          <span>History</span>
-          <span className="nav-agents-group-count tabular-nums">{archived.length}</span>
-        </div>
-      ) : null}
-      {archived.map((entry) => (
-        <button
-          className={`nav-agent is-archived${activeTicket === entry.ticket ? " is-active" : ""}`}
-          data-state="archived"
-          key={`${entry.ticket}-${entry.archived_at}`}
-          type="button"
-          onClick={() => onOpen(entry.ticket)}
-        >
-          <span className="nav-agent-ticket">{entry.ticket}</span>
-          <span className="nav-agent-meta" data-state="archived">{entry.outcome ?? entry.state ?? ""}</span>
-          <span className="nav-agent-age tabular-nums">{archivedAge(entry.archived_at)}</span>
-        </button>
+      {ungrouped.map((worker) => workerRow(worker, false, workerNumbers.get(worker.ticket)))}
+      {historyGroups.map((group, groupIndex) => (
+        <Fragment key={group.label}>
+          <div
+            className="nav-agents-group-title"
+            data-testid={groupIndex === 0 ? "nav-agents-group-history" : undefined}
+          >
+            <span>{group.label}</span>
+            <span className="nav-agents-group-count tabular-nums">{group.entries.length}</span>
+          </div>
+          {group.entries.map((entry) => (
+            <button
+              className={`nav-agent is-archived${activeTicket === entry.ticket ? " is-active" : ""}`}
+              data-state="archived"
+              key={`${entry.ticket}-${entry.archived_at}`}
+              type="button"
+              onClick={() => onOpen(entry.ticket)}
+            >
+              <span aria-hidden="true" className="nav-agent-num tabular-nums">
+                {archivedNumbers.get(`${entry.ticket}-${entry.archived_at}`)}
+              </span>
+              <span className="nav-agent-ticket">{entry.ticket}</span>
+              <span className="nav-agent-meta" data-state="archived">{entry.outcome ?? entry.state ?? ""}</span>
+              <span className="nav-agent-age tabular-nums">{archivedAge(entry.archived_at)}</span>
+            </button>
+          ))}
+        </Fragment>
       ))}
     </div>
   );

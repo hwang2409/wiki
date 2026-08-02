@@ -1,6 +1,7 @@
 export const THEME_STORAGE_KEY = "wiki-theme";
 
 export type ThemeFamilyId =
+  | "opencode"
   | "mono"
   | "gruvbox"
   | "vscode"
@@ -12,6 +13,7 @@ export type ThemeFamilyId =
   | "catppuccin";
 export type ThemePolarity = "light" | "dark";
 export type ThemeId =
+  | "opencode"
   | "mono-light"
   | "mono-dark"
   | "gruvbox-dark"
@@ -33,9 +35,16 @@ export interface ThemeDefinition {
   preview: readonly [string, string, string, string];
 }
 
-export const DEFAULT_THEME: ThemeId = "mono-light";
+export const DEFAULT_THEME: ThemeId = "opencode";
 
 export const THEMES: readonly ThemeDefinition[] = [
+  {
+    id: "opencode",
+    label: "OpenCode",
+    family: "opencode",
+    polarity: "dark",
+    preview: ["#1e1e17", "#2c2c21", "#35352a", "#b18bf4"],
+  },
   {
     id: "mono-light",
     label: "Mono Light",
@@ -124,6 +133,7 @@ export const THEMES: readonly ThemeDefinition[] = [
 
 const THEME_BY_ID = new Map(THEMES.map((theme) => [theme.id, theme]));
 const FAMILY_VARIANTS: Record<ThemeFamilyId, Partial<Record<ThemePolarity, ThemeId>>> = {
+  opencode: { dark: "opencode" },
   mono: { light: "mono-light", dark: "mono-dark" },
   gruvbox: { light: "gruvbox-light", dark: "gruvbox-dark" },
   vscode: { dark: "vscode-dark-plus" },

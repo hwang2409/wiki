@@ -861,6 +861,8 @@ function SessionModelFooter({
 
   return (
     <span className="session-model-control">
+      <span className="session-footer-kind">{kind}</span>
+      <span aria-hidden="true" className="session-footer-sep">·</span>
       <span className={`session-model-badge${desiredModel ? " has-queued" : ""}`}>
         <button
           aria-expanded={open}
@@ -2852,6 +2854,22 @@ export function SessionTab({
       )}
       <div className="session-footer tabular-nums">
         <SessionModelFooter session={session} ticket={ticket} />
+        {subagent || !showComposer ? null : (
+          <div aria-hidden="true" className="session-footer-hints">
+            <span className="session-hint">
+              <span className="session-hint-key">enter</span> send
+            </span>
+            <span className="session-hint">
+              {/* Mirrors the composer handler: Shift+Enter queues only while
+                  the agent is working; when idle it inserts a newline. */}
+              <span className="session-hint-key">shift+enter</span>{" "}
+              {session.working ? "queue" : "newline"}
+            </span>
+            <span className="session-hint">
+              <span className="session-hint-key">esc</span> vim
+            </span>
+          </div>
+        )}
       </div>
       </div>
     </QuestionUiContext.Provider>
