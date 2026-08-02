@@ -3652,6 +3652,29 @@ Preserve the same identity, role, worktree, orchestrator grouping, PR gates, and
             if pending_id is not None and not any(
                 item.get("pending_id") == pending_id for item in remaining
             ):
+                # WIKI-232 R4 H1: the inline drain removes the queue head
+                # BOTH on successful delivery and on a failed
+                # ``adapter.send_on_idle`` (uncertain-acknowledged path in
+                # ``_deliver_next_queued_locked``). Queue-slot removal is
+                # therefore not proof of provider acceptance. Consult the
+                # terminal steer effect and mirror ITS result — only report
+                # ``sent`` when delivery was accepted or observed.
+                terminal = self.store.command_log.steer_effect_for_pending(
+                    run_id, pending_id
+                )
+                if (
+                    terminal is not None
+                    and terminal["status"] in {"sent", "acknowledged"}
+                ):
+                    terminal_result = terminal.get("result")
+                    if isinstance(terminal_result, dict):
+                        enriched = dict(terminal_result)
+                        if (
+                            dedupe_key is not None
+                            and "dedupe_key" not in enriched
+                        ):
+                            enriched["dedupe_key"] = dedupe_key
+                        return enriched
                 return {
                     "status": "sent",
                     "pending_id": pending_id,

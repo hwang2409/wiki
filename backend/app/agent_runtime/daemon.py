@@ -42,6 +42,35 @@ def fleet_monitor_request_id(run_id: str, dedupe_key: str | None) -> str:
     return f"fleet-monitor:{digest}"
 
 
+def fleet_monitor_message_dedupe_key(
+    run_id: str, dedupe_key: str | None
+) -> str | None:
+    """Scope the transport ``dedupe_key`` to the target orchestrator run.
+
+    ``RunStore.replace`` copies ``message_dedupe_keys`` from the old run to
+    the replacement so a mid-flight composer retry stays idempotent. Several
+    FleetMonitor alarm keys are stable across daemon boots and across
+    replacements (staleness / unrouted-verdict / graph-health hash only the
+    ticket + event). After replacement, the same alarm therefore lands on
+    an already-claimed dedupe entry inherited from the old run's effect,
+    ``claim_message_dedupe_key`` rejects the different owner, and the
+    dispatch returns ``deduplicated`` without ever calling the provider
+    (WIKI-232 R4 H2).
+
+    Bind the transport dedupe_key to ``(run_id, dedupe_key)`` at the
+    callback layer. Within a single run, retries of the same alarm still
+    collapse to one delivery; across replacement, the replacement run's
+    dedupe namespace is disjoint so the new orchestrator gets exactly one
+    fresh delivery of an already-fired alarm.
+    """
+
+    if dedupe_key is None:
+        return None
+    payload = f"{run_id or ''}:{dedupe_key}"
+    digest = hashlib.sha256(payload.encode("utf-8")).hexdigest()[:32]
+    return f"fleet-monitor:{digest}"
+
+
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Wiki headless agent supervisor")
     parser.add_argument("--runtime-dir")
@@ -159,13 +188,18 @@ async def run_daemon(args: argparse.Namespace) -> None:
             # queue admission and provider delivery replays exactly once
             # instead of vanishing without a receipt. R3 H2 scopes the
             # request id to run_id so orchestrator replacement does not
-            # collide on the same dedupe_key.
+            # collide on the same dedupe_key. R4 H2 scopes the transport
+            # dedupe_key to run_id as well so replacements do not
+            # accidentally reuse an inherited dedupe entry from the old
+            # run and swallow the first post-replacement delivery.
             lambda run_id, message, dedupe_key, source: supervisor.dispatch(
                 "run/send_now",
                 {
                     "run_id": run_id,
                     "text": message,
-                    "dedupe_key": dedupe_key,
+                    "dedupe_key": fleet_monitor_message_dedupe_key(
+                        run_id, dedupe_key
+                    ),
                     "source": source,
                     "request_id": fleet_monitor_request_id(run_id, dedupe_key),
                 },

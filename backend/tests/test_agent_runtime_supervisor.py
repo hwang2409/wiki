@@ -1783,6 +1783,104 @@ class SupervisorTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(resolved["status"], "acknowledged")
         self.assertEqual(resolved["result"]["status"], "uncertain")
 
+    async def test_r4_send_on_idle_reports_uncertain_when_adapter_rejects(
+        self,
+    ) -> None:
+        """WIKI-232 R4 H1: dispatch-level surface. When the adapter is IDLE
+        and the inline drain's ``send_on_idle`` raises, the queue head is
+        removed as part of the uncertain-acknowledged termination in
+        ``_deliver_next_queued_locked``. Prior to the fix, ``_send_on_idle``
+        treated queue-slot removal as proof of provider acceptance and
+        returned ``status=sent``. CommandQueue then recorded a successful
+        sent receipt for a delivery that never touched the provider.
+        The dispatch must return the terminal steer effect's result
+        (``uncertain``) and the receipt must carry it forward."""
+
+        record = await self.supervisor.start_run(
+            agent_id="WIKI-232-R4A",
+            provider=ProviderKind.CODEX,
+            role="implement",
+            model="fixture-codex",
+            effort="high",
+            worktree=str(self.worktree),
+            prompt="r4 uncertain on-idle",
+        )
+        adapter = self.supervisor.adapters[record.run_id]
+        snapshot = adapter.snapshot()
+
+        # Force the adapter IDLE so ``_send_on_idle`` takes the inline
+        # drain branch. That's the only path that hits the buggy return
+        # site — a WORKING adapter would return ``queued`` instead.
+        idle = AdapterStatus(
+            LifecycleState.IDLE,
+            snapshot.session_id,
+            os.getpid(),
+            generation=snapshot.generation,
+        )
+        adapter._status = idle  # noqa: SLF001 - drain fixture
+        self.store.update_adapter_status(record.run_id, idle)
+
+        # Adapter rejects every inline delivery — mirrors a provider whose
+        # transport dropped between IDLE observation and the actual send.
+        original_send = adapter.send_on_idle
+        provider_calls: list[str] = []
+
+        async def rejecting_send(msg: str) -> AdapterStatus:
+            provider_calls.append(msg)
+            raise RuntimeError("simulated transport rejection")
+
+        adapter.send_on_idle = rejecting_send  # type: ignore[method-assign]
+        request_id = "r4-uncertain-1"
+        try:
+            result = await self.supervisor.dispatch(
+                "run/send_on_idle",
+                {
+                    "run_id": record.run_id,
+                    "text": "uncertain-me",
+                    "request_id": request_id,
+                },
+            )
+        finally:
+            adapter.send_on_idle = original_send  # type: ignore[method-assign]
+
+        # Dispatch return AND durable receipt both carry uncertain — proof
+        # that the caller sees the terminal steer effect, not a spurious
+        # ``sent``. The provider was called once (the failing attempt) and
+        # never again.
+        self.assertEqual(provider_calls, ["uncertain-me"])
+        self.assertEqual(
+            result.get("status"),
+            "uncertain",
+            f"dispatch must return uncertain when adapter rejects; got {result!r}",
+        )
+        receipt = self.store.command_log.receipt("run/send_on_idle", request_id)
+        self.assertIsNotNone(receipt, "dispatch must persist a receipt")
+        assert receipt is not None
+        self.assertTrue(
+            receipt.ok,
+            "the command itself succeeded (no exception); only the delivery is uncertain",
+        )
+        self.assertIsInstance(receipt.result, dict)
+        self.assertEqual(
+            receipt.result.get("status"),
+            "uncertain",
+            f"receipt.result must carry uncertain, got {receipt.result!r}",
+        )
+
+        # The queue head was removed by the inline drain's
+        # uncertain-acknowledged branch — that removal was the exact signal
+        # the buggy return path misread as delivery success.
+        self.assertEqual(self.store.queued_messages(record.run_id), [])
+
+        # The terminal steer effect matches the returned result.
+        terminal = self.store.command_log.steer_effect_for_pending(
+            record.run_id, result.get("pending_id"),
+        )
+        self.assertIsNotNone(terminal)
+        assert terminal is not None
+        self.assertEqual(terminal["status"], "acknowledged")
+        self.assertEqual(terminal["result"]["status"], "uncertain")
+
     async def test_delivered_pending_id_survives_replace_until_late_echo(self) -> None:
         record = await self.supervisor.start_run(
             agent_id="WIKI-96-REPLACE",

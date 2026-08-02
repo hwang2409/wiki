@@ -15,7 +15,10 @@ from unittest import mock
 
 from backend.app import workgraph, workgraph_service
 from backend.app.agent_runtime import graph_health
-from backend.app.agent_runtime.daemon import fleet_monitor_request_id
+from backend.app.agent_runtime.daemon import (
+    fleet_monitor_message_dedupe_key,
+    fleet_monitor_request_id,
+)
 from backend.app.agent_runtime.fake import FixtureAdapterFactory
 from backend.app.agent_runtime.fleet_monitor import FleetMonitor, Notification, _WorkerView
 from backend.app.agent_runtime.store import RunStore, RuntimePaths
@@ -1451,6 +1454,133 @@ class FleetMonitorTests(unittest.IsolatedAsyncioTestCase):
         self.assertLessEqual(
             len(fleet_monitor_request_id(replacement.run_id, stable_dedupe)),
             200,
+        )
+
+    async def test_replace_delivers_same_alarm_key_through_new_provider(self) -> None:
+        """WIKI-232 R4 H2: the SAME notification dedupe_key before and after
+        orchestrator replacement must reach the replacement provider. Round 3
+        only scoped ``request_id`` to run_id; the transport ``dedupe_key``
+        (which lands in ``message_dedupe_keys``) still collided because
+        ``RunStore.replace`` copies dedupe entries forward. A stable
+        FleetMonitor alarm therefore returned ``deduplicated`` post-
+        replacement with zero provider delivery.
+        Scope the transport dedupe_key to run_id as well — retries within
+        one run still dedupe, but replacement gives the new orchestrator a
+        fresh dedupe namespace for the same alarm."""
+
+        orch = await self._spawn("WIKI-ORCH", role="orchestrator", orch=None)
+        first_run_id = orch.run_id
+
+        # Match the production daemon exactly: scope BOTH request_id and
+        # transport dedupe_key at the callback layer.
+        supervisor = self.supervisor
+        callback_calls: list[tuple[str, str, str | None, str | None]] = []
+
+        async def dispatch_send(
+            run_id: str,
+            message: str,
+            dedupe_key: str | None,
+            source: str | None = None,
+        ) -> dict:
+            callback_calls.append((run_id, message, dedupe_key, source))
+            return await supervisor.dispatch(
+                "run/send_now",
+                {
+                    "run_id": run_id,
+                    "text": message,
+                    "dedupe_key": fleet_monitor_message_dedupe_key(
+                        run_id, dedupe_key
+                    ),
+                    "source": source,
+                    "request_id": fleet_monitor_request_id(run_id, dedupe_key),
+                },
+            )
+
+        # Alarm key is stable across orchestrator generations — e.g. a
+        # graph-health alarm hashes only the ticket + reason.
+        stable_alarm_key = "fleet:WIKI-ORCH:graph-health-blocking:no-reviewer"
+
+        # Fire the alarm through the FIRST run.
+        pre_provider = self.supervisor.adapters[first_run_id]
+        with mock.patch.object(
+            pre_provider, "send_now", wraps=pre_provider.send_now
+        ) as pre_send:
+            pre_result = await dispatch_send(
+                first_run_id,
+                "stable-alarm on pre-replacement run",
+                stable_alarm_key,
+                "fleet-monitor",
+            )
+        self.assertEqual(pre_result.get("status"), "sent")
+        self.assertEqual(pre_send.await_count, 1)
+
+        # Replace the orchestrator. RunStore.replace copies
+        # message_dedupe_keys forward — this is the surface the bug relied on.
+        replacement = await self.supervisor.replace(
+            first_run_id, "replacement orchestrator prompt"
+        )
+        self.assertNotEqual(replacement.run_id, first_run_id)
+
+        carried_keys = self.store.get(replacement.run_id).message_dedupe_keys
+        # The pre-replacement dedupe entry IS still carried forward — proof
+        # that the guarantee comes from scoping the transport key, not from
+        # zeroing the inherited state.
+        self.assertTrue(
+            any(entry.get("owner", "").startswith("run/send_now:") for entry in carried_keys),
+            f"expected inherited fleet-monitor dedupe claim; got {carried_keys!r}",
+        )
+
+        # Fire the SAME alarm key against the replacement run. The new
+        # provider must receive exactly one delivery — proof that the
+        # per-run dedupe namespace prevents the inherited claim from
+        # swallowing the first post-replacement send.
+        # The FixtureAdapter instance may be reused across runs; the
+        # invariant we care about is the send-count on the CURRENT provider
+        # for the replacement run.
+        post_provider = self.supervisor.adapters[replacement.run_id]
+        with mock.patch.object(
+            post_provider, "send_now", wraps=post_provider.send_now
+        ) as post_send:
+            post_result = await dispatch_send(
+                replacement.run_id,
+                "stable-alarm on replacement run",
+                stable_alarm_key,
+                "fleet-monitor",
+            )
+        self.assertEqual(
+            post_result.get("status"),
+            "sent",
+            f"replacement dispatch should deliver, got {post_result!r}",
+        )
+        self.assertEqual(
+            post_send.await_count,
+            1,
+            f"replacement provider must be called exactly once, got calls={post_send.call_args_list!r}",
+        )
+
+        # Both callbacks reused the identical alarm dedupe_key — this is the
+        # mutation-sensitive part the round-3 test missed.
+        self.assertEqual(len(callback_calls), 2)
+        self.assertEqual(callback_calls[0][2], stable_alarm_key)
+        self.assertEqual(callback_calls[1][2], stable_alarm_key)
+
+        # A same-run RETRY does not fire a second provider call. The
+        # matching (run_id, dedupe_key) yields both the same request_id
+        # (idempotent replay) AND the same transport dedupe key, so the
+        # retry short-circuits before touching the adapter.
+        with mock.patch.object(
+            post_provider, "send_now", wraps=post_provider.send_now
+        ) as retry_send:
+            await dispatch_send(
+                replacement.run_id,
+                "stable-alarm on replacement run",
+                stable_alarm_key,
+                "fleet-monitor",
+            )
+        self.assertEqual(
+            retry_send.await_count,
+            0,
+            "same-run retry must not double-send to the provider",
         )
 
     async def test_no_change_between_ticks_emits_nothing(self) -> None:
