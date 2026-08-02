@@ -6291,8 +6291,8 @@ def _review4_first_block_flags(data: bytes, identifier: int) -> int:
     raise AssertionError("fixture has no requested block")
 
 
-def _review6_displayed_block_count(data: bytes) -> int:
-    """Count source blocks that WebM marks as visible."""
+def _review6_visible_block_flag_count(data: bytes) -> int:
+    """Count blocks whose source Invisible flag is clear."""
     view = memoryview(data)
     ebml = webm_scrubber._read_element(view, 0, len(view))
     segment = webm_scrubber._read_element(view, ebml.body_end, len(view))
@@ -6428,6 +6428,79 @@ def _review4_block_group_webm(
         bytes(view[:ebml.body_end])
         + webm_scrubber._emit_element(
             webm_scrubber._ID_SEGMENT, bytes(segment_prefix) + cluster,
+        )
+    )
+
+
+def _review7_mixed_block_webm(
+    *,
+    block_kinds: tuple[str, ...],
+    cluster_timestamps: tuple[int, ...],
+    relative_timestamps: tuple[int, ...],
+) -> bytes:
+    if not (
+        len(block_kinds)
+        == len(cluster_timestamps)
+        == len(relative_timestamps)
+    ):
+        raise ValueError("mixed block fixture fields must have equal lengths")
+    base = _review2_webm()
+    view = memoryview(base)
+    ebml = webm_scrubber._read_element(view, 0, len(view))
+    segment = webm_scrubber._read_element(view, ebml.body_end, len(view))
+    segment_prefix = bytearray()
+    for child in webm_scrubber._iter_children(
+        view, segment.body_start, segment.body_end,
+    ):
+        if child.identifier not in (
+            webm_scrubber._ID_INFO,
+            webm_scrubber._ID_TRACKS,
+        ):
+            continue
+        child_start = child.body_start - child.id_width - child.size_width
+        segment_prefix.extend(view[child_start:child.body_end])
+
+    frame = _review2_first_frame(REAL_WEBM_VIDEO_ONLY.read_bytes(), 1)
+    clusters: list[bytes] = []
+    for block_kind, cluster_timestamp, relative_timestamp in zip(
+        block_kinds,
+        cluster_timestamps,
+        relative_timestamps,
+        strict=True,
+    ):
+        if block_kind not in ("simple", "group"):
+            raise ValueError(f"unsupported block kind {block_kind!r}")
+        block_payload = (
+            webm_scrubber._emit_vint_size(1)
+            + relative_timestamp.to_bytes(2, "big", signed=True)
+            + bytes([0x80 if block_kind == "simple" else 0])
+            + frame
+        )
+        if block_kind == "simple":
+            block = webm_scrubber._emit_element(
+                webm_scrubber._ID_SIMPLE_BLOCK, block_payload,
+            )
+        else:
+            block = webm_scrubber._emit_element(
+                webm_scrubber._ID_BLOCK_GROUP,
+                webm_scrubber._emit_element(
+                    webm_scrubber._ID_BLOCK, block_payload,
+                ),
+            )
+        clusters.append(
+            webm_scrubber._emit_element(
+                webm_scrubber._ID_CLUSTER,
+                webm_scrubber._emit_uint(
+                    webm_scrubber._ID_TIMESTAMP, cluster_timestamp,
+                )
+                + block,
+            )
+        )
+    return (
+        bytes(view[:ebml.body_end])
+        + webm_scrubber._emit_element(
+            webm_scrubber._ID_SEGMENT,
+            bytes(segment_prefix) + b"".join(clusters),
         )
     )
 
@@ -6613,22 +6686,23 @@ class WebmReview5MetadataAllowlistTests(unittest.TestCase):
             ],
         )
         info, tracks, cluster = segment_children
+        self.assertEqual(info.identifier, 0x1549A966)
         info_children = _review5_children(view, info)
         self.assertEqual(
             [child.identifier for child in info_children],
             [
-                webm_scrubber._ID_TIMESTAMP_SCALE,
-                webm_scrubber._ID_MUXING_APP,
-                webm_scrubber._ID_WRITING_APP,
+                0x2AD7B1,  # TimestampScale
+                0x4D80,  # MuxingApp
+                0x5741,  # WritingApp
             ],
         )
         self.assertEqual(
             bytes(view[info_children[1].body_start:info_children[1].body_end]),
-            webm_scrubber._WEBM_CANONICAL_APP,
+            b"wiki-webm-scrubber",
         )
         self.assertEqual(
             bytes(view[info_children[2].body_start:info_children[2].body_end]),
-            webm_scrubber._WEBM_CANONICAL_APP,
+            b"wiki-webm-scrubber",
         )
         tracks_children = _review5_children(view, tracks)
         self.assertEqual(
@@ -6672,6 +6746,37 @@ class WebmReview5MetadataAllowlistTests(unittest.TestCase):
             [webm_scrubber._ID_BLOCK, webm_scrubber._ID_BLOCK_DURATION],
         )
 
+    def test_info_with_duration_uses_literal_wire_ids_and_app_bytes(self) -> None:
+        result = media_scrub.scrub_video(
+            _review2_webm(duration_ticks=1.0),
+            "video/webm",
+        )
+        view = memoryview(result.data)
+        ebml = webm_scrubber._read_element(view, 0, len(view))
+        segment = webm_scrubber._read_element(view, ebml.body_end, len(view))
+        info = next(
+            child for child in _review5_children(view, segment)
+            if child.identifier == 0x1549A966  # Info
+        )
+        children = _review5_children(view, info)
+        self.assertEqual(
+            [child.identifier for child in children],
+            [
+                0x2AD7B1,  # TimestampScale
+                0x4489,  # Duration
+                0x4D80,  # MuxingApp
+                0x5741,  # WritingApp
+            ],
+        )
+        self.assertEqual(
+            bytes(view[children[2].body_start:children[2].body_end]),
+            b"wiki-webm-scrubber",
+        )
+        self.assertEqual(
+            bytes(view[children[3].body_start:children[3].body_end]),
+            b"wiki-webm-scrubber",
+        )
+
 
 class WebmReview4SimpleBlockFlagsTests(unittest.TestCase):
     @unittest.skipIf(FFMPEG is None, "ffmpeg not installed")
@@ -6711,11 +6816,13 @@ class WebmReview4SimpleBlockFlagsTests(unittest.TestCase):
                     "video/webm",
                 )
 
-    def test_invisible_source_cannot_gain_a_displayed_frame(self) -> None:
+    def test_invisible_source_has_one_visible_flag_and_public_scrub_rejects(
+        self,
+    ) -> None:
         original = REAL_WEBM_KEYFRAMES.read_bytes()
         invisible = _review4_mutate_first_simple_block_flags(original, 0x88)
-        self.assertEqual(_review6_displayed_block_count(original), 2)
-        self.assertEqual(_review6_displayed_block_count(invisible), 1)
+        self.assertEqual(_review6_visible_block_flag_count(original), 2)
+        self.assertEqual(_review6_visible_block_flag_count(invisible), 1)
         with self.assertRaisesRegex(
             media_scrub.MediaScrubError, "invisible frames",
         ):
@@ -6824,15 +6931,15 @@ class WebmReview5PresentationPolicyTests(unittest.TestCase):
         segment = webm_scrubber._read_element(view, ebml.body_end, len(view))
         tracks = next(
             child for child in _review5_children(view, segment)
-            if child.identifier == webm_scrubber._ID_TRACKS
+            if child.identifier == 0x1654AE6B  # Tracks
         )
         entry = next(
             child for child in _review5_children(view, tracks)
-            if child.identifier == webm_scrubber._ID_TRACK_ENTRY
+            if child.identifier == 0xAE  # TrackEntry
         )
         video = next(
             child for child in _review5_children(view, entry)
-            if child.identifier == webm_scrubber._ID_VIDEO
+            if child.identifier == 0xE0  # Video
         )
         return view, _review5_children(view, video)
 
@@ -6870,19 +6977,19 @@ class WebmReview5PresentationPolicyTests(unittest.TestCase):
         self.assertEqual(
             [child.identifier for child in children],
             [
-                webm_scrubber._ID_FLAG_INTERLACED,
-                webm_scrubber._ID_PIXEL_WIDTH,
-                webm_scrubber._ID_PIXEL_HEIGHT,
-                webm_scrubber._ID_DISPLAY_WIDTH,
-                webm_scrubber._ID_DISPLAY_HEIGHT,
-                webm_scrubber._ID_DISPLAY_UNIT,
-                webm_scrubber._ID_COLOUR,
+                0x9A,  # FlagInterlaced
+                0xB0,  # PixelWidth
+                0xBA,  # PixelHeight
+                0x54B0,  # DisplayWidth
+                0x54BA,  # DisplayHeight
+                0x54B2,  # DisplayUnit
+                0x55B0,  # Colour
             ],
         )
         colour_children = _review5_children(view, children[-1])
         self.assertEqual(
             [child.identifier for child in colour_children],
-            [webm_scrubber._ID_RANGE],
+            [0x55B9],  # Range
         )
         self.assertEqual(
             webm_scrubber._parse_uint(view, colour_children[0], "Range"),
@@ -7028,6 +7135,35 @@ class WebmReview4TimelineTests(unittest.TestCase):
             with self.subTest(size=len(payload)):
                 result = media_scrub.scrub_video(payload, "video/webm")
                 self.assertEqual((result.width, result.height), (160, 120))
+
+    def test_composed_cross_cluster_timestamps_share_one_mixed_block_timeline(
+        self,
+    ) -> None:
+        for block_kinds in (
+            ("simple", "group"),
+            ("group", "simple"),
+        ):
+            with self.subTest(block_kinds=block_kinds), self.assertRaisesRegex(
+                media_scrub.MediaScrubError, "must not decrease",
+            ):
+                media_scrub.scrub_video(
+                    _review7_mixed_block_webm(
+                        block_kinds=block_kinds,
+                        cluster_timestamps=(10, 11),
+                        relative_timestamps=(0, -2),
+                    ),
+                    "video/webm",
+                )
+
+            equal = media_scrub.scrub_video(
+                _review7_mixed_block_webm(
+                    block_kinds=block_kinds,
+                    cluster_timestamps=(10, 11),
+                    relative_timestamps=(0, -1),
+                ),
+                "video/webm",
+            )
+            self.assertEqual((equal.width, equal.height), (160, 120))
 
     def test_duration_rejects_nonpositive_and_accepts_smallest_positive(self) -> None:
         smallest_positive = math.nextafter(0.0, 1.0)
