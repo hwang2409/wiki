@@ -4,6 +4,7 @@ import { afterEach, beforeEach, describe, expect, test, vi } from "vitest";
 
 import type { SessionArtifact, SessionEvent } from "../src/api";
 import { VideoRenderer, AudioRenderer } from "../src/artifact-renderers";
+import { downloadName } from "../src/artifact-payload";
 
 const TICKET = "WIKI-190";
 
@@ -53,6 +54,22 @@ afterEach(() => {
 });
 
 describe("VideoRenderer", () => {
+  test("renders WebM through the native video path", () => {
+    const artifact: SessionArtifact = {
+      kind: "video",
+      mime: "video/webm",
+      ref: "artifact://webm",
+      width: 160,
+      height: 120,
+    };
+    const event = makeEvent(artifact, "webm");
+    render(<VideoRenderer artifact={artifact} event={event} ticket={TICKET} />);
+    const video = screen.getByLabelText("Fixture media") as HTMLVideoElement;
+    expect(video.tagName).toBe("VIDEO");
+    expect(video.getAttribute("src")).toContain("/artifact/webm");
+    expect(downloadName(event)).toBe("Fixture-media.webm");
+  });
+
   test("renders a native <video> with controls and preload=metadata", () => {
     const artifact: SessionArtifact = {
       kind: "video",

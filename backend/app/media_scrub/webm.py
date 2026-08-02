@@ -160,6 +160,21 @@ _WEBM_MAX_BLOCKS: Final = 1 << 20
 _WEBM_MAX_FRAME_SIZE: Final = 1 << 24
 _WEBM_MAX_FRAME_PIXELS: Final = 4096 * 4096
 _WEBM_MAX_DECODED_PIXELS: Final = 32 * 1024 * 1024
+_WEBM_MAX_DECODED_FRAMES: Final = 4096
+_WEBM_MIN_DECODE_PIXELS_PER_FRAME: Final = 160 * 120
+
+# Canonical single-frame Block flags. Rebuilt VP8 frames are keyframes,
+# visible, and not discardable. Block has no keyframe or discardable bit.
+_BLOCK_FLAG_INVISIBLE: Final = 0x08
+_BLOCK_FLAG_LACING: Final = 0x06
+_SIMPLE_BLOCK_FLAG_KEYFRAME: Final = 0x80
+_SIMPLE_BLOCK_FLAG_DISCARDABLE: Final = 0x01
+_SIMPLE_BLOCK_ALLOWED_FLAGS: Final = (
+    _SIMPLE_BLOCK_FLAG_KEYFRAME
+    | _BLOCK_FLAG_INVISIBLE
+    | _SIMPLE_BLOCK_FLAG_DISCARDABLE
+)
+_BLOCK_ALLOWED_FLAGS: Final = _BLOCK_FLAG_INVISIBLE
 
 # Track type in the supported WebM subset.
 _TRACK_TYPE_VIDEO: Final = 1
@@ -186,6 +201,8 @@ class _WebmTrack:
     kind: int
     codec_id: bytes
     enabled: bool
+    default: bool
+    default_duration_ns: int | None
     width: int | None
     height: int | None
 
@@ -193,18 +210,64 @@ class _WebmTrack:
 @dataclass
 class _WebmDecodeBudget:
     remaining_pixels: int
+    remaining_frames: int
 
     def charge(self, track: _WebmTrack) -> None:
         if track.kind != _TRACK_TYPE_VIDEO:
             return
         if track.width is None or track.height is None:  # pragma: no cover
             raise MediaScrubError("webm video track is missing dimensions")
-        pixels = track.width * track.height
+        if self.remaining_frames <= 0:
+            raise MediaScrubError(
+                f"webm decoded video exceeds {_WEBM_MAX_DECODED_FRAMES} frame budget"
+            )
+        pixels = max(
+            track.width * track.height,
+            _WEBM_MIN_DECODE_PIXELS_PER_FRAME,
+        )
         if pixels > self.remaining_pixels:
             raise MediaScrubError(
                 f"webm decoded video exceeds {_WEBM_MAX_DECODED_PIXELS} pixel budget"
             )
+        self.remaining_frames -= 1
         self.remaining_pixels -= pixels
+
+
+@dataclass(frozen=True)
+class _WebmTimeline:
+    timestamp_scale: int
+    declared_duration_ticks: float | None
+
+    def validate_block(
+        self,
+        cluster_timestamp: int,
+        relative_timestamp: int,
+        block_duration_ticks: int | None = None,
+        default_duration_ns: int | None = None,
+    ) -> None:
+        absolute_ticks = cluster_timestamp + relative_timestamp
+        if absolute_ticks < 0:
+            raise MediaScrubError("webm block absolute timestamp is negative")
+        if block_duration_ticks is not None and block_duration_ticks <= 0:
+            raise MediaScrubError("webm BlockDuration must be positive")
+        absolute_ns = absolute_ticks * self.timestamp_scale
+        duration_ns = (
+            block_duration_ticks * self.timestamp_scale
+            if block_duration_ticks is not None
+            else default_duration_ns or 0
+        )
+        end_ns = absolute_ns + duration_ns
+        max_duration_ns = _WEBM_MAX_DURATION_MS * 1_000_000
+        if end_ns > max_duration_ns:
+            raise MediaScrubError("webm block timeline exceeds seven-day cap")
+        if (
+            self.declared_duration_ticks is not None
+            and end_ns
+            > self.declared_duration_ticks * self.timestamp_scale
+        ):
+            raise MediaScrubError(
+                "webm block timeline exceeds declared Duration"
+            )
 
 
 def scrub_webm(data: bytes) -> MediaScrubResult:
@@ -500,7 +563,10 @@ def _rebuild_segment(
     tracks_bytes = b""
     clusters: list[bytes] = []
     framed_track_numbers: set[int] = set()
-    decode_budget = _WebmDecodeBudget(_WEBM_MAX_DECODED_PIXELS)
+    decode_budget = _WebmDecodeBudget(
+        _WEBM_MAX_DECODED_PIXELS,
+        _WEBM_MAX_DECODED_FRAMES,
+    )
     for child in children:
         cid = child.identifier
         if cid in (_ID_SEEK_HEAD, _ID_TAGS, _ID_ATTACHMENTS, _ID_CHAPTERS, _ID_CUES, _ID_VOID, _ID_CRC32):
@@ -516,11 +582,15 @@ def _rebuild_segment(
             tracks_seen = True
             tracks_bytes, tracks = _rebuild_tracks(view, child)
         elif cid == _ID_CLUSTER:
-            if not tracks_seen:
-                raise MediaScrubError("webm Cluster must follow Tracks")
+            if not info_seen or not tracks_seen:
+                raise MediaScrubError("webm Cluster must follow Info and Tracks")
             cluster_seen = True
             cluster_bytes, cluster_tracks = _rebuild_cluster(
-                view, child, tracks, decode_budget,
+                view,
+                child,
+                tracks,
+                decode_budget,
+                _WebmTimeline(timestamp_scale, duration_ticks),
             )
             clusters.append(cluster_bytes)
             framed_track_numbers.update(cluster_tracks)
@@ -535,41 +605,38 @@ def _rebuild_segment(
     if not cluster_seen:
         raise MediaScrubError("webm Segment missing at least one Cluster")
 
-    enabled_video_tracks = {
-        track.number
+    enabled_video_tracks = [
+        track
         for track in tracks
         if track.kind == _TRACK_TYPE_VIDEO and track.enabled
-    }
-    if not enabled_video_tracks:
+    ]
+    if len(enabled_video_tracks) != 1:
         raise MediaScrubError(
-            "webm video artifact requires an enabled supported video track"
+            "webm video artifact requires exactly one enabled video track"
         )
-    if not enabled_video_tracks.intersection(framed_track_numbers):
+    selected_track = enabled_video_tracks[0]
+    if any(
+        track.number != selected_track.number and track.default
+        for track in tracks
+    ):
         raise MediaScrubError(
-            "webm video artifact requires a validated frame for an enabled video track"
+            "webm non-selected video tracks cannot be default tracks"
+        )
+    if selected_track.number not in framed_track_numbers:
+        raise MediaScrubError(
+            "webm enabled video track requires a validated frame"
         )
 
     duration_ms: int | None = None
     if duration_ticks is not None:
-        duration_ms = int(round(duration_ticks * timestamp_scale / 1_000_000))
-        if duration_ms < 0 or duration_ms > _WEBM_MAX_DURATION_MS:
+        duration_ns = duration_ticks * timestamp_scale
+        if duration_ns < 0 or duration_ns > _WEBM_MAX_DURATION_MS * 1_000_000:
             raise MediaScrubError("webm duration exceeds scrubber cap")
+        duration_ms = int(round(duration_ns / 1_000_000))
 
-    width, height = _select_dimensions(tracks)
+    width, height = selected_track.width, selected_track.height
     body = info_bytes + tracks_bytes + b"".join(clusters)
     return body, width, height, duration_ms
-
-
-def _select_dimensions(tracks: list[_WebmTrack]) -> tuple[int | None, int | None]:
-    for track in tracks:
-        if (
-            track.kind == _TRACK_TYPE_VIDEO
-            and track.enabled
-            and track.width
-            and track.height
-        ):
-            return track.width, track.height
-    return None, None
 
 
 def _rebuild_info(
@@ -762,6 +829,10 @@ def _rebuild_track_entry(
             "webm V_VP8 does not accept CodecPrivate; sequence headers "
             "must ride in-band with the first keyframe"
         )
+    if default_duration is not None and not (
+        1 <= default_duration <= _WEBM_MAX_DURATION_MS * 1_000_000
+    ):
+        raise MediaScrubError("webm DefaultDuration exceeds seven-day cap")
 
     body = (
         _emit_uint(_ID_TRACK_NUMBER, number)
@@ -774,13 +845,22 @@ def _rebuild_track_entry(
         + _emit_element(_ID_LANGUAGE, b"und")
         + _emit_element(_ID_CODEC_ID, codec_id)
     )
-    if default_duration is not None and default_duration > 0:
+    if default_duration is not None:
         body += _emit_uint(_ID_DEFAULT_DURATION, default_duration)
     if video_bytes:
         body += video_bytes
     return (
         _emit_element(_ID_TRACK_ENTRY, body),
-        _WebmTrack(number, kind, codec_id, bool(flag_enabled), width, height),
+        _WebmTrack(
+            number,
+            kind,
+            codec_id,
+            bool(flag_enabled),
+            bool(flag_default),
+            default_duration,
+            width,
+            height,
+        ),
     )
 
 
@@ -968,25 +1048,35 @@ def _rebuild_cluster(
     cluster: _WebmElement,
     tracks: list[_WebmTrack],
     decode_budget: _WebmDecodeBudget,
+    timeline: _WebmTimeline,
 ) -> tuple[bytes, set[int]]:
     children = _iter_children(view, cluster.body_start, cluster.body_end)
-    timestamp_seen = False
-    timestamp = 0
+    timestamp_children = [
+        child for child in children if child.identifier == _ID_TIMESTAMP
+    ]
+    if not timestamp_children:
+        raise MediaScrubError("webm Cluster missing Timestamp")
+    if len(timestamp_children) != 1:
+        raise MediaScrubError("webm Cluster has duplicate Timestamp")
+    timestamp = _parse_uint(view, timestamp_children[0], "Cluster/Timestamp")
     block_count = 0
-    body = bytearray()
+    body = bytearray(_emit_uint(_ID_TIMESTAMP, timestamp))
     framed_track_numbers: set[int] = set()
     track_map = {track.number: track for track in tracks}
     for child in children:
         cid = child.identifier
         if cid == _ID_TIMESTAMP:
-            timestamp = _parse_uint(view, child, "Cluster/Timestamp")
-            timestamp_seen = True
-            body.extend(_emit_uint(_ID_TIMESTAMP, timestamp))
+            continue
         elif cid == _ID_SIMPLE_BLOCK:
             if block_count >= _WEBM_MAX_BLOCKS:
                 raise MediaScrubError("webm Cluster exceeds scrubber block cap")
             block_bytes, track_number = _rebuild_simple_block(
-                view, child, track_map, decode_budget,
+                view,
+                child,
+                track_map,
+                decode_budget,
+                timeline,
+                timestamp,
             )
             body.extend(block_bytes)
             framed_track_numbers.add(track_number)
@@ -995,7 +1085,12 @@ def _rebuild_cluster(
             if block_count >= _WEBM_MAX_BLOCKS:
                 raise MediaScrubError("webm Cluster exceeds scrubber block cap")
             group_bytes, track_number = _rebuild_block_group(
-                view, child, track_map, decode_budget,
+                view,
+                child,
+                track_map,
+                decode_budget,
+                timeline,
+                timestamp,
             )
             body.extend(group_bytes)
             framed_track_numbers.add(track_number)
@@ -1008,8 +1103,6 @@ def _rebuild_cluster(
             raise MediaScrubError(
                 f"webm Cluster child 0x{cid:x} outside allowlist"
             )
-    if not timestamp_seen:
-        raise MediaScrubError("webm Cluster missing Timestamp")
     if block_count == 0:
         raise MediaScrubError("webm Cluster contains no SimpleBlock or BlockGroup")
     return _emit_element(_ID_CLUSTER, bytes(body)), framed_track_numbers
@@ -1020,8 +1113,10 @@ def _rebuild_simple_block(
     block: _WebmElement,
     track_map: dict[int, _WebmTrack],
     decode_budget: _WebmDecodeBudget,
+    timeline: _WebmTimeline,
+    cluster_timestamp: int,
 ) -> tuple[bytes, int]:
-    payload, track_number, frame_offset = _parse_block_body(
+    payload, track_number, frame_offset, relative_timestamp = _parse_block_body(
         view, block, block_label="SimpleBlock",
     )
     track = track_map.get(track_number)
@@ -1029,6 +1124,11 @@ def _rebuild_simple_block(
         raise MediaScrubError(
             f"webm SimpleBlock references unknown TrackNumber {track_number}"
         )
+    timeline.validate_block(
+        cluster_timestamp,
+        relative_timestamp,
+        default_duration_ns=track.default_duration_ns,
+    )
     frame = _rebuild_frame_bytes(
         track, payload[frame_offset:], "SimpleBlock", decode_budget,
     )
@@ -1041,19 +1141,26 @@ def _rebuild_block_group(
     group: _WebmElement,
     track_map: dict[int, _WebmTrack],
     decode_budget: _WebmDecodeBudget,
+    timeline: _WebmTimeline,
+    cluster_timestamp: int,
 ) -> tuple[bytes, int]:
     children = _iter_children(view, group.body_start, group.body_end)
     block_bytes: bytes | None = None
     duration: int | None = None
-    reference: int | None = None
-    discard_padding: int | None = None
     block_track_number: int | None = None
+    block_relative_timestamp: int | None = None
+    block_track: _WebmTrack | None = None
     for child in children:
         cid = child.identifier
         if cid == _ID_BLOCK:
             if block_bytes is not None:
                 raise MediaScrubError("webm BlockGroup has duplicate Block")
-            payload, track_number, frame_offset = _parse_block_body(
+            (
+                payload,
+                track_number,
+                frame_offset,
+                relative_timestamp,
+            ) = _parse_block_body(
                 view, child, block_label="Block",
             )
             track = track_map.get(track_number)
@@ -1066,12 +1173,22 @@ def _rebuild_block_group(
             )
             block_bytes = _emit_element(_ID_BLOCK, payload[:frame_offset] + frame)
             block_track_number = track_number
+            block_relative_timestamp = relative_timestamp
+            block_track = track
         elif cid == _ID_BLOCK_DURATION:
+            if duration is not None:
+                raise MediaScrubError("webm BlockGroup has duplicate BlockDuration")
             duration = _parse_uint(view, child, "BlockDuration")
         elif cid == _ID_REFERENCE_BLOCK:
-            reference = _parse_signed_int(view, child, "ReferenceBlock")
+            _parse_signed_int(view, child, "ReferenceBlock")
+            raise MediaScrubError(
+                "webm ReferenceBlock is outside the VP8 keyframe-only subset"
+            )
         elif cid == _ID_DISCARD_PADDING:
-            discard_padding = _parse_signed_int(view, child, "DiscardPadding")
+            _parse_signed_int(view, child, "DiscardPadding")
+            raise MediaScrubError(
+                "webm DiscardPadding is outside the video-only subset"
+            )
         elif cid in (_ID_BLOCK_ADDITIONS, _ID_VOID, _ID_CRC32):
             continue
         else:
@@ -1080,13 +1197,17 @@ def _rebuild_block_group(
             )
     if block_bytes is None:
         raise MediaScrubError("webm BlockGroup missing Block")
+    assert block_relative_timestamp is not None
+    assert block_track is not None
+    timeline.validate_block(
+        cluster_timestamp,
+        block_relative_timestamp,
+        block_duration_ticks=duration,
+        default_duration_ns=block_track.default_duration_ns,
+    )
     body = bytearray(block_bytes)
     if duration is not None:
         body.extend(_emit_uint(_ID_BLOCK_DURATION, duration))
-    if reference is not None:
-        body.extend(_emit_signed_int(_ID_REFERENCE_BLOCK, reference))
-    if discard_padding is not None:
-        body.extend(_emit_signed_int(_ID_DISCARD_PADDING, discard_padding))
     assert block_track_number is not None
     return _emit_element(_ID_BLOCK_GROUP, bytes(body)), block_track_number
 
@@ -1118,12 +1239,11 @@ def _emit_signed_int(identifier: int, value: int) -> bytes:
 
 def _parse_block_body(
     view: memoryview, block: _WebmElement, *, block_label: str,
-) -> tuple[bytes, int, int]:
+) -> tuple[bytes, int, int, int]:
     """Rebuild a Block or SimpleBlock envelope from validated header fields.
 
-    Returns the rebuilt payload, the parsed track number, and the byte
-    offset within the rebuilt payload where the codec frame body begins
-    (so the caller can hand it to a per-codec validator).
+    Returns the rebuilt payload, parsed track number, frame offset, and
+    signed timestamp relative to the Cluster.
 
     Layout: VINT track number, int16 timestamp (relative to Cluster), one
     flag byte, then a single frame body. Lacing (flag bits 1..3 non-zero)
@@ -1140,18 +1260,22 @@ def _parse_block_body(
     fixed = 2 + 1  # timestamp + flags
     if len(payload) < track_width + fixed + 1:
         raise MediaScrubError(f"webm {block_label} payload missing frame body")
+    relative_timestamp = int.from_bytes(
+        payload[track_width:track_width + 2], "big", signed=True,
+    )
     flags = payload[track_width + 2]
-    lacing = (flags >> 1) & 0x3
-    if lacing != 0:
+    if flags & _BLOCK_FLAG_LACING:
         raise MediaScrubError(
             f"webm {block_label} lacing is not accepted by scrubber"
         )
-    if block_label == "Block" and (flags & 0xF0):
-        raise MediaScrubError("webm Block flags reserved bits set")
-    if block_label == "SimpleBlock" and (flags & 0x70):
-        # SimpleBlock: bit 7 keyframe, bit 0 discardable. Bits 4-6 reserved
-        # in Matroska; the WebM specialization keeps them zero.
-        raise MediaScrubError("webm SimpleBlock flags reserved bits set")
+    if block_label == "SimpleBlock":
+        if flags & ~_SIMPLE_BLOCK_ALLOWED_FLAGS:
+            raise MediaScrubError("webm SimpleBlock flags reserved bits set")
+        canonical_flags = _SIMPLE_BLOCK_FLAG_KEYFRAME
+    else:
+        if flags & ~_BLOCK_ALLOWED_FLAGS:
+            raise MediaScrubError("webm Block flags reserved bits set")
+        canonical_flags = 0
     frame_len = len(payload) - track_width - fixed
     if frame_len > _WEBM_MAX_FRAME_SIZE:
         raise MediaScrubError(
@@ -1160,12 +1284,12 @@ def _parse_block_body(
     canonical_track = _emit_vint_size(track_number)
     rebuilt = (
         canonical_track
-        + payload[track_width:track_width + 2]
-        + bytes([flags])
+        + relative_timestamp.to_bytes(2, "big", signed=True)
+        + bytes([canonical_flags])
         + payload[track_width + fixed:]
     )
     frame_offset = len(canonical_track) + fixed
-    return rebuilt, track_number, frame_offset
+    return rebuilt, track_number, frame_offset, relative_timestamp
 
 
 def _rebuild_frame_bytes(

@@ -55,7 +55,11 @@ export function downloadName(event: SessionEvent): string {
   if (effectiveKind === "code" && artifact.filename) {
     return artifact.filename.split(/[\\/]/).pop() || `${base}.txt`;
   }
-  const videoExtension = artifact.mime === "image/gif" ? "gif" : "mp4";
+  const videoExtension = artifact.mime === "image/gif"
+    ? "gif"
+    : artifact.mime === "video/webm"
+      ? "webm"
+      : "mp4";
   const audioExtension = artifact.mime === "audio/mpeg" ? "mp3" : "wav";
   const extension = {
     mermaid: "mmd",

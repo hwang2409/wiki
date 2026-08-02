@@ -733,6 +733,7 @@ export type SessionArtifact = {
     | "image/webp"
     | "image/gif"
     | "video/mp4"
+    | "video/webm"
     | "audio/wav"
     | "audio/mpeg";
   byte_size?: number;
