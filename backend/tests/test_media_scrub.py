@@ -28,8 +28,10 @@ REAL_AAC_ONLY_MP4 = FIXTURE_DIR / "tiny_aac_only.mp4"
 REAL_WAV = FIXTURE_DIR / "tone.wav"
 REAL_MP3 = FIXTURE_DIR / "tone.mp3"
 REAL_MP3_APE = FIXTURE_DIR / "tone_ape.mp3"
-REAL_WEBM_AV = FIXTURE_DIR / "tiny_vp9_opus.webm"
-REAL_WEBM_VIDEO_ONLY = FIXTURE_DIR / "tiny_vp9_video_only.webm"
+REAL_WEBM_AV = FIXTURE_DIR / "tiny_vp8_opus.webm"
+REAL_WEBM_VIDEO_ONLY = FIXTURE_DIR / "tiny_vp8_video_only.webm"
+REAL_WEBM_VP9_AV = FIXTURE_DIR / "tiny_vp9_opus.webm"
+REAL_WEBM_VP9_VIDEO_ONLY = FIXTURE_DIR / "tiny_vp9_video_only.webm"
 
 FFMPEG = shutil.which("ffmpeg")
 FFPROBE = shutil.which("ffprobe")
@@ -5360,18 +5362,11 @@ class WebmBoundedWorkRegressionTests(unittest.TestCase):
 
 
 class WebmPerCodecFrameValidationTests(unittest.TestCase):
-    """WIKI-225 REVIEW1 BLOCKER 2: SimpleBlock/Block frame bodies
-    must not survive as arbitrary bytes under an allowlisted CodecID.
-    Every accepted codec has a header-shape validator.
-    """
+    """Every accepted video frame gets a full decode and canonical rebuild."""
 
     def _mutate_first_frame(
-        self, fixture: Path, replacement: bytes,
+        self, fixture: Path, track_number_wanted: int, replacement: bytes,
     ) -> bytes:
-        """Overwrite the first SimpleBlock frame body of the given
-        WebM fixture with `replacement` (same length so no EBML sizes
-        need rewriting). Returns the mutated bytes.
-        """
         data = bytearray(fixture.read_bytes())
         view = memoryview(bytes(data))
         ebml = webm_scrubber._read_element(view, 0, len(data))
@@ -5394,30 +5389,82 @@ class WebmPerCodecFrameValidationTests(unittest.TestCase):
                     memoryview(bytes(data[payload_start:payload_end])),
                     0, payload_end - payload_start, is_id=False,
                 )
+                if track_number != track_number_wanted:
+                    continue
                 frame_start = payload_start + tw + 3
-                assert payload_end - frame_start >= len(replacement)
-                data[frame_start:frame_start + len(replacement)] = replacement
+                assert payload_end - frame_start == len(replacement)
+                data[frame_start:payload_end] = replacement
                 return bytes(data)
         raise RuntimeError("no SimpleBlock in fixture")
 
-    def test_vp9_frame_with_ascii_marker_is_rejected(self) -> None:
-        # ATTACKER-FRAME-METADATA — starts with 'A' = 0x41 = 01000001
-        # so frame_marker (top 2 bits) is 01, not the required 10.
-        payload = self._mutate_first_frame(
-            REAL_WEBM_VIDEO_ONLY, b"ATTACKER-FRAME-METADATA",
-        )
+    def _first_frame(self, fixture: Path, track_number_wanted: int) -> bytes:
+        data = fixture.read_bytes()
+        view = memoryview(data)
+        ebml = webm_scrubber._read_element(view, 0, len(data))
+        segment = webm_scrubber._read_element(view, ebml.body_end, len(data))
+        for child in webm_scrubber._iter_children(
+            view, segment.body_start, segment.body_end,
+        ):
+            if child.identifier != webm_scrubber._ID_CLUSTER:
+                continue
+            for block in webm_scrubber._iter_children(
+                view, child.body_start, child.body_end,
+            ):
+                if block.identifier != webm_scrubber._ID_SIMPLE_BLOCK:
+                    continue
+                payload, track_number, offset = webm_scrubber._parse_block_body(
+                    view, block, block_label="SimpleBlock",
+                )
+                if track_number == track_number_wanted:
+                    return payload[offset:]
+        raise RuntimeError("no matching SimpleBlock in fixture")
+
+    def test_vp8_valid_header_with_corrupt_partition_is_rejected(self) -> None:
+        frame = self._first_frame(REAL_WEBM_VIDEO_ONLY, 1)
+        attack = frame[:10] + b"ATTACKER-FRAME-METADATA"
+        attack = (attack + b"A" * len(frame))[:len(frame)]
+        payload = self._mutate_first_frame(REAL_WEBM_VIDEO_ONLY, 1, attack)
         with self.assertRaisesRegex(
-            media_scrub.MediaScrubError, "VP9 frame_marker",
+            media_scrub.MediaScrubError, "VP8 frame failed full decode",
         ):
             media_scrub.scrub_video(payload, "video/webm")
 
-    def test_vp9_frame_marker_zero_top_bits_is_rejected(self) -> None:
-        # 0x00 has frame_marker == 00.
-        payload = self._mutate_first_frame(REAL_WEBM_VIDEO_ONLY, b"\x00" * 8)
+    def test_vp9_is_rejected_until_a_full_decoder_exists(self) -> None:
+        frame = self._first_frame(REAL_WEBM_VP9_VIDEO_ONLY, 1)
+        attack = frame[:4] + b"ATTACKER-FRAME-METADATA"
+        attack = (attack + b"A" * len(frame))[:len(frame)]
+        payload = self._mutate_first_frame(
+            REAL_WEBM_VP9_VIDEO_ONLY, 1, attack,
+        )
         with self.assertRaisesRegex(
-            media_scrub.MediaScrubError, "VP9 frame_marker",
+            media_scrub.MediaScrubError, "outside VP8 allowlist",
         ):
             media_scrub.scrub_video(payload, "video/webm")
+
+    def test_vp8_interframe_is_rejected(self) -> None:
+        frame = bytearray(self._first_frame(REAL_WEBM_VIDEO_ONLY, 1))
+        frame[0] |= 0x01
+        payload = self._mutate_first_frame(
+            REAL_WEBM_VIDEO_ONLY, 1, bytes(frame),
+        )
+        with self.assertRaisesRegex(
+            media_scrub.MediaScrubError, "interframes are outside",
+        ):
+            media_scrub.scrub_video(payload, "video/webm")
+
+    def test_vp8_frame_is_canonically_reencoded(self) -> None:
+        original_frame = self._first_frame(REAL_WEBM_VIDEO_ONLY, 1)
+        result = media_scrub.scrub_video(
+            REAL_WEBM_VIDEO_ONLY.read_bytes(), "video/webm",
+        )
+        with tempfile.NamedTemporaryFile(suffix=".webm", delete=False) as handle:
+            handle.write(result.data)
+            path = Path(handle.name)
+        try:
+            rebuilt_frame = self._first_frame(path, 1)
+        finally:
+            path.unlink(missing_ok=True)
+        self.assertNotEqual(rebuilt_frame, original_frame)
 
     def test_opus_ascii_marker_rejects_via_packet_structure(self) -> None:
         # Replace the Opus TOC + payload with an ASCII string that
@@ -5431,9 +5478,9 @@ class WebmPerCodecFrameValidationTests(unittest.TestCase):
         # different first byte that parses as code-3.
         # 0x43 = 0b01000011 → code = 11 = 3, m byte follows. m=0
         # triggers "frame count is zero" rejection.
-        payload = self._mutate_first_frame(
-            REAL_WEBM_AV, b"\x43\x00" + b"ATTACKER",
-        )
+        frame = self._first_frame(REAL_WEBM_AV, 2)
+        replacement = (b"\x43\x00" + b"ATTACKER" + b"A" * len(frame))[:len(frame)]
+        payload = self._mutate_first_frame(REAL_WEBM_AV, 2, replacement)
         with self.assertRaisesRegex(
             media_scrub.MediaScrubError, "A_OPUS code-3 frame count is zero",
         ):
@@ -5794,3 +5841,244 @@ class WebmNonFiniteFloatTests(unittest.TestCase):
         ):
             webm_scrubber._parse_float(view, elem, "OutputSamplingFrequency")
 
+
+def _review2_first_frame(data: bytes, track_number_wanted: int) -> bytes:
+    view = memoryview(data)
+    ebml = webm_scrubber._read_element(view, 0, len(data))
+    segment = webm_scrubber._read_element(view, ebml.body_end, len(data))
+    for child in webm_scrubber._iter_children(
+        view, segment.body_start, segment.body_end,
+    ):
+        if child.identifier != webm_scrubber._ID_CLUSTER:
+            continue
+        for block in webm_scrubber._iter_children(
+            view, child.body_start, child.body_end,
+        ):
+            if block.identifier != webm_scrubber._ID_SIMPLE_BLOCK:
+                continue
+            payload, track_number, offset = webm_scrubber._parse_block_body(
+                view, block, block_label="SimpleBlock",
+            )
+            if track_number == track_number_wanted:
+                return payload[offset:]
+    raise RuntimeError(f"no SimpleBlock for track {track_number_wanted}")
+
+
+def _review2_webm(
+    *,
+    video: bool = True,
+    audio: bool = False,
+    video_enabled: bool = True,
+    video_blocks: int = 1,
+    audio_blocks: int = 0,
+    language: bytes = b"und",
+    video_child_count: int = 1,
+    audio_child_count: int = 1,
+    audio_child_on_video: bool = False,
+    video_child_on_audio: bool = False,
+    opus_packet: bytes = b"\x78\x00",
+) -> bytes:
+    emit = webm_scrubber._emit_element
+    emit_uint = webm_scrubber._emit_uint
+    ebml_body = (
+        emit_uint(webm_scrubber._ID_EBML_VERSION, 1)
+        + emit_uint(webm_scrubber._ID_EBML_READ_VERSION, 1)
+        + emit_uint(webm_scrubber._ID_EBML_MAX_ID_LENGTH, 4)
+        + emit_uint(webm_scrubber._ID_EBML_MAX_SIZE_LENGTH, 8)
+        + emit(webm_scrubber._ID_DOC_TYPE, b"webm")
+        + emit_uint(webm_scrubber._ID_DOC_TYPE_VERSION, 2)
+        + emit_uint(webm_scrubber._ID_DOC_TYPE_READ_VERSION, 2)
+    )
+    ebml = emit(webm_scrubber._ID_EBML, ebml_body)
+    info = emit(
+        webm_scrubber._ID_INFO,
+        emit_uint(webm_scrubber._ID_TIMESTAMP_SCALE, 1_000_000),
+    )
+    video_child = emit(
+        webm_scrubber._ID_VIDEO,
+        emit_uint(webm_scrubber._ID_PIXEL_WIDTH, 160)
+        + emit_uint(webm_scrubber._ID_PIXEL_HEIGHT, 120),
+    )
+    audio_child = emit(
+        webm_scrubber._ID_AUDIO,
+        webm_scrubber._emit_float(
+            webm_scrubber._ID_SAMPLING_FREQUENCY, 48_000.0,
+        )
+        + emit_uint(webm_scrubber._ID_CHANNELS, 1),
+    )
+    track_entries: list[bytes] = []
+    if video:
+        video_body = (
+            emit_uint(webm_scrubber._ID_TRACK_NUMBER, 1)
+            + emit_uint(webm_scrubber._ID_TRACK_UID, 1)
+            + emit_uint(webm_scrubber._ID_TRACK_TYPE, 1)
+            + emit_uint(webm_scrubber._ID_FLAG_ENABLED, int(video_enabled))
+            + emit(webm_scrubber._ID_LANGUAGE, language)
+            + emit(webm_scrubber._ID_CODEC_ID, b"V_VP8")
+            + video_child * video_child_count
+        )
+        if audio_child_on_video:
+            video_body += audio_child
+        track_entries.append(emit(webm_scrubber._ID_TRACK_ENTRY, video_body))
+    if audio:
+        opus_head = (
+            b"OpusHead\x01\x01"
+            + struct.pack("<H", 312)
+            + struct.pack("<I", 48_000)
+            + b"\x00\x00\x00"
+        )
+        audio_body = (
+            emit_uint(webm_scrubber._ID_TRACK_NUMBER, 2)
+            + emit_uint(webm_scrubber._ID_TRACK_UID, 2)
+            + emit_uint(webm_scrubber._ID_TRACK_TYPE, 2)
+            + emit(webm_scrubber._ID_LANGUAGE, b"und")
+            + emit(webm_scrubber._ID_CODEC_ID, b"A_OPUS")
+            + emit(webm_scrubber._ID_CODEC_PRIVATE, opus_head)
+            + audio_child * audio_child_count
+        )
+        if video_child_on_audio:
+            audio_body += video_child
+        track_entries.append(emit(webm_scrubber._ID_TRACK_ENTRY, audio_body))
+    tracks = emit(webm_scrubber._ID_TRACKS, b"".join(track_entries))
+
+    vp8_frame = _review2_first_frame(
+        REAL_WEBM_VIDEO_ONLY.read_bytes(), 1,
+    )
+    blocks = []
+    for _ in range(video_blocks if video else 0):
+        blocks.append(
+            emit(
+                webm_scrubber._ID_SIMPLE_BLOCK,
+                webm_scrubber._emit_vint_size(1)
+                + b"\x00\x00\x80"
+                + vp8_frame,
+            )
+        )
+    for _ in range(audio_blocks if audio else 0):
+        blocks.append(
+            emit(
+                webm_scrubber._ID_SIMPLE_BLOCK,
+                webm_scrubber._emit_vint_size(2)
+                + b"\x00\x00\x80"
+                + opus_packet,
+            )
+        )
+    cluster = emit(
+        webm_scrubber._ID_CLUSTER,
+        emit_uint(webm_scrubber._ID_TIMESTAMP, 0) + b"".join(blocks),
+    )
+    return ebml + emit(webm_scrubber._ID_SEGMENT, info + tracks + cluster)
+
+
+class WebmReview2TrackPolicyTests(unittest.TestCase):
+    def test_invalid_language_is_replaced_with_canonical_und(self) -> None:
+        result = media_scrub.scrub_video(
+            _review2_webm(language=b"!!!"), "video/webm",
+        )
+        self.assertNotIn(b"!!!", result.data)
+        self.assertIn(b"und", result.data)
+
+    def test_oversized_language_is_rejected(self) -> None:
+        with self.assertRaisesRegex(
+            media_scrub.MediaScrubError, "Language string exceeds",
+        ):
+            media_scrub.scrub_video(
+                _review2_webm(language=b"x" * 257), "video/webm",
+            )
+
+    def test_audio_only_webm_is_rejected(self) -> None:
+        with self.assertRaisesRegex(
+            media_scrub.MediaScrubError, "enabled supported video track",
+        ):
+            media_scrub.scrub_video(
+                _review2_webm(
+                    video=False, audio=True, video_blocks=0, audio_blocks=1,
+                ),
+                "video/webm",
+            )
+
+    def test_disabled_video_track_is_rejected(self) -> None:
+        with self.assertRaisesRegex(
+            media_scrub.MediaScrubError, "enabled supported video track",
+        ):
+            media_scrub.scrub_video(
+                _review2_webm(video_enabled=False), "video/webm",
+            )
+
+    def test_video_track_without_video_frame_is_rejected(self) -> None:
+        with self.assertRaisesRegex(
+            media_scrub.MediaScrubError, "validated frame",
+        ):
+            media_scrub.scrub_video(
+                _review2_webm(
+                    audio=True, video_blocks=0, audio_blocks=1,
+                ),
+                "video/webm",
+            )
+
+    def test_track_type_child_mismatches_and_duplicates_reject(self) -> None:
+        cases = (
+            ({"audio_child_on_video": True}, "video track cannot contain Audio"),
+            ({"video_child_on_audio": True, "audio": True}, "audio track cannot contain Video"),
+            ({"video_child_count": 2}, "duplicate Video"),
+            ({"audio": True, "audio_child_count": 2}, "duplicate Audio"),
+        )
+        for kwargs, message in cases:
+            with self.subTest(message=message), self.assertRaisesRegex(
+                media_scrub.MediaScrubError, message,
+            ):
+                media_scrub.scrub_video(_review2_webm(**kwargs), "video/webm")
+
+
+class WebmReview2OpusFramingTests(unittest.TestCase):
+    def _scrub_packet(self, packet: bytes) -> media_scrub.MediaScrubResult:
+        return media_scrub.scrub_video(
+            _review2_webm(
+                audio=True,
+                video_blocks=1,
+                audio_blocks=1,
+                opus_packet=packet,
+            ),
+            "video/webm",
+        )
+
+    def test_valid_code_zero_through_three_packets(self) -> None:
+        packets = (
+            b"\x78A",                 # code 0, one frame
+            b"\x79AB",                # code 1, two one-byte CBR frames
+            b"\x7a\x01AB",           # code 2, two one-byte VBR frames
+            b"\x7b\x02AB",           # code 3, two one-byte CBR frames
+            b"\x7b\x82\x01AB",      # code 3, two one-byte VBR frames
+            b"\x7b\x42\x03AB\0\0\0",  # code 3, canonical zero padding
+            b"\x13\x03ABC",          # code 3, 3 x 40 ms = 120 ms
+        )
+        for packet in packets:
+            with self.subTest(packet=packet.hex()):
+                self.assertEqual(self._scrub_packet(packet).mime, "video/webm")
+
+    def test_code_three_255_padding_extension_counts_as_254(self) -> None:
+        packet = b"\x7b\x42\xff\x01AB" + b"\x00" * 255
+        self.assertEqual(self._scrub_packet(packet).mime, "video/webm")
+
+    def test_nonzero_padding_is_rejected(self) -> None:
+        with self.assertRaisesRegex(
+            media_scrub.MediaScrubError, "padding must be zero",
+        ):
+            self._scrub_packet(b"\x7b\x42\x03ABATT")
+
+    def test_invalid_framing_invariants_are_rejected(self) -> None:
+        cases = (
+            (b"\x79ABC", "even and non-empty"),
+            (b"\x7a\x05AB", "first-frame length overruns"),
+            (b"\x7b\x02ABC", "not divisible"),
+            (b"\x7b\x82\x05AB", "VBR frame length overruns"),
+            (b"\x7b\x82\x01A" + b"B" * 1276, "exceeds 1275 bytes"),
+            (b"\x78" + b"A" * 1276, "exceeds 1275 bytes"),
+            (b"\x13\x04ABCD", "duration exceeds 120 ms"),
+            (b"\x03\x3f" + b"A" * 63, "frame count exceeds 48"),
+        )
+        for packet, message in cases:
+            with self.subTest(packet=packet[:8].hex()), self.assertRaisesRegex(
+                media_scrub.MediaScrubError, message,
+            ):
+                self._scrub_packet(packet)

@@ -2,10 +2,9 @@
 
 Every stored byte in the output is either (a) an EBML VINT encoding a
 validated identifier / size / integer field, (b) a UTF-8 DocType string
-selected from an allowlist, or (c) an opaque codec frame body whose
-container envelope (SimpleBlock header, BlockGroup Block header) was
-parsed from validated integer fields. No element body is byte-copied
-without a per-element rebuild that reads specific fields.
+selected from an allowlist, or (c) a canonical VP8 keyframe or a bounded,
+fully framed Opus packet. No element body is byte-copied without a
+per-element rebuild that reads specific fields.
 
 Top-level chain:
     EBML header              parsed field-by-field; DocType must be
@@ -18,10 +17,10 @@ Top-level chain:
                              DROP MuxingApp / WritingApp / Title /
                              DateUTC / SegmentUID / SegmentFilename
         Tracks               rebuild TrackEntry fields; codec allowlist
-                             = V_VP8, V_VP9, A_OPUS, A_VORBIS
+                             = V_VP8 keyframes + A_OPUS
         Cluster              rebuild Timestamp + SimpleBlock /
-                             BlockGroup; frame bodies pass through with
-                             validated header envelopes
+                             BlockGroup; VP8 keyframes decode and re-encode;
+                             Opus packets get canonical framing
         Tags                 DROP (metadata)
         Attachments          DROP (embedded files)
         Chapters             DROP (chapter metadata)
@@ -39,7 +38,10 @@ from __future__ import annotations
 import math
 import struct
 from dataclasses import dataclass
+from io import BytesIO
 from typing import Final
+
+from PIL import Image, UnidentifiedImageError
 
 from .base import MediaScrubError, MediaScrubResult
 
@@ -165,6 +167,10 @@ _WEBM_MAX_CHANNELS: Final = 8
 _WEBM_MAX_SAMPLE_RATE: Final = 192_000
 _WEBM_MAX_BLOCKS: Final = 1 << 20
 _WEBM_MAX_FRAME_SIZE: Final = 1 << 24
+_WEBM_MAX_FRAME_PIXELS: Final = 4096 * 4096
+_WEBM_MAX_DECODED_PIXELS: Final = 32 * 1024 * 1024
+_OPUS_MAX_FRAME_BYTES: Final = 1275
+_OPUS_MAX_PACKET_DURATION_US: Final = 120_000
 
 # Track types that appear in scrubber-supported WebM containers.
 _TRACK_TYPE_VIDEO: Final = 1
@@ -176,7 +182,11 @@ _TRACK_TYPE_AUDIO: Final = 2
 # strings. Scrubbing it well requires a Vorbis comment parser, and its
 # in-band frames are opaque codec data. Until we add that parser, any
 # A_VORBIS track rejects the file rather than smuggling metadata.
-_WEBM_VIDEO_CODECS: Final = frozenset({b"V_VP8", b"V_VP9"})
+# VP9 is intentionally OUT under WIKI-225 REVIEW2. Its compressed frame
+# syntax needs a full decoder before the scrubber can prove that a frame is
+# valid. VP8 remains as a keyframe-only subset because Pillow/libwebp fully
+# decodes each accepted frame and emits a new canonical VP8 keyframe.
+_WEBM_VIDEO_CODECS: Final = frozenset({b"V_VP8"})
 _WEBM_AUDIO_CODECS: Final = frozenset({b"A_OPUS"})
 
 
@@ -195,8 +205,26 @@ class _WebmTrack:
     number: int
     kind: int
     codec_id: bytes
+    enabled: bool
     width: int | None
     height: int | None
+
+
+@dataclass
+class _WebmDecodeBudget:
+    remaining_pixels: int = _WEBM_MAX_DECODED_PIXELS
+
+    def charge(self, track: _WebmTrack) -> None:
+        if track.kind != _TRACK_TYPE_VIDEO:
+            return
+        if track.width is None or track.height is None:  # pragma: no cover
+            raise MediaScrubError("webm video track is missing dimensions")
+        pixels = track.width * track.height
+        if pixels > self.remaining_pixels:
+            raise MediaScrubError(
+                f"webm decoded video exceeds {_WEBM_MAX_DECODED_PIXELS} pixel budget"
+            )
+        self.remaining_pixels -= pixels
 
 
 def scrub_webm(data: bytes) -> MediaScrubResult:
@@ -469,6 +497,8 @@ def _rebuild_segment(
     info_bytes = b""
     tracks_bytes = b""
     clusters: list[bytes] = []
+    framed_track_numbers: set[int] = set()
+    decode_budget = _WebmDecodeBudget()
     for child in children:
         cid = child.identifier
         if cid in (_ID_SEEK_HEAD, _ID_TAGS, _ID_ATTACHMENTS, _ID_CHAPTERS, _ID_CUES, _ID_VOID, _ID_CRC32):
@@ -484,8 +514,14 @@ def _rebuild_segment(
             tracks_seen = True
             tracks_bytes, tracks = _rebuild_tracks(view, child)
         elif cid == _ID_CLUSTER:
+            if not tracks_seen:
+                raise MediaScrubError("webm Cluster must follow Tracks")
             cluster_seen = True
-            clusters.append(_rebuild_cluster(view, child, tracks))
+            cluster_bytes, cluster_tracks = _rebuild_cluster(
+                view, child, tracks, decode_budget,
+            )
+            clusters.append(cluster_bytes)
+            framed_track_numbers.update(cluster_tracks)
         else:
             raise MediaScrubError(
                 f"webm Segment child 0x{cid:x} outside allowlist"
@@ -496,6 +532,20 @@ def _rebuild_segment(
         raise MediaScrubError("webm Segment missing Tracks")
     if not cluster_seen:
         raise MediaScrubError("webm Segment missing at least one Cluster")
+
+    enabled_video_tracks = {
+        track.number
+        for track in tracks
+        if track.kind == _TRACK_TYPE_VIDEO and track.enabled
+    }
+    if not enabled_video_tracks:
+        raise MediaScrubError(
+            "webm video artifact requires an enabled supported video track"
+        )
+    if not enabled_video_tracks.intersection(framed_track_numbers):
+        raise MediaScrubError(
+            "webm video artifact requires a validated frame for an enabled video track"
+        )
 
     duration_ms: int | None = None
     if duration_ticks is not None:
@@ -510,7 +560,12 @@ def _rebuild_segment(
 
 def _select_dimensions(tracks: list[_WebmTrack]) -> tuple[int | None, int | None]:
     for track in tracks:
-        if track.kind == _TRACK_TYPE_VIDEO and track.width and track.height:
+        if (
+            track.kind == _TRACK_TYPE_VIDEO
+            and track.enabled
+            and track.width
+            and track.height
+        ):
             return track.width, track.height
     return None, None
 
@@ -591,9 +646,11 @@ def _rebuild_track_entry(
     flag_default = 1
     flag_forced = 0
     flag_lacing = 0
-    language = "und"
+    language_seen = False
     video_bytes = b""
     audio_bytes = b""
+    video_seen = False
+    audio_seen = False
     width: int | None = None
     height: int | None = None
     audio_channels: int | None = None
@@ -636,10 +693,24 @@ def _rebuild_track_entry(
             if flag_lacing not in (0, 1):
                 raise MediaScrubError("webm FlagLacing must be 0 or 1")
         elif cid == _ID_LANGUAGE:
-            language = _parse_ascii(view, child, "Language")
+            if language_seen:
+                raise MediaScrubError("webm TrackEntry has duplicate Language")
+            language_seen = True
+            if child.size > _WEBM_MAX_STRING_BYTES:
+                raise MediaScrubError(
+                    f"webm Language string exceeds {_WEBM_MAX_STRING_BYTES} bytes"
+                )
+            # Language is metadata, not a decoder input. Drop the caller value
+            # and emit the canonical WebM default below.
         elif cid == _ID_VIDEO:
+            if video_seen:
+                raise MediaScrubError("webm TrackEntry has duplicate Video")
+            video_seen = True
             video_bytes, width, height = _rebuild_video(view, child)
         elif cid == _ID_AUDIO:
+            if audio_seen:
+                raise MediaScrubError("webm TrackEntry has duplicate Audio")
+            audio_seen = True
             audio_bytes, audio_channels = _rebuild_audio(view, child)
         elif cid == _ID_CONTENT_ENCODINGS:
             # WIKI-225 REVIEW1 MAJOR: silent-drop leaves the ENCODED
@@ -677,24 +748,28 @@ def _rebuild_track_entry(
     if kind == _TRACK_TYPE_VIDEO:
         if codec_id not in _WEBM_VIDEO_CODECS:
             raise MediaScrubError(
-                f"webm video CodecID {codec_id!r} outside VP8/VP9 allowlist"
+                f"webm video CodecID {codec_id!r} outside VP8 allowlist"
             )
-        if not video_bytes:
+        if not video_seen:
             raise MediaScrubError("webm video track missing Video element")
+        if audio_seen:
+            raise MediaScrubError("webm video track cannot contain Audio")
     else:
         if codec_id not in _WEBM_AUDIO_CODECS:
             raise MediaScrubError(
                 f"webm audio CodecID {codec_id!r} outside Opus allowlist"
             )
-        if not audio_bytes:
+        if not audio_seen:
             raise MediaScrubError("webm audio track missing Audio element")
+        if video_seen:
+            raise MediaScrubError("webm audio track cannot contain Video")
 
-    # Per-codec CodecPrivate policy. VP8/VP9 in WebM do not carry a
+    # Per-codec CodecPrivate policy. VP8 in WebM does not carry a
     # meaningful CodecPrivate — the sequence header rides in the first
     # keyframe. A_OPUS requires a 19-byte OpusHead identification packet
     # whose fields we rebuild from parsed integers and cross-check
     # against TrackEntry.
-    if codec_id in (b"V_VP8", b"V_VP9"):
+    if codec_id == b"V_VP8":
         if codec_private is not None:
             raise MediaScrubError(
                 f"webm {codec_id!r} does not accept CodecPrivate (sequence "
@@ -723,7 +798,7 @@ def _rebuild_track_entry(
         + _emit_uint(_ID_FLAG_DEFAULT, flag_default)
         + _emit_uint(_ID_FLAG_FORCED, flag_forced)
         + _emit_uint(_ID_FLAG_LACING, flag_lacing)
-        + _emit_element(_ID_LANGUAGE, language.encode("ascii"))
+        + _emit_element(_ID_LANGUAGE, b"und")
         + _emit_element(_ID_CODEC_ID, codec_id)
     )
     if codec_private_bytes:
@@ -740,7 +815,7 @@ def _rebuild_track_entry(
         body += audio_bytes
     return (
         _emit_element(_ID_TRACK_ENTRY, body),
-        _WebmTrack(number, kind, codec_id, width, height),
+        _WebmTrack(number, kind, codec_id, bool(flag_enabled), width, height),
     )
 
 
@@ -922,76 +997,135 @@ def _rebuild_opus_head(body: bytes, *, expected_channels: int | None) -> bytes:
 
 
 # ---------------------------------------------------------------------------
-# Per-codec frame validators
+# Per-codec frame rebuilders
 # ---------------------------------------------------------------------------
-#
-# WIKI-225 REVIEW1 BLOCKER 2: the block parser copied codec-frame bytes
-# unchanged. A mutated VP9 payload with "ATTACKER-FRAME-METADATA" ASCII
-# survived every envelope check. Every accepted codec now goes through
-# a bounded validator that rejects frames whose header bits do not
-# match the codec's spec. Interior spectral/motion-vector bytes remain
-# opaque — validating those requires a full decoder — but the codec
-# header check catches crude byte-swap attacks and non-codec payloads.
-
-
-def _validate_vp9_frame(frame: bytes) -> None:
-    """VP9 uncompressed header — VP9 bitstream spec, section 6.2.
-
-    First byte layout: frame_marker (2 bits, always 0b10) + profile
-    (2 bits, 0-3) + profile-3 reserved bit / show_existing_frame + …
-    For keyframes we can also validate the 24-bit frame_sync_code
-    (0x498342) that follows the profile bits.
-    """
-    if not frame:
-        raise MediaScrubError("webm VP9 frame is empty")
-    first = frame[0]
-    frame_marker = first >> 6
-    if frame_marker != 0b10:
-        raise MediaScrubError(
-            f"webm VP9 frame_marker 0x{frame_marker:x} is not 0b10"
-        )
-    profile = (first >> 4) & 0x03
-    # profile 3 pushes the show_existing_frame bit one position further,
-    # so the frame_type bit ordering differs. Both profiles-space entries
-    # are valid; the frame_marker check is the load-bearing envelope
-    # guard for arbitrary-byte payloads.
-    if profile == 3:
-        # bit 3 is a reserved zero; bit 2 is show_existing_frame
-        if first & 0b00001000:
-            raise MediaScrubError("webm VP9 profile-3 reserved bit non-zero")
-    # Keyframe detection is profile-dependent; the sync code lives after
-    # the leading show_frame / error_resilient bits when frame_type == 0
-    # (KEY_FRAME). For all profiles the sync code appears at byte offset
-    # 1..4 in the canonical uncompressed header.
-    if len(frame) >= 4 and frame[1:4] == b"\x49\x83\x42":
-        # Keyframe with well-formed sync code — good.
-        return
-
-
-def _validate_vp8_frame(frame: bytes) -> None:
-    """VP8 uncompressed data chunk header — RFC 6386, section 9.1.
-
-    Bit 0 of byte 0 = frame_type (0 = key frame, 1 = inter). Keyframes
-    additionally carry the 3-byte start code 0x9d 0x01 0x2a immediately
-    after the 3-byte frame_tag.
-    """
-    if not frame:
-        raise MediaScrubError("webm VP8 frame is empty")
-    if len(frame) < 3:
-        raise MediaScrubError("webm VP8 frame_tag truncated")
+def _validate_vp8_keyframe_header(
+    frame: bytes, *, expected_width: int, expected_height: int,
+) -> None:
+    """Validate the complete uncompressed header of one VP8 keyframe."""
+    if len(frame) < 10:
+        raise MediaScrubError("webm VP8 keyframe header is truncated")
     frame_tag = int.from_bytes(frame[0:3], "little")
-    frame_type = frame_tag & 0x1
+    if frame_tag & 0x1:
+        raise MediaScrubError(
+            "webm VP8 interframes are outside the canonical keyframe-only subset"
+        )
     version = (frame_tag >> 1) & 0x7
     if version > 3:
         raise MediaScrubError(f"webm VP8 version {version} outside 0..3")
-    if frame_type == 0:  # key frame
-        if len(frame) < 6:
-            raise MediaScrubError("webm VP8 keyframe missing start code")
-        if frame[3:6] != b"\x9d\x01\x2a":
-            raise MediaScrubError("webm VP8 keyframe start code not 9d 01 2a")
+    if not (frame_tag & 0x10):
+        raise MediaScrubError("webm VP8 keyframe has show_frame cleared")
+    first_partition_size = frame_tag >> 5
+    if first_partition_size < 7 or first_partition_size > len(frame) - 3:
+        raise MediaScrubError("webm VP8 first partition size is invalid")
+    if frame[3:6] != b"\x9d\x01\x2a":
+        raise MediaScrubError("webm VP8 keyframe start code not 9d 01 2a")
+    width = int.from_bytes(frame[6:8], "little") & 0x3FFF
+    height = int.from_bytes(frame[8:10], "little") & 0x3FFF
+    if (width, height) != (expected_width, expected_height):
+        raise MediaScrubError(
+            f"webm VP8 frame dimensions {(width, height)} disagree with "
+            f"TrackEntry {(expected_width, expected_height)}"
+        )
 
 
-def _validate_opus_packet(packet: bytes) -> None:
+def _wrap_vp8_as_webp(frame: bytes) -> bytes:
+    chunk = b"VP8 " + struct.pack("<I", len(frame)) + frame
+    if len(frame) & 1:
+        chunk += b"\x00"
+    riff_body = b"WEBP" + chunk
+    return b"RIFF" + struct.pack("<I", len(riff_body)) + riff_body
+
+
+def _extract_vp8_from_webp(payload: bytes) -> bytes:
+    if len(payload) < 20 or payload[:4] != b"RIFF" or payload[8:12] != b"WEBP":
+        raise MediaScrubError("webm VP8 canonical encoder returned invalid WebP")
+    declared_size = struct.unpack("<I", payload[4:8])[0]
+    if declared_size + 8 != len(payload):
+        raise MediaScrubError("webm VP8 canonical WebP size is inconsistent")
+    cursor = 12
+    vp8_frame: bytes | None = None
+    while cursor < len(payload):
+        if cursor + 8 > len(payload):
+            raise MediaScrubError("webm VP8 canonical WebP chunk is truncated")
+        tag = payload[cursor:cursor + 4]
+        size = struct.unpack("<I", payload[cursor + 4:cursor + 8])[0]
+        body_start = cursor + 8
+        body_end = body_start + size
+        padded_end = body_end + (size & 1)
+        if padded_end > len(payload):
+            raise MediaScrubError("webm VP8 canonical WebP chunk exceeds payload")
+        if tag == b"VP8 ":
+            if vp8_frame is not None:
+                raise MediaScrubError("webm VP8 canonical WebP has duplicate VP8 chunks")
+            vp8_frame = payload[body_start:body_end]
+        else:
+            raise MediaScrubError(
+                f"webm VP8 canonical WebP returned unsupported chunk {tag!r}"
+            )
+        cursor = padded_end
+    if vp8_frame is None:
+        raise MediaScrubError("webm VP8 canonical WebP is missing VP8 chunk")
+    return vp8_frame
+
+
+def _rebuild_vp8_frame(
+    frame: bytes, *, expected_width: int, expected_height: int,
+) -> bytes:
+    """Fully decode one VP8 keyframe and emit a new canonical keyframe."""
+    if expected_width * expected_height > _WEBM_MAX_FRAME_PIXELS:
+        raise MediaScrubError(
+            f"webm VP8 frame exceeds {_WEBM_MAX_FRAME_PIXELS} decoded pixels"
+        )
+    _validate_vp8_keyframe_header(
+        frame, expected_width=expected_width, expected_height=expected_height,
+    )
+    try:
+        with Image.open(BytesIO(_wrap_vp8_as_webp(frame))) as image:
+            image.load()
+            if image.size != (expected_width, expected_height):
+                raise MediaScrubError(
+                    f"webm VP8 decoded dimensions {image.size} disagree with TrackEntry"
+                )
+            canonical_image = image.convert("RGB")
+            output = BytesIO()
+            canonical_image.save(
+                output,
+                format="WEBP",
+                quality=100,
+                method=6,
+                exact=True,
+            )
+    except (Image.DecompressionBombError, UnidentifiedImageError, OSError) as exc:
+        raise MediaScrubError("webm VP8 frame failed full decode") from exc
+    rebuilt = _extract_vp8_from_webp(output.getvalue())
+    _validate_vp8_keyframe_header(
+        rebuilt, expected_width=expected_width, expected_height=expected_height,
+    )
+    if len(rebuilt) > _WEBM_MAX_FRAME_SIZE:
+        raise MediaScrubError("webm canonical VP8 frame exceeds scrubber cap")
+    return rebuilt
+
+
+def _opus_frame_duration_us(toc: int) -> int:
+    config = toc >> 3
+    if config < 12:
+        return (10_000, 20_000, 40_000)[config % 3]
+    if config < 16:
+        return (10_000, 20_000)[config % 2]
+    return (2_500, 5_000, 10_000, 20_000)[config % 4]
+
+
+def _validate_opus_frame_size(size: int) -> None:
+    if size <= 0:
+        raise MediaScrubError("webm A_OPUS frame is empty")
+    if size > _OPUS_MAX_FRAME_BYTES:
+        raise MediaScrubError(
+            f"webm A_OPUS frame exceeds {_OPUS_MAX_FRAME_BYTES} bytes"
+        )
+
+
+def _rebuild_opus_packet(packet: bytes) -> bytes:
     """Opus packet framing — RFC 6716 section 3.
 
     TOC byte + one of four internal framings (code 0..3). We validate
@@ -1006,16 +1140,20 @@ def _validate_opus_packet(packet: bytes) -> None:
     toc = packet[0]
     frame_count_code = toc & 0x3
     frames_body = packet[1:]
+    frame_count = 1 if frame_count_code == 0 else 2
+    canonical_packet = packet
     if frame_count_code == 0:
         # Exactly one frame, uses all remaining bytes.
         if not frames_body:
             raise MediaScrubError("webm A_OPUS code-0 packet has no frame body")
+        _validate_opus_frame_size(len(frames_body))
     elif frame_count_code == 1:
         # Two equal-length CBR frames.
         if len(frames_body) & 1 or not frames_body:
             raise MediaScrubError(
                 "webm A_OPUS code-1 packet payload must be even and non-empty"
             )
+        _validate_opus_frame_size(len(frames_body) // 2)
     elif frame_count_code == 2:
         # Two VBR frames: 1..2 byte length of first frame, then both.
         length, header_len = _opus_read_length(frames_body, 0)
@@ -1029,6 +1167,8 @@ def _validate_opus_packet(packet: bytes) -> None:
             raise MediaScrubError(
                 "webm A_OPUS code-2 packet missing second frame"
             )
+        _validate_opus_frame_size(length)
+        _validate_opus_frame_size(len(frames_body) - first_end)
     else:  # code 3 — signalled M frames + optional padding
         if not frames_body:
             raise MediaScrubError(
@@ -1040,6 +1180,9 @@ def _validate_opus_packet(packet: bytes) -> None:
         padding_flag = bool(fc_byte & 0x40)
         if m == 0:
             raise MediaScrubError("webm A_OPUS code-3 frame count is zero")
+        if m > 48:
+            raise MediaScrubError("webm A_OPUS code-3 frame count exceeds 48")
+        frame_count = m
         cursor = 1
         padding = 0
         if padding_flag:
@@ -1052,47 +1195,70 @@ def _validate_opus_packet(packet: bytes) -> None:
                     )
                 b = frames_body[cursor]
                 cursor += 1
-                padding += b
+                padding += 254 if b == 255 else b
                 if b < 255:
                     break
                 if padding > len(packet):
                     raise MediaScrubError(
                         "webm A_OPUS code-3 padding exceeds packet size"
                     )
+        payload_end = len(frames_body) - padding
+        if payload_end < cursor:
+            raise MediaScrubError(
+                "webm A_OPUS code-3 padding exceeds packet payload"
+            )
+        padding_bytes = frames_body[payload_end:]
+        if any(padding_bytes):
+            raise MediaScrubError("webm A_OPUS code-3 padding must be zero")
+        frames_start = cursor
         if vbr:
             # (m-1) length-prefixed frames, last frame fills remainder.
             for _ in range(m - 1):
-                length, header_len = _opus_read_length(frames_body, cursor)
+                length, header_len = _opus_read_length(
+                    frames_body, cursor, end=payload_end,
+                )
+                _validate_opus_frame_size(length)
                 cursor += header_len + length
-                if cursor > len(frames_body) - padding:
+                if cursor > payload_end:
                     raise MediaScrubError(
                         "webm A_OPUS code-3 VBR frame length overruns payload"
                     )
-        # CBR + VBR both must leave >= 1 byte for the trailing frame(s).
-        remaining = len(frames_body) - cursor - padding
-        if remaining < 0:
+            _validate_opus_frame_size(payload_end - cursor)
+        else:
+            remaining = payload_end - cursor
+            if remaining % m:
+                raise MediaScrubError(
+                    "webm A_OPUS code-3 CBR payload is not divisible by frame count"
+                )
+            _validate_opus_frame_size(remaining // m)
+        if payload_end - cursor < 0:
             raise MediaScrubError(
                 "webm A_OPUS code-3 payload leaves negative remainder"
             )
+        # Canonical output strips all padding and clears the padding flag.
+        canonical_packet = (
+            bytes([toc, fc_byte & ~0x40])
+            + frames_body[frames_start:payload_end]
+        )
+
+    if frame_count * _opus_frame_duration_us(toc) > _OPUS_MAX_PACKET_DURATION_US:
+        raise MediaScrubError("webm A_OPUS packet duration exceeds 120 ms")
+    return canonical_packet
 
 
-def _opus_read_length(payload: bytes, offset: int) -> tuple[int, int]:
+def _opus_read_length(
+    payload: bytes, offset: int, *, end: int | None = None,
+) -> tuple[int, int]:
     """Read an Opus internal length field: 1 or 2 bytes."""
-    if offset >= len(payload):
+    limit = len(payload) if end is None else end
+    if offset >= limit:
         raise MediaScrubError("webm A_OPUS length field truncated")
     first = payload[offset]
     if first < 252:
         return first, 1
-    if offset + 1 >= len(payload):
+    if offset + 1 >= limit:
         raise MediaScrubError("webm A_OPUS 2-byte length truncated")
     return first + payload[offset + 1] * 4, 2
-
-
-_WEBM_FRAME_VALIDATORS: Final = {
-    b"V_VP8": _validate_vp8_frame,
-    b"V_VP9": _validate_vp9_frame,
-    b"A_OPUS": _validate_opus_packet,
-}
 
 
 # ---------------------------------------------------------------------------
@@ -1101,14 +1267,18 @@ _WEBM_FRAME_VALIDATORS: Final = {
 
 
 def _rebuild_cluster(
-    view: memoryview, cluster: _WebmElement, tracks: list[_WebmTrack],
-) -> bytes:
+    view: memoryview,
+    cluster: _WebmElement,
+    tracks: list[_WebmTrack],
+    decode_budget: _WebmDecodeBudget,
+) -> tuple[bytes, set[int]]:
     children = _iter_children(view, cluster.body_start, cluster.body_end)
     timestamp_seen = False
     timestamp = 0
     block_count = 0
     body = bytearray()
-    track_codecs = {track.number: track.codec_id for track in tracks}
+    framed_track_numbers: set[int] = set()
+    track_map = {track.number: track for track in tracks}
     for child in children:
         cid = child.identifier
         if cid == _ID_TIMESTAMP:
@@ -1118,12 +1288,20 @@ def _rebuild_cluster(
         elif cid == _ID_SIMPLE_BLOCK:
             if block_count >= _WEBM_MAX_BLOCKS:
                 raise MediaScrubError("webm Cluster exceeds scrubber block cap")
-            body.extend(_rebuild_simple_block(view, child, track_codecs))
+            block_bytes, track_number = _rebuild_simple_block(
+                view, child, track_map, decode_budget,
+            )
+            body.extend(block_bytes)
+            framed_track_numbers.add(track_number)
             block_count += 1
         elif cid == _ID_BLOCK_GROUP:
             if block_count >= _WEBM_MAX_BLOCKS:
                 raise MediaScrubError("webm Cluster exceeds scrubber block cap")
-            body.extend(_rebuild_block_group(view, child, track_codecs))
+            group_bytes, track_number = _rebuild_block_group(
+                view, child, track_map, decode_budget,
+            )
+            body.extend(group_bytes)
+            framed_track_numbers.add(track_number)
             block_count += 1
         elif cid in (_ID_POSITION, _ID_PREV_SIZE, _ID_VOID, _ID_CRC32):
             # Position and PrevSize refer to Segment-absolute offsets that
@@ -1137,32 +1315,42 @@ def _rebuild_cluster(
         raise MediaScrubError("webm Cluster missing Timestamp")
     if block_count == 0:
         raise MediaScrubError("webm Cluster contains no SimpleBlock or BlockGroup")
-    return _emit_element(_ID_CLUSTER, bytes(body))
+    return _emit_element(_ID_CLUSTER, bytes(body)), framed_track_numbers
 
 
 def _rebuild_simple_block(
-    view: memoryview, block: _WebmElement, track_codecs: dict[int, bytes],
-) -> bytes:
+    view: memoryview,
+    block: _WebmElement,
+    track_map: dict[int, _WebmTrack],
+    decode_budget: _WebmDecodeBudget,
+) -> tuple[bytes, int]:
     payload, track_number, frame_offset = _parse_block_body(
         view, block, block_label="SimpleBlock",
     )
-    codec = track_codecs.get(track_number)
-    if codec is None:
+    track = track_map.get(track_number)
+    if track is None:
         raise MediaScrubError(
             f"webm SimpleBlock references unknown TrackNumber {track_number}"
         )
-    _validate_frame_bytes(codec, payload[frame_offset:], "SimpleBlock")
-    return _emit_element(_ID_SIMPLE_BLOCK, payload)
+    frame = _rebuild_frame_bytes(
+        track, payload[frame_offset:], "SimpleBlock", decode_budget,
+    )
+    rebuilt_payload = payload[:frame_offset] + frame
+    return _emit_element(_ID_SIMPLE_BLOCK, rebuilt_payload), track_number
 
 
 def _rebuild_block_group(
-    view: memoryview, group: _WebmElement, track_codecs: dict[int, bytes],
-) -> bytes:
+    view: memoryview,
+    group: _WebmElement,
+    track_map: dict[int, _WebmTrack],
+    decode_budget: _WebmDecodeBudget,
+) -> tuple[bytes, int]:
     children = _iter_children(view, group.body_start, group.body_end)
     block_bytes: bytes | None = None
     duration: int | None = None
     reference: int | None = None
     discard_padding: int | None = None
+    block_track_number: int | None = None
     for child in children:
         cid = child.identifier
         if cid == _ID_BLOCK:
@@ -1171,13 +1359,16 @@ def _rebuild_block_group(
             payload, track_number, frame_offset = _parse_block_body(
                 view, child, block_label="Block",
             )
-            codec = track_codecs.get(track_number)
-            if codec is None:
+            track = track_map.get(track_number)
+            if track is None:
                 raise MediaScrubError(
                     f"webm Block references unknown TrackNumber {track_number}"
                 )
-            _validate_frame_bytes(codec, payload[frame_offset:], "Block")
-            block_bytes = _emit_element(_ID_BLOCK, payload)
+            frame = _rebuild_frame_bytes(
+                track, payload[frame_offset:], "Block", decode_budget,
+            )
+            block_bytes = _emit_element(_ID_BLOCK, payload[:frame_offset] + frame)
+            block_track_number = track_number
         elif cid == _ID_BLOCK_DURATION:
             duration = _parse_uint(view, child, "BlockDuration")
         elif cid == _ID_REFERENCE_BLOCK:
@@ -1199,7 +1390,8 @@ def _rebuild_block_group(
         body.extend(_emit_signed_int(_ID_REFERENCE_BLOCK, reference))
     if discard_padding is not None:
         body.extend(_emit_signed_int(_ID_DISCARD_PADDING, discard_padding))
-    return _emit_element(_ID_BLOCK_GROUP, bytes(body))
+    assert block_track_number is not None
+    return _emit_element(_ID_BLOCK_GROUP, bytes(body)), block_track_number
 
 
 def _parse_signed_int(view: memoryview, element: _WebmElement, label: str) -> int:
@@ -1279,10 +1471,23 @@ def _parse_block_body(
     return rebuilt, track_number, frame_offset
 
 
-def _validate_frame_bytes(codec: bytes, frame: bytes, block_label: str) -> None:
-    validator = _WEBM_FRAME_VALIDATORS.get(codec)
-    if validator is None:  # pragma: no cover — codec allowlist gates this
-        raise MediaScrubError(
-            f"webm {block_label} codec {codec!r} has no frame validator"
+def _rebuild_frame_bytes(
+    track: _WebmTrack,
+    frame: bytes,
+    block_label: str,
+    decode_budget: _WebmDecodeBudget,
+) -> bytes:
+    if track.codec_id == b"V_VP8":
+        if track.width is None or track.height is None:  # pragma: no cover
+            raise MediaScrubError("webm VP8 track is missing dimensions")
+        decode_budget.charge(track)
+        return _rebuild_vp8_frame(
+            frame,
+            expected_width=track.width,
+            expected_height=track.height,
         )
-    validator(frame)
+    if track.codec_id == b"A_OPUS":
+        return _rebuild_opus_packet(frame)
+    raise MediaScrubError(
+        f"webm {block_label} codec {track.codec_id!r} has no frame rebuilder"
+    )
