@@ -47,6 +47,22 @@ class RecoveryAction(str, Enum):
 
 TERMINAL_STATES = frozenset({LifecycleState.DEAD, LifecycleState.COMPLETED})
 MAX_MESSAGE_DEDUPE_KEYS = 256
+MAX_PENDING_USER_MESSAGES = 32
+
+
+def _dedupe_entry(item: Any) -> dict[str, str] | None:
+    if isinstance(item, str) and item:
+        return {"key": item}
+    if isinstance(item, dict):
+        key = item.get("key")
+        if not isinstance(key, str) or not key:
+            return None
+        entry: dict[str, str] = {"key": key}
+        owner = item.get("owner")
+        if isinstance(owner, str) and owner:
+            entry["owner"] = owner
+        return entry
+    return None
 
 
 ALLOWED_STATE_TRANSITIONS: dict[LifecycleState, frozenset[LifecycleState]] = {
@@ -188,7 +204,27 @@ class RunRecord:
     # The unread-dot surface must not light on those, so we track a parallel
     # counter that advances only on genuinely agent-originated events.
     unread_event_seq: int = 0
+    # Despite its legacy name, this is the normalized-sequence component of
+    # the causal checkpoint. Pair it with ``last_causal_raw_seq`` so recovery
+    # can apply later normalized lifecycle rows that share one raw sequence.
     last_lifecycle_event_seq: int = 0
+    # Max ``raw_seq`` of a normalized event whose ORDER-SENSITIVE
+    # projections (lifecycle_state, pending_requests, current_turn_diff,
+    # composer_messages, unread_event_seq) have been applied to the
+    # record. Any later ``append_normalized`` — including
+    # ``_normalize_orphan_raw_events`` replaying a stale-order recovery
+    # — writes the durable normalized row for observability but only
+    # mutates projections when its ``(raw_seq, normalized seq)`` position is
+    # at or beyond the causal checkpoint. Equal raw values let one raw event
+    # fan out into normalized rows in stable order. This stops a raw_seq=1
+    # orphan approval
+    # from re-adding a
+    # pending_request that raw_seq=2 serverRequest/resolved already
+    # cleared, and a raw_seq=1 orphan turn/started from flipping IDLE
+    # back to WORKING after raw_seq=2 turn/completed already landed
+    # (WIKI-232 REVIEW11 H1). Suppression covers every later causal
+    # event, not only lifecycle events.
+    last_causal_raw_seq: int = 0
     disposition_counts: dict[str, int] = field(
         default_factory=lambda: {item.value: 0 for item in EventDisposition}
     )
@@ -196,7 +232,11 @@ class RunRecord:
     pending_user_messages: list[dict[str, str]] = field(default_factory=list)
     composer_messages: list[dict[str, Any]] = field(default_factory=list)
     queued_messages: list[dict[str, str]] = field(default_factory=list)
-    message_dedupe_keys: list[str] = field(default_factory=list)
+    # Entries: {"key": str, "owner": str | None}. Older on-disk snapshots
+    # stored bare strings; from_dict() promotes them to owner-less entries so
+    # a legacy claim remains unretryable, while post-WIKI-232 claims can bind
+    # a stable owner (steer effect_id) and safely replay after a crash.
+    message_dedupe_keys: list[dict[str, str]] = field(default_factory=list)
     schema_version: int = 1
 
     @classmethod
@@ -283,6 +323,7 @@ class RunRecord:
             "normalized_event_count": self.normalized_event_count,
             "unread_event_seq": self.unread_event_seq,
             "last_lifecycle_event_seq": self.last_lifecycle_event_seq,
+            "last_causal_raw_seq": self.last_causal_raw_seq,
             "disposition_counts": dict(self.disposition_counts),
             "pending_requests": {
                 key: dict(request) for key, request in self.pending_requests.items()
@@ -366,6 +407,7 @@ class RunRecord:
                 )
             ),
             last_lifecycle_event_seq=int(value.get("last_lifecycle_event_seq", 0)),
+            last_causal_raw_seq=int(value.get("last_causal_raw_seq", 0)),
             disposition_counts={
                 item.value: int(
                     (value.get("disposition_counts") or {}).get(item.value, 0)
@@ -385,9 +427,12 @@ class RunRecord:
             ],
             queued_messages=[dict(item) for item in value.get("queued_messages") or []],
             message_dedupe_keys=[
-                str(item)
-                for item in value.get("message_dedupe_keys") or []
-                if isinstance(item, str) and item
+                entry
+                for entry in (
+                    _dedupe_entry(item)
+                    for item in value.get("message_dedupe_keys") or []
+                )
+                if entry is not None
             ],
         )
 

@@ -13,10 +13,51 @@ from typing import BinaryIO
 from .factory import RealAdapterFactory
 from .fake import FixtureAdapterFactory
 from .fleet_monitor import FleetMonitor
+from .fleet_monitor_ids import (
+    fleet_monitor_message_dedupe_key,
+    fleet_monitor_request_id,
+)
 from .autopilot import AutopilotController
 from .protocol import UnixSupervisorServer
 from .store import RunStore, RuntimePaths
 from .supervisor import Supervisor
+
+
+def build_fleet_monitor_dispatch(supervisor: Supervisor):
+    """Return the durable dispatch callable that ``FleetMonitor`` uses.
+
+    Extracted so tests can exercise the same callable production wires
+    into ``run_daemon`` instead of hand-rolling a lookalike — a rewrite
+    that skipped ``supervisor.dispatch`` or dropped the scoped request
+    id / dedupe key would then cause both this helper and the test to
+    fail together (WIKI-232 REVIEW11 M1). The runtime binding also
+    lives in ``run_daemon`` below and MUST stay in sync with this
+    helper; every property the tests assert (routes through
+    ``run/send_now``, uses ``fleet_monitor_request_id``, uses
+    ``fleet_monitor_message_dedupe_key``, forwards ``source``) is a
+    contract of this function.
+    """
+
+    async def dispatch(
+        run_id: str,
+        message: str,
+        dedupe_key: str | None,
+        source: str | None = None,
+    ):
+        return await supervisor.dispatch(
+            "run/send_now",
+            {
+                "run_id": run_id,
+                "text": message,
+                "dedupe_key": fleet_monitor_message_dedupe_key(
+                    run_id, dedupe_key
+                ),
+                "source": source,
+                "request_id": fleet_monitor_request_id(run_id, dedupe_key),
+            },
+        )
+
+    return dispatch
 
 
 def parse_args() -> argparse.Namespace:
@@ -131,9 +172,16 @@ async def run_daemon(args: argparse.Namespace) -> None:
         )
         fleet_monitor = FleetMonitor(
             supervisor.store,
-            lambda run_id, message, dedupe_key, source: supervisor.send_now(
-                run_id, message, dedupe_key=dedupe_key, source=source
-            ),
+            # WIKI-232 H3: route monitor steers through the command queue
+            # so they join the durable total order — a daemon stop between
+            # queue admission and provider delivery replays exactly once
+            # instead of vanishing without a receipt. R3 H2 scopes the
+            # request id to run_id so orchestrator replacement does not
+            # collide on the same dedupe_key. R4 H2 scopes the transport
+            # dedupe_key to run_id as well so replacements do not
+            # accidentally reuse an inherited dedupe entry from the old
+            # run and swallow the first post-replacement delivery.
+            build_fleet_monitor_dispatch(supervisor),
             ownership_lock=supervisor._agent_lock,  # noqa: SLF001
             on_transition=AutopilotController(
                 notify=AutopilotController.live_notify,

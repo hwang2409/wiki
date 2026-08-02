@@ -11,12 +11,23 @@ from contextlib import ExitStack
 import unittest
 from datetime import datetime, timezone
 from pathlib import Path
+from typing import Any
 from unittest import mock
 
 from backend.app import workgraph, workgraph_service
 from backend.app.agent_runtime import graph_health
+from backend.app.agent_runtime.daemon import (
+    build_fleet_monitor_dispatch,
+    fleet_monitor_message_dedupe_key,
+    fleet_monitor_request_id,
+)
 from backend.app.agent_runtime.fake import FixtureAdapterFactory
-from backend.app.agent_runtime.fleet_monitor import FleetMonitor, Notification, _WorkerView
+from backend.app.agent_runtime.fleet_monitor import (
+    FLEET_MONITOR_SOURCE,
+    FleetMonitor,
+    Notification,
+    _WorkerView,
+)
 from backend.app.agent_runtime.store import RunStore, RuntimePaths
 from backend.app.agent_runtime.supervisor import Supervisor
 from backend.app.agent_runtime.types import LifecycleState, ProviderKind
@@ -1248,6 +1259,1169 @@ class FleetMonitorTests(unittest.IsolatedAsyncioTestCase):
             [n for n in again if n.event_type == "status-transition"], []
         )
 
+    async def test_status_transition_writes_command_log_intent_and_receipt(self) -> None:
+        """WIKI-232 H3 + REVIEW11 M1: cover the exact dispatch callable
+        production wires into ``FleetMonitor``. A copied lookalike that
+        skipped ``supervisor.dispatch``, dropped the scoped request id,
+        or bypassed the scoped transport dedupe key would leave this
+        test green while production regressed. Wire the monitor with
+        ``build_fleet_monitor_dispatch(supervisor)`` — the same helper
+        ``run_daemon`` uses — and prove the durable intent carries the
+        scoped identity, that the receipt is terminal, and that a
+        replay of the same intent does not fire a second provider
+        delivery."""
+
+        await self._spawn("WIKI-ORCH", role="orchestrator", orch=None)
+        await self._spawn("WIKI-232-H3", role="implement", orch="WIKI-ORCH")
+        _write_status(
+            self.store,
+            "WIKI-232-H3",
+            {"state": "working", "pr": None, "step": "coding", "blocker": None},
+        )
+
+        dispatch_send = build_fleet_monitor_dispatch(self.supervisor)
+
+        durable_monitor = FleetMonitor(
+            self.store,
+            dispatch_send,
+            clock=self.clock,
+            interval=0.01,
+            unrouted_verdict_realarm=300.0,
+            review_gap_threshold=300.0,
+            review_gap_realarm=600.0,
+            staleness_threshold=1800.0,
+            ownership_lock=self.supervisor._agent_lock,  # noqa: SLF001
+        )
+
+        # Wrap the underlying supervisor.dispatch so the assertions can
+        # inspect the exact payload the helper forwarded and count how
+        # many provider deliveries the replay produced.
+        original_dispatch = self.supervisor.dispatch
+        dispatched_calls: list[dict[str, object]] = []
+
+        async def recording_dispatch(method: str, params: dict[str, object]):
+            dispatched_calls.append({"method": method, "params": dict(params)})
+            return await original_dispatch(method, params)
+
+        # Seed (no transitions), then observe the working -> merge-ready jump.
+        await durable_monitor.tick()
+        _write_status(
+            self.store,
+            "WIKI-232-H3",
+            {
+                "state": "merge-ready",
+                "pr": "https://gh/x/pull/232",
+                "step": "PR open",
+                "blocker": None,
+            },
+        )
+        with mock.patch.object(
+            self.supervisor,
+            "dispatch",
+            side_effect=recording_dispatch,
+        ):
+            notes = await durable_monitor.tick()
+        status_notes = [n for n in notes if n.event_type == "status-transition"]
+        self.assertEqual(len(status_notes), 1, f"got: {notes}")
+
+        note = status_notes[0]
+        expected_request_id = fleet_monitor_request_id(
+            note.orch_run_id, note.dedupe_key
+        )
+        expected_dedupe_key = fleet_monitor_message_dedupe_key(
+            note.orch_run_id, note.dedupe_key
+        )
+        # The helper's dispatch payload MUST carry (a) run/send_now
+        # routing, (b) the run-scoped request_id, (c) the run-scoped
+        # transport dedupe_key, and (d) the notification source. If the
+        # helper ever regresses to a raw dedupe_key or an unscoped
+        # request_id, these assertions catch the drift.
+        forwarded = [
+            call for call in dispatched_calls if call["method"] == "run/send_now"
+        ]
+        self.assertEqual(
+            len(forwarded), 1, f"one dispatch per monitor note: {forwarded}"
+        )
+        params = forwarded[0]["params"]
+        self.assertEqual(params["run_id"], note.orch_run_id)
+        self.assertEqual(params["text"], note.message)
+        self.assertEqual(params["request_id"], expected_request_id)
+        self.assertEqual(params["dedupe_key"], expected_dedupe_key)
+        self.assertEqual(params["source"], FLEET_MONITOR_SOURCE)
+
+        receipt = self.store.command_log.receipt("run/send_now", expected_request_id)
+        self.assertIsNotNone(
+            receipt,
+            "monitor-originated steer must produce a durable receipt",
+        )
+        assert receipt is not None
+        self.assertTrue(receipt.ok)
+        intent_methods = {
+            event["method"]
+            for event in self.store.command_log.events(method="run/send_now")
+        }
+        self.assertIn("run/send_now", intent_methods)
+
+        # Replay the same helper invocation. The command log must
+        # recognise the request_id and return the prior receipt without
+        # re-dispatching to the provider.
+        pre_replay_count = len(dispatched_calls)
+        with mock.patch.object(
+            self.supervisor,
+            "dispatch",
+            side_effect=recording_dispatch,
+        ):
+            replayed = await dispatch_send(
+                note.orch_run_id,
+                note.message,
+                note.dedupe_key,
+                FLEET_MONITOR_SOURCE,
+            )
+        self.assertEqual(
+            len(dispatched_calls) - pre_replay_count,
+            1,
+            "replay still goes through supervisor.dispatch — "
+            "idempotency is the log's job, not the helper's",
+        )
+        # ``dispatch`` returns the prior receipt shape when the same
+        # request_id lands twice; the command-log identity (single
+        # command_id) proves the replay hit the idempotency cache
+        # rather than opening a new intent that would fan out to a
+        # second provider delivery.
+        self.assertIsInstance(replayed, dict)
+        command_ids = {
+            event.get("command_id")
+            for event in self.store.command_log.events(method="run/send_now")
+            if event.get("request_id") == expected_request_id
+        }
+        self.assertEqual(
+            len(command_ids),
+            1,
+            "replay of the same helper invocation must reuse the "
+            "prior command_id rather than opening a second intent",
+        )
+        # The receipt is unchanged after replay — no second provider
+        # delivery, no second acknowledgement.
+        receipt_after_replay = self.store.command_log.receipt(
+            "run/send_now", expected_request_id
+        )
+        self.assertIsNotNone(receipt_after_replay)
+        assert receipt_after_replay is not None
+        self.assertEqual(receipt_after_replay.result, receipt.result)
+        self.assertEqual(
+            receipt_after_replay.command_hash, receipt.command_hash
+        )
+
+    async def test_journal_write_failure_blocks_dispatch_until_durable(
+        self,
+    ) -> None:
+        """WIKI-232 REVIEW12 M1: ``_persist_pending_messages`` used to
+        swallow disk-write failures, letting ``_emit`` dispatch a
+        time-dependent staleness / graph-health payload whose only
+        stable copy lived in memory. After a daemon restart, the fresh
+        monitor rebuilds a different elapsed-time text under the same
+        ``fleet_monitor_request_id`` and the command log rejects every
+        retry with ``CommandConflict``. Persistence MUST be part of
+        the dispatch commit boundary: if the journal write fails, skip
+        ``send_now`` until the payload is durable, then let a later
+        tick (or restart) build a fresh entry and retry.
+
+        Inject an ``_atomic_write_json`` failure on the first tick,
+        verify no provider delivery lands and no conflicting intent
+        gets recorded. Advance the clock so the recomputed staleness
+        text would differ. Bring up a fresh ``FleetMonitor`` (the
+        journal file was never written on the first tick), tick again
+        with the write path restored, and prove exactly one provider
+        delivery lands under a single, terminal-ok receipt with no
+        ``CommandConflict``."""
+
+        from backend.app.agent_runtime import fleet_monitor as fm_module
+        from backend.app.agent_runtime.command_log import CommandConflict
+
+        await self._spawn("WIKI-ORCH", role="orchestrator", orch=None)
+        await self._spawn("WIKI-232-M1", role="implement", orch="WIKI-ORCH")
+
+        mtime = self.clock.now - 1900.0
+        _write_status(
+            self.store,
+            "WIKI-232-M1",
+            {"state": "working", "pr": None, "step": "coding", "blocker": None},
+            mtime=mtime,
+        )
+
+        supervisor = self.supervisor
+        dispatched: list[tuple[str, str, str | None]] = []
+
+        async def dispatch_send(
+            run_id: str,
+            message: str,
+            dedupe_key: str | None,
+            source: str | None = None,
+        ):
+            dispatched.append((run_id, message, dedupe_key))
+            return await supervisor.dispatch(
+                "run/send_now",
+                {
+                    "run_id": run_id,
+                    "text": message,
+                    "dedupe_key": fleet_monitor_message_dedupe_key(
+                        run_id, dedupe_key
+                    ),
+                    "source": source,
+                    "request_id": fleet_monitor_request_id(run_id, dedupe_key),
+                },
+            )
+
+        original_atomic_write = fm_module._atomic_write_json
+
+        first_monitor = FleetMonitor(
+            self.store,
+            dispatch_send,
+            clock=self.clock,
+            interval=0.01,
+            unrouted_verdict_realarm=300.0,
+            review_gap_threshold=300.0,
+            review_gap_realarm=600.0,
+            staleness_threshold=1800.0,
+            ownership_lock=self.supervisor._agent_lock,  # noqa: SLF001
+        )
+        journal_path = first_monitor._pending_messages_path  # noqa: SLF001
+        self.assertFalse(journal_path.exists())
+
+        write_attempts: list[Path] = []
+
+        def failing_atomic_write(path: Path, value: Any) -> None:
+            write_attempts.append(Path(path))
+            raise OSError(28, "no space left on device", str(path))
+
+        with mock.patch.object(
+            fm_module, "_atomic_write_json", side_effect=failing_atomic_write
+        ):
+            first_notes = await first_monitor.tick()
+
+        # The failing write attempted persistence but returned no
+        # notification: dispatch must NOT run if the payload is not
+        # durable.
+        self.assertTrue(write_attempts, "persist must attempt the atomic write")
+        self.assertEqual(
+            [n for n in first_notes if n.event_type == "staleness"],
+            [],
+            "no staleness notification is dispatched when the journal "
+            "write fails",
+        )
+        self.assertEqual(
+            dispatched,
+            [],
+            "run/send_now must not fire until the pending journal is durable",
+        )
+        self.assertFalse(
+            journal_path.exists(),
+            "atomic_write failure must leave the journal untouched",
+        )
+        # In-memory add is rolled back so a same-process retry starts
+        # fresh with the current clock (no divergence from disk).
+        self.assertEqual(first_monitor._pending_messages, {})  # noqa: SLF001
+
+        # Verify the command log carries no conflicting intent for the
+        # exact production request_id that the failed tick would have used.
+        expected_dedupe = f"fleet:WIKI-232-M1:staleness:{int(mtime)}"
+        orch_run_id = self.store.current_run_id("WIKI-ORCH")
+        assert orch_run_id is not None
+        request_id = fleet_monitor_request_id(orch_run_id, expected_dedupe)
+        self.assertFalse(
+            self.store.command_log.known("run/send_now", request_id),
+            "no intent should exist when the journal write failed",
+        )
+        self.assertIsNone(
+            self.store.command_log.receipt("run/send_now", request_id),
+            "no receipt should exist when the journal write failed",
+        )
+
+        # Advance the clock so the recomputed staleness text (in
+        # elapsed-minutes) would differ from any payload the failed
+        # tick had assembled. If the failed tick had leaked a payload
+        # into the command log, the restart would hit CommandConflict.
+        self.clock.advance(600)
+
+        # Fresh FleetMonitor (simulates a daemon restart). The journal
+        # file does not exist, so the restart cannot replay a stale
+        # payload from a prior successful tick either.
+        restarted_monitor = FleetMonitor(
+            self.store,
+            dispatch_send,
+            clock=self.clock,
+            interval=0.01,
+            unrouted_verdict_realarm=300.0,
+            review_gap_threshold=300.0,
+            review_gap_realarm=600.0,
+            staleness_threshold=1800.0,
+            ownership_lock=self.supervisor._agent_lock,  # noqa: SLF001
+        )
+        self.assertEqual(
+            restarted_monitor._pending_messages, {}  # noqa: SLF001
+        )
+
+        # Journal writes work again; the retry succeeds and dispatches
+        # exactly once with the freshly-computed message.
+        dispatched.clear()
+        try:
+            retry_notes = await restarted_monitor.tick()
+        except CommandConflict as exc:  # pragma: no cover - regression witness
+            self.fail(
+                "restarted monitor raised CommandConflict on retry after "
+                f"a failed journal write: {exc}"
+            )
+
+        staleness_notes = [n for n in retry_notes if n.event_type == "staleness"]
+        self.assertEqual(
+            len(staleness_notes),
+            1,
+            f"restarted tick must produce exactly one staleness dispatch: {staleness_notes}",
+        )
+        # Isolate the staleness-driven dispatches from unrelated
+        # notifications the same tick may fire (graph-health, unrouted-
+        # verdict). The invariant that must hold: for the staleness
+        # dedupe key the failed tick would have used, exactly one
+        # provider delivery lands.
+        staleness_dispatches = [
+            call for call in dispatched if call[2] == staleness_notes[0].dedupe_key
+        ]
+        self.assertEqual(
+            len(staleness_dispatches),
+            1,
+            "exactly one provider delivery for the staleness dedupe key "
+            "after the durable retry",
+        )
+        # The delivered message is the one the RESTARTED monitor
+        # computed from the current clock, not any leaked payload from
+        # the failed first tick.
+        self.assertEqual(
+            staleness_dispatches[0][1], staleness_notes[0].message
+        )
+
+        # The persisted journal now exists.
+        self.assertTrue(journal_path.exists())
+
+        # Terminal, ok receipt for the retry request_id — no conflict.
+        retry_request_id = fleet_monitor_request_id(
+            staleness_notes[0].orch_run_id, staleness_notes[0].dedupe_key
+        )
+        receipt = self.store.command_log.receipt(
+            "run/send_now", retry_request_id
+        )
+        self.assertIsNotNone(
+            receipt,
+            "durable retry must produce a terminal command-log receipt",
+        )
+        assert receipt is not None
+        self.assertTrue(
+            receipt.ok,
+            f"receipt for durable retry must be ok, got {receipt}",
+        )
+        # Sanity: original_atomic_write is untouched.
+        self.assertIs(fm_module._atomic_write_json, original_atomic_write)
+
+    async def test_corrupt_journal_recovers_payload_from_command_log(
+        self,
+    ) -> None:
+        """REVIEW13 H2: corrupt local state must not change a request body."""
+
+        await self._spawn("WIKI-ORCH", role="orchestrator", orch=None)
+        await self._spawn("WIKI-232-CORRUPT", role="implement", orch="WIKI-ORCH")
+        mtime = self.clock.now - 1900.0
+        _write_status(
+            self.store,
+            "WIKI-232-CORRUPT",
+            {"state": "working", "pr": None, "step": "coding", "blocker": None},
+            mtime=mtime,
+        )
+        dispatch_send = build_fleet_monitor_dispatch(self.supervisor)
+        first_monitor = FleetMonitor(
+            self.store,
+            dispatch_send,
+            clock=self.clock,
+            interval=0.01,
+            staleness_threshold=1800.0,
+            ownership_lock=self.supervisor._agent_lock,  # noqa: SLF001
+        )
+        orch_run_id = self.store.current_run_id("WIKI-ORCH")
+        assert orch_run_id is not None
+        adapter = self.supervisor.adapters[orch_run_id]
+        with mock.patch.object(
+            adapter, "send_now", wraps=adapter.send_now
+        ) as provider_send:
+            first = await first_monitor.tick()
+            stale = [note for note in first if note.event_type == "staleness"]
+            self.assertEqual(len(stale), 1)
+            original_message = stale[0].message
+            first_staleness_delivery_count = sum(
+                original_message in repr(call)
+                for call in provider_send.await_args_list
+            )
+
+            journal_path = first_monitor._pending_messages_path  # noqa: SLF001
+            journal_path.write_text("{not-json", encoding="utf-8")
+            self.clock.advance(600)
+            restarted = FleetMonitor(
+                self.store,
+                dispatch_send,
+                clock=self.clock,
+                interval=0.01,
+                staleness_threshold=1800.0,
+                ownership_lock=self.supervisor._agent_lock,  # noqa: SLF001
+            )
+            self.assertTrue(restarted._pending_journal_unknown)  # noqa: SLF001
+            replay = await restarted.tick()
+
+        replayed_stale = [
+            note for note in replay if note.event_type == "staleness"
+        ]
+        self.assertEqual(len(replayed_stale), 1)
+        self.assertEqual(replayed_stale[0].message, original_message)
+        self.assertEqual(
+            sum(
+                original_message in repr(call)
+                for call in provider_send.await_args_list
+            ),
+            first_staleness_delivery_count,
+            "receipt replay must not deliver a second provider message",
+        )
+        recovered_journal = json.loads(journal_path.read_text(encoding="utf-8"))
+        self.assertLessEqual(
+            len(recovered_journal["entries"]),
+            restarted.max_pending_messages,
+        )
+
+    async def test_pending_journal_stays_bounded_across_long_run(
+        self,
+    ) -> None:
+        """REVIEW13 M1: windows, mtimes, and transitions replace old rows."""
+
+        await self._spawn("WIKI-ORCH", role="orchestrator", orch=None)
+        worker = await self._spawn(
+            "WIKI-232-LONG", role="implement", orch="WIKI-ORCH"
+        )
+        _set_created_at(self.store, worker, self.clock.now - 3600.0)
+        dispatch_send = build_fleet_monitor_dispatch(self.supervisor)
+        monitor = FleetMonitor(
+            self.store,
+            dispatch_send,
+            clock=self.clock,
+            interval=0.01,
+            staleness_threshold=1800.0,
+            graph_health_realarm=300.0,
+            max_pending_messages=8,
+            ownership_lock=self.supervisor._agent_lock,  # noqa: SLF001
+        )
+
+        for occurrence in range(24):
+            stale_mtime = self.clock.now - 1900.0 - occurrence
+            _write_status(
+                self.store,
+                worker.agent_id,
+                {
+                    "state": "working",
+                    "pr": None,
+                    "step": f"coding {occurrence}",
+                    "blocker": None,
+                },
+                mtime=stale_mtime,
+            )
+            await monitor.tick()
+            _write_status(
+                self.store,
+                worker.agent_id,
+                {
+                    "state": "merge-ready" if occurrence % 2 == 0 else "blocked",
+                    "pr": "https://gh/x/pull/232",
+                    "step": f"transition {occurrence}",
+                    "blocker": "review" if occurrence % 2 else None,
+                },
+                mtime=self.clock.now,
+            )
+            await monitor.tick()
+            self.clock.advance(301.0)
+
+        # Reconcile the final window after the last clock advance.
+        await monitor.tick()
+        journal_path = monitor._pending_messages_path  # noqa: SLF001
+        journal = json.loads(journal_path.read_text(encoding="utf-8"))
+        self.assertLessEqual(len(journal["entries"]), 8)
+        self.assertLessEqual(len(monitor._pending_messages), 8)  # noqa: SLF001
+        self.assertFalse(
+            any(
+                entry["event_type"].endswith("transition")
+                for entry in journal["entries"]
+            ),
+            "completed transition rows must be removed immediately",
+        )
+
+        current_entries = [
+            entry
+            for entry in journal["entries"]
+            if entry["event_type"] == "graph-unavailable"
+        ]
+        self.assertEqual(len(current_entries), 1)
+        current_entry = current_entries[0]
+        current_request_id = fleet_monitor_request_id(
+            self.store.current_run_id("WIKI-ORCH") or "",
+            current_entry["dedupe_key"],
+        )
+        original_receipt = self.store.command_log.receipt(
+            "run/send_now", current_request_id
+        )
+        self.assertIsNotNone(original_receipt)
+
+        # Seed the production journal with more rows than the configured hard
+        # limit. The current recurring alarm is last, so startup trim must
+        # retain it and the seven newest obsolete rows exactly.
+        obsolete_entries = [
+            {
+                "agent_id": worker.agent_id,
+                "run_id": worker.run_id,
+                "dedupe_key": f"fleet:{worker.agent_id}:staleness:{index}",
+                "message": f"obsolete staleness {index}",
+                "event_type": "staleness",
+            }
+            for index in range(12)
+        ]
+        oversized_entries = [*obsolete_entries, current_entry]
+        journal_path.write_text(
+            json.dumps({"entries": oversized_entries}),
+            encoding="utf-8",
+        )
+
+        # A restart in the same live run must trim through the production load
+        # path, replay the exact retained alarm, and prune obsolete rows.
+        restarted = FleetMonitor(
+            self.store,
+            dispatch_send,
+            clock=self.clock,
+            interval=0.01,
+            staleness_threshold=1800.0,
+            graph_health_realarm=300.0,
+            max_pending_messages=8,
+            ownership_lock=self.supervisor._agent_lock,  # noqa: SLF001
+        )
+        expected_loaded = oversized_entries[-8:]
+        self.assertEqual(
+            list(restarted._pending_messages),  # noqa: SLF001
+            [
+                (entry["agent_id"], entry["run_id"], entry["dedupe_key"])
+                for entry in expected_loaded
+            ],
+        )
+        orch_run_id = self.store.current_run_id("WIKI-ORCH")
+        assert orch_run_id is not None
+        adapter = self.supervisor.adapters[orch_run_id]
+        with mock.patch.object(
+            adapter, "send_now", wraps=adapter.send_now
+        ) as provider_send:
+            restart_notes = await restarted.tick()
+            after_prune_notes = await restarted.tick()
+
+        self.assertEqual(
+            [note.event_type for note in restart_notes],
+            ["graph-unavailable"],
+        )
+        self.assertEqual(
+            [note.event_type for note in after_prune_notes],
+            ["status-transition"],
+            "the hard-limit deferral must deliver after pruning frees space",
+        )
+        replayed = [
+            note for note in restart_notes if note.event_type == "graph-unavailable"
+        ]
+        self.assertEqual(len(replayed), 1)
+        self.assertEqual(replayed[0].dedupe_key, current_entry["dedupe_key"])
+        self.assertEqual(replayed[0].message, current_entry["message"])
+        self.assertFalse(
+            any(
+                current_entry["message"] in repr(call)
+                for call in provider_send.await_args_list
+            ),
+            "receipt replay must not deliver the retained alarm twice",
+        )
+        rewritten = json.loads(journal_path.read_text(encoding="utf-8"))
+        self.assertEqual(rewritten["entries"], [current_entry])
+        replayed_receipt = self.store.command_log.receipt(
+            "run/send_now", current_request_id
+        )
+        assert replayed_receipt is not None and original_receipt is not None
+        self.assertEqual(
+            replayed_receipt.command_hash, original_receipt.command_hash
+        )
+
+    async def test_active_alarm_reaches_replacement_orchestrator_once(
+        self,
+    ) -> None:
+        """REVIEW14 H1: destination replacement resets alarm suppression."""
+
+        orchestrator = await self._spawn(
+            "WIKI-ORCH", role="orchestrator", orch=None
+        )
+        worker = await self._spawn(
+            "WIKI-232-DEST", role="implement", orch="WIKI-ORCH"
+        )
+        stale_mtime = self.clock.now - 1900.0
+        _set_created_at(self.store, worker, stale_mtime - 1.0)
+        _write_status(
+            self.store,
+            worker.agent_id,
+            {"state": "working", "pr": None, "step": "coding", "blocker": None},
+            mtime=stale_mtime,
+        )
+        monitor = FleetMonitor(
+            self.store,
+            build_fleet_monitor_dispatch(self.supervisor),
+            clock=self.clock,
+            interval=0.01,
+            staleness_threshold=1800.0,
+            ownership_lock=self.supervisor._agent_lock,  # noqa: SLF001
+        )
+        first = await monitor.tick()
+        first_stale = [note for note in first if note.event_type == "staleness"]
+        self.assertEqual(len(first_stale), 1)
+        original_message = first_stale[0].message
+        self.assertEqual(first_stale[0].orch_run_id, orchestrator.run_id)
+
+        replacement = await self.supervisor.replace(
+            orchestrator.run_id, "replacement orchestrator"
+        )
+        replacement_adapter = self.supervisor.adapters[replacement.run_id]
+        with mock.patch.object(
+            replacement_adapter,
+            "send_now",
+            wraps=replacement_adapter.send_now,
+        ) as replacement_send:
+            after_replace = await monitor.tick()
+            unchanged = await monitor.tick()
+
+        replacement_stale = [
+            note for note in after_replace if note.event_type == "staleness"
+        ]
+        self.assertEqual(len(replacement_stale), 1)
+        self.assertEqual(replacement_stale[0].orch_run_id, replacement.run_id)
+        self.assertEqual(replacement_stale[0].message, original_message)
+        self.assertEqual(
+            [note for note in unchanged if note.event_type == "staleness"], []
+        )
+        self.assertEqual(
+            sum(
+                original_message in repr(call)
+                for call in replacement_send.await_args_list
+            ),
+            1,
+            "the active alarm must reach the replacement exactly once",
+        )
+
+    async def test_pending_message_survives_monitor_restart(self) -> None:
+        """WIKI-232 REVIEW8 H2: an in-memory ``_pending_messages`` dict
+        loses the original retry payload on monitor restart. The next
+        staleness tick recomputes a fresh elapsed-time message under the
+        same durable ``request_id`` and the command log rejects the
+        second dispatch as a conflicting payload. A restarted FleetMonitor
+        must replay the exact original payload."""
+
+        from backend.app.agent_runtime.command_log import CommandConflict
+
+        await self._spawn("WIKI-ORCH", role="orchestrator", orch=None)
+        await self._spawn("WIKI-8232", role="implement", orch="WIKI-ORCH")
+
+        mtime = self.clock.now - 1900.0
+        _write_status(
+            self.store,
+            "WIKI-8232",
+            {"state": "working", "pr": None, "step": "coding", "blocker": None},
+            mtime=mtime,
+        )
+
+        supervisor = self.supervisor
+        dispatched: list[tuple[str, str, str | None]] = []
+
+        async def dispatch_send(
+            run_id: str,
+            message: str,
+            dedupe_key: str | None,
+            source: str | None = None,
+        ):
+            dispatched.append((run_id, message, dedupe_key))
+            return await supervisor.dispatch(
+                "run/send_now",
+                {
+                    "run_id": run_id,
+                    "text": message,
+                    "dedupe_key": fleet_monitor_message_dedupe_key(
+                        run_id, dedupe_key
+                    ),
+                    "source": source,
+                    "request_id": fleet_monitor_request_id(run_id, dedupe_key),
+                },
+            )
+
+        first_monitor = FleetMonitor(
+            self.store,
+            dispatch_send,
+            clock=self.clock,
+            interval=0.01,
+            unrouted_verdict_realarm=300.0,
+            review_gap_threshold=300.0,
+            review_gap_realarm=600.0,
+            staleness_threshold=1800.0,
+            ownership_lock=self.supervisor._agent_lock,  # noqa: SLF001
+        )
+
+        notes = await first_monitor.tick()
+        staleness_notes = [n for n in notes if n.event_type == "staleness"]
+        self.assertEqual(len(staleness_notes), 1)
+        original_message = staleness_notes[0].message
+        dedupe_key = staleness_notes[0].dedupe_key
+        orch_run_id = staleness_notes[0].orch_run_id
+
+        request_id = fleet_monitor_request_id(orch_run_id, dedupe_key)
+        original_receipt = self.store.command_log.receipt(
+            "run/send_now", request_id
+        )
+        self.assertIsNotNone(original_receipt)
+
+        # The worker's own run_id is the third field in the internal
+        # dedupe identity (agent_id, worker_run_id, dedupe_key). Fetch
+        # it so the simulated "ack loss" state uses the same shape
+        # ``_emit`` will look up next tick.
+        worker_run_id = self.store.current_run_id("WIKI-8232")
+        assert worker_run_id is not None
+        pending_identity = (
+            "WIKI-8232",
+            worker_run_id,
+            dedupe_key,
+        )
+
+        # Simulate ack loss on the fleet-monitor side: the durable
+        # send_now receipt exists, but the monitor process died before
+        # ``_pending_messages`` cleanup could persist the pop.
+        first_monitor._pending_messages.clear()  # noqa: SLF001
+        first_monitor._pending_messages[pending_identity] = original_message  # noqa: SLF001
+        first_monitor._persist_pending_messages()  # noqa: SLF001
+        self.assertTrue(first_monitor._pending_messages_path.exists())  # noqa: SLF001
+
+        # Advance so the recomputed elapsed-minutes changes the message
+        # the next tick would generate, then bring up a fresh monitor.
+        self.clock.advance(600)
+        restarted = FleetMonitor(
+            self.store,
+            dispatch_send,
+            clock=self.clock,
+            interval=0.01,
+            unrouted_verdict_realarm=300.0,
+            review_gap_threshold=300.0,
+            review_gap_realarm=600.0,
+            staleness_threshold=1800.0,
+            ownership_lock=self.supervisor._agent_lock,  # noqa: SLF001
+        )
+        # Restart hydrated pending state from disk.
+        self.assertIn(
+            pending_identity,
+            restarted._pending_messages,  # noqa: SLF001
+        )
+
+        dispatched.clear()
+        try:
+            follow_up = await restarted.tick()
+        except CommandConflict as exc:  # pragma: no cover - regression witness
+            self.fail(
+                f"restarted monitor raised CommandConflict on retry: {exc}"
+            )
+        # Retry replayed the exact original message, so idempotent
+        # dispatch returned the cached receipt result without conflict.
+        replayed = [call for call in dispatched if call[2] == dedupe_key]
+        self.assertEqual(len(replayed), 1)
+        self.assertEqual(replayed[0][1], original_message)
+        # Under REVIEW9 semantics the durable payload stays after a
+        # successful retry so a subsequent restart replays the same
+        # message under the same request_id. The receipt from the retry
+        # matches the original (idempotent dispatch).
+        self.assertIn(
+            pending_identity,
+            restarted._pending_messages,  # noqa: SLF001
+        )
+        replayed_receipt = self.store.command_log.receipt(
+            "run/send_now", request_id
+        )
+        self.assertIsNotNone(replayed_receipt)
+        assert replayed_receipt is not None and original_receipt is not None
+        self.assertEqual(
+            replayed_receipt.command_hash, original_receipt.command_hash
+        )
+        self.assertTrue(restarted._pending_messages_path.exists())  # noqa: SLF001
+        del follow_up
+
+    async def test_pending_message_survives_normal_daemon_restart(self) -> None:
+        """WIKI-232 REVIEW9 F1: after a successful staleness send, the
+        durable payload must remain persisted long enough that a normal
+        daemon restart replays the same message under the same
+        request_id. Without this a rebuilt elapsed-time message hits
+        CommandConflict every tick because the send_now receipt is
+        already durable under the shared request_id."""
+
+        from backend.app.agent_runtime.command_log import CommandConflict
+
+        await self._spawn("WIKI-ORCH", role="orchestrator", orch=None)
+        await self._spawn("WIKI-232-R9", role="implement", orch="WIKI-ORCH")
+
+        mtime = self.clock.now - 1900.0
+        _write_status(
+            self.store,
+            "WIKI-232-R9",
+            {"state": "working", "pr": None, "step": "coding", "blocker": None},
+            mtime=mtime,
+        )
+
+        supervisor = self.supervisor
+        dispatched: list[tuple[str, str, str | None]] = []
+
+        async def dispatch_send(
+            run_id: str,
+            message: str,
+            dedupe_key: str | None,
+            source: str | None = None,
+        ):
+            dispatched.append((run_id, message, dedupe_key))
+            return await supervisor.dispatch(
+                "run/send_now",
+                {
+                    "run_id": run_id,
+                    "text": message,
+                    "dedupe_key": fleet_monitor_message_dedupe_key(
+                        run_id, dedupe_key
+                    ),
+                    "source": source,
+                    "request_id": fleet_monitor_request_id(run_id, dedupe_key),
+                },
+            )
+
+        first_monitor = FleetMonitor(
+            self.store,
+            dispatch_send,
+            clock=self.clock,
+            interval=0.01,
+            unrouted_verdict_realarm=300.0,
+            review_gap_threshold=300.0,
+            review_gap_realarm=600.0,
+            staleness_threshold=1800.0,
+            ownership_lock=self.supervisor._agent_lock,  # noqa: SLF001
+        )
+
+        notes = await first_monitor.tick()
+        staleness_notes = [n for n in notes if n.event_type == "staleness"]
+        self.assertEqual(len(staleness_notes), 1)
+        original_message = staleness_notes[0].message
+        dedupe_key = staleness_notes[0].dedupe_key
+        orch_run_id = staleness_notes[0].orch_run_id
+        request_id = fleet_monitor_request_id(orch_run_id, dedupe_key)
+        original_receipt = self.store.command_log.receipt(
+            "run/send_now", request_id
+        )
+        self.assertIsNotNone(original_receipt)
+
+        # A second tick against the same first monitor is a no-op — the
+        # snapshot has ``staleness_alarmed_mtime == mtime`` so the alarm
+        # is skipped. This proves the first send was fully successful,
+        # not stuck mid-flight.
+        dispatched.clear()
+        followup = await first_monitor.tick()
+        self.assertEqual(
+            [n for n in followup if n.event_type == "staleness"], []
+        )
+        self.assertEqual(dispatched, [])
+
+        # Normal daemon restart: no manual state restore. Advance so
+        # the recomputed elapsed-minutes would change the message on
+        # any tick that rebuilt it from wall time. If the R8 fix pops
+        # after success, the retry rebuilds an incompatible payload and
+        # send_now raises CommandConflict.
+        self.clock.advance(600)
+        restarted = FleetMonitor(
+            self.store,
+            dispatch_send,
+            clock=self.clock,
+            interval=0.01,
+            unrouted_verdict_realarm=300.0,
+            review_gap_threshold=300.0,
+            review_gap_realarm=600.0,
+            staleness_threshold=1800.0,
+            ownership_lock=self.supervisor._agent_lock,  # noqa: SLF001
+        )
+
+        dispatched.clear()
+        try:
+            await restarted.tick()
+        except CommandConflict as exc:  # pragma: no cover - regression witness
+            self.fail(
+                f"restarted monitor raised CommandConflict on retry: {exc}"
+            )
+        replayed = [call for call in dispatched if call[2] == dedupe_key]
+        self.assertEqual(len(replayed), 1)
+        self.assertEqual(replayed[0][1], original_message)
+        replayed_receipt = self.store.command_log.receipt(
+            "run/send_now", request_id
+        )
+        assert replayed_receipt is not None and original_receipt is not None
+        self.assertEqual(
+            replayed_receipt.command_hash, original_receipt.command_hash
+        )
+
+    async def test_orchestrator_replace_scopes_monitor_request_id(self) -> None:
+        """WIKI-232 R3 H2: the durable FleetMonitor request_id must be scoped
+        to the target orchestrator run. Several monitor dedupe keys are
+        stable across daemon boots and across replacement runs — a naive
+        ``fleet-monitor:<dedupe_key>`` request id then reuses the same
+        command-log slot for the replacement run's payload, and the store
+        rejects the retry as a conflicting payload (CommandConflict).
+        Steers stop reaching the current orchestrator until the alarm
+        key rotates.
+
+        Bind request_id to (run_id, dedupe_key) so a replacement run has
+        its own request-id namespace while dedupe_key itself is unchanged."""
+
+        from backend.app.agent_runtime.command_log import CommandConflict
+
+        orch = await self._spawn("WIKI-ORCH", role="orchestrator", orch=None)
+        supervisor = self.supervisor
+        first_run_id = orch.run_id
+
+        # Regression witness first, before we lose the ability to dispatch
+        # against first_run_id. A single stable dedupe_key from a monitor
+        # alarm (staleness / unrouted-verdict / graph-health) hashes into
+        # the SAME legacy request_id across boots. Dispatch it once on the
+        # pre-replacement run so the receipt exists.
+        stable_dedupe = "fleet:WIKI-ORCH:staleness:1700000000"
+        legacy_request_id = f"fleet-monitor:{stable_dedupe}"
+        legacy_first = await supervisor.dispatch(
+            "run/send_now",
+            {
+                "run_id": first_run_id,
+                "text": "stable-alarm on pre-replacement run",
+                "dedupe_key": stable_dedupe,
+                "source": "fleet-monitor",
+                "request_id": legacy_request_id,
+            },
+        )
+        self.assertEqual(legacy_first.get("status"), "sent")
+
+        # Alarm occurrence #1 with a per-occurrence dedupe_key that we
+        # will pair with an R3 run-scoped request_id — verifies the
+        # helper path is durable pre-replacement.
+        dedupe_first = "fleet:WIKI-ORCH:graph-health-blocking:no-reviewer:1"
+        first_request_id = fleet_monitor_request_id(first_run_id, dedupe_first)
+        first_result = await supervisor.dispatch(
+            "run/send_now",
+            {
+                "run_id": first_run_id,
+                "text": "alarm #1 on pre-replacement run",
+                "dedupe_key": dedupe_first,
+                "source": "fleet-monitor",
+                "request_id": first_request_id,
+            },
+        )
+        self.assertEqual(first_result.get("status"), "sent")
+
+        # Replace the orchestrator run.
+        replacement = await self.supervisor.replace(
+            orch.run_id, "replacement orchestrator prompt"
+        )
+        self.assertNotEqual(replacement.run_id, first_run_id)
+        self.assertEqual(
+            self.store.current_run_id("WIKI-ORCH"), replacement.run_id
+        )
+
+        # Legacy scheme now collides: same request_id, but the payload's
+        # run_id is the replacement run instead of the original. The
+        # command log rejects it as a conflicting payload — the exact
+        # failure that stops fleet-monitor from reaching the new run.
+        with self.assertRaises(CommandConflict):
+            await supervisor.dispatch(
+                "run/send_now",
+                {
+                    "run_id": replacement.run_id,
+                    "text": "stable-alarm on replacement run",
+                    "dedupe_key": stable_dedupe,
+                    "source": "fleet-monitor",
+                    "request_id": legacy_request_id,
+                },
+            )
+
+        # R3 scheme dodges the collision: the request_id namespace flips
+        # with the run_id, so the same alarm dedupe_key against the new
+        # run lands in its own slot.
+        dedupe_second = "fleet:WIKI-ORCH:graph-health-blocking:no-reviewer:2"
+        second_request_id = fleet_monitor_request_id(
+            replacement.run_id, dedupe_second
+        )
+        self.assertNotEqual(first_request_id, second_request_id)
+        second_result = await supervisor.dispatch(
+            "run/send_now",
+            {
+                "run_id": replacement.run_id,
+                "text": "alarm #2 on replacement run",
+                "dedupe_key": dedupe_second,
+                "source": "fleet-monitor",
+                "request_id": second_request_id,
+            },
+        )
+        self.assertEqual(second_result.get("status"), "sent")
+
+        second_receipt = self.store.command_log.receipt(
+            "run/send_now", second_request_id
+        )
+        self.assertIsNotNone(
+            second_receipt,
+            "monitor steer for replacement run must produce its own receipt",
+        )
+        assert second_receipt is not None
+        self.assertTrue(second_receipt.ok)
+
+        # The stable dedupe_key produces distinct request ids across the
+        # two runs — proof that the R3 scheme moves the collision surface
+        # out of the request-id namespace entirely.
+        self.assertNotEqual(
+            fleet_monitor_request_id(first_run_id, stable_dedupe),
+            fleet_monitor_request_id(replacement.run_id, stable_dedupe),
+        )
+
+        # Request id must stay within the supervisor's 200-char limit.
+        self.assertLessEqual(len(second_request_id), 200)
+        self.assertLessEqual(
+            len(fleet_monitor_request_id(replacement.run_id, stable_dedupe)),
+            200,
+        )
+
+    async def test_replace_delivers_same_alarm_key_through_new_provider(self) -> None:
+        """WIKI-232 R4 H2: the SAME notification dedupe_key before and after
+        orchestrator replacement must reach the replacement provider. Round 3
+        only scoped ``request_id`` to run_id; the transport ``dedupe_key``
+        (which lands in ``message_dedupe_keys``) still collided because
+        ``RunStore.replace`` copies dedupe entries forward. A stable
+        FleetMonitor alarm therefore returned ``deduplicated`` post-
+        replacement with zero provider delivery.
+        Scope the transport dedupe_key to run_id as well — retries within
+        one run still dedupe, but replacement gives the new orchestrator a
+        fresh dedupe namespace for the same alarm."""
+
+        orch = await self._spawn("WIKI-ORCH", role="orchestrator", orch=None)
+        first_run_id = orch.run_id
+
+        # Match the production daemon exactly: scope BOTH request_id and
+        # transport dedupe_key at the callback layer.
+        supervisor = self.supervisor
+        callback_calls: list[tuple[str, str, str | None, str | None]] = []
+
+        async def dispatch_send(
+            run_id: str,
+            message: str,
+            dedupe_key: str | None,
+            source: str | None = None,
+        ) -> dict:
+            callback_calls.append((run_id, message, dedupe_key, source))
+            return await supervisor.dispatch(
+                "run/send_now",
+                {
+                    "run_id": run_id,
+                    "text": message,
+                    "dedupe_key": fleet_monitor_message_dedupe_key(
+                        run_id, dedupe_key
+                    ),
+                    "source": source,
+                    "request_id": fleet_monitor_request_id(run_id, dedupe_key),
+                },
+            )
+
+        # Alarm key is stable across orchestrator generations — e.g. a
+        # graph-health alarm hashes only the ticket + reason.
+        stable_alarm_key = "fleet:WIKI-ORCH:graph-health-blocking:no-reviewer"
+
+        # Fire the alarm through the FIRST run.
+        pre_provider = self.supervisor.adapters[first_run_id]
+        with mock.patch.object(
+            pre_provider, "send_now", wraps=pre_provider.send_now
+        ) as pre_send:
+            pre_result = await dispatch_send(
+                first_run_id,
+                "stable-alarm on pre-replacement run",
+                stable_alarm_key,
+                "fleet-monitor",
+            )
+        self.assertEqual(pre_result.get("status"), "sent")
+        self.assertEqual(pre_send.await_count, 1)
+
+        # Replace the orchestrator. RunStore.replace copies
+        # message_dedupe_keys forward — this is the surface the bug relied on.
+        replacement = await self.supervisor.replace(
+            first_run_id, "replacement orchestrator prompt"
+        )
+        self.assertNotEqual(replacement.run_id, first_run_id)
+
+        carried_keys = self.store.get(replacement.run_id).message_dedupe_keys
+        # The pre-replacement dedupe entry IS still carried forward — proof
+        # that the guarantee comes from scoping the transport key, not from
+        # zeroing the inherited state.
+        self.assertTrue(
+            any(entry.get("owner", "").startswith("run/send_now:") for entry in carried_keys),
+            f"expected inherited fleet-monitor dedupe claim; got {carried_keys!r}",
+        )
+
+        # Fire the SAME alarm key against the replacement run. The new
+        # provider must receive exactly one delivery — proof that the
+        # per-run dedupe namespace prevents the inherited claim from
+        # swallowing the first post-replacement send.
+        # The FixtureAdapter instance may be reused across runs; the
+        # invariant we care about is the send-count on the CURRENT provider
+        # for the replacement run.
+        post_provider = self.supervisor.adapters[replacement.run_id]
+        with mock.patch.object(
+            post_provider, "send_now", wraps=post_provider.send_now
+        ) as post_send:
+            post_result = await dispatch_send(
+                replacement.run_id,
+                "stable-alarm on replacement run",
+                stable_alarm_key,
+                "fleet-monitor",
+            )
+        self.assertEqual(
+            post_result.get("status"),
+            "sent",
+            f"replacement dispatch should deliver, got {post_result!r}",
+        )
+        self.assertEqual(
+            post_send.await_count,
+            1,
+            f"replacement provider must be called exactly once, got calls={post_send.call_args_list!r}",
+        )
+
+        # Both callbacks reused the identical alarm dedupe_key — this is the
+        # mutation-sensitive part the round-3 test missed.
+        self.assertEqual(len(callback_calls), 2)
+        self.assertEqual(callback_calls[0][2], stable_alarm_key)
+        self.assertEqual(callback_calls[1][2], stable_alarm_key)
+
+        # A same-run RETRY does not fire a second provider call. The
+        # matching (run_id, dedupe_key) yields both the same request_id
+        # (idempotent replay) AND the same transport dedupe key, so the
+        # retry short-circuits before touching the adapter.
+        with mock.patch.object(
+            post_provider, "send_now", wraps=post_provider.send_now
+        ) as retry_send:
+            await dispatch_send(
+                replacement.run_id,
+                "stable-alarm on replacement run",
+                stable_alarm_key,
+                "fleet-monitor",
+            )
+        self.assertEqual(
+            retry_send.await_count,
+            0,
+            "same-run retry must not double-send to the provider",
+        )
+
     async def test_no_change_between_ticks_emits_nothing(self) -> None:
         await self._spawn("WIKI-ORCH", role="orchestrator", orch=None)
         await self._spawn("WIKI-101", role="implement", orch="WIKI-ORCH")
@@ -2322,6 +3496,76 @@ class FleetMonitorTests(unittest.IsolatedAsyncioTestCase):
         self.clock.advance(60)
         second = await self.monitor.tick()
         self.assertEqual([n for n in second if n.event_type == "staleness"], [])
+
+    async def test_staleness_lost_ack_replays_immutable_message(self) -> None:
+        """WIKI-232 REVIEW7 H2: a retry must reuse the first rendered
+        message when the staleness clock changes before receipt replay."""
+
+        orch = await self._spawn("WIKI-ORCH", role="orchestrator", orch=None)
+        worker = await self._spawn("WIKI-801", role="implement", orch="WIKI-ORCH")
+        stale_mtime = self.clock.now - 2100
+        _set_created_at(self.store, worker, stale_mtime - 1)
+        _write_status(
+            self.store,
+            worker.agent_id,
+            {"state": "working", "pr": None, "step": "coding", "blocker": None},
+            mtime=stale_mtime,
+        )
+
+        calls: list[str] = []
+        receipts: dict[str, dict[str, str]] = {}
+        first_attempt = True
+
+        async def dispatch_send(
+            run_id: str,
+            message: str,
+            dedupe_key: str | None,
+            source: str | None = None,
+        ):
+            nonlocal first_attempt
+            calls.append(message)
+            request_id = fleet_monitor_request_id(run_id, dedupe_key)
+            existing = receipts.get(request_id)
+            if existing is not None:
+                if message != existing["message"]:
+                    raise AssertionError("retry changed the durable command payload")
+                return {"status": existing["status"]}
+            receipts[request_id] = {"message": message, "status": "sent"}
+            if first_attempt:
+                first_attempt = False
+                raise TimeoutError("lost acknowledgement after durable dispatch")
+            return {"status": "sent"}
+
+        monitor = FleetMonitor(
+            self.store,
+            dispatch_send,
+            clock=self.clock,
+            interval=0.01,
+            staleness_threshold=1800.0,
+            ownership_lock=self.supervisor._agent_lock,  # noqa: SLF001
+        )
+        first = await monitor.tick()
+        self.assertEqual([note for note in first if note.event_type == "staleness"], [])
+        self.clock.advance(60)
+        second = await monitor.tick()
+        stale = [note for note in second if note.event_type == "staleness"]
+        self.assertEqual(
+            len(stale),
+            1,
+            f"first={first!r}, second={second!r}, calls={calls!r}",
+        )
+        stale_calls = [message for message in calls if "status file silent" in message]
+        self.assertEqual(len(stale_calls), 2)
+        self.assertEqual(stale_calls[0], stale_calls[1])
+
+        request_id = fleet_monitor_request_id(
+            orch.run_id,
+            stale[0].dedupe_key,
+        )
+        receipt = receipts.get(request_id)
+        self.assertIsNotNone(receipt)
+        assert receipt is not None
+        self.assertEqual(receipt["status"], "sent")
 
     async def test_send_failure_does_not_break_loop(self) -> None:
         await self._spawn("WIKI-ORCH", role="orchestrator", orch=None)

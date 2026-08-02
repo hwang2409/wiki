@@ -49,6 +49,7 @@ class FakeSupervisorClient:
         self.raw_events: list[dict[str, Any]] = []
         self.current_turn_diff: dict[str, Any] | None = None
         self.pending_requests: list[dict[str, Any]] = []
+        self.composer_messages: list[dict[str, Any]] = []
         self.fail_unavailable = False
         self.rotation_error: SupervisorRemoteError | None = None
         self.event = {
@@ -314,6 +315,9 @@ class FakeSupervisorClient:
                     "unknown": 0,
                 },
                 "pending_requests": list(self.pending_requests),
+                "composer_messages": [
+                    dict(message) for message in self.composer_messages
+                ],
                 "current_turn_diff": self.current_turn_diff,
                 "events": normalized,
                 "raw": raw if values.get("include_raw") else None,
@@ -402,6 +406,42 @@ class HeadlessMainRouteTests(unittest.IsolatedAsyncioTestCase):
             registry = json.loads(self.registry.read_text(encoding="utf-8"))
             registry["WIKI-42"]["current"]["transcript"] = str(transcript)
             self.registry.write_text(json.dumps(registry), encoding="utf-8")
+
+    def _seed_replacement_composer(
+        self,
+        *,
+        transcript: Path | None = None,
+    ) -> list[tuple[str, str]]:
+        self.client._write_current(  # noqa: SLF001 - replacement fixture setup
+            REPLACEMENT_RUN_ID,
+            {
+                "agent_id": "WIKI-42",
+                "provider": "codex",
+                "role": "orchestrator",
+                "model": "gpt-5.4",
+                "effort": "high",
+                "worktree": str(self.worktree),
+                "orchestrator_id": None,
+            },
+        )
+        if transcript is not None:
+            registry = json.loads(self.registry.read_text(encoding="utf-8"))
+            registry["WIKI-42"]["current"]["transcript"] = str(transcript)
+            self.registry.write_text(json.dumps(registry), encoding="utf-8")
+        expected = [
+            ("pending-old", "old-source"),
+            ("pending-new", "new-source"),
+        ]
+        self.client.composer_messages = [
+            {
+                "pending_id": pending_id,
+                "source": source,
+                "text": "same replacement alarm",
+                "sent_at": f"2026-08-02T12:00:0{index}+00:00",
+            }
+            for index, (pending_id, source) in enumerate(expected)
+        ]
+        return expected
 
     def _write_claude_transcript(
         self,
@@ -1063,6 +1103,40 @@ class HeadlessMainRouteTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(payload["model"], "gpt-5.4")
         self.assertEqual(payload["kind"], "cdx")
         self.assertEqual(payload["provider"], "codex")
+
+    async def test_session_transcript_branch_exposes_replacement_composer(
+        self,
+    ) -> None:
+        transcript = self.root / "rollout-replacement-session.jsonl"
+        transcript.write_bytes((FIXTURES / "codex_rollout_success.jsonl").read_bytes())
+        self._seed_headless()
+        expected = self._seed_replacement_composer(transcript=transcript)
+
+        payload = main.agent_session("WIKI-42")
+
+        self.assertEqual(payload["format"], "codex")
+        correlated = [
+            (message.get("pending_id"), message.get("source"))
+            for message in cast(list[dict[str, Any]], payload["composer_messages"])
+        ]
+        self.assertEqual(correlated, expected)
+        self.assertEqual(len(correlated), len(set(correlated)))
+
+    async def test_session_provider_fallback_exposes_replacement_composer(
+        self,
+    ) -> None:
+        self._seed_headless()
+        expected = self._seed_replacement_composer()
+
+        payload = main.agent_session("WIKI-42")
+
+        self.assertEqual(payload["format"], "provider-events")
+        correlated = [
+            (message.get("pending_id"), message.get("source"))
+            for message in cast(list[dict[str, Any]], payload["composer_messages"])
+        ]
+        self.assertEqual(correlated, expected)
+        self.assertEqual(len(correlated), len(set(correlated)))
 
     async def test_session_overlays_pending_headless_question_from_raw_log(self) -> None:
         transcript = self.root / "claude-session.jsonl"

@@ -35,6 +35,7 @@ from backend.app.agent_runtime.store import (
 from backend.app.agent_runtime.types import (
     EventDisposition,
     LifecycleState,
+    MAX_PENDING_USER_MESSAGES,
     ProviderKind,
     RecoveryAction,
     RunRecord,
@@ -764,6 +765,32 @@ class RunStoreTests(unittest.TestCase):
             )
             self.assertEqual(reloaded.get(record.run_id).composer_messages[0]["seq"], 1)
 
+    def test_pending_user_message_store_rejects_overbound_append(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            store = RunStore(_paths(root))
+            record = store.create(_record(root))
+            for index in range(MAX_PENDING_USER_MESSAGES):
+                store.track_pending_user_message(
+                    record.run_id,
+                    f"pending-{index}",
+                    "same text",
+                )
+
+            with self.assertRaisesRegex(
+                StoreConflict, "pending user message limit reached"
+            ):
+                store.track_pending_user_message(
+                    record.run_id,
+                    "pending-overflow",
+                    "same text",
+                )
+
+            self.assertEqual(
+                len(store.get(record.run_id).pending_user_messages),
+                MAX_PENDING_USER_MESSAGES,
+            )
+
     def test_event_inspector_pages_from_cursor_or_bounded_tail(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
@@ -943,6 +970,304 @@ class RunStoreTests(unittest.TestCase):
                 payload=response,
             )
             self.assertEqual(restarted.get(record.run_id).pending_requests, {})
+
+    def test_legacy_snapshot_migration_preserves_external_blocked_state(
+        self,
+    ) -> None:
+        """WIKI-232 REVIEW12 H1: pre-``last_causal_raw_seq`` snapshots
+        lack the checkpoint. Without seeding it from the legacy
+        ``last_lifecycle_event_seq`` marker on load, the boot rebuild
+        replays every historical lifecycle event and destroys an
+        externally-driven BLOCKED state — the exact case is a run that
+        went WORKING -> IDLE via turn events, was then transitioned to
+        BLOCKED with a ``state_reason`` and ``recovery_from_state`` by
+        the recovery watcher (or ``mark_automatic_resume_failed``), and
+        is expected to stay BLOCKED after the daemon restarts. The
+        legacy migration must derive the applied raw boundary and
+        replay only rows past it."""
+
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            paths = _paths(root)
+            store = RunStore(paths)
+            record = store.create(_record(root))
+            # Seed the lifecycle history the review requires: prior
+            # WORKING (turn/started) then IDLE (turn/completed) — both
+            # legal for a run before the operator/watcher pins BLOCKED.
+            started = store.append_raw(
+                record.run_id,
+                provider="codex",
+                direction="provider",
+                payload={
+                    "method": "turn/started",
+                    "params": {"turn": {"turnId": "legacy-1"}},
+                },
+            )
+            store.append_normalized(
+                record.run_id,
+                raw_seq=started["seq"],
+                disposition=EventDisposition.RENDERED,
+                kind="turn_started",
+                payload={"method": "turn/started"},
+                lifecycle_state=LifecycleState.WORKING,
+            )
+            completed = store.append_raw(
+                record.run_id,
+                provider="codex",
+                direction="provider",
+                payload={
+                    "method": "turn/completed",
+                    "params": {
+                        "turn": {"turnId": "legacy-1", "status": "completed"}
+                    },
+                },
+            )
+            store.append_normalized(
+                record.run_id,
+                raw_seq=completed["seq"],
+                disposition=EventDisposition.RENDERED,
+                kind="turn_completed",
+                payload={"status": "completed"},
+                lifecycle_state=LifecycleState.IDLE,
+            )
+            # External transition after the events — pins BLOCKED with
+            # state_reason and recovery_from_state.
+            store.transition(
+                record.run_id,
+                LifecycleState.BLOCKED,
+                reason="provider identity is uncertain after restart",
+            )
+            # Set recovery_from_state directly to mirror what
+            # ``mark_provider_pid_recovery_pending`` / ``mark_automatic_resume_failed``
+            # persist alongside the BLOCKED transition.
+            live = store.get(record.run_id)
+            live.recovery_from_state = LifecycleState.IDLE
+            store._write_record(live)  # noqa: SLF001 - external-transition fixture
+            live = store.get(record.run_id)
+            self.assertEqual(live.state, LifecycleState.BLOCKED)
+            self.assertEqual(
+                live.state_reason,
+                "provider identity is uncertain after restart",
+            )
+            self.assertEqual(
+                live.recovery_from_state, LifecycleState.IDLE
+            )
+
+            # Simulate the legacy on-disk shape: strip
+            # ``last_causal_raw_seq`` so the migration path has to
+            # derive it from ``last_lifecycle_event_seq``. Keep
+            # ``last_lifecycle_event_seq`` as the legacy schema wrote
+            # it (the normalized seq of the last applied lifecycle
+            # event — here the turn/completed row).
+            metadata = json.loads(
+                store.run_path(record.run_id).read_text(encoding="utf-8")
+            )
+            self.assertGreater(metadata.get("last_lifecycle_event_seq", 0), 0)
+            metadata.pop("last_causal_raw_seq", None)
+            store.run_path(record.run_id).write_text(
+                json.dumps(metadata),
+                encoding="utf-8",
+            )
+
+            restarted = RunStore(paths)
+            recovered = restarted.get(record.run_id)
+            # (a) External BLOCKED survives the migration.
+            self.assertEqual(
+                recovered.state,
+                LifecycleState.BLOCKED,
+                "legacy migration must not replay pre-BLOCKED lifecycle "
+                "history and overwrite the externally-pinned state",
+            )
+            # (b) state_reason survives.
+            self.assertEqual(
+                recovered.state_reason,
+                "provider identity is uncertain after restart",
+            )
+            # (c) recovery_from_state survives.
+            self.assertEqual(
+                recovered.recovery_from_state, LifecycleState.IDLE
+            )
+            # (d) The migration seeded last_causal_raw_seq from the
+            # legacy marker so future stale-order recoveries are still
+            # guarded — anything at or below the last applied raw_seq
+            # is treated as already-applied causal history.
+            self.assertGreaterEqual(
+                recovered.last_causal_raw_seq,
+                int(completed["seq"]),
+                "migration must seed last_causal_raw_seq from the "
+                "legacy last_lifecycle_event_seq boundary",
+            )
+
+    def test_rebuild_applies_later_lifecycle_row_at_same_raw_sequence(
+        self,
+    ) -> None:
+        """REVIEW13 H1: the durable checkpoint is a raw/normalized pair.
+
+        One provider row can produce more than one normalized lifecycle row.
+        Simulate a crash after the later IDLE JSONL append but before its
+        run.json replace. Recovery must apply the later same-raw row while
+        still treating lower raw sequences as stale.
+        """
+
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            paths = _paths(root)
+            store = RunStore(paths)
+            record = store.create(_record(root))
+            raw = store.append_raw(
+                record.run_id,
+                provider="codex",
+                direction="provider",
+                payload={"method": "turn/lifecycle"},
+            )
+            store.append_normalized(
+                record.run_id,
+                raw_seq=raw["seq"],
+                disposition=EventDisposition.RENDERED,
+                kind="turn_started",
+                payload={"method": "turn/started"},
+                lifecycle_state=LifecycleState.WORKING,
+            )
+            before_idle = store.run_path(record.run_id).read_text(
+                encoding="utf-8"
+            )
+            store.append_normalized(
+                record.run_id,
+                raw_seq=raw["seq"],
+                disposition=EventDisposition.RENDERED,
+                kind="turn_completed",
+                payload={"status": "completed"},
+                lifecycle_state=LifecycleState.IDLE,
+            )
+            self.assertEqual(store.get(record.run_id).state, LifecycleState.IDLE)
+
+            # Restore the metadata checkpoint from before IDLE. The later
+            # normalized JSONL row stays durable, matching the crash boundary.
+            store.run_path(record.run_id).write_text(before_idle, encoding="utf-8")
+
+            restarted = RunStore(paths)
+            recovered = restarted.get(record.run_id)
+            self.assertEqual(recovered.state, LifecycleState.IDLE)
+            self.assertEqual(recovered.last_causal_raw_seq, int(raw["seq"]))
+            self.assertEqual(recovered.last_lifecycle_event_seq, 2)
+
+    def test_clean_reopen_does_not_rewrite_rebuilt_run_projection(
+        self,
+    ) -> None:
+        """REVIEW18 M1: a clean projection rebuild is byte-for-byte idle."""
+
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            paths = _paths(root)
+            store = RunStore(paths)
+            record = store.create(_record(root))
+            raw = store.append_raw(
+                record.run_id,
+                provider="codex",
+                direction="provider",
+                payload={"method": "fixture/clean-reopen"},
+            )
+            store.append_normalized(
+                record.run_id,
+                raw_seq=int(raw["seq"]),
+                disposition=EventDisposition.IGNORED,
+                kind="fixture_clean_reopen",
+                payload={},
+            )
+            run_path = store.run_path(record.run_id)
+            before_bytes = run_path.read_bytes()
+            before_mtime = run_path.stat().st_mtime_ns
+            before_updated_at = store.get(record.run_id).updated_at
+
+            time.sleep(0.01)
+            restarted = RunStore(paths)
+
+            self.assertEqual(run_path.read_bytes(), before_bytes)
+            self.assertEqual(run_path.stat().st_mtime_ns, before_mtime)
+            self.assertEqual(
+                restarted.get(record.run_id).updated_at,
+                before_updated_at,
+            )
+
+    def test_rebuild_orders_current_composer_echoes_by_raw_sequence(
+        self,
+    ) -> None:
+        """REVIEW14 M1: middle-gap replay keeps identical echoes correlated."""
+
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            store = RunStore(_paths(root))
+            record = store.create(_record(root))
+            inherited = {
+                "pending_id": "inherited",
+                "text": "older message",
+                "sent_at": "2026-01-01T00:00:00Z",
+                "echoed_at": "2026-01-01T00:00:01Z",
+                "seq": 9,
+            }
+            record.composer_messages = [inherited]
+            store._write_record(record)  # noqa: SLF001 - replacement history fixture
+
+            raw_a = store.append_raw(
+                record.run_id,
+                provider="claude",
+                direction="provider",
+                payload={"type": "user", "label": "A"},
+            )
+            raw_b = store.append_raw(
+                record.run_id,
+                provider="claude",
+                direction="provider",
+                payload={"type": "user", "label": "B"},
+            )
+            # B normalizes first. A is the recovered middle-gap row. Both
+            # carry identical text, so FIFO order is required for exact source
+            # correlation.
+            store.append_normalized(
+                record.run_id,
+                raw_seq=raw_b["seq"],
+                disposition=EventDisposition.RENDERED,
+                kind="claude_user",
+                payload={
+                    "pending_id": "pending-b",
+                    "composer_text": "identical user message",
+                    "composer_sent_at": "2026-01-01T00:00:03Z",
+                },
+            )
+            store.append_normalized(
+                record.run_id,
+                raw_seq=raw_a["seq"],
+                disposition=EventDisposition.RENDERED,
+                kind="claude_user",
+                payload={
+                    "pending_id": "pending-a",
+                    "composer_text": "identical user message",
+                    "composer_sent_at": "2026-01-01T00:00:02Z",
+                    "source": "fleet-monitor",
+                },
+            )
+            self.assertEqual(
+                [
+                    message["pending_id"]
+                    for message in store.get(record.run_id).composer_messages
+                ],
+                ["inherited", "pending-b"],
+            )
+
+            rebuilt = store.rebuild_projections_from_normalized(record.run_id)
+            self.assertEqual(
+                [message["pending_id"] for message in rebuilt.composer_messages],
+                ["inherited", "pending-a", "pending-b"],
+            )
+            self.assertEqual(rebuilt.composer_messages[0], inherited)
+            self.assertEqual(
+                rebuilt.composer_messages[1].get("source"), "fleet-monitor"
+            )
+            self.assertNotIn("source", rebuilt.composer_messages[2])
+            self.assertEqual(
+                rebuilt.composer_messages[1]["text"],
+                rebuilt.composer_messages[2]["text"],
+            )
 
     def test_store_files_are_private_and_registry_keeps_legacy_shape(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

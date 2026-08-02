@@ -30,6 +30,7 @@ from .runtime_card import inject_runtime_card
 from .provider import (
     AdapterStatus,
     ProviderAdapter,
+    ProviderBusy,
     ProviderEvent,
     ProviderProcessError,
     StartRequest,
@@ -38,6 +39,7 @@ from .store import RunNotFound, RunStore, StoreConflict
 from .types import (
     LifecycleState,
     EventDisposition,
+    MAX_PENDING_USER_MESSAGES,
     ProviderKind,
     RecoveryAction,
     RunRecord,
@@ -58,6 +60,7 @@ _COMMAND_METHODS = frozenset(
     {"run/start", "run/send_now", "run/send_on_idle", "run/archive", "run/replace"}
 )
 DEFAULT_APPROVAL_RECOVERY_TIMEOUT_SECONDS = 30.0
+AMBIGUOUS_SEND_ECHO_GRACE_SECONDS = 0.05
 logger = logging.getLogger(__name__)
 
 
@@ -389,6 +392,23 @@ class Supervisor:
         self.event_drain_condition = asyncio.Condition()
         self.event_routes: dict[tuple[int, int], str] = {}
         self.queue_locks: dict[str, asyncio.Lock] = {}
+        self._queued_delivery_attempts: set[tuple[str, str]] = set()
+        self._delivery_attempt_echoes: dict[
+            tuple[str, str], asyncio.Future[None]
+        ] = {}
+        self._deferred_provider_events: dict[
+            str,
+            list[
+                tuple[
+                    ProviderAdapter,
+                    ProviderEvent,
+                    dict[str, Any],
+                    NormalizedProviderEvent,
+                    LifecycleState,
+                ]
+            ],
+        ] = {}
+        self._deferred_provider_event_barriers: dict[str, asyncio.Future[None]] = {}
         self.agent_locks: dict[str, asyncio.Lock] = {}
         self.handover_condition = asyncio.Condition()
         self.active_run_mutations = 0
@@ -402,6 +422,11 @@ class Supervisor:
         self.codex_rotation_task: asyncio.Task[dict[str, Any]] | None = None
         self.codex_rotation_operation_id: str | None = None
         self.recovery_scan_lock = asyncio.Lock()
+        # A supervisor boot invalidates any provider stdin write that had not
+        # completed before shutdown: even if the row is at "sending", the
+        # previous transport is gone. Sweep once per boot so the on-idle
+        # queue drain does not wedge on a stale head (WIKI-232).
+        self._sending_effects_reconciled = False
         self.pipeline_failures: dict[str, str] = {}
         self.expected_stream_ends: set[int] = set()
         self.subscribers: set[asyncio.Queue[dict[str, Any]]] = set()
@@ -443,6 +468,9 @@ class Supervisor:
 
     def _runtime_status(self, record: RunRecord) -> dict[str, Any]:
         value = _public_run(record)
+        value["composer_messages"] = self.store.composer_messages_for_run(
+            record.run_id
+        )
         adapter = self.adapters.get(record.run_id)
         snapshot = adapter.snapshot() if adapter is not None else None
         value["control_attached"] = adapter is not None
@@ -843,6 +871,9 @@ Preserve the same identity, role, worktree, orchestrator grouping, PR gates, and
         async with self._event_mutation_admission(run_id, adapter, event) as admitted:
             if not admitted:
                 return
+            barrier = self._deferred_provider_event_barriers.get(run_id)
+            if barrier is not None and not barrier.done():
+                await asyncio.shield(barrier)
             await self._handle_provider_event_without_admission(
                 run_id,
                 adapter,
@@ -857,28 +888,60 @@ Preserve the same identity, role, worktree, orchestrator grouping, PR gates, and
         *,
         update_adapter_snapshot: bool = True,
         schedule_monitor_actions: bool = True,
+        raw: dict[str, Any] | None = None,
+        normalized: NormalizedProviderEvent | None = None,
+        prior_state: LifecycleState | None = None,
     ) -> None:
-        prior = self.store.get(run_id)
-        raw = self.store.append_raw(
-            run_id,
-            provider=event.provider.value,
-            direction=event.direction,
-            payload=event.payload,
-            generation=event.generation,
-            received_at=event.received_at,
-        )
-        try:
-            normalized = normalize_provider_event(
-                event.provider,
-                event.payload,
+        record_before_event = self.store.get(run_id)
+        if prior_state is None:
+            prior_state = record_before_event.state
+        if raw is None:
+            raw = self.store.append_raw(
+                run_id,
+                provider=event.provider.value,
                 direction=event.direction,
+                payload=event.payload,
+                generation=event.generation,
+                received_at=event.received_at,
             )
-        except Exception as exc:
-            normalized = NormalizedProviderEvent(
-                EventDisposition.UNKNOWN,
-                "normalization_error",
-                {"error": str(exc), "raw_payload": event.payload},
+        if (
+            event.generation > 0
+            and event.generation < record_before_event.provider_generation
+        ):
+            # A stopped transport cannot prove delivery for a matcher owned
+            # by the resumed generation. Keep the raw event for audit, but
+            # terminalize its normalization as ignored before text matching.
+            self.store.append_normalized(
+                run_id,
+                raw_seq=int(raw["seq"]),
+                disposition=EventDisposition.IGNORED,
+                kind="retired_generation_event",
+                payload={
+                    "event_generation": event.generation,
+                    "provider_generation": record_before_event.provider_generation,
+                },
             )
+            await self._publish(
+                {
+                    "type": "session",
+                    "ticket": record_before_event.agent_id,
+                    "surface": "session",
+                }
+            )
+            return
+        if normalized is None:
+            try:
+                normalized = normalize_provider_event(
+                    event.provider,
+                    event.payload,
+                    direction=event.direction,
+                )
+            except Exception as exc:
+                normalized = NormalizedProviderEvent(
+                    EventDisposition.UNKNOWN,
+                    "normalization_error",
+                    {"error": str(exc), "raw_payload": event.payload},
+                )
         pending_message = None
         echoed_text = _provider_user_text(
             event.provider,
@@ -892,9 +955,25 @@ Preserve the same identity, role, worktree, orchestrator grouping, PR gates, and
                 echoed_text,
             )
             if pending_message is not None:
-                self.store.command_log.acknowledge_steer_for_pending(
-                    run_id, pending_message["pending_id"]
-                )
+                attempt_key = (run_id, pending_message["pending_id"])
+                if attempt_key in self._queued_delivery_attempts:
+                    barrier = self._deferred_provider_event_barriers.get(run_id)
+                    if barrier is None or barrier.done():
+                        barrier = asyncio.get_running_loop().create_future()
+                        self._deferred_provider_event_barriers[run_id] = barrier
+                    self._deferred_provider_events.setdefault(run_id, []).append(
+                        (
+                            adapter,
+                            event,
+                            raw,
+                            normalized,
+                            prior_state,
+                        )
+                    )
+                    boundary = self._delivery_attempt_echoes.get(attempt_key)
+                    if boundary is not None and not boundary.done():
+                        boundary.set_result(None)
+                    return
                 normalized_payload = {
                     **normalized.payload,
                     "pending_id": pending_message["pending_id"],
@@ -912,6 +991,14 @@ Preserve the same identity, role, worktree, orchestrator grouping, PR gates, and
             payload=normalized_payload,
             lifecycle_state=normalized.lifecycle_state,
         )
+        if pending_message is not None:
+            # The normalized row is the durable delivery proof. Do not make
+            # the steer terminal before this append commits: a failed append
+            # must remain recoverable from the already-durable raw echo
+            # (REVIEW18 H1).
+            self.store.command_log.acknowledge_steer_for_pending(
+                run_id, pending_message["pending_id"]
+            )
 
         record = self.store.get(run_id)
         if normalized.lifecycle_state is not None and update_adapter_snapshot:
@@ -986,7 +1073,7 @@ Preserve the same identity, role, worktree, orchestrator grouping, PR gates, and
                 run_id,
                 adapter,
                 event,
-                prior_state=prior.state,
+                prior_state=prior_state,
                 record=record,
             )
         if claude_turn_succeeded:
@@ -1014,6 +1101,41 @@ Preserve the same identity, role, worktree, orchestrator grouping, PR gates, and
                 self._deliver_next_queued(run_id, adapter),
                 name=f"agent-idle-boundary-{run_id}",
             )
+
+    async def _flush_deferred_provider_events(self, run_id: str) -> None:
+        events = self._deferred_provider_events.pop(run_id, [])
+        barrier = self._deferred_provider_event_barriers.pop(run_id, None)
+        try:
+            for adapter, event, raw, normalized, prior_state in events:
+                await self._handle_provider_event_without_admission(
+                    run_id,
+                    adapter,
+                    event,
+                    raw=raw,
+                    normalized=normalized,
+                    prior_state=prior_state,
+                )
+        except BaseException as exc:
+            if barrier is not None and not barrier.done():
+                barrier.set_exception(exc)
+                # The flush caller already receives this exception. Mark the
+                # barrier result observed so a run with no later event waiter
+                # does not emit an unhandled-future warning.
+                barrier.exception()
+            raise
+        else:
+            if barrier is not None and not barrier.done():
+                barrier.set_result(None)
+
+    async def _flush_deferred_delivery_events(self, run_id: str) -> None:
+        """Flush delivery echoes without closing their command intents on error."""
+
+        try:
+            await self._flush_deferred_provider_events(run_id)
+        except Exception as exc:
+            raise CommandRetryable(
+                "provider echo normalization did not commit"
+            ) from exc
 
     async def _flush_handover_events(
         self, run_id: str, *, schedule_monitor_actions: bool = False
@@ -1383,6 +1505,29 @@ Preserve the same identity, role, worktree, orchestrator grouping, PR gates, and
             async with self._run_lock(run_id):
                 await self._deliver_next_queued_locked(run_id, adapter)
 
+    def _schedule_queued_drain_if_idle(
+        self,
+        run_id: str,
+        adapter: ProviderAdapter,
+        *,
+        name: str,
+    ) -> None:
+        """Continue queue recovery only when the attached provider is idle."""
+
+        if self.adapters.get(run_id) is not adapter:
+            return
+        if self.store.peek_queued_message(run_id) is None:
+            return
+        try:
+            status = adapter.snapshot()
+        except Exception:
+            return
+        if status.state is LifecycleState.IDLE:
+            self._spawn_monitor_task(
+                self._deliver_next_queued(run_id, adapter),
+                name=f"{name}-{run_id}",
+            )
+
     async def _apply_desired_model_locked(
         self,
         run_id: str,
@@ -1473,12 +1618,18 @@ Preserve the same identity, role, worktree, orchestrator grouping, PR gates, and
                 return
             pending_id = queued.get("pending_id")
             queued_source = queued.get("source")
+            effect: dict[str, Any] | None = None
             if pending_id is not None:
                 effect = self.store.command_log.steer_effect_for_pending(
                     run_id, pending_id
                 )
                 if effect is not None and effect["status"] in {"sent", "acknowledged"}:
                     self.store.remove_queued_message_by_pending_id(run_id, pending_id)
+                    self._schedule_queued_drain_if_idle(
+                        run_id,
+                        adapter,
+                        name="agent-queue-terminal-cleanup",
+                    )
                     return
                 if effect is not None and effect["status"] == "sending":
                     if self.store.steer_delivery_observed(run_id, pending_id):
@@ -1492,38 +1643,204 @@ Preserve the same identity, role, worktree, orchestrator grouping, PR gates, and
                         self.store.remove_queued_message_by_pending_id(
                             run_id, pending_id
                         )
+                        self._schedule_queued_drain_if_idle(
+                            run_id,
+                            adapter,
+                            name="agent-queue-observed-cleanup",
+                        )
+                    # No echo yet. The recover_on_start sweep resolves
+                    # sending effects whose transport died; here we just
+                    # wait so the healthy in-flight case can still finish.
+                    return
+            # WIKI-232 R3 H1: preserve the queued item and its (still
+            # queued) effect when the provider is busy. Every entry point
+            # that reaches here for a fresh delivery already had reason
+            # to believe the adapter is IDLE — the natural WORKING->IDLE
+            # transition, an inline send_on_idle path that verified
+            # ``adapter.status()``, or the resume/recovery path that
+            # checked ``status.state`` — but the state can flip between
+            # that check and the queue-lock acquisition. Confirm with a
+            # fresh snapshot: if the provider is no longer idle, back off
+            # so ``send_on_idle`` never raises ProviderBusy inside the
+            # exception handler, which would terminate the effect
+            # uncertain and cascade through the queue.
+            #
+            # Only gate when we have a durable effect to preserve
+            # (``effect`` is not None and status is ``queued``). Ad-hoc
+            # deliveries with no bound effect fall through to the
+            # historical behavior so the fixture-driven "adapter queues
+            # internally" tests keep passing.
+            if effect is not None and effect["status"] == "queued":
+                try:
+                    fresh_status = adapter.snapshot()
+                except Exception:
+                    fresh_status = None
+                if (
+                    fresh_status is not None
+                    and fresh_status.state is not LifecycleState.IDLE
+                ):
                     return
             if pending_id is not None:
+                current_pending = self.store.get(run_id).pending_user_messages
+                if (
+                    len(current_pending) >= MAX_PENDING_USER_MESSAGES
+                    and not any(
+                        item.get("pending_id") == pending_id
+                        for item in current_pending
+                    )
+                ):
+                    adapter = await self._rotate_pending_matcher_transport_locked(
+                        run_id,
+                        adapter,
+                    )
                 self.store.track_pending_user_message(
                     run_id,
                     pending_id,
                     queued["text"],
                     source=queued_source if isinstance(queued_source, str) else None,
                 )
+            attempt_key: tuple[str, str] | None = None
+            echo_boundary: asyncio.Future[None] | None = None
             try:
                 if pending_id is not None:
                     self.store.command_log.mark_steer_sending_for_pending(
                         run_id, pending_id
                     )
+                    attempt_key = (run_id, pending_id)
+                    self._queued_delivery_attempts.add(attempt_key)
+                    echo_boundary = asyncio.get_running_loop().create_future()
+                    self._delivery_attempt_echoes[attempt_key] = echo_boundary
                 status = await adapter.send_on_idle(queued["text"])
-            except Exception as exc:
+            except asyncio.CancelledError:
+                if attempt_key is not None:
+                    self._queued_delivery_attempts.discard(attempt_key)
+                    self._delivery_attempt_echoes.pop(attempt_key, None)
+                raise
+            except ProviderBusy:
+                # WIKI-232 R5 H1: the R3 idle-snapshot gate above is TOCTOU.
+                # The provider can flip WORKING between our fresh
+                # ``snapshot() == IDLE`` observation and ``send_on_idle``'s
+                # authoritative state check. That check raises ProviderBusy —
+                # a known non-acceptance, not an unknown-outcome error. The
+                # generic handler below terminates the effect ``uncertain``
+                # and pops the head, silently discarding a message the
+                # provider explicitly refused. Instead, treat it like the
+                # pre-``mark_sending`` snapshot gate: keep the queue entry,
+                # revert the steer effect from ``sending`` back to
+                # ``queued``, and let the next real WORKING->IDLE transition
+                # drive the retry.
+                if attempt_key is not None:
+                    self._queued_delivery_attempts.discard(attempt_key)
+                    self._delivery_attempt_echoes.pop(attempt_key, None)
                 if pending_id is not None:
                     self.store.discard_pending_user_message(run_id, pending_id)
-                # Provider refusal/races are delivery failures, not event
-                # persistence failures. Retain the durable message for the
-                # next idle edge and keep the provider control stream alive.
+                    self.store.command_log.revert_steer_sending_to_queued_for_pending(
+                        run_id, pending_id
+                    )
+                await self._flush_deferred_delivery_events(run_id)
+                return
+            except Exception as exc:
+                # Match send_now's ambiguous transport boundary. A provider
+                # can queue an echo for the next event-loop turn before its
+                # transport reports failure. Keep the matcher active until
+                # that already-arriving event either signals or times out
+                # (REVIEW17 H1).
+                if echo_boundary is not None:
+                    try:
+                        await asyncio.wait_for(
+                            asyncio.shield(echo_boundary),
+                            timeout=AMBIGUOUS_SEND_ECHO_GRACE_SECONDS,
+                        )
+                    except TimeoutError:
+                        pass
+                if attempt_key is not None:
+                    self._queued_delivery_attempts.discard(attempt_key)
+                    self._delivery_attempt_echoes.pop(attempt_key, None)
+                # Provider events that arrive during a queued attempt are
+                # durable raw rows but remain deferred until the transport
+                # outcome is known. Flush while the pending matcher still
+                # exists so an accepted-then-error echo keeps its pending_id
+                # and composer source correlation (REVIEW15 H2).
+                await self._flush_deferred_delivery_events(run_id)
+                delivery_observed = False
+                if pending_id is not None:
+                    effect_for_pending = (
+                        self.store.command_log.steer_effect_for_pending(
+                            run_id, pending_id
+                        )
+                    )
+                    delivery_observed = self.store.steer_delivery_observed(
+                        run_id, pending_id
+                    )
+                    if delivery_observed:
+                        result = {"status": "sent", "pending_id": pending_id}
+                        if effect_for_pending is not None:
+                            self.store.command_log.update_steer_effect(
+                                str(effect_for_pending["method"]),
+                                str(effect_for_pending["request_id"]),
+                                "acknowledged",
+                                result,
+                            )
+                        self.store.remove_queued_message_by_pending_id(
+                            run_id, pending_id
+                        )
+                    else:
+                        self.store.discard_pending_user_message(
+                            run_id, pending_id
+                        )
+                    # The "sending" marker was written above and cannot
+                    # revert to "queued" after an unknown transport result.
+                    # Without durable delivery evidence, record uncertainty
+                    # and drop the head so later messages can drain.
+                    if (
+                        not delivery_observed
+                        and effect_for_pending is not None
+                        and effect_for_pending["status"] == "sending"
+                    ):
+                        self.store.command_log.update_steer_effect(
+                            str(effect_for_pending["method"]),
+                            str(effect_for_pending["request_id"]),
+                            "acknowledged",
+                            {
+                                "status": "uncertain",
+                                "pending_id": pending_id,
+                                "reason": f"adapter send failed: {exc}",
+                            },
+                        )
+                        self.store.remove_queued_message_by_pending_id(
+                            run_id, pending_id
+                        )
                 record = self.store.get(run_id)
-                record = self.store.transition(
-                    run_id,
-                    record.state,
-                    reason=f"queued message delivery failed: {exc}",
-                )
+                if not delivery_observed:
+                    record = self.store.transition(
+                        run_id,
+                        record.state,
+                        reason=f"queued message delivery failed: {exc}",
+                    )
                 await self._publish(
                     {"type": "session", "ticket": record.agent_id, "surface": "queue"}
                 )
+                # Dropping an uncertain head does not itself emit any later
+                # idle transition, so anything queued behind it would stay
+                # stranded until the next external trigger (WIKI-232 R2).
+                # Schedule a fresh drain if there is more work, this adapter
+                # is still the one attached, AND the provider is currently
+                # IDLE — otherwise the spawned task would hit ProviderBusy
+                # on the next head, terminate it uncertain, and cascade
+                # (WIKI-232 R3 H1). The natural WORKING->IDLE transition
+                # schedules the drain when the provider frees up.
+                self._schedule_queued_drain_if_idle(
+                    run_id,
+                    adapter,
+                    name="agent-queue-drain",
+                )
                 return
+            if attempt_key is not None:
+                self._queued_delivery_attempts.discard(attempt_key)
+                self._delivery_attempt_echoes.pop(attempt_key, None)
             if pending_id is not None:
                 self.store.command_log.mark_steer_sent_for_pending(run_id, pending_id)
+            await self._flush_deferred_delivery_events(run_id)
             self.store.pop_queued_message(run_id)
             record = self.store.update_adapter_status(run_id, status)
             record = self.store.clear_automatic_resume_suppression(run_id)
@@ -1729,6 +2046,44 @@ Preserve the same identity, role, worktree, orchestrator grouping, PR gates, and
             await self._detach_adapter(run_id, preserve_event_routes=True)
         finally:
             self.expected_stream_ends.discard(stream_key)
+
+    async def _rotate_pending_matcher_transport_locked(
+        self,
+        run_id: str,
+        adapter: ProviderAdapter,
+    ) -> ProviderAdapter:
+        """Create a safe echo boundary before retiring pending matchers."""
+
+        record = self.store.get(run_id)
+        session_id = record.provider_session_id
+        if not session_id:
+            raise CommandRetryable("provider session cannot rotate pending matchers")
+        try:
+            await self._quiesce_adapter_for_replacement(run_id, adapter)
+            await adapter.close()
+        except Exception as exc:
+            raise CommandRetryable(
+                "provider transport could not rotate pending matchers"
+            ) from exc
+
+        # Stop and drain form the safe terminal boundary. No event from the
+        # old transport can now consume a matcher installed below.
+        self._remove_adapter_mapping(run_id, adapter)
+        self.store.clear_pending_user_messages(run_id)
+        record = self.store.get(run_id)
+        replacement = self.adapter_factory(record)
+        try:
+            self._attach_adapter(run_id, replacement)
+            status = await replacement.resume(session_id)
+            record = self.store.update_adapter_status(run_id, status)
+            self._route_adapter_generation(run_id, replacement, status.generation)
+        except Exception as exc:
+            await self._close_and_drain_adapter(run_id, replacement)
+            raise CommandRetryable(
+                "provider transport did not resume after matcher rotation"
+            ) from exc
+        await self._publish_agent_change(record.agent_id)
+        return replacement
 
     async def _await_cleanup(self, awaitable: Any) -> Any:
         """Finish a cleanup operation even when its caller is cancelled."""
@@ -2092,6 +2447,11 @@ Preserve the same identity, role, worktree, orchestrator grouping, PR gates, and
             raise StoreConflict(
                 "provider PID is live without attached control; refusing duplicate resume"
             )
+        # All resume callers share this dead-transport boundary: explicit
+        # resume, account rotation, auth recovery, and startup recovery must
+        # retire pre-upgrade overflow before a new adapter can emit events.
+        self.store.retire_overbound_pending_user_messages(run_id)
+        record = self.store.get(run_id)
         resolve_safe_worktree(record.worktree)
         # Request ids belong to the old transport generation. A resumed
         # provider must re-emit any still-actionable request before the UI can
@@ -2169,7 +2529,13 @@ Preserve the same identity, role, worktree, orchestrator grouping, PR gates, and
         async with self._run_mutation_admission():
             async with self.recovery_scan_lock:
                 self.store.abort_uncommitted_starts()
+                # Normalize orphan raw rows before ``_recover_once`` attaches
+                # any live provider event pumps. Running after recovery let an
+                # in-flight normalize race the sweep and the middle-gap case
+                # go undetected (WIKI-232 REVIEW9 F2).
+                await self._normalize_orphan_raw_events()
                 results = await self._recover_once()
+                await self._reconcile_sending_steer_effects()
                 await self.command_queue.recover_pending()
                 if self._reaper_due():
                     by_run_id = {
@@ -2182,6 +2548,355 @@ Preserve the same identity, role, worktree, orchestrator grouping, PR gates, and
                         else:
                             results[index] = reaped
                 return results
+
+    async def _normalize_orphan_raw_events(self) -> None:
+        """Normalize raw provider rows whose normalization did not commit.
+
+        ``_handle_provider_event_without_admission`` appends the raw row
+        first, then defers the normalized append while a queued send is
+        mid-flight so an inbound composer echo cannot beat
+        ``mark_steer_sent_for_pending`` (WIKI-232 R6). A daemon stop
+        between the raw append and the deferred flush leaves an orphan
+        raw row: the normalized side never lands, so
+        ``steer_delivery_observed`` returns False during the subsequent
+        ``_reconcile_sending_steer_effects`` sweep and the still-``sending``
+        effect gets marked ``supervisor_restart_dropped_send`` even though
+        the provider durably accepted the send. Running this reconcile
+        before the sending-effect sweep replays each orphan raw through
+        the normalize + pending-match path so the composer echo is
+        recovered from the durable raw row.
+        """
+
+        for record in self.store.list_runs():
+            run_id = record.run_id
+            try:
+                raw_events = self.store.read_raw_events(run_id)
+            except RunNotFound:
+                continue
+            if not raw_events:
+                continue
+            try:
+                normalized_events = self.store.read_normalized_events(run_id)
+            except RunNotFound:
+                normalized_events = []
+            # Walk the full set of normalized raw_seq values: a middle gap
+            # (raw row N unnormalized, later raw row M > N normalized) sits
+            # at or below the max and would be skipped forever by a
+            # max-based cutoff (WIKI-232 REVIEW9 F2).
+            normalized_seqs = {
+                int(event.get("raw_seq", 0)) for event in normalized_events
+            }
+            orphans = [
+                event
+                for event in raw_events
+                if int(event.get("seq", 0)) not in normalized_seqs
+            ]
+            if not orphans:
+                continue
+            # Recover in raw order so downstream normalizers see the same
+            # sequence the live pump would deliver.
+            orphans.sort(key=lambda event: int(event.get("seq", 0)))
+            # Hold the per-run event-processing lock so a live event that
+            # arrives mid-scan cannot append a duplicate normalize row for
+            # a raw seq this pass is already replaying.
+            event_lock = self.event_processing_locks.setdefault(
+                run_id, asyncio.Lock()
+            )
+            recovered_any = False
+            async with event_lock:
+                # Reload after acquiring the lock so a normalize that landed
+                # while we were waiting is not double-processed here.
+                try:
+                    normalized_events = self.store.read_normalized_events(run_id)
+                except RunNotFound:
+                    continue
+                normalized_seqs = {
+                    int(event.get("raw_seq", 0)) for event in normalized_events
+                }
+                for envelope in orphans:
+                    orphan_seq = int(envelope.get("seq", 0))
+                    if orphan_seq in normalized_seqs:
+                        continue
+                    appended = await self._recover_orphan_raw_event(
+                        run_id, envelope
+                    )
+                    if appended:
+                        recovered_any = True
+                if recovered_any:
+                    # Recovered orphans get appended after later normalized
+                    # rows, so any projection built by walking normalized
+                    # events in file order (lifecycle state,
+                    # pending_requests, current_turn_diff, disposition
+                    # counts, unread_event_seq) can now regress or
+                    # resurrect superseded causal state — not just
+                    # lifecycle. Rebuild every order-sensitive projection
+                    # from the complete normalized set sorted by raw_seq
+                    # so record state reflects true provider order
+                    # (WIKI-232 REVIEW11 H1).
+                    self.store.rebuild_projections_from_normalized(run_id)
+
+    async def _recover_orphan_raw_event(
+        self,
+        run_id: str,
+        envelope: dict[str, Any],
+    ) -> bool:
+        """Replay one orphan raw event through the normalize + match path.
+
+        The write preserves the normalized event's original
+        ``lifecycle_state`` for durable observability. The caller
+        (``_normalize_orphan_raw_events``) rebuilds order-sensitive
+        projections in raw_seq order afterwards so a stale-order append
+        cannot regress record state (WIKI-232 REVIEW11 H1).
+        """
+
+        payload = envelope.get("payload")
+        raw_seq = int(envelope.get("seq", 0))
+        raw_generation = envelope.get("generation")
+        record = self.store.get(run_id)
+        if (
+            type(raw_generation) is int
+            and raw_generation > 0
+            and raw_generation < record.provider_generation
+        ):
+            self.store.append_normalized(
+                run_id,
+                raw_seq=raw_seq,
+                disposition=EventDisposition.IGNORED,
+                kind="retired_generation_event",
+                payload={
+                    "event_generation": raw_generation,
+                    "provider_generation": record.provider_generation,
+                },
+            )
+            return True
+        direction = str(envelope.get("direction") or "provider")
+        provider_value = str(envelope.get("provider") or "")
+        if provider_value == "supervisor" and isinstance(payload, dict):
+            normalized = NormalizedProviderEvent(
+                EventDisposition.RENDERED,
+                str(payload.get("type") or "supervisor_event"),
+                payload,
+            )
+            provider: ProviderKind | None = None
+        else:
+            try:
+                provider = ProviderKind(provider_value)
+            except ValueError:
+                provider = None
+            if provider is None or not isinstance(payload, dict):
+                normalized = NormalizedProviderEvent(
+                    EventDisposition.UNKNOWN,
+                    "normalization_error",
+                    {
+                        "error": f"unsupported raw provider: {provider_value or 'missing'}",
+                        "raw_payload": payload,
+                    },
+                )
+            else:
+                try:
+                    normalized = normalize_provider_event(
+                        provider,
+                        payload,
+                        direction=direction,
+                    )
+                except Exception as exc:
+                    normalized = NormalizedProviderEvent(
+                        EventDisposition.UNKNOWN,
+                        "normalization_error",
+                        {"error": str(exc), "raw_payload": payload},
+                    )
+        if not isinstance(payload, dict) or provider is None:
+            echoed_text = None
+        else:
+            echoed_text = _provider_user_text(
+                provider,
+                normalized.kind,
+                normalized.payload,
+            )
+        normalized_payload = normalized.payload
+        matched_pending_id: str | None = None
+        if echoed_text is not None:
+            pending_message = self.store.match_pending_user_message(
+                run_id,
+                echoed_text,
+            )
+            if pending_message is not None:
+                matched_pending_id = str(pending_message["pending_id"])
+                normalized_payload = {
+                    **normalized.payload,
+                    "pending_id": matched_pending_id,
+                    "composer_text": pending_message["text"],
+                    "composer_sent_at": pending_message["sent_at"],
+                }
+                pending_source = pending_message.get("source")
+                if isinstance(pending_source, str) and pending_source:
+                    normalized_payload["source"] = pending_source
+        self.store.append_normalized(
+            run_id,
+            raw_seq=raw_seq,
+            disposition=normalized.disposition,
+            kind=normalized.kind,
+            payload=normalized_payload,
+            lifecycle_state=normalized.lifecycle_state,
+        )
+        if matched_pending_id is not None:
+            self.store.command_log.acknowledge_steer_for_pending(
+                run_id, matched_pending_id
+            )
+            # The live drain path pairs its own ``mark_sent`` with a
+            # ``remove_queued_message_by_pending_id`` when the provider
+            # accepts the send. Recovery bypasses that drain — orphan
+            # normalization is the only signal we have that the send
+            # completed — so the queue removal has to happen here.
+            # Without it the queued row survives ``recover_on_start``,
+            # every later ``send_on_idle`` sees a stale head, and the
+            # queue never drains (WIKI-232 REVIEW11 M2).
+            self.store.remove_queued_message_by_pending_id(
+                run_id, matched_pending_id
+            )
+        return True
+
+    async def _reconcile_sending_steer_effects(self) -> None:
+        """Resolve every steer effect left at status='sending' by a prior boot.
+
+        A daemon stop between ``mark_steer_sending_for_pending`` and the
+        provider echo leaves the on-idle queue head bound to a `sending`
+        effect that no new echo can reach: the previous adapter transport
+        is dead. Without this sweep the drain returns without changing
+        the effect or removing the head, and every later queued message
+        is starved (WIKI-232 H2).
+
+        Called once per boot from ``recover_on_start`` after per-run
+        recovery has replayed persisted events (so ``steer_delivery_observed``
+        sees any composer echo that was already durable). Effects whose
+        delivery is observed are promoted to ``acknowledged`` normally;
+        effects whose delivery is not observed are marked ``acknowledged``
+        with an ``uncertain`` payload, and the queued message plus the
+        pending user message are dropped so the queue can drain.
+        """
+
+        if self._sending_effects_reconciled:
+            return
+        for effect in self.store.command_log.sending_steer_effects():
+            run_id = str(effect.get("run_id") or "")
+            method = str(effect.get("method") or "")
+            request_id = str(effect.get("request_id") or "")
+            if not run_id or not method or not request_id:
+                continue
+            pending_id = effect.get("pending_id")
+            pending_id_str = (
+                str(pending_id) if isinstance(pending_id, str) else None
+            )
+            try:
+                record = self.store.get(run_id)
+            except RunNotFound:
+                missing: dict[str, Any] = {
+                    "status": "uncertain",
+                    "reason": "run_missing_during_startup_reconcile",
+                }
+                if pending_id_str is not None:
+                    missing["pending_id"] = pending_id_str
+                self.store.command_log.update_steer_effect(
+                    method, request_id, "acknowledged", missing
+                )
+                continue
+            async with self._agent_lock(record.agent_id):
+                try:
+                    self.store.get(run_id)
+                except RunNotFound:
+                    missing = {
+                        "status": "uncertain",
+                        "reason": "run_missing_during_startup_reconcile",
+                    }
+                    if pending_id_str is not None:
+                        missing["pending_id"] = pending_id_str
+                    self.store.command_log.update_steer_effect(
+                        method, request_id, "acknowledged", missing
+                    )
+                    continue
+                # The initial list is only a candidate snapshot. A live
+                # drain can finish this exact effect before this run lock is
+                # acquired, so reload it and reconcile only if it is still
+                # genuinely in-flight (WIKI-232 REVIEW6 H1).
+                current_effect = self.store.command_log.steer_effect_for_request(
+                    method,
+                    request_id,
+                )
+                if (
+                    current_effect is None
+                    or current_effect.get("run_id") != run_id
+                    or current_effect.get("status") != "sending"
+                ):
+                    continue
+                pending_id = current_effect.get("pending_id")
+                pending_id_str = (
+                    str(pending_id) if isinstance(pending_id, str) else None
+                )
+                observed = False
+                if pending_id_str is not None:
+                    try:
+                        observed = self.store.steer_delivery_observed(
+                            run_id, pending_id_str
+                        )
+                    except RunNotFound:
+                        continue
+                if observed:
+                    result: dict[str, Any] = {"status": "sent"}
+                    if pending_id_str is not None:
+                        result["pending_id"] = pending_id_str
+                    self.store.command_log.update_steer_effect(
+                        method, request_id, "acknowledged", result
+                    )
+                    if pending_id_str is not None:
+                        self.store.remove_queued_message_by_pending_id(
+                            run_id, pending_id_str
+                        )
+                        adapter = self.adapters.get(run_id)
+                        if adapter is not None:
+                            self._schedule_queued_drain_if_idle(
+                                run_id,
+                                adapter,
+                                name="agent-recover-observed-cleanup",
+                            )
+                    continue
+                uncertain: dict[str, Any] = {"status": "uncertain"}
+                if pending_id_str is not None:
+                    uncertain["pending_id"] = pending_id_str
+                uncertain["reason"] = "supervisor_restart_dropped_send"
+                self.store.command_log.update_steer_effect(
+                    method, request_id, "acknowledged", uncertain
+                )
+                if pending_id_str is not None:
+                    self.store.remove_queued_message_by_pending_id(
+                        run_id, pending_id_str
+                    )
+                    self.store.discard_pending_user_message(run_id, pending_id_str)
+                # Removing the wedged head does not fire a new idle event,
+                # so anything queued behind it would remain stranded until
+                # the next external trigger (WIKI-232 R2). If the recovered
+                # adapter is attached, the provider is IDLE, and there is
+                # more work, schedule a drain — the monitor task will re-enter
+                # through the normal queue lock once this reconcile step
+                # releases its run lock. Gate on IDLE so a still-WORKING
+                # adapter does not cascade uncertain-drops through the queue
+                # via ProviderBusy (WIKI-232 R3 H1); the natural
+                # WORKING->IDLE transition drains later.
+                adapter = self.adapters.get(run_id)
+                try:
+                    drain_status = adapter.snapshot() if adapter is not None else None
+                except Exception:
+                    drain_status = None
+                if (
+                    adapter is not None
+                    and self.store.peek_queued_message(run_id) is not None
+                    and drain_status is not None
+                    and drain_status.state is LifecycleState.IDLE
+                ):
+                    self._spawn_monitor_task(
+                        self._deliver_next_queued(run_id, adapter),
+                        name=f"agent-recover-queue-drain-{run_id}",
+                    )
+        self._sending_effects_reconciled = True
 
     async def _reap_lost_runs(self) -> list[dict[str, str]]:
         self.last_reaper_at = time.monotonic()
@@ -3021,6 +3736,16 @@ Preserve the same identity, role, worktree, orchestrator grouping, PR gates, and
         # Decision inputs are refreshed per run; no stale list snapshot can
         # override a replacement that happened while recovery was running.
         record = self.store.get(run_id)
+        adapter = self.adapters.get(record.run_id)
+        provider_pid_alive = (
+            self.pid_alive(record.provider_pid) if adapter is None else True
+        )
+        if adapter is None and not provider_pid_alive:
+            # A daemon restart has no attached stream and the saved provider
+            # PID is dead. Retire legacy overflow before suppression, detach,
+            # or other safe early returns can preserve it indefinitely.
+            self.store.retire_overbound_pending_user_messages(record.run_id)
+            record = self.store.get(run_id)
         pipeline_failure = self.pipeline_failures.get(record.run_id)
         if pipeline_failure:
             return {
@@ -3028,7 +3753,6 @@ Preserve the same identity, role, worktree, orchestrator grouping, PR gates, and
                 "action": RecoveryAction.BLOCK.value,
                 "reason": pipeline_failure,
             }
-        adapter = self.adapters.get(record.run_id)
         if adapter is not None:
             if record.state in {
                 LifecycleState.DEAD,
@@ -3090,7 +3814,7 @@ Preserve the same identity, role, worktree, orchestrator grouping, PR gates, and
         decision = restart_recovery_decision(
             record,
             is_current=self.store.is_current(record),
-            provider_pid_alive=self.pid_alive(record.provider_pid),
+            provider_pid_alive=provider_pid_alive,
             provider_control_attached=record.run_id in self.adapters,
         )
         result = {
@@ -3285,8 +4009,94 @@ Preserve the same identity, role, worktree, orchestrator grouping, PR gates, and
                     "run/send_now", effect_id, "acknowledged", result
                 )
                 return result
+        normalized_message = message.strip()
+        if normalized_message:
+            current_record = self.store.get(run_id)
+            unresolved_match = None
+            rotate_matcher_transport = (
+                len(current_record.pending_user_messages)
+                >= MAX_PENDING_USER_MESSAGES
+                and not any(
+                    item.get("pending_id") == pending_id
+                    for item in current_record.pending_user_messages
+                )
+            )
+            for item in current_record.pending_user_messages:
+                old_pending_id = item.get("pending_id")
+                if (
+                    old_pending_id == pending_id
+                    or str(item.get("text") or "").strip()
+                    != normalized_message
+                    or not isinstance(old_pending_id, str)
+                ):
+                    continue
+                old_effect = self.store.command_log.steer_effect_for_pending(
+                    run_id, old_pending_id
+                )
+                inherited_from_replacement = False
+                if old_effect is None and current_record.replaces_run_id is not None:
+                    old_effect = self.store.command_log.steer_effect_for_pending(
+                        current_record.replaces_run_id,
+                        old_pending_id,
+                    )
+                    inherited_from_replacement = True
+                old_result = (
+                    old_effect.get("result")
+                    if isinstance(old_effect, dict)
+                    else None
+                )
+                accepted = bool(
+                    isinstance(old_effect, dict)
+                    and old_effect.get("status") in {"sent", "acknowledged"}
+                    and not (
+                        isinstance(old_result, dict)
+                        and old_result.get("status") == "uncertain"
+                    )
+                )
+                if inherited_from_replacement:
+                    # Store replacement drops old-transport matchers. Keep
+                    # this legacy guard for snapshots written before that
+                    # migration. The old transport was quiesced and drained,
+                    # so its matcher cannot consume the new alarm's echo.
+                    self.store.discard_pending_user_message(
+                        run_id, old_pending_id
+                    )
+                    continue
+                if accepted:
+                    # Keep accepted same-run matchers in FIFO order. They are
+                    # echo tombstones: a delayed first echo must consume the
+                    # first pending_id/source before the later equal-text echo
+                    # consumes the second (REVIEW20 H1). Accepted matchers do
+                    # not block another send because provider acceptance is
+                    # already durable.
+                    continue
+                unresolved_match = item
+                break
+            if unresolved_match is not None:
+                # FIFO text matching cannot distinguish two unresolved sends
+                # with equal normalized text. Stop and drain the transport
+                # before retiring the old slot. The new generation then gives
+                # this command a finite, non-starving delivery path without
+                # allowing an old echo to prove it (REVIEW21 H2).
+                rotate_matcher_transport = True
+            if rotate_matcher_transport:
+                adapter = await self._rotate_pending_matcher_transport_locked(
+                    run_id,
+                    adapter,
+                )
         if dedupe_key is not None:
-            _, claimed = self.store.claim_message_dedupe_key(run_id, dedupe_key)
+            # Bind the dedupe claim to the steer effect so replay after a
+            # crash between the claim and provider delivery can resume
+            # (WIKI-232). The owner is method-scoped because the command log
+            # permits the same request_id once per method (send_now +
+            # send_on_idle); an unscoped owner would let a cross-method
+            # collision reclaim its sibling's key. Non-command paths
+            # (effect_id is None) keep the legacy owner-less behavior and
+            # remain single-shot.
+            owner = f"run/send_now:{effect_id}" if effect_id is not None else None
+            _, claimed = self.store.claim_message_dedupe_key(
+                run_id, dedupe_key, owner=owner
+            )
             if not claimed:
                 return {"status": "deduplicated", "dedupe_key": dedupe_key}
         if pending_id is None and source is not None:
@@ -3295,11 +4105,7 @@ Preserve the same identity, role, worktree, orchestrator grouping, PR gates, and
             pending_id = str(uuid4())
         # Cleanup obligation is established BEFORE the tracker runs. A partial
         # tracker success (atomic os.replace committed but a follow-up chmod
-        # or dir fsync raises) would otherwise leak a durable pending row
-        # while releasing the dedupe key — a retry would then land a second
-        # pending row for the same pending_id, and the stale first row could
-        # consume the retry's provider echo.
-        accepted = False
+        # or dir fsync raises) would otherwise leak a durable pending row.
         try:
             if pending_id is not None:
                 try:
@@ -3315,18 +4121,105 @@ Preserve the same identity, role, worktree, orchestrator grouping, PR gates, and
                 self.store.command_log.update_steer_effect(
                     "run/send_now", effect_id, "sending"
                 )
-            status = await adapter.send_now(message)
-            accepted = True
         except Exception:
-            if dedupe_key is not None and not accepted:
+            if dedupe_key is not None:
                 self.store.release_message_dedupe_key(run_id, dedupe_key)
-            if pending_id is not None and not accepted:
+            if pending_id is not None:
                 self.store.discard_pending_user_message(run_id, pending_id)
             raise
+
+        attempt_key: tuple[str, str] | None = None
+        echo_boundary: asyncio.Future[None] | None = None
+        if pending_id is not None:
+            attempt_key = (run_id, pending_id)
+            self._queued_delivery_attempts.add(attempt_key)
+            echo_boundary = asyncio.get_running_loop().create_future()
+            self._delivery_attempt_echoes[attempt_key] = echo_boundary
+        try:
+            status = await adapter.send_now(message)
+        except asyncio.CancelledError:
+            if attempt_key is not None:
+                self._queued_delivery_attempts.discard(attempt_key)
+                self._delivery_attempt_echoes.pop(attempt_key, None)
+            raise
+        except ProviderBusy:
+            if attempt_key is not None:
+                self._queued_delivery_attempts.discard(attempt_key)
+                self._delivery_attempt_echoes.pop(attempt_key, None)
+            if dedupe_key is not None:
+                self.store.release_message_dedupe_key(run_id, dedupe_key)
+            if pending_id is not None:
+                self.store.discard_pending_user_message(run_id, pending_id)
+            raise
+        except Exception as exc:
+            # A transport can accept the write, schedule its echo for the next
+            # event-loop turn, then report an error. Keep the pending matcher
+            # active while the event pump crosses this bounded barrier. The
+            # matching handler persists raw input, defers normalization, and
+            # signals the future above (REVIEW16 H1).
+            if echo_boundary is not None:
+                try:
+                    await asyncio.wait_for(
+                        asyncio.shield(echo_boundary),
+                        timeout=AMBIGUOUS_SEND_ECHO_GRACE_SECONDS,
+                    )
+                except TimeoutError:
+                    pass
+            if attempt_key is not None:
+                self._queued_delivery_attempts.discard(attempt_key)
+                self._delivery_attempt_echoes.pop(attempt_key, None)
+            await self._flush_deferred_delivery_events(run_id)
+            delivery_observed = False
+            if pending_id is not None:
+                terminal = self.store.command_log.steer_effect_for_pending(
+                    run_id, pending_id
+                )
+                terminal_result = (
+                    terminal.get("result") if isinstance(terminal, dict) else None
+                )
+                terminal_sent = bool(
+                    isinstance(terminal, dict)
+                    and terminal.get("status") in {"sent", "acknowledged"}
+                    and not (
+                        isinstance(terminal_result, dict)
+                        and terminal_result.get("status") == "uncertain"
+                    )
+                )
+                delivery_observed = terminal_sent or (
+                    self.store.steer_delivery_observed(run_id, pending_id)
+                )
+            if delivery_observed:
+                response: dict[str, Any] = {"status": "sent"}
+                if pending_id is not None and expose_pending_id:
+                    response["pending_id"] = pending_id
+                if dedupe_key is not None:
+                    response["dedupe_key"] = dedupe_key
+                if effect_id is not None:
+                    self.store.command_log.update_steer_effect(
+                        "run/send_now", effect_id, "acknowledged", response
+                    )
+                return response
+            # The provider outcome is ambiguous. Preserve the sending effect,
+            # pending matcher, and dedupe claim. A later echo can still gain
+            # exact source correlation, and a replay cannot send a duplicate.
+            response = {"status": "uncertain", "reason": str(exc)}
+            if pending_id is not None and expose_pending_id:
+                response["pending_id"] = pending_id
+            if dedupe_key is not None:
+                response["dedupe_key"] = dedupe_key
+            if effect_id is not None:
+                self.store.command_log.update_steer_effect(
+                    "run/send_now", effect_id, "sending", response
+                )
+            return response
+        if attempt_key is not None:
+            self._queued_delivery_attempts.discard(attempt_key)
+            self._delivery_attempt_echoes.pop(attempt_key, None)
         if effect_id is not None:
             self.store.command_log.update_steer_effect(
                 "run/send_now", effect_id, "sent"
             )
+        await self._flush_deferred_delivery_events(run_id)
         record = self.store.update_adapter_status(run_id, status)
         record = self.store.clear_automatic_resume_suppression(run_id)
         await self._publish_agent_change(record.agent_id)
@@ -3412,7 +4305,13 @@ Preserve the same identity, role, worktree, orchestrator grouping, PR gates, and
                     return result
                 return {"status": "uncertain", "pending_id": pending_id}
         if dedupe_key is not None:
-            record, claimed = self.store.claim_message_dedupe_key(run_id, dedupe_key)
+            # Method-scope the owner: see the twin comment in _send_now.
+            owner = (
+                f"run/send_on_idle:{effect_id}" if effect_id is not None else None
+            )
+            record, claimed = self.store.claim_message_dedupe_key(
+                run_id, dedupe_key, owner=owner
+            )
             if not claimed:
                 return {
                     "status": "deduplicated",
@@ -3456,6 +4355,29 @@ Preserve the same identity, role, worktree, orchestrator grouping, PR gates, and
             if pending_id is not None and not any(
                 item.get("pending_id") == pending_id for item in remaining
             ):
+                # WIKI-232 R4 H1: the inline drain removes the queue head
+                # BOTH on successful delivery and on a failed
+                # ``adapter.send_on_idle`` (uncertain-acknowledged path in
+                # ``_deliver_next_queued_locked``). Queue-slot removal is
+                # therefore not proof of provider acceptance. Consult the
+                # terminal steer effect and mirror ITS result — only report
+                # ``sent`` when delivery was accepted or observed.
+                terminal = self.store.command_log.steer_effect_for_pending(
+                    run_id, pending_id
+                )
+                if (
+                    terminal is not None
+                    and terminal["status"] in {"sent", "acknowledged"}
+                ):
+                    terminal_result = terminal.get("result")
+                    if isinstance(terminal_result, dict):
+                        enriched = dict(terminal_result)
+                        if (
+                            dedupe_key is not None
+                            and "dedupe_key" not in enriched
+                        ):
+                            enriched["dedupe_key"] = dedupe_key
+                        return enriched
                 return {
                     "status": "sent",
                     "pending_id": pending_id,
@@ -4659,9 +5581,7 @@ Preserve the same identity, role, worktree, orchestrator grouping, PR gates, and
                 "pending_requests": [
                     dict(request) for request in record.pending_requests.values()
                 ],
-                "composer_messages": [
-                    dict(message) for message in record.composer_messages
-                ],
+                "composer_messages": self.store.composer_messages_for_run(run_id),
                 "current_turn_diff": self.store.current_turn_diff(run_id),
                 "events": self.store.read_normalized_events(
                     run_id,
@@ -4726,6 +5646,8 @@ Preserve the same identity, role, worktree, orchestrator grouping, PR gates, and
         self.event_routes.clear()
         self.event_processing_locks.clear()
         self.event_inflight_counts.clear()
+        self._queued_delivery_attempts.clear()
+        self._delivery_attempt_echoes.clear()
         self.queue_locks.clear()
         self.agent_locks.clear()
         self.pipeline_failures.clear()

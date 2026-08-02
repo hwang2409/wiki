@@ -21,7 +21,10 @@ from dataclasses import dataclass
 from typing import Any
 from uuid import uuid4
 
-from .store import RunStore
+from pathlib import Path
+
+from .fleet_monitor_ids import fleet_monitor_request_id
+from .store import RunStore, _atomic_write_json
 from .graph_health import GraphHealthMonitor, default_clock
 from .ticket import base_ticket
 from .types import LifecycleState, RunRecord, TERMINAL_STATES
@@ -43,6 +46,7 @@ DEFAULT_GRAPH_HEALTH_REALARM_SECONDS = 300.0
 DEFAULT_REVIEW_ROUTE_SUPPRESSION_SECONDS = 900.0
 DEFAULT_SEND_TIMEOUT_SECONDS = 10.0
 DEFAULT_MAX_CONCURRENT_SENDS = 4
+DEFAULT_MAX_PENDING_MESSAGES = 256
 
 
 logger = logging.getLogger(__name__)
@@ -157,6 +161,7 @@ class FleetMonitor:
         review_route_suppression: float = DEFAULT_REVIEW_ROUTE_SUPPRESSION_SECONDS,
         send_timeout: float = DEFAULT_SEND_TIMEOUT_SECONDS,
         max_concurrent_sends: int = DEFAULT_MAX_CONCURRENT_SENDS,
+        max_pending_messages: int = DEFAULT_MAX_PENDING_MESSAGES,
         ownership_lock: Callable[[str], asyncio.Lock] | None = None,
         on_transition: TransitionHook | None = None,
     ):
@@ -183,8 +188,11 @@ class FleetMonitor:
             raise ValueError("send_timeout must be positive")
         if max_concurrent_sends < 1:
             raise ValueError("max_concurrent_sends must be positive")
+        if max_pending_messages < 1:
+            raise ValueError("max_pending_messages must be positive")
         self.send_timeout = send_timeout
         self.max_concurrent_sends = max_concurrent_sends
+        self.max_pending_messages = max_pending_messages
         self.ownership_lock = ownership_lock
         self.on_transition = on_transition
         self._instance_id = uuid4().hex[:12]
@@ -198,7 +206,182 @@ class FleetMonitor:
         )
         self._graph_health_snapshots = self._graph_health.snapshots
         self._sent_dedupe_keys: set[tuple[str, str, str]] = set()
+        self._destination_run_ids: dict[str, str] = {}
+        # Persisted on write / removed on success so a restarted FleetMonitor
+        # replays the exact original payload for the same dedupe key. Without
+        # this, staleness retries would recompute a new elapsed-time message,
+        # collide with the durable send_now receipt for the original message
+        # under the same request_id, and raise CommandConflict every tick
+        # (WIKI-232 REVIEW8 H2).
+        self._pending_messages_path: Path = (
+            self.store.paths.runtime_dir / "fleet-monitor-pending.json"
+        )
+        self._pending_journal_unknown = False
+        self._pending_journal_needs_rewrite = False
+        self._pending_event_types: dict[tuple[str, str, str], str] = {}
+        self._pending_messages: dict[tuple[str, str, str], str] = (
+            self._load_pending_messages()
+        )
+        self._pending_messages_lock = asyncio.Lock()
         self._send_semaphores: dict[str, asyncio.Semaphore] = {}
+
+    @staticmethod
+    def _event_type_from_dedupe_key(dedupe_key: str) -> str:
+        for marker, event_type in (
+            (":status-transition:", "status-transition"),
+            (":runtime-transition:", "runtime-transition"),
+            (":unrouted-verdict:", "unrouted-verdict"),
+            (":staleness:", "staleness"),
+            (":graph-unavailable:", "graph-unavailable"),
+            (":graph-health:blocking-no-reviewer:", "graph-health"),
+            (":graph-health:stall:", "graph-health-stall"),
+            (":graph-health:iteration-cap:", "graph-health-iteration-cap"),
+        ):
+            if marker in dedupe_key:
+                return event_type
+        return "unknown"
+
+    def _load_pending_messages(self) -> dict[tuple[str, str, str], str]:
+        try:
+            data = json.loads(self._pending_messages_path.read_text(encoding="utf-8"))
+        except FileNotFoundError:
+            return {}
+        except (OSError, json.JSONDecodeError):
+            logger.warning(
+                "fleet_monitor: pending messages file %s unreadable; "
+                "recovering matching payloads from the command log",
+                self._pending_messages_path,
+            )
+            self._pending_journal_unknown = True
+            return {}
+        entries = data.get("entries") if isinstance(data, dict) else None
+        if not isinstance(entries, list):
+            self._pending_journal_unknown = True
+            return {}
+        valid_entries = [entry for entry in entries if isinstance(entry, dict)]
+        if len(valid_entries) > self.max_pending_messages:
+            logger.warning(
+                "fleet_monitor: pending journal has %s entries; trimming to %s",
+                len(valid_entries),
+                self.max_pending_messages,
+            )
+            valid_entries = valid_entries[-self.max_pending_messages :]
+            self._pending_journal_needs_rewrite = True
+        loaded: dict[tuple[str, str, str], str] = {}
+        for entry in valid_entries:
+            agent_id = entry.get("agent_id")
+            run_id = entry.get("run_id")
+            dedupe_key = entry.get("dedupe_key")
+            message = entry.get("message")
+            event_type = entry.get("event_type")
+            if (
+                isinstance(agent_id, str)
+                and isinstance(run_id, str)
+                and isinstance(dedupe_key, str)
+                and isinstance(message, str)
+            ):
+                identity = (agent_id, run_id, dedupe_key)
+                loaded[identity] = message
+                self._pending_event_types[identity] = (
+                    event_type
+                    if isinstance(event_type, str)
+                    else self._event_type_from_dedupe_key(dedupe_key)
+                )
+        return loaded
+
+    def _persist_pending_messages(self) -> None:
+        """Write the in-memory pending journal atomically.
+
+        Raises on failure so the caller can decide whether a durable
+        commit boundary depends on it (``_emit`` MUST skip dispatch
+        when this raises — WIKI-232 REVIEW12 M1) or whether the write
+        is best-effort cleanup (``_reconcile_worker_state`` and
+        ``_reset_agent_state`` catch and log).
+        """
+
+        entries = [
+            {
+                "agent_id": identity[0],
+                "run_id": identity[1],
+                "dedupe_key": identity[2],
+                "message": message,
+                "event_type": self._pending_event_types.get(
+                    identity,
+                    self._event_type_from_dedupe_key(identity[2]),
+                ),
+            }
+            for identity, message in sorted(self._pending_messages.items())
+        ]
+        if not entries:
+            try:
+                self._pending_messages_path.unlink()
+            except FileNotFoundError:
+                pass
+            self._pending_journal_unknown = False
+            self._pending_journal_needs_rewrite = False
+            return
+        _atomic_write_json(self._pending_messages_path, {"entries": entries})
+        self._pending_journal_unknown = False
+        self._pending_journal_needs_rewrite = False
+
+    def _durable_pending_message(
+        self, orch_run_id: str, dedupe_key: str
+    ) -> tuple[bool, str | None]:
+        """Return an exact prior payload when this request already exists."""
+
+        request_id = fleet_monitor_request_id(orch_run_id, dedupe_key)
+        effect = self.store.command_log.steer_effect_for_request(
+            "run/send_now", request_id
+        )
+        if isinstance(effect, dict):
+            message = effect.get("message")
+            if effect.get("run_id") == orch_run_id and isinstance(message, str):
+                return True, message
+        for command in self.store.command_log.pending():
+            if command.method != "run/send_now" or command.request_id != request_id:
+                continue
+            message = command.payload.get("text")
+            return True, message if isinstance(message, str) else None
+        return self.store.command_log.known("run/send_now", request_id), None
+
+    def _drop_pending_identity(self, identity: tuple[str, str, str]) -> None:
+        self._pending_messages.pop(identity, None)
+        self._pending_event_types.pop(identity, None)
+
+    def _drop_prior_event_occurrences(
+        self,
+        identity: tuple[str, str, str],
+        event_type: str,
+    ) -> None:
+        for candidate in list(self._pending_messages):
+            if candidate == identity or candidate[:2] != identity[:2]:
+                continue
+            candidate_type = self._pending_event_types.get(
+                candidate,
+                self._event_type_from_dedupe_key(candidate[2]),
+            )
+            if candidate_type == event_type:
+                self._drop_pending_identity(candidate)
+
+    def _persist_pending_messages_best_effort(self) -> None:
+        """Cleanup-path persist: log and swallow write failures.
+
+        Reconcile-driven persists (archived-run purge, replacement
+        agent reset) prune stale entries. Losing that write is a
+        cleanup hygiene issue, not a commit-boundary violation, so it
+        must not crash the tick or interfere with subsequent dispatch
+        attempts.
+        """
+
+        try:
+            self._persist_pending_messages()
+        except Exception:
+            self._pending_journal_needs_rewrite = True
+            logger.exception(
+                "fleet_monitor: best-effort persist of pending messages "
+                "to %s failed; retrying next reconcile",
+                self._pending_messages_path,
+            )
 
     async def run(self, stop: asyncio.Event) -> None:
         while not stop.is_set():
@@ -223,6 +406,7 @@ class FleetMonitor:
             view.record.agent_id: view.record.run_id for view in views
         }
         self._reconcile_worker_state(current_run_ids)
+        self._reconcile_destination_runs(views)
 
         wall_now = self.wall_clock()
         monotonic_now = self.monotonic_clock()
@@ -251,6 +435,7 @@ class FleetMonitor:
         notifications.extend(
             await self._process_graph_health(views, wall_now)
         )
+        self._prune_obsolete_pending(views, wall_now, monotonic_now)
         return notifications
 
     def _reconcile_worker_state(self, current_run_ids: dict[str, str]) -> None:
@@ -264,14 +449,203 @@ class FleetMonitor:
             for identity in self._sent_dedupe_keys
             if current_run_ids.get(identity[0]) == identity[1]
         }
+        pending_before = self._pending_messages
+        self._pending_messages = {
+            identity: message
+            for identity, message in self._pending_messages.items()
+            if current_run_ids.get(identity[0]) == identity[1]
+        }
+        self._pending_event_types = {
+            identity: event_type
+            for identity, event_type in self._pending_event_types.items()
+            if identity in self._pending_messages
+        }
+        if pending_before.keys() != self._pending_messages.keys():
+            self._persist_pending_messages_best_effort()
+        self._destination_run_ids = {
+            agent_id: run_id
+            for agent_id, run_id in self._destination_run_ids.items()
+            if agent_id in current_run_ids
+        }
 
-    def _reset_agent_state(self, agent_id: str) -> None:
+    def _reconcile_destination_runs(self, views: list[_WorkerView]) -> None:
+        """Reset delivery suppression when an orchestrator run changes."""
+
+        for view in views:
+            agent_id = view.record.agent_id
+            orch_agent_id = view.record.orchestrator_id
+            if not orch_agent_id:
+                continue
+            try:
+                orch_run_id = self.store.current_run_id(orch_agent_id)
+            except Exception:
+                continue
+            if not orch_run_id:
+                continue
+            prior_run_id = self._destination_run_ids.get(agent_id)
+            self._destination_run_ids[agent_id] = orch_run_id
+            if prior_run_id is None or prior_run_id == orch_run_id:
+                continue
+
+            # Sent suppression belongs to the destination run. The worker run
+            # and durable alarm payload stay unchanged across an orchestrator
+            # replacement, but the new run-scoped command identity must get
+            # one delivery of every still-active alarm.
+            self._sent_dedupe_keys = {
+                identity
+                for identity in self._sent_dedupe_keys
+                if identity[0] != agent_id
+            }
+            snapshot = self._snapshots.get(agent_id)
+            if snapshot is not None:
+                snapshot.last_unrouted_verdict_alarm_at = None
+                snapshot.staleness_alarmed_mtime = None
+
+            graph_snapshot = self._graph_health_snapshots.get(
+                base_ticket(agent_id)
+            )
+            if graph_snapshot is not None:
+                graph_snapshot.last_blocking_no_reviewer_alarm_at = None
+                graph_snapshot.last_graph_unavailable_alarm_at = None
+                graph_snapshot.stall_notification_sent = False
+                graph_snapshot.iteration_notification_sent = False
+
+    def _reset_agent_state(
+        self, agent_id: str, *, keep_run_id: str | None = None
+    ) -> None:
         self._snapshots.pop(agent_id, None)
+        # Preserve state that belongs to ``keep_run_id`` so a fresh
+        # boot (snapshot missing, but the worker's run is unchanged)
+        # does not discard durable ``_pending_messages`` entries the
+        # restarted monitor must replay under the original request id
+        # (WIKI-232 REVIEW8 H2).
         self._sent_dedupe_keys = {
             identity
             for identity in self._sent_dedupe_keys
-            if identity[0] != agent_id
+            if identity[0] != agent_id or identity[1] == keep_run_id
         }
+        pending_before = self._pending_messages
+        self._pending_messages = {
+            identity: message
+            for identity, message in self._pending_messages.items()
+            if identity[0] != agent_id or identity[1] == keep_run_id
+        }
+        self._pending_event_types = {
+            identity: event_type
+            for identity, event_type in self._pending_event_types.items()
+            if identity in self._pending_messages
+        }
+        if pending_before.keys() != self._pending_messages.keys():
+            self._persist_pending_messages_best_effort()
+
+    def _prune_obsolete_pending(
+        self,
+        views: list[_WorkerView],
+        wall_now: float,
+        monotonic_now: float,
+    ) -> None:
+        """Keep only alarm payloads whose durable request can recur."""
+
+        views_by_agent = {view.record.agent_id: view for view in views}
+        graph_window = int(wall_now // max(self.graph_health_realarm, 1.0))
+        verdict_window = int(
+            monotonic_now // max(self.unrouted_verdict_realarm, 1.0)
+        )
+        obsolete: list[tuple[str, str, str]] = []
+        for identity in self._pending_messages:
+            agent_id, _run_id, dedupe_key = identity
+            event_type = self._pending_event_types.get(
+                identity,
+                self._event_type_from_dedupe_key(dedupe_key),
+            )
+            view = views_by_agent.get(agent_id)
+            keep = True
+            if event_type in {"status-transition", "runtime-transition"}:
+                keep = False
+            elif event_type == "staleness":
+                keep = bool(
+                    view is not None
+                    and view.status_state == "working"
+                    and view.status_mtime is not None
+                    and wall_now - view.status_mtime >= self.staleness_threshold
+                    and dedupe_key
+                    == f"fleet:{agent_id}:staleness:{int(view.status_mtime)}"
+                )
+            elif event_type == "unrouted-verdict":
+                step = view.step if view is not None else None
+                keep = bool(
+                    view is not None
+                    and view.record.role == "review"
+                    and step is not None
+                    and ("MERGE-READY" in step or "NOT-MERGE-READY" in step)
+                    and dedupe_key
+                    == f"fleet:{agent_id}:unrouted-verdict:{verdict_window}"
+                )
+            elif event_type.startswith("graph-"):
+                parts = dedupe_key.split(":")
+                ticket = parts[1] if len(parts) > 1 else ""
+                graph_state = self._graph_health_snapshots.get(ticket)
+                if event_type == "graph-unavailable":
+                    keep = bool(
+                        graph_state is not None
+                        and graph_state.graph_unavailable_active
+                        and dedupe_key
+                        == (
+                            f"fleet:{ticket}:graph-unavailable:"
+                            f"{graph_state.graph_unavailable_episode}:{graph_window}"
+                        )
+                    )
+                elif event_type == "graph-health":
+                    marker = (
+                        graph_state.blocking_no_reviewer_episode_marker
+                        if graph_state is not None
+                        else None
+                    )
+                    keep = bool(
+                        graph_state is not None
+                        and graph_state.blocking_no_reviewer_active
+                        and marker
+                        and dedupe_key
+                        == (
+                            f"fleet:{ticket}:graph-health:"
+                            f"blocking-no-reviewer:{marker}:{graph_window}"
+                        )
+                    )
+                elif event_type == "graph-health-stall":
+                    marker = (
+                        graph_state.stall_episode_marker
+                        if graph_state is not None
+                        else None
+                    )
+                    keep = bool(
+                        graph_state is not None
+                        and graph_state.stall_active
+                        and marker
+                        and dedupe_key
+                        == f"fleet:{ticket}:graph-health:stall:{marker}"
+                    )
+                elif event_type == "graph-health-iteration-cap":
+                    marker = (
+                        graph_state.iteration_episode_marker
+                        if graph_state is not None
+                        else None
+                    )
+                    keep = bool(
+                        graph_state is not None
+                        and graph_state.iteration_active
+                        and marker
+                        and dedupe_key
+                        == (
+                            f"fleet:{ticket}:graph-health:iteration-cap:{marker}"
+                        )
+                    )
+            if not keep:
+                obsolete.append(identity)
+
+        for identity in obsolete:
+            self._drop_pending_identity(identity)
+        if obsolete or self._pending_journal_needs_rewrite:
+            self._persist_pending_messages_best_effort()
 
     def _collect_views(self) -> list[_WorkerView]:
         views: list[_WorkerView] = []
@@ -328,7 +702,7 @@ class FleetMonitor:
         record = view.record
         snapshot = self._snapshots.get(record.agent_id)
         if snapshot is None or snapshot.run_id != record.run_id:
-            self._reset_agent_state(record.agent_id)
+            self._reset_agent_state(record.agent_id, keep_run_id=record.run_id)
             snapshot = _WorkerSnapshot(run_id=record.run_id)
         results: list[Notification] = []
 
@@ -605,12 +979,62 @@ class FleetMonitor:
             dedupe_identity = self._dedupe_identity(view, dedupe_key)
             if dedupe_identity in self._sent_dedupe_keys:
                 return None
+            async with self._pending_messages_lock:
+                existing_pending = self._pending_messages.get(dedupe_identity)
+                if existing_pending is None:
+                    # A corrupt journal can lose the local payload after a
+                    # successful command. Recover the exact message from the
+                    # durable steer effect. If a command exists without a
+                    # recoverable payload, fail closed instead of submitting
+                    # different time-dependent text under the same request id.
+                    known_request, durable_message = self._durable_pending_message(
+                        orch_run_id, dedupe_key
+                    )
+                    if known_request and durable_message is None:
+                        logger.error(
+                            "fleet_monitor: command %s has no recoverable "
+                            "payload; skipping conflicting dispatch",
+                            fleet_monitor_request_id(orch_run_id, dedupe_key),
+                        )
+                        return None
+                    stable_message = durable_message or message
+                    before_messages = dict(self._pending_messages)
+                    before_types = dict(self._pending_event_types)
+                    self._drop_prior_event_occurrences(
+                        dedupe_identity, event_type
+                    )
+                    if len(self._pending_messages) >= self.max_pending_messages:
+                        logger.error(
+                            "fleet_monitor: pending journal reached hard "
+                            "limit %s; skipping %s",
+                            self.max_pending_messages,
+                            dedupe_identity,
+                        )
+                        self._pending_messages = before_messages
+                        self._pending_event_types = before_types
+                        return None
+                    self._pending_messages[dedupe_identity] = stable_message
+                    self._pending_event_types[dedupe_identity] = event_type
+                    try:
+                        self._persist_pending_messages()
+                    except Exception:
+                        logger.exception(
+                            "fleet_monitor: pending message journal write "
+                            "for %s failed; skipping dispatch until the "
+                            "payload is durable",
+                            dedupe_identity,
+                        )
+                        self._pending_messages = before_messages
+                        self._pending_event_types = before_types
+                        return None
+                else:
+                    stable_message = existing_pending
             try:
                 async with self._send_semaphore(orch_agent_id):
                     await asyncio.wait_for(
                         self.send_now(
                             orch_run_id,
-                            message,
+                            stable_message,
                             dedupe_key,
                             FLEET_MONITOR_SOURCE,
                         ),
@@ -626,12 +1050,20 @@ class FleetMonitor:
                 )
                 return None
             self._sent_dedupe_keys.add(dedupe_identity)
+            # Transition request ids include this monitor instance and cannot
+            # recur after their successful occurrence. Alarm payloads remain
+            # until their mtime, window, or episode changes; the end-of-tick
+            # prune removes them at that boundary.
+            if event_type in {"status-transition", "runtime-transition"}:
+                async with self._pending_messages_lock:
+                    self._drop_pending_identity(dedupe_identity)
+                    self._persist_pending_messages_best_effort()
             return Notification(
                 ticket=view.record.agent_id,
                 orch_agent_id=orch_agent_id,
                 orch_run_id=orch_run_id,
                 event_type=event_type,
-                message=message,
+                message=stable_message,
                 dedupe_key=dedupe_key,
             )
 
