@@ -2759,7 +2759,9 @@ class RunStore:
         ``pending_user_messages`` is left alone because it interleaves
         with external ``track_pending_user_message`` calls that predate
         any matching echo event; the walk's remove semantics inside
-        ``_apply_composer_message_event`` are already idempotent.
+        ``_apply_composer_message_event`` are already idempotent. Composer
+        rows inherited from a replaced run are also preserved. Rows owned by
+        this run are removed and replayed in raw order.
         """
 
         with self._lock:
@@ -2771,6 +2773,20 @@ class RunStore:
                     int(event.get("seq", 0)),
                 ),
             )
+            replayed_composer_ids = {
+                str(payload["pending_id"])
+                for event in normalized_events
+                for payload in [event.get("payload")]
+                if isinstance(payload, dict)
+                and isinstance(payload.get("pending_id"), str)
+                and isinstance(payload.get("composer_text"), str)
+                and isinstance(payload.get("composer_sent_at"), str)
+            }
+            record.composer_messages = [
+                message
+                for message in record.composer_messages
+                if message.get("pending_id") not in replayed_composer_ids
+            ]
             record.pending_requests = {}
             record.current_turn_diff_turn_id = None
             record.current_turn_diff_started_seq = 0

@@ -1756,8 +1756,43 @@ class FleetMonitorTests(unittest.IsolatedAsyncioTestCase):
             "completed transition rows must be removed immediately",
         )
 
-        # A restart in the same live run must replay retained occurrences
-        # without a payload conflict and must keep the same hard bound.
+        current_entries = [
+            entry
+            for entry in journal["entries"]
+            if entry["event_type"] == "graph-unavailable"
+        ]
+        self.assertEqual(len(current_entries), 1)
+        current_entry = current_entries[0]
+        current_request_id = fleet_monitor_request_id(
+            self.store.current_run_id("WIKI-ORCH") or "",
+            current_entry["dedupe_key"],
+        )
+        original_receipt = self.store.command_log.receipt(
+            "run/send_now", current_request_id
+        )
+        self.assertIsNotNone(original_receipt)
+
+        # Seed the production journal with more rows than the configured hard
+        # limit. The current recurring alarm is last, so startup trim must
+        # retain it and the seven newest obsolete rows exactly.
+        obsolete_entries = [
+            {
+                "agent_id": worker.agent_id,
+                "run_id": worker.run_id,
+                "dedupe_key": f"fleet:{worker.agent_id}:staleness:{index}",
+                "message": f"obsolete staleness {index}",
+                "event_type": "staleness",
+            }
+            for index in range(12)
+        ]
+        oversized_entries = [*obsolete_entries, current_entry]
+        journal_path.write_text(
+            json.dumps({"entries": oversized_entries}),
+            encoding="utf-8",
+        )
+
+        # A restart in the same live run must trim through the production load
+        # path, replay the exact retained alarm, and prune obsolete rows.
         restarted = FleetMonitor(
             self.store,
             dispatch_send,
@@ -1768,8 +1803,117 @@ class FleetMonitorTests(unittest.IsolatedAsyncioTestCase):
             max_pending_messages=8,
             ownership_lock=self.supervisor._agent_lock,  # noqa: SLF001
         )
-        await restarted.tick()
-        self.assertLessEqual(len(restarted._pending_messages), 8)  # noqa: SLF001
+        expected_loaded = oversized_entries[-8:]
+        self.assertEqual(
+            list(restarted._pending_messages),  # noqa: SLF001
+            [
+                (entry["agent_id"], entry["run_id"], entry["dedupe_key"])
+                for entry in expected_loaded
+            ],
+        )
+        orch_run_id = self.store.current_run_id("WIKI-ORCH")
+        assert orch_run_id is not None
+        adapter = self.supervisor.adapters[orch_run_id]
+        with mock.patch.object(
+            adapter, "send_now", wraps=adapter.send_now
+        ) as provider_send:
+            restart_notes = await restarted.tick()
+            after_prune_notes = await restarted.tick()
+
+        self.assertEqual(
+            [note.event_type for note in restart_notes],
+            ["graph-unavailable"],
+        )
+        self.assertEqual(
+            [note.event_type for note in after_prune_notes],
+            ["status-transition"],
+            "the hard-limit deferral must deliver after pruning frees space",
+        )
+        replayed = [
+            note for note in restart_notes if note.event_type == "graph-unavailable"
+        ]
+        self.assertEqual(len(replayed), 1)
+        self.assertEqual(replayed[0].dedupe_key, current_entry["dedupe_key"])
+        self.assertEqual(replayed[0].message, current_entry["message"])
+        self.assertFalse(
+            any(
+                current_entry["message"] in repr(call)
+                for call in provider_send.await_args_list
+            ),
+            "receipt replay must not deliver the retained alarm twice",
+        )
+        rewritten = json.loads(journal_path.read_text(encoding="utf-8"))
+        self.assertEqual(rewritten["entries"], [current_entry])
+        replayed_receipt = self.store.command_log.receipt(
+            "run/send_now", current_request_id
+        )
+        assert replayed_receipt is not None and original_receipt is not None
+        self.assertEqual(
+            replayed_receipt.command_hash, original_receipt.command_hash
+        )
+
+    async def test_active_alarm_reaches_replacement_orchestrator_once(
+        self,
+    ) -> None:
+        """REVIEW14 H1: destination replacement resets alarm suppression."""
+
+        orchestrator = await self._spawn(
+            "WIKI-ORCH", role="orchestrator", orch=None
+        )
+        worker = await self._spawn(
+            "WIKI-232-DEST", role="implement", orch="WIKI-ORCH"
+        )
+        stale_mtime = self.clock.now - 1900.0
+        _set_created_at(self.store, worker, stale_mtime - 1.0)
+        _write_status(
+            self.store,
+            worker.agent_id,
+            {"state": "working", "pr": None, "step": "coding", "blocker": None},
+            mtime=stale_mtime,
+        )
+        monitor = FleetMonitor(
+            self.store,
+            build_fleet_monitor_dispatch(self.supervisor),
+            clock=self.clock,
+            interval=0.01,
+            staleness_threshold=1800.0,
+            ownership_lock=self.supervisor._agent_lock,  # noqa: SLF001
+        )
+        first = await monitor.tick()
+        first_stale = [note for note in first if note.event_type == "staleness"]
+        self.assertEqual(len(first_stale), 1)
+        original_message = first_stale[0].message
+        self.assertEqual(first_stale[0].orch_run_id, orchestrator.run_id)
+
+        replacement = await self.supervisor.replace(
+            orchestrator.run_id, "replacement orchestrator"
+        )
+        replacement_adapter = self.supervisor.adapters[replacement.run_id]
+        with mock.patch.object(
+            replacement_adapter,
+            "send_now",
+            wraps=replacement_adapter.send_now,
+        ) as replacement_send:
+            after_replace = await monitor.tick()
+            unchanged = await monitor.tick()
+
+        replacement_stale = [
+            note for note in after_replace if note.event_type == "staleness"
+        ]
+        self.assertEqual(len(replacement_stale), 1)
+        self.assertEqual(replacement_stale[0].orch_run_id, replacement.run_id)
+        self.assertEqual(replacement_stale[0].message, original_message)
+        self.assertEqual(
+            [note for note in unchanged if note.event_type == "staleness"], []
+        )
+        self.assertEqual(
+            sum(
+                original_message in repr(call)
+                for call in replacement_send.await_args_list
+            ),
+            1,
+            "the active alarm must reach the replacement exactly once",
+        )
 
     async def test_pending_message_survives_monitor_restart(self) -> None:
         """WIKI-232 REVIEW8 H2: an in-memory ``_pending_messages`` dict

@@ -206,6 +206,7 @@ class FleetMonitor:
         )
         self._graph_health_snapshots = self._graph_health.snapshots
         self._sent_dedupe_keys: set[tuple[str, str, str]] = set()
+        self._destination_run_ids: dict[str, str] = {}
         # Persisted on write / removed on success so a restarted FleetMonitor
         # replays the exact original payload for the same dedupe key. Without
         # this, staleness retries would recompute a new elapsed-time message,
@@ -405,6 +406,7 @@ class FleetMonitor:
             view.record.agent_id: view.record.run_id for view in views
         }
         self._reconcile_worker_state(current_run_ids)
+        self._reconcile_destination_runs(views)
 
         wall_now = self.wall_clock()
         monotonic_now = self.monotonic_clock()
@@ -460,6 +462,53 @@ class FleetMonitor:
         }
         if pending_before.keys() != self._pending_messages.keys():
             self._persist_pending_messages_best_effort()
+        self._destination_run_ids = {
+            agent_id: run_id
+            for agent_id, run_id in self._destination_run_ids.items()
+            if agent_id in current_run_ids
+        }
+
+    def _reconcile_destination_runs(self, views: list[_WorkerView]) -> None:
+        """Reset delivery suppression when an orchestrator run changes."""
+
+        for view in views:
+            agent_id = view.record.agent_id
+            orch_agent_id = view.record.orchestrator_id
+            if not orch_agent_id:
+                continue
+            try:
+                orch_run_id = self.store.current_run_id(orch_agent_id)
+            except Exception:
+                continue
+            if not orch_run_id:
+                continue
+            prior_run_id = self._destination_run_ids.get(agent_id)
+            self._destination_run_ids[agent_id] = orch_run_id
+            if prior_run_id is None or prior_run_id == orch_run_id:
+                continue
+
+            # Sent suppression belongs to the destination run. The worker run
+            # and durable alarm payload stay unchanged across an orchestrator
+            # replacement, but the new run-scoped command identity must get
+            # one delivery of every still-active alarm.
+            self._sent_dedupe_keys = {
+                identity
+                for identity in self._sent_dedupe_keys
+                if identity[0] != agent_id
+            }
+            snapshot = self._snapshots.get(agent_id)
+            if snapshot is not None:
+                snapshot.last_unrouted_verdict_alarm_at = None
+                snapshot.staleness_alarmed_mtime = None
+
+            graph_snapshot = self._graph_health_snapshots.get(
+                base_ticket(agent_id)
+            )
+            if graph_snapshot is not None:
+                graph_snapshot.last_blocking_no_reviewer_alarm_at = None
+                graph_snapshot.last_graph_unavailable_alarm_at = None
+                graph_snapshot.stall_notification_sent = False
+                graph_snapshot.iteration_notification_sent = False
 
     def _reset_agent_state(
         self, agent_id: str, *, keep_run_id: str | None = None

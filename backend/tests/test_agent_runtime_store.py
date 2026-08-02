@@ -1124,6 +1124,86 @@ class RunStoreTests(unittest.TestCase):
             self.assertEqual(recovered.last_causal_raw_seq, int(raw["seq"]))
             self.assertEqual(recovered.last_lifecycle_event_seq, 2)
 
+    def test_rebuild_orders_current_composer_echoes_by_raw_sequence(
+        self,
+    ) -> None:
+        """REVIEW14 M1: middle-gap replay keeps identical echoes correlated."""
+
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            store = RunStore(_paths(root))
+            record = store.create(_record(root))
+            inherited = {
+                "pending_id": "inherited",
+                "text": "older message",
+                "sent_at": "2026-01-01T00:00:00Z",
+                "echoed_at": "2026-01-01T00:00:01Z",
+                "seq": 9,
+            }
+            record.composer_messages = [inherited]
+            store._write_record(record)  # noqa: SLF001 - replacement history fixture
+
+            raw_a = store.append_raw(
+                record.run_id,
+                provider="claude",
+                direction="provider",
+                payload={"type": "user", "label": "A"},
+            )
+            raw_b = store.append_raw(
+                record.run_id,
+                provider="claude",
+                direction="provider",
+                payload={"type": "user", "label": "B"},
+            )
+            # B normalizes first. A is the recovered middle-gap row. Both
+            # carry identical text, so FIFO order is required for exact source
+            # correlation.
+            store.append_normalized(
+                record.run_id,
+                raw_seq=raw_b["seq"],
+                disposition=EventDisposition.RENDERED,
+                kind="claude_user",
+                payload={
+                    "pending_id": "pending-b",
+                    "composer_text": "identical user message",
+                    "composer_sent_at": "2026-01-01T00:00:03Z",
+                },
+            )
+            store.append_normalized(
+                record.run_id,
+                raw_seq=raw_a["seq"],
+                disposition=EventDisposition.RENDERED,
+                kind="claude_user",
+                payload={
+                    "pending_id": "pending-a",
+                    "composer_text": "identical user message",
+                    "composer_sent_at": "2026-01-01T00:00:02Z",
+                    "source": "fleet-monitor",
+                },
+            )
+            self.assertEqual(
+                [
+                    message["pending_id"]
+                    for message in store.get(record.run_id).composer_messages
+                ],
+                ["inherited", "pending-b"],
+            )
+
+            rebuilt = store.rebuild_projections_from_normalized(record.run_id)
+            self.assertEqual(
+                [message["pending_id"] for message in rebuilt.composer_messages],
+                ["inherited", "pending-a", "pending-b"],
+            )
+            self.assertEqual(rebuilt.composer_messages[0], inherited)
+            self.assertEqual(
+                rebuilt.composer_messages[1].get("source"), "fleet-monitor"
+            )
+            self.assertNotIn("source", rebuilt.composer_messages[2])
+            self.assertEqual(
+                rebuilt.composer_messages[1]["text"],
+                rebuilt.composer_messages[2]["text"],
+            )
+
     def test_store_files_are_private_and_registry_keeps_legacy_shape(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
