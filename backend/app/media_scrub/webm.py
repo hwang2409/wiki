@@ -142,6 +142,7 @@ _ID_DISCARD_PADDING: Final = 0x75A2
 
 
 _WEBM_DOC_TYPE: Final = "webm"
+_WEBM_CANONICAL_APP: Final = b"wiki-webm-scrubber"
 # Bounded to keep hostile many-child fixtures from amplifying traced
 # memory before rejection. WIKI-225 REVIEW1 flagged the prior 1M cap
 # as reachable-but-tiny elements can materialise many MB before the
@@ -172,10 +173,9 @@ _SIMPLE_BLOCK_FLAG_KEYFRAME: Final = 0x80
 _SIMPLE_BLOCK_FLAG_DISCARDABLE: Final = 0x01
 _SIMPLE_BLOCK_ALLOWED_FLAGS: Final = (
     _SIMPLE_BLOCK_FLAG_KEYFRAME
-    | _BLOCK_FLAG_INVISIBLE
     | _SIMPLE_BLOCK_FLAG_DISCARDABLE
 )
-_BLOCK_ALLOWED_FLAGS: Final = _BLOCK_FLAG_INVISIBLE
+_BLOCK_ALLOWED_FLAGS: Final = 0
 
 # Track type in the supported WebM subset.
 _TRACK_TYPE_VIDEO: Final = 1
@@ -234,10 +234,11 @@ class _WebmDecodeBudget:
         self.remaining_pixels -= pixels
 
 
-@dataclass(frozen=True)
+@dataclass
 class _WebmTimeline:
     timestamp_scale: int
     declared_duration_ticks: float | None
+    last_absolute_ticks: int | None = None
 
     def validate_block(
         self,
@@ -249,6 +250,13 @@ class _WebmTimeline:
         absolute_ticks = cluster_timestamp + relative_timestamp
         if absolute_ticks < 0:
             raise MediaScrubError("webm block absolute timestamp is negative")
+        if (
+            self.last_absolute_ticks is not None
+            and absolute_ticks < self.last_absolute_ticks
+        ):
+            raise MediaScrubError(
+                "webm block absolute timestamps must not decrease"
+            )
         if block_duration_ticks is not None and block_duration_ticks <= 0:
             raise MediaScrubError("webm BlockDuration must be positive")
         absolute_ns = absolute_ticks * self.timestamp_scale
@@ -269,6 +277,7 @@ class _WebmTimeline:
             raise MediaScrubError(
                 "webm block timeline exceeds declared Duration"
             )
+        self.last_absolute_ticks = absolute_ticks
 
 
 def scrub_webm(data: bytes) -> MediaScrubResult:
@@ -539,7 +548,7 @@ def _rebuild_ebml_header(view: memoryview, ebml: _WebmElement) -> tuple[bytes, s
         + _emit_uint(_ID_EBML_MAX_ID_LENGTH, 4)
         + _emit_uint(_ID_EBML_MAX_SIZE_LENGTH, 8)
         + _emit_element(_ID_DOC_TYPE, b"webm")
-        + _emit_uint(_ID_DOC_TYPE_VERSION, 2)
+        + _emit_uint(_ID_DOC_TYPE_VERSION, 4)
         + _emit_uint(_ID_DOC_TYPE_READ_VERSION, 2)
     )
     return _emit_element(_ID_EBML, header_body), doc_type
@@ -568,6 +577,7 @@ def _rebuild_segment(
         _WEBM_MAX_DECODED_PIXELS,
         _WEBM_MAX_DECODED_FRAMES,
     )
+    timeline: _WebmTimeline | None = None
     for child in children:
         cid = child.identifier
         if cid in (_ID_SEEK_HEAD, _ID_TAGS, _ID_ATTACHMENTS, _ID_CHAPTERS, _ID_CUES, _ID_VOID, _ID_CRC32):
@@ -577,21 +587,25 @@ def _rebuild_segment(
                 raise MediaScrubError("webm Segment has duplicate Info")
             info_seen = True
             info_bytes, timestamp_scale, duration_ticks = _rebuild_info(view, child)
+            timeline = _WebmTimeline(timestamp_scale, duration_ticks)
         elif cid == _ID_TRACKS:
             if tracks_seen:
                 raise MediaScrubError("webm Segment has duplicate Tracks")
             tracks_seen = True
             tracks_bytes, tracks = _rebuild_tracks(view, child)
         elif cid == _ID_CLUSTER:
-            if not info_seen or not tracks_seen:
-                raise MediaScrubError("webm Cluster must follow Info and Tracks")
+            if not info_seen:
+                raise MediaScrubError("webm Cluster must follow Info")
+            if not tracks_seen:
+                raise MediaScrubError("webm Cluster must follow Tracks")
             cluster_seen = True
+            assert timeline is not None
             cluster_bytes, cluster_tracks = _rebuild_cluster(
                 view,
                 child,
                 tracks,
                 decode_budget,
-                _WebmTimeline(timestamp_scale, duration_ticks),
+                timeline,
             )
             clusters.append(cluster_bytes)
             framed_track_numbers.update(cluster_tracks)
@@ -631,7 +645,7 @@ def _rebuild_segment(
     duration_ms: int | None = None
     if duration_ticks is not None:
         duration_ns = duration_ticks * timestamp_scale
-        if duration_ns < 0 or duration_ns > _WEBM_MAX_DURATION_MS * 1_000_000:
+        if duration_ns <= 0 or duration_ns > _WEBM_MAX_DURATION_MS * 1_000_000:
             raise MediaScrubError("webm duration exceeds scrubber cap")
         duration_ms = int(round(duration_ns / 1_000_000))
 
@@ -656,7 +670,7 @@ def _rebuild_info(
                 )
         elif cid == _ID_DURATION:
             duration = _parse_float(view, child, "Duration")
-            if duration < 0 or duration > 1e12:
+            if duration <= 0 or duration > 1e12:
                 raise MediaScrubError("webm Duration outside scrubber bounds")
         elif cid in (
             _ID_MUXING_APP, _ID_WRITING_APP, _ID_TITLE, _ID_DATE_UTC,
@@ -672,6 +686,8 @@ def _rebuild_info(
     body = _emit_uint(_ID_TIMESTAMP_SCALE, timestamp_scale)
     if duration is not None:
         body += _emit_float(_ID_DURATION, duration)
+    body += _emit_element(_ID_MUXING_APP, _WEBM_CANONICAL_APP)
+    body += _emit_element(_ID_WRITING_APP, _WEBM_CANONICAL_APP)
     return _emit_element(_ID_INFO, body), timestamp_scale, duration
 
 
@@ -895,6 +911,8 @@ def _rebuild_video(
             display_height = _parse_uint(view, child, "DisplayHeight")
         elif cid == _ID_DISPLAY_UNIT:
             display_unit = _parse_uint(view, child, "DisplayUnit")
+            if display_unit != 0:
+                raise MediaScrubError("webm DisplayUnit must use pixel unit 0")
         elif cid == _ID_FLAG_INTERLACED:
             flag_interlaced = _parse_uint(view, child, "FlagInterlaced")
             if flag_interlaced not in (0, 1, 2):
@@ -933,10 +951,10 @@ def _rebuild_video(
         raise MediaScrubError(
             f"webm Video dimensions exceed {_WEBM_MAX_DIMENSION}"
         )
-    if display_width is not None and display_width > _WEBM_MAX_DIMENSION:
-        raise MediaScrubError("webm DisplayWidth exceeds scrubber cap")
-    if display_height is not None and display_height > _WEBM_MAX_DIMENSION:
-        raise MediaScrubError("webm DisplayHeight exceeds scrubber cap")
+    if display_width is not None and not 1 <= display_width <= _WEBM_MAX_DIMENSION:
+        raise MediaScrubError("webm DisplayWidth must be positive and within cap")
+    if display_height is not None and not 1 <= display_height <= _WEBM_MAX_DIMENSION:
+        raise MediaScrubError("webm DisplayHeight must be positive and within cap")
     if flag_interlaced == 1:
         raise MediaScrubError("webm interlaced video is not accepted")
     body = (
@@ -1313,6 +1331,10 @@ def _parse_block_body(
     if flags & _BLOCK_FLAG_LACING:
         raise MediaScrubError(
             f"webm {block_label} lacing is not accepted by scrubber"
+        )
+    if flags & _BLOCK_FLAG_INVISIBLE:
+        raise MediaScrubError(
+            f"webm {block_label} invisible frames are not accepted"
         )
     if block_label == "SimpleBlock":
         if flags & ~_SIMPLE_BLOCK_ALLOWED_FLAGS:
