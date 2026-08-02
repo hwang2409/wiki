@@ -219,8 +219,15 @@ try {
   assert(disclosureStyle.height >= 40, `orchestrator row hit area must be >=40px, got ${disclosureStyle.height}`);
   assert(disclosureStyle.chevron, "orchestrator disclosure needs a visible chevron");
 
-  await page.reload({ waitUntil: "domcontentloaded" });
+  await page.reload({ waitUntil: "load" });
   await wikiWorkers.waitFor();
+  await page.evaluate(() => document.fonts.ready);
+  await page.waitForFunction(() => {
+    const sidebar = document.querySelector(".workspace-sidebar");
+    const sessionHeader = document.querySelector(".agent-session-surface.is-full .session-header");
+    if (!(sidebar instanceof HTMLElement) || !(sessionHeader instanceof HTMLElement)) return false;
+    return sessionHeader.getBoundingClientRect().left >= sidebar.getBoundingClientRect().right;
+  });
   await page.screenshot({ path: path.join(OUT_DIR, "01-sidebar-normal.png") });
   await page.setViewportSize({ width: 1000, height: 760 });
   const narrowLayout = await page.locator(".nav-agents").evaluate((el) => ({

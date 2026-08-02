@@ -2531,17 +2531,32 @@ export function AgentsSidebar({
     const observedSeq = worker?.latest_event_seq ?? null;
     if (!runId || observedSeq === null) return;
 
-    // Do not retry a failed seq on every render. A later observed seq starts
-    // one new bounded chain, which can clear the failure after recovery.
-    if ((viewedFailed[runId] ?? -1) >= observedSeq) return;
+    const priorServer = worker?.last_viewed_seq ?? -1;
+    const failedSeq = viewedFailed[runId];
+    if (failedSeq !== undefined) {
+      if (priorServer >= failedSeq) {
+        // A POST can commit even when every client response fails. Trust a
+        // later server refresh and remove the stale local failure marker.
+        setViewedFailed((current) => {
+          const currentFailedSeq = current[runId];
+          if (currentFailedSeq === undefined || priorServer < currentFailedSeq) return current;
+          const next = { ...current };
+          delete next[runId];
+          return next;
+        });
+      } else if (failedSeq >= observedSeq) {
+        // Do not retry the same failed seq on every render. A later event
+        // starts one new bounded chain, which can clear a real failure.
+        return;
+      }
+    }
 
     // Skip if we (or the server) have already recorded a viewed seq that
     // covers everything visible in this refresh. Prevents the effect from
     // POSTing on every /api/agents refresh (the round 1 regression), while
     // still re-POSTing when the active session's seq advances.
     const priorOverride = viewedOverrides[runId];
-    const priorServer = worker?.last_viewed_seq ?? null;
-    const priorSeq = Math.max(priorOverride ?? -1, priorServer ?? -1);
+    const priorSeq = Math.max(priorOverride ?? -1, priorServer);
     if (priorSeq >= observedSeq) return;
 
     setViewedOverrides((current) => {
