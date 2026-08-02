@@ -621,7 +621,10 @@ class SendNowSourceTests(unittest.IsolatedAsyncioTestCase):
             )
 
         record = self.store.get(run_id)
-        self.assertNotIn(dedupe_key, record.message_dedupe_keys)
+        self.assertNotIn(
+            dedupe_key,
+            [entry["key"] for entry in record.message_dedupe_keys],
+        )
         # The whole point of the fix: no orphan pending row after post-commit
         # failure — otherwise the retry lands a second row and echoes swap.
         self.assertEqual(record.pending_user_messages, [])

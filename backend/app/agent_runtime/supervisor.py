@@ -1389,6 +1389,29 @@ Preserve the same identity, role, worktree, orchestrator grouping, PR gates, and
             async with self._run_lock(run_id):
                 await self._deliver_next_queued_locked(run_id, adapter)
 
+    def _schedule_queued_drain_if_idle(
+        self,
+        run_id: str,
+        adapter: ProviderAdapter,
+        *,
+        name: str,
+    ) -> None:
+        """Continue queue recovery only when the attached provider is idle."""
+
+        if self.adapters.get(run_id) is not adapter:
+            return
+        if self.store.peek_queued_message(run_id) is None:
+            return
+        try:
+            status = adapter.snapshot()
+        except Exception:
+            return
+        if status.state is LifecycleState.IDLE:
+            self._spawn_monitor_task(
+                self._deliver_next_queued(run_id, adapter),
+                name=f"{name}-{run_id}",
+            )
+
     async def _apply_desired_model_locked(
         self,
         run_id: str,
@@ -1486,6 +1509,11 @@ Preserve the same identity, role, worktree, orchestrator grouping, PR gates, and
                 )
                 if effect is not None and effect["status"] in {"sent", "acknowledged"}:
                     self.store.remove_queued_message_by_pending_id(run_id, pending_id)
+                    self._schedule_queued_drain_if_idle(
+                        run_id,
+                        adapter,
+                        name="agent-queue-terminal-cleanup",
+                    )
                     return
                 if effect is not None and effect["status"] == "sending":
                     if self.store.steer_delivery_observed(run_id, pending_id):
@@ -1498,6 +1526,11 @@ Preserve the same identity, role, worktree, orchestrator grouping, PR gates, and
                         )
                         self.store.remove_queued_message_by_pending_id(
                             run_id, pending_id
+                        )
+                        self._schedule_queued_drain_if_idle(
+                            run_id,
+                            adapter,
+                            name="agent-queue-observed-cleanup",
                         )
                     # No echo yet. The recover_on_start sweep resolves
                     # sending effects whose transport died; here we just
@@ -1558,6 +1591,7 @@ Preserve the same identity, role, worktree, orchestrator grouping, PR gates, and
                 # ``queued``, and let the next real WORKING->IDLE transition
                 # drive the retry.
                 if pending_id is not None:
+                    self.store.discard_pending_user_message(run_id, pending_id)
                     self.store.command_log.revert_steer_sending_to_queued_for_pending(
                         run_id, pending_id
                     )
@@ -1611,20 +1645,11 @@ Preserve the same identity, role, worktree, orchestrator grouping, PR gates, and
                 # on the next head, terminate it uncertain, and cascade
                 # (WIKI-232 R3 H1). The natural WORKING->IDLE transition
                 # schedules the drain when the provider frees up.
-                try:
-                    drain_status = adapter.snapshot()
-                except Exception:
-                    drain_status = None
-                if (
-                    self.store.peek_queued_message(run_id) is not None
-                    and self.adapters.get(run_id) is adapter
-                    and drain_status is not None
-                    and drain_status.state is LifecycleState.IDLE
-                ):
-                    self._spawn_monitor_task(
-                        self._deliver_next_queued(run_id, adapter),
-                        name=f"agent-queue-drain-{run_id}",
-                    )
+                self._schedule_queued_drain_if_idle(
+                    run_id,
+                    adapter,
+                    name="agent-queue-drain",
+                )
                 return
             if pending_id is not None:
                 self.store.command_log.mark_steer_sent_for_pending(run_id, pending_id)
@@ -2342,6 +2367,13 @@ Preserve the same identity, role, worktree, orchestrator grouping, PR gates, and
                         self.store.remove_queued_message_by_pending_id(
                             run_id, pending_id_str
                         )
+                        adapter = self.adapters.get(run_id)
+                        if adapter is not None:
+                            self._schedule_queued_drain_if_idle(
+                                run_id,
+                                adapter,
+                                name="agent-recover-observed-cleanup",
+                            )
                     continue
                 uncertain: dict[str, Any] = {"status": "uncertain"}
                 if pending_id_str is not None:

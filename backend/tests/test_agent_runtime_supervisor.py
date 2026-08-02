@@ -1159,6 +1159,109 @@ class SupervisorTests(unittest.IsolatedAsyncioTestCase):
             "acknowledged",
         )
 
+    async def test_recovery_after_sent_before_pop_drains_queue_tail(self) -> None:
+        """WIKI-232 REVIEW5 H2: recovery must drain a tail after a sent
+        effect survives a crash before its queue row is popped."""
+
+        record = await self.supervisor.start_run(
+            agent_id="WIKI-232-REVIEW5-SENT",
+            provider=ProviderKind.CODEX,
+            role="implement",
+            model="fixture-codex",
+            effort="high",
+            worktree=str(self.worktree),
+            prompt="review 5 sent before pop",
+        )
+        adapter = self.supervisor.adapters[record.run_id]
+        pid1 = str(uuid4())
+        pid2 = str(uuid4())
+
+        real_mark = self.store.command_log.mark_steer_sent_for_pending
+
+        def mark_sent_then_crash(run_id: str, pending_id: str) -> None:
+            real_mark(run_id, pending_id)
+            raise asyncio.CancelledError
+
+        with mock.patch.object(
+            self.store.command_log,
+            "mark_steer_sent_for_pending",
+            side_effect=mark_sent_then_crash,
+        ):
+            with self.assertRaises(asyncio.CancelledError):
+                await self.supervisor.send_on_idle(
+                    record.run_id,
+                    "crashed-head",
+                    pending_id=pid1,
+                    effect_id="review5-sent-before-pop-1",
+                )
+
+        first = self.store.command_log.steer_effect_for_pending(
+            record.run_id, pid1,
+        )
+        self.assertIsNotNone(first)
+        assert first is not None
+        self.assertEqual(first["status"], "sent")
+        self.assertEqual(
+            [message["text"] for message in self.store.queued_messages(record.run_id)],
+            ["crashed-head"],
+        )
+
+        # Keep the tail behind the stale sent head while the provider is
+        # working, then make the recovery cleanup observe IDLE.
+        snapshot = adapter.snapshot()
+        working = AdapterStatus(
+            LifecycleState.WORKING,
+            snapshot.session_id,
+            os.getpid(),
+            generation=snapshot.generation,
+        )
+        adapter._status = working  # noqa: SLF001 - queue fixture
+        self.store.update_adapter_status(record.run_id, working)
+        queued = await self.supervisor.send_on_idle(
+            record.run_id,
+            "tail-message",
+            pending_id=pid2,
+            effect_id="review5-sent-before-pop-2",
+        )
+        self.assertEqual(queued["status"], "queued")
+
+        idle = AdapterStatus(
+            LifecycleState.IDLE,
+            snapshot.session_id,
+            os.getpid(),
+            generation=snapshot.generation,
+        )
+        adapter._status = idle  # noqa: SLF001 - recovery fixture
+        self.store.update_adapter_status(record.run_id, idle)
+
+        original_send = adapter.send_on_idle
+        provider_calls: list[str] = []
+
+        async def tracked_send(message: str) -> AdapterStatus:
+            provider_calls.append(message)
+            return await original_send(message)
+
+        adapter.send_on_idle = tracked_send  # type: ignore[method-assign]
+        try:
+            await self.supervisor._deliver_next_queued_locked(  # noqa: SLF001
+                record.run_id, adapter,
+            )
+            for _ in range(200):
+                if not self.store.queued_messages(record.run_id):
+                    break
+                await asyncio.sleep(0.01)
+        finally:
+            adapter.send_on_idle = original_send  # type: ignore[method-assign]
+
+        self.assertEqual(provider_calls, ["tail-message"])
+        self.assertEqual(self.store.queued_messages(record.run_id), [])
+        second = self.store.command_log.steer_effect_for_pending(
+            record.run_id, pid2,
+        )
+        self.assertIsNotNone(second)
+        assert second is not None
+        self.assertIn(second["status"], {"sent", "acknowledged"})
+
     async def test_send_now_replay_after_dedupe_claim_delivers_once(self) -> None:
         """WIKI-232 H1: a crash between the dedupe-claim write and the
         provider send used to leave the effect at 'queued' with the dedupe
@@ -1995,6 +2098,39 @@ class SupervisorTests(unittest.IsolatedAsyncioTestCase):
             effect["status"],
             "acknowledged",
             "known non-acceptance must NOT terminalize the effect",
+        )
+        self.assertEqual(
+            self.store.get(record.run_id).pending_user_messages,
+            [],
+            "known rejection must discard the pending echo matcher",
+        )
+
+        # An unrelated provider echo with identical text must not consume the
+        # rejected effect before its retry is accepted by the provider.
+        await self.supervisor._handle_provider_event(  # noqa: SLF001
+            record.run_id,
+            adapter,
+            ProviderEvent(
+                ProviderKind.CODEX,
+                {
+                    "method": "item/completed",
+                    "params": {
+                        "item": {
+                            "type": "userMessage",
+                            "content": [{"type": "text", "text": "busy-race"}],
+                        }
+                    },
+                },
+            ),
+        )
+        effect_after_echo = self.store.command_log.steer_effect_for_pending(
+            record.run_id, pending_id,
+        )
+        assert effect_after_echo is not None
+        self.assertEqual(effect_after_echo["status"], "queued")
+        self.assertEqual(
+            self.store.queued_messages(record.run_id)[0]["text"],
+            "busy-race",
         )
 
         # Retry path: a natural WORKING->IDLE transition drains the same
