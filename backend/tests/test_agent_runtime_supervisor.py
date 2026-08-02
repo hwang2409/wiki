@@ -58,6 +58,7 @@ from backend.app.agent_runtime.supervisor import Supervisor, resolve_safe_worktr
 from backend.app.agent_runtime.types import (
     EventDisposition,
     MAX_MESSAGE_DEDUPE_KEYS,
+    MAX_PENDING_USER_MESSAGES,
     LifecycleState,
     ProviderKind,
     RunRecord,
@@ -1821,10 +1822,10 @@ class SupervisorTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(effect["status"], "sending")
         self.assertEqual(effect["result"]["status"], "uncertain")
 
-    async def test_send_now_equal_text_waits_for_older_unresolved_matcher(
+    async def test_send_now_equal_text_rotates_older_unresolved_matcher(
         self,
     ) -> None:
-        """REVIEW18 H2: equal text cannot create two unresolved matchers."""
+        """REVIEW21 H2: an uncertain matcher gets a safe finite boundary."""
 
         record = await self.supervisor.start_run(
             agent_id="WIKI-232-R18-EQUAL",
@@ -1839,13 +1840,25 @@ class SupervisorTests(unittest.IsolatedAsyncioTestCase):
         original_send = adapter.send_now
         provider_calls: list[str] = []
 
-        async def ambiguous_then_accept(message: str) -> AdapterStatus:
+        async def ambiguous_send(message: str) -> AdapterStatus:
             provider_calls.append(message)
-            if len(provider_calls) == 1:
-                raise RuntimeError("ambiguous first delivery")
-            return await original_send(message)
+            raise RuntimeError("ambiguous first delivery")
 
-        adapter.send_now = ambiguous_then_accept  # type: ignore[method-assign]
+        adapter.send_now = ambiguous_send  # type: ignore[method-assign]
+        original_factory = self.supervisor.adapter_factory
+
+        def tracking_factory(run_record: RunRecord) -> ProviderAdapter:
+            replacement_adapter = original_factory(run_record)
+            replacement_send = replacement_adapter.send_now
+
+            async def tracked_send(message: str) -> AdapterStatus:
+                provider_calls.append(message)
+                return await replacement_send(message)
+
+            replacement_adapter.send_now = tracked_send  # type: ignore[method-assign]
+            return replacement_adapter
+
+        self.supervisor.adapter_factory = tracking_factory
         first_params = {
             "run_id": record.run_id,
             "text": "same normalized text",
@@ -1860,42 +1873,15 @@ class SupervisorTests(unittest.IsolatedAsyncioTestCase):
         }
         try:
             first = await self.supervisor.dispatch("run/send_now", first_params)
-            with self.assertRaisesRegex(
-                CommandRetryable, "identical message delivery"
-            ):
-                await self.supervisor.dispatch("run/send_now", second_params)
-
+            second = await self.supervisor.dispatch("run/send_now", second_params)
             first_pending_id = first.get("pending_id")
             self.assertIsInstance(first_pending_id, str)
-            await self.supervisor._handle_provider_event(  # noqa: SLF001
-                record.run_id,
-                adapter,
-                ProviderEvent(
-                    ProviderKind.CODEX,
-                    {
-                        "method": "item/completed",
-                        "params": {
-                            "item": {
-                                "type": "userMessage",
-                                "content": [
-                                    {"type": "text", "text": first_params["text"]}
-                                ],
-                            }
-                        },
-                    },
-                ),
-            )
-            await self.supervisor.command_queue.recover_pending()
-            second_effect = self.store.command_log.steer_effect_for_request(
-                "run/send_now", "review18-equal-second"
-            )
-            self.assertIsNotNone(second_effect)
-            assert second_effect is not None
-            second_pending_id = second_effect.get("pending_id")
+            second_pending_id = second.get("pending_id")
             self.assertIsInstance(second_pending_id, str)
+            replacement_adapter = self.supervisor.adapters[record.run_id]
             await self.supervisor._handle_provider_event(  # noqa: SLF001
                 record.run_id,
-                adapter,
+                replacement_adapter,
                 ProviderEvent(
                     ProviderKind.CODEX,
                     {
@@ -1911,11 +1897,9 @@ class SupervisorTests(unittest.IsolatedAsyncioTestCase):
                     },
                 ),
             )
-            second = await self.supervisor.dispatch(
-                "run/send_now", dict(second_params)
-            )
         finally:
             adapter.send_now = original_send  # type: ignore[method-assign]
+            self.supervisor.adapter_factory = original_factory
 
         self.assertEqual(first["status"], "uncertain")
         self.assertEqual(second["status"], "sent")
@@ -1939,11 +1923,14 @@ class SupervisorTests(unittest.IsolatedAsyncioTestCase):
         }
         self.assertEqual(
             matching_sources,
-            {
-                first_pending_id: "first-source",
-                second_pending_id: "second-source",
-            },
+            {second_pending_id: "second-source"},
         )
+        first_receipt = self.store.command_log.receipt(
+            "run/send_now", "review18-equal-first"
+        )
+        self.assertIsNotNone(first_receipt)
+        assert first_receipt is not None
+        self.assertEqual(first_receipt.result["status"], "uncertain")
 
     async def test_send_now_normalize_failure_recovers_sent_receipt(
         self,
@@ -2350,6 +2337,226 @@ class SupervisorTests(unittest.IsolatedAsyncioTestCase):
         assert second_effect is not None
         self.assertEqual(second_effect["status"], "sending")
         self.assertEqual(second_effect["result"]["status"], "uncertain")
+
+        original_factory = self.supervisor.adapter_factory
+
+        def tracking_factory(run_record: RunRecord) -> ProviderAdapter:
+            replacement_adapter = original_factory(run_record)
+            replacement_send = replacement_adapter.send_now
+
+            async def tracked_send(message_text: str) -> AdapterStatus:
+                provider_calls.append(message_text)
+                return await replacement_send(message_text)
+
+            replacement_adapter.send_now = tracked_send  # type: ignore[method-assign]
+            return replacement_adapter
+
+        self.supervisor.adapter_factory = tracking_factory
+        try:
+            third = await self.supervisor.dispatch(
+                "run/send_now",
+                {
+                    "run_id": record.run_id,
+                    "text": message,
+                    "source": "third-source",
+                    "request_id": "review21-reject-third",
+                },
+            )
+        finally:
+            self.supervisor.adapter_factory = original_factory
+
+        third_pending_id = third.get("pending_id")
+        self.assertEqual(third["status"], "sent")
+        self.assertEqual(provider_calls, [message, message, message])
+        self.assertEqual(
+            [
+                item.get("pending_id")
+                for item in self.store.get(record.run_id).pending_user_messages
+            ],
+            [third_pending_id],
+        )
+        third_receipt = self.store.command_log.receipt(
+            "run/send_now", "review21-reject-third"
+        )
+        self.assertIsNotNone(third_receipt)
+        assert third_receipt is not None
+        self.assertTrue(third_receipt.ok)
+        self.assertEqual(third_receipt.result, third)
+        rotated_adapter = self.supervisor.adapters[record.run_id]
+        await self.supervisor._handle_provider_event(  # noqa: SLF001
+            record.run_id,
+            rotated_adapter,
+            ProviderEvent(
+                ProviderKind.CODEX,
+                {
+                    "method": "item/completed",
+                    "params": {
+                        "item": {
+                            "type": "userMessage",
+                            "content": [{"type": "text", "text": message}],
+                        }
+                    },
+                },
+                generation=rotated_adapter.snapshot().generation,
+            ),
+        )
+        current = self.store.get(record.run_id)
+        self.assertEqual(current.pending_user_messages, [])
+        correlated = [
+            (item.get("pending_id"), item.get("source"))
+            for item in current.composer_messages
+            if item.get("pending_id")
+            in {first_pending_id, second_pending_id, third_pending_id}
+        ]
+        self.assertEqual(
+            correlated,
+            [
+                (first_pending_id, "first-source"),
+                (third_pending_id, "third-source"),
+            ],
+        )
+        self.assertEqual(self.store.command_log.pending(), [])
+
+    async def test_send_now_equal_matchers_stay_bounded_across_restart(
+        self,
+    ) -> None:
+        """REVIEW21 H2: safe transport rotations enforce a hard bound."""
+
+        provider_calls: list[str] = []
+        original_factory = self.supervisor.adapter_factory
+
+        def tracking_factory(run_record: RunRecord) -> ProviderAdapter:
+            adapter = original_factory(run_record)
+            original_send = adapter.send_now
+
+            async def tracked_send(message: str) -> AdapterStatus:
+                provider_calls.append(message)
+                return await original_send(message)
+
+            adapter.send_now = tracked_send  # type: ignore[method-assign]
+            return adapter
+
+        self.supervisor.adapter_factory = tracking_factory
+        record = await self.supervisor.start_run(
+            agent_id="WIKI-232-R21-BOUND",
+            provider=ProviderKind.CODEX,
+            role="orchestrator",
+            model="fixture-codex",
+            effort="high",
+            worktree=str(self.worktree),
+            prompt="bound recurring alarm matchers",
+        )
+        message = "bounded recurring alarm"
+        send_count = MAX_PENDING_USER_MESSAGES + 5
+        results: list[dict[str, Any]] = []
+        for index in range(send_count):
+            results.append(
+                await self.supervisor.dispatch(
+                    "run/send_now",
+                    {
+                        "run_id": record.run_id,
+                        "text": message,
+                        "source": f"source-{index}",
+                        "request_id": f"review21-bound-{index}",
+                    },
+                )
+            )
+
+        retained_before_restart = self.store.get(
+            record.run_id
+        ).pending_user_messages
+        self.assertEqual(len(retained_before_restart), 5)
+        self.assertLessEqual(
+            len(retained_before_restart), MAX_PENDING_USER_MESSAGES
+        )
+        retained_ids = [item["pending_id"] for item in retained_before_restart]
+        retained_sources = [item["source"] for item in retained_before_restart]
+        self.assertEqual(
+            retained_sources,
+            [f"source-{index}" for index in range(send_count - 5, send_count)],
+        )
+        self.assertEqual(provider_calls, [message] * send_count)
+        self.assertTrue(all(result["status"] == "sent" for result in results))
+        self.assertEqual(self.store.command_log.pending(), [])
+        for index, result in enumerate(results):
+            receipt = self.store.command_log.receipt(
+                "run/send_now", f"review21-bound-{index}"
+            )
+            self.assertIsNotNone(receipt)
+            assert receipt is not None
+            self.assertTrue(receipt.ok)
+            self.assertEqual(receipt.result, result)
+
+        await self.supervisor.close()
+        restarted_store = RunStore(self.paths)
+        restarted = Supervisor(
+            restarted_store,
+            tracking_factory,
+            pid_alive=lambda _pid: False,
+        )
+        self.store = restarted_store
+        self.supervisor = restarted
+        await restarted.recover_on_start()
+        self.assertEqual(
+            [
+                item["pending_id"]
+                for item in restarted_store.get(record.run_id).pending_user_messages
+            ],
+            retained_ids,
+        )
+        self.assertEqual(provider_calls, [message] * send_count)
+
+        restarted_adapter = restarted.adapters[record.run_id]
+        for _ in retained_ids:
+            await restarted._handle_provider_event(  # noqa: SLF001
+                record.run_id,
+                restarted_adapter,
+                ProviderEvent(
+                    ProviderKind.CODEX,
+                    {
+                        "method": "item/completed",
+                        "params": {
+                            "item": {
+                                "type": "userMessage",
+                                "content": [{"type": "text", "text": message}],
+                            }
+                        },
+                    },
+                    generation=restarted_adapter.snapshot().generation,
+                ),
+            )
+
+        recovered = restarted_store.get(record.run_id)
+        self.assertEqual(recovered.pending_user_messages, [])
+        correlated = [
+            (item.get("pending_id"), item.get("source"))
+            for item in recovered.composer_messages
+            if item.get("pending_id") in set(retained_ids)
+        ]
+        self.assertEqual(
+            correlated,
+            list(zip(retained_ids, retained_sources, strict=True)),
+        )
+
+        final = await restarted.dispatch(
+            "run/send_now",
+            {
+                "run_id": record.run_id,
+                "text": message,
+                "source": "source-after-restart",
+                "request_id": "review21-bound-after-restart",
+            },
+        )
+        self.assertEqual(final["status"], "sent")
+        self.assertEqual(provider_calls, [message] * (send_count + 1))
+        self.assertEqual(restarted_store.command_log.pending(), [])
+        final_receipt = restarted_store.command_log.receipt(
+            "run/send_now", "review21-bound-after-restart"
+        )
+        self.assertIsNotNone(final_receipt)
+        assert final_receipt is not None
+        self.assertTrue(final_receipt.ok)
+        self.assertEqual(final_receipt.result, final)
 
     async def test_recover_on_start_reconciles_wedged_sending_effect(self) -> None:
         """WIKI-232 H2: an on-idle effect stuck at 'sending' after a daemon
@@ -4490,6 +4697,8 @@ class SupervisorTests(unittest.IsolatedAsyncioTestCase):
             provider_calls.append(message_text)
             if len(provider_calls) == 1:
                 return await original_send(message_text)
+            if len(provider_calls) > 2:
+                return await original_send(message_text)
             asyncio.get_running_loop().call_soon(
                 adapter._events.put_nowait,  # noqa: SLF001 - routing fixture
                 ProviderEvent(
@@ -4576,6 +4785,38 @@ class SupervisorTests(unittest.IsolatedAsyncioTestCase):
         self.assertIsNotNone(receipt)
         assert receipt is not None
         self.assertEqual(receipt.result["status"], "uncertain")
+
+        adapter.send_now = accept_then_reject  # type: ignore[method-assign]
+        try:
+            final_replacement = await self.supervisor.replace(
+                replacement.run_id,
+                "retire the uncertain replacement transport",
+            )
+            third = await self.supervisor.dispatch(
+                "run/send_now",
+                {
+                    "agent_id": record.agent_id,
+                    "text": message,
+                    "source": "third-source",
+                    "request_id": "review21-replace-third",
+                },
+            )
+        finally:
+            adapter.send_now = original_send  # type: ignore[method-assign]
+        self.assertEqual(third["status"], "sent")
+        self.assertEqual(provider_calls, [message, message, message])
+        self.assertEqual(self.store.command_log.pending(), [])
+        final_record = self.store.get(final_replacement.run_id)
+        self.assertEqual(
+            [item.get("pending_id") for item in final_record.pending_user_messages],
+            [third.get("pending_id")],
+        )
+        third_receipt = self.store.command_log.receipt(
+            "run/send_now", "review21-replace-third"
+        )
+        self.assertIsNotNone(third_receipt)
+        assert third_receipt is not None
+        self.assertEqual(third_receipt.result, third)
 
     async def test_equal_text_delayed_echoes_keep_sources_across_replace(
         self,
@@ -4668,23 +4909,36 @@ class SupervisorTests(unittest.IsolatedAsyncioTestCase):
         else:
             self.fail("replacement echo routes did not drain pending matchers")
 
-        old_record = self.store.get(record.run_id)
-        new_record = self.store.get(replacement.run_id)
-        self.assertEqual(old_record.pending_user_messages, [])
-        self.assertEqual(new_record.pending_user_messages, [])
-        correlated = [
-            (item.get("pending_id"), item.get("source"))
-            for source_record in (old_record, new_record)
-            for item in source_record.composer_messages
-            if item.get("pending_id") in {first_pending_id, second_pending_id}
-        ]
+        self.assertEqual(self.store.get(record.run_id).pending_user_messages, [])
         self.assertEqual(
-            correlated,
-            [
-                (first_pending_id, "old-source"),
-                (second_pending_id, "new-source"),
-            ],
+            self.store.get(replacement.run_id).pending_user_messages, []
         )
+        events_read = await self.supervisor.dispatch(
+            "events/read", {"agent_id": record.agent_id}
+        )
+        session = await self.supervisor.dispatch(
+            "run/status", {"agent_id": record.agent_id}
+        )
+        expected_sources = [
+            (first_pending_id, "old-source"),
+            (second_pending_id, "new-source"),
+        ]
+        for surface in (events_read, session):
+            correlated = [
+                (item.get("pending_id"), item.get("source"))
+                for item in surface["composer_messages"]
+                if item.get("pending_id") in {first_pending_id, second_pending_id}
+            ]
+            self.assertEqual(correlated, expected_sources)
+        for request_id in (
+            "review20-replace-fifo-first",
+            "review20-replace-fifo-second",
+        ):
+            receipt = self.store.command_log.receipt("run/send_now", request_id)
+            self.assertIsNotNone(receipt)
+            assert receipt is not None
+            self.assertTrue(receipt.ok)
+            self.assertEqual(receipt.result["status"], "sent")
 
     async def test_codex_question_before_turn_response_can_be_answered(self) -> None:
         await self.supervisor.close()

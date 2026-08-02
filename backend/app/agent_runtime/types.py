@@ -47,6 +47,7 @@ class RecoveryAction(str, Enum):
 
 TERMINAL_STATES = frozenset({LifecycleState.DEAD, LifecycleState.COMPLETED})
 MAX_MESSAGE_DEDUPE_KEYS = 256
+MAX_PENDING_USER_MESSAGES = 32
 
 
 def _dedupe_entry(item: Any) -> dict[str, str] | None:

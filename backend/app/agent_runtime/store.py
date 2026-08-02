@@ -2478,6 +2478,46 @@ class RunStore:
             self._write_record(record)
             return record
 
+    def clear_pending_user_messages(self, run_id: str) -> RunRecord:
+        """Retire matchers after their provider transport is fully stopped."""
+
+        with self._lock:
+            record = self.get(run_id)
+            if not record.pending_user_messages:
+                return record
+            record.pending_user_messages = []
+            self._write_record(record)
+            return record
+
+    def composer_messages_for_run(self, run_id: str) -> list[dict[str, Any]]:
+        """Read one canonical composer journal across a replacement chain."""
+
+        with self._lock:
+            chain: list[RunRecord] = []
+            seen_run_ids: set[str] = set()
+            record = self.get(run_id)
+            while record.run_id not in seen_run_ids:
+                chain.append(record)
+                seen_run_ids.add(record.run_id)
+                if record.replaces_run_id is None:
+                    break
+                try:
+                    record = self.get(record.replaces_run_id)
+                except RunNotFound:
+                    break
+
+            messages: list[dict[str, Any]] = []
+            seen_pending_ids: set[str] = set()
+            for source_record in reversed(chain):
+                for message in source_record.composer_messages:
+                    pending_id = message.get("pending_id")
+                    if isinstance(pending_id, str):
+                        if pending_id in seen_pending_ids:
+                            continue
+                        seen_pending_ids.add(pending_id)
+                    messages.append(dict(message))
+            return messages
+
     def queue_message(
         self,
         run_id: str,

@@ -39,6 +39,7 @@ from .store import RunNotFound, RunStore, StoreConflict
 from .types import (
     LifecycleState,
     EventDisposition,
+    MAX_PENDING_USER_MESSAGES,
     ProviderKind,
     RecoveryAction,
     RunRecord,
@@ -467,6 +468,9 @@ class Supervisor:
 
     def _runtime_status(self, record: RunRecord) -> dict[str, Any]:
         value = _public_run(record)
+        value["composer_messages"] = self.store.composer_messages_for_run(
+            record.run_id
+        )
         adapter = self.adapters.get(record.run_id)
         snapshot = adapter.snapshot() if adapter is not None else None
         value["control_attached"] = adapter is not None
@@ -1651,6 +1655,18 @@ Preserve the same identity, role, worktree, orchestrator grouping, PR gates, and
                 ):
                     return
             if pending_id is not None:
+                current_pending = self.store.get(run_id).pending_user_messages
+                if (
+                    len(current_pending) >= MAX_PENDING_USER_MESSAGES
+                    and not any(
+                        item.get("pending_id") == pending_id
+                        for item in current_pending
+                    )
+                ):
+                    adapter = await self._rotate_pending_matcher_transport_locked(
+                        run_id,
+                        adapter,
+                    )
                 self.store.track_pending_user_message(
                     run_id,
                     pending_id,
@@ -2004,6 +2020,44 @@ Preserve the same identity, role, worktree, orchestrator grouping, PR gates, and
             await self._detach_adapter(run_id, preserve_event_routes=True)
         finally:
             self.expected_stream_ends.discard(stream_key)
+
+    async def _rotate_pending_matcher_transport_locked(
+        self,
+        run_id: str,
+        adapter: ProviderAdapter,
+    ) -> ProviderAdapter:
+        """Create a safe echo boundary before retiring pending matchers."""
+
+        record = self.store.get(run_id)
+        session_id = record.provider_session_id
+        if not session_id:
+            raise CommandRetryable("provider session cannot rotate pending matchers")
+        try:
+            await self._quiesce_adapter_for_replacement(run_id, adapter)
+            await adapter.close()
+        except Exception as exc:
+            raise CommandRetryable(
+                "provider transport could not rotate pending matchers"
+            ) from exc
+
+        # Stop and drain form the safe terminal boundary. No event from the
+        # old transport can now consume a matcher installed below.
+        self._remove_adapter_mapping(run_id, adapter)
+        self.store.clear_pending_user_messages(run_id)
+        record = self.store.get(run_id)
+        replacement = self.adapter_factory(record)
+        try:
+            self._attach_adapter(run_id, replacement)
+            status = await replacement.resume(session_id)
+            record = self.store.update_adapter_status(run_id, status)
+            self._route_adapter_generation(run_id, replacement, status.generation)
+        except Exception as exc:
+            await self._close_and_drain_adapter(run_id, replacement)
+            raise CommandRetryable(
+                "provider transport did not resume after matcher rotation"
+            ) from exc
+        await self._publish_agent_change(record.agent_id)
+        return replacement
 
     async def _await_cleanup(self, awaitable: Any) -> Any:
         """Finish a cleanup operation even when its caller is cancelled."""
@@ -3901,6 +3955,14 @@ Preserve the same identity, role, worktree, orchestrator grouping, PR gates, and
         if normalized_message:
             current_record = self.store.get(run_id)
             unresolved_match = None
+            rotate_matcher_transport = (
+                len(current_record.pending_user_messages)
+                >= MAX_PENDING_USER_MESSAGES
+                and not any(
+                    item.get("pending_id") == pending_id
+                    for item in current_record.pending_user_messages
+                )
+            )
             for item in current_record.pending_user_messages:
                 old_pending_id = item.get("pending_id")
                 if (
@@ -3954,11 +4016,15 @@ Preserve the same identity, role, worktree, orchestrator grouping, PR gates, and
                 break
             if unresolved_match is not None:
                 # FIFO text matching cannot distinguish two unresolved sends
-                # with equal normalized text. Keep the later command intent
-                # retryable until the older echo resolves instead of letting
-                # that echo consume the wrong source identity (REVIEW18 H2).
-                raise CommandRetryable(
-                    "an identical message delivery is still unresolved"
+                # with equal normalized text. Stop and drain the transport
+                # before retiring the old slot. The new generation then gives
+                # this command a finite, non-starving delivery path without
+                # allowing an old echo to prove it (REVIEW21 H2).
+                rotate_matcher_transport = True
+            if rotate_matcher_transport:
+                adapter = await self._rotate_pending_matcher_transport_locked(
+                    run_id,
+                    adapter,
                 )
         if dedupe_key is not None:
             # Bind the dedupe claim to the steer effect so replay after a
@@ -5457,9 +5523,7 @@ Preserve the same identity, role, worktree, orchestrator grouping, PR gates, and
                 "pending_requests": [
                     dict(request) for request in record.pending_requests.values()
                 ],
-                "composer_messages": [
-                    dict(message) for message in record.composer_messages
-                ],
+                "composer_messages": self.store.composer_messages_for_run(run_id),
                 "current_turn_diff": self.store.current_turn_diff(run_id),
                 "events": self.store.read_normalized_events(
                     run_id,
