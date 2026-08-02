@@ -43,15 +43,6 @@ function assertNoAmbientNoise(errors, presentSelectors, page) {
   );
 }
 
-async function assertRunDetailsDefaultClosed(page) {
-  const details = page.locator('[data-testid="session-run-details"]').first();
-  await details.waitFor({ state: "attached" });
-  if (await details.evaluate((el) => el.hasAttribute("open"))) {
-    throw new Error("WIKI-152: Run details disclosure must be closed by default");
-  }
-  return details;
-}
-
 async function main() {
   await fs.mkdir(OUT_DIR, { recursive: true });
   const fixtures = makeFixtureRoot("wiki-152-chrome-");
@@ -156,11 +147,8 @@ async function main() {
         throw new Error(`WIKI-152: tmux status item must not carry tmux punctuation (got: ${JSON.stringify(label)})`);
       }
     }
-    const runDetailsMaybeInitial = page.locator('[data-testid="session-run-details"]');
-    if ((await runDetailsMaybeInitial.count()) > 0) {
-      if (await runDetailsMaybeInitial.first().evaluate((el) => el.hasAttribute("open"))) {
-        throw new Error("WIKI-152: Run details disclosure must be closed by default");
-      }
+    if ((await page.locator('[data-testid="session-run-details"]').count()) !== 0) {
+      throw new Error("WIKI-235: Run details must not render");
     }
     // Footer must not carry raw dispositions or format strings any more.
     const footerText = await page.locator(".session-footer").innerText();
@@ -216,26 +204,7 @@ async function main() {
       fullPage: true,
     });
 
-    logStep("state 4: diagnostics disclosure opens on click");
-    const runDetailsMaybe = page.locator('[data-testid="session-run-details"]');
-    if ((await runDetailsMaybe.count()) > 0) {
-      const runDetails = runDetailsMaybe.first();
-      if (await runDetails.evaluate((el) => el.hasAttribute("open"))) {
-        throw new Error("WIKI-152: Run details must open only on click, not by default");
-      }
-      await runDetails.locator("summary").click();
-      const opened = await runDetails.evaluate((el) => el.hasAttribute("open"));
-      if (!opened) throw new Error("WIKI-152: Run details did not open after summary click");
-      await runDetails.locator(".session-run-details-body").waitFor({ state: "visible" });
-      await page.screenshot({
-        path: path.join(OUT_DIR, "04-diagnostics-open.png"),
-        fullPage: true,
-      });
-    } else {
-      logStep("state 4: fixture emits no provider inspector — nothing to disclose (default chrome is empty diagnostics)");
-    }
-
-    logStep("state 5: action-required panel promoted above transcript");
+    logStep("state 4: action-required panel promoted above transcript");
     // Inject a synthetic providerInspector with a pending user-input request
     // into the session endpoint. The chrome must surface an "Action required"
     // heading + the question form outside any disclosure.
@@ -338,19 +307,15 @@ async function main() {
     await page.waitForSelector(".agent-session-surface-head");
     await page.locator('[data-testid="session-state-pill"]').filter({ hasText: "working" }).waitFor();
     await page.locator('[data-testid="session-step-row"]').waitFor({ state: "visible" });
-    // Cold start: no action required, no blocker, no visible diagnostics.
-    // Run details may still exist (format is derivable from the transcript
-    // shape) but must stay collapsed by default.
+    // Cold start: no action required, no blocker, and no visible diagnostics.
     if ((await page.locator('[data-testid="session-action-required"]').count()) !== 0) {
       throw new Error("WIKI-152 R1-05: zero-event chrome must not render an Action required panel");
     }
     if ((await page.locator('[data-testid="session-blocker-row"]').count()) !== 0) {
       throw new Error("WIKI-152 R1-05: zero-event chrome must not render a blocker row");
     }
-    const coldRunDetails = page.locator('[data-testid="session-run-details"]');
-    if ((await coldRunDetails.count()) > 0
-      && (await coldRunDetails.first().evaluate((el) => el.hasAttribute("open")))) {
-      throw new Error("WIKI-152 R1-05: zero-event Run details must stay collapsed");
+    if ((await page.locator('[data-testid="session-run-details"]').count()) !== 0) {
+      throw new Error("WIKI-235: zero-event Run details must not render");
     }
     await page.screenshot({
       path: path.join(OUT_DIR, "06-zero-event.png"),
@@ -365,7 +330,6 @@ async function main() {
             "01-default-chrome.png",
             "02-blocked-chrome.png",
             "03-merge-ready-chrome.png",
-            "04-diagnostics-open.png",
             "05-action-required.png",
             "06-zero-event.png",
           ],

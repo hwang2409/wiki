@@ -6114,8 +6114,9 @@ body.is-resizing-panes .pane-cell {
   white-space: pre-wrap;
 }
 
-/* WIKI-152: ambient .session-dispositions block removed. Diagnostic counts
-   now live only inside .session-run-details. */
+/* WIKI-152: ambient .session-dispositions block removed.
+   WIKI-235: .session-run-details removed with it — provider diagnostics
+   no longer render in the session view. */
 
 /* WIKI-203: compact Codex provider-stream renderers stay in the default chrome. */
 
@@ -6388,19 +6389,6 @@ body.is-resizing-panes .pane-cell {
   color: var(--accent-primary);
 }
 
-.session-provider-state {
-  color: var(--text-muted);
-}
-
-.session-provider-state.is-blocked,
-.session-provider-state.is-dead {
-  color: var(--accent-danger);
-}
-
-.session-provider-state.is-waiting-approval {
-  color: var(--accent-warning);
-}
-
 .session-provider-request {
   padding: 10px 12px;
   color: var(--text-normal);
@@ -6485,73 +6473,9 @@ body.is-resizing-panes .pane-cell {
   overflow-wrap: anywhere;
 }
 
-/* WIKI-152 R1-04: the per-card .session-provider-request-details mini
-   disclosure was removed. Kind / request id / raw payload now live in
-   Run details only, cross-referenced by raw_seq. */
-
 .session-provider-request-error {
   margin-top: 6px;
   color: var(--accent-danger);
-}
-
-.session-provider-events {
-  /* max-height set inline from STREAM_CLAMP_PX (stream-clamp.tsx) */
-  overflow: auto;
-  border-top: 1px solid var(--background-modifier-border);
-}
-
-.session-provider-event + .session-provider-event {
-  border-top: 1px solid var(--background-modifier-border);
-}
-
-.session-provider-event summary {
-  display: flex;
-  align-items: center;
-  gap: 8px;
-  padding: 5px 8px;
-  cursor: pointer;
-  list-style: none;
-}
-
-.session-provider-event summary::-webkit-details-marker {
-  display: none;
-}
-
-.session-provider-event summary .is-rendered {
-  color: var(--accent-success);
-}
-
-.session-provider-event summary .is-unknown {
-  color: var(--accent-warning);
-}
-
-.session-provider-event.is-pending {
-  border-left: 2px solid var(--accent-warning);
-  background-color: color-mix(in srgb, var(--accent-warning) 6%, transparent);
-}
-
-.session-provider-event.is-pending summary .is-pending {
-  color: var(--accent-warning);
-  font-weight: var(--fw-semibold);
-  text-transform: uppercase;
-  letter-spacing: 0.04em;
-}
-
-.session-provider-pending-list + .session-provider-events {
-  border-top: 1px solid var(--background-modifier-border);
-}
-
-.session-provider-event pre {
-  margin: 0;
-  padding: 8px;
-  border-top: 1px dashed var(--background-modifier-border);
-  color: var(--text-muted);
-  white-space: pre-wrap;
-  overflow-wrap: anywhere;
-}
-
-.session-provider-empty {
-  padding: 8px;
 }
 
 /* Session sidebar */
@@ -7864,6 +7788,14 @@ body.is-resizing-panes .pane-cell {
 /* Agents in left sidebar */
 
 .nav-agents {
+  --radius-xs: 1px;
+  --radius-s: 1px;
+  --radius-sm: 1px;
+  --radius-m: 2px;
+  --radius-md: 2px;
+  --radius-lg: 2px;
+  --radius-full: 2px;
+
   display: flex;
   flex-direction: column;
   gap: 1px;
@@ -7879,6 +7811,7 @@ body.is-resizing-panes .pane-cell {
   gap: 7px;
   width: 100%;
   min-width: 0;
+  min-height: 40px;
   padding: 5px 8px;
   border-radius: var(--radius-s);
   color: var(--text-muted);
@@ -7893,19 +7826,6 @@ body.is-resizing-panes .pane-cell {
    through the brighter ticket text via .has-unread instead. */
 .nav-agent-unread {
   display: none;
-}
-
-/* WIKI-234: opencode-style session gutter numbers. */
-.nav-agent-num {
-  flex-shrink: 0;
-  min-width: 2ch;
-  color: var(--text-faint);
-  font-variant-numeric: tabular-nums;
-  text-align: right;
-}
-
-.nav-agent.is-active .nav-agent-num {
-  color: var(--accent-primary);
 }
 
 .sr-only {
@@ -7932,10 +7852,6 @@ body.is-resizing-panes .pane-cell {
 .nav-agent.is-active {
   background-color: var(--background-modifier-active-hover, var(--background-modifier-hover));
   color: var(--text-normal);
-}
-
-.nav-agent.is-archived {
-  opacity: 0.65;
 }
 
 .nav-agent-ticket {
@@ -8001,14 +7917,41 @@ body.is-resizing-panes .pane-cell {
   color: var(--text-muted);
 }
 
+.nav-agent.is-orch .nav-orch-chevron {
+  transition-property: transform;
+  transition-duration: 140ms;
+  transition-timing-function: ease-out;
+}
+
+.nav-agent.is-orch.is-expanded .nav-orch-chevron {
+  transform: rotate(90deg);
+}
+
+.nav-agent.is-orch.is-empty .nav-orch-chevron {
+  visibility: hidden;
+}
+
 .nav-agent.is-orch .nav-agent-meta {
   font-weight: var(--fw-regular);
 }
 
 .nav-agent.is-owned {
-  /* 8px row pad + 12px orch icon + 7px gap: owned tickets align with the
-     orchestrator label text above them. */
-  padding-left: 27px;
+  gap: 4px;
+  padding-right: 6px;
+  padding-left: 8px;
+}
+
+.nav-orch-group,
+.nav-orch-workers {
+  display: flex;
+  flex-direction: column;
+  gap: 1px;
+}
+
+.nav-orch-workers {
+  margin-left: 12px;
+  padding-left: 2px;
+  border-left: 1px solid var(--background-modifier-border);
 }
 
 .agents-orch-group {
@@ -8094,12 +8037,6 @@ body.is-resizing-panes .pane-cell {
   border-top: none;
 }
 
-.nav-agents-group-count {
-  color: var(--text-faint);
-  font-weight: var(--fw-regular);
-  font-variant-numeric: tabular-nums;
-}
-
 .nav-empty-cta {
   display: flex;
   flex-direction: column;
@@ -8130,7 +8067,7 @@ body.is-resizing-panes .pane-cell {
   display: inline-flex;
   align-items: center;
   justify-content: center;
-  min-height: 28px;
+  min-height: 40px;
   margin-top: 4px;
   padding: 4px 14px;
   border: 1px solid var(--text-normal);
@@ -8148,7 +8085,7 @@ body.is-resizing-panes .pane-cell {
 }
 
 .nav-empty-primary:active {
-  transform: scale(0.98);
+  transform: scale(0.96);
 }
 
 .nav-empty-secondary {
@@ -10872,40 +10809,6 @@ textarea.composer-command-input {
 .cost-prompt-bar strong {
   color: var(--text-normal);
   font-weight: var(--fw-medium);
-}
-
-.ticket-cost-strip {
-  display: flex;
-  align-items: baseline;
-  gap: 8px;
-  min-height: 26px;
-  padding: 4px 12px;
-  border-top: 1px solid var(--background-modifier-border);
-  border-bottom: 1px solid var(--background-modifier-border);
-  color: var(--text-muted);
-  font-size: var(--fs-xs);
-}
-
-.ticket-cost-strip > span:first-child {
-  color: var(--text-faint);
-  text-transform: uppercase;
-  letter-spacing: 0.05em;
-}
-
-.ticket-cost-strip strong {
-  color: var(--text-normal);
-  font-weight: var(--fw-medium);
-}
-
-.ticket-cost-strip strong.is-unpriced,
-.ticket-cost-strip strong.is-mixed {
-  color: var(--accent-warning);
-}
-
-.ticket-cost-detail {
-  overflow: hidden;
-  text-overflow: ellipsis;
-  white-space: nowrap;
 }
 
 @media (max-width: 720px) {
@@ -13998,8 +13901,21 @@ textarea.composer-command-input {
    the persistent session-footer-hints strip carries the visible shortcuts. */
 
 /* WIKI-152: agent-session chrome. Header state pill, step, blocker,
-   action-required panel, run-details disclosure. Scoped so it does
-   not affect other headers or `<details>` disclosures elsewhere. */
+   and action-required panel. WIKI-235 removes the diagnostic disclosure. */
+
+/* WIKI-235: keep runs chrome anchored and rectangular without changing
+   radius tokens in note, search, or utility surfaces. */
+.agents-view,
+.agent-session-surface,
+.session-sidebar {
+  --radius-xs: 1px;
+  --radius-s: 1px;
+  --radius-sm: 1px;
+  --radius-m: 2px;
+  --radius-md: 2px;
+  --radius-lg: 2px;
+  --radius-full: 2px;
+}
 
 .agent-session-surface-head .session-state-pill {
   display: inline-flex;
@@ -14133,77 +14049,6 @@ textarea.composer-command-input {
   background-color: var(--background-primary);
   color: var(--accent-warning);
   font-size: 10px;
-}
-
-.session-tab > .session-run-details {
-  margin: 6px 12px 0;
-  border: 1px solid var(--background-modifier-border);
-  border-radius: var(--radius-xs);
-  background-color: color-mix(in srgb, var(--background-secondary) 72%, transparent);
-  color: var(--text-faint);
-  font-family: var(--font-monospace);
-  font-weight: var(--font-monospace-weight);
-  font-size: var(--font-ui-smaller);
-}
-
-.session-tab > .session-run-details > summary {
-  display: flex;
-  align-items: center;
-  gap: 8px;
-  padding: 5px 8px;
-  color: var(--text-muted);
-  cursor: pointer;
-  list-style: none;
-  user-select: none;
-}
-
-.session-tab > .session-run-details > summary::-webkit-details-marker {
-  display: none;
-}
-
-.session-tab > .session-run-details > summary::marker {
-  content: "";
-}
-
-.session-tab > .session-run-details > summary .session-run-details-chevron {
-  flex-shrink: 0;
-  transition: transform 100ms ease-out;
-}
-
-.session-tab > .session-run-details[open] > summary .session-run-details-chevron {
-  transform: rotate(90deg);
-}
-
-.session-tab > .session-run-details > summary .session-run-details-label {
-  color: var(--text-normal);
-  font-weight: var(--fw-semibold);
-}
-
-.session-tab > .session-run-details .session-run-details-body {
-  display: flex;
-  flex-direction: column;
-  gap: 6px;
-  padding: 6px 8px 8px;
-  border-top: 1px solid var(--background-modifier-border);
-}
-
-.session-tab > .session-run-details .session-run-details-meta {
-  display: grid;
-  grid-template-columns: max-content 1fr;
-  gap: 3px 12px;
-  margin: 0;
-}
-
-.session-tab > .session-run-details .session-run-details-meta dt {
-  color: var(--text-faint);
-  text-transform: uppercase;
-  letter-spacing: 0.06em;
-  font-size: 10px;
-}
-
-.session-tab > .session-run-details .session-run-details-meta dd {
-  margin: 0;
-  color: var(--text-muted);
 }
 
 /* Video / audio artifacts (WIKI-190/191) */

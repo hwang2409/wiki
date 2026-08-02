@@ -146,20 +146,14 @@ async function main() {
 
     await expectVisibleText(page, ".session-state-meta", "Fixture transcript");
     await expectVisibleText(page, ".session-state-meta.is-faint", "wiki worker");
-    // WIKI-152: dispositions moved into the collapsed Run details disclosure.
-    // Verify (a) no ambient dispositions chip is rendered, (b) the disclosure
-    // exists closed by default, and (c) opening it reveals the count.
+    // WIKI-235: provider dispositions and Run details are absent from the
+    // default transcript surface. The action forms remain available below.
     if ((await page.locator(".session-dispositions").count()) !== 0) {
       throw new Error("WIKI-152: ambient .session-dispositions chip must not render");
     }
-    const runDetailsClaude = page.locator('[data-testid="session-run-details"]').first();
-    await runDetailsClaude.waitFor({ state: "attached" });
-    if (await runDetailsClaude.evaluate((el) => el.hasAttribute("open"))) {
-      throw new Error("WIKI-152: Run details disclosure must be closed by default");
+    if ((await page.locator('[data-testid="session-run-details"]').count()) !== 0) {
+      throw new Error("WIKI-235: Run details must not render");
     }
-    await runDetailsClaude.evaluate((el) => { el.setAttribute("open", ""); });
-    await expectVisibleText(page, ".session-dispositions-value", "Unknown 0");
-    await runDetailsClaude.evaluate((el) => { el.removeAttribute("open"); });
 
     const scopeQuestion = page.locator(".session-question").filter({ hasText: "Which scope?" });
     await scopeQuestion.waitFor({ state: "visible" });
@@ -190,14 +184,9 @@ async function main() {
     if ((await page.locator(".session-dispositions").count()) !== 0) {
       throw new Error("WIKI-152: ambient .session-dispositions chip must not render for Codex either");
     }
-    const runDetailsCodex = page.locator('[data-testid="session-run-details"]').first();
-    await runDetailsCodex.waitFor({ state: "attached" });
-    if (await runDetailsCodex.evaluate((el) => el.hasAttribute("open"))) {
-      throw new Error("WIKI-152: Codex Run details disclosure must be closed by default");
+    if ((await page.locator('[data-testid="session-run-details"]').count()) !== 0) {
+      throw new Error("WIKI-235: Codex Run details must not render");
     }
-    await runDetailsCodex.evaluate((el) => { el.setAttribute("open", ""); });
-    await expectVisibleText(page, ".session-dispositions-value", "Unknown 1");
-    await runDetailsCodex.evaluate((el) => { el.removeAttribute("open"); });
     const codexActivityToggle = page.locator(".session-activity-head").first();
     await codexActivityToggle.waitFor({ state: "visible" });
     await codexActivityToggle.click();
@@ -237,11 +226,9 @@ async function main() {
       JSON.stringify(
         {
           claude: {
-            dispositions: "Unknown 0",
             screenshot: path.join(OUT_DIR, "claude-native-surfaces.png"),
           },
           codex: {
-            dispositions: "Unknown 1",
             screenshot: path.join(OUT_DIR, "codex-native-surfaces.png"),
           },
           github_preview: {

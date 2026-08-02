@@ -4,6 +4,7 @@ import {
   Archive,
   Bot,
   ChevronDown,
+  ChevronRight,
   ExternalLink,
   GitPullRequest,
   MoreHorizontal,
@@ -109,10 +110,22 @@ function ageLabel(seconds: number | null): string {
   return `${Math.floor(seconds / 3600)}h ago`;
 }
 
+function navAgeLabel(seconds: number | null): string {
+  if (seconds === null) return "—";
+  if (seconds < 60) return `${seconds}s`;
+  if (seconds < 3600) return `${Math.floor(seconds / 60)}m`;
+  return `${Math.floor(seconds / 3600)}h`;
+}
+
 function stateLabel(worker: AgentWorker): string {
   if (!worker.state) return "unknown";
   if (worker.state === "merge-ready" && worker.role === "plan") return "plan ready";
   return worker.state;
+}
+
+function navStateLabel(worker: AgentWorker): string {
+  if (worker.state === "merge-ready" && worker.role !== "plan") return "ready";
+  return stateLabel(worker);
 }
 
 function stateValueLabel(state: string | null | undefined): string {
@@ -196,6 +209,34 @@ function readStoredExpandedScreencasts(): Set<string> {
     );
   } catch {
     return new Set();
+  }
+}
+
+// WIKI-235: sidebar orchestrator groups collapse by default; expansion
+// survives reloads.
+const NAV_ORCH_EXPANDED_KEY = "wiki-nav-orch-expanded";
+
+function readExpandedOrchs(): Record<string, boolean> {
+  try {
+    const raw = localStorage.getItem(NAV_ORCH_EXPANDED_KEY);
+    const parsed: unknown = raw ? JSON.parse(raw) : [];
+    if (!Array.isArray(parsed)) return {};
+    return Object.fromEntries(
+      parsed.filter((p): p is string => typeof p === "string").map((id) => [id, true])
+    );
+  } catch {
+    return {};
+  }
+}
+
+function writeExpandedOrchs(expanded: Record<string, boolean>) {
+  try {
+    localStorage.setItem(
+      NAV_ORCH_EXPANDED_KEY,
+      JSON.stringify(Object.keys(expanded).filter((id) => expanded[id]))
+    );
+  } catch {
+    /* localStorage unavailable — expansion stays session-local */
   }
 }
 
@@ -2407,7 +2448,6 @@ export function AgentsSidebar({
   data?: {
     workers: AgentWorker[] | null;
     orchestrators: Orchestrator[];
-    archived: ArchivedWorker[];
     error: string | null;
   };
   refreshTick: number;
@@ -2418,7 +2458,7 @@ export function AgentsSidebar({
 }) {
   const [fetchedWorkers, setFetchedWorkers] = useState<AgentWorker[] | null>(null);
   const [fetchedOrchestrators, setFetchedOrchestrators] = useState<Orchestrator[]>([]);
-  const [fetchedArchived, setFetchedArchived] = useState<ArchivedWorker[]>([]);
+  const [expandedOrchs, setExpandedOrchs] = useState<Record<string, boolean>>(readExpandedOrchs);
   // Keyed by run_id (durable). Value is the observed seq we tried to mark
   // viewed at — comparing seqs (monotonic int) sidesteps timestamp-format
   // and wall-clock issues from the round 1 implementation.
@@ -2445,7 +2485,6 @@ export function AgentsSidebar({
         if (!ignore) {
           setFetchedWorkers(result.workers);
           setFetchedOrchestrators(result.orchestrators ?? []);
-          setFetchedArchived(result.archived ?? []);
         }
       })
       .catch(() => {
@@ -2458,7 +2497,14 @@ export function AgentsSidebar({
 
   const workers = data?.workers ?? fetchedWorkers;
   const orchestrators = data?.orchestrators ?? fetchedOrchestrators;
-  const archived = data?.archived ?? fetchedArchived;
+
+  const toggleOrch = (id: string) => {
+    setExpandedOrchs((current) => {
+      const next = { ...current, [id]: !current[id] };
+      writeExpandedOrchs(next);
+      return next;
+    });
+  };
 
   useEffect(() => {
     if (!activeTicket || workers === null) return;
@@ -2589,7 +2635,7 @@ export function AgentsSidebar({
       </div>
     );
   }
-  if (workers.length === 0 && archived.length === 0 && orchestrators.length === 0) {
+  if (workers.length === 0 && orchestrators.length === 0) {
     return (
       <div className="nav-empty-cta" data-testid="nav-agents-empty">
         <div className="nav-empty-title">No runs yet</div>
@@ -2635,10 +2681,12 @@ export function AgentsSidebar({
     return latest > viewed;
   };
 
-  const workerRow = (worker: AgentWorker, owned: boolean, num?: number) => {
+  const workerRow = (worker: AgentWorker, owned: boolean) => {
     const unread = hasUnread(worker);
     const failed = worker.run_id ? viewedFailed[worker.run_id] === true : false;
     const stateKey = worker.state ?? "unknown";
+    const stateText = navStateLabel(worker);
+    const stateTitle = stateLabel(worker);
     return (
       <button
         className={`nav-agent${owned ? " is-owned" : ""}${activeTicket === worker.ticket ? " is-active" : ""}${unread ? " has-unread" : ""}${failed ? " has-viewed-failure" : ""}`}
@@ -2649,11 +2697,6 @@ export function AgentsSidebar({
         title={failed ? "Failed to persist read state to the server" : undefined}
         {...dragProps(worker.ticket)}
       >
-        {num !== undefined ? (
-          <span aria-hidden="true" className="nav-agent-num tabular-nums">
-            {num}
-          </span>
-        ) : null}
         {unread ? (
           <>
             <span aria-hidden="true" className="nav-agent-unread" data-testid="nav-agent-unread" />
@@ -2670,33 +2713,42 @@ export function AgentsSidebar({
           </>
         ) : null}
         <span className="nav-agent-ticket">{worker.ticket}</span>
-        <span className="nav-agent-meta" data-state={stateKey}>{stateLabel(worker)}</span>
+        <span className="nav-agent-meta" data-state={stateKey} title={stateTitle}>{stateText}</span>
         {!owned && worker.orch ? (
           <span className="nav-agent-orch-chip" title={`Coordinator: ${worker.orch}`}>
             {worker.orch}
           </span>
         ) : null}
-        <span className="nav-agent-age tabular-nums">{ageLabel(worker.status_age_seconds)}</span>
+        <span className="nav-agent-age tabular-nums" title={ageLabel(worker.status_age_seconds)}>
+          {navAgeLabel(worker.status_age_seconds)}
+        </span>
       </button>
     );
   };
 
-  const orchestratorRow = (orch: Orchestrator) => {
+  const orchestratorRow = (orch: Orchestrator, workerCount: number) => {
     const meta = orch.run_id
       ? orch.runtime_state ?? "orchestrator"
       : orch.window && !orch.window_alive
         ? "window gone"
         : "orchestrator";
+    const expanded = expandedOrchs[orch.id] === true;
     return (
       <button
-        className={`nav-agent is-orch${activeTicket === orch.id ? " is-active" : ""}`}
+        aria-controls={workerCount > 0 ? `nav-orch-workers-${orch.id}` : undefined}
+        aria-expanded={workerCount > 0 ? expanded : undefined}
+        className={`nav-agent is-orch${workerCount === 0 ? " is-empty" : ""}${expanded ? " is-expanded" : ""}${activeTicket === orch.id ? " is-active" : ""}`}
         data-state="orchestrator"
         key={orch.id}
         type="button"
-        onClick={() => onOpen(orch.id)}
+        onClick={() => {
+          if (workerCount > 0) toggleOrch(orch.id);
+          else onOpen(orch.id);
+        }}
+        title={workerCount > 0 ? `${expanded ? "Collapse" : "Expand"} ${orch.id} workers` : `${orch.id} has no active workers`}
         {...dragProps(orch.id)}
       >
-        <Bot size={12} />
+        <ChevronRight aria-hidden="true" className="nav-orch-chevron" size={12} />
         <span className="nav-agent-ticket">{orch.id}</span>
         <span className="nav-agent-meta" data-state="orchestrator">{meta}</span>
       </button>
@@ -2737,43 +2789,6 @@ export function AgentsSidebar({
   );
   const hasActive = orderedOrchestrators.length > 0 || workers.length > 0;
 
-  // opencode-style gutter numbers: one running sequence over session rows
-  // (workers then archived), skipping orchestrator parent rows.
-  let seq = 0;
-  const workerNumbers = new Map<string, number>();
-  for (const orch of orderedOrchestrators) {
-    for (const worker of ownedByOrch.get(orch.id) ?? []) {
-      workerNumbers.set(worker.ticket, ++seq);
-    }
-  }
-  for (const worker of ungrouped) workerNumbers.set(worker.ticket, ++seq);
-  const archivedNumbers = new Map<string, number>();
-  for (const entry of archived) {
-    archivedNumbers.set(`${entry.ticket}-${entry.archived_at}`, ++seq);
-  }
-
-  const historyGroups: { label: string; entries: ArchivedWorker[] }[] = [];
-  {
-    const now = new Date();
-    const startOfDay = (offsetDays: number) =>
-      new Date(now.getFullYear(), now.getMonth(), now.getDate() - offsetDays).getTime();
-    const today = startOfDay(0);
-    const yesterday = startOfDay(1);
-    for (const entry of archived) {
-      const at = Date.parse(entry.archived_at);
-      const label = Number.isNaN(at)
-        ? "Earlier"
-        : at >= today
-          ? "Today"
-          : at >= yesterday
-            ? "Yesterday"
-            : "Earlier";
-      const group = historyGroups.find((candidate) => candidate.label === label);
-      if (group) group.entries.push(entry);
-      else historyGroups.push({ label, entries: [entry] });
-    }
-  }
-
   return (
     <div className="nav-agents">
       {hasActive ? (
@@ -2782,47 +2797,27 @@ export function AgentsSidebar({
           data-testid="nav-agents-group-active"
         >
           <span>Active</span>
-          <span className="nav-agents-group-count tabular-nums">
-            {orderedOrchestrators.length + workers.length}
-          </span>
         </div>
       ) : null}
-      {orderedOrchestrators.map((orch) => (
-        <div key={orch.id}>
-          {orchestratorRow(orch)}
-          {(ownedByOrch.get(orch.id) ?? []).map((worker) =>
-            workerRow(worker, true, workerNumbers.get(worker.ticket))
-          )}
-        </div>
-      ))}
-      {ungrouped.map((worker) => workerRow(worker, false, workerNumbers.get(worker.ticket)))}
-      {historyGroups.map((group, groupIndex) => (
-        <Fragment key={group.label}>
-          <div
-            className="nav-agents-group-title"
-            data-testid={groupIndex === 0 ? "nav-agents-group-history" : undefined}
-          >
-            <span>{group.label}</span>
-            <span className="nav-agents-group-count tabular-nums">{group.entries.length}</span>
+      {orderedOrchestrators.map((orch) => {
+        const owned = ownedByOrch.get(orch.id) ?? [];
+        const expanded = expandedOrchs[orch.id] === true;
+        return (
+          <div className="nav-orch-group" key={orch.id}>
+            {orchestratorRow(orch, owned.length)}
+            {expanded && owned.length > 0 ? (
+              <div
+                className="nav-orch-workers"
+                id={`nav-orch-workers-${orch.id}`}
+                data-testid={`nav-orch-workers-${orch.id}`}
+              >
+                {owned.map((worker) => workerRow(worker, true))}
+              </div>
+            ) : null}
           </div>
-          {group.entries.map((entry) => (
-            <button
-              className={`nav-agent is-archived${activeTicket === entry.ticket ? " is-active" : ""}`}
-              data-state="archived"
-              key={`${entry.ticket}-${entry.archived_at}`}
-              type="button"
-              onClick={() => onOpen(entry.ticket)}
-            >
-              <span aria-hidden="true" className="nav-agent-num tabular-nums">
-                {archivedNumbers.get(`${entry.ticket}-${entry.archived_at}`)}
-              </span>
-              <span className="nav-agent-ticket">{entry.ticket}</span>
-              <span className="nav-agent-meta" data-state="archived">{entry.outcome ?? entry.state ?? ""}</span>
-              <span className="nav-agent-age tabular-nums">{archivedAge(entry.archived_at)}</span>
-            </button>
-          ))}
-        </Fragment>
-      ))}
+        );
+      })}
+      {ungrouped.map((worker) => workerRow(worker, false))}
     </div>
   );
 }

@@ -16,7 +16,7 @@ import { ArtifactPanel } from "./artifact-panel";
 import { ReplayScrubberPanel } from "./replay-scrubber-panel";
 import { deletePaneStateEntries } from "./pane-state-cache";
 import { ReplaceAgentModal } from "./replace-agent-modal";
-import { getTicketCosts, type CostRow, type SessionEvent, type SpawnWorkerEffort, type SpawnWorkerKind } from "./api";
+import { type SessionEvent, type SpawnWorkerEffort, type SpawnWorkerKind } from "./api";
 import { InspectableSessionTab, SessionTab, usePollTick } from "./session";
 import { StatusBadge } from "./status-badge";
 import {
@@ -124,38 +124,6 @@ export function WorkerStatePill({ state }: { state: string | null | undefined })
     >
       {state}
     </span>
-  );
-}
-
-function formatTicketCost(row: CostRow): string {
-  if (row.cost_usd === null) return `unpriced · ${row.unpriced_tokens.toLocaleString()} tokens`;
-  if (row.pricing === "mixed") return `$${row.cost_usd.toFixed(4)} + unpriced`;
-  return `$${row.cost_usd.toFixed(4)}`;
-}
-
-function TicketCostStrip({ ticket, refreshTick }: { ticket: string; refreshTick: number }) {
-  const [summary, setSummary] = useState<CostRow | null>(null);
-  useEffect(() => {
-    let active = true;
-    getTicketCosts(ticket)
-      .then((data) => {
-        if (active) setSummary(data.totals);
-      })
-      .catch(() => {
-        if (active) setSummary(null);
-      });
-    return () => {
-      active = false;
-    };
-  }, [ticket, refreshTick]);
-  if (!summary || summary.total_tokens === 0) return null;
-  return (
-    <div className="ticket-cost-strip" aria-label={`cost for ${ticket}`}>
-      <span>cost</span>
-      <strong className={`is-${summary.pricing}`}>{formatTicketCost(summary)}</strong>
-      <span className="ticket-cost-detail">{summary.total_tokens.toLocaleString()} tokens</span>
-      {summary.models.length > 0 ? <span className="ticket-cost-detail">{summary.models.join(", ")}</span> : null}
-    </div>
   );
 }
 
@@ -711,7 +679,6 @@ export function AgentSessionSurface({
             <span className="session-step-text">{step}</span>
           </div>
         ) : null}
-        <TicketCostStrip ticket={worker.ticket} refreshTick={tick} />
         <div className="agent-session-surface-main" ref={mainScopeRef}>
           <SessionTab
             onArtifactsChange={handleArtifactsChange}

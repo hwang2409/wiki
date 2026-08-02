@@ -273,6 +273,12 @@ try {
   );
   assert(groupTexts.includes("Active"), `expected Active group, got ${groupTexts.join("/")}`);
 
+  // WIKI-235: orchestrator children start collapsed. Expand the wiki group
+  // before checking WIKI-151 row anatomy and attention ordering.
+  const wikiOrchestrator = page.locator('.nav-agent.is-orch', { hasText: "wiki" });
+  await wikiOrchestrator.click();
+  await page.waitForSelector('[data-testid="nav-orch-workers-wiki"]');
+
   const rowOrder = await page.evaluate(() =>
     Array.from(document.querySelectorAll(".nav-agent"))
       .filter((el) => !el.classList.contains("is-orch"))

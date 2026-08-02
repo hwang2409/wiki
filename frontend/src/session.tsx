@@ -61,7 +61,6 @@ import type {
   ProviderEventInspector,
   ProviderPendingRequest,
   QueuedMessage,
-  SessionDispositionCounts,
   SessionEvent,
   SessionInit,
   SessionRateLimit,
@@ -97,7 +96,7 @@ import { createStateKeyWriteBarrier, deletePaneStateEntries } from "./pane-state
 import { Timestamp } from "./timestamp";
 import { StatusBadge } from "./status-badge";
 import { BoundedPreview } from "./transcript-preview";
-import { STREAM_CLAMP_PX, StreamClamp } from "./stream-clamp";
+import { StreamClamp } from "./stream-clamp";
 import { CodexStreamHighlights } from "./codex-stream-renderers";
 import { markerRule } from "./hook-message-registry";
 import type { MarkerSeverity } from "./hook-message-registry";
@@ -388,17 +387,6 @@ function usePinnedScroll<T extends HTMLElement>(
   };
 }
 
-function formatTokens(tokens: number | null): string | null {
-  if (!tokens) return null;
-  if (tokens >= 1_000_000) return `${(tokens / 1_000_000).toFixed(1)}M tok`;
-  if (tokens >= 1_000) return `${Math.round(tokens / 1_000)}k tok`;
-  return `${tokens} tok`;
-}
-
-function formatDispositionCounts({ unknown }: { unknown: number }): string {
-  return `Unknown ${unknown}`;
-}
-
 type ProviderQuestion = {
   id: string;
   header?: string;
@@ -552,9 +540,8 @@ function ProviderPendingRequestCard({
                 : "Send response"}
         </button>
       </div>
-      {/* R1-04: request kind, id, and raw payload no longer live in a
-          per-card mini disclosure. Run details is the single diagnostics
-          home — cross-reference by raw_seq #{request.raw_seq}. */}
+      {/* R1-04/WIKI-235: request kind, id, and raw payload do not render in
+          default session chrome. They remain available through event APIs. */}
       {error ? <div className="session-provider-request-error">{error}</div> : null}
     </div>
   );
@@ -956,131 +943,6 @@ export function ProviderActionRequired({
         ))}
       </div>
     </div>
-  );
-}
-
-export function SessionRunDetails({
-  inspector,
-  format,
-  tokens,
-  thinkingTokens,
-  dispositions,
-}: {
-  inspector: ProviderEventInspector | null;
-  format: string | null;
-  tokens: number | null;
-  thinkingTokens: number | null;
-  dispositions: SessionDispositionCounts | null;
-}) {
-  if (!inspector && !format && !tokens && !thinkingTokens && !dispositions) return null;
-  // R2-01: prefer inspector.dispositions — it is the source of truth for
-  // live provider events. Session-level dispositions come from the
-  // transcript fallback path which zeroes counts while real provider
-  // events are flowing (the exact "Unknown 0" artifact this ticket
-  // kills). Only fall back to session dispositions when there is no
-  // inspector at all.
-  const dispositionCounts = inspector
-    ? formatDispositionCounts(inspector.dispositions)
-    : dispositions
-    ? formatDispositionCounts(dispositions)
-    : null;
-  const pendingRequests = inspector?.pending_requests ?? [];
-  const tokensLabel = formatTokens(tokens);
-  return (
-    <details className="session-run-details" data-testid="session-run-details">
-      <summary>
-        <ChevronRight size={12} className="session-run-details-chevron" />
-        <span className="session-run-details-label">Run details</span>
-      </summary>
-      <div className="session-run-details-body">
-        <dl className="session-run-details-meta tabular-nums">
-          {inspector ? (
-            <>
-              <dt>provider</dt>
-              <dd>{inspector.provider}</dd>
-              <dt>state</dt>
-              <dd className={`session-provider-state is-${inspector.state}`}>{inspector.state}</dd>
-              <dt>events</dt>
-              <dd>raw {inspector.raw_count} → normalized {inspector.normalized_count}</dd>
-            </>
-          ) : null}
-          {dispositionCounts ? (
-            <>
-              <dt>dispositions</dt>
-              <dd className="session-dispositions-value">{dispositionCounts}</dd>
-            </>
-          ) : null}
-          {format ? (
-            <>
-              <dt>format</dt>
-              <dd>{format}</dd>
-            </>
-          ) : null}
-          {tokensLabel ? (
-            <>
-              <dt>tokens</dt>
-              <dd>{tokensLabel}</dd>
-            </>
-          ) : null}
-          {typeof thinkingTokens === "number" ? (
-            <>
-              <dt>thinking</dt>
-              <dd>{thinkingTokens} tokens</dd>
-            </>
-          ) : null}
-        </dl>
-        {/* R2-02: render pending requests as first-class diagnostics so a
-            pending request that has not yet produced an event (e.g. id 0
-            with an empty event log) is discoverable — the action-required
-            card intentionally hides kind/id/payload, so Run details is
-            their one home. */}
-        {pendingRequests.length > 0 ? (
-          <div className="session-provider-pending-list" data-testid="run-details-pending-requests">
-            {pendingRequests.map((request) => (
-              <details
-                className="session-provider-event is-pending"
-                key={`pending:${typeof request.request_id}:${request.request_id}`}
-              >
-                <summary>
-                  <span className="is-pending">pending</span>
-                  <span>id #{String(request.request_id)}</span>
-                  <span>{request.request_kind}</span>
-                  <span>raw #{request.raw_seq}</span>
-                </summary>
-                <StreamClamp>
-                  <pre>{JSON.stringify(request.payload, null, 2)}</pre>
-                </StreamClamp>
-              </details>
-            ))}
-          </div>
-        ) : null}
-        {inspector ? (
-          <div className="session-provider-events" style={{ maxHeight: STREAM_CLAMP_PX }}>
-            {inspector.events.length > 0 ? (
-              inspector.events
-                .slice()
-                .reverse()
-                .map((event) => (
-                  <details className="session-provider-event" key={event.seq}>
-                    <summary>
-                      <span className={`is-${event.disposition}`}>{event.disposition}</span>
-                      <span>#{event.seq}</span>
-                      <span>{event.kind}</span>
-                      {event.lifecycle_state ? <span>→ {event.lifecycle_state}</span> : null}
-                      <span>raw #{event.raw_seq}</span>
-                    </summary>
-                    <StreamClamp>
-                      <pre>{JSON.stringify(event.payload, null, 2)}</pre>
-                    </StreamClamp>
-                  </details>
-                ))
-            ) : pendingRequests.length === 0 ? (
-              <div className="session-provider-empty">No normalized provider events yet.</div>
-            ) : null}
-          </div>
-        ) : null}
-      </div>
-    </details>
   );
 }
 
@@ -2753,7 +2615,6 @@ export function SessionTab({
   }
 
   const rateLimit = session.sessionMeta.rate_limit;
-  const thinkingTokens = session.sessionMeta.thinking_tokens?.total ?? null;
   const inspector = session.providerInspector;
 
   return (
@@ -2803,13 +2664,6 @@ export function SessionTab({
           }
         />
       ) : null}
-      <SessionRunDetails
-        inspector={inspector ?? null}
-        format={session.format ?? null}
-        tokens={session.tokens ?? null}
-        thinkingTokens={thinkingTokens}
-        dispositions={session.dispositions ?? null}
-      />
       <div className="session-scroll" ref={ref}>
         <div className="session-scroll-inner" ref={innerRef}>
           {session.hasOlder && !subagent ? (

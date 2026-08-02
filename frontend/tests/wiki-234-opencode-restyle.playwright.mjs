@@ -1,8 +1,6 @@
-// WIKI-234: opencode-inspired restyle. Asserts the terminal-native language
-// holds at the structural level: opencode is the default theme, session rows
-// carry gutter numbers, history splits into time groups, user turns render as
-// left-accent-bar blocks, and the composer strip exposes the model line plus
-// keybinding hints.
+// WIKI-234/235: asserts that the terminal-native language survives the runs
+// declutter: orchestrators disclose active workers, archive groups stay out of
+// the sidebar, and session chrome stays flat and rectangular.
 import fs from "node:fs/promises";
 import { mkdirSync } from "node:fs";
 import path from "node:path";
@@ -17,7 +15,7 @@ import {
 } from "../scripts/wiki32-harness.mjs";
 
 const HERE = path.dirname(new URL(import.meta.url).pathname);
-const OUT_DIR = process.env.WIKI_PLAYWRIGHT_OUT_DIR || path.join(HERE, "evidence", "wiki-234");
+const OUT_DIR = process.env.WIKI_PLAYWRIGHT_OUT_DIR || path.join(HERE, "evidence", "wiki-235");
 mkdirSync(OUT_DIR, { recursive: true });
 
 function assert(condition, message) {
@@ -83,12 +81,13 @@ try {
       },
     },
     "WIKI-301": { history: [], current: { ...workerBase, ticket: "WIKI-301" } },
-    "WIKI-302": { history: [], current: { ...workerBase, ticket: "WIKI-302", state: "idle" } },
+    "WIKI-302": { history: [], current: { ...workerBase, ticket: "WIKI-302", state: "blocked" } },
+    "WIKI-303": { history: [], current: { ...workerBase, ticket: "WIKI-303", state: "merge-ready" } },
     "FREE-1": { history: [], current: { ...workerBase, ticket: "FREE-1", orch: null } },
   };
   await fs.writeFile(fixtures.registryPath, JSON.stringify(registry, null, 2));
   writeQueue(fixtures.queuePath, "WIKI-301", []);
-  for (const ticket of ["WIKI-301", "WIKI-302", "FREE-1"]) {
+  for (const ticket of ["WIKI-301", "WIKI-302", "WIKI-303", "FREE-1"]) {
     await fs.writeFile(
       path.join(fixtures.statusDir, `${ticket}.json`),
       JSON.stringify({ state: registry[ticket].current.state, pr: null, step: "seeded", blocker: null }),
@@ -136,39 +135,62 @@ try {
   const bodyFont = await page.evaluate(() => getComputedStyle(document.body).fontFamily);
   assert(/mono/i.test(bodyFont), `opencode chrome must be mono, got ${bodyFont}`);
 
-  logStep("state 2: numbered sidebar with time-grouped history");
+  logStep("state 2: orchestrator-first sidebar with persisted disclosure");
   await page.click('[data-testid="workspace-ribbon"] [aria-label="Agent list"]');
   await page.waitForSelector('[data-testid="nav-agents-group-active"]');
-  await page.waitForSelector('[data-testid="nav-agents-group-history"]');
-  const groups = await page.evaluate(() =>
-    Array.from(document.querySelectorAll(".nav-agents-group-title")).map((el) => ({
-      label: (el.firstElementChild?.textContent ?? "").trim(),
-      count: (el.querySelector(".nav-agents-group-count")?.textContent ?? "").trim(),
-    })),
-  );
-  const labels = groups.map((group) => group.label);
-  assert(
-    JSON.stringify(labels) === JSON.stringify(["Active", "Today", "Yesterday", "Earlier"]),
-    `expected Active/Today/Yesterday/Earlier groups, got ${labels.join("/")}`,
-  );
-  const counts = Object.fromEntries(groups.map((group) => [group.label, group.count]));
-  assert(counts.Active === "4", `Active count must include orch + workers (4), got ${counts.Active}`);
-  assert(counts.Today === "1" && counts.Yesterday === "1" && counts.Earlier === "1",
-    `each history group must count 1, got ${JSON.stringify(counts)}`);
-  const nums = await page.evaluate(() =>
-    Array.from(document.querySelectorAll(".nav-agent .nav-agent-num")).map((el) =>
-      (el.textContent ?? "").trim(),
+  const initialRows = await page.evaluate(() =>
+    Array.from(document.querySelectorAll(".nav-agent")).map((el) =>
+      el.querySelector(".nav-agent-ticket")?.textContent?.trim() ?? "",
     ),
   );
   assert(
-    JSON.stringify(nums) === JSON.stringify(["1", "2", "3", "4", "5", "6"]),
-    `gutter numbers must run 1..6 across workers then history, got ${nums.join(",")}`,
+    JSON.stringify(initialRows) === JSON.stringify(["wiki", "FREE-1"]),
+    `collapsed sidebar must show orchestrators then ungrouped workers, got ${initialRows.join("/")}`,
   );
-  const orchHasNum = await page.evaluate(
-    () => document.querySelector(".nav-agent.is-orch .nav-agent-num") !== null,
+  const sidebarText = await page.locator(".nav-agents").innerText();
+  for (const removed of ["Today", "Yesterday", "Earlier", "ARC-TODAY", "ARC-YDAY", "ARC-OLD"]) {
+    assert(!sidebarText.includes(removed), `archived sidebar chrome must omit ${removed}`);
+  }
+  assert((await page.locator(".nav-agent-num").count()) === 0, "session gutter numbers must be removed");
+
+  const wikiRow = page.locator('.nav-agent.is-orch', { hasText: "wiki" });
+  assert((await wikiRow.getAttribute("aria-expanded")) === "false", "wiki workers must start collapsed");
+  await wikiRow.click();
+  const wikiWorkers = page.locator('[data-testid="nav-orch-workers-wiki"]');
+  await wikiWorkers.waitFor();
+  const expandedTickets = await wikiWorkers.locator(".nav-agent-ticket").allInnerTexts();
+  assert(
+    JSON.stringify(expandedTickets) === JSON.stringify(["WIKI-302", "WIKI-303", "WIKI-301"]),
+    `attention order must be blocked, merge-ready, working; got ${expandedTickets.join("/")}`,
   );
-  assert(!orchHasNum, "orchestrator rows must not carry gutter numbers");
-  await page.screenshot({ path: path.join(OUT_DIR, "01-sidebar-groups.png") });
+  const disclosureStyle = await wikiRow.evaluate((el) => ({
+    radius: Number.parseFloat(getComputedStyle(el).borderRadius),
+    height: el.getBoundingClientRect().height,
+    chevron: el.querySelector(".nav-orch-chevron") !== null,
+  }));
+  assert(disclosureStyle.radius <= 2, `orchestrator row radius must be <=2px, got ${disclosureStyle.radius}`);
+  assert(disclosureStyle.height >= 40, `orchestrator row hit area must be >=40px, got ${disclosureStyle.height}`);
+  assert(disclosureStyle.chevron, "orchestrator disclosure needs a visible chevron");
+
+  await page.screenshot({ path: path.join(OUT_DIR, "01-sidebar-normal.png") });
+  await page.setViewportSize({ width: 1000, height: 760 });
+  const narrowLayout = await page.locator(".nav-agents").evaluate((el) => ({
+    clientWidth: el.clientWidth,
+    scrollWidth: el.scrollWidth,
+  }));
+  assert(
+    narrowLayout.scrollWidth <= narrowLayout.clientWidth,
+    `narrow sidebar must not overflow: ${narrowLayout.scrollWidth} > ${narrowLayout.clientWidth}`,
+  );
+  await page.screenshot({ path: path.join(OUT_DIR, "02-sidebar-narrow.png") });
+  await page.setViewportSize({ width: 1440, height: 900 });
+
+  await wikiRow.click();
+  assert((await page.locator('[data-testid="nav-orch-workers-wiki"]').count()) === 0, "second click must collapse workers");
+  await wikiRow.click();
+  await wikiWorkers.waitFor();
+  await page.reload({ waitUntil: "domcontentloaded" });
+  await page.waitForSelector('[data-testid="nav-orch-workers-wiki"]');
 
   logStep("state 3: accent-bar user block + quiet composer strip");
   // The "wiki" orchestrator shares the native transcript fixture, which the
@@ -205,7 +227,15 @@ try {
   for (const key of ["enter", "shift+enter", "esc"]) {
     assert(hints.includes(key), `footer hints must include ${key}, got ${hints}`);
   }
-  await page.screenshot({ path: path.join(OUT_DIR, "02-session-surface.png") });
+  const composerRadius = await page.locator(".session-composer-row").evaluate((el) =>
+    Number.parseFloat(getComputedStyle(el).borderRadius),
+  );
+  assert(composerRadius <= 2, `session composer radius must be <=2px, got ${composerRadius}`);
+  assert((await page.locator('[data-testid="session-run-details"]').count()) === 0,
+    "Run details must not render");
+  assert((await page.locator(".ticket-cost-strip").count()) === 0,
+    "ticket cost strip must not render");
+  await page.screenshot({ path: path.join(OUT_DIR, "03-session-surface.png") });
 
   logStep("state 4: shift+enter hint mirrors composer behavior (working vs idle)");
   // The backend derives `working` from transcript mtime (< 30s) when no
@@ -256,7 +286,7 @@ try {
       `hint [${hint.left}, ${hint.right}] must sit inside footer [${layout.footer.left}, ${layout.footer.right}]`,
     );
   }
-  await page.screenshot({ path: path.join(OUT_DIR, "03-narrow-footer.png") });
+  await page.screenshot({ path: path.join(OUT_DIR, "04-narrow-footer.png") });
 
   logStep("PASS");
 } finally {
