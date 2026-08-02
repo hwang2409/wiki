@@ -305,6 +305,30 @@ async function main() {
       await page.mouse.up();
     };
 
+    const closeBlankPane = async () => {
+      const blankPane = page.locator(".pane-frame", { has: page.locator("[data-new-pane='true']") });
+      await blankPane.click({ position: { x: 20, y: 20 } });
+      await page.waitForFunction(() =>
+        document.querySelector(".pane-frame.is-focused [data-new-pane='true']") !== null,
+      );
+      await page.keyboard.press("Control+a");
+      await page.keyboard.press("x");
+      await page.locator(".pane-split.row").waitFor({ state: "detached" });
+    };
+
+    const assertSingleAgentPane = async (context) => {
+      const paneState = await page.evaluate(() => ({
+        agentPanes: document.querySelectorAll(".pane-frame .agent-session-surface").length,
+        blankPanes: document.querySelectorAll(".pane-frame [data-new-pane='true']").length,
+        panes: document.querySelectorAll(".pane-frame").length,
+        splits: document.querySelectorAll(".pane-split").length,
+      }));
+      assert(
+        paneState.panes === 1 && paneState.agentPanes === 1 && paneState.blankPanes === 0 && paneState.splits === 0,
+        `${context} must show one unsplit agent pane: ${JSON.stringify(paneState)}`,
+      );
+    };
+
     const assertNoHorizontalOverflow = async (context) => {
       const bounds = await page.locator(".session-tab").evaluate((root) => {
         const composerRoot = root.querySelector(".session-composer");
@@ -324,6 +348,28 @@ async function main() {
       );
     };
 
+    const assertPromptDockFitsViewport = async (context) => {
+      const layout = await page.locator(".session-tab").evaluate((root) => {
+        const composerRoot = root.querySelector(".session-composer");
+        const footer = root.querySelector(".session-footer");
+        const rootRect = root.getBoundingClientRect();
+        const composerRect = composerRoot.getBoundingClientRect();
+        const footerRect = footer.getBoundingClientRect();
+        return {
+          composer: [composerRect.left, composerRect.right],
+          footer: [footerRect.left, footerRect.right],
+          root: [rootRect.left, rootRect.right],
+          viewportWidth: window.innerWidth,
+        };
+      });
+      for (const [name, bounds] of [["composer", layout.composer], ["footer", layout.footer]]) {
+        assert(
+          bounds[0] >= layout.root[0] && bounds[1] <= layout.root[1] && bounds[1] <= layout.viewportWidth,
+          `${context} ${name} must fit the 360px viewport: ${bounds.join("/")}`,
+        );
+      }
+    };
+
     logStep("working state at normal width");
     await mountSession();
     let mountedComposer = await page.locator(".session-composer").elementHandle();
@@ -337,6 +383,7 @@ async function main() {
         `${context} must keep the original composer mounted`,
       );
     };
+    await assertSingleAgentPane("normal working screenshot");
     await assertTarget();
     await assertGuidance("enter send now · shift+enter queue until idle · esc vim");
     await assertExpandedSend("normal working");
@@ -356,6 +403,7 @@ async function main() {
     await assertGuidance("enter send · shift+enter newline · esc vim");
     await assertExpandedSend("normal idle after polling");
     await assertComposerStayedMounted("working-to-idle polling");
+    await assertSingleAgentPane("normal idle polling screenshot");
     assert(await send.getAttribute("aria-label") === "Send", "idle send action must not say send now");
     await page.screenshot({ path: SCREENSHOTS.idleNormal, fullPage: true });
 
@@ -526,17 +574,31 @@ async function main() {
     await assertNoHorizontalOverflow("expanded split working");
     await assertComposerStayedMounted("narrow-to-wide split resize");
 
-    logStep("live working state at narrow viewport width");
+    logStep("restore one pane after the working split regression");
+    await closeBlankPane();
+    await assertSingleAgentPane("restored normal working screenshot");
+    mountedComposer = await page.locator(".session-composer").elementHandle();
+    assert(mountedComposer, "single-pane composer must mount after closing the blank pane");
+    await assertTarget();
+    await assertGuidance("enter send now · shift+enter queue until idle · esc vim");
+    await assertExpandedSend("restored single-pane working");
+    await assertNoHorizontalOverflow("restored single-pane working");
+    await page.screenshot({ path: SCREENSHOTS.workingNormal, fullPage: true });
+
+    logStep("live working state in one narrow viewport pane");
     await page.setViewportSize({ width: 360, height: 1200 });
+    await assertSingleAgentPane("narrow viewport working screenshot");
     await assertTarget(`Steer ${TICKET}…`);
     await assertGuidance("enter send now · shift+enter queue until idle · esc vim");
     await assertCompactSend("narrow viewport working");
     await assertNoHorizontalOverflow("narrow viewport working");
+    await assertPromptDockFitsViewport("narrow viewport working");
     await assertComposerStayedMounted("narrow viewport resize");
     await page.screenshot({ path: SCREENSHOTS.workingNarrow, fullPage: true });
 
     logStep("return to idle through mounted-session refresh");
     await page.setViewportSize({ width: 1280, height: 900 });
+    await assertSingleAgentPane("restored normal working state");
     await assertTarget();
     await assertExpandedSend("restored normal working");
     working = false;
@@ -552,6 +614,7 @@ async function main() {
     await assertGuidance("enter send · shift+enter newline · esc vim");
     await assertExpandedSend("normal idle");
     await assertComposerStayedMounted("working-to-idle polling");
+    await assertSingleAgentPane("normal idle screenshot");
     assert(await send.getAttribute("aria-label") === "Send", "idle send action must not say send now");
     await page.screenshot({ path: SCREENSHOTS.idleNormal, fullPage: true });
 
@@ -568,7 +631,26 @@ async function main() {
     assert(deliveries.length === beforeIdleShift, "idle Shift+Enter must not queue a message");
     await composer.fill("");
 
+    logStep("live idle state in one narrow viewport pane");
+    await page.setViewportSize({ width: 360, height: 1200 });
+    await assertSingleAgentPane("narrow viewport idle screenshot");
+    await assertTarget(`Ask ${TICKET}…`);
+    await assertGuidance("enter send · shift+enter newline · esc vim");
+    await assertCompactSend("narrow viewport idle");
+    await assertNoHorizontalOverflow("narrow viewport idle");
+    await assertPromptDockFitsViewport("narrow viewport idle");
+    await assertComposerStayedMounted("narrow viewport polling");
+    await page.screenshot({ path: SCREENSHOTS.idleNarrow, fullPage: true });
+
     logStep("live idle state in a narrow desktop split pane");
+    await page.setViewportSize({ width: 1280, height: 900 });
+    await assertSingleAgentPane("idle state before split recreation");
+    await composer.focus();
+    await page.keyboard.press("Control+a");
+    await page.keyboard.press("p");
+    await page.locator(".pane-split.row").waitFor({ state: "visible" });
+    mountedComposer = await page.locator(".session-composer").elementHandle();
+    assert(mountedComposer, "idle split composer must mount before live divider checks");
     await resizeSplit(0.35);
     await assertTarget(`Ask ${TICKET}…`);
     await assertGuidance("enter send · shift+enter newline · esc vim");
@@ -577,17 +659,11 @@ async function main() {
     await assertComposerStayedMounted("narrow split idle resize");
     await page.screenshot({ path: SCREENSHOTS.idleSplit, fullPage: true });
 
-    logStep("live idle state at narrow viewport width");
     await resizeSplit(0.65);
     await assertTarget();
-    await assertExpandedSend("restored expanded idle");
-    await page.setViewportSize({ width: 360, height: 1200 });
-    await assertTarget(`Ask ${TICKET}…`);
-    await assertGuidance("enter send · shift+enter newline · esc vim");
-    await assertCompactSend("narrow viewport idle");
-    await assertNoHorizontalOverflow("narrow viewport idle");
-    await assertComposerStayedMounted("narrow viewport polling");
-    await page.screenshot({ path: SCREENSHOTS.idleNarrow, fullPage: true });
+    await assertExpandedSend("restored expanded idle split");
+    await assertNoHorizontalOverflow("restored expanded idle split");
+    await assertComposerStayedMounted("idle split narrow-to-wide resize");
 
     logStep("PASS");
   } finally {
