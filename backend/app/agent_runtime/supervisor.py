@@ -944,9 +944,6 @@ Preserve the same identity, role, worktree, orchestrator grouping, PR gates, and
                     if boundary is not None and not boundary.done():
                         boundary.set_result(None)
                     return
-                self.store.command_log.acknowledge_steer_for_pending(
-                    run_id, pending_message["pending_id"]
-                )
                 normalized_payload = {
                     **normalized.payload,
                     "pending_id": pending_message["pending_id"],
@@ -964,6 +961,14 @@ Preserve the same identity, role, worktree, orchestrator grouping, PR gates, and
             payload=normalized_payload,
             lifecycle_state=normalized.lifecycle_state,
         )
+        if pending_message is not None:
+            # The normalized row is the durable delivery proof. Do not make
+            # the steer terminal before this append commits: a failed append
+            # must remain recoverable from the already-durable raw echo
+            # (REVIEW18 H1).
+            self.store.command_log.acknowledge_steer_for_pending(
+                run_id, pending_message["pending_id"]
+            )
 
         record = self.store.get(run_id)
         if normalized.lifecycle_state is not None and update_adapter_snapshot:
@@ -1083,10 +1088,24 @@ Preserve the same identity, role, worktree, orchestrator grouping, PR gates, and
         except BaseException as exc:
             if barrier is not None and not barrier.done():
                 barrier.set_exception(exc)
+                # The flush caller already receives this exception. Mark the
+                # barrier result observed so a run with no later event waiter
+                # does not emit an unhandled-future warning.
+                barrier.exception()
             raise
         else:
             if barrier is not None and not barrier.done():
                 barrier.set_result(None)
+
+    async def _flush_deferred_delivery_events(self, run_id: str) -> None:
+        """Flush delivery echoes without closing their command intents on error."""
+
+        try:
+            await self._flush_deferred_provider_events(run_id)
+        except Exception as exc:
+            raise CommandRetryable(
+                "provider echo normalization did not commit"
+            ) from exc
 
     async def _flush_handover_events(
         self, run_id: str, *, schedule_monitor_actions: bool = False
@@ -1676,7 +1695,7 @@ Preserve the same identity, role, worktree, orchestrator grouping, PR gates, and
                     self.store.command_log.revert_steer_sending_to_queued_for_pending(
                         run_id, pending_id
                     )
-                await self._flush_deferred_provider_events(run_id)
+                await self._flush_deferred_delivery_events(run_id)
                 return
             except Exception as exc:
                 # Match send_now's ambiguous transport boundary. A provider
@@ -1700,7 +1719,7 @@ Preserve the same identity, role, worktree, orchestrator grouping, PR gates, and
                 # outcome is known. Flush while the pending matcher still
                 # exists so an accepted-then-error echo keeps its pending_id
                 # and composer source correlation (REVIEW15 H2).
-                await self._flush_deferred_provider_events(run_id)
+                await self._flush_deferred_delivery_events(run_id)
                 delivery_observed = False
                 if pending_id is not None:
                     effect_for_pending = (
@@ -1779,7 +1798,7 @@ Preserve the same identity, role, worktree, orchestrator grouping, PR gates, and
                 self._delivery_attempt_echoes.pop(attempt_key, None)
             if pending_id is not None:
                 self.store.command_log.mark_steer_sent_for_pending(run_id, pending_id)
-            await self._flush_deferred_provider_events(run_id)
+            await self._flush_deferred_delivery_events(run_id)
             self.store.pop_queued_message(run_id)
             record = self.store.update_adapter_status(run_id, status)
             record = self.store.clear_automatic_resume_suppression(run_id)
@@ -2513,8 +2532,11 @@ Preserve the same identity, role, worktree, orchestrator grouping, PR gates, and
                     orphan_seq = int(envelope.get("seq", 0))
                     if orphan_seq in normalized_seqs:
                         continue
-                    await self._recover_orphan_raw_event(run_id, envelope)
-                    recovered_any = True
+                    appended = await self._recover_orphan_raw_event(
+                        run_id, envelope
+                    )
+                    if appended:
+                        recovered_any = True
                 if recovered_any:
                     # Recovered orphans get appended after later normalized
                     # rows, so any projection built by walking normalized
@@ -2532,7 +2554,7 @@ Preserve the same identity, role, worktree, orchestrator grouping, PR gates, and
         self,
         run_id: str,
         envelope: dict[str, Any],
-    ) -> None:
+    ) -> bool:
         """Replay one orphan raw event through the normalize + match path.
 
         The write preserves the normalized event's original
@@ -2542,33 +2564,53 @@ Preserve the same identity, role, worktree, orchestrator grouping, PR gates, and
         cannot regress record state (WIKI-232 REVIEW11 H1).
         """
 
-        try:
-            provider = ProviderKind(str(envelope.get("provider")))
-        except ValueError:
-            return
         payload = envelope.get("payload")
-        if not isinstance(payload, dict):
-            return
         raw_seq = int(envelope.get("seq", 0))
         direction = str(envelope.get("direction") or "provider")
-        try:
-            normalized = normalize_provider_event(
-                provider,
-                payload,
-                direction=direction,
-            )
-        except Exception as exc:
+        provider_value = str(envelope.get("provider") or "")
+        if provider_value == "supervisor" and isinstance(payload, dict):
             normalized = NormalizedProviderEvent(
-                EventDisposition.UNKNOWN,
-                "normalization_error",
-                {"error": str(exc), "raw_payload": payload},
+                EventDisposition.RENDERED,
+                str(payload.get("type") or "supervisor_event"),
+                payload,
+            )
+            provider: ProviderKind | None = None
+        else:
+            try:
+                provider = ProviderKind(provider_value)
+            except ValueError:
+                provider = None
+            if provider is None or not isinstance(payload, dict):
+                normalized = NormalizedProviderEvent(
+                    EventDisposition.UNKNOWN,
+                    "normalization_error",
+                    {
+                        "error": f"unsupported raw provider: {provider_value or 'missing'}",
+                        "raw_payload": payload,
+                    },
+                )
+            else:
+                try:
+                    normalized = normalize_provider_event(
+                        provider,
+                        payload,
+                        direction=direction,
+                    )
+                except Exception as exc:
+                    normalized = NormalizedProviderEvent(
+                        EventDisposition.UNKNOWN,
+                        "normalization_error",
+                        {"error": str(exc), "raw_payload": payload},
+                    )
+        if not isinstance(payload, dict) or provider is None:
+            echoed_text = None
+        else:
+            echoed_text = _provider_user_text(
+                provider,
+                normalized.kind,
+                normalized.payload,
             )
         normalized_payload = normalized.payload
-        echoed_text = _provider_user_text(
-            provider,
-            normalized.kind,
-            normalized.payload,
-        )
         matched_pending_id: str | None = None
         if echoed_text is not None:
             pending_message = self.store.match_pending_user_message(
@@ -2577,9 +2619,6 @@ Preserve the same identity, role, worktree, orchestrator grouping, PR gates, and
             )
             if pending_message is not None:
                 matched_pending_id = str(pending_message["pending_id"])
-                self.store.command_log.acknowledge_steer_for_pending(
-                    run_id, matched_pending_id
-                )
                 normalized_payload = {
                     **normalized.payload,
                     "pending_id": matched_pending_id,
@@ -2598,6 +2637,9 @@ Preserve the same identity, role, worktree, orchestrator grouping, PR gates, and
             lifecycle_state=normalized.lifecycle_state,
         )
         if matched_pending_id is not None:
+            self.store.command_log.acknowledge_steer_for_pending(
+                run_id, matched_pending_id
+            )
             # The live drain path pairs its own ``mark_sent`` with a
             # ``remove_queued_message_by_pending_id`` when the provider
             # accepts the send. Recovery bypasses that drain — orphan
@@ -2609,6 +2651,7 @@ Preserve the same identity, role, worktree, orchestrator grouping, PR gates, and
             self.store.remove_queued_message_by_pending_id(
                 run_id, matched_pending_id
             )
+        return True
 
     async def _reconcile_sending_steer_effects(self) -> None:
         """Resolve every steer effect left at status='sending' by a prior boot.
@@ -3854,6 +3897,25 @@ Preserve the same identity, role, worktree, orchestrator grouping, PR gates, and
                     "run/send_now", effect_id, "acknowledged", result
                 )
                 return result
+        normalized_message = message.strip()
+        if normalized_message:
+            unresolved_match = next(
+                (
+                    item
+                    for item in self.store.get(run_id).pending_user_messages
+                    if item.get("pending_id") != pending_id
+                    and str(item.get("text") or "").strip() == normalized_message
+                ),
+                None,
+            )
+            if unresolved_match is not None:
+                # FIFO text matching cannot distinguish two unresolved sends
+                # with equal normalized text. Keep the later command intent
+                # retryable until the older echo resolves instead of letting
+                # that echo consume the wrong source identity (REVIEW18 H2).
+                raise CommandRetryable(
+                    "an identical message delivery is still unresolved"
+                )
         if dedupe_key is not None:
             # Bind the dedupe claim to the steer effect so replay after a
             # crash between the claim and provider delivery can resume
@@ -3938,7 +4000,7 @@ Preserve the same identity, role, worktree, orchestrator grouping, PR gates, and
             if attempt_key is not None:
                 self._queued_delivery_attempts.discard(attempt_key)
                 self._delivery_attempt_echoes.pop(attempt_key, None)
-            await self._flush_deferred_provider_events(run_id)
+            await self._flush_deferred_delivery_events(run_id)
             delivery_observed = False
             if pending_id is not None:
                 terminal = self.store.command_log.steer_effect_for_pending(
@@ -3989,7 +4051,7 @@ Preserve the same identity, role, worktree, orchestrator grouping, PR gates, and
             self.store.command_log.update_steer_effect(
                 "run/send_now", effect_id, "sent"
             )
-        await self._flush_deferred_provider_events(run_id)
+        await self._flush_deferred_delivery_events(run_id)
         record = self.store.update_adapter_status(run_id, status)
         record = self.store.clear_automatic_resume_suppression(run_id)
         await self._publish_agent_change(record.agent_id)

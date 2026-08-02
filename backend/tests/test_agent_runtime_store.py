@@ -1124,6 +1124,44 @@ class RunStoreTests(unittest.TestCase):
             self.assertEqual(recovered.last_causal_raw_seq, int(raw["seq"]))
             self.assertEqual(recovered.last_lifecycle_event_seq, 2)
 
+    def test_clean_reopen_does_not_rewrite_rebuilt_run_projection(
+        self,
+    ) -> None:
+        """REVIEW18 M1: a clean projection rebuild is byte-for-byte idle."""
+
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            paths = _paths(root)
+            store = RunStore(paths)
+            record = store.create(_record(root))
+            raw = store.append_raw(
+                record.run_id,
+                provider="codex",
+                direction="provider",
+                payload={"method": "fixture/clean-reopen"},
+            )
+            store.append_normalized(
+                record.run_id,
+                raw_seq=int(raw["seq"]),
+                disposition=EventDisposition.IGNORED,
+                kind="fixture_clean_reopen",
+                payload={},
+            )
+            run_path = store.run_path(record.run_id)
+            before_bytes = run_path.read_bytes()
+            before_mtime = run_path.stat().st_mtime_ns
+            before_updated_at = store.get(record.run_id).updated_at
+
+            time.sleep(0.01)
+            restarted = RunStore(paths)
+
+            self.assertEqual(run_path.read_bytes(), before_bytes)
+            self.assertEqual(run_path.stat().st_mtime_ns, before_mtime)
+            self.assertEqual(
+                restarted.get(record.run_id).updated_at,
+                before_updated_at,
+            )
+
     def test_rebuild_orders_current_composer_echoes_by_raw_sequence(
         self,
     ) -> None:

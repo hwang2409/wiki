@@ -2766,6 +2766,10 @@ class RunStore:
 
         with self._lock:
             record = self.get(run_id)
+            record_before_rebuild = record.to_dict()
+            current_diff_before_rebuild = self._read_current_turn_diff_snapshot(
+                run_id
+            )
             normalized_events = sorted(
                 self._read_json_lines(self.normalized_events_path(run_id)),
                 key=lambda event: (
@@ -2869,8 +2873,12 @@ class RunStore:
             record.unread_event_seq = rebuilt_unread_seq
             record.last_causal_raw_seq = max_raw_seq
             record.last_lifecycle_event_seq = max_causal_seq
-            self._write_record(record)
-            if current_diff_dirty:
+            if record.to_dict() != record_before_rebuild:
+                self._write_record(record)
+            if (
+                current_diff_dirty
+                and current_diff != current_diff_before_rebuild
+            ):
                 self._write_current_turn_diff_snapshot(run_id, current_diff)
             return record
 

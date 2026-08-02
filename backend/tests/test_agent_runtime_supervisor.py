@@ -1821,6 +1821,180 @@ class SupervisorTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(effect["status"], "sending")
         self.assertEqual(effect["result"]["status"], "uncertain")
 
+    async def test_send_now_equal_text_waits_for_older_unresolved_matcher(
+        self,
+    ) -> None:
+        """REVIEW18 H2: equal text cannot create two unresolved matchers."""
+
+        record = await self.supervisor.start_run(
+            agent_id="WIKI-232-R18-EQUAL",
+            provider=ProviderKind.CODEX,
+            role="implement",
+            model="fixture-codex",
+            effort="high",
+            worktree=str(self.worktree),
+            prompt="defer equal send text",
+        )
+        adapter = self.supervisor.adapters[record.run_id]
+        original_send = adapter.send_now
+        provider_calls: list[str] = []
+
+        async def ambiguous_send(message: str) -> AdapterStatus:
+            provider_calls.append(message)
+            raise RuntimeError("ambiguous first delivery")
+
+        adapter.send_now = ambiguous_send  # type: ignore[method-assign]
+        first_params = {
+            "run_id": record.run_id,
+            "text": "same normalized text",
+            "source": "first-source",
+            "request_id": "review18-equal-first",
+        }
+        second_params = {
+            "run_id": record.run_id,
+            "text": "  same normalized text  ",
+            "source": "second-source",
+            "request_id": "review18-equal-second",
+        }
+        try:
+            first = await self.supervisor.dispatch("run/send_now", first_params)
+            with self.assertRaisesRegex(
+                CommandRetryable, "identical message delivery"
+            ):
+                await self.supervisor.dispatch("run/send_now", second_params)
+        finally:
+            adapter.send_now = original_send  # type: ignore[method-assign]
+
+        self.assertEqual(first["status"], "uncertain")
+        self.assertEqual(provider_calls, ["same normalized text"])
+        self.assertIsNone(
+            self.store.command_log.receipt(
+                "run/send_now", "review18-equal-second"
+            )
+        )
+        pending_commands = self.store.command_log.pending()
+        self.assertEqual(
+            [command.request_id for command in pending_commands],
+            ["review18-equal-second"],
+        )
+        pending_messages = self.store.get(record.run_id).pending_user_messages
+        self.assertEqual(len(pending_messages), 1)
+        self.assertEqual(pending_messages[0].get("source"), "first-source")
+        second_effect = self.store.command_log.steer_effect_for_request(
+            "run/send_now", "review18-equal-second"
+        )
+        self.assertIsNotNone(second_effect)
+        assert second_effect is not None
+        self.assertEqual(second_effect["status"], "queued")
+
+    async def test_send_now_normalize_failure_recovers_sent_receipt(
+        self,
+    ) -> None:
+        """REVIEW18 H1: raw echo recovery completes the original command."""
+
+        record = await self.supervisor.start_run(
+            agent_id="WIKI-232-R18-NOW",
+            provider=ProviderKind.CODEX,
+            role="implement",
+            model="fixture-codex",
+            effort="high",
+            worktree=str(self.worktree),
+            prompt="recover send_now normalization",
+        )
+        record = await _wait_for_events(self.store, record.run_id, 10)
+        adapter = self.supervisor.adapters[record.run_id]
+        original_send = adapter.send_now
+        provider_calls: list[str] = []
+
+        async def schedule_echo_then_raise(message: str) -> AdapterStatus:
+            provider_calls.append(message)
+            event = ProviderEvent(
+                ProviderKind.CODEX,
+                {
+                    "method": "item/completed",
+                    "params": {
+                        "item": {
+                            "type": "userMessage",
+                            "content": [{"type": "text", "text": message}],
+                        }
+                    },
+                },
+            )
+            asyncio.get_running_loop().call_soon(
+                adapter._events.put_nowait,  # noqa: SLF001 - pump boundary fixture
+                event,
+            )
+            raise RuntimeError("transport failed after durable raw echo")
+
+        adapter.send_now = schedule_echo_then_raise  # type: ignore[method-assign]
+        real_append = self.store.append_normalized
+        failed_appends = 0
+
+        def fail_first_append(*args, **kwargs):
+            nonlocal failed_appends
+            if failed_appends == 0:
+                failed_appends += 1
+                raise OSError("fixture normalized append failure")
+            return real_append(*args, **kwargs)
+
+        request_id = "review18-send-now-request"
+        params = {
+            "run_id": record.run_id,
+            "text": "recover this send now echo",
+            "source": "fleet-monitor",
+            "dedupe_key": "review18-send-now-dedupe",
+            "request_id": request_id,
+        }
+        try:
+            with mock.patch.object(
+                self.store,
+                "append_normalized",
+                side_effect=fail_first_append,
+            ):
+                with self.assertRaisesRegex(
+                    CommandRetryable, "normalization did not commit"
+                ):
+                    await self.supervisor.dispatch("run/send_now", params)
+        finally:
+            adapter.send_now = original_send  # type: ignore[method-assign]
+
+        self.assertEqual(failed_appends, 1)
+        self.assertEqual(provider_calls, ["recover this send now echo"])
+        self.assertIsNone(
+            self.store.command_log.receipt("run/send_now", request_id)
+        )
+        self.assertEqual(
+            [command.request_id for command in self.store.command_log.pending()],
+            [request_id],
+        )
+
+        await self.supervisor.recover_on_start()
+        replay = await self.supervisor.dispatch("run/send_now", dict(params))
+
+        self.assertEqual(replay["status"], "sent")
+        self.assertEqual(provider_calls, ["recover this send now echo"])
+        receipt = self.store.command_log.receipt("run/send_now", request_id)
+        self.assertIsNotNone(receipt)
+        assert receipt is not None
+        self.assertTrue(receipt.ok)
+        self.assertEqual(receipt.result, replay)
+        pending_id = replay.get("pending_id")
+        self.assertIsInstance(pending_id, str)
+        matching_normalized = [
+            event
+            for event in self.store.read_normalized_events(record.run_id)
+            if isinstance(event.get("payload"), dict)
+            and event["payload"].get("pending_id") == pending_id
+        ]
+        self.assertEqual(len(matching_normalized), 1)
+        matching_composer = [
+            message
+            for message in self.store.get(record.run_id).composer_messages
+            if message.get("pending_id") == pending_id
+        ]
+        self.assertEqual(len(matching_composer), 1)
+        self.assertEqual(matching_composer[0].get("source"), "fleet-monitor")
+
     async def test_recover_on_start_reconciles_wedged_sending_effect(self) -> None:
         """WIKI-232 H2: an on-idle effect stuck at 'sending' after a daemon
         crash used to wedge the queue forever because no fresh transport
@@ -2092,6 +2266,65 @@ class SupervisorTests(unittest.IsolatedAsyncioTestCase):
                 for message in recovered.composer_messages
             )
         )
+
+    async def test_orphan_scan_recovers_supervisor_model_change_once(
+        self,
+    ) -> None:
+        """REVIEW18 H1: a synthetic raw row becomes one normalized row."""
+
+        record = await self.supervisor.start_run(
+            agent_id="WIKI-232-R18-MODEL",
+            provider=ProviderKind.CODEX,
+            role="implement",
+            model="fixture-codex",
+            effort="high",
+            worktree=str(self.worktree),
+            prompt="recover synthetic model change",
+        )
+        record = await _wait_for_events(self.store, record.run_id, 10)
+        before_raw = self.store.get(record.run_id).raw_event_count
+        with mock.patch.object(
+            self.store,
+            "append_normalized",
+            side_effect=OSError("model change normalize crash"),
+        ):
+            with self.assertRaisesRegex(OSError, "model change normalize crash"):
+                self.supervisor._append_model_changed_event(  # noqa: SLF001
+                    record,
+                    old_model="fixture-codex",
+                    new_model="fixture-codex-new",
+                    trigger="review18-crash",
+                )
+
+        raw_rows = self.store.read_raw_events(record.run_id)
+        self.assertEqual(len(raw_rows), before_raw + 1)
+        orphan = raw_rows[-1]
+        self.assertEqual(orphan["provider"], "supervisor")
+        self.assertEqual(orphan["payload"]["type"], "model_changed")
+
+        await self.supervisor.recover_on_start()
+        normalized_path = self.store.normalized_events_path(record.run_id)
+        run_path = self.store.run_path(record.run_id)
+        matching = [
+            row
+            for row in self.store.read_normalized_events(record.run_id)
+            if int(row.get("raw_seq", 0)) == int(orphan["seq"])
+        ]
+        self.assertEqual(len(matching), 1)
+        self.assertEqual(matching[0]["kind"], "model_changed")
+        self.assertEqual(matching[0]["disposition"], "rendered")
+        normalized_mtime = normalized_path.stat().st_mtime_ns
+        run_mtime = run_path.stat().st_mtime_ns
+        normalized_bytes = normalized_path.read_bytes()
+        run_bytes = run_path.read_bytes()
+
+        await asyncio.sleep(0.01)
+        await self.supervisor.recover_on_start()
+
+        self.assertEqual(normalized_path.read_bytes(), normalized_bytes)
+        self.assertEqual(run_path.read_bytes(), run_bytes)
+        self.assertEqual(normalized_path.stat().st_mtime_ns, normalized_mtime)
+        self.assertEqual(run_path.stat().st_mtime_ns, run_mtime)
 
     async def test_orphan_scan_recovers_middle_gap_raw_row(self) -> None:
         """WIKI-232 REVIEW9 F2: a max-based cutoff skips a middle gap
@@ -3528,6 +3761,123 @@ class SupervisorTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(
             matching_normalized[0]["payload"].get("source"), "fleet-monitor"
         )
+
+    async def test_send_on_idle_normalize_failure_recovers_sent_receipt(
+        self,
+    ) -> None:
+        """REVIEW18 H1: queued raw echo recovery completes its command."""
+
+        record = await self.supervisor.start_run(
+            agent_id="WIKI-232-R18-IDLE",
+            provider=ProviderKind.CODEX,
+            role="implement",
+            model="fixture-codex",
+            effort="high",
+            worktree=str(self.worktree),
+            prompt="recover send_on_idle normalization",
+        )
+        record = await _wait_for_events(self.store, record.run_id, 10)
+        adapter = self.supervisor.adapters[record.run_id]
+        snapshot = adapter.snapshot()
+        idle = AdapterStatus(
+            LifecycleState.IDLE,
+            snapshot.session_id,
+            os.getpid(),
+            generation=snapshot.generation,
+        )
+        adapter._status = idle  # noqa: SLF001 - inline drain fixture
+        self.store.update_adapter_status(record.run_id, idle)
+        original_send = adapter.send_on_idle
+        provider_calls: list[str] = []
+
+        async def schedule_echo_then_raise(message: str) -> AdapterStatus:
+            provider_calls.append(message)
+            event = ProviderEvent(
+                ProviderKind.CODEX,
+                {
+                    "method": "item/completed",
+                    "params": {
+                        "item": {
+                            "type": "userMessage",
+                            "content": [{"type": "text", "text": message}],
+                        }
+                    },
+                },
+            )
+            asyncio.get_running_loop().call_soon(
+                adapter._events.put_nowait,  # noqa: SLF001 - pump boundary fixture
+                event,
+            )
+            raise RuntimeError("transport failed after durable queued raw echo")
+
+        adapter.send_on_idle = schedule_echo_then_raise  # type: ignore[method-assign]
+        real_append = self.store.append_normalized
+        failed_appends = 0
+
+        def fail_first_append(*args, **kwargs):
+            nonlocal failed_appends
+            if failed_appends == 0:
+                failed_appends += 1
+                raise OSError("fixture queued normalized append failure")
+            return real_append(*args, **kwargs)
+
+        request_id = "review18-send-on-idle-request"
+        params = {
+            "run_id": record.run_id,
+            "text": "recover this queued echo",
+            "source": "fleet-monitor",
+            "request_id": request_id,
+        }
+        try:
+            with mock.patch.object(
+                self.store,
+                "append_normalized",
+                side_effect=fail_first_append,
+            ):
+                with self.assertRaisesRegex(
+                    CommandRetryable, "normalization did not commit"
+                ):
+                    await self.supervisor.dispatch("run/send_on_idle", params)
+        finally:
+            adapter.send_on_idle = original_send  # type: ignore[method-assign]
+
+        self.assertEqual(failed_appends, 1)
+        self.assertEqual(provider_calls, ["recover this queued echo"])
+        self.assertIsNone(
+            self.store.command_log.receipt("run/send_on_idle", request_id)
+        )
+        self.assertEqual(
+            [command.request_id for command in self.store.command_log.pending()],
+            [request_id],
+        )
+
+        await self.supervisor.recover_on_start()
+        replay = await self.supervisor.dispatch("run/send_on_idle", dict(params))
+
+        self.assertEqual(replay["status"], "sent")
+        self.assertEqual(provider_calls, ["recover this queued echo"])
+        receipt = self.store.command_log.receipt("run/send_on_idle", request_id)
+        self.assertIsNotNone(receipt)
+        assert receipt is not None
+        self.assertTrue(receipt.ok)
+        self.assertEqual(receipt.result, replay)
+        self.assertEqual(self.store.queued_messages(record.run_id), [])
+        pending_id = replay.get("pending_id")
+        self.assertIsInstance(pending_id, str)
+        matching_normalized = [
+            event
+            for event in self.store.read_normalized_events(record.run_id)
+            if isinstance(event.get("payload"), dict)
+            and event["payload"].get("pending_id") == pending_id
+        ]
+        self.assertEqual(len(matching_normalized), 1)
+        matching_composer = [
+            message
+            for message in self.store.get(record.run_id).composer_messages
+            if message.get("pending_id") == pending_id
+        ]
+        self.assertEqual(len(matching_composer), 1)
+        self.assertEqual(matching_composer[0].get("source"), "fleet-monitor")
 
     async def test_r5_provider_busy_after_idle_snapshot_preserves_queue(
         self,
