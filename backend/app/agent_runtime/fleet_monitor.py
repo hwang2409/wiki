@@ -23,6 +23,7 @@ from uuid import uuid4
 
 from pathlib import Path
 
+from .fleet_monitor_ids import fleet_monitor_request_id
 from .store import RunStore, _atomic_write_json
 from .graph_health import GraphHealthMonitor, default_clock
 from .ticket import base_ticket
@@ -45,6 +46,7 @@ DEFAULT_GRAPH_HEALTH_REALARM_SECONDS = 300.0
 DEFAULT_REVIEW_ROUTE_SUPPRESSION_SECONDS = 900.0
 DEFAULT_SEND_TIMEOUT_SECONDS = 10.0
 DEFAULT_MAX_CONCURRENT_SENDS = 4
+DEFAULT_MAX_PENDING_MESSAGES = 256
 
 
 logger = logging.getLogger(__name__)
@@ -159,6 +161,7 @@ class FleetMonitor:
         review_route_suppression: float = DEFAULT_REVIEW_ROUTE_SUPPRESSION_SECONDS,
         send_timeout: float = DEFAULT_SEND_TIMEOUT_SECONDS,
         max_concurrent_sends: int = DEFAULT_MAX_CONCURRENT_SENDS,
+        max_pending_messages: int = DEFAULT_MAX_PENDING_MESSAGES,
         ownership_lock: Callable[[str], asyncio.Lock] | None = None,
         on_transition: TransitionHook | None = None,
     ):
@@ -185,8 +188,11 @@ class FleetMonitor:
             raise ValueError("send_timeout must be positive")
         if max_concurrent_sends < 1:
             raise ValueError("max_concurrent_sends must be positive")
+        if max_pending_messages < 1:
+            raise ValueError("max_pending_messages must be positive")
         self.send_timeout = send_timeout
         self.max_concurrent_sends = max_concurrent_sends
+        self.max_pending_messages = max_pending_messages
         self.ownership_lock = ownership_lock
         self.on_transition = on_transition
         self._instance_id = uuid4().hex[:12]
@@ -209,10 +215,30 @@ class FleetMonitor:
         self._pending_messages_path: Path = (
             self.store.paths.runtime_dir / "fleet-monitor-pending.json"
         )
+        self._pending_journal_unknown = False
+        self._pending_journal_needs_rewrite = False
+        self._pending_event_types: dict[tuple[str, str, str], str] = {}
         self._pending_messages: dict[tuple[str, str, str], str] = (
             self._load_pending_messages()
         )
+        self._pending_messages_lock = asyncio.Lock()
         self._send_semaphores: dict[str, asyncio.Semaphore] = {}
+
+    @staticmethod
+    def _event_type_from_dedupe_key(dedupe_key: str) -> str:
+        for marker, event_type in (
+            (":status-transition:", "status-transition"),
+            (":runtime-transition:", "runtime-transition"),
+            (":unrouted-verdict:", "unrouted-verdict"),
+            (":staleness:", "staleness"),
+            (":graph-unavailable:", "graph-unavailable"),
+            (":graph-health:blocking-no-reviewer:", "graph-health"),
+            (":graph-health:stall:", "graph-health-stall"),
+            (":graph-health:iteration-cap:", "graph-health-iteration-cap"),
+        ):
+            if marker in dedupe_key:
+                return event_type
+        return "unknown"
 
     def _load_pending_messages(self) -> dict[tuple[str, str, str], str]:
         try:
@@ -221,28 +247,45 @@ class FleetMonitor:
             return {}
         except (OSError, json.JSONDecodeError):
             logger.warning(
-                "fleet_monitor: pending messages file %s unreadable; starting empty",
+                "fleet_monitor: pending messages file %s unreadable; "
+                "recovering matching payloads from the command log",
                 self._pending_messages_path,
             )
+            self._pending_journal_unknown = True
             return {}
         entries = data.get("entries") if isinstance(data, dict) else None
         if not isinstance(entries, list):
+            self._pending_journal_unknown = True
             return {}
+        valid_entries = [entry for entry in entries if isinstance(entry, dict)]
+        if len(valid_entries) > self.max_pending_messages:
+            logger.warning(
+                "fleet_monitor: pending journal has %s entries; trimming to %s",
+                len(valid_entries),
+                self.max_pending_messages,
+            )
+            valid_entries = valid_entries[-self.max_pending_messages :]
+            self._pending_journal_needs_rewrite = True
         loaded: dict[tuple[str, str, str], str] = {}
-        for entry in entries:
-            if not isinstance(entry, dict):
-                continue
+        for entry in valid_entries:
             agent_id = entry.get("agent_id")
             run_id = entry.get("run_id")
             dedupe_key = entry.get("dedupe_key")
             message = entry.get("message")
+            event_type = entry.get("event_type")
             if (
                 isinstance(agent_id, str)
                 and isinstance(run_id, str)
                 and isinstance(dedupe_key, str)
                 and isinstance(message, str)
             ):
-                loaded[(agent_id, run_id, dedupe_key)] = message
+                identity = (agent_id, run_id, dedupe_key)
+                loaded[identity] = message
+                self._pending_event_types[identity] = (
+                    event_type
+                    if isinstance(event_type, str)
+                    else self._event_type_from_dedupe_key(dedupe_key)
+                )
         return loaded
 
     def _persist_pending_messages(self) -> None:
@@ -261,6 +304,10 @@ class FleetMonitor:
                 "run_id": identity[1],
                 "dedupe_key": identity[2],
                 "message": message,
+                "event_type": self._pending_event_types.get(
+                    identity,
+                    self._event_type_from_dedupe_key(identity[2]),
+                ),
             }
             for identity, message in sorted(self._pending_messages.items())
         ]
@@ -268,9 +315,52 @@ class FleetMonitor:
             try:
                 self._pending_messages_path.unlink()
             except FileNotFoundError:
-                return
+                pass
+            self._pending_journal_unknown = False
+            self._pending_journal_needs_rewrite = False
             return
         _atomic_write_json(self._pending_messages_path, {"entries": entries})
+        self._pending_journal_unknown = False
+        self._pending_journal_needs_rewrite = False
+
+    def _durable_pending_message(
+        self, orch_run_id: str, dedupe_key: str
+    ) -> tuple[bool, str | None]:
+        """Return an exact prior payload when this request already exists."""
+
+        request_id = fleet_monitor_request_id(orch_run_id, dedupe_key)
+        effect = self.store.command_log.steer_effect_for_request(
+            "run/send_now", request_id
+        )
+        if isinstance(effect, dict):
+            message = effect.get("message")
+            if effect.get("run_id") == orch_run_id and isinstance(message, str):
+                return True, message
+        for command in self.store.command_log.pending():
+            if command.method != "run/send_now" or command.request_id != request_id:
+                continue
+            message = command.payload.get("text")
+            return True, message if isinstance(message, str) else None
+        return self.store.command_log.known("run/send_now", request_id), None
+
+    def _drop_pending_identity(self, identity: tuple[str, str, str]) -> None:
+        self._pending_messages.pop(identity, None)
+        self._pending_event_types.pop(identity, None)
+
+    def _drop_prior_event_occurrences(
+        self,
+        identity: tuple[str, str, str],
+        event_type: str,
+    ) -> None:
+        for candidate in list(self._pending_messages):
+            if candidate == identity or candidate[:2] != identity[:2]:
+                continue
+            candidate_type = self._pending_event_types.get(
+                candidate,
+                self._event_type_from_dedupe_key(candidate[2]),
+            )
+            if candidate_type == event_type:
+                self._drop_pending_identity(candidate)
 
     def _persist_pending_messages_best_effort(self) -> None:
         """Cleanup-path persist: log and swallow write failures.
@@ -285,6 +375,7 @@ class FleetMonitor:
         try:
             self._persist_pending_messages()
         except Exception:
+            self._pending_journal_needs_rewrite = True
             logger.exception(
                 "fleet_monitor: best-effort persist of pending messages "
                 "to %s failed; retrying next reconcile",
@@ -342,6 +433,7 @@ class FleetMonitor:
         notifications.extend(
             await self._process_graph_health(views, wall_now)
         )
+        self._prune_obsolete_pending(views, wall_now, monotonic_now)
         return notifications
 
     def _reconcile_worker_state(self, current_run_ids: dict[str, str]) -> None:
@@ -360,6 +452,11 @@ class FleetMonitor:
             identity: message
             for identity, message in self._pending_messages.items()
             if current_run_ids.get(identity[0]) == identity[1]
+        }
+        self._pending_event_types = {
+            identity: event_type
+            for identity, event_type in self._pending_event_types.items()
+            if identity in self._pending_messages
         }
         if pending_before.keys() != self._pending_messages.keys():
             self._persist_pending_messages_best_effort()
@@ -384,7 +481,121 @@ class FleetMonitor:
             for identity, message in self._pending_messages.items()
             if identity[0] != agent_id or identity[1] == keep_run_id
         }
+        self._pending_event_types = {
+            identity: event_type
+            for identity, event_type in self._pending_event_types.items()
+            if identity in self._pending_messages
+        }
         if pending_before.keys() != self._pending_messages.keys():
+            self._persist_pending_messages_best_effort()
+
+    def _prune_obsolete_pending(
+        self,
+        views: list[_WorkerView],
+        wall_now: float,
+        monotonic_now: float,
+    ) -> None:
+        """Keep only alarm payloads whose durable request can recur."""
+
+        views_by_agent = {view.record.agent_id: view for view in views}
+        graph_window = int(wall_now // max(self.graph_health_realarm, 1.0))
+        verdict_window = int(
+            monotonic_now // max(self.unrouted_verdict_realarm, 1.0)
+        )
+        obsolete: list[tuple[str, str, str]] = []
+        for identity in self._pending_messages:
+            agent_id, _run_id, dedupe_key = identity
+            event_type = self._pending_event_types.get(
+                identity,
+                self._event_type_from_dedupe_key(dedupe_key),
+            )
+            view = views_by_agent.get(agent_id)
+            keep = True
+            if event_type in {"status-transition", "runtime-transition"}:
+                keep = False
+            elif event_type == "staleness":
+                keep = bool(
+                    view is not None
+                    and view.status_state == "working"
+                    and view.status_mtime is not None
+                    and wall_now - view.status_mtime >= self.staleness_threshold
+                    and dedupe_key
+                    == f"fleet:{agent_id}:staleness:{int(view.status_mtime)}"
+                )
+            elif event_type == "unrouted-verdict":
+                step = view.step if view is not None else None
+                keep = bool(
+                    view is not None
+                    and view.record.role == "review"
+                    and step is not None
+                    and ("MERGE-READY" in step or "NOT-MERGE-READY" in step)
+                    and dedupe_key
+                    == f"fleet:{agent_id}:unrouted-verdict:{verdict_window}"
+                )
+            elif event_type.startswith("graph-"):
+                parts = dedupe_key.split(":")
+                ticket = parts[1] if len(parts) > 1 else ""
+                graph_state = self._graph_health_snapshots.get(ticket)
+                if event_type == "graph-unavailable":
+                    keep = bool(
+                        graph_state is not None
+                        and graph_state.graph_unavailable_active
+                        and dedupe_key
+                        == (
+                            f"fleet:{ticket}:graph-unavailable:"
+                            f"{graph_state.graph_unavailable_episode}:{graph_window}"
+                        )
+                    )
+                elif event_type == "graph-health":
+                    marker = (
+                        graph_state.blocking_no_reviewer_episode_marker
+                        if graph_state is not None
+                        else None
+                    )
+                    keep = bool(
+                        graph_state is not None
+                        and graph_state.blocking_no_reviewer_active
+                        and marker
+                        and dedupe_key
+                        == (
+                            f"fleet:{ticket}:graph-health:"
+                            f"blocking-no-reviewer:{marker}:{graph_window}"
+                        )
+                    )
+                elif event_type == "graph-health-stall":
+                    marker = (
+                        graph_state.stall_episode_marker
+                        if graph_state is not None
+                        else None
+                    )
+                    keep = bool(
+                        graph_state is not None
+                        and graph_state.stall_active
+                        and marker
+                        and dedupe_key
+                        == f"fleet:{ticket}:graph-health:stall:{marker}"
+                    )
+                elif event_type == "graph-health-iteration-cap":
+                    marker = (
+                        graph_state.iteration_episode_marker
+                        if graph_state is not None
+                        else None
+                    )
+                    keep = bool(
+                        graph_state is not None
+                        and graph_state.iteration_active
+                        and marker
+                        and dedupe_key
+                        == (
+                            f"fleet:{ticket}:graph-health:iteration-cap:{marker}"
+                        )
+                    )
+            if not keep:
+                obsolete.append(identity)
+
+        for identity in obsolete:
+            self._drop_pending_identity(identity)
+        if obsolete or self._pending_journal_needs_rewrite:
             self._persist_pending_messages_best_effort()
 
     def _collect_views(self) -> list[_WorkerView]:
@@ -719,37 +930,56 @@ class FleetMonitor:
             dedupe_identity = self._dedupe_identity(view, dedupe_key)
             if dedupe_identity in self._sent_dedupe_keys:
                 return None
-            existing_pending = self._pending_messages.get(dedupe_identity)
-            if existing_pending is None:
-                # The message payload MUST be durable before dispatch:
-                # ``fleet_monitor_request_id`` is time-independent, but
-                # staleness / graph-health text depends on ``wall_now``.
-                # If the journal write fails and dispatch runs anyway, a
-                # restart or later tick rebuilds a different text under
-                # the SAME request_id and the command log rejects every
-                # retry with ``CommandConflict``. Persist first, and
-                # skip dispatch until the payload is durable. The next
-                # tick rebuilds a fresh entry from the current clock and
-                # retries the persist (WIKI-232 REVIEW12 M1).
-                self._pending_messages[dedupe_identity] = message
-                try:
-                    self._persist_pending_messages()
-                except Exception:
-                    logger.exception(
-                        "fleet_monitor: pending message journal write "
-                        "for %s failed; skipping dispatch until the "
-                        "payload is durable",
-                        dedupe_identity,
+            async with self._pending_messages_lock:
+                existing_pending = self._pending_messages.get(dedupe_identity)
+                if existing_pending is None:
+                    # A corrupt journal can lose the local payload after a
+                    # successful command. Recover the exact message from the
+                    # durable steer effect. If a command exists without a
+                    # recoverable payload, fail closed instead of submitting
+                    # different time-dependent text under the same request id.
+                    known_request, durable_message = self._durable_pending_message(
+                        orch_run_id, dedupe_key
                     )
-                    # Roll the in-memory add back so the next tick
-                    # starts fresh with the current clock; leaving it
-                    # in memory would let a same-process retry dispatch
-                    # a payload the restart path cannot reproduce.
-                    self._pending_messages.pop(dedupe_identity, None)
-                    return None
-                stable_message = message
-            else:
-                stable_message = existing_pending
+                    if known_request and durable_message is None:
+                        logger.error(
+                            "fleet_monitor: command %s has no recoverable "
+                            "payload; skipping conflicting dispatch",
+                            fleet_monitor_request_id(orch_run_id, dedupe_key),
+                        )
+                        return None
+                    stable_message = durable_message or message
+                    before_messages = dict(self._pending_messages)
+                    before_types = dict(self._pending_event_types)
+                    self._drop_prior_event_occurrences(
+                        dedupe_identity, event_type
+                    )
+                    if len(self._pending_messages) >= self.max_pending_messages:
+                        logger.error(
+                            "fleet_monitor: pending journal reached hard "
+                            "limit %s; skipping %s",
+                            self.max_pending_messages,
+                            dedupe_identity,
+                        )
+                        self._pending_messages = before_messages
+                        self._pending_event_types = before_types
+                        return None
+                    self._pending_messages[dedupe_identity] = stable_message
+                    self._pending_event_types[dedupe_identity] = event_type
+                    try:
+                        self._persist_pending_messages()
+                    except Exception:
+                        logger.exception(
+                            "fleet_monitor: pending message journal write "
+                            "for %s failed; skipping dispatch until the "
+                            "payload is durable",
+                            dedupe_identity,
+                        )
+                        self._pending_messages = before_messages
+                        self._pending_event_types = before_types
+                        return None
+                else:
+                    stable_message = existing_pending
             try:
                 async with self._send_semaphore(orch_agent_id):
                     await asyncio.wait_for(
@@ -771,16 +1001,14 @@ class FleetMonitor:
                 )
                 return None
             self._sent_dedupe_keys.add(dedupe_identity)
-            # Keep the durable payload as long as this dedupe_identity's
-            # request_id can recur. Several dedupe keys (staleness pinned to
-            # int(mtime), unrouted-verdict pinned to the realarm window,
-            # graph-health pinned to the diagnostic window) are stable across
-            # daemon restarts, and _sent_dedupe_keys is process-local. Popping
-            # here on the first success lets a restarted monitor rebuild an
-            # elapsed-time message under the same durable request_id and hit
-            # CommandConflict every tick (WIKI-232 REVIEW9 F1). _reconcile_worker_state
-            # prunes entries whose run has archived; per-mtime staleness
-            # entries at the same run are naturally garbage as mtime advances.
+            # Transition request ids include this monitor instance and cannot
+            # recur after their successful occurrence. Alarm payloads remain
+            # until their mtime, window, or episode changes; the end-of-tick
+            # prune removes them at that boundary.
+            if event_type in {"status-transition", "runtime-transition"}:
+                async with self._pending_messages_lock:
+                    self._drop_pending_identity(dedupe_identity)
+                    self._persist_pending_messages_best_effort()
             return Notification(
                 ticket=view.record.agent_id,
                 orch_agent_id=orch_agent_id,

@@ -2745,11 +2745,12 @@ class RunStore:
 
         ``pending_requests``, ``current_turn_diff``,
         ``disposition_counts``, and ``unread_event_seq`` are rebuilt
-        from scratch by walking events sorted by raw_seq, so a crash
+        from scratch by walking events sorted by ``(raw_seq, seq)``, so a crash
         between the JSONL append and ``run.json`` replace cannot leave
         stale approval indices behind. Lifecycle transitions are only
-        re-applied for events whose raw_seq strictly exceeds
-        ``record.last_causal_raw_seq`` — that guard preserves external
+        re-applied for events whose raw/normalized position exceeds
+        ``(record.last_causal_raw_seq, record.last_lifecycle_event_seq)``.
+        The two-part guard preserves external
         transitions (``store.transition(BLOCKED)``,
         ``mark_automatic_resume_failed`` etc.) while still catching new
         lifecycle events that landed in JSONL but had not persisted a
@@ -2765,7 +2766,10 @@ class RunStore:
             record = self.get(run_id)
             normalized_events = sorted(
                 self._read_json_lines(self.normalized_events_path(run_id)),
-                key=lambda event: int(event.get("raw_seq", 0)),
+                key=lambda event: (
+                    int(event.get("raw_seq", 0)),
+                    int(event.get("seq", 0)),
+                ),
             )
             record.pending_requests = {}
             record.current_turn_diff_turn_id = None
@@ -2775,8 +2779,12 @@ class RunStore:
             rebuilt_unread_seq = 0
             current_diff: str | None = None
             current_diff_dirty = False
-            lifecycle_gate = record.last_causal_raw_seq
+            lifecycle_gate = (
+                record.last_causal_raw_seq,
+                record.last_lifecycle_event_seq,
+            )
             max_raw_seq = record.last_causal_raw_seq
+            max_causal_seq = record.last_lifecycle_event_seq
 
             for event in normalized_events:
                 disposition = event.get("disposition")
@@ -2786,9 +2794,13 @@ class RunStore:
                 kind_value = str(event.get("kind") or "unknown")
                 seq = int(event.get("seq", 0))
                 raw_seq_int = int(event.get("raw_seq", 0))
+                causal_position = (raw_seq_int, seq)
                 normalized_at = str(event.get("normalized_at") or utc_now())
                 if raw_seq_int > max_raw_seq:
                     max_raw_seq = raw_seq_int
+                    max_causal_seq = seq
+                elif raw_seq_int == max_raw_seq and seq > max_causal_seq:
+                    max_causal_seq = seq
                 if isinstance(payload, dict):
                     _apply_pending_request_event(
                         record,
@@ -2815,7 +2827,10 @@ class RunStore:
                     if seq > rebuilt_unread_seq:
                         rebuilt_unread_seq = seq
                 lifecycle_value = event.get("lifecycle_state")
-                if isinstance(lifecycle_value, str) and raw_seq_int > lifecycle_gate:
+                if (
+                    isinstance(lifecycle_value, str)
+                    and causal_position > lifecycle_gate
+                ):
                     try:
                         target = LifecycleState(lifecycle_value)
                         validate_transition(record.state, target)
@@ -2832,11 +2847,12 @@ class RunStore:
                         if target in TERMINAL_STATES:
                             record.pending_requests.clear()
                     record.last_lifecycle_event_seq = seq
-                    lifecycle_gate = raw_seq_int
+                    lifecycle_gate = causal_position
 
             record.disposition_counts = counts
             record.unread_event_seq = rebuilt_unread_seq
             record.last_causal_raw_seq = max_raw_seq
+            record.last_lifecycle_event_seq = max_causal_seq
             self._write_record(record)
             if current_diff_dirty:
                 self._write_current_turn_diff_snapshot(run_id, current_diff)

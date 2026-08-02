@@ -203,6 +203,9 @@ class RunRecord:
     # The unread-dot surface must not light on those, so we track a parallel
     # counter that advances only on genuinely agent-originated events.
     unread_event_seq: int = 0
+    # Despite its legacy name, this is the normalized-sequence component of
+    # the causal checkpoint. Pair it with ``last_causal_raw_seq`` so recovery
+    # can apply later normalized lifecycle rows that share one raw sequence.
     last_lifecycle_event_seq: int = 0
     # Max ``raw_seq`` of a normalized event whose ORDER-SENSITIVE
     # projections (lifecycle_state, pending_requests, current_turn_diff,
@@ -210,9 +213,10 @@ class RunRecord:
     # record. Any later ``append_normalized`` — including
     # ``_normalize_orphan_raw_events`` replaying a stale-order recovery
     # — writes the durable normalized row for observability but only
-    # mutates projections when ``raw_seq >= last_causal_raw_seq``. Equal
-    # values let one raw event fan out into normalized rows in stable
-    # normalized-sequence order. This stops a raw_seq=1 orphan approval
+    # mutates projections when its ``(raw_seq, normalized seq)`` position is
+    # at or beyond the causal checkpoint. Equal raw values let one raw event
+    # fan out into normalized rows in stable order. This stops a raw_seq=1
+    # orphan approval
     # from re-adding a
     # pending_request that raw_seq=2 serverRequest/resolved already
     # cleared, and a raw_seq=1 orphan turn/started from flipping IDLE

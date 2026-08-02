@@ -3,7 +3,6 @@ from __future__ import annotations
 import argparse
 import asyncio
 import fcntl
-import hashlib
 import os
 import signal
 import time
@@ -14,32 +13,14 @@ from typing import BinaryIO
 from .factory import RealAdapterFactory
 from .fake import FixtureAdapterFactory
 from .fleet_monitor import FleetMonitor
+from .fleet_monitor_ids import (
+    fleet_monitor_message_dedupe_key,
+    fleet_monitor_request_id,
+)
 from .autopilot import AutopilotController
 from .protocol import UnixSupervisorServer
 from .store import RunStore, RuntimePaths
 from .supervisor import Supervisor
-
-
-def fleet_monitor_request_id(run_id: str, dedupe_key: str | None) -> str:
-    """Scope the durable FleetMonitor request id to the target orchestrator run.
-
-    The notification ``dedupe_key`` alone is stable across daemon boots and
-    across orchestrator run replacements (several monitor keys hash only the
-    ticket + event). If the target orchestrator gets a replacement run, the
-    monitor retries reuse the same ``request_id`` with a different ``run_id``
-    in the payload, and the command log rejects it as a conflicting payload
-    (``CommandConflict``). Steers can no longer reach the new orchestrator
-    run (WIKI-232 R3 H2).
-
-    Bind the request id to the current run instead — a bounded SHA-256 digest
-    of ``run_id + dedupe_key`` — so a replacement run receives its own
-    request-id namespace, while ``dedupe_key`` itself stays unchanged for
-    per-run message dedupe.
-    """
-
-    payload = f"{run_id or ''}:{dedupe_key or ''}"
-    digest = hashlib.sha256(payload.encode("utf-8")).hexdigest()[:32]
-    return f"fleet-monitor:{digest}"
 
 
 def build_fleet_monitor_dispatch(supervisor: Supervisor):
@@ -77,35 +58,6 @@ def build_fleet_monitor_dispatch(supervisor: Supervisor):
         )
 
     return dispatch
-
-
-def fleet_monitor_message_dedupe_key(
-    run_id: str, dedupe_key: str | None
-) -> str | None:
-    """Scope the transport ``dedupe_key`` to the target orchestrator run.
-
-    ``RunStore.replace`` copies ``message_dedupe_keys`` from the old run to
-    the replacement so a mid-flight composer retry stays idempotent. Several
-    FleetMonitor alarm keys are stable across daemon boots and across
-    replacements (staleness / unrouted-verdict / graph-health hash only the
-    ticket + event). After replacement, the same alarm therefore lands on
-    an already-claimed dedupe entry inherited from the old run's effect,
-    ``claim_message_dedupe_key`` rejects the different owner, and the
-    dispatch returns ``deduplicated`` without ever calling the provider
-    (WIKI-232 R4 H2).
-
-    Bind the transport dedupe_key to ``(run_id, dedupe_key)`` at the
-    callback layer. Within a single run, retries of the same alarm still
-    collapse to one delivery; across replacement, the replacement run's
-    dedupe namespace is disjoint so the new orchestrator gets exactly one
-    fresh delivery of an already-fired alarm.
-    """
-
-    if dedupe_key is None:
-        return None
-    payload = f"{run_id or ''}:{dedupe_key}"
-    digest = hashlib.sha256(payload.encode("utf-8")).hexdigest()[:32]
-    return f"fleet-monitor:{digest}"
 
 
 def parse_args() -> argparse.Namespace:

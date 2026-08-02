@@ -1071,6 +1071,59 @@ class RunStoreTests(unittest.TestCase):
                 "legacy last_lifecycle_event_seq boundary",
             )
 
+    def test_rebuild_applies_later_lifecycle_row_at_same_raw_sequence(
+        self,
+    ) -> None:
+        """REVIEW13 H1: the durable checkpoint is a raw/normalized pair.
+
+        One provider row can produce more than one normalized lifecycle row.
+        Simulate a crash after the later IDLE JSONL append but before its
+        run.json replace. Recovery must apply the later same-raw row while
+        still treating lower raw sequences as stale.
+        """
+
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            paths = _paths(root)
+            store = RunStore(paths)
+            record = store.create(_record(root))
+            raw = store.append_raw(
+                record.run_id,
+                provider="codex",
+                direction="provider",
+                payload={"method": "turn/lifecycle"},
+            )
+            store.append_normalized(
+                record.run_id,
+                raw_seq=raw["seq"],
+                disposition=EventDisposition.RENDERED,
+                kind="turn_started",
+                payload={"method": "turn/started"},
+                lifecycle_state=LifecycleState.WORKING,
+            )
+            before_idle = store.run_path(record.run_id).read_text(
+                encoding="utf-8"
+            )
+            store.append_normalized(
+                record.run_id,
+                raw_seq=raw["seq"],
+                disposition=EventDisposition.RENDERED,
+                kind="turn_completed",
+                payload={"status": "completed"},
+                lifecycle_state=LifecycleState.IDLE,
+            )
+            self.assertEqual(store.get(record.run_id).state, LifecycleState.IDLE)
+
+            # Restore the metadata checkpoint from before IDLE. The later
+            # normalized JSONL row stays durable, matching the crash boundary.
+            store.run_path(record.run_id).write_text(before_idle, encoding="utf-8")
+
+            restarted = RunStore(paths)
+            recovered = restarted.get(record.run_id)
+            self.assertEqual(recovered.state, LifecycleState.IDLE)
+            self.assertEqual(recovered.last_causal_raw_seq, int(raw["seq"]))
+            self.assertEqual(recovered.last_lifecycle_event_seq, 2)
+
     def test_store_files_are_private_and_registry_keeps_legacy_shape(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)

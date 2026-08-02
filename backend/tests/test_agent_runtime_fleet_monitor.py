@@ -11,6 +11,7 @@ from contextlib import ExitStack
 import unittest
 from datetime import datetime, timezone
 from pathlib import Path
+from typing import Any
 from unittest import mock
 
 from backend.app import workgraph, workgraph_service
@@ -1521,14 +1522,16 @@ class FleetMonitorTests(unittest.IsolatedAsyncioTestCase):
         # fresh with the current clock (no divergence from disk).
         self.assertEqual(first_monitor._pending_messages, {})  # noqa: SLF001
 
-        worker_run_id = self.store.current_run_id("WIKI-232-M1")
-        assert worker_run_id is not None
         # Verify the command log carries no conflicting intent for the
-        # request_id that the failed tick would have used.
-        expected_dedupe = f"staleness:{worker_run_id}:{int(mtime)}:1800"
+        # exact production request_id that the failed tick would have used.
+        expected_dedupe = f"fleet:WIKI-232-M1:staleness:{int(mtime)}"
         orch_run_id = self.store.current_run_id("WIKI-ORCH")
         assert orch_run_id is not None
         request_id = fleet_monitor_request_id(orch_run_id, expected_dedupe)
+        self.assertFalse(
+            self.store.command_log.known("run/send_now", request_id),
+            "no intent should exist when the journal write failed",
+        )
         self.assertIsNone(
             self.store.command_log.receipt("run/send_now", request_id),
             "no receipt should exist when the journal write failed",
@@ -1617,6 +1620,156 @@ class FleetMonitorTests(unittest.IsolatedAsyncioTestCase):
         )
         # Sanity: original_atomic_write is untouched.
         self.assertIs(fm_module._atomic_write_json, original_atomic_write)
+
+    async def test_corrupt_journal_recovers_payload_from_command_log(
+        self,
+    ) -> None:
+        """REVIEW13 H2: corrupt local state must not change a request body."""
+
+        await self._spawn("WIKI-ORCH", role="orchestrator", orch=None)
+        await self._spawn("WIKI-232-CORRUPT", role="implement", orch="WIKI-ORCH")
+        mtime = self.clock.now - 1900.0
+        _write_status(
+            self.store,
+            "WIKI-232-CORRUPT",
+            {"state": "working", "pr": None, "step": "coding", "blocker": None},
+            mtime=mtime,
+        )
+        dispatch_send = build_fleet_monitor_dispatch(self.supervisor)
+        first_monitor = FleetMonitor(
+            self.store,
+            dispatch_send,
+            clock=self.clock,
+            interval=0.01,
+            staleness_threshold=1800.0,
+            ownership_lock=self.supervisor._agent_lock,  # noqa: SLF001
+        )
+        orch_run_id = self.store.current_run_id("WIKI-ORCH")
+        assert orch_run_id is not None
+        adapter = self.supervisor.adapters[orch_run_id]
+        with mock.patch.object(
+            adapter, "send_now", wraps=adapter.send_now
+        ) as provider_send:
+            first = await first_monitor.tick()
+            stale = [note for note in first if note.event_type == "staleness"]
+            self.assertEqual(len(stale), 1)
+            original_message = stale[0].message
+            first_staleness_delivery_count = sum(
+                original_message in repr(call)
+                for call in provider_send.await_args_list
+            )
+
+            journal_path = first_monitor._pending_messages_path  # noqa: SLF001
+            journal_path.write_text("{not-json", encoding="utf-8")
+            self.clock.advance(600)
+            restarted = FleetMonitor(
+                self.store,
+                dispatch_send,
+                clock=self.clock,
+                interval=0.01,
+                staleness_threshold=1800.0,
+                ownership_lock=self.supervisor._agent_lock,  # noqa: SLF001
+            )
+            self.assertTrue(restarted._pending_journal_unknown)  # noqa: SLF001
+            replay = await restarted.tick()
+
+        replayed_stale = [
+            note for note in replay if note.event_type == "staleness"
+        ]
+        self.assertEqual(len(replayed_stale), 1)
+        self.assertEqual(replayed_stale[0].message, original_message)
+        self.assertEqual(
+            sum(
+                original_message in repr(call)
+                for call in provider_send.await_args_list
+            ),
+            first_staleness_delivery_count,
+            "receipt replay must not deliver a second provider message",
+        )
+        recovered_journal = json.loads(journal_path.read_text(encoding="utf-8"))
+        self.assertLessEqual(
+            len(recovered_journal["entries"]),
+            restarted.max_pending_messages,
+        )
+
+    async def test_pending_journal_stays_bounded_across_long_run(
+        self,
+    ) -> None:
+        """REVIEW13 M1: windows, mtimes, and transitions replace old rows."""
+
+        await self._spawn("WIKI-ORCH", role="orchestrator", orch=None)
+        worker = await self._spawn(
+            "WIKI-232-LONG", role="implement", orch="WIKI-ORCH"
+        )
+        _set_created_at(self.store, worker, self.clock.now - 3600.0)
+        dispatch_send = build_fleet_monitor_dispatch(self.supervisor)
+        monitor = FleetMonitor(
+            self.store,
+            dispatch_send,
+            clock=self.clock,
+            interval=0.01,
+            staleness_threshold=1800.0,
+            graph_health_realarm=300.0,
+            max_pending_messages=8,
+            ownership_lock=self.supervisor._agent_lock,  # noqa: SLF001
+        )
+
+        for occurrence in range(24):
+            stale_mtime = self.clock.now - 1900.0 - occurrence
+            _write_status(
+                self.store,
+                worker.agent_id,
+                {
+                    "state": "working",
+                    "pr": None,
+                    "step": f"coding {occurrence}",
+                    "blocker": None,
+                },
+                mtime=stale_mtime,
+            )
+            await monitor.tick()
+            _write_status(
+                self.store,
+                worker.agent_id,
+                {
+                    "state": "merge-ready" if occurrence % 2 == 0 else "blocked",
+                    "pr": "https://gh/x/pull/232",
+                    "step": f"transition {occurrence}",
+                    "blocker": "review" if occurrence % 2 else None,
+                },
+                mtime=self.clock.now,
+            )
+            await monitor.tick()
+            self.clock.advance(301.0)
+
+        # Reconcile the final window after the last clock advance.
+        await monitor.tick()
+        journal_path = monitor._pending_messages_path  # noqa: SLF001
+        journal = json.loads(journal_path.read_text(encoding="utf-8"))
+        self.assertLessEqual(len(journal["entries"]), 8)
+        self.assertLessEqual(len(monitor._pending_messages), 8)  # noqa: SLF001
+        self.assertFalse(
+            any(
+                entry["event_type"].endswith("transition")
+                for entry in journal["entries"]
+            ),
+            "completed transition rows must be removed immediately",
+        )
+
+        # A restart in the same live run must replay retained occurrences
+        # without a payload conflict and must keep the same hard bound.
+        restarted = FleetMonitor(
+            self.store,
+            dispatch_send,
+            clock=self.clock,
+            interval=0.01,
+            staleness_threshold=1800.0,
+            graph_health_realarm=300.0,
+            max_pending_messages=8,
+            ownership_lock=self.supervisor._agent_lock,  # noqa: SLF001
+        )
+        await restarted.tick()
+        self.assertLessEqual(len(restarted._pending_messages), 8)  # noqa: SLF001
 
     async def test_pending_message_survives_monitor_restart(self) -> None:
         """WIKI-232 REVIEW8 H2: an in-memory ``_pending_messages`` dict
