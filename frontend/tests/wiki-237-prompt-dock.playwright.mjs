@@ -44,6 +44,7 @@ async function main() {
 
   let working = true;
   const deliveries = [];
+  let sessionRequests = 0;
   let skillsRequests = 0;
   const backend = await startBackend(fixtures);
   const browser = await chromium.launch({ headless: true });
@@ -51,6 +52,7 @@ async function main() {
 
   try {
     await page.route(`**/api/agents/${TICKET}/session?**`, async (route) => {
+      sessionRequests += 1;
       await route.fulfill({
         status: 200,
         contentType: "application/json",
@@ -128,7 +130,7 @@ async function main() {
 
     await page.addInitScript(({ ticket }) => {
       if (localStorage.getItem("wiki-sidebar-visible") === null) {
-        localStorage.setItem("wiki-sidebar-visible", "false");
+        localStorage.setItem("wiki-sidebar-visible", "true");
       }
       if (localStorage.getItem("wiki-window-layout-v2") === null) {
         localStorage.setItem(
@@ -148,14 +150,10 @@ async function main() {
       }
     }, { ticket: TICKET });
 
-    const openSession = async () => {
+    const mountSession = async () => {
       const sessionUrl = `${backend.baseUrl}/#/agent/${TICKET}`;
       const skillsRequestsBeforeNavigation = skillsRequests;
-      if (page.url() === sessionUrl) {
-        await page.reload({ waitUntil: "domcontentloaded" });
-      } else {
-        await page.goto(sessionUrl, { waitUntil: "domcontentloaded" });
-      }
+      await page.goto(sessionUrl, { waitUntil: "domcontentloaded" });
       await page.locator(".session-composer textarea").waitFor({ state: "visible" });
       const deadline = Date.now() + 5_000;
       while (skillsRequests <= skillsRequestsBeforeNavigation && Date.now() < deadline) {
@@ -186,15 +184,51 @@ async function main() {
     };
 
     const assertGuidance = async (expected) => {
+      const visibleExpected = expected.replaceAll(" · ", " ");
+      await page.waitForFunction(
+        ({ selector, value }) => {
+          const node = document.querySelector(selector);
+          return node instanceof HTMLElement && node.innerText.replace(/\s+/g, " ").trim() === value;
+        },
+        { selector: ".session-footer-hints", value: visibleExpected },
+      );
       const footerText = (await page.locator(".session-footer-hints").innerText()).replace(/\s+/g, " ");
       assert(
-        footerText === expected.replaceAll(" · ", " "),
+        footerText === visibleExpected,
         `visible guidance mismatch: ${footerText}`,
       );
       const composer = page.locator(".session-composer textarea");
       const helpId = await composer.getAttribute("aria-describedby");
       const helpText = (await page.locator(`[id=${JSON.stringify(helpId)}]`).textContent()).trim();
       assert(helpText === expected, `accessible guidance mismatch: ${helpText}`);
+    };
+
+    const waitForDelivery = async (count) => {
+      const deadline = Date.now() + 5_000;
+      while (deliveries.length < count && Date.now() < deadline) {
+        await new Promise((resolve) => setTimeout(resolve, 25));
+      }
+      assert(deliveries.length >= count, `expected ${count} deliveries, got ${deliveries.length}`);
+    };
+
+    const waitForWorkingState = async (nextWorking) => {
+      const requestsBeforeChange = sessionRequests;
+      working = nextWorking;
+      await page.evaluate(() => window.dispatchEvent(new Event("resize")));
+      await new Promise((resolve) => setTimeout(resolve, 2_600));
+      const pollDeadline = Date.now() + 5_000;
+      while (sessionRequests <= requestsBeforeChange && Date.now() < pollDeadline) {
+        await new Promise((resolve) => setTimeout(resolve, 25));
+      }
+      assert(
+        sessionRequests > requestsBeforeChange,
+        "session polling must request the new working state",
+      );
+      const expectedAction = nextWorking ? "Send now" : "Send";
+      await page.waitForFunction(
+        ({ selector, value }) => document.querySelector(selector)?.getAttribute("aria-label") === value,
+        { selector: ".session-send", value: expectedAction },
+      );
     };
 
     const assertCompactSend = async (context) => {
@@ -227,6 +261,50 @@ async function main() {
       );
     };
 
+    const assertExpandedSend = async (context) => {
+      await page.waitForFunction(() =>
+        document.querySelector(".session-composer")?.getAttribute("data-compact") !== "true",
+      );
+      const expandedState = await page.locator(".session-composer").evaluate((root) => {
+        const sendButton = root.querySelector(".session-send");
+        const sendLabel = root.querySelector(".session-send-label");
+        const buttonRect = sendButton.getBoundingClientRect();
+        return {
+          composerWidth: root.getBoundingClientRect().width,
+          buttonWidth: buttonRect.width,
+          buttonHeight: buttonRect.height,
+          labelDisplay: getComputedStyle(sendLabel).display,
+        };
+      });
+      assert(
+        expandedState.composerWidth > 480,
+        `${context} composer must exceed 480px: ${expandedState.composerWidth}`,
+      );
+      assert(
+        expandedState.buttonWidth >= 82 && expandedState.buttonHeight === 40,
+        `${context} send action must show its 82x40 layout: ${expandedState.buttonWidth}x${expandedState.buttonHeight}`,
+      );
+      assert(
+        expandedState.labelDisplay !== "none",
+        `${context} send text must be visible: ${expandedState.labelDisplay}`,
+      );
+    };
+
+    const resizeSplit = async (ratio) => {
+      const split = page.locator(".pane-split.row");
+      const divider = split.locator(".pane-divider.row");
+      const bounds = await split.boundingBox();
+      assert(bounds, "split pane must have measurable bounds");
+      await divider.hover();
+      await page.mouse.down();
+      await page.mouse.move(
+        bounds.x + bounds.width * ratio,
+        bounds.y + bounds.height / 2,
+        { steps: 8 },
+      );
+      await page.mouse.up();
+    };
+
     const assertNoHorizontalOverflow = async (context) => {
       const bounds = await page.locator(".session-tab").evaluate((root) => {
         const composerRoot = root.querySelector(".session-composer");
@@ -247,9 +325,21 @@ async function main() {
     };
 
     logStep("working state at normal width");
-    await openSession();
+    await mountSession();
+    let mountedComposer = await page.locator(".session-composer").elementHandle();
+    assert(mountedComposer, "composer must mount once before live update checks");
+    const assertComposerStayedMounted = async (context) => {
+      assert(
+        await page.evaluate(
+          (node) => node.isConnected && document.querySelector(".session-composer") === node,
+          mountedComposer,
+        ),
+        `${context} must keep the original composer mounted`,
+      );
+    };
     await assertTarget();
     await assertGuidance("enter send now · shift+enter queue until idle · esc vim");
+    await assertExpandedSend("normal working");
     const send = page.locator(".session-send");
     assert((await send.innerText()).trim() === "send", "normal-width send action must have visible text");
     const sendSize = await send.evaluate((node) => {
@@ -260,24 +350,49 @@ async function main() {
     await page.screenshot({ path: SCREENSHOTS.workingNormal, fullPage: true });
 
     const composer = page.locator(".session-composer textarea");
-    await composer.fill("queue this after the current turn");
-    await composer.press("Shift+Enter");
-    await page.waitForFunction(() => document.querySelector(".session-composer textarea")?.value === "");
-    assert(deliveries.at(-1)?.mode === "on-idle", "working Shift+Enter must queue until idle");
-
-    logStep("idle state at normal width");
-    working = false;
-    await openSession();
+    logStep("live working-to-idle polling at normal width");
+    await waitForWorkingState(false);
     await assertTarget();
     await assertGuidance("enter send · shift+enter newline · esc vim");
+    await assertExpandedSend("normal idle after polling");
+    await assertComposerStayedMounted("working-to-idle polling");
     assert(await send.getAttribute("aria-label") === "Send", "idle send action must not say send now");
     await page.screenshot({ path: SCREENSHOTS.idleNormal, fullPage: true });
 
-    const beforeIdleShift = deliveries.length;
-    await composer.fill("first line");
+    let expectedDeliveries = deliveries.length + 1;
+    const requestsBeforeIdleEnter = sessionRequests;
+    working = true;
+    await composer.fill("send now while idle");
+    await composer.press("Enter");
+    await waitForDelivery(expectedDeliveries);
+    assert(deliveries.at(-1)?.mode === "now", "idle Enter must use mode now");
+    await page.waitForFunction(() =>
+      document.querySelector(".session-send")?.getAttribute("aria-label") === "Send now",
+    );
+    assert(
+      sessionRequests > requestsBeforeIdleEnter,
+      "idle Enter must refresh the mounted composer into working state",
+    );
+    await assertGuidance("enter send now · shift+enter queue until idle · esc vim");
+
+    expectedDeliveries += 1;
+    await composer.fill("send now with enter");
+    await composer.press("Enter");
+    await waitForDelivery(expectedDeliveries);
+    assert(deliveries.at(-1)?.mode === "now", "working Enter must use mode now");
+
+    expectedDeliveries += 1;
+    await composer.fill("send now with the visible action");
+    await send.click();
+    await waitForDelivery(expectedDeliveries);
+    assert(deliveries.at(-1)?.mode === "now", "working Send button must use mode now");
+
+    expectedDeliveries += 1;
+    await composer.fill("queue this after the current turn");
     await composer.press("Shift+Enter");
-    assert((await composer.inputValue()) === "first line\n", "idle Shift+Enter must insert a newline");
-    assert(deliveries.length === beforeIdleShift, "idle Shift+Enter must not queue a message");
+    await waitForDelivery(expectedDeliveries);
+    await page.waitForFunction(() => document.querySelector(".session-composer textarea")?.value === "");
+    assert(deliveries.at(-1)?.mode === "on-idle", "working Shift+Enter must queue until idle");
 
     logStep("retained composer functions");
     const durableHistoryRow = page.locator(".session-user:not(.session-pending-user)", {
@@ -384,71 +499,95 @@ async function main() {
     await attachment.getByRole("button", { name: "Remove attachment" }).click();
     await attachment.waitFor({ state: "detached" });
     assert(!(await composer.inputValue()).includes("[image:"), "attachment removal must clear its token");
+    await composer.fill("");
 
-    logStep("working and idle states at narrow width");
-    working = true;
-    // Below 900px, the shell hides the sidebar through CSS. Keep the stored
-    // sidebar state on so the mobile two-column grid owns the pane width.
-    await page.evaluate(() => localStorage.setItem("wiki-sidebar-visible", "true"));
-    await page.setViewportSize({ width: 360, height: 780 });
-    await openSession();
-    await assertTarget(`Steer ${TICKET}…`);
-    await assertGuidance("enter send now · shift+enter queue until idle · esc vim");
-    await assertCompactSend("narrow viewport working");
-    await assertNoHorizontalOverflow("narrow viewport working");
-    await page.screenshot({ path: SCREENSHOTS.workingNarrow, fullPage: true });
+    logStep("create a real split without reloading");
+    await composer.focus();
+    await page.keyboard.press("Control+a");
+    await page.keyboard.press("p");
+    await page.locator(".pane-split.row").waitFor({ state: "visible" });
+    mountedComposer = await page.locator(".session-composer").elementHandle();
+    assert(mountedComposer, "split composer must mount before live divider checks");
 
-    working = false;
-    await openSession();
-    await assertTarget(`Ask ${TICKET}…`);
-    await assertGuidance("enter send · shift+enter newline · esc vim");
-    await assertCompactSend("narrow viewport idle");
-    await assertNoHorizontalOverflow("narrow viewport idle");
-    await page.screenshot({ path: SCREENSHOTS.idleNarrow, fullPage: true });
-
-    logStep("working and idle states in a narrow desktop split pane");
-    await page.setViewportSize({ width: 1280, height: 900 });
-    await page.evaluate(({ ticket }) => {
-      localStorage.setItem("wiki-sidebar-visible", "false");
-      localStorage.setItem(
-        "wiki-window-layout-v2",
-        JSON.stringify({
-          version: 2,
-          activeWindowId: "window-0",
-          windows: [
-            {
-              id: "window-0",
-              focusedPaneId: "pane-2",
-              layout: {
-                kind: "split",
-                direction: "row",
-                ratio: 0.72,
-                first: { kind: "pane", id: "pane-1", path: null },
-                second: { kind: "pane", id: "pane-2", path: `agent://${ticket}` },
-              },
-            },
-          ],
-        }),
-      );
-    }, { ticket: TICKET });
-
-    working = true;
-    await openSession();
-    assert(page.viewportSize().width === 1280, "split-pane case must keep a wide viewport");
-    await page.locator(".pane-frame[data-pane-key='pane-2']").waitFor({ state: "visible" });
+    logStep("live resize into a narrow desktop split pane");
+    await resizeSplit(0.35);
     await assertTarget(`Steer ${TICKET}…`);
     await assertGuidance("enter send now · shift+enter queue until idle · esc vim");
     await assertCompactSend("narrow split working");
     await assertNoHorizontalOverflow("narrow split working");
+    await assertComposerStayedMounted("wide-to-narrow split resize");
     await page.screenshot({ path: SCREENSHOTS.workingSplit, fullPage: true });
 
+    logStep("live resize back to an expanded working pane");
+    await resizeSplit(0.65);
+    await assertTarget();
+    await assertGuidance("enter send now · shift+enter queue until idle · esc vim");
+    await assertExpandedSend("expanded split working");
+    await assertNoHorizontalOverflow("expanded split working");
+    await assertComposerStayedMounted("narrow-to-wide split resize");
+
+    logStep("live working state at narrow viewport width");
+    await page.setViewportSize({ width: 360, height: 1200 });
+    await assertTarget(`Steer ${TICKET}…`);
+    await assertGuidance("enter send now · shift+enter queue until idle · esc vim");
+    await assertCompactSend("narrow viewport working");
+    await assertNoHorizontalOverflow("narrow viewport working");
+    await assertComposerStayedMounted("narrow viewport resize");
+    await page.screenshot({ path: SCREENSHOTS.workingNarrow, fullPage: true });
+
+    logStep("return to idle through mounted-session refresh");
+    await page.setViewportSize({ width: 1280, height: 900 });
+    await assertTarget();
+    await assertExpandedSend("restored normal working");
     working = false;
-    await openSession();
+    expectedDeliveries += 1;
+    await composer.fill("finish the working turn now");
+    await composer.press("Enter");
+    await waitForDelivery(expectedDeliveries);
+    assert(deliveries.at(-1)?.mode === "now", "working Enter before idle widths must use mode now");
+    await page.waitForFunction(() =>
+      document.querySelector(".session-send")?.getAttribute("aria-label") === "Send",
+    );
+    await assertTarget();
+    await assertGuidance("enter send · shift+enter newline · esc vim");
+    await assertExpandedSend("normal idle");
+    await assertComposerStayedMounted("working-to-idle polling");
+    assert(await send.getAttribute("aria-label") === "Send", "idle send action must not say send now");
+    await page.screenshot({ path: SCREENSHOTS.idleNormal, fullPage: true });
+
+    expectedDeliveries += 1;
+    await composer.fill("send now while idle");
+    await composer.press("Enter");
+    await waitForDelivery(expectedDeliveries);
+    assert(deliveries.at(-1)?.mode === "now", "idle Enter must use mode now");
+
+    const beforeIdleShift = deliveries.length;
+    await composer.fill("first line");
+    await composer.press("Shift+Enter");
+    assert((await composer.inputValue()) === "first line\n", "idle Shift+Enter must insert a newline");
+    assert(deliveries.length === beforeIdleShift, "idle Shift+Enter must not queue a message");
+    await composer.fill("");
+
+    logStep("live idle state in a narrow desktop split pane");
+    await resizeSplit(0.35);
     await assertTarget(`Ask ${TICKET}…`);
     await assertGuidance("enter send · shift+enter newline · esc vim");
     await assertCompactSend("narrow split idle");
     await assertNoHorizontalOverflow("narrow split idle");
+    await assertComposerStayedMounted("narrow split idle resize");
     await page.screenshot({ path: SCREENSHOTS.idleSplit, fullPage: true });
+
+    logStep("live idle state at narrow viewport width");
+    await resizeSplit(0.65);
+    await assertTarget();
+    await assertExpandedSend("restored expanded idle");
+    await page.setViewportSize({ width: 360, height: 1200 });
+    await assertTarget(`Ask ${TICKET}…`);
+    await assertGuidance("enter send · shift+enter newline · esc vim");
+    await assertCompactSend("narrow viewport idle");
+    await assertNoHorizontalOverflow("narrow viewport idle");
+    await assertComposerStayedMounted("narrow viewport polling");
+    await page.screenshot({ path: SCREENSHOTS.idleNarrow, fullPage: true });
 
     logStep("PASS");
   } finally {

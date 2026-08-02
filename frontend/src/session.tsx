@@ -10,7 +10,7 @@ import {
   useRef,
   useState,
 } from "react";
-import type { ComponentProps, CSSProperties, RefObject } from "react";
+import type { ComponentProps, CSSProperties } from "react";
 import {
   AlertTriangle,
   Bell,
@@ -279,12 +279,14 @@ export function usePollTick(refreshTick: number): number {
   return pollTick + refreshTick;
 }
 
-function useElementVisible(ref: RefObject<HTMLElement | null>): boolean {
+function useElementVisible(node: HTMLElement | null): boolean {
   const [visible, setVisible] = useState(false);
 
   useEffect(() => {
-    const node = ref.current;
-    if (!node) return;
+    if (!node) {
+      setVisible(false);
+      return;
+    }
 
     const compute = () => {
       const rect = node.getBoundingClientRect();
@@ -298,21 +300,24 @@ function useElementVisible(ref: RefObject<HTMLElement | null>): boolean {
       setVisible(document.visibilityState === "visible" && inViewport);
     };
 
-    const observer = new IntersectionObserver(() => compute());
-    observer.observe(node);
+    const intersectionObserver = new IntersectionObserver(() => compute());
+    const resizeObserver = new ResizeObserver(() => compute());
+    intersectionObserver.observe(node);
+    resizeObserver.observe(node);
     document.addEventListener("visibilitychange", compute);
     window.addEventListener("focus", compute);
     window.addEventListener("resize", compute);
     window.addEventListener("scroll", compute, true);
     compute();
     return () => {
-      observer.disconnect();
+      intersectionObserver.disconnect();
+      resizeObserver.disconnect();
       document.removeEventListener("visibilitychange", compute);
       window.removeEventListener("focus", compute);
       window.removeEventListener("resize", compute);
       window.removeEventListener("scroll", compute, true);
     };
-  }, [ref]);
+  }, [node]);
 
   return visible;
 }
@@ -2206,7 +2211,7 @@ export function SessionTab({
   const layoutDirtyFromRef = useRef(Number.POSITIVE_INFINITY);
   const layoutRef = useRef<VirtualLayout | null>(null);
   const layoutResetKeyRef = useRef(resetKey);
-  const containerRef = useRef<HTMLDivElement | null>(null);
+  const [containerNode, setContainerNode] = useState<HTMLDivElement | null>(null);
   const restoreAttemptsRef = useRef(3);
   const scrollRestoreStateRef = useRef<ScrollState | null>(sessionScrollCache.get(sessionStateKey) ?? null);
   const scrollRestorePendingRef = useRef(Boolean(scrollRestoreStateRef.current));
@@ -2236,7 +2241,7 @@ export function SessionTab({
           : { ticket },
     [archivedAt, subagent, ticket]
   );
-  const visible = useElementVisible(containerRef);
+  const visible = useElementVisible(containerNode);
   const { session, pendingUserMessages, error, loading } = useTranscriptSession(target, visible);
   const inlineArtifactKey = `${ticket}:${subagent ?? ""}:${session?.path ?? ""}`;
   const inlineArtifactKeyRef = useRef(inlineArtifactKey);
@@ -2771,13 +2776,13 @@ export function SessionTab({
   if (!session) {
     if (error && !loading) {
       return (
-        <div className="session-tab" ref={containerRef}>
+        <div className="session-tab" ref={setContainerNode}>
           <div className="session-empty">{error}</div>
         </div>
       );
     }
     return (
-      <div className="session-tab" ref={containerRef}>
+      <div className="session-tab" ref={setContainerNode}>
         <div className="session-empty">
           <LoadingPlaceholder className="session-loading" lines={[82, 96, 74, 88]} />
         </div>
@@ -2791,7 +2796,7 @@ export function SessionTab({
 
   return (
     <QuestionUiContext.Provider value={questionUi}>
-      <div className="session-tab" ref={containerRef}>
+      <div className="session-tab" ref={setContainerNode}>
       {(session.tasks.length > 0 || session.pr || session.sessionMeta.custom_title || session.sessionMeta.agent_name || (rateLimit?.status && rateLimit.status !== "allowed")) ? (
         <div className="session-state-strip">
           {session.sessionMeta.custom_title ? (
