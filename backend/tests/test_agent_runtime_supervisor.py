@@ -652,6 +652,154 @@ class SupervisorTests(unittest.IsolatedAsyncioTestCase):
         ]
         self.assertEqual(reloaded_keys, [dedupe_key])
 
+        # WIKI-232 REVIEW11 M3: cover the legacy on-disk schema too.
+        # Snapshots that predate the owner-aware entry format store
+        # ``message_dedupe_keys`` as a bare list of strings; a broken
+        # migration would either drop them (redeliver messages) or
+        # promote them with an unexpected owner (let unrelated retries
+        # bypass the dedupe). Overwrite the JSON snapshot with the
+        # legacy shape, reopen the store, and verify:
+        #  (a) legacy strings are promoted to owner-less objects,
+        #  (b) an ownerless duplicate is rejected,
+        #  (c) an owned re-claim by the SAME owner replays cleanly,
+        #  (d) an owned re-claim by a DIFFERENT owner still dedupes,
+        #  (e) release removes the entry,
+        #  (f) ``RunStore.replace`` copies the promoted entries to the
+        #      replacement run.
+        legacy_run_path = self.store.run_path(record.run_id)
+        legacy_snapshot = json.loads(legacy_run_path.read_text(encoding="utf-8"))
+        legacy_snapshot["message_dedupe_keys"] = [
+            dedupe_key,
+            "legacy-only:migration-key:v0",
+        ]
+        legacy_run_path.write_text(
+            json.dumps(legacy_snapshot),
+            encoding="utf-8",
+        )
+
+        legacy_store = RunStore(self.paths)
+        promoted = legacy_store.get(record.run_id).message_dedupe_keys
+        # (a) The migration promotes bare strings into owner-less objects.
+        self.assertEqual(
+            promoted,
+            [
+                {"key": dedupe_key},
+                {"key": "legacy-only:migration-key:v0"},
+            ],
+        )
+
+        # (b) An ownerless duplicate claim on a legacy key is rejected.
+        _, claimed_ownerless = legacy_store.claim_message_dedupe_key(
+            record.run_id, dedupe_key
+        )
+        self.assertFalse(
+            claimed_ownerless,
+            "legacy ownerless entry must reject a repeat unowned claim",
+        )
+
+        # (c) An owned re-claim uses the effect_id as owner. Because the
+        # legacy entry has no owner, the first owned claim still rejects
+        # (matches the current invariant that legacy claims cannot be
+        # retried — the owner match check requires an existing owner).
+        _, first_owned = legacy_store.claim_message_dedupe_key(
+            record.run_id,
+            dedupe_key,
+            owner="run/send_on_idle:legacy-effect-1",
+        )
+        self.assertFalse(
+            first_owned,
+            "legacy ownerless entry does not silently gain an owner",
+        )
+
+        # Now claim a fresh key with an owner, then prove the same owner
+        # replays cleanly and a different owner still dedupes.
+        fresh_key = "artifact-render:fresh-owner:svg-render"
+        _, fresh_claim = legacy_store.claim_message_dedupe_key(
+            record.run_id,
+            fresh_key,
+            owner="run/send_on_idle:legacy-effect-2",
+        )
+        self.assertTrue(fresh_claim)
+        _, replay_claim = legacy_store.claim_message_dedupe_key(
+            record.run_id,
+            fresh_key,
+            owner="run/send_on_idle:legacy-effect-2",
+        )
+        self.assertTrue(
+            replay_claim,
+            "same-owner replay must succeed so a crash between the "
+            "dedupe write and the provider send can retry",
+        )
+        _, cross_owner = legacy_store.claim_message_dedupe_key(
+            record.run_id,
+            fresh_key,
+            owner="run/send_on_idle:different-effect",
+        )
+        self.assertFalse(
+            cross_owner,
+            "different-owner claim must dedupe against the prior owner",
+        )
+
+        # (e) Release drops the promoted legacy entry.
+        legacy_store.release_message_dedupe_key(
+            record.run_id, "legacy-only:migration-key:v0"
+        )
+        after_release = {
+            entry["key"]
+            for entry in legacy_store.get(record.run_id).message_dedupe_keys
+        }
+        self.assertNotIn("legacy-only:migration-key:v0", after_release)
+        # And the released key is now claimable fresh (with any owner).
+        _, reclaimed = legacy_store.claim_message_dedupe_key(
+            record.run_id,
+            "legacy-only:migration-key:v0",
+            owner="run/send_on_idle:post-release",
+        )
+        self.assertTrue(reclaimed)
+
+        # (f) Replacement copies the promoted entries so a mid-flight
+        # composer retry stays idempotent across ``RunStore.replace``.
+        old_record = legacy_store.get(record.run_id)
+        replacement = RunRecord.new(
+            agent_id=old_record.agent_id,
+            provider=old_record.provider,
+            role=old_record.role,
+            model=old_record.model,
+            worktree=old_record.worktree,
+            prompt=old_record.initial_prompt or "legacy replacement",
+        )
+        _old_after, new_run = legacy_store.replace(record.run_id, replacement)
+        # Every prior dedupe key survives to the replacement so a
+        # replayed retry on the same key still dedupes.
+        replaced_keys = {
+            entry["key"] for entry in new_run.message_dedupe_keys
+        }
+        self.assertIn(dedupe_key, replaced_keys)
+        _, replaced_ownerless = legacy_store.claim_message_dedupe_key(
+            new_run.run_id, dedupe_key
+        )
+        self.assertFalse(
+            replaced_ownerless,
+            "replacement inherits the legacy dedupe entry so retries "
+            "on the same key still dedupe",
+        )
+
+        # Reset the store to the current-schema snapshot for the rest of
+        # the test — cap enforcement below assumes the full object list.
+        current_snapshot = legacy_store.get(record.run_id).to_dict()
+        # Restore the pre-legacy record so cap-eviction below runs on
+        # the same starting point as the original assertion.
+        current_snapshot["message_dedupe_keys"] = [
+            {"key": entry["key"]}
+            for entry in current_snapshot["message_dedupe_keys"]
+            if entry["key"] == dedupe_key
+        ]
+        legacy_run_path.write_text(
+            json.dumps(current_snapshot),
+            encoding="utf-8",
+        )
+        self.store = RunStore(self.paths)
+
         for index in range(MAX_MESSAGE_DEDUPE_KEYS + 1):
             self.store.claim_message_dedupe_key(
                 record.run_id, f"artifact-render:key-{index}:svg-render"
@@ -1907,17 +2055,18 @@ class SupervisorTests(unittest.IsolatedAsyncioTestCase):
 
         normalized_rows = self.store.read_normalized_events(run_id)
         by_raw_seq = {int(row.get("raw_seq", 0)): row for row in normalized_rows}
-        # Both raw seqs are now normalized (durable observability preserved).
+        # Both raw seqs are now normalized (durable observability preserved),
+        # and each keeps its original lifecycle_state so a later replay can
+        # inspect the historical transition. The rebuild in raw_seq order is
+        # what keeps ``record.state`` at IDLE.
         self.assertIn(1, by_raw_seq)
         self.assertIn(2, by_raw_seq)
-        # Recovered stale orphan carries no lifecycle_state so a later
-        # rebuild cannot re-apply it. Authoritative later row keeps IDLE.
-        self.assertIsNone(by_raw_seq[1].get("lifecycle_state"))
+        self.assertEqual(by_raw_seq[1].get("lifecycle_state"), "working")
         self.assertEqual(by_raw_seq[2].get("lifecycle_state"), "idle")
 
-        # Walking normalized events in raw_seq order gives a monotonic,
-        # regression-free lifecycle sequence: the max-raw_seq lifecycle
-        # event is authoritative.
+        # Walking normalized events in raw_seq order gives a monotonic
+        # lifecycle progression that ends at the max-raw_seq authoritative
+        # state.
         ordered_lifecycles = [
             row.get("lifecycle_state")
             for row in sorted(
@@ -1926,7 +2075,7 @@ class SupervisorTests(unittest.IsolatedAsyncioTestCase):
             )
             if isinstance(row.get("lifecycle_state"), str)
         ]
-        self.assertEqual(ordered_lifecycles, ["idle"])
+        self.assertEqual(ordered_lifecycles, ["working", "idle"])
 
         # Simulate a fresh boot: a full store rebuild must not resurrect
         # the WORKING transition even though the recovered row is
@@ -1996,7 +2145,7 @@ class SupervisorTests(unittest.IsolatedAsyncioTestCase):
         by_raw_seq = {int(row.get("raw_seq", 0)): row for row in normalized_rows}
         self.assertIn(1, by_raw_seq)
         self.assertIn(2, by_raw_seq)
-        self.assertIsNone(by_raw_seq[1].get("lifecycle_state"))
+        self.assertEqual(by_raw_seq[1].get("lifecycle_state"), "working")
         self.assertEqual(by_raw_seq[2].get("lifecycle_state"), "blocked")
 
         # Fresh boot rebuild must not resurrect WORKING and mislead
@@ -2004,6 +2153,341 @@ class SupervisorTests(unittest.IsolatedAsyncioTestCase):
         rebuilt = RunStore(self.paths)
         rebuilt_record = rebuilt.get(run_id)
         self.assertEqual(rebuilt_record.state, LifecycleState.BLOCKED)
+
+    async def test_public_restart_path_recovers_wedged_send_end_to_end(
+        self,
+    ) -> None:
+        """WIKI-232 REVIEW11 M2: exercise the full ``recover_on_start``
+        contract. Prior boot-recovery coverage called private helpers
+        with hand-authored effect / pending / raw rows — a regression
+        in the public wiring (``run_daemon`` starting the recovery in
+        the wrong order, ``command_queue.recover_pending`` failing to
+        skip an already-acknowledged effect, a replaced ``run/start``
+        wrapper losing the queued send_on_idle intent) would stay
+        green. Drive the crash state through ``supervisor.dispatch``,
+        tear down the current supervisor, spin up a fresh supervisor
+        on the same ``RuntimePaths``, and call ``recover_on_start``
+        once. Assert: (a) the orphan raw event is normalized exactly
+        once, (b) the queue drains, (c) the steer effect ends
+        ``acknowledged`` with a sent-shape result (not
+        ``supervisor_restart_dropped_send``), (d) the durable send
+        receipt is ok, (e) no second provider delivery fires."""
+
+        # Start via public dispatch so the command log carries a
+        # ``run/start`` receipt the restart path can replay.
+        start_result = await self.supervisor.dispatch(
+            "run/start",
+            {
+                "agent_id": "WIKI-232-R11-M2-PUBLIC",
+                "provider": "codex",
+                "role": "implement",
+                "model": "fixture-codex",
+                "effort": "high",
+                "worktree": str(self.worktree),
+                "prompt": "public restart integration",
+                "request_id": "r11-m2-start",
+            },
+        )
+        run_id = start_result["run_id"]
+        record = self.store.get(run_id)
+        adapter = self.supervisor.adapters[run_id]
+
+        # Force adapter to WORKING so the public send_on_idle intent
+        # queues instead of delivering immediately — matches the
+        # production window in which a monitor steer arrives during a
+        # provider turn.
+        snapshot = adapter.snapshot()
+        working = AdapterStatus(
+            LifecycleState.WORKING,
+            snapshot.session_id,
+            os.getpid(),
+            generation=snapshot.generation,
+        )
+        adapter._status = working  # noqa: SLF001 - queueing fixture
+        self.store.update_adapter_status(run_id, working)
+
+        pending_id = str(uuid4())
+        effect_id = "r11-m2-send-effect"
+        echoed_text = "public restart echo body"
+
+        queued = await self.supervisor.dispatch(
+            "run/send_on_idle",
+            {
+                "agent_id": record.agent_id,
+                "run_id": run_id,
+                "text": echoed_text,
+                "pending_id": pending_id,
+                "request_id": effect_id,
+            },
+        )
+        self.assertEqual(queued["status"], "queued")
+        self.assertEqual(len(self.store.queued_messages(run_id)), 1)
+        self.assertEqual(
+            self.store.command_log.steer_effect_for_pending(run_id, pending_id)[
+                "status"
+            ],
+            "queued",
+        )
+
+        # Simulate the crash between the drain's ``mark_sending`` step
+        # and the composer echo landing normalized: the raw echo is
+        # durable in JSONL but its normalized row never flushed.
+        self.store.command_log.mark_steer_sending_for_pending(run_id, pending_id)
+        self.store.track_pending_user_message(run_id, pending_id, echoed_text)
+        raw_row = self.store.append_raw(
+            run_id,
+            provider=ProviderKind.CODEX.value,
+            direction="provider",
+            payload={
+                "method": "item/completed",
+                "params": {
+                    "item": {
+                        "type": "userMessage",
+                        "content": [{"type": "text", "text": echoed_text}],
+                    }
+                },
+            },
+            generation=1,
+        )
+        pre_reconcile = self.store.command_log.steer_effect_for_pending(
+            run_id, pending_id
+        )
+        assert pre_reconcile is not None
+        self.assertEqual(pre_reconcile["status"], "sending")
+        self.assertFalse(self.store.steer_delivery_observed(run_id, pending_id))
+
+        # Snapshot pre-recovery totals so the "no second delivery"
+        # invariant can be verified from the durable side (raw rows do
+        # not grow, normalized log gains exactly one row for the orphan).
+        pre_raw_count = self.store.get(run_id).raw_event_count
+        pre_normalized_count = self.store.get(run_id).normalized_event_count
+
+        # Simulate the daemon restart: tear down the current supervisor
+        # and rebuild on the same on-disk paths.
+        await self.supervisor.close()
+        restarted_store = RunStore(self.paths)
+        restarted = Supervisor(
+            restarted_store,
+            FixtureAdapterFactory(FIXTURES, pid=os.getpid()),
+        )
+        try:
+            adapter_calls: list[str] = []
+
+            # Wrap the adapter factory so we can watch send_on_idle on
+            # the replacement adapter — recovery must not re-drive the
+            # provider once the durable echo has been recovered.
+            base_factory = restarted.adapter_factory
+
+            def watching_factory(record_arg):
+                fresh = base_factory(record_arg)
+                original_send = fresh.send_on_idle
+
+                async def tracked(msg: str):
+                    adapter_calls.append(msg)
+                    return await original_send(msg)
+
+                fresh.send_on_idle = tracked  # type: ignore[method-assign]
+                return fresh
+
+            restarted.adapter_factory = watching_factory  # type: ignore[assignment]
+
+            results = await restarted.recover_on_start()
+            self.assertTrue(
+                any(
+                    result.get("run_id") == run_id
+                    for result in results
+                ),
+                f"recover_on_start must report the recovered run: {results}",
+            )
+
+            # (a) Exactly one normalized row exists for the recovered
+            # raw echo. No duplicates.
+            normalized_rows = restarted_store.read_normalized_events(run_id)
+            matching = [
+                row
+                for row in normalized_rows
+                if isinstance(row.get("payload"), dict)
+                and row["payload"].get("pending_id") == pending_id
+            ]
+            self.assertEqual(
+                len(matching),
+                1,
+                f"exactly one normalized row for the recovered echo: {matching}",
+            )
+            self.assertEqual(int(matching[0]["raw_seq"]), int(raw_row["seq"]))
+
+            # (b) Queue drained through the public path.
+            self.assertEqual(restarted_store.queued_messages(run_id), [])
+
+            # (c) Steer effect terminal with sent-shape result.
+            resolved = restarted_store.command_log.steer_effect_for_pending(
+                run_id, pending_id
+            )
+            assert resolved is not None
+            self.assertEqual(resolved["status"], "acknowledged")
+            result = resolved.get("result")
+            if result is not None:
+                self.assertNotEqual(
+                    result.get("reason"),
+                    "supervisor_restart_dropped_send",
+                    "recovery must not drop a send whose echo was durable",
+                )
+
+            # (d) Durable receipt for the queued send_on_idle intent is ok.
+            receipt = restarted_store.command_log.receipt(
+                "run/send_on_idle", effect_id
+            )
+            self.assertIsNotNone(receipt)
+            assert receipt is not None
+            self.assertTrue(
+                receipt.ok,
+                f"send_on_idle receipt must be ok, got {receipt}",
+            )
+
+            # (e) No second provider delivery. raw_event_count is
+            # unchanged (recovery only normalizes the existing orphan;
+            # it must not append a fresh raw echo), and the replacement
+            # adapter's send_on_idle was NOT invoked during recovery.
+            post_raw_count = restarted_store.get(run_id).raw_event_count
+            self.assertEqual(
+                post_raw_count,
+                pre_raw_count,
+                "recovery must not append a duplicate raw echo",
+            )
+            self.assertEqual(
+                adapter_calls,
+                [],
+                "recovery must not re-drive adapter.send_on_idle for a "
+                "durably-observed echo",
+            )
+            post_normalized_count = restarted_store.get(run_id).normalized_event_count
+            self.assertEqual(
+                post_normalized_count,
+                pre_normalized_count + 1,
+                "recovery normalizes exactly the one orphan raw row",
+            )
+        finally:
+            await restarted.close()
+
+    async def test_orphan_scan_preserves_later_causal_projection(self) -> None:
+        """WIKI-232 REVIEW11 H1: the suppression must cover every later
+        causal event, not only lifecycle. Middle gap: raw seq 1 is an
+        approval request (would add ``pending_requests[42]`` and set
+        lifecycle WAITING_APPROVAL) with a dropped normalize; raw seq 2
+        is the matching ``serverRequest/resolved`` (already normalized,
+        no lifecycle_state). A lifecycle-only guard leaves the max
+        applied lifecycle raw_seq at 0, so the recovered approval still
+        runs its pending_request add and flips ``idle {}`` to
+        ``waiting-approval [42]``. Recovering an unanswerable pending
+        request wedges resume (``RESTART_RECOVERY_TABLE`` treats
+        WAITING_APPROVAL as resumable) or, worse, resumes a run the
+        provider already stopped."""
+
+        record = await self.supervisor.start_run(
+            agent_id="WIKI-232-R11-MIDGAP-APPROVAL",
+            provider=ProviderKind.CODEX,
+            role="implement",
+            model="fixture-codex",
+            effort="high",
+            worktree=str(self.worktree),
+            prompt="middle-gap approval",
+        )
+        run_id = record.run_id
+
+        # An earlier lifecycle event so ``record.state`` is a real IDLE
+        # (matching the review's reproduction) and the marker reflects a
+        # pre-approval baseline. Live path normally lands this before
+        # any approval fires.
+        self.store.append_raw(
+            run_id,
+            provider=ProviderKind.CODEX.value,
+            direction="provider",
+            payload={
+                "method": "thread/status/changed",
+                "params": {"status": {"type": "idle"}},
+            },
+            generation=1,
+        )
+        self.store.append_normalized(
+            run_id,
+            raw_seq=1,
+            disposition=EventDisposition.RENDERED,
+            kind="thread_status_changed",
+            payload={"status": {"type": "idle"}},
+            lifecycle_state=LifecycleState.IDLE,
+        )
+
+        # Raw seq 2: approval request (orphan). Live pump dropped this
+        # normalize between raw fsync and normalized append.
+        approval_request_id = 42
+        approval_payload = {
+            "method": "item/tool/requestUserInput",
+            "id": approval_request_id,
+            "params": {"questions": []},
+        }
+        self.store.append_raw(
+            run_id,
+            provider=ProviderKind.CODEX.value,
+            direction="provider",
+            payload=approval_payload,
+            generation=1,
+        )
+        # Raw seq 3: serverRequest/resolved (already normalized). Carries
+        # no lifecycle_state — the whole point of the finding is that a
+        # lifecycle-only marker cannot see it.
+        resolved_payload = {
+            "method": "serverRequest/resolved",
+            "params": {"requestId": approval_request_id, "result": "approve"},
+        }
+        self.store.append_raw(
+            run_id,
+            provider=ProviderKind.CODEX.value,
+            direction="provider",
+            payload=resolved_payload,
+            generation=1,
+        )
+        self.store.append_normalized(
+            run_id,
+            raw_seq=3,
+            disposition=EventDisposition.RENDERED,
+            kind="approval_resolved",
+            payload=resolved_payload,
+        )
+
+        pre_recovery = self.store.get(run_id)
+        self.assertEqual(pre_recovery.state, LifecycleState.IDLE)
+        self.assertEqual(pre_recovery.pending_requests, {})
+
+        self.supervisor._sending_effects_reconciled = False  # noqa: SLF001
+        await self.supervisor._normalize_orphan_raw_events()  # noqa: SLF001
+
+        post_scan = self.store.get(run_id)
+        self.assertEqual(
+            post_scan.state,
+            LifecycleState.IDLE,
+            "recovered stale-order approval must not flip IDLE to "
+            "WAITING_APPROVAL",
+        )
+        self.assertEqual(
+            post_scan.pending_requests,
+            {},
+            "recovered stale-order approval must not resurrect a "
+            "pending_request that raw_seq=3 serverRequest/resolved "
+            "already cleared",
+        )
+
+        normalized_rows = self.store.read_normalized_events(run_id)
+        by_raw_seq = {int(row.get("raw_seq", 0)): row for row in normalized_rows}
+        # The orphan row is durably recovered so replay is complete.
+        self.assertIn(2, by_raw_seq)
+        self.assertEqual(by_raw_seq[2].get("kind"), "approval")
+        self.assertEqual(by_raw_seq[2].get("lifecycle_state"), "waiting-approval")
+
+        # Fresh boot rebuild must also preserve IDLE and empty pending.
+        rebuilt = RunStore(self.paths)
+        rebuilt_record = rebuilt.get(run_id)
+        self.assertEqual(rebuilt_record.state, LifecycleState.IDLE)
+        self.assertEqual(rebuilt_record.pending_requests, {})
 
     async def test_dedupe_owner_is_scoped_by_command_method(self) -> None:
         """WIKI-232 R2 H1: request IDs are legal once per supervisor

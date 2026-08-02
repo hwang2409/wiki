@@ -1120,7 +1120,13 @@ class RunStore:
         self._write_record(record)
 
     def _reconcile_existing_runs(self) -> None:
-        """Repair event counters after a crash between JSONL fsync and run.json."""
+        """Repair event counters after a crash between JSONL fsync and run.json.
+
+        Delegates the order-sensitive projection walk to
+        ``rebuild_projections_from_normalized`` so a boot after
+        orphan-raw recovery sees projections rebuilt in raw provider
+        order rather than JSONL append order (WIKI-232 REVIEW11 H1).
+        """
 
         for path in sorted(self.paths.runs_dir.glob("*/run.json")):
             try:
@@ -1142,81 +1148,6 @@ class RunStore:
                 _repair_jsonl_tail(normalized_path)
                 raw_events = self._read_json_lines(raw_path)
                 normalized_events = self._read_json_lines(normalized_path)
-                counts = {item.value: 0 for item in EventDisposition}
-                previous_pending_requests = {
-                    key: dict(request)
-                    for key, request in record.pending_requests.items()
-                }
-                previous_pending_user_messages = list(record.pending_user_messages)
-                previous_composer_messages = list(record.composer_messages)
-                previous_current_turn_diff = (
-                    record.current_turn_diff_turn_id,
-                    record.current_turn_diff_started_seq,
-                    record.current_turn_diff_seq,
-                )
-                record.pending_requests = {}
-                record.current_turn_diff_turn_id = None
-                record.current_turn_diff_started_seq = 0
-                record.current_turn_diff_seq = 0
-                current_diff: str | None = None
-                current_diff_dirty = False
-                lifecycle_checkpoint = record.last_lifecycle_event_seq
-                rebuilt_unread_seq = 0
-                for event in normalized_events:
-                    disposition = event.get("disposition")
-                    if disposition in counts:
-                        counts[disposition] += 1
-                    payload = event.get("payload")
-                    kind_value = str(event.get("kind") or "unknown")
-                    if isinstance(payload, dict):
-                        _apply_pending_request_event(
-                            record,
-                            kind=kind_value,
-                            payload=payload,
-                            raw_seq=int(event.get("raw_seq", 0)),
-                            normalized_at=str(event.get("normalized_at") or utc_now()),
-                        )
-                    seq = int(event.get("seq", 0))
-                    if isinstance(payload, dict):
-                        _apply_composer_message_event(
-                            record,
-                            payload=payload,
-                            seq=seq,
-                            normalized_at=str(event.get("normalized_at") or utc_now()),
-                        )
-                    changed, snapshot = _current_turn_diff_update(record, event)
-                    if changed:
-                        current_diff = snapshot
-                        current_diff_dirty = True
-                    # Rebuild the WIKI-161 unread-worthy counter alongside
-                    # normalized_event_count so a crash between JSONL fsync
-                    # and run.json replace cannot leave a stale value on disk.
-                    if _is_unread_worthy(
-                        kind_value,
-                        payload if isinstance(payload, dict) else None,
-                        str(disposition or ""),
-                    ):
-                        rebuilt_unread_seq = seq
-                    if seq <= lifecycle_checkpoint:
-                        continue
-                    lifecycle_value = event.get("lifecycle_state")
-                    if isinstance(lifecycle_value, str):
-                        try:
-                            target = LifecycleState(lifecycle_value)
-                            validate_transition(record.state, target)
-                        except ValueError:
-                            pass
-                        else:
-                            record.state = target
-                            record.state_reason = None
-                            if (
-                                target is not LifecycleState.BLOCKED
-                                and record.quiesce_operation_id is None
-                            ):
-                                record.recovery_from_state = None
-                            if target in TERMINAL_STATES:
-                                record.pending_requests.clear()
-                    lifecycle_checkpoint = seq
                 raw_count = max(
                     (int(event.get("seq", 0)) for event in raw_events),
                     default=0,
@@ -1228,28 +1159,15 @@ class RunStore:
                 if (
                     record.raw_event_count != raw_count
                     or record.normalized_event_count != normalized_count
-                    or record.disposition_counts != counts
-                    or previous_pending_requests != record.pending_requests
-                    or previous_pending_user_messages != record.pending_user_messages
-                    or previous_composer_messages != record.composer_messages
-                    or record.last_lifecycle_event_seq != lifecycle_checkpoint
-                    or record.unread_event_seq != rebuilt_unread_seq
-                    or previous_current_turn_diff
-                    != (
-                        record.current_turn_diff_turn_id,
-                        record.current_turn_diff_started_seq,
-                        record.current_turn_diff_seq,
-                    )
-                    or "current_turn_diff" in value
                 ):
                     record.raw_event_count = raw_count
                     record.normalized_event_count = normalized_count
-                    record.disposition_counts = counts
-                    record.last_lifecycle_event_seq = lifecycle_checkpoint
-                    record.unread_event_seq = rebuilt_unread_seq
                     self._write_record(record)
-                if current_diff_dirty:
-                    self._write_current_turn_diff_snapshot(record.run_id, current_diff)
+                # Rebuild every event-derived projection from scratch in
+                # raw_seq order so a post-recovery boot cannot resurrect
+                # superseded lifecycle / pending_request / current_turn_diff
+                # state from the JSONL append order (WIKI-232 REVIEW11 H1).
+                self.rebuild_projections_from_normalized(record.run_id)
             except (OSError, StoreError, TypeError, ValueError):
                 # A corrupt run remains on disk for the inspector; one bad run
                 # must not prevent the daemon from recovering healthy siblings.
@@ -2138,50 +2056,64 @@ class RunStore:
                 "lifecycle_state": lifecycle_state.value if lifecycle_state else None,
             }
             _append_json_line(self.normalized_events_path(run_id), envelope)
-            changed, snapshot = _current_turn_diff_update(record, envelope)
-            if changed:
-                self._write_current_turn_diff_snapshot(run_id, snapshot)
             record.normalized_event_count = int(envelope["seq"])
-            # Unread advances only on genuinely worker-authored surface events
-            # (see _is_unread_worthy). Synthetic supervisor wakes, outbound
-            # client_message rows, provider-lifecycle boundaries, and user
-            # inbound echoes all leave the counter alone.
-            if _is_unread_worthy(kind, payload, disposition.value):
-                record.unread_event_seq = int(envelope["seq"])
             record.disposition_counts[disposition.value] = (
                 record.disposition_counts.get(disposition.value, 0) + 1
             )
-            _apply_pending_request_event(
-                record,
-                kind=kind,
-                payload=payload,
-                raw_seq=raw_seq,
-                normalized_at=str(envelope["normalized_at"]),
-            )
-            _apply_composer_message_event(
-                record,
-                payload=payload,
-                seq=int(envelope["seq"]),
-                normalized_at=str(envelope["normalized_at"]),
-            )
-            if lifecycle_state is not None:
-                try:
-                    validate_transition(record.state, lifecycle_state)
-                except ValueError:
-                    # Late provider events cannot resurrect terminal/replaced
-                    # runs, but the event remains durably accounted for.
-                    pass
-                else:
-                    record.state = lifecycle_state
-                    record.state_reason = None
-                    if (
-                        lifecycle_state is not LifecycleState.BLOCKED
-                        and record.quiesce_operation_id is None
-                    ):
-                        record.recovery_from_state = None
-            if record.state in TERMINAL_STATES:
-                record.pending_requests.clear()
-            record.last_lifecycle_event_seq = int(envelope["seq"])
+            # A stale-order recovery (``_normalize_orphan_raw_events``
+            # replaying a raw row whose raw_seq sits below the max
+            # already applied) must not mutate any order-sensitive
+            # projection. Applying it would let a raw_seq=1 orphan
+            # approval re-add a pending_request that raw_seq=2
+            # serverRequest/resolved already cleared, or flip an idle
+            # run back to working after turn/completed already landed.
+            # The suppression covers every later causal event, not just
+            # lifecycle (WIKI-232 REVIEW11 H1). The durable JSONL row
+            # and disposition tally still land unconditionally so
+            # observability and replay are complete.
+            if raw_seq > record.last_causal_raw_seq:
+                record.last_causal_raw_seq = raw_seq
+                # Unread advances only on genuinely worker-authored surface
+                # events (see _is_unread_worthy). Synthetic supervisor wakes,
+                # outbound client_message rows, provider-lifecycle
+                # boundaries, and user inbound echoes all leave the counter
+                # alone.
+                if _is_unread_worthy(kind, payload, disposition.value):
+                    record.unread_event_seq = int(envelope["seq"])
+                changed, snapshot = _current_turn_diff_update(record, envelope)
+                if changed:
+                    self._write_current_turn_diff_snapshot(run_id, snapshot)
+                _apply_pending_request_event(
+                    record,
+                    kind=kind,
+                    payload=payload,
+                    raw_seq=raw_seq,
+                    normalized_at=str(envelope["normalized_at"]),
+                )
+                _apply_composer_message_event(
+                    record,
+                    payload=payload,
+                    seq=int(envelope["seq"]),
+                    normalized_at=str(envelope["normalized_at"]),
+                )
+                if lifecycle_state is not None:
+                    try:
+                        validate_transition(record.state, lifecycle_state)
+                    except ValueError:
+                        # Late provider events cannot resurrect terminal/replaced
+                        # runs, but the event remains durably accounted for.
+                        pass
+                    else:
+                        record.state = lifecycle_state
+                        record.state_reason = None
+                        if (
+                            lifecycle_state is not LifecycleState.BLOCKED
+                            and record.quiesce_operation_id is None
+                        ):
+                            record.recovery_from_state = None
+                if record.state in TERMINAL_STATES:
+                    record.pending_requests.clear()
+                record.last_lifecycle_event_seq = int(envelope["seq"])
             self._write_record(record)
             return envelope
 
@@ -2764,6 +2696,109 @@ class RunStore:
             after_seq=after_seq,
             limit=limit,
         )
+
+    def rebuild_projections_from_normalized(self, run_id: str) -> RunRecord:
+        """Replay the normalized event log in raw provider order to
+        repair projections after a crash or an orphan-raw recovery.
+
+        ``pending_requests``, ``current_turn_diff``,
+        ``disposition_counts``, and ``unread_event_seq`` are rebuilt
+        from scratch by walking events sorted by raw_seq, so a crash
+        between the JSONL append and ``run.json`` replace cannot leave
+        stale approval indices behind. Lifecycle transitions are only
+        re-applied for events whose raw_seq strictly exceeds
+        ``record.last_causal_raw_seq`` — that guard preserves external
+        transitions (``store.transition(BLOCKED)``,
+        ``mark_automatic_resume_failed`` etc.) while still catching new
+        lifecycle events that landed in JSONL but had not persisted a
+        matching ``record.state`` before the crash.
+
+        ``pending_user_messages`` is left alone because it interleaves
+        with external ``track_pending_user_message`` calls that predate
+        any matching echo event; the walk's remove semantics inside
+        ``_apply_composer_message_event`` are already idempotent.
+        """
+
+        with self._lock:
+            record = self.get(run_id)
+            normalized_events = sorted(
+                self._read_json_lines(self.normalized_events_path(run_id)),
+                key=lambda event: int(event.get("raw_seq", 0)),
+            )
+            record.pending_requests = {}
+            record.current_turn_diff_turn_id = None
+            record.current_turn_diff_started_seq = 0
+            record.current_turn_diff_seq = 0
+            counts = {item.value: 0 for item in EventDisposition}
+            rebuilt_unread_seq = 0
+            current_diff: str | None = None
+            current_diff_dirty = False
+            lifecycle_gate = record.last_causal_raw_seq
+            max_raw_seq = record.last_causal_raw_seq
+
+            for event in normalized_events:
+                disposition = event.get("disposition")
+                if disposition in counts:
+                    counts[disposition] += 1
+                payload = event.get("payload")
+                kind_value = str(event.get("kind") or "unknown")
+                seq = int(event.get("seq", 0))
+                raw_seq_int = int(event.get("raw_seq", 0))
+                normalized_at = str(event.get("normalized_at") or utc_now())
+                if raw_seq_int > max_raw_seq:
+                    max_raw_seq = raw_seq_int
+                if isinstance(payload, dict):
+                    _apply_pending_request_event(
+                        record,
+                        kind=kind_value,
+                        payload=payload,
+                        raw_seq=raw_seq_int,
+                        normalized_at=normalized_at,
+                    )
+                    _apply_composer_message_event(
+                        record,
+                        payload=payload,
+                        seq=seq,
+                        normalized_at=normalized_at,
+                    )
+                changed, snapshot = _current_turn_diff_update(record, event)
+                if changed:
+                    current_diff = snapshot
+                    current_diff_dirty = True
+                if _is_unread_worthy(
+                    kind_value,
+                    payload if isinstance(payload, dict) else None,
+                    str(disposition or ""),
+                ):
+                    if seq > rebuilt_unread_seq:
+                        rebuilt_unread_seq = seq
+                lifecycle_value = event.get("lifecycle_state")
+                if isinstance(lifecycle_value, str) and raw_seq_int > lifecycle_gate:
+                    try:
+                        target = LifecycleState(lifecycle_value)
+                        validate_transition(record.state, target)
+                    except ValueError:
+                        pass
+                    else:
+                        record.state = target
+                        record.state_reason = None
+                        if (
+                            target is not LifecycleState.BLOCKED
+                            and record.quiesce_operation_id is None
+                        ):
+                            record.recovery_from_state = None
+                        if target in TERMINAL_STATES:
+                            record.pending_requests.clear()
+                    record.last_lifecycle_event_seq = seq
+                    lifecycle_gate = raw_seq_int
+
+            record.disposition_counts = counts
+            record.unread_event_seq = rebuilt_unread_seq
+            record.last_causal_raw_seq = max_raw_seq
+            self._write_record(record)
+            if current_diff_dirty:
+                self._write_current_turn_diff_snapshot(run_id, current_diff)
+            return record
 
     def read_normalized_events(
         self,

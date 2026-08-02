@@ -42,6 +42,43 @@ def fleet_monitor_request_id(run_id: str, dedupe_key: str | None) -> str:
     return f"fleet-monitor:{digest}"
 
 
+def build_fleet_monitor_dispatch(supervisor: Supervisor):
+    """Return the durable dispatch callable that ``FleetMonitor`` uses.
+
+    Extracted so tests can exercise the same callable production wires
+    into ``run_daemon`` instead of hand-rolling a lookalike — a rewrite
+    that skipped ``supervisor.dispatch`` or dropped the scoped request
+    id / dedupe key would then cause both this helper and the test to
+    fail together (WIKI-232 REVIEW11 M1). The runtime binding also
+    lives in ``run_daemon`` below and MUST stay in sync with this
+    helper; every property the tests assert (routes through
+    ``run/send_now``, uses ``fleet_monitor_request_id``, uses
+    ``fleet_monitor_message_dedupe_key``, forwards ``source``) is a
+    contract of this function.
+    """
+
+    async def dispatch(
+        run_id: str,
+        message: str,
+        dedupe_key: str | None,
+        source: str | None = None,
+    ):
+        return await supervisor.dispatch(
+            "run/send_now",
+            {
+                "run_id": run_id,
+                "text": message,
+                "dedupe_key": fleet_monitor_message_dedupe_key(
+                    run_id, dedupe_key
+                ),
+                "source": source,
+                "request_id": fleet_monitor_request_id(run_id, dedupe_key),
+            },
+        )
+
+    return dispatch
+
+
 def fleet_monitor_message_dedupe_key(
     run_id: str, dedupe_key: str | None
 ) -> str | None:
@@ -192,18 +229,7 @@ async def run_daemon(args: argparse.Namespace) -> None:
             # dedupe_key to run_id as well so replacements do not
             # accidentally reuse an inherited dedupe entry from the old
             # run and swallow the first post-replacement delivery.
-            lambda run_id, message, dedupe_key, source: supervisor.dispatch(
-                "run/send_now",
-                {
-                    "run_id": run_id,
-                    "text": message,
-                    "dedupe_key": fleet_monitor_message_dedupe_key(
-                        run_id, dedupe_key
-                    ),
-                    "source": source,
-                    "request_id": fleet_monitor_request_id(run_id, dedupe_key),
-                },
-            ),
+            build_fleet_monitor_dispatch(supervisor),
             ownership_lock=supervisor._agent_lock,  # noqa: SLF001
             on_transition=AutopilotController(
                 notify=AutopilotController.live_notify,

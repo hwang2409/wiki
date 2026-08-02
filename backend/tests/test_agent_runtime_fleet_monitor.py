@@ -16,11 +16,17 @@ from unittest import mock
 from backend.app import workgraph, workgraph_service
 from backend.app.agent_runtime import graph_health
 from backend.app.agent_runtime.daemon import (
+    build_fleet_monitor_dispatch,
     fleet_monitor_message_dedupe_key,
     fleet_monitor_request_id,
 )
 from backend.app.agent_runtime.fake import FixtureAdapterFactory
-from backend.app.agent_runtime.fleet_monitor import FleetMonitor, Notification, _WorkerView
+from backend.app.agent_runtime.fleet_monitor import (
+    FLEET_MONITOR_SOURCE,
+    FleetMonitor,
+    Notification,
+    _WorkerView,
+)
 from backend.app.agent_runtime.store import RunStore, RuntimePaths
 from backend.app.agent_runtime.supervisor import Supervisor
 from backend.app.agent_runtime.types import LifecycleState, ProviderKind
@@ -1253,10 +1259,16 @@ class FleetMonitorTests(unittest.IsolatedAsyncioTestCase):
         )
 
     async def test_status_transition_writes_command_log_intent_and_receipt(self) -> None:
-        """WIKI-232 H3: production daemon wraps the fleet-monitor callable in
-        supervisor.dispatch so each monitor steer joins the durable total
-        order. Prove one tick produces a `run/send_now` intent + receipt
-        keyed by the notification's dedupe identity."""
+        """WIKI-232 H3 + REVIEW11 M1: cover the exact dispatch callable
+        production wires into ``FleetMonitor``. A copied lookalike that
+        skipped ``supervisor.dispatch``, dropped the scoped request id,
+        or bypassed the scoped transport dedupe key would leave this
+        test green while production regressed. Wire the monitor with
+        ``build_fleet_monitor_dispatch(supervisor)`` — the same helper
+        ``run_daemon`` uses — and prove the durable intent carries the
+        scoped identity, that the receipt is terminal, and that a
+        replay of the same intent does not fire a second provider
+        delivery."""
 
         await self._spawn("WIKI-ORCH", role="orchestrator", orch=None)
         await self._spawn("WIKI-232-H3", role="implement", orch="WIKI-ORCH")
@@ -1266,26 +1278,7 @@ class FleetMonitorTests(unittest.IsolatedAsyncioTestCase):
             {"state": "working", "pr": None, "step": "coding", "blocker": None},
         )
 
-        # Same shape the daemon installs — route the monitor callable
-        # through supervisor.dispatch("run/send_now", ...).
-        supervisor = self.supervisor
-
-        async def dispatch_send(
-            run_id: str,
-            message: str,
-            dedupe_key: str | None,
-            source: str | None = None,
-        ):
-            return await supervisor.dispatch(
-                "run/send_now",
-                {
-                    "run_id": run_id,
-                    "text": message,
-                    "dedupe_key": dedupe_key,
-                    "source": source,
-                    "request_id": fleet_monitor_request_id(run_id, dedupe_key),
-                },
-            )
+        dispatch_send = build_fleet_monitor_dispatch(self.supervisor)
 
         durable_monitor = FleetMonitor(
             self.store,
@@ -1299,6 +1292,16 @@ class FleetMonitorTests(unittest.IsolatedAsyncioTestCase):
             ownership_lock=self.supervisor._agent_lock,  # noqa: SLF001
         )
 
+        # Wrap the underlying supervisor.dispatch so the assertions can
+        # inspect the exact payload the helper forwarded and count how
+        # many provider deliveries the replay produced.
+        original_dispatch = self.supervisor.dispatch
+        dispatched_calls: list[dict[str, object]] = []
+
+        async def recording_dispatch(method: str, params: dict[str, object]):
+            dispatched_calls.append({"method": method, "params": dict(params)})
+            return await original_dispatch(method, params)
+
         # Seed (no transitions), then observe the working -> merge-ready jump.
         await durable_monitor.tick()
         _write_status(
@@ -1311,14 +1314,41 @@ class FleetMonitorTests(unittest.IsolatedAsyncioTestCase):
                 "blocker": None,
             },
         )
-        notes = await durable_monitor.tick()
+        with mock.patch.object(
+            self.supervisor,
+            "dispatch",
+            side_effect=recording_dispatch,
+        ):
+            notes = await durable_monitor.tick()
         status_notes = [n for n in notes if n.event_type == "status-transition"]
         self.assertEqual(len(status_notes), 1, f"got: {notes}")
 
-        request_id = fleet_monitor_request_id(
-            status_notes[0].orch_run_id, status_notes[0].dedupe_key
+        note = status_notes[0]
+        expected_request_id = fleet_monitor_request_id(
+            note.orch_run_id, note.dedupe_key
         )
-        receipt = self.store.command_log.receipt("run/send_now", request_id)
+        expected_dedupe_key = fleet_monitor_message_dedupe_key(
+            note.orch_run_id, note.dedupe_key
+        )
+        # The helper's dispatch payload MUST carry (a) run/send_now
+        # routing, (b) the run-scoped request_id, (c) the run-scoped
+        # transport dedupe_key, and (d) the notification source. If the
+        # helper ever regresses to a raw dedupe_key or an unscoped
+        # request_id, these assertions catch the drift.
+        forwarded = [
+            call for call in dispatched_calls if call["method"] == "run/send_now"
+        ]
+        self.assertEqual(
+            len(forwarded), 1, f"one dispatch per monitor note: {forwarded}"
+        )
+        params = forwarded[0]["params"]
+        self.assertEqual(params["run_id"], note.orch_run_id)
+        self.assertEqual(params["text"], note.message)
+        self.assertEqual(params["request_id"], expected_request_id)
+        self.assertEqual(params["dedupe_key"], expected_dedupe_key)
+        self.assertEqual(params["source"], FLEET_MONITOR_SOURCE)
+
+        receipt = self.store.command_log.receipt("run/send_now", expected_request_id)
         self.assertIsNotNone(
             receipt,
             "monitor-originated steer must produce a durable receipt",
@@ -1330,6 +1360,56 @@ class FleetMonitorTests(unittest.IsolatedAsyncioTestCase):
             for event in self.store.command_log.events(method="run/send_now")
         }
         self.assertIn("run/send_now", intent_methods)
+
+        # Replay the same helper invocation. The command log must
+        # recognise the request_id and return the prior receipt without
+        # re-dispatching to the provider.
+        pre_replay_count = len(dispatched_calls)
+        with mock.patch.object(
+            self.supervisor,
+            "dispatch",
+            side_effect=recording_dispatch,
+        ):
+            replayed = await dispatch_send(
+                note.orch_run_id,
+                note.message,
+                note.dedupe_key,
+                FLEET_MONITOR_SOURCE,
+            )
+        self.assertEqual(
+            len(dispatched_calls) - pre_replay_count,
+            1,
+            "replay still goes through supervisor.dispatch — "
+            "idempotency is the log's job, not the helper's",
+        )
+        # ``dispatch`` returns the prior receipt shape when the same
+        # request_id lands twice; the command-log identity (single
+        # command_id) proves the replay hit the idempotency cache
+        # rather than opening a new intent that would fan out to a
+        # second provider delivery.
+        self.assertIsInstance(replayed, dict)
+        command_ids = {
+            event.get("command_id")
+            for event in self.store.command_log.events(method="run/send_now")
+            if event.get("request_id") == expected_request_id
+        }
+        self.assertEqual(
+            len(command_ids),
+            1,
+            "replay of the same helper invocation must reuse the "
+            "prior command_id rather than opening a second intent",
+        )
+        # The receipt is unchanged after replay — no second provider
+        # delivery, no second acknowledgement.
+        receipt_after_replay = self.store.command_log.receipt(
+            "run/send_now", expected_request_id
+        )
+        self.assertIsNotNone(receipt_after_replay)
+        assert receipt_after_replay is not None
+        self.assertEqual(receipt_after_replay.result, receipt.result)
+        self.assertEqual(
+            receipt_after_replay.command_hash, receipt.command_hash
+        )
 
     async def test_pending_message_survives_monitor_restart(self) -> None:
         """WIKI-232 REVIEW8 H2: an in-memory ``_pending_messages`` dict

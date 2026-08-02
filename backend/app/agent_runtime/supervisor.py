@@ -2447,6 +2447,7 @@ Preserve the same identity, role, worktree, orchestrator grouping, PR gates, and
             event_lock = self.event_processing_locks.setdefault(
                 run_id, asyncio.Lock()
             )
+            recovered_any = False
             async with event_lock:
                 # Reload after acquiring the lock so a normalize that landed
                 # while we were waiting is not double-processed here.
@@ -2457,49 +2458,37 @@ Preserve the same identity, role, worktree, orchestrator grouping, PR gates, and
                 normalized_seqs = {
                     int(event.get("raw_seq", 0)) for event in normalized_events
                 }
-                # An orphan whose raw_seq sits below an already-normalized
-                # lifecycle event is a stale-order recovery: applying its
-                # lifecycle transition now would overwrite the later
-                # authoritative state (e.g. a raw_seq=1 turn/started
-                # recovered after raw_seq=2 turn/completed already landed
-                # would flip an idle run back to working, or worse, undo a
-                # blocked/interrupted terminal state). Track the max
-                # raw_seq of any already-normalized event that carries a
-                # lifecycle transition so the recovery path can suppress
-                # projection updates for older rows (WIKI-232 REVIEW10 H1).
-                max_lifecycle_raw_seq = max(
-                    (
-                        int(event.get("raw_seq", 0))
-                        for event in normalized_events
-                        if isinstance(event.get("lifecycle_state"), str)
-                    ),
-                    default=0,
-                )
                 for envelope in orphans:
                     orphan_seq = int(envelope.get("seq", 0))
                     if orphan_seq in normalized_seqs:
                         continue
-                    stale_order = orphan_seq < max_lifecycle_raw_seq
-                    await self._recover_orphan_raw_event(
-                        run_id, envelope, stale_order=stale_order
-                    )
+                    await self._recover_orphan_raw_event(run_id, envelope)
+                    recovered_any = True
+                if recovered_any:
+                    # Recovered orphans get appended after later normalized
+                    # rows, so any projection built by walking normalized
+                    # events in file order (lifecycle state,
+                    # pending_requests, current_turn_diff, disposition
+                    # counts, unread_event_seq) can now regress or
+                    # resurrect superseded causal state — not just
+                    # lifecycle. Rebuild every order-sensitive projection
+                    # from the complete normalized set sorted by raw_seq
+                    # so record state reflects true provider order
+                    # (WIKI-232 REVIEW11 H1).
+                    self.store.rebuild_projections_from_normalized(run_id)
 
     async def _recover_orphan_raw_event(
         self,
         run_id: str,
         envelope: dict[str, Any],
-        *,
-        stale_order: bool = False,
     ) -> None:
         """Replay one orphan raw event through the normalize + match path.
 
-        ``stale_order`` marks recoveries whose raw_seq sits below an
-        already-normalized authoritative lifecycle event. The normalized
-        row is still appended for durable observability, but its
-        derived lifecycle_state is dropped so neither this write nor a
-        later ``_reconcile_existing_runs`` rebuild can regress the
-        run's state past the newer authoritative event
-        (WIKI-232 REVIEW10 H1).
+        The write preserves the normalized event's original
+        ``lifecycle_state`` for durable observability. The caller
+        (``_normalize_orphan_raw_events``) rebuilds order-sensitive
+        projections in raw_seq order afterwards so a stale-order append
+        cannot regress record state (WIKI-232 REVIEW11 H1).
         """
 
         try:
@@ -2529,35 +2518,46 @@ Preserve the same identity, role, worktree, orchestrator grouping, PR gates, and
             normalized.kind,
             normalized.payload,
         )
+        matched_pending_id: str | None = None
         if echoed_text is not None:
             pending_message = self.store.match_pending_user_message(
                 run_id,
                 echoed_text,
             )
             if pending_message is not None:
+                matched_pending_id = str(pending_message["pending_id"])
                 self.store.command_log.acknowledge_steer_for_pending(
-                    run_id, pending_message["pending_id"]
+                    run_id, matched_pending_id
                 )
                 normalized_payload = {
                     **normalized.payload,
-                    "pending_id": pending_message["pending_id"],
+                    "pending_id": matched_pending_id,
                     "composer_text": pending_message["text"],
                     "composer_sent_at": pending_message["sent_at"],
                 }
                 pending_source = pending_message.get("source")
                 if isinstance(pending_source, str) and pending_source:
                     normalized_payload["source"] = pending_source
-        effective_lifecycle_state = (
-            None if stale_order else normalized.lifecycle_state
-        )
         self.store.append_normalized(
             run_id,
             raw_seq=raw_seq,
             disposition=normalized.disposition,
             kind=normalized.kind,
             payload=normalized_payload,
-            lifecycle_state=effective_lifecycle_state,
+            lifecycle_state=normalized.lifecycle_state,
         )
+        if matched_pending_id is not None:
+            # The live drain path pairs its own ``mark_sent`` with a
+            # ``remove_queued_message_by_pending_id`` when the provider
+            # accepts the send. Recovery bypasses that drain — orphan
+            # normalization is the only signal we have that the send
+            # completed — so the queue removal has to happen here.
+            # Without it the queued row survives ``recover_on_start``,
+            # every later ``send_on_idle`` sees a stale head, and the
+            # queue never drains (WIKI-232 REVIEW11 M2).
+            self.store.remove_queued_message_by_pending_id(
+                run_id, matched_pending_id
+            )
 
     async def _reconcile_sending_steer_effects(self) -> None:
         """Resolve every steer effect left at status='sending' by a prior boot.

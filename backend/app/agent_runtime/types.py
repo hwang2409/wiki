@@ -204,6 +204,20 @@ class RunRecord:
     # counter that advances only on genuinely agent-originated events.
     unread_event_seq: int = 0
     last_lifecycle_event_seq: int = 0
+    # Max ``raw_seq`` of a normalized event whose ORDER-SENSITIVE
+    # projections (lifecycle_state, pending_requests, current_turn_diff,
+    # composer_messages, unread_event_seq) have been applied to the
+    # record. Any later ``append_normalized`` — including
+    # ``_normalize_orphan_raw_events`` replaying a stale-order recovery
+    # — writes the durable normalized row for observability but only
+    # mutates projections when ``raw_seq > last_causal_raw_seq``. This
+    # stops a raw_seq=1 orphan approval from re-adding a
+    # pending_request that raw_seq=2 serverRequest/resolved already
+    # cleared, and a raw_seq=1 orphan turn/started from flipping IDLE
+    # back to WORKING after raw_seq=2 turn/completed already landed
+    # (WIKI-232 REVIEW11 H1). Suppression covers every later causal
+    # event, not only lifecycle events.
+    last_causal_raw_seq: int = 0
     disposition_counts: dict[str, int] = field(
         default_factory=lambda: {item.value: 0 for item in EventDisposition}
     )
@@ -302,6 +316,7 @@ class RunRecord:
             "normalized_event_count": self.normalized_event_count,
             "unread_event_seq": self.unread_event_seq,
             "last_lifecycle_event_seq": self.last_lifecycle_event_seq,
+            "last_causal_raw_seq": self.last_causal_raw_seq,
             "disposition_counts": dict(self.disposition_counts),
             "pending_requests": {
                 key: dict(request) for key, request in self.pending_requests.items()
@@ -385,6 +400,7 @@ class RunRecord:
                 )
             ),
             last_lifecycle_event_seq=int(value.get("last_lifecycle_event_seq", 0)),
+            last_causal_raw_seq=int(value.get("last_causal_raw_seq", 0)),
             disposition_counts={
                 item.value: int(
                     (value.get("disposition_counts") or {}).get(item.value, 0)
