@@ -135,6 +135,7 @@ const VIRTUAL_OVERSCAN_MULTIPLIER = 5;
 const VIRTUAL_DEFAULT_VIEWPORT = 720;
 const MIN_ROW_HEIGHT = 24;
 const COMPOSER_MIN_HEIGHT = 44;
+const COMPOSER_NARROW_WIDTH = 480;
 
 type ComposerShortcut = {
   key: string;
@@ -3004,12 +3005,24 @@ function MessageComposer({
   const commandInFlightRef = useRef(false);
   const visualAnchorRef = useRef(0);
   const visualHeadRef = useRef(0);
+  const composerRef = useRef<HTMLDivElement | null>(null);
   const inputRef = useRef<HTMLTextAreaElement | null>(null);
   const measureRef = useRef<HTMLTextAreaElement | null>(null);
   const composerInputId = useId();
   const composerHelpId = `${composerInputId}-help`;
   const [caretPos, setCaretPos] = useState(selectionRef.current.start);
+  const [narrowComposer, setNarrowComposer] = useState(false);
   const [overlayPos, setOverlayPos] = useState<{ top: number; left: number } | null>(null);
+
+  useLayoutEffect(() => {
+    const node = composerRef.current;
+    if (!node) return;
+    const update = () => setNarrowComposer(node.clientWidth <= COMPOSER_NARROW_WIDTH);
+    update();
+    const observer = new ResizeObserver(update);
+    observer.observe(node);
+    return () => observer.disconnect();
+  }, []);
 
   useEffect(() => {
     const cached = getComposerState(stateKey);
@@ -3688,7 +3701,7 @@ function MessageComposer({
   }
 
   return (
-    <div className="session-composer">
+    <div className="session-composer" ref={composerRef}>
       {pending.map((message) => (
         <div
           className={`session-user session-pending-user is-${message.status}`}
@@ -3850,7 +3863,11 @@ function MessageComposer({
                 spellCheck={false}
                 placeholder={
                   vimMode === "insert"
-                    ? `Ask a question or give ${ticket} a new direction…`
+                    ? narrowComposer
+                      ? thinking
+                        ? `Steer ${ticket}…`
+                        : `Ask ${ticket}…`
+                      : `Ask a question or give ${ticket} a new direction…`
                     : undefined
                 }
                 aria-describedby={composerHelpId}
