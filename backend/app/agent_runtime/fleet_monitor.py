@@ -730,8 +730,16 @@ class FleetMonitor:
                 )
                 return None
             self._sent_dedupe_keys.add(dedupe_identity)
-            if self._pending_messages.pop(dedupe_identity, None) is not None:
-                self._persist_pending_messages()
+            # Keep the durable payload as long as this dedupe_identity's
+            # request_id can recur. Several dedupe keys (staleness pinned to
+            # int(mtime), unrouted-verdict pinned to the realarm window,
+            # graph-health pinned to the diagnostic window) are stable across
+            # daemon restarts, and _sent_dedupe_keys is process-local. Popping
+            # here on the first success lets a restarted monitor rebuild an
+            # elapsed-time message under the same durable request_id and hit
+            # CommandConflict every tick (WIKI-232 REVIEW9 F1). _reconcile_worker_state
+            # prunes entries whose run has archived; per-mtime staleness
+            # entries at the same run are naturally garbage as mtime advances.
             return Notification(
                 ticket=view.record.agent_id,
                 orch_agent_id=orch_agent_id,

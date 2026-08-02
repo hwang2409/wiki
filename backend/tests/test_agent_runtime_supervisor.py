@@ -1645,6 +1645,203 @@ class SupervisorTests(unittest.IsolatedAsyncioTestCase):
             )
         )
 
+    async def test_orphan_scan_recovers_middle_gap_raw_row(self) -> None:
+        """WIKI-232 REVIEW9 F2: a max-based cutoff skips a middle gap
+        forever. Raw row N unnormalized, later raw row M > N normalized,
+        so max(normalized.raw_seq) >= N. The sweep must recover every
+        absent raw row, not just those past the max."""
+
+        record = await self.supervisor.start_run(
+            agent_id="WIKI-232-R9-GAP",
+            provider=ProviderKind.CODEX,
+            role="implement",
+            model="fixture-codex",
+            effort="high",
+            worktree=str(self.worktree),
+            prompt="middle gap",
+        )
+        pending_id = str(uuid4())
+        echoed_text = "middle gap echo body"
+
+        self.store.command_log.steer_effect(
+            method="run/send_on_idle",
+            request_id="review9-gap-effect",
+            agent_id=record.agent_id,
+            command_hash="",
+            run_id=record.run_id,
+            pending_id=pending_id,
+            message=echoed_text,
+            mode="on_idle",
+        )
+        self.store.command_log.mark_steer_sending_for_pending(
+            record.run_id, pending_id
+        )
+        self.store.track_pending_user_message(
+            record.run_id, pending_id, echoed_text
+        )
+
+        # Raw seq 1 is the orphan (deferred normalize crashed). Raw seq 2
+        # is a benign later event that DID normalize. max(normalized.raw_seq)
+        # is 2, so the old max-based cutoff skips seq 1 forever.
+        self.store.append_raw(
+            record.run_id,
+            provider=ProviderKind.CODEX.value,
+            direction="provider",
+            payload={
+                "method": "item/completed",
+                "params": {
+                    "item": {
+                        "type": "userMessage",
+                        "content": [{"type": "text", "text": echoed_text}],
+                    }
+                },
+            },
+            generation=1,
+        )
+        self.store.append_raw(
+            record.run_id,
+            provider=ProviderKind.CODEX.value,
+            direction="provider",
+            payload={
+                "method": "item/started",
+                "params": {"item": {"type": "agentReasoning"}},
+            },
+            generation=1,
+        )
+        # Only seq 2 has a normalized row — mimics the later event landing
+        # while seq 1's deferred normalize was dropped by a crash.
+        self.store.append_normalized(
+            record.run_id,
+            raw_seq=2,
+            disposition=EventDisposition.IGNORED,
+            kind="agent_reasoning",
+            payload={},
+        )
+
+        self.assertFalse(
+            self.store.steer_delivery_observed(record.run_id, pending_id)
+        )
+
+        self.supervisor._sending_effects_reconciled = False  # noqa: SLF001
+        await self.supervisor._normalize_orphan_raw_events()  # noqa: SLF001
+        await self.supervisor._reconcile_sending_steer_effects()  # noqa: SLF001
+
+        normalized_rows = self.store.read_normalized_events(record.run_id)
+        matching = [
+            row
+            for row in normalized_rows
+            if isinstance(row.get("payload"), dict)
+            and row["payload"].get("pending_id") == pending_id
+        ]
+        self.assertEqual(len(matching), 1)
+        self.assertEqual(int(matching[0]["raw_seq"]), 1)
+        self.assertTrue(
+            self.store.steer_delivery_observed(record.run_id, pending_id)
+        )
+        resolved = self.store.command_log.steer_effect_for_pending(
+            record.run_id, pending_id
+        )
+        assert resolved is not None
+        self.assertEqual(resolved["status"], "acknowledged")
+        result = resolved.get("result")
+        if result is not None:
+            self.assertNotEqual(
+                result.get("reason"), "supervisor_restart_dropped_send"
+            )
+
+    async def test_orphan_scan_serializes_with_live_event_pump(self) -> None:
+        """WIKI-232 REVIEW9 F2: the orphan sweep runs before recovery
+        attaches live event pumps, and holds the per-run
+        event-processing lock so a concurrent normalize path cannot
+        write a second normalized row for the same raw seq."""
+
+        record = await self.supervisor.start_run(
+            agent_id="WIKI-232-R9-RACE",
+            provider=ProviderKind.CODEX,
+            role="implement",
+            model="fixture-codex",
+            effort="high",
+            worktree=str(self.worktree),
+            prompt="startup race",
+        )
+        pending_id = str(uuid4())
+        echoed_text = "startup race echo body"
+
+        self.store.command_log.steer_effect(
+            method="run/send_on_idle",
+            request_id="review9-race-effect",
+            agent_id=record.agent_id,
+            command_hash="",
+            run_id=record.run_id,
+            pending_id=pending_id,
+            message=echoed_text,
+            mode="on_idle",
+        )
+        self.store.command_log.mark_steer_sending_for_pending(
+            record.run_id, pending_id
+        )
+        self.store.track_pending_user_message(
+            record.run_id, pending_id, echoed_text
+        )
+        self.store.append_raw(
+            record.run_id,
+            provider=ProviderKind.CODEX.value,
+            direction="provider",
+            payload={
+                "method": "item/completed",
+                "params": {
+                    "item": {
+                        "type": "userMessage",
+                        "content": [{"type": "text", "text": echoed_text}],
+                    }
+                },
+            },
+            generation=1,
+        )
+
+        run_id = record.run_id
+        event_lock = self.supervisor.event_processing_locks.setdefault(
+            run_id, asyncio.Lock()
+        )
+        # Simulate a live pump holding the lock at recovery time. The
+        # sweep must wait for the pump to release. Once it does, the
+        # sweep sees the normalize the pump wrote and does not double-
+        # process the raw row.
+        await event_lock.acquire()
+        try:
+            sweep = asyncio.create_task(
+                self.supervisor._normalize_orphan_raw_events()  # noqa: SLF001
+            )
+            # Give the sweep a chance to reach the lock and block.
+            await asyncio.sleep(0.05)
+            self.assertFalse(sweep.done())
+            self.store.append_normalized(
+                run_id,
+                raw_seq=1,
+                disposition=EventDisposition.RENDERED,
+                kind="agent_user_message",
+                payload={
+                    "pending_id": pending_id,
+                    "composer_text": echoed_text,
+                    "composer_sent_at": time.time(),
+                },
+            )
+        finally:
+            event_lock.release()
+        await sweep
+
+        normalized_rows = self.store.read_normalized_events(run_id)
+        matching = [
+            row
+            for row in normalized_rows
+            if int(row.get("raw_seq", 0)) == 1
+        ]
+        self.assertEqual(
+            len(matching),
+            1,
+            f"sweep must not duplicate the pump's normalized row: {matching}",
+        )
+
     async def test_dedupe_owner_is_scoped_by_command_method(self) -> None:
         """WIKI-232 R2 H1: request IDs are legal once per supervisor
         method, so the dedupe owner must be method-scoped. A bare

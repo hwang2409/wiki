@@ -1452,9 +1452,11 @@ class FleetMonitorTests(unittest.IsolatedAsyncioTestCase):
         replayed = [call for call in dispatched if call[2] == dedupe_key]
         self.assertEqual(len(replayed), 1)
         self.assertEqual(replayed[0][1], original_message)
-        # Success: the pending entry is cleared and no second receipt
-        # exists — one durable send remains authoritative.
-        self.assertNotIn(
+        # Under REVIEW9 semantics the durable payload stays after a
+        # successful retry so a subsequent restart replays the same
+        # message under the same request_id. The receipt from the retry
+        # matches the original (idempotent dispatch).
+        self.assertIn(
             pending_identity,
             restarted._pending_messages,  # noqa: SLF001
         )
@@ -1466,9 +1468,123 @@ class FleetMonitorTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(
             replayed_receipt.command_hash, original_receipt.command_hash
         )
-        # Persistence file is empty once the retry succeeded.
-        self.assertFalse(restarted._pending_messages_path.exists())  # noqa: SLF001
+        self.assertTrue(restarted._pending_messages_path.exists())  # noqa: SLF001
         del follow_up
+
+    async def test_pending_message_survives_normal_daemon_restart(self) -> None:
+        """WIKI-232 REVIEW9 F1: after a successful staleness send, the
+        durable payload must remain persisted long enough that a normal
+        daemon restart replays the same message under the same
+        request_id. Without this a rebuilt elapsed-time message hits
+        CommandConflict every tick because the send_now receipt is
+        already durable under the shared request_id."""
+
+        from backend.app.agent_runtime.command_log import CommandConflict
+
+        await self._spawn("WIKI-ORCH", role="orchestrator", orch=None)
+        await self._spawn("WIKI-232-R9", role="implement", orch="WIKI-ORCH")
+
+        mtime = self.clock.now - 1900.0
+        _write_status(
+            self.store,
+            "WIKI-232-R9",
+            {"state": "working", "pr": None, "step": "coding", "blocker": None},
+            mtime=mtime,
+        )
+
+        supervisor = self.supervisor
+        dispatched: list[tuple[str, str, str | None]] = []
+
+        async def dispatch_send(
+            run_id: str,
+            message: str,
+            dedupe_key: str | None,
+            source: str | None = None,
+        ):
+            dispatched.append((run_id, message, dedupe_key))
+            return await supervisor.dispatch(
+                "run/send_now",
+                {
+                    "run_id": run_id,
+                    "text": message,
+                    "dedupe_key": fleet_monitor_message_dedupe_key(
+                        run_id, dedupe_key
+                    ),
+                    "source": source,
+                    "request_id": fleet_monitor_request_id(run_id, dedupe_key),
+                },
+            )
+
+        first_monitor = FleetMonitor(
+            self.store,
+            dispatch_send,
+            clock=self.clock,
+            interval=0.01,
+            unrouted_verdict_realarm=300.0,
+            review_gap_threshold=300.0,
+            review_gap_realarm=600.0,
+            staleness_threshold=1800.0,
+            ownership_lock=self.supervisor._agent_lock,  # noqa: SLF001
+        )
+
+        notes = await first_monitor.tick()
+        staleness_notes = [n for n in notes if n.event_type == "staleness"]
+        self.assertEqual(len(staleness_notes), 1)
+        original_message = staleness_notes[0].message
+        dedupe_key = staleness_notes[0].dedupe_key
+        orch_run_id = staleness_notes[0].orch_run_id
+        request_id = fleet_monitor_request_id(orch_run_id, dedupe_key)
+        original_receipt = self.store.command_log.receipt(
+            "run/send_now", request_id
+        )
+        self.assertIsNotNone(original_receipt)
+
+        # A second tick against the same first monitor is a no-op — the
+        # snapshot has ``staleness_alarmed_mtime == mtime`` so the alarm
+        # is skipped. This proves the first send was fully successful,
+        # not stuck mid-flight.
+        dispatched.clear()
+        followup = await first_monitor.tick()
+        self.assertEqual(
+            [n for n in followup if n.event_type == "staleness"], []
+        )
+        self.assertEqual(dispatched, [])
+
+        # Normal daemon restart: no manual state restore. Advance so
+        # the recomputed elapsed-minutes would change the message on
+        # any tick that rebuilt it from wall time. If the R8 fix pops
+        # after success, the retry rebuilds an incompatible payload and
+        # send_now raises CommandConflict.
+        self.clock.advance(600)
+        restarted = FleetMonitor(
+            self.store,
+            dispatch_send,
+            clock=self.clock,
+            interval=0.01,
+            unrouted_verdict_realarm=300.0,
+            review_gap_threshold=300.0,
+            review_gap_realarm=600.0,
+            staleness_threshold=1800.0,
+            ownership_lock=self.supervisor._agent_lock,  # noqa: SLF001
+        )
+
+        dispatched.clear()
+        try:
+            await restarted.tick()
+        except CommandConflict as exc:  # pragma: no cover - regression witness
+            self.fail(
+                f"restarted monitor raised CommandConflict on retry: {exc}"
+            )
+        replayed = [call for call in dispatched if call[2] == dedupe_key]
+        self.assertEqual(len(replayed), 1)
+        self.assertEqual(replayed[0][1], original_message)
+        replayed_receipt = self.store.command_log.receipt(
+            "run/send_now", request_id
+        )
+        assert replayed_receipt is not None and original_receipt is not None
+        self.assertEqual(
+            replayed_receipt.command_hash, original_receipt.command_hash
+        )
 
     async def test_orchestrator_replace_scopes_monitor_request_id(self) -> None:
         """WIKI-232 R3 H2: the durable FleetMonitor request_id must be scoped

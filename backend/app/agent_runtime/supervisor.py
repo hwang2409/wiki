@@ -2374,8 +2374,12 @@ Preserve the same identity, role, worktree, orchestrator grouping, PR gates, and
         async with self._run_mutation_admission():
             async with self.recovery_scan_lock:
                 self.store.abort_uncommitted_starts()
-                results = await self._recover_once()
+                # Normalize orphan raw rows before ``_recover_once`` attaches
+                # any live provider event pumps. Running after recovery let an
+                # in-flight normalize race the sweep and the middle-gap case
+                # go undetected (WIKI-232 REVIEW9 F2).
                 await self._normalize_orphan_raw_events()
+                results = await self._recover_once()
                 await self._reconcile_sending_steer_effects()
                 await self.command_queue.recover_pending()
                 if self._reaper_due():
@@ -2420,19 +2424,43 @@ Preserve the same identity, role, worktree, orchestrator grouping, PR gates, and
                 normalized_events = self.store.read_normalized_events(run_id)
             except RunNotFound:
                 normalized_events = []
-            max_normalized_raw_seq = max(
-                (int(event.get("raw_seq", 0)) for event in normalized_events),
-                default=0,
-            )
+            # Walk the full set of normalized raw_seq values: a middle gap
+            # (raw row N unnormalized, later raw row M > N normalized) sits
+            # at or below the max and would be skipped forever by a
+            # max-based cutoff (WIKI-232 REVIEW9 F2).
+            normalized_seqs = {
+                int(event.get("raw_seq", 0)) for event in normalized_events
+            }
             orphans = [
                 event
                 for event in raw_events
-                if int(event.get("seq", 0)) > max_normalized_raw_seq
+                if int(event.get("seq", 0)) not in normalized_seqs
             ]
             if not orphans:
                 continue
-            for envelope in orphans:
-                await self._recover_orphan_raw_event(run_id, envelope)
+            # Recover in raw order so downstream normalizers see the same
+            # sequence the live pump would deliver.
+            orphans.sort(key=lambda event: int(event.get("seq", 0)))
+            # Hold the per-run event-processing lock so a live event that
+            # arrives mid-scan cannot append a duplicate normalize row for
+            # a raw seq this pass is already replaying.
+            event_lock = self.event_processing_locks.setdefault(
+                run_id, asyncio.Lock()
+            )
+            async with event_lock:
+                # Reload after acquiring the lock so a normalize that landed
+                # while we were waiting is not double-processed here.
+                try:
+                    normalized_events = self.store.read_normalized_events(run_id)
+                except RunNotFound:
+                    continue
+                normalized_seqs = {
+                    int(event.get("raw_seq", 0)) for event in normalized_events
+                }
+                for envelope in orphans:
+                    if int(envelope.get("seq", 0)) in normalized_seqs:
+                        continue
+                    await self._recover_orphan_raw_event(run_id, envelope)
 
     async def _recover_orphan_raw_event(
         self, run_id: str, envelope: dict[str, Any]
