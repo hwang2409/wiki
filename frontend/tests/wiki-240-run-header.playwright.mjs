@@ -849,7 +849,7 @@ async function main() {
           if ((await liveSurface.locator('[data-testid="session-run-details"]').count()) !== 0) {
             throw new Error(`${label}: Run details must stay removed from the live agent surface`);
           }
-          if ((await liveSurface.locator(".session-cost").count()) !== 0) {
+          if ((await liveSurface.locator(".ticket-cost-strip").count()) !== 0) {
             throw new Error(`${label}: cost chrome must stay removed from the live agent surface`);
           }
           await header.getByRole("button", { name: "Close pane" }).click();
