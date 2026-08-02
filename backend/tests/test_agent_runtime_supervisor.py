@@ -1212,7 +1212,9 @@ class SupervisorTests(unittest.IsolatedAsyncioTestCase):
             keys = self.store.get(record.run_id).message_dedupe_keys
             self.assertEqual(len(keys), 1)
             self.assertEqual(keys[0].get("key"), dedupe_key)
-            self.assertEqual(keys[0].get("owner"), effect_id)
+            # Owner is method-scoped so the same request_id can legally
+            # appear once per supervisor method without cross-claim.
+            self.assertEqual(keys[0].get("owner"), f"run/send_now:{effect_id}")
             queued_effect = self.store.command_log.steer_effect_for_pending(
                 record.run_id, pending_id
             )
@@ -1308,6 +1310,253 @@ class SupervisorTests(unittest.IsolatedAsyncioTestCase):
             self.supervisor.adapters[record.run_id],
         )
         self.assertEqual(self.store.queued_messages(record.run_id), [])
+
+    async def test_dedupe_owner_is_scoped_by_command_method(self) -> None:
+        """WIKI-232 R2 H1: request IDs are legal once per supervisor
+        method, so the dedupe owner must be method-scoped. A bare
+        effect_id would let a run/send_on_idle call with the same
+        request_id + dedupe_key reclaim a prior run/send_now claim and
+        deliver a duplicate. The correct behavior is to surface the
+        collision as deduplicated on the second call."""
+
+        record = await self.supervisor.start_run(
+            agent_id="WIKI-232-XMODE",
+            provider=ProviderKind.CODEX,
+            role="implement",
+            model="fixture-codex",
+            effort="high",
+            worktree=str(self.worktree),
+            prompt="cross-mode dedupe",
+        )
+        dedupe_key = "wiki-232-xmode:artifact-render:1"
+        shared_request_id = "xmode-request-1"
+
+        sent = await self.supervisor.send_now(
+            record.run_id,
+            "cross-mode message",
+            dedupe_key=dedupe_key,
+            effect_id=shared_request_id,
+        )
+        self.assertEqual(sent["status"], "sent")
+
+        # Same request_id under the other method is a legal command-log
+        # entry, but it carries the same dedupe_key so the second call
+        # must be deduplicated instead of queuing a duplicate message.
+        dupe = await self.supervisor.send_on_idle(
+            record.run_id,
+            "cross-mode message",
+            dedupe_key=dedupe_key,
+            effect_id=shared_request_id,
+        )
+        self.assertEqual(dupe["status"], "deduplicated")
+        self.assertEqual(dupe["dedupe_key"], dedupe_key)
+
+        entries = [
+            entry
+            for entry in self.store.get(record.run_id).message_dedupe_keys
+            if entry.get("key") == dedupe_key
+        ]
+        self.assertEqual(len(entries), 1)
+        self.assertEqual(
+            entries[0].get("owner"),
+            f"run/send_now:{shared_request_id}",
+        )
+
+    async def test_in_session_uncertain_head_drains_next_queued(self) -> None:
+        """WIKI-232 R2 H2a: dropping an uncertain queue head from the
+        in-session exception path must not strand later queued messages.
+        Prior to the fix the drop returned without triggering another
+        drain, so anything queued behind the failed head sat forever
+        unless a fresh external idle event happened to fire."""
+
+        record = await self.supervisor.start_run(
+            agent_id="WIKI-232-R2A",
+            provider=ProviderKind.CODEX,
+            role="implement",
+            model="fixture-codex",
+            effort="high",
+            worktree=str(self.worktree),
+            prompt="uncertain-head drain",
+        )
+        adapter = self.supervisor.adapters[record.run_id]
+        snapshot = adapter.snapshot()
+
+        # Force adapter non-idle so send_on_idle queues instead of delivering.
+        working = AdapterStatus(
+            LifecycleState.WORKING,
+            snapshot.session_id,
+            os.getpid(),
+            generation=snapshot.generation,
+        )
+        adapter._status = working  # noqa: SLF001 - queueing fixture
+        self.store.update_adapter_status(record.run_id, working)
+
+        pid1 = str(uuid4())
+        pid2 = str(uuid4())
+        q1 = await self.supervisor.send_on_idle(
+            record.run_id,
+            "queued-1",
+            pending_id=pid1,
+            effect_id="r2a-1",
+        )
+        q2 = await self.supervisor.send_on_idle(
+            record.run_id,
+            "queued-2",
+            pending_id=pid2,
+            effect_id="r2a-2",
+        )
+        self.assertEqual(q1["status"], "queued")
+        self.assertEqual(q2["status"], "queued")
+        self.assertEqual(len(self.store.queued_messages(record.run_id)), 2)
+
+        idle = AdapterStatus(
+            LifecycleState.IDLE,
+            snapshot.session_id,
+            os.getpid(),
+            generation=snapshot.generation,
+        )
+        adapter._status = idle  # noqa: SLF001 - drain fixture
+        self.store.update_adapter_status(record.run_id, idle)
+
+        original_send = adapter.send_on_idle
+        call_log: list[str] = []
+
+        async def flaky_send_on_idle(msg: str) -> AdapterStatus:
+            call_log.append(msg)
+            if msg == "queued-1":
+                raise RuntimeError("simulated transient adapter failure")
+            return await original_send(msg)
+
+        adapter.send_on_idle = flaky_send_on_idle  # type: ignore[method-assign]
+        try:
+            await self.supervisor._deliver_next_queued_locked(  # noqa: SLF001
+                record.run_id,
+                adapter,
+            )
+            for _ in range(200):
+                if not self.store.queued_messages(record.run_id):
+                    break
+                await asyncio.sleep(0.01)
+        finally:
+            adapter.send_on_idle = original_send  # type: ignore[method-assign]
+
+        # Both attempts were made: the second WITHOUT any new
+        # supervisor.send_on_idle call or synthetic idle event.
+        self.assertEqual(call_log, ["queued-1", "queued-2"])
+        self.assertEqual(self.store.queued_messages(record.run_id), [])
+
+        first_effect = self.store.command_log.steer_effect_for_pending(
+            record.run_id, pid1,
+        )
+        self.assertIsNotNone(first_effect)
+        assert first_effect is not None
+        self.assertEqual(first_effect["status"], "acknowledged")
+        self.assertEqual(first_effect["result"]["status"], "uncertain")
+
+        second_effect = self.store.command_log.steer_effect_for_pending(
+            record.run_id, pid2,
+        )
+        self.assertIsNotNone(second_effect)
+        assert second_effect is not None
+        self.assertIn(second_effect["status"], {"sent", "acknowledged"})
+
+    async def test_recover_on_start_uncertain_head_drains_next_queued(
+        self,
+    ) -> None:
+        """WIKI-232 R2 H2b: same guarantee as the in-session path but
+        for the restart sweep. After the sweep terminalizes a wedged
+        head it must schedule delivery of the next queued message, so
+        recovery does not leave a run stranded until the next external
+        idle event."""
+
+        record = await self.supervisor.start_run(
+            agent_id="WIKI-232-R2B",
+            provider=ProviderKind.CODEX,
+            role="implement",
+            model="fixture-codex",
+            effort="high",
+            worktree=str(self.worktree),
+            prompt="restart drain",
+        )
+        adapter = self.supervisor.adapters[record.run_id]
+        pid1 = str(uuid4())
+
+        # Wedge the first message in `sending` state — the CancelledError
+        # trick used by the existing H2 test.
+        with mock.patch.object(
+            self.store.command_log,
+            "mark_steer_sent_for_pending",
+            side_effect=asyncio.CancelledError,
+        ):
+            with self.assertRaises(asyncio.CancelledError):
+                await self.supervisor.send_on_idle(
+                    record.run_id,
+                    "wedged-1",
+                    pending_id=pid1,
+                    effect_id="r2b-1",
+                )
+
+        wedged = self.store.command_log.steer_effect_for_pending(
+            record.run_id, pid1,
+        )
+        self.assertIsNotNone(wedged)
+        assert wedged is not None
+        self.assertEqual(wedged["status"], "sending")
+        self.assertEqual(len(self.store.queued_messages(record.run_id)), 1)
+
+        # Adapter is WORKING after the wedge, so queue a second message
+        # behind the stuck head via the normal send_on_idle path.
+        pid2 = str(uuid4())
+        q2 = await self.supervisor.send_on_idle(
+            record.run_id,
+            "queued-2",
+            pending_id=pid2,
+            effect_id="r2b-2",
+        )
+        self.assertEqual(q2["status"], "queued")
+        self.assertEqual(len(self.store.queued_messages(record.run_id)), 2)
+
+        # Return the adapter to IDLE so the post-sweep drain can deliver.
+        snapshot = adapter.snapshot()
+        idle = AdapterStatus(
+            LifecycleState.IDLE,
+            snapshot.session_id,
+            os.getpid(),
+            generation=snapshot.generation,
+        )
+        adapter._status = idle  # noqa: SLF001 - drain fixture
+        self.store.update_adapter_status(record.run_id, idle)
+
+        original_send = adapter.send_on_idle
+        call_log: list[str] = []
+
+        async def tracked_send(msg: str) -> AdapterStatus:
+            call_log.append(msg)
+            return await original_send(msg)
+
+        adapter.send_on_idle = tracked_send  # type: ignore[method-assign]
+        try:
+            self.supervisor._sending_effects_reconciled = False  # noqa: SLF001
+            await self.supervisor._reconcile_sending_steer_effects()  # noqa: SLF001
+            for _ in range(200):
+                if not self.store.queued_messages(record.run_id):
+                    break
+                await asyncio.sleep(0.01)
+        finally:
+            adapter.send_on_idle = original_send  # type: ignore[method-assign]
+
+        # The second message drained without any new supervisor call
+        # or synthetic idle event — only the sweep + its spawned drain.
+        self.assertEqual(call_log, ["queued-2"])
+        self.assertEqual(self.store.queued_messages(record.run_id), [])
+
+        resolved = self.store.command_log.steer_effect_for_pending(
+            record.run_id, pid1,
+        )
+        self.assertIsNotNone(resolved)
+        assert resolved is not None
+        self.assertEqual(resolved["status"], "acknowledged")
+        self.assertEqual(resolved["result"]["status"], "uncertain")
 
     async def test_delivered_pending_id_survives_replace_until_late_echo(self) -> None:
         record = await self.supervisor.start_run(

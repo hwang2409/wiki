@@ -1554,6 +1554,21 @@ Preserve the same identity, role, worktree, orchestrator grouping, PR gates, and
                 await self._publish(
                     {"type": "session", "ticket": record.agent_id, "surface": "queue"}
                 )
+                # Dropping an uncertain head does not itself emit any later
+                # idle transition, so anything queued behind it would stay
+                # stranded until the next external trigger (WIKI-232 R2).
+                # Schedule a fresh drain if there is more work and this
+                # adapter is still the one attached — the monitor task waits
+                # on the run+queue locks we hold here, so it runs strictly
+                # after this exception path releases them.
+                if (
+                    self.store.peek_queued_message(run_id) is not None
+                    and self.adapters.get(run_id) is adapter
+                ):
+                    self._spawn_monitor_task(
+                        self._deliver_next_queued(run_id, adapter),
+                        name=f"agent-queue-drain-{run_id}",
+                    )
                 return
             if pending_id is not None:
                 self.store.command_log.mark_steer_sent_for_pending(run_id, pending_id)
@@ -2284,6 +2299,21 @@ Preserve the same identity, role, worktree, orchestrator grouping, PR gates, and
                         run_id, pending_id_str
                     )
                     self.store.discard_pending_user_message(run_id, pending_id_str)
+                # Removing the wedged head does not fire a new idle event,
+                # so anything queued behind it would remain stranded until
+                # the next external trigger (WIKI-232 R2). If the recovered
+                # adapter is attached and there is more work, schedule a
+                # drain — the monitor task will re-enter through the normal
+                # queue lock once this reconcile step releases its run lock.
+                adapter = self.adapters.get(run_id)
+                if (
+                    adapter is not None
+                    and self.store.peek_queued_message(run_id) is not None
+                ):
+                    self._spawn_monitor_task(
+                        self._deliver_next_queued(run_id, adapter),
+                        name=f"agent-recover-queue-drain-{run_id}",
+                    )
 
     async def _reap_lost_runs(self) -> list[dict[str, str]]:
         self.last_reaper_at = time.monotonic()
@@ -3390,10 +3420,15 @@ Preserve the same identity, role, worktree, orchestrator grouping, PR gates, and
         if dedupe_key is not None:
             # Bind the dedupe claim to the steer effect so replay after a
             # crash between the claim and provider delivery can resume
-            # (WIKI-232). Non-command paths (effect_id is None) keep the
-            # legacy owner-less behavior and remain single-shot.
+            # (WIKI-232). The owner is method-scoped because the command log
+            # permits the same request_id once per method (send_now +
+            # send_on_idle); an unscoped owner would let a cross-method
+            # collision reclaim its sibling's key. Non-command paths
+            # (effect_id is None) keep the legacy owner-less behavior and
+            # remain single-shot.
+            owner = f"run/send_now:{effect_id}" if effect_id is not None else None
             _, claimed = self.store.claim_message_dedupe_key(
-                run_id, dedupe_key, owner=effect_id
+                run_id, dedupe_key, owner=owner
             )
             if not claimed:
                 return {"status": "deduplicated", "dedupe_key": dedupe_key}
@@ -3520,8 +3555,12 @@ Preserve the same identity, role, worktree, orchestrator grouping, PR gates, and
                     return result
                 return {"status": "uncertain", "pending_id": pending_id}
         if dedupe_key is not None:
+            # Method-scope the owner: see the twin comment in _send_now.
+            owner = (
+                f"run/send_on_idle:{effect_id}" if effect_id is not None else None
+            )
             record, claimed = self.store.claim_message_dedupe_key(
-                run_id, dedupe_key, owner=effect_id
+                run_id, dedupe_key, owner=owner
             )
             if not claimed:
                 return {
