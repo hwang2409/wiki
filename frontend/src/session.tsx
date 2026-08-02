@@ -2860,7 +2860,10 @@ export function SessionTab({
               <span className="session-hint-key">enter</span> send
             </span>
             <span className="session-hint">
-              <span className="session-hint-key">shift+enter</span> queue
+              {/* Mirrors the composer handler: Shift+Enter queues only while
+                  the agent is working; when idle it inserts a newline. */}
+              <span className="session-hint-key">shift+enter</span>{" "}
+              {session.working ? "queue" : "newline"}
             </span>
             <span className="session-hint">
               <span className="session-hint-key">esc</span> vim

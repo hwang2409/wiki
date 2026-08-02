@@ -207,6 +207,57 @@ try {
   }
   await page.screenshot({ path: path.join(OUT_DIR, "02-session-surface.png") });
 
+  logStep("state 4: shift+enter hint mirrors composer behavior (working vs idle)");
+  // The backend derives `working` from transcript mtime (< 30s) when no
+  // supervisor or tmux pane resolves — touch vs backdate drives both states.
+  await fs.utimes(transcript, new Date(), new Date());
+  await page.reload({ waitUntil: "domcontentloaded" });
+  await page.waitForSelector(".session-footer-hints");
+  const workingHint = await page.locator(".session-footer-hints").innerText();
+  assert(
+    /shift\+enter\s+queue/.test(workingHint),
+    `working session must advertise queue, got ${workingHint}`,
+  );
+
+  const stale = new Date(Date.now() - 120_000);
+  await fs.utimes(transcript, stale, stale);
+  await page.reload({ waitUntil: "domcontentloaded" });
+  await page.waitForSelector(".session-footer-hints");
+  const idleHint = await page.locator(".session-footer-hints").innerText();
+  assert(
+    /shift\+enter\s+newline/.test(idleHint),
+    `idle session must advertise newline, got ${idleHint}`,
+  );
+
+  logStep("state 5: hint strip stays inside footer bounds at 320px");
+  await page.setViewportSize({ width: 320, height: 900 });
+  await page.waitForSelector(".session-footer-hints");
+  const layout = await page.evaluate(() => {
+    const footer = document.querySelector(".session-footer");
+    const rect = footer.getBoundingClientRect();
+    return {
+      scrollWidth: footer.scrollWidth,
+      clientWidth: footer.clientWidth,
+      footer: { left: rect.left, right: rect.right },
+      hints: Array.from(document.querySelectorAll(".session-hint")).map((el) => {
+        const r = el.getBoundingClientRect();
+        return { left: r.left, right: r.right };
+      }),
+    };
+  });
+  assert(
+    layout.scrollWidth <= layout.clientWidth,
+    `footer must not overflow horizontally at 320px: scrollWidth ${layout.scrollWidth} vs clientWidth ${layout.clientWidth}`,
+  );
+  assert(layout.hints.length === 3, `all three hints must stay visible, got ${layout.hints.length}`);
+  for (const hint of layout.hints) {
+    assert(
+      hint.left >= layout.footer.left - 0.5 && hint.right <= layout.footer.right + 0.5,
+      `hint [${hint.left}, ${hint.right}] must sit inside footer [${layout.footer.left}, ${layout.footer.right}]`,
+    );
+  }
+  await page.screenshot({ path: path.join(OUT_DIR, "03-narrow-footer.png") });
+
   logStep("PASS");
 } finally {
   await browser?.close();
