@@ -5,6 +5,7 @@ import struct
 
 from .base import MediaScrubError
 from ._mp4_sample_entry import (
+    _Mp4TrackDimensions,
     _parse_avc_sample_config_from_entry,
     _sample_entry_pasp_ratio,
     _validate_avc_dimensions,
