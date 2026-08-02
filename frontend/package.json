@@ -15,6 +15,8 @@
     "pretest:wiki-235": "npm run build",
     "test:wiki-235": "vitest run tests/wiki-235-runs-declutter.integration.test.tsx && node tests/wiki-234-opencode-restyle.playwright.mjs",
     "test:wiki-237": "node tests/wiki-237-prompt-dock.playwright.mjs",
+    "pretest:wiki-240": "npm run build",
+    "test:wiki-240": "vitest run tests/loop-state-chrome.integration.test.tsx && node tests/wiki-240-run-header.playwright.mjs",
     "test:wiki-218": "node tests/wiki-218-terminal-chrome.playwright.mjs",
     "test:terminal-pane": "node tests/terminal-pane.playwright.mjs",
     "test:wiki-195": "node tests/wiki-195-inspector.playwright.mjs",

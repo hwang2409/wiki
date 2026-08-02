@@ -603,13 +603,29 @@ export function AgentSessionSurface({
     <div className={`agent-session-surface-row is-${context}`} ref={rowRef}>
       <section className={`agent-session-surface is-${context}`}>
         <header className="session-header agent-session-surface-head">
-          <span className="session-ticket">{worker.ticket}</span>
-          {worker.kind ? <StatusBadge compact label={worker.kind} state="neutral" /> : null}
-          {worker.role ? <StatusBadge compact label={worker.role} state="neutral" /> : null}
-          {worker.model ? <StatusBadge compact label={worker.model} state="faint" /> : null}
-          <WorkerStatePill state={state} />
-          <LoopStateChrome ticket={worker.ticket} tick={tick} />
-          <div className="agent-surface-actions">
+          <div className="agent-session-head-primary" data-testid="session-header-primary">
+            <span className="session-ticket">{worker.ticket}</span>
+            <WorkerStatePill state={state} />
+            {blocker ? (
+              <div className="session-blocker-row" data-testid="session-blocker-row" role="alert">
+                <AlertTriangle aria-hidden size={13} />
+                <span className="session-blocker-text" title={blocker}>{blocker}</span>
+              </div>
+            ) : step ? (
+              <div className="session-step-row" data-testid="session-step-row">
+                <span className="session-step-label">now</span>
+                <span className="session-step-text" title={step}>{step}</span>
+              </div>
+            ) : null}
+          </div>
+          <div className="agent-session-head-secondary" data-testid="session-header-secondary">
+            <div className="agent-session-runtime" aria-label="Runtime metadata">
+              {worker.kind ? <span className="agent-session-runtime-item">{worker.kind}</span> : null}
+              {worker.role ? <span className="agent-session-runtime-item">{worker.role}</span> : null}
+              {worker.model ? <span className="agent-session-runtime-item">{worker.model}</span> : null}
+              <LoopStateChrome ticket={worker.ticket} tick={tick} />
+            </div>
+            <div className="agent-surface-actions" aria-label="Run actions">
               {worker.canReplace && worker.kind && worker.model ? (
                 <button
                   className="agent-surface-action"
@@ -666,19 +682,8 @@ export function AgentSessionSurface({
                 </button>
               ) : null}
             </div>
+          </div>
         </header>
-        {blocker ? (
-          <div className="session-blocker-row" data-testid="session-blocker-row" role="alert">
-            <AlertTriangle size={13} />
-            <span className="session-blocker-label">blocked</span>
-            <span className="session-blocker-text">{blocker}</span>
-          </div>
-        ) : step ? (
-          <div className="session-step-row" data-testid="session-step-row">
-            <span className="session-step-label">step</span>
-            <span className="session-step-text">{step}</span>
-          </div>
-        ) : null}
         <div className="agent-session-surface-main" ref={mainScopeRef}>
           <SessionTab
             onArtifactsChange={handleArtifactsChange}

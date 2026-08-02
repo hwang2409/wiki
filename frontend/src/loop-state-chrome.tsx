@@ -14,6 +14,20 @@ type Props = {
   tick: number;
 };
 
+type LoopLimitState = "below-cap" | "at-cap" | "over-cap";
+
+function loopLimitState(state: LoopState): LoopLimitState {
+  if (state.round > state.cap) return "over-cap";
+  if (state.round === state.cap) return "at-cap";
+  return "below-cap";
+}
+
+function loopRoundLabel(state: LoopState): string {
+  return loopLimitState(state) === "over-cap"
+    ? `round ${state.round} · cap ${state.cap} exceeded`
+    : `round ${state.round} of ${state.cap}`;
+}
+
 function shortTime(value: string | null | undefined): string {
   if (!value) return "";
   return value.slice(11, 16) || value;
@@ -212,20 +226,17 @@ export function LoopStateChrome({ ticket, tick }: Props) {
 
   const chips = useMemo(() => {
     if (!state) return null;
-    const capReached = state.round >= state.cap;
-    const roundLabel = `round ${state.round} of ${state.cap}`;
+    const limitState = loopLimitState(state);
+    const roundLabel = loopRoundLabel(state);
     return (
       <>
         <span
-          className={`loop-chrome-chip loop-chrome-round is-${state.danger}${capReached ? " is-cap" : ""}`}
+          className={`loop-chrome-chip loop-chrome-round is-${limitState}`}
+          data-danger={state.danger}
+          data-limit-state={limitState}
           data-testid="loop-chrome-round"
         >
-          <span className="loop-chrome-glyph tabular-nums">
-            <span className="loop-chrome-round-num">{state.round}</span>
-            <span className="loop-chrome-round-slash">/</span>
-            <span className="loop-chrome-round-cap">{state.cap}</span>
-          </span>
-          <span className="loop-chrome-label">{roundLabel}</span>
+          <span className="loop-chrome-label tabular-nums">{roundLabel}</span>
         </span>
         {state.unrouted_verdict_count > 0 ? (
           <span
@@ -265,7 +276,11 @@ export function LoopStateChrome({ ticket, tick }: Props) {
   const hasDetails = Boolean(hasLoopHistory || hasAutopilotLog);
 
   return (
-    <div className="loop-chrome" data-danger={state?.danger ?? "normal"}>
+    <div
+      className="loop-chrome"
+      data-danger={state?.danger ?? "normal"}
+      data-limit-state={state ? loopLimitState(state) : "none"}
+    >
       <div className="loop-chrome-controls">
         {hasDetails ? (
           <button
@@ -308,7 +323,7 @@ export function LoopStateChrome({ ticket, tick }: Props) {
             <span className="loop-chrome-detail-title">merge-ready loop</span>
             {state ? (
               <span className="loop-chrome-detail-sub tabular-nums">
-                {state.round}/{state.cap} rounds
+                {loopRoundLabel(state)}
                 {state.plateau_length >= 2
                   ? ` · plateau ${state.plateau_length}`
                   : ""}

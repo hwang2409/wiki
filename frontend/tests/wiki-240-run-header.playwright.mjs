@@ -1,0 +1,358 @@
+import fs from "node:fs/promises";
+import path from "node:path";
+import { fileURLToPath } from "node:url";
+import { chromium } from "playwright";
+
+import {
+  codexAssistant,
+  makeFixtureRoot,
+  startBackend,
+  writeQueue,
+  writeRegistry,
+} from "../scripts/wiki32-harness.mjs";
+
+const HERE = path.dirname(fileURLToPath(import.meta.url));
+const OUT_DIR = process.env.WIKI_PLAYWRIGHT_OUT_DIR
+  || path.join(HERE, "evidence", "wiki-240");
+const TICKET = "WIKI-240";
+
+async function writeJsonl(target, rows) {
+  await fs.writeFile(target, `${rows.map((row) => JSON.stringify(row)).join("\n")}\n`);
+}
+
+async function writeStatus(fixtures, body) {
+  await fs.writeFile(
+    path.join(fixtures.statusDir, `${TICKET}.json`),
+    JSON.stringify(body, null, 2),
+  );
+}
+
+function loopState(round, cap = 8, danger = "normal") {
+  return {
+    round,
+    cap,
+    danger,
+    unrouted_verdict_count: 2,
+    plateau_length: 3,
+    latest_verdict: null,
+    latest_verdict_finding: "The header hid the current run step.",
+    history: [
+      {
+        round: Math.max(1, round - 1),
+        reviewer: `${TICKET}-REVIEW1`,
+        spawned_at: "2026-08-02T12:00:00Z",
+        verdict_state: "NOT-MERGE-READY",
+        verdict_at: "2026-08-02T12:10:00Z",
+        routed_at: "2026-08-02T12:12:00Z",
+        archived_at: null,
+        top_finding: "The header hid the current run step.",
+        finding_signature: "header step hidden",
+      },
+    ],
+  };
+}
+
+async function main() {
+  await fs.mkdir(OUT_DIR, { recursive: true });
+  const fixtures = makeFixtureRoot("wiki-240-header-");
+  const transcript = path.join(fixtures.root, "wiki-240-transcript.jsonl");
+  await writeJsonl(transcript, [
+    codexAssistant(
+      "Stable header fixture. All run functions remain available.",
+      "2026-08-02T12:00:00Z",
+    ),
+  ]);
+  writeRegistry(fixtures.registryPath, [[TICKET, transcript]]);
+  writeQueue(fixtures.queuePath, TICKET, []);
+
+  let currentStatus = {
+    state: "working",
+    pr: "https://github.com/hwang2409/wiki/pull/999",
+    step: "building the two-level run header and checking responsive action access",
+    blocker: null,
+  };
+  let currentLoop = loopState(3);
+  await writeStatus(fixtures, currentStatus);
+
+  const backend = await startBackend(fixtures);
+  const browser = await chromium.launch({ headless: true });
+  const page = await browser.newPage({ viewport: { width: 1440, height: 900 } });
+
+  try {
+    await page.addInitScript(({ ticket }) => {
+      localStorage.setItem("wiki-sidebar-visible", "false");
+      localStorage.setItem(
+        "wiki-window-layout-v2",
+        JSON.stringify({
+          version: 2,
+          activeWindowId: "window-0",
+          windows: [
+            {
+              id: "window-0",
+              focusedPaneId: "pane-1",
+              layout: { kind: "pane", id: "pane-1", path: `agent://${ticket}` },
+            },
+          ],
+        }),
+      );
+    }, { ticket: TICKET });
+
+    await page.route("**/api/agents", async (route) => {
+      const response = await route.fetch();
+      const body = await response.json();
+      await route.fulfill({
+        status: 200,
+        contentType: "application/json",
+        body: JSON.stringify({
+          ...body,
+          orchestrators: (body.orchestrators ?? []).filter((orch) => orch.id !== TICKET),
+          workers: (body.workers ?? []).map((worker) =>
+            worker.ticket === TICKET
+              ? {
+                  ...worker,
+                  ...currentStatus,
+                  kind: "cdx",
+                  role: "implement",
+                  model: "gpt-5.6-sol",
+                  run_id: "fixture-run",
+                  canReview: true,
+                  canReplace: true,
+                }
+              : worker,
+          ),
+        }),
+      });
+    });
+    await page.route(`**/api/agents/${TICKET}/workgraph`, async (route) => {
+      await route.fulfill({
+        status: 200,
+        contentType: "application/json",
+        body: JSON.stringify({
+          ok: true,
+          source: "live",
+          workgraph: {
+            ticket: TICKET,
+            orch: "wiki",
+            created_at: "2026-08-02T12:00:00Z",
+            updated_at: "2026-08-02T12:12:00Z",
+            nodes: [],
+            edges: [],
+            composite_health: {
+              state: "iterating",
+              open_findings: 2,
+              blocking: 0,
+              slowest_node_stall_seconds: 0,
+              iteration_count: currentLoop.round,
+            },
+          },
+          loop_state: currentLoop,
+        }),
+      });
+    });
+    await page.route(`**/api/autopilot/${TICKET}`, async (route) => {
+      await route.fulfill({
+        status: 200,
+        contentType: "application/json",
+        body: JSON.stringify({
+          enabled: true,
+          iteration_cap: 8,
+          plateau_guard: 3,
+          henry_ack_required_for_merge: false,
+          last_action_at_ns: 1_754_000_000_000_000_000,
+          halted: null,
+          merge_ack_at_ns: null,
+          actions: [
+            {
+              action: "steer-sent",
+              at_ns: 1_754_000_000_000_000_000,
+              source: "autopilot",
+              preview: "keep the current step in the first reading level",
+              target: TICKET,
+            },
+          ],
+        }),
+      });
+    });
+
+    const states = [
+      {
+        name: "working",
+        status: {
+          state: "working",
+          pr: currentStatus.pr,
+          step: "building the two-level run header and checking responsive action access",
+          blocker: null,
+        },
+        loop: loopState(3),
+      },
+      {
+        name: "merge-ready",
+        status: {
+          state: "merge-ready",
+          pr: currentStatus.pr,
+          step: "focused header tests pass twice; the screenshot audit is complete",
+          blocker: null,
+        },
+        loop: loopState(6),
+      },
+      {
+        name: "blocked",
+        status: {
+          state: "blocked",
+          pr: currentStatus.pr,
+          step: "waiting for the fixture service",
+          blocker: "the fixture service stopped before the header audit completed",
+        },
+        loop: loopState(4),
+      },
+      {
+        name: "at-cap",
+        status: {
+          state: "working",
+          pr: currentStatus.pr,
+          step: "review round eight is active at the configured loop cap",
+          blocker: null,
+        },
+        loop: loopState(8),
+      },
+      {
+        name: "over-cap",
+        status: {
+          state: "working",
+          pr: currentStatus.pr,
+          step: "review round nine continues after the configured loop cap",
+          blocker: null,
+        },
+        loop: loopState(9),
+      },
+    ];
+
+    for (const fixture of states) {
+      currentStatus = fixture.status;
+      currentLoop = fixture.loop;
+      await writeStatus(fixtures, currentStatus);
+      for (const viewport of [
+        { name: "normal", width: 1440, height: 900 },
+        { name: "narrow", width: 960, height: 900 },
+      ]) {
+        await page.setViewportSize({ width: viewport.width, height: viewport.height });
+        await page.goto("about:blank");
+        await page.goto(`${backend.baseUrl}/#/agent/${TICKET}`, { waitUntil: "domcontentloaded" });
+        const header = page.locator(".agent-session-surface-head");
+        await header.waitFor({ state: "visible" });
+        await header.locator('[data-testid="session-state-pill"]').filter({ hasText: fixture.status.state }).waitFor();
+        const expectedRound = fixture.loop.round > fixture.loop.cap
+          ? `round ${fixture.loop.round} · cap ${fixture.loop.cap} exceeded`
+          : `round ${fixture.loop.round} of ${fixture.loop.cap}`;
+        await header.getByText(expectedRound, { exact: true }).waitFor();
+
+        if ((await header.locator('[data-testid="session-header-primary"]').count()) !== 1
+          || (await header.locator('[data-testid="session-header-secondary"]').count()) !== 1) {
+          throw new Error(`${fixture.name}/${viewport.name}: header must have two levels`);
+        }
+        const actionLabels = await header.locator(".agent-surface-actions").innerText();
+        for (const action of ["Replace", "Review", "Graph", "Replay"]) {
+          if (!actionLabels.includes(action)) {
+            throw new Error(`${fixture.name}/${viewport.name}: missing ${action} action`);
+          }
+        }
+        if ((await header.getByRole("button", { name: "Close pane" }).count()) !== 1) {
+          throw new Error(`${fixture.name}/${viewport.name}: close action is missing`);
+        }
+        if ((await header.getByRole("button", { name: /autopilot on/i }).count()) !== 1) {
+          throw new Error(`${fixture.name}/${viewport.name}: autopilot control is missing`);
+        }
+        const undersizedTargets = await header.locator("button").evaluateAll((buttons) =>
+          buttons
+            .map((button) => ({
+              name: button.getAttribute("aria-label") || button.textContent?.trim() || "button",
+              height: Math.round(button.getBoundingClientRect().height),
+            }))
+            .filter((button) => button.height < 32),
+        );
+        if (undersizedTargets.length > 0) {
+          throw new Error(`${fixture.name}/${viewport.name}: undersized targets ${JSON.stringify(undersizedTargets)}`);
+        }
+        const overflow = await header.evaluate((element) => element.scrollWidth > element.clientWidth);
+        if (overflow) {
+          const dimensions = await header.evaluate((element) => ({
+            clientWidth: element.clientWidth,
+            scrollWidth: element.scrollWidth,
+            headerStyle: {
+              alignItems: getComputedStyle(element).alignItems,
+              flexDirection: getComputedStyle(element).flexDirection,
+              flexWrap: getComputedStyle(element).flexWrap,
+            },
+            primaryStyle: {
+              display: getComputedStyle(element.querySelector(".agent-session-head-primary")).display,
+              width: getComputedStyle(element.querySelector(".agent-session-head-primary")).width,
+            },
+            overflowing: Array.from(element.querySelectorAll("*") )
+              .filter((child) => child.scrollWidth > child.clientWidth)
+              .map((child) => ({
+                className: child.className,
+                clientWidth: child.clientWidth,
+                scrollWidth: child.scrollWidth,
+              }))
+              .slice(0, 8),
+            outside: Array.from(element.querySelectorAll("*"))
+              .map((child) => ({
+                className: child.className,
+                left: Math.round(child.getBoundingClientRect().left),
+                right: Math.round(child.getBoundingClientRect().right),
+              }))
+              .filter((child) => child.right > Math.round(element.getBoundingClientRect().right))
+              .slice(0, 8),
+          }));
+          throw new Error(`${fixture.name}/${viewport.name}: header clips horizontally ${JSON.stringify(dimensions)}`);
+        }
+
+        await header.screenshot({
+          path: path.join(OUT_DIR, `${fixture.name}-${viewport.name}.png`),
+        });
+      }
+    }
+
+    await page.setViewportSize({ width: 1440, height: 900 });
+    currentStatus = states[0].status;
+    currentLoop = states[0].loop;
+    await page.goto("about:blank");
+    await page.goto(`${backend.baseUrl}/#/agent/${TICKET}`, { waitUntil: "domcontentloaded" });
+    const loopTrigger = page.getByRole("button", { name: /show merge-ready loop history/i });
+    await loopTrigger.click();
+    const detail = page.locator(".loop-chrome-detail");
+    await detail.getByText("latest finding").waitFor();
+    await detail.getByText("The header hid the current run step.").first().waitFor();
+    await detail.getByText("autopilot log").waitFor();
+    if ((await page.locator('[data-testid="session-run-details"]').count()) !== 0) {
+      throw new Error("WIKI-240: Run details must stay removed");
+    }
+    if ((await page.locator(".session-cost").count()) !== 0) {
+      throw new Error("WIKI-240: cost chrome must stay removed");
+    }
+
+    await fs.writeFile(
+      path.join(OUT_DIR, "summary.json"),
+      JSON.stringify({
+        screenshots: states.flatMap((fixture) => [
+          `${fixture.name}-normal.png`,
+          `${fixture.name}-narrow.png`,
+        ]),
+        audit: [
+          "two clear header levels at normal and narrow widths",
+          "current step remains readable without horizontal clipping",
+          "Replace, Review, Graph, Replay, Close, and autopilot remain discoverable",
+          "loop history, findings, plateau state, and autopilot log remain available",
+          "dense controls keep at least 32px height and visible focus",
+          "cost and Run details remain absent",
+        ],
+      }, null, 2),
+    );
+  } finally {
+    await page.close();
+    await browser.close();
+    await backend.stop();
+  }
+}
+
+await main();

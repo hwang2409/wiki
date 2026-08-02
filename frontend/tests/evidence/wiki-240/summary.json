@@ -1,0 +1,22 @@
+{
+  "screenshots": [
+    "working-normal.png",
+    "working-narrow.png",
+    "merge-ready-normal.png",
+    "merge-ready-narrow.png",
+    "blocked-normal.png",
+    "blocked-narrow.png",
+    "at-cap-normal.png",
+    "at-cap-narrow.png",
+    "over-cap-normal.png",
+    "over-cap-narrow.png"
+  ],
+  "audit": [
+    "two clear header levels at normal and narrow widths",
+    "current step remains readable without horizontal clipping",
+    "Replace, Review, Graph, Replay, Close, and autopilot remain discoverable",
+    "loop history, findings, plateau state, and autopilot log remain available",
+    "dense controls keep at least 32px height and visible focus",
+    "cost and Run details remain absent"
+  ]
+}

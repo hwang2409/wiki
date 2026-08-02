@@ -12251,16 +12251,17 @@ textarea.composer-command-input {
 .loop-chrome-controls {
   display: flex;
   align-items: center;
-  gap: 6px;
+  gap: 0;
 }
 
 .loop-autopilot-toggle {
   display: inline-flex;
   align-items: center;
   gap: 4px;
-  border: 1px solid var(--background-modifier-border);
-  border-radius: 4px;
-  padding: 3px 7px;
+  min-height: 32px;
+  border-left: 1px solid var(--background-modifier-border);
+  border-radius: 0;
+  padding: 4px 8px;
   color: var(--text-faint);
   background: transparent;
   font: inherit;
@@ -12269,8 +12270,12 @@ textarea.composer-command-input {
 }
 
 .loop-autopilot-toggle.is-on {
-  border-color: var(--interactive-accent);
   color: var(--interactive-accent);
+}
+
+.loop-autopilot-toggle:hover {
+  background-color: var(--background-modifier-hover);
+  color: var(--text-normal);
 }
 
 .loop-autopilot-log {
@@ -12358,29 +12363,34 @@ textarea.composer-command-input {
   align-items: stretch;
   gap: 0;
   padding: 0;
-  border: 1px solid var(--loop-tone-border);
-  border-radius: var(--radius-sm);
-  background-color: var(--loop-tone-bg);
+  border: 0;
+  border-radius: 0;
+  background-color: transparent;
   color: var(--text-normal);
   overflow: hidden;
   transition-property: border-color, background-color;
   transition-duration: 120ms;
   transition-timing-function: ease-out;
-  min-height: 26px;
+  min-height: 32px;
 }
 
 .loop-chrome-trigger:hover,
 .loop-chrome-trigger.is-open {
-  border-color: color-mix(in srgb, var(--loop-tone-color) 80%, var(--background-modifier-border));
-  background-color: color-mix(in srgb, var(--loop-tone-bg) 60%, var(--background-modifier-hover));
+  background-color: var(--background-modifier-hover);
+}
+
+.loop-chrome[data-danger="warning"] .loop-chrome-trigger,
+.loop-chrome[data-danger="danger"] .loop-chrome-trigger {
+  box-shadow: inset 2px 0 0 var(--loop-tone-color);
 }
 
 .loop-chrome-chip {
   display: inline-flex;
   align-items: center;
   gap: 6px;
+  min-height: 24px;
   padding: 3px 8px;
-  border-right: 1px solid var(--loop-tone-border);
+  border-right: 1px solid var(--background-modifier-border);
   color: var(--text-normal);
   white-space: nowrap;
   line-height: 1;
@@ -12391,41 +12401,23 @@ textarea.composer-command-input {
 }
 
 .loop-chrome-round {
-  color: var(--loop-tone-color);
-  font-weight: var(--fw-semibold);
+  color: var(--text-muted);
+  font-weight: var(--fw-regular);
 }
 
-.loop-chrome-round.is-normal {
+.loop-chrome-round.is-at-cap {
   color: var(--text-normal);
-}
-
-.loop-chrome-round.is-cap {
-  color: var(--accent-danger, var(--text-normal));
-  font-weight: var(--fw-display);
-}
-
-.loop-chrome-glyph {
-  display: inline-flex;
-  align-items: baseline;
-  gap: 1px;
-  font-variant-numeric: tabular-nums;
   font-weight: var(--fw-semibold);
 }
 
-.loop-chrome-round-num {
-  font-size: var(--fs-md);
-  color: currentColor;
+.loop-chrome-round.is-over-cap {
+  color: var(--accent-warning, var(--text-normal));
+  font-weight: var(--fw-semibold);
 }
 
-.loop-chrome-round-slash {
-  color: var(--text-faint);
-  font-size: var(--fs-xs);
-  padding: 0 1px;
-}
-
-.loop-chrome-round-cap {
-  color: var(--text-faint);
-  font-size: var(--fs-xs);
+.loop-chrome[data-danger="warning"] .loop-chrome-round,
+.loop-chrome[data-danger="danger"] .loop-chrome-round {
+  color: var(--loop-tone-color);
 }
 
 .loop-chrome-label {
@@ -12434,9 +12426,8 @@ textarea.composer-command-input {
   letter-spacing: 0.01em;
 }
 
-.loop-chrome-round.is-warning .loop-chrome-label,
-.loop-chrome-round.is-danger .loop-chrome-label {
-  color: var(--loop-tone-color);
+.loop-chrome-round .loop-chrome-label {
+  color: inherit;
 }
 
 .loop-chrome-unrouted {
@@ -12468,10 +12459,10 @@ textarea.composer-command-input {
 .loop-chrome-detail {
   position: absolute;
   top: calc(100% + 6px);
-  right: 0;
+  left: 0;
   z-index: 40;
-  min-width: 360px;
-  max-width: 520px;
+  width: min(520px, calc(100vw - 24px));
+  min-width: min(360px, calc(100vw - 24px));
   max-height: 60vh;
   overflow-y: auto;
   padding: 10px 12px 12px;
@@ -13972,8 +13963,8 @@ textarea.composer-command-input {
   border: 0;
 }
 
-/* WIKI-152: agent-session chrome. Header state pill, step, blocker,
-   and action-required panel. WIKI-235 removes the diagnostic disclosure. */
+/* WIKI-152/240: agent-session chrome. Two rectangular levels put identity
+   and current work before runtime metadata and actions. */
 
 /* WIKI-235: keep runs chrome anchored and rectangular without changing
    radius tokens in note, search, or utility surfaces. */
@@ -13989,6 +13980,70 @@ textarea.composer-command-input {
   --radius-full: 2px;
 }
 
+.agent-session-surface-head {
+  display: flex;
+  align-items: stretch;
+  flex-direction: column;
+  flex-wrap: nowrap;
+  gap: 0;
+  padding: 0;
+  border-bottom: 1px solid var(--background-modifier-border);
+}
+
+.agent-session-head-primary,
+.agent-session-head-secondary {
+  display: flex;
+  align-items: center;
+  min-width: 0;
+}
+
+.agent-session-head-primary {
+  gap: 10px;
+  min-height: 44px;
+  padding: 7px 14px;
+}
+
+.agent-session-head-secondary {
+  gap: 12px;
+  min-height: 40px;
+  padding: 4px 10px 4px 14px;
+  border-top: 1px solid var(--background-modifier-border);
+  background-color: color-mix(in srgb, var(--background-secondary) 62%, transparent);
+}
+
+.agent-session-head-primary .session-ticket {
+  flex-shrink: 0;
+  font-size: var(--font-ui-medium);
+  letter-spacing: 0.01em;
+}
+
+.agent-session-runtime {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  min-width: 0;
+  color: var(--text-muted);
+  font-family: var(--font-monospace);
+  font-weight: var(--font-monospace-weight);
+  font-size: var(--font-ui-smaller);
+}
+
+.agent-session-runtime-item {
+  display: inline-flex;
+  align-items: center;
+  min-height: 32px;
+  white-space: nowrap;
+}
+
+.agent-session-runtime > :not(:first-child)::before {
+  content: "";
+  align-self: center;
+  width: 1px;
+  height: 14px;
+  margin: 0 10px;
+  background-color: var(--background-modifier-border);
+}
+
 .agent-session-surface-head .session-state-pill {
   display: inline-flex;
   align-items: center;
@@ -14002,6 +14057,7 @@ textarea.composer-command-input {
   font-size: var(--font-ui-smaller);
   text-transform: lowercase;
   letter-spacing: 0.03em;
+  flex-shrink: 0;
 }
 
 /* Themes intentionally collapse accent-* to a single mono color (see
@@ -14032,32 +14088,30 @@ textarea.composer-command-input {
   color: var(--text-faint);
 }
 
-.agent-session-surface .session-step-row,
-.agent-session-surface .session-blocker-row {
+.agent-session-head-primary .session-step-row,
+.agent-session-head-primary .session-blocker-row {
   display: flex;
   align-items: center;
+  flex: 1;
   gap: 8px;
-  padding: 6px 14px;
-  border-top: 1px solid var(--background-modifier-border);
+  min-width: 0;
+  padding: 2px 0 2px 12px;
+  border-left: 1px solid var(--background-modifier-border);
   font-family: var(--font-monospace);
   font-weight: var(--font-monospace-weight);
   font-size: var(--font-ui-smaller);
   color: var(--text-muted);
-  min-width: 0;
 }
 
-.agent-session-surface .session-step-row {
-  background-color: color-mix(in srgb, var(--background-secondary) 60%, transparent);
-}
-
-.agent-session-surface .session-step-label {
+.agent-session-head-primary .session-step-label {
   color: var(--text-faint);
   text-transform: uppercase;
   letter-spacing: 0.06em;
   font-size: 10px;
+  flex-shrink: 0;
 }
 
-.agent-session-surface .session-step-text {
+.agent-session-head-primary .session-step-text {
   color: var(--text-normal);
   min-width: 0;
   overflow: hidden;
@@ -14065,29 +14119,110 @@ textarea.composer-command-input {
   white-space: nowrap;
 }
 
-.agent-session-surface .session-blocker-row {
-  border-left: 3px solid var(--accent-danger);
+.agent-session-head-primary .session-blocker-row {
+  border-left: 2px solid var(--accent-danger);
+  padding-left: 10px;
   background-color: color-mix(in srgb, var(--accent-danger) 10%, var(--background-primary));
   color: var(--text-normal);
 }
 
-.agent-session-surface .session-blocker-row svg {
+.agent-session-head-primary .session-blocker-row svg {
   color: var(--accent-danger);
   flex-shrink: 0;
 }
 
-.agent-session-surface .session-blocker-label {
-  color: var(--accent-danger);
-  text-transform: uppercase;
-  letter-spacing: 0.06em;
-  font-weight: var(--fw-semibold);
-  font-size: 10px;
-}
-
-.agent-session-surface .session-blocker-text {
+.agent-session-head-primary .session-blocker-text {
   color: var(--text-normal);
   min-width: 0;
-  overflow-wrap: anywhere;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.agent-session-head-secondary .agent-surface-actions {
+  flex-shrink: 0;
+}
+
+.agent-session-head-secondary .agent-surface-action,
+.agent-session-head-secondary .session-close {
+  min-height: 32px;
+  color: var(--text-muted);
+  transition-property: background-color, color, scale;
+}
+
+.agent-session-head-secondary .agent-surface-action:active,
+.agent-session-head-secondary .session-close:active,
+.loop-chrome button:active {
+  scale: 0.96;
+}
+
+.agent-session-head-secondary :where(button):focus-visible {
+  outline-width: 2px;
+}
+
+@media (max-width: 1000px) {
+  .agent-session-head-primary {
+    display: grid;
+    grid-template-columns: auto minmax(0, 1fr);
+    gap: 6px 10px;
+    padding: 7px 10px;
+  }
+
+  .agent-session-head-primary .session-state-pill {
+    justify-self: start;
+  }
+
+  .agent-session-head-primary .session-step-row,
+  .agent-session-head-primary .session-blocker-row {
+    grid-column: 1 / -1;
+    padding: 5px 0 0;
+    border-top: 1px solid var(--background-modifier-border);
+    border-left: 0;
+  }
+
+  .agent-session-head-primary .session-blocker-row {
+    padding: 5px 6px;
+    border-top: 2px solid var(--accent-danger);
+  }
+
+  .agent-session-head-primary .session-step-text,
+  .agent-session-head-primary .session-blocker-text {
+    display: -webkit-box;
+    overflow: hidden;
+    white-space: normal;
+    overflow-wrap: anywhere;
+    -webkit-box-orient: vertical;
+    -webkit-line-clamp: 2;
+  }
+
+  .agent-session-head-secondary {
+    align-items: stretch;
+    flex-direction: column;
+    gap: 0;
+    padding: 4px 8px 6px 10px;
+  }
+
+  .agent-session-runtime {
+    width: 100%;
+  }
+
+  .agent-session-runtime > .loop-chrome {
+    flex-basis: 100%;
+    width: 100%;
+    border-top: 1px solid var(--background-modifier-border);
+  }
+
+  .agent-session-runtime > .loop-chrome::before {
+    display: none;
+  }
+
+  .agent-session-head-secondary .agent-surface-actions {
+    width: 100%;
+    margin-left: 0;
+    padding-top: 3px;
+    border-top: 1px solid var(--background-modifier-border);
+    overflow-x: auto;
+  }
 }
 
 .session-tab > .session-action-required {

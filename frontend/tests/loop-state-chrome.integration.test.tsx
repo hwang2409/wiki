@@ -131,6 +131,56 @@ describe("LoopStateChrome", () => {
     cleanup();
   });
 
+  function useLoopState(overrides: Partial<LoopState>) {
+    const nextState = { ...loopState, ...overrides };
+    vi.mocked(fetch).mockImplementation(async (input: RequestInfo | URL) =>
+      new Response(
+        JSON.stringify(
+          String(input).includes("/autopilot/")
+            ? autopilot
+            : { ...payload, loop_state: nextState },
+        ),
+        { status: 200 },
+      ),
+    );
+  }
+
+  test.each([
+    {
+      name: "below cap",
+      state: { round: 7, cap: 8, danger: "normal" as const },
+      label: "round 7 of 8",
+      limit: "below-cap",
+    },
+    {
+      name: "at cap",
+      state: { round: 8, cap: 8, danger: "normal" as const },
+      label: "round 8 of 8",
+      limit: "at-cap",
+    },
+    {
+      name: "over cap",
+      state: { round: 9, cap: 8, danger: "normal" as const },
+      label: "round 9 · cap 8 exceeded",
+      limit: "over-cap",
+    },
+    {
+      name: "backend danger below cap",
+      state: { round: 4, cap: 8, danger: "danger" as const },
+      label: "round 4 of 8",
+      limit: "below-cap",
+    },
+  ])("separates $name semantics", async ({ state, label, limit }) => {
+    useLoopState(state);
+    render(<LoopStateChrome ticket="WIKI-000" tick={0} />);
+
+    const round = await screen.findByTestId("loop-chrome-round");
+    expect(round.textContent).toBe(label);
+    expect(round.getAttribute("data-limit-state")).toBe(limit);
+    expect(round.getAttribute("data-danger")).toBe(state.danger);
+    expect(round.textContent).not.toMatch(/^\d+\/\d+/);
+  });
+
   test("pointer sequence on trigger toggles cleanly (mousedown + click do not fight)", async () => {
     render(<LoopStateChrome ticket="WIKI-000" tick={0} />);
 
