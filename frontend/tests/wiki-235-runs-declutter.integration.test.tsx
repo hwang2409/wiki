@@ -50,6 +50,14 @@ function orchestrator(id: string): Orchestrator {
   };
 }
 
+function expectWikiWorkViewedRequest(input: RequestInfo | URL, init?: RequestInit): number {
+  expect(String(input)).toBe("/api/agents/runs/run-WIKI-WORK/viewed");
+  expect(init?.method).toBe("POST");
+  const body = JSON.parse(String(init?.body)) as { seq?: unknown };
+  expect(body).toEqual({ seq: expect.any(Number) });
+  return body.seq as number;
+}
+
 const workers = [
   worker("WIKI-WORK", "working", "wiki"),
   worker("WIKI-READY", "merge-ready", "wiki"),
@@ -205,7 +213,10 @@ describe("WIKI-235 runs sidebar", () => {
   test("prioritizes owned-worker persistence failure and clears it after recovery", async () => {
     vi.useFakeTimers();
     let shouldFail = true;
-    const fetchMock = vi.fn(async () => {
+    const postedSeqs: number[] = [];
+    const fetchMock = vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
+      const postedSeq = expectWikiWorkViewedRequest(input, init);
+      postedSeqs.push(postedSeq);
       if (shouldFail) {
         return new Response(JSON.stringify({ detail: "failed" }), {
           status: 500,
@@ -216,9 +227,9 @@ describe("WIKI-235 runs sidebar", () => {
         JSON.stringify({
           run_id: "run-WIKI-WORK",
           last_viewed_at: "2026-08-02T01:00:00Z",
-          last_viewed_seq: 3,
+          last_viewed_seq: postedSeq,
           latest_event_at: "2026-08-02T01:00:00Z",
-          latest_event_seq: 3,
+          latest_event_seq: postedSeq,
         }),
         { status: 200, headers: { "Content-Type": "application/json" } },
       );
@@ -247,6 +258,7 @@ describe("WIKI-235 runs sidebar", () => {
       await vi.runAllTimersAsync();
     });
     expect(fetchMock).toHaveBeenCalledTimes(3);
+    expect(postedSeqs).toEqual([2, 2, 2]);
 
     fireEvent.click(screen.getByRole("button", { name: "Collapse wiki workers" }));
     const wiki = screen.getByText("wiki").closest("button");
@@ -283,20 +295,23 @@ describe("WIKI-235 runs sidebar", () => {
     });
 
     expect(fetchMock).toHaveBeenCalledTimes(4);
+    expect(postedSeqs).toEqual([2, 2, 2, 3]);
     expect(wiki?.classList.contains("has-unread")).toBe(false);
     expect(wiki?.classList.contains("has-viewed-failure")).toBe(false);
     expect(within(wiki!).queryByTestId("nav-orch-unread")).toBeNull();
     expect(within(wiki!).queryByTestId("nav-orch-viewed-failed")).toBeNull();
   });
 
-  test("clears a failed viewed marker when a server refresh confirms the same sequence", async () => {
+  test("clears an inactive worker failure when a server refresh confirms the exact sequence", async () => {
     vi.useFakeTimers();
-    const fetchMock = vi.fn(async () =>
-      new Response(JSON.stringify({ detail: "response lost" }), {
+    const postedSeqs: number[] = [];
+    const fetchMock = vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
+      postedSeqs.push(expectWikiWorkViewedRequest(input, init));
+      return new Response(JSON.stringify({ detail: "response lost" }), {
         status: 500,
         headers: { "Content-Type": "application/json" },
-      }),
-    );
+      });
+    });
     vi.stubGlobal("fetch", fetchMock);
 
     const failedWorkers = workers.map((item) =>
@@ -317,6 +332,7 @@ describe("WIKI-235 runs sidebar", () => {
       await vi.runAllTimersAsync();
     });
     expect(fetchMock).toHaveBeenCalledTimes(3);
+    expect(postedSeqs).toEqual([2, 2, 2]);
     const failedWorker = screen.getByText("WIKI-WORK").closest("button");
     expect(within(failedWorker!).getByTestId("nav-agent-viewed-failed")).toBeTruthy();
 
@@ -327,7 +343,7 @@ describe("WIKI-235 runs sidebar", () => {
     await act(async () => {
       view.rerender(
         <AgentsSidebar
-          activeTicket="WIKI-WORK"
+          activeTicket="FREE-1"
           data={{
             workers: failedWorkers.map((item) =>
               item.ticket === "WIKI-WORK" ? { ...item, last_viewed_seq: 2 } : { ...item },
@@ -342,6 +358,7 @@ describe("WIKI-235 runs sidebar", () => {
     });
 
     expect(fetchMock).toHaveBeenCalledTimes(3);
+    expect(postedSeqs).toEqual([2, 2, 2]);
     expect(wiki?.classList.contains("has-viewed-failure")).toBe(false);
     expect(within(wiki!).queryByTestId("nav-orch-viewed-failed")).toBeNull();
 

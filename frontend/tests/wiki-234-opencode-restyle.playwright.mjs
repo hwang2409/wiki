@@ -26,6 +26,28 @@ function logStep(message) {
   console.error(`[wiki-234-playwright] ${message}`);
 }
 
+async function waitForStableRunsLayout(page) {
+  await page.evaluate(() => document.fonts.ready);
+  await page.waitForFunction(() => {
+    const sidebar = document.querySelector(".workspace-sidebar");
+    const runsTitle = document.querySelector('.sidebar-mode[data-mode="agents"] .sidebar-mode-title');
+    const activeTitle = document.querySelector('[data-testid="nav-agents-group-active"]');
+    const sessionHeader = document.querySelector(".agent-session-surface.is-full .session-header");
+    const sessionTicket = sessionHeader?.querySelector(".session-ticket");
+    const sessionUser = document.querySelector(".agent-session-surface.is-full .session-user");
+    if (!(sidebar instanceof HTMLElement) || !(sessionHeader instanceof HTMLElement)) return false;
+    return runsTitle?.textContent?.includes("Runs")
+      && activeTitle?.textContent?.includes("Active")
+      && sessionTicket?.textContent?.includes("wiki")
+      && sessionUser?.textContent?.includes("hey wiki, adopt the opencode look")
+      && sessionHeader.getBoundingClientRect().left >= sidebar.getBoundingClientRect().right;
+  });
+  await page.evaluate(() => new Promise((resolve) => {
+    requestAnimationFrame(() => requestAnimationFrame(resolve));
+  }));
+  await page.waitForTimeout(250);
+}
+
 function isoAtStartOfDayOffset(offsetDays, plusSeconds) {
   const now = new Date();
   const day = new Date(now.getFullYear(), now.getMonth(), now.getDate() - offsetDays);
@@ -196,6 +218,7 @@ try {
   await page.waitForURL(/#\/agent\/wiki$/);
   assert((await page.locator('[data-testid="nav-orch-workers-wiki"]').count()) === 0,
     "opening the orchestrator session must not expand workers");
+  await waitForStableRunsLayout(page);
   await page.screenshot({ path: path.join(OUT_DIR, "05-orchestrator-navigation.png") });
   await wikiDisclosure.click();
   const wikiWorkers = page.locator('[data-testid="nav-orch-workers-wiki"]');
@@ -219,15 +242,7 @@ try {
   assert(disclosureStyle.height >= 40, `orchestrator row hit area must be >=40px, got ${disclosureStyle.height}`);
   assert(disclosureStyle.chevron, "orchestrator disclosure needs a visible chevron");
 
-  await page.reload({ waitUntil: "load" });
-  await wikiWorkers.waitFor();
-  await page.evaluate(() => document.fonts.ready);
-  await page.waitForFunction(() => {
-    const sidebar = document.querySelector(".workspace-sidebar");
-    const sessionHeader = document.querySelector(".agent-session-surface.is-full .session-header");
-    if (!(sidebar instanceof HTMLElement) || !(sessionHeader instanceof HTMLElement)) return false;
-    return sessionHeader.getBoundingClientRect().left >= sidebar.getBoundingClientRect().right;
-  });
+  await waitForStableRunsLayout(page);
   await page.screenshot({ path: path.join(OUT_DIR, "01-sidebar-normal.png") });
   await page.setViewportSize({ width: 1000, height: 760 });
   const narrowLayout = await page.locator(".nav-agents").evaluate((el) => ({

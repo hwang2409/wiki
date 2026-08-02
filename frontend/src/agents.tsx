@@ -2525,6 +2525,21 @@ export function AgentsSidebar({
   }, [activeTicket, selectedWorkerOwner]);
 
   useEffect(() => {
+    if (workers === null || Object.keys(viewedFailed).length === 0) return;
+    setViewedFailed((current) => {
+      let next = current;
+      for (const worker of workers) {
+        if (!worker.run_id || worker.last_viewed_seq === null) continue;
+        const failedSeq = current[worker.run_id];
+        if (failedSeq === undefined || worker.last_viewed_seq < failedSeq) continue;
+        if (next === current) next = { ...current };
+        delete next[worker.run_id];
+      }
+      return next;
+    });
+  }, [viewedFailed, workers]);
+
+  useEffect(() => {
     if (!activeTicket || workers === null) return;
     const worker = workers.find((row) => row.ticket === activeTicket);
     const runId = worker?.run_id ?? null;
@@ -2533,23 +2548,10 @@ export function AgentsSidebar({
 
     const priorServer = worker?.last_viewed_seq ?? -1;
     const failedSeq = viewedFailed[runId];
-    if (failedSeq !== undefined) {
-      if (priorServer >= failedSeq) {
-        // A POST can commit even when every client response fails. Trust a
-        // later server refresh and remove the stale local failure marker.
-        setViewedFailed((current) => {
-          const currentFailedSeq = current[runId];
-          if (currentFailedSeq === undefined || priorServer < currentFailedSeq) return current;
-          const next = { ...current };
-          delete next[runId];
-          return next;
-        });
-      } else if (failedSeq >= observedSeq) {
-        // Do not retry the same failed seq on every render. A later event
-        // starts one new bounded chain, which can clear a real failure.
-        return;
-      }
-    }
+    // Do not retry the same failed seq on every render. The independent
+    // reconciliation effect clears exact server-confirmed failures for all
+    // workers, while a later event starts one new bounded write chain.
+    if (failedSeq !== undefined && failedSeq >= observedSeq) return;
 
     // Skip if we (or the server) have already recorded a viewed seq that
     // covers everything visible in this refresh. Prevents the effect from
