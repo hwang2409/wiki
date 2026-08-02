@@ -1,4 +1,5 @@
 import fs from "node:fs/promises";
+import os from "node:os";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { chromium } from "playwright";
@@ -12,8 +13,11 @@ import {
 } from "../scripts/wiki32-harness.mjs";
 
 const HERE = path.dirname(fileURLToPath(import.meta.url));
+const UPDATE_EVIDENCE = process.env.WIKI_UPDATE_EVIDENCE === "1";
 const OUT_DIR = process.env.WIKI_PLAYWRIGHT_OUT_DIR
-  || path.join(HERE, "evidence", "wiki-240");
+  || (UPDATE_EVIDENCE
+    ? path.join(HERE, "evidence", "wiki-240")
+    : await fs.mkdtemp(path.join(os.tmpdir(), "wiki-240-evidence-")));
 const TICKET = "WIKI-240";
 
 async function writeJsonl(target, rows) {
@@ -55,6 +59,11 @@ function loopState(round, cap = 8, danger = "normal") {
 async function main() {
   await fs.mkdir(OUT_DIR, { recursive: true });
   const fixtures = makeFixtureRoot("wiki-240-header-");
+  await fs.mkdir(path.join(fixtures.root, "vault"), { recursive: true });
+  await fs.writeFile(
+    path.join(fixtures.root, "vault", "split-fixture.md"),
+    "# split fixture\n\nThis pane keeps the wide-window split open.\n",
+  );
   const transcript = path.join(fixtures.root, "wiki-240-transcript.jsonl");
   await writeJsonl(transcript, [
     codexAssistant(
@@ -81,6 +90,16 @@ async function main() {
   try {
     await page.addInitScript(({ ticket }) => {
       localStorage.setItem("wiki-sidebar-visible", "false");
+      const agentPane = { kind: "pane", id: "pane-1", path: `agent://${ticket}` };
+      const layout = window.innerWidth === 1280
+        ? {
+            kind: "split",
+            direction: "row",
+            ratio: 0.5,
+            first: agentPane,
+            second: { kind: "pane", id: "pane-2", path: "split-fixture.md" },
+          }
+        : agentPane;
       localStorage.setItem(
         "wiki-window-layout-v2",
         JSON.stringify({
@@ -90,7 +109,7 @@ async function main() {
             {
               id: "window-0",
               focusedPaneId: "pane-1",
-              layout: { kind: "pane", id: "pane-1", path: `agent://${ticket}` },
+              layout,
             },
           ],
         }),
@@ -232,14 +251,36 @@ async function main() {
       currentLoop = fixture.loop;
       await writeStatus(fixtures, currentStatus);
       for (const viewport of [
-        { name: "normal", width: 1440, height: 900 },
-        { name: "narrow", width: 960, height: 900 },
+        { name: "normal", width: 1440, height: 900, splitRatio: null },
+        { name: "split-35", width: 1280, height: 900, splitRatio: 0.35 },
       ]) {
         await page.setViewportSize({ width: viewport.width, height: viewport.height });
         await page.goto("about:blank");
         await page.goto(`${backend.baseUrl}/#/agent/${TICKET}`, { waitUntil: "domcontentloaded" });
         const header = page.locator(".agent-session-surface-head");
         await header.waitFor({ state: "visible" });
+        if (viewport.splitRatio !== null) {
+          const split = page.locator(".pane-split.row");
+          const divider = split.locator(".pane-divider.row");
+          const bounds = await split.boundingBox();
+          if (!bounds) throw new Error(`${fixture.name}: split pane has no bounds`);
+          await divider.hover();
+          await page.mouse.down();
+          await page.mouse.move(
+            bounds.x + bounds.width * viewport.splitRatio,
+            bounds.y + bounds.height / 2,
+            { steps: 8 },
+          );
+          await page.mouse.up();
+          await page.waitForFunction(() => {
+            const pane = document.querySelector(".pane-frame[data-pane-key='pane-1']");
+            if (!(pane instanceof HTMLElement)) return false;
+            const splitRoot = pane.closest(".pane-split");
+            if (!(splitRoot instanceof HTMLElement)) return false;
+            const ratio = pane.getBoundingClientRect().width / splitRoot.getBoundingClientRect().width;
+            return ratio >= 0.33 && ratio <= 0.37;
+          });
+        }
         await header.locator('[data-testid="session-state-pill"]').filter({ hasText: fixture.status.state }).waitFor();
         const expectedRound = fixture.loop.round > fixture.loop.cap
           ? `round ${fixture.loop.round} · cap ${fixture.loop.cap} exceeded`
@@ -306,6 +347,24 @@ async function main() {
           }));
           throw new Error(`${fixture.name}/${viewport.name}: header clips horizontally ${JSON.stringify(dimensions)}`);
         }
+        const escapedControls = await header.evaluate((root) => {
+          const headerRect = root.getBoundingClientRect();
+          return Array.from(root.querySelectorAll(
+            ".loop-chrome-trigger, .loop-autopilot-toggle, .agent-surface-action, .session-close",
+          ))
+              .map((control) => {
+                const rect = control.getBoundingClientRect();
+                return {
+                  name: control.getAttribute("aria-label") || control.textContent?.trim() || "control",
+                  left: Math.round(rect.left),
+                  right: Math.round(rect.right),
+                };
+              })
+              .filter((control) => control.left < Math.floor(headerRect.left) || control.right > Math.ceil(headerRect.right));
+        });
+        if (escapedControls.length > 0) {
+          throw new Error(`${fixture.name}/${viewport.name}: controls escaped header ${JSON.stringify(escapedControls)}`);
+        }
 
         await header.screenshot({
           path: path.join(OUT_DIR, `${fixture.name}-${viewport.name}.png`),
@@ -336,10 +395,10 @@ async function main() {
       JSON.stringify({
         screenshots: states.flatMap((fixture) => [
           `${fixture.name}-normal.png`,
-          `${fixture.name}-narrow.png`,
+          `${fixture.name}-split-35.png`,
         ]),
         audit: [
-          "two clear header levels at normal and narrow widths",
+          "two clear header levels at normal width and in a real 35% split pane",
           "current step remains readable without horizontal clipping",
           "Replace, Review, Graph, Replay, Close, and autopilot remain discoverable",
           "loop history, findings, plateau state, and autopilot log remain available",
@@ -348,6 +407,7 @@ async function main() {
         ],
       }, null, 2),
     );
+    console.error(`[wiki-240-playwright] evidence written to ${OUT_DIR}`);
   } finally {
     await page.close();
     await browser.close();

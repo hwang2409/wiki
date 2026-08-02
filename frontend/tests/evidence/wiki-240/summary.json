@@ -1,18 +1,18 @@
 {
   "screenshots": [
     "working-normal.png",
-    "working-narrow.png",
+    "working-split-35.png",
     "merge-ready-normal.png",
-    "merge-ready-narrow.png",
+    "merge-ready-split-35.png",
     "blocked-normal.png",
-    "blocked-narrow.png",
+    "blocked-split-35.png",
     "at-cap-normal.png",
-    "at-cap-narrow.png",
+    "at-cap-split-35.png",
     "over-cap-normal.png",
-    "over-cap-narrow.png"
+    "over-cap-split-35.png"
   ],
   "audit": [
-    "two clear header levels at normal and narrow widths",
+    "two clear header levels at normal width and in a real 35% split pane",
     "current step remains readable without horizontal clipping",
     "Replace, Review, Graph, Replay, Close, and autopilot remain discoverable",
     "loop history, findings, plateau state, and autopilot log remain available",

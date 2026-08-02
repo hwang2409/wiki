@@ -8471,6 +8471,8 @@ body.is-resizing-panes .pane-cell {
   flex: 1;
   flex-direction: column;
   min-width: 0;
+  container-name: agent-session;
+  container-type: inline-size;
 }
 
 .agent-session-surface-main {
@@ -14160,7 +14162,7 @@ textarea.composer-command-input {
   outline-width: 2px;
 }
 
-@media (max-width: 1000px) {
+@container agent-session (max-width: 720px) {
   .agent-session-head-primary {
     display: grid;
     grid-template-columns: auto minmax(0, 1fr);
@@ -14216,12 +14218,29 @@ textarea.composer-command-input {
     display: none;
   }
 
+  .loop-chrome-controls {
+    flex-wrap: wrap;
+    width: 100%;
+  }
+
+  .loop-chrome-trigger {
+    flex: 1 1 100%;
+    flex-wrap: wrap;
+    width: 100%;
+    max-width: 100%;
+  }
+
+  .loop-chrome-caret {
+    margin-left: auto;
+  }
+
   .agent-session-head-secondary .agent-surface-actions {
     width: 100%;
     margin-left: 0;
     padding-top: 3px;
     border-top: 1px solid var(--background-modifier-border);
-    overflow-x: auto;
+    flex-wrap: wrap;
+    overflow-x: visible;
   }
 }
 
