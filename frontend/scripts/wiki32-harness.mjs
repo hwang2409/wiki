@@ -171,10 +171,57 @@ export async function waitForHealth(baseUrl, timeoutMs = 15000) {
   throw new Error(`Timed out waiting for ${baseUrl}/health`);
 }
 
-export async function startBackend(fixtures) {
-  const port = await choosePort();
+function childHasExited(child) {
+  return child.exitCode !== null || child.signalCode !== null;
+}
+
+async function terminateChild(child) {
+  if (childHasExited(child)) return;
+  await new Promise((resolveStop, rejectStop) => {
+    let settled = false;
+    const cleanup = () => {
+      child.off("exit", onExit);
+      child.off("error", onError);
+    };
+    const finish = (callback, value) => {
+      if (settled) return;
+      settled = true;
+      cleanup();
+      callback(value);
+    };
+    const onExit = () => finish(resolveStop);
+    const onError = (error) => finish(rejectStop, error);
+    child.once("exit", onExit);
+    child.once("error", onError);
+    if (childHasExited(child)) {
+      onExit();
+      return;
+    }
+    try {
+      const signaled = child.kill("SIGTERM");
+      if (childHasExited(child)) {
+        onExit();
+      } else if (!signaled) {
+        finish(rejectStop, new Error("Could not stop isolated backend process"));
+      }
+    } catch (error) {
+      finish(rejectStop, error);
+    }
+  });
+}
+
+export async function startBackend(
+  fixtures,
+  {
+    chooseBackendPort = choosePort,
+    healthTimeoutMs = 15000,
+    spawnProcess = spawn,
+    waitForReady = waitForHealth,
+  } = {},
+) {
+  const port = await chooseBackendPort();
   const baseUrl = `http://127.0.0.1:${port}`;
-  const child = spawn(
+  const child = spawnProcess(
     PYTHON,
     [
       WRAPPER,
@@ -205,17 +252,91 @@ export async function startBackend(fixtures) {
   child.stderr.on("data", (chunk) => {
     stderr += chunk.toString();
   });
-  await waitForHealth(baseUrl);
+  try {
+    await waitForReady(baseUrl, healthTimeoutMs);
+  } catch (error) {
+    try {
+      await terminateChild(child);
+    } catch (cleanupError) {
+      throw new AggregateError(
+        [error, cleanupError],
+        "Isolated backend failed health check and cleanup",
+      );
+    }
+    throw error;
+  }
+  let stopPromise = null;
   return {
     baseUrl,
     port,
     process: child,
-    async stop() {
-      child.kill("SIGTERM");
-      await new Promise((resolveStop) => child.once("exit", resolveStop));
-      if (child.exitCode && stderr) {
-        throw new Error(stderr);
+    stop() {
+      stopPromise ??= (async () => {
+        await terminateChild(child);
+        if (child.exitCode && stderr) {
+          throw new Error(stderr);
+        }
+      })();
+      return stopPromise;
+    },
+  };
+}
+
+async function cleanupBackendBrowserFixture({ backend, browser, page }) {
+  const cleanup = await Promise.allSettled([
+    (async () => {
+      try {
+        if (page && !page.isClosed()) {
+          try {
+            await page.unrouteAll({ behavior: "ignoreErrors" });
+          } finally {
+            await page.close();
+          }
+        }
+      } finally {
+        await browser?.close();
       }
+    })(),
+    backend.stop(),
+  ]);
+  const errors = cleanup
+    .filter((result) => result.status === "rejected")
+    .map((result) => result.reason);
+  if (errors.length > 0) {
+    throw new AggregateError(errors, "Backend browser fixture cleanup failed");
+  }
+}
+
+export async function startBackendBrowserFixture({
+  createPage,
+  launchBrowser,
+  startBackendProcess,
+}) {
+  const backend = await startBackendProcess();
+  let browser = null;
+  let page = null;
+  try {
+    browser = await launchBrowser();
+    page = await createPage(browser);
+  } catch (error) {
+    try {
+      await cleanupBackendBrowserFixture({ backend, browser, page });
+    } catch (cleanupError) {
+      throw new AggregateError(
+        [error, cleanupError],
+        "Backend browser fixture failed startup and cleanup",
+      );
+    }
+    throw error;
+  }
+  let stopPromise = null;
+  return {
+    backend,
+    browser,
+    page,
+    stop() {
+      stopPromise ??= cleanupBackendBrowserFixture({ backend, browser, page });
+      return stopPromise;
     },
   };
 }

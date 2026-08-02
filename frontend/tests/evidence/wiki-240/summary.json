@@ -1,0 +1,39 @@
+{
+  "screenshots": [
+    "working-normal.png",
+    "working-split-35.png",
+    "merge-ready-normal.png",
+    "merge-ready-split-35.png",
+    "blocked-normal.png",
+    "blocked-split-35.png",
+    "at-cap-normal.png",
+    "at-cap-split-35.png",
+    "over-cap-normal.png",
+    "over-cap-split-35.png",
+    "over-cap-dialog-split-35.png",
+    "over-cap-dialog-split-15.png",
+    "over-cap-dialog-log-split-15.png",
+    "action-replace-split-35.png",
+    "action-review-split-35.png",
+    "action-graph-split-35.png",
+    "action-replay-split-35.png",
+    "action-close-split-35.png",
+    "action-replace-split-15.png",
+    "action-review-split-15.png",
+    "action-graph-split-15.png",
+    "action-replay-split-15.png",
+    "action-close-split-15.png"
+  ],
+  "audit": [
+    "two clear header levels at normal width and in real 35% and 15% split panes",
+    "current step remains readable without horizontal clipping",
+    "Replace, Review, Graph, Replay, Close, and autopilot remain discoverable",
+    "Replace, Review, Graph, Replay, and Close complete safe interactions in isolated 35% and 15% split states",
+    "Review, Graph, and Replay show final fixture content with useful controls inside the visible pane",
+    "Close keeps the split fixture peer visible with its content intact",
+    "the visible composer and footer stay inside every split pane",
+    "open loop history, findings, plateau state, and autopilot log stay inside narrow panes",
+    "dense controls keep at least 32px height and visible focus",
+    "cost and Run details remain absent"
+  ]
+}
