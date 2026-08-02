@@ -1331,6 +1331,145 @@ class FleetMonitorTests(unittest.IsolatedAsyncioTestCase):
         }
         self.assertIn("run/send_now", intent_methods)
 
+    async def test_pending_message_survives_monitor_restart(self) -> None:
+        """WIKI-232 REVIEW8 H2: an in-memory ``_pending_messages`` dict
+        loses the original retry payload on monitor restart. The next
+        staleness tick recomputes a fresh elapsed-time message under the
+        same durable ``request_id`` and the command log rejects the
+        second dispatch as a conflicting payload. A restarted FleetMonitor
+        must replay the exact original payload."""
+
+        from backend.app.agent_runtime.command_log import CommandConflict
+
+        await self._spawn("WIKI-ORCH", role="orchestrator", orch=None)
+        await self._spawn("WIKI-8232", role="implement", orch="WIKI-ORCH")
+
+        mtime = self.clock.now - 1900.0
+        _write_status(
+            self.store,
+            "WIKI-8232",
+            {"state": "working", "pr": None, "step": "coding", "blocker": None},
+            mtime=mtime,
+        )
+
+        supervisor = self.supervisor
+        dispatched: list[tuple[str, str, str | None]] = []
+
+        async def dispatch_send(
+            run_id: str,
+            message: str,
+            dedupe_key: str | None,
+            source: str | None = None,
+        ):
+            dispatched.append((run_id, message, dedupe_key))
+            return await supervisor.dispatch(
+                "run/send_now",
+                {
+                    "run_id": run_id,
+                    "text": message,
+                    "dedupe_key": fleet_monitor_message_dedupe_key(
+                        run_id, dedupe_key
+                    ),
+                    "source": source,
+                    "request_id": fleet_monitor_request_id(run_id, dedupe_key),
+                },
+            )
+
+        first_monitor = FleetMonitor(
+            self.store,
+            dispatch_send,
+            clock=self.clock,
+            interval=0.01,
+            unrouted_verdict_realarm=300.0,
+            review_gap_threshold=300.0,
+            review_gap_realarm=600.0,
+            staleness_threshold=1800.0,
+            ownership_lock=self.supervisor._agent_lock,  # noqa: SLF001
+        )
+
+        notes = await first_monitor.tick()
+        staleness_notes = [n for n in notes if n.event_type == "staleness"]
+        self.assertEqual(len(staleness_notes), 1)
+        original_message = staleness_notes[0].message
+        dedupe_key = staleness_notes[0].dedupe_key
+        orch_run_id = staleness_notes[0].orch_run_id
+
+        request_id = fleet_monitor_request_id(orch_run_id, dedupe_key)
+        original_receipt = self.store.command_log.receipt(
+            "run/send_now", request_id
+        )
+        self.assertIsNotNone(original_receipt)
+
+        # The worker's own run_id is the third field in the internal
+        # dedupe identity (agent_id, worker_run_id, dedupe_key). Fetch
+        # it so the simulated "ack loss" state uses the same shape
+        # ``_emit`` will look up next tick.
+        worker_run_id = self.store.current_run_id("WIKI-8232")
+        assert worker_run_id is not None
+        pending_identity = (
+            "WIKI-8232",
+            worker_run_id,
+            dedupe_key,
+        )
+
+        # Simulate ack loss on the fleet-monitor side: the durable
+        # send_now receipt exists, but the monitor process died before
+        # ``_pending_messages`` cleanup could persist the pop.
+        first_monitor._pending_messages.clear()  # noqa: SLF001
+        first_monitor._pending_messages[pending_identity] = original_message  # noqa: SLF001
+        first_monitor._persist_pending_messages()  # noqa: SLF001
+        self.assertTrue(first_monitor._pending_messages_path.exists())  # noqa: SLF001
+
+        # Advance so the recomputed elapsed-minutes changes the message
+        # the next tick would generate, then bring up a fresh monitor.
+        self.clock.advance(600)
+        restarted = FleetMonitor(
+            self.store,
+            dispatch_send,
+            clock=self.clock,
+            interval=0.01,
+            unrouted_verdict_realarm=300.0,
+            review_gap_threshold=300.0,
+            review_gap_realarm=600.0,
+            staleness_threshold=1800.0,
+            ownership_lock=self.supervisor._agent_lock,  # noqa: SLF001
+        )
+        # Restart hydrated pending state from disk.
+        self.assertIn(
+            pending_identity,
+            restarted._pending_messages,  # noqa: SLF001
+        )
+
+        dispatched.clear()
+        try:
+            follow_up = await restarted.tick()
+        except CommandConflict as exc:  # pragma: no cover - regression witness
+            self.fail(
+                f"restarted monitor raised CommandConflict on retry: {exc}"
+            )
+        # Retry replayed the exact original message, so idempotent
+        # dispatch returned the cached receipt result without conflict.
+        replayed = [call for call in dispatched if call[2] == dedupe_key]
+        self.assertEqual(len(replayed), 1)
+        self.assertEqual(replayed[0][1], original_message)
+        # Success: the pending entry is cleared and no second receipt
+        # exists — one durable send remains authoritative.
+        self.assertNotIn(
+            pending_identity,
+            restarted._pending_messages,  # noqa: SLF001
+        )
+        replayed_receipt = self.store.command_log.receipt(
+            "run/send_now", request_id
+        )
+        self.assertIsNotNone(replayed_receipt)
+        assert replayed_receipt is not None and original_receipt is not None
+        self.assertEqual(
+            replayed_receipt.command_hash, original_receipt.command_hash
+        )
+        # Persistence file is empty once the retry succeeded.
+        self.assertFalse(restarted._pending_messages_path.exists())  # noqa: SLF001
+        del follow_up
+
     async def test_orchestrator_replace_scopes_monitor_request_id(self) -> None:
         """WIKI-232 R3 H2: the durable FleetMonitor request_id must be scoped
         to the target orchestrator run. Several monitor dedupe keys are

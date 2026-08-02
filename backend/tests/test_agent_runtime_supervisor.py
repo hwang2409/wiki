@@ -1534,6 +1534,117 @@ class SupervisorTests(unittest.IsolatedAsyncioTestCase):
         )
         self.assertEqual(self.store.queued_messages(record.run_id), [])
 
+    async def test_recover_on_start_normalizes_orphan_raw_before_reconcile(
+        self,
+    ) -> None:
+        """WIKI-232 REVIEW8 H1: a daemon stop between raw append and the
+        deferred normalize flush leaves an orphan raw echo. Without
+        recovery-side normalization, ``steer_delivery_observed`` misses
+        the durable echo and the sending sweep marks the effect
+        ``supervisor_restart_dropped_send`` even though the provider
+        durably accepted the send."""
+
+        record = await self.supervisor.start_run(
+            agent_id="WIKI-232-REVIEW8-ORPHAN",
+            provider=ProviderKind.CODEX,
+            role="implement",
+            model="fixture-codex",
+            effort="high",
+            worktree=str(self.worktree),
+            prompt="review8 orphan raw",
+        )
+        pending_id = str(uuid4())
+        echoed_text = "orphan echo body"
+
+        # Steer effect at ``sending`` and a pending user message match
+        # what ``_deliver_next_queued`` writes before an inbound
+        # composer echo would land.
+        self.store.command_log.steer_effect(
+            method="run/send_on_idle",
+            request_id="review8-orphan-effect",
+            agent_id=record.agent_id,
+            command_hash="",
+            run_id=record.run_id,
+            pending_id=pending_id,
+            message=echoed_text,
+            mode="on_idle",
+        )
+        self.store.command_log.mark_steer_sending_for_pending(
+            record.run_id, pending_id
+        )
+        self.store.track_pending_user_message(
+            record.run_id, pending_id, echoed_text
+        )
+
+        # Simulate the crash: raw echo committed, deferred normalize
+        # never flushed. Do NOT append a normalized row.
+        self.store.append_raw(
+            record.run_id,
+            provider=ProviderKind.CODEX.value,
+            direction="provider",
+            payload={
+                "method": "item/completed",
+                "params": {
+                    "item": {
+                        "type": "userMessage",
+                        "content": [{"type": "text", "text": echoed_text}],
+                    }
+                },
+            },
+            generation=1,
+        )
+        # Precondition: no normalized row references the raw echo, so
+        # ``steer_delivery_observed`` returns False before the recovery.
+        self.assertFalse(
+            self.store.steer_delivery_observed(record.run_id, pending_id)
+        )
+        pre_reconcile = self.store.command_log.steer_effect_for_pending(
+            record.run_id, pending_id
+        )
+        assert pre_reconcile is not None
+        self.assertEqual(pre_reconcile["status"], "sending")
+
+        # Boot-time recovery: normalize orphan raws, then reconcile
+        # sending effects. Composer echo is now durable, so the sweep
+        # promotes the effect to ``sent`` rather than dropping.
+        self.supervisor._sending_effects_reconciled = False  # noqa: SLF001
+        await self.supervisor._normalize_orphan_raw_events()  # noqa: SLF001
+        await self.supervisor._reconcile_sending_steer_effects()  # noqa: SLF001
+
+        normalized_rows = self.store.read_normalized_events(record.run_id)
+        matching = [
+            row
+            for row in normalized_rows
+            if isinstance(row.get("payload"), dict)
+            and row["payload"].get("pending_id") == pending_id
+        ]
+        self.assertEqual(len(matching), 1)
+        self.assertEqual(int(matching[0]["raw_seq"]), 1)
+        self.assertTrue(
+            self.store.steer_delivery_observed(record.run_id, pending_id)
+        )
+        resolved = self.store.command_log.steer_effect_for_pending(
+            record.run_id, pending_id
+        )
+        assert resolved is not None
+        self.assertEqual(resolved["status"], "acknowledged")
+        # Live path uses ``acknowledge_steer_for_pending`` which sets no
+        # result payload. The regression we guard against is the sweep
+        # writing an uncertain ``supervisor_restart_dropped_send`` here.
+        result = resolved.get("result")
+        if result is not None:
+            self.assertNotEqual(
+                result.get("reason"), "supervisor_restart_dropped_send"
+            )
+        recovered = self.store.get(record.run_id)
+        self.assertEqual(recovered.pending_user_messages, [])
+        self.assertTrue(
+            any(
+                message.get("pending_id") == pending_id
+                for message in recovered.composer_messages
+            )
+        )
+
     async def test_dedupe_owner_is_scoped_by_command_method(self) -> None:
         """WIKI-232 R2 H1: request IDs are legal once per supervisor
         method, so the dedupe owner must be method-scoped. A bare

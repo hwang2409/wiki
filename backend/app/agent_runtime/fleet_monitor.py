@@ -21,7 +21,9 @@ from dataclasses import dataclass
 from typing import Any
 from uuid import uuid4
 
-from .store import RunStore
+from pathlib import Path
+
+from .store import RunStore, _atomic_write_json
 from .graph_health import GraphHealthMonitor, default_clock
 from .ticket import base_ticket
 from .types import LifecycleState, RunRecord, TERMINAL_STATES
@@ -198,8 +200,79 @@ class FleetMonitor:
         )
         self._graph_health_snapshots = self._graph_health.snapshots
         self._sent_dedupe_keys: set[tuple[str, str, str]] = set()
-        self._pending_messages: dict[tuple[str, str, str], str] = {}
+        # Persisted on write / removed on success so a restarted FleetMonitor
+        # replays the exact original payload for the same dedupe key. Without
+        # this, staleness retries would recompute a new elapsed-time message,
+        # collide with the durable send_now receipt for the original message
+        # under the same request_id, and raise CommandConflict every tick
+        # (WIKI-232 REVIEW8 H2).
+        self._pending_messages_path: Path = (
+            self.store.paths.runtime_dir / "fleet-monitor-pending.json"
+        )
+        self._pending_messages: dict[tuple[str, str, str], str] = (
+            self._load_pending_messages()
+        )
         self._send_semaphores: dict[str, asyncio.Semaphore] = {}
+
+    def _load_pending_messages(self) -> dict[tuple[str, str, str], str]:
+        try:
+            data = json.loads(self._pending_messages_path.read_text(encoding="utf-8"))
+        except FileNotFoundError:
+            return {}
+        except (OSError, json.JSONDecodeError):
+            logger.warning(
+                "fleet_monitor: pending messages file %s unreadable; starting empty",
+                self._pending_messages_path,
+            )
+            return {}
+        entries = data.get("entries") if isinstance(data, dict) else None
+        if not isinstance(entries, list):
+            return {}
+        loaded: dict[tuple[str, str, str], str] = {}
+        for entry in entries:
+            if not isinstance(entry, dict):
+                continue
+            agent_id = entry.get("agent_id")
+            run_id = entry.get("run_id")
+            dedupe_key = entry.get("dedupe_key")
+            message = entry.get("message")
+            if (
+                isinstance(agent_id, str)
+                and isinstance(run_id, str)
+                and isinstance(dedupe_key, str)
+                and isinstance(message, str)
+            ):
+                loaded[(agent_id, run_id, dedupe_key)] = message
+        return loaded
+
+    def _persist_pending_messages(self) -> None:
+        entries = [
+            {
+                "agent_id": identity[0],
+                "run_id": identity[1],
+                "dedupe_key": identity[2],
+                "message": message,
+            }
+            for identity, message in sorted(self._pending_messages.items())
+        ]
+        if not entries:
+            try:
+                self._pending_messages_path.unlink()
+            except FileNotFoundError:
+                return
+            except OSError:
+                logger.exception(
+                    "fleet_monitor: failed to remove pending messages file %s",
+                    self._pending_messages_path,
+                )
+            return
+        try:
+            _atomic_write_json(self._pending_messages_path, {"entries": entries})
+        except Exception:
+            logger.exception(
+                "fleet_monitor: failed to persist pending messages to %s",
+                self._pending_messages_path,
+            )
 
     async def run(self, stop: asyncio.Event) -> None:
         while not stop.is_set():
@@ -265,24 +338,37 @@ class FleetMonitor:
             for identity in self._sent_dedupe_keys
             if current_run_ids.get(identity[0]) == identity[1]
         }
+        pending_before = self._pending_messages
         self._pending_messages = {
             identity: message
             for identity, message in self._pending_messages.items()
             if current_run_ids.get(identity[0]) == identity[1]
         }
+        if pending_before.keys() != self._pending_messages.keys():
+            self._persist_pending_messages()
 
-    def _reset_agent_state(self, agent_id: str) -> None:
+    def _reset_agent_state(
+        self, agent_id: str, *, keep_run_id: str | None = None
+    ) -> None:
         self._snapshots.pop(agent_id, None)
+        # Preserve state that belongs to ``keep_run_id`` so a fresh
+        # boot (snapshot missing, but the worker's run is unchanged)
+        # does not discard durable ``_pending_messages`` entries the
+        # restarted monitor must replay under the original request id
+        # (WIKI-232 REVIEW8 H2).
         self._sent_dedupe_keys = {
             identity
             for identity in self._sent_dedupe_keys
-            if identity[0] != agent_id
+            if identity[0] != agent_id or identity[1] == keep_run_id
         }
+        pending_before = self._pending_messages
         self._pending_messages = {
             identity: message
             for identity, message in self._pending_messages.items()
-            if identity[0] != agent_id
+            if identity[0] != agent_id or identity[1] == keep_run_id
         }
+        if pending_before.keys() != self._pending_messages.keys():
+            self._persist_pending_messages()
 
     def _collect_views(self) -> list[_WorkerView]:
         views: list[_WorkerView] = []
@@ -339,7 +425,7 @@ class FleetMonitor:
         record = view.record
         snapshot = self._snapshots.get(record.agent_id)
         if snapshot is None or snapshot.run_id != record.run_id:
-            self._reset_agent_state(record.agent_id)
+            self._reset_agent_state(record.agent_id, keep_run_id=record.run_id)
             snapshot = _WorkerSnapshot(run_id=record.run_id)
         results: list[Notification] = []
 
@@ -616,10 +702,13 @@ class FleetMonitor:
             dedupe_identity = self._dedupe_identity(view, dedupe_key)
             if dedupe_identity in self._sent_dedupe_keys:
                 return None
-            stable_message = self._pending_messages.setdefault(
-                dedupe_identity,
-                message,
-            )
+            existing_pending = self._pending_messages.get(dedupe_identity)
+            if existing_pending is None:
+                self._pending_messages[dedupe_identity] = message
+                self._persist_pending_messages()
+                stable_message = message
+            else:
+                stable_message = existing_pending
             try:
                 async with self._send_semaphore(orch_agent_id):
                     await asyncio.wait_for(
@@ -641,7 +730,8 @@ class FleetMonitor:
                 )
                 return None
             self._sent_dedupe_keys.add(dedupe_identity)
-            self._pending_messages.pop(dedupe_identity, None)
+            if self._pending_messages.pop(dedupe_identity, None) is not None:
+                self._persist_pending_messages()
             return Notification(
                 ticket=view.record.agent_id,
                 orch_agent_id=orch_agent_id,

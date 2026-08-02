@@ -2375,6 +2375,7 @@ Preserve the same identity, role, worktree, orchestrator grouping, PR gates, and
             async with self.recovery_scan_lock:
                 self.store.abort_uncommitted_starts()
                 results = await self._recover_once()
+                await self._normalize_orphan_raw_events()
                 await self._reconcile_sending_steer_effects()
                 await self.command_queue.recover_pending()
                 if self._reaper_due():
@@ -2388,6 +2389,109 @@ Preserve the same identity, role, worktree, orchestrator grouping, PR gates, and
                         else:
                             results[index] = reaped
                 return results
+
+    async def _normalize_orphan_raw_events(self) -> None:
+        """Normalize raw provider rows whose normalization did not commit.
+
+        ``_handle_provider_event_without_admission`` appends the raw row
+        first, then defers the normalized append while a queued send is
+        mid-flight so an inbound composer echo cannot beat
+        ``mark_steer_sent_for_pending`` (WIKI-232 R6). A daemon stop
+        between the raw append and the deferred flush leaves an orphan
+        raw row: the normalized side never lands, so
+        ``steer_delivery_observed`` returns False during the subsequent
+        ``_reconcile_sending_steer_effects`` sweep and the still-``sending``
+        effect gets marked ``supervisor_restart_dropped_send`` even though
+        the provider durably accepted the send. Running this reconcile
+        before the sending-effect sweep replays each orphan raw through
+        the normalize + pending-match path so the composer echo is
+        recovered from the durable raw row.
+        """
+
+        for record in self.store.list_runs():
+            run_id = record.run_id
+            try:
+                raw_events = self.store.read_raw_events(run_id)
+            except RunNotFound:
+                continue
+            if not raw_events:
+                continue
+            try:
+                normalized_events = self.store.read_normalized_events(run_id)
+            except RunNotFound:
+                normalized_events = []
+            max_normalized_raw_seq = max(
+                (int(event.get("raw_seq", 0)) for event in normalized_events),
+                default=0,
+            )
+            orphans = [
+                event
+                for event in raw_events
+                if int(event.get("seq", 0)) > max_normalized_raw_seq
+            ]
+            if not orphans:
+                continue
+            for envelope in orphans:
+                await self._recover_orphan_raw_event(run_id, envelope)
+
+    async def _recover_orphan_raw_event(
+        self, run_id: str, envelope: dict[str, Any]
+    ) -> None:
+        """Replay one orphan raw event through the normalize + match path."""
+
+        try:
+            provider = ProviderKind(str(envelope.get("provider")))
+        except ValueError:
+            return
+        payload = envelope.get("payload")
+        if not isinstance(payload, dict):
+            return
+        raw_seq = int(envelope.get("seq", 0))
+        direction = str(envelope.get("direction") or "provider")
+        try:
+            normalized = normalize_provider_event(
+                provider,
+                payload,
+                direction=direction,
+            )
+        except Exception as exc:
+            normalized = NormalizedProviderEvent(
+                EventDisposition.UNKNOWN,
+                "normalization_error",
+                {"error": str(exc), "raw_payload": payload},
+            )
+        normalized_payload = normalized.payload
+        echoed_text = _provider_user_text(
+            provider,
+            normalized.kind,
+            normalized.payload,
+        )
+        if echoed_text is not None:
+            pending_message = self.store.match_pending_user_message(
+                run_id,
+                echoed_text,
+            )
+            if pending_message is not None:
+                self.store.command_log.acknowledge_steer_for_pending(
+                    run_id, pending_message["pending_id"]
+                )
+                normalized_payload = {
+                    **normalized.payload,
+                    "pending_id": pending_message["pending_id"],
+                    "composer_text": pending_message["text"],
+                    "composer_sent_at": pending_message["sent_at"],
+                }
+                pending_source = pending_message.get("source")
+                if isinstance(pending_source, str) and pending_source:
+                    normalized_payload["source"] = pending_source
+        self.store.append_normalized(
+            run_id,
+            raw_seq=raw_seq,
+            disposition=normalized.disposition,
+            kind=normalized.kind,
+            payload=normalized_payload,
+            lifecycle_state=normalized.lifecycle_state,
+        )
 
     async def _reconcile_sending_steer_effects(self) -> None:
         """Resolve every steer effect left at status='sending' by a prior boot.
