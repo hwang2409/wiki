@@ -9,6 +9,7 @@ from dataclasses import dataclass
 from .base import MediaScrubError
 from ._mp4_primitives import Mp4Atom as _Mp4Atom, parse_container as _parse_container
 from ._mp4_avc import _sample_description_configs
+from ._mp4_aac import Mp4AacConfig as _Mp4AacConfig
 
 
 _MP4_MAX_SAMPLES = 16_777_216
@@ -18,20 +19,22 @@ _MP4_MAX_TABLE_ENTRIES = 4096
 _CANONICAL_FULLBOX_FLAGS = b"\x00\x00\x00"
 
 
+_Mp4CodecConfig = tuple[int, dict[int, tuple[int, int]], bool] | _Mp4AacConfig | None
+
+
 @dataclass(frozen=True)
 class Mp4SampleRange:
     start: int
     end: int
     description_index: int
-    codec_config: tuple[int, dict[int, tuple[int, int]], bool] | None
+    codec_config: _Mp4CodecConfig
 
 
 @dataclass(frozen=True)
 class Mp4TrackSamplePlan:
     chunks_by_mdat: dict[
         int,
-        tuple[tuple[int, int, int, int, int, tuple[int, dict[int, tuple[int, int]], bool]
-                    | None, int], ...],
+        tuple[tuple[int, int, int, int, int, _Mp4CodecConfig, int], ...],
     ]
     sample_size: int
     sample_sizes: memoryview | None
@@ -65,8 +68,7 @@ def _build_sample_plan(
     track_plans: list[_Mp4TrackSamplePlan] = []
     track_mdat_groups = 0
     ownership: list[
-        tuple[int, int, int, int, int,
-              tuple[int, dict[int, tuple[int, int]], bool] | None, int]
+        tuple[int, int, int, int, int, _Mp4CodecConfig, int]
     ] = []
     mdat_starts = [start for start, _end in mdat_ranges]
     for moov in (atom for atom in top_atoms if atom.type == b"moov"):
@@ -238,8 +240,7 @@ def _build_sample_plan_from_stbl(
     sample_index = 0
     stsc_cursor = 0
     chunks_by_mdat: dict[int, list[tuple[
-        int, int, int, int, int,
-        tuple[int, dict[int, tuple[int, int]], bool] | None, int,
+        int, int, int, int, int, _Mp4CodecConfig, int,
     ]]] = {}
     for chunk_number in range(1, chunk_count + 1):
         stsc_cursor, samples_per_chunk, description_index, _ = stsc_for_chunk(

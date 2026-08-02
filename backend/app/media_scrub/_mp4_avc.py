@@ -13,6 +13,7 @@ from ._h264 import (
     canonicalise_sps_with_picture_bounds,
     parse_slice_header_with_first_mb,
 )
+from ._mp4_aac import Mp4AacConfig as _Mp4AacConfig, _parse_aac_config_from_esds
 from ._mp4_primitives import Mp4Atom as _Mp4Atom, parse_container as _parse_container
 
 
@@ -20,12 +21,18 @@ _MP4_MAX_TABLE_ENTRIES = 4096
 _MP4_MAX_BOXES_PER_CONTAINER = 4096
 _MP4_AVC_SAMPLE_NAL_TYPES = {1, 5, 6, 9, 12}
 _CANONICAL_FULLBOX_FLAGS = b"\x00\x00\x00"
-_MP4_SAMPLE_ENTRY_INNER_ALLOWED = {b"avcC", b"btrt", b"pasp", b"colr"}
+_MP4_VISUAL_SAMPLE_ENTRY_INNER_ALLOWED = {b"avcC", b"btrt", b"pasp", b"colr"}
+_MP4_AUDIO_SAMPLE_ENTRY_INNER_ALLOWED = {b"esds", b"btrt"}
+_MP4_SAMPLE_ENTRY_INNER_ALLOWED = (
+    _MP4_VISUAL_SAMPLE_ENTRY_INNER_ALLOWED | _MP4_AUDIO_SAMPLE_ENTRY_INNER_ALLOWED
+)
 _Mp4Sar = tuple[int, int]
+_Mp4CodecConfig = tuple[int, dict[int, tuple[int, int]], bool] | _Mp4AacConfig | None
 
 
 def _iter_sample_entry_inner_boxes(
     entry_bytes: bytes, inner_start: int,
+    allowed: frozenset[bytes] | set[bytes] = _MP4_SAMPLE_ENTRY_INNER_ALLOWED,
 ) -> Iterator[tuple[bytes, bytes]]:
     offset = inner_start
     end = len(entry_bytes)
@@ -42,7 +49,7 @@ def _iter_sample_entry_inner_boxes(
         box_type = entry_bytes[offset + 4:offset + 8]
         if box_size < 8 or offset + box_size > end:
             raise MediaScrubError("mp4 sample entry inner box size out of bounds")
-        if box_type not in _MP4_SAMPLE_ENTRY_INNER_ALLOWED:
+        if box_type not in allowed:
             raise MediaScrubError(
                 f"mp4 sample entry inner box {box_type!r} outside allowlist"
             )
@@ -52,11 +59,11 @@ def _iter_sample_entry_inner_boxes(
 
 def _sample_description_configs(
     data: bytes, body_start: int, body_end: int, handler_type: bytes,
-) -> list[tuple[int, dict[int, tuple[int, int]], bool] | None]:
+) -> list[_Mp4CodecConfig]:
     """Return one codec configuration per stsd sample-description index."""
-    if handler_type != b"vide":
+    if handler_type not in (b"vide", b"soun"):
         raise MediaScrubError(
-            "mp4 audio tracks, including mp4a, are deferred to WIKI-225"
+            f"mp4 hdlr track type {handler_type!r} is outside scrubber scope"
         )
     stsd_atoms = [
         atom for atom in _parse_container(data, body_start, body_end)
@@ -74,7 +81,7 @@ def _sample_description_configs(
         raise MediaScrubError(
             f"mp4 stsd entry count exceeds {_MP4_MAX_TABLE_ENTRIES}"
         )
-    entries: list[tuple[int, dict[int, tuple[int, int]], bool] | None] = []
+    entries: list[_Mp4CodecConfig] = []
     offset = 8
     for _ in range(entry_count):
         if offset + 8 > len(body):
@@ -84,17 +91,47 @@ def _sample_description_configs(
         if entry_size < 8 or offset + entry_size > len(body):
             raise MediaScrubError("mp4 stsd entry size out of bounds")
         entry = body[offset:offset + entry_size]
-        expected_entry_type = b"avc1"
-        if entry_type != expected_entry_type:
-            raise MediaScrubError(
-                f"mp4 {handler_type.decode('ascii')} track cannot use "
-                f"{entry_type.decode('ascii', 'replace')} sample entry; "
-                "outside scrubber scope"
-            )
-        config, _dimensions, _vui_sar = _parse_avc_sample_config_from_entry(entry)
-        entries.append(config)
+        if handler_type == b"vide":
+            if entry_type != b"avc1":
+                raise MediaScrubError(
+                    f"mp4 vide track cannot use "
+                    f"{entry_type.decode('ascii', 'replace')} sample entry; "
+                    "outside scrubber scope"
+                )
+            config, _dimensions, _vui_sar = _parse_avc_sample_config_from_entry(entry)
+            entries.append(config)
+        else:
+            if entry_type != b"mp4a":
+                raise MediaScrubError(
+                    f"mp4 soun track cannot use "
+                    f"{entry_type.decode('ascii', 'replace')} sample entry; "
+                    "outside scrubber scope"
+                )
+            entries.append(_parse_aac_sample_config_from_entry(entry))
         offset += entry_size
     return entries
+
+
+def _parse_aac_sample_config_from_entry(entry: bytes) -> _Mp4AacConfig:
+    """Extract an AAC-LC config from a validated mp4a sample entry.
+
+    The mp4a audio sample entry uses a 20-byte fixed header (v0) after
+    the 16-byte base header, followed by inner boxes — the same shape
+    the sample-entry walker enforces. We only need the esds body here.
+    """
+    if len(entry) < 16 + 20:
+        raise MediaScrubError("mp4 mp4a sample entry too short for audio header")
+    esds_body: bytes | None = None
+    for box_type, box_body in _iter_sample_entry_inner_boxes(
+        entry, 16 + 20, allowed=_MP4_AUDIO_SAMPLE_ENTRY_INNER_ALLOWED,
+    ):
+        if box_type == b"esds":
+            if esds_body is not None:
+                raise MediaScrubError("mp4 mp4a sample entry has duplicate esds")
+            esds_body = box_body
+    if esds_body is None:
+        raise MediaScrubError("mp4 mp4a sample entry requires exactly one esds")
+    return _parse_aac_config_from_esds(esds_body)
 
 
 def _parse_avc_sample_config_from_entry(
@@ -102,7 +139,9 @@ def _parse_avc_sample_config_from_entry(
 ) -> tuple[tuple[int, dict[int, tuple[int, int]], bool], tuple[int, int], _Mp4Sar | None]:
     avcc_body: bytes | None = None
     seen: set[bytes] = set()
-    for box_type, box_body in _iter_sample_entry_inner_boxes(entry, 16 + 70):
+    for box_type, box_body in _iter_sample_entry_inner_boxes(
+        entry, 16 + 70, allowed=_MP4_VISUAL_SAMPLE_ENTRY_INNER_ALLOWED,
+    ):
         if box_type in seen:
             raise MediaScrubError(
                 f"mp4 avc1 sample entry has duplicate {box_type.decode('ascii', 'replace')}"

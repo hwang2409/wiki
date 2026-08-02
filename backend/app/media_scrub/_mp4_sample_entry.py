@@ -12,6 +12,7 @@ from ._h264 import (
     canonicalise_nal_with_ids,
     canonicalise_sps_with_dimensions,
 )
+from ._mp4_aac import _rebuild_inner_esds
 from ._mp4_avc import _parse_avc_sample_config_from_entry
 from ._mp4_primitives import pack as _pack
 
@@ -19,8 +20,11 @@ from ._mp4_primitives import pack as _pack
 _MP4_MAX_TABLE_ENTRIES = 4096
 _MP4_MAX_BOXES_PER_CONTAINER = 4096
 _MP4_VISUAL_ENTRIES = {b"avc1"}
-_MP4_SAMPLE_ENTRY_INNER_ALLOWED = {b"avcC", b"btrt", b"pasp", b"colr"}
-_MP4_SAMPLE_ENTRY_REQUIRED_CONFIG = {b"avc1": b"avcC"}
+_MP4_AUDIO_ENTRIES = {b"mp4a"}
+_MP4_VISUAL_INNER_ALLOWED = frozenset({b"avcC", b"btrt", b"pasp", b"colr"})
+_MP4_AUDIO_INNER_ALLOWED = frozenset({b"esds", b"btrt"})
+_MP4_SAMPLE_ENTRY_INNER_ALLOWED = _MP4_VISUAL_INNER_ALLOWED | _MP4_AUDIO_INNER_ALLOWED
+_MP4_SAMPLE_ENTRY_REQUIRED_CONFIG = {b"avc1": b"avcC", b"mp4a": b"esds"}
 _CANONICAL_FULLBOX_FLAGS = b"\x00\x00\x00"
 _MP4_FULLBOX_ALLOWED_FLAG_MASK = {
     b"avcC": 0,
@@ -61,11 +65,14 @@ def _rebuild_stsd(
         if entry_size < 8 or offset + entry_size > len(payload):
             return None
         entry_bytes = payload[offset:offset + entry_size]
-        if handler_type != b"vide":
+        if handler_type == b"vide":
+            expected_entry_type = b"avc1"
+        elif handler_type == b"soun":
+            expected_entry_type = b"mp4a"
+        else:
             raise MediaScrubError(
-                "mp4 audio tracks, including mp4a, are deferred to WIKI-225"
+                f"mp4 hdlr track type {handler_type!r} is outside scrubber scope"
             )
-        expected_entry_type = b"avc1"
         if entry_type != expected_entry_type:
             raise MediaScrubError(
                 f"mp4 {handler_type.decode('ascii')} track cannot use "
@@ -150,6 +157,11 @@ def _rebuild_sample_entry(
     if entry_type in _MP4_VISUAL_ENTRIES:
         fixed = _rebuild_visual_sample_entry_fixed(entry_bytes)
         inner_start = 16 + 70
+        inner_allowed = _MP4_VISUAL_INNER_ALLOWED
+    elif entry_type in _MP4_AUDIO_ENTRIES:
+        fixed = _rebuild_audio_sample_entry_fixed(entry_bytes)
+        inner_start = 16 + 20
+        inner_allowed = _MP4_AUDIO_INNER_ALLOWED
     else:
         raise MediaScrubError(
             f"mp4 sample entry type {entry_type!r} outside allowlist"
@@ -178,6 +190,7 @@ def _rebuild_sample_entry(
         entry_bytes,
         inner_start,
         entry_type=entry_type,
+        allowed=inner_allowed,
     )
     required_config = _MP4_SAMPLE_ENTRY_REQUIRED_CONFIG[entry_type]
     if required_config not in inner_types:
@@ -194,10 +207,62 @@ def _rebuild_sample_entry(
     return _pack(entry_type, body)
 
 
+def _rebuild_audio_sample_entry_fixed(entry_bytes: bytes) -> bytes:
+    """20-byte v0 audio sample entry — ISO/IEC 14496-12.
+
+    Fields (all big-endian):
+        reserved (8 bytes: 2 uint32) — must be zero
+        channel_count (uint16)
+        sample_size (uint16, must be 16)
+        pre_defined (uint16) — dropped, emitted as 0
+        reserved (uint16) — dropped, emitted as 0
+        sample_rate (uint32, 16.16 fixed point)
+
+    Extended audio sample entries (v1, v2) are rejected — the strict
+    subset only accepts the canonical v0 shape ffmpeg produces for
+    AAC-LC. Channel count must match a mono / stereo configuration; the
+    real per-track channel count comes from esds AudioSpecificConfig
+    and is checked there.
+    """
+    if len(entry_bytes) < 16 + 20:
+        raise MediaScrubError("mp4 audio sample entry too short")
+    body = entry_bytes[16:16 + 20]
+    if body[0:8] != b"\x00" * 8:
+        raise MediaScrubError("mp4 audio sample entry reserved-8 bytes non-zero")
+    channel_count = struct.unpack(">H", body[8:10])[0]
+    sample_size = struct.unpack(">H", body[10:12])[0]
+    sample_rate_fixed = struct.unpack(">I", body[16:20])[0]
+    if channel_count not in (1, 2):
+        raise MediaScrubError(
+            f"mp4 audio sample entry channel_count {channel_count} outside {{1,2}}"
+        )
+    if sample_size != 16:
+        raise MediaScrubError(
+            f"mp4 audio sample entry sample_size {sample_size} is not the canonical 16"
+        )
+    if sample_rate_fixed & 0xFFFF:
+        raise MediaScrubError(
+            "mp4 audio sample entry sample_rate must have zero fractional bits"
+        )
+    sample_rate = sample_rate_fixed >> 16
+    if not 8000 <= sample_rate <= 96000:
+        raise MediaScrubError(
+            f"mp4 audio sample entry sample_rate {sample_rate} outside 8000..96000"
+        )
+    return (
+        b"\x00" * 8
+        + struct.pack(">HH", channel_count, sample_size)
+        + b"\x00" * 4
+        + struct.pack(">I", sample_rate_fixed)
+    )
+
+
 def _sample_entry_pasp_ratio(entry_bytes: bytes) -> tuple[int, int] | None:
     """Return a validated pixel-aspect ratio from an avc1 entry, if present."""
     ratio: tuple[int, int] | None = None
-    for box_type, body in _iter_sample_entry_inner_boxes(entry_bytes, 16 + 70):
+    for box_type, body in _iter_sample_entry_inner_boxes(
+        entry_bytes, 16 + 70, allowed=_MP4_VISUAL_INNER_ALLOWED,
+    ):
         if box_type != b"pasp":
             continue
         if len(body) != 8:
@@ -320,6 +385,7 @@ def _walk_sample_entry_inner_boxes(
     inner_start: int,
     *,
     entry_type: bytes,
+    allowed: frozenset[bytes] | set[bytes] = _MP4_SAMPLE_ENTRY_INNER_ALLOWED,
 ) -> tuple[bytes, set[bytes]]:
     """Rebuild each inner box from parsed fields. No opaque body copy
     path remains: every allowlisted type dispatches to a struct.pack
@@ -329,7 +395,9 @@ def _walk_sample_entry_inner_boxes(
     """
     out = bytearray()
     seen: set[bytes] = set()
-    for box_type, body in _iter_sample_entry_inner_boxes(entry_bytes, inner_start):
+    for box_type, body in _iter_sample_entry_inner_boxes(
+        entry_bytes, inner_start, allowed=allowed,
+    ):
         if box_type in seen:
             raise MediaScrubError(
                 f"mp4 {entry_type.decode('ascii')} sample entry has duplicate "
@@ -348,6 +416,8 @@ def _walk_sample_entry_inner_boxes(
             out.extend(_rebuild_inner_pasp(body))
         elif box_type == b"colr":
             out.extend(_rebuild_inner_colr(body))
+        elif box_type == b"esds":
+            out.extend(_rebuild_inner_esds(body))
         else:  # pragma: no cover — allowlist above already gated
             raise MediaScrubError(
                 f"mp4 sample entry inner box {box_type!r} missing rebuilder"
@@ -357,6 +427,7 @@ def _walk_sample_entry_inner_boxes(
 
 def _iter_sample_entry_inner_boxes(
     entry_bytes: bytes, inner_start: int,
+    allowed: frozenset[bytes] | set[bytes] = _MP4_SAMPLE_ENTRY_INNER_ALLOWED,
 ) -> Iterator[tuple[bytes, bytes]]:
     offset = inner_start
     end = len(entry_bytes)
@@ -373,7 +444,7 @@ def _iter_sample_entry_inner_boxes(
         box_type = entry_bytes[offset + 4:offset + 8]
         if box_size < 8 or offset + box_size > end:
             raise MediaScrubError("mp4 sample entry inner box size out of bounds")
-        if box_type not in _MP4_SAMPLE_ENTRY_INNER_ALLOWED:
+        if box_type not in allowed:
             raise MediaScrubError(
                 f"mp4 sample entry inner box {box_type!r} outside allowlist"
             )
