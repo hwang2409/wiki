@@ -22,6 +22,8 @@ export function textPayload(artifact: SessionArtifact): string {
         ? artifact.json_data
         : JSON.stringify(artifact.json_data ?? {}, null, 2);
     case "pdf":
+    case "video":
+    case "audio":
       return artifact.ref ?? "";
     case "visual-diff":
       return JSON.stringify(
@@ -53,6 +55,8 @@ export function downloadName(event: SessionEvent): string {
   if (effectiveKind === "code" && artifact.filename) {
     return artifact.filename.split(/[\\/]/).pop() || `${base}.txt`;
   }
+  const videoExtension = artifact.mime === "image/gif" ? "gif" : "mp4";
+  const audioExtension = artifact.mime === "audio/mpeg" ? "mp3" : "wav";
   const extension = {
     mermaid: "mmd",
     svg: "svg",
@@ -64,6 +68,8 @@ export function downloadName(event: SessionEvent): string {
     "file-list": "txt",
     json: "json",
     pdf: "pdf",
+    video: videoExtension,
+    audio: audioExtension,
     "visual-diff": "json",
   }[effectiveKind];
   return `${base}.${extension}`;
@@ -98,9 +104,11 @@ export async function downloadArtifact(ticket: string, event: SessionEvent): Pro
     return;
   }
   let blob: Blob;
-  if (artifact.kind === "pdf") {
-    const response = await fetch(artifactUrl(ticket, event));
-    if (!response.ok) throw new Error(`PDF download failed (${response.status})`);
+  if (artifact.kind === "pdf" || artifact.kind === "video" || artifact.kind === "audio") {
+    const response = artifact.data_base64
+      ? await fetch(`data:${artifact.mime};base64,${artifact.data_base64}`)
+      : await fetch(artifactUrl(ticket, event));
+    if (!response.ok) throw new Error(`${artifact.kind} download failed (${response.status})`);
     blob = await response.blob();
   } else if (artifact.kind === "image" && !artifact.data_base64) {
     const response = await fetch(artifactUrl(ticket, event));

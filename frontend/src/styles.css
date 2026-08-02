@@ -13880,6 +13880,16 @@ textarea.composer-command-input {
   color: var(--text-muted);
 }
 
+/* Video / audio artifacts (WIKI-190/191) */
+
+.artifact-video-wrap {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  width: 100%;
+  max-width: 720px;
+}
+
 /* WIKI-193 visual-diff artifact ------------------------------------------- */
 .visual-diff {
   display: flex;
@@ -13888,6 +13898,166 @@ textarea.composer-command-input {
   width: 100%;
   min-width: 0;
 }
+
+.artifact-video-frame {
+  position: relative;
+  overflow: hidden;
+  width: 100%;
+  border-radius: 8px;
+  border: 1px solid var(--background-modifier-border);
+  background: var(--background-secondary);
+}
+
+.artifact-video-wrap .artifact-video {
+  display: block;
+  width: 100%;
+  height: auto;
+  max-height: 560px;
+  object-fit: contain;
+  border-radius: inherit;
+  background: var(--background-primary);
+}
+
+.artifact-gif-wrap {
+  position: relative;
+  border-radius: 8px;
+  overflow: hidden;
+  border: 1px solid var(--background-modifier-border);
+  background: var(--background-secondary);
+}
+
+.artifact-gif-wrap .artifact-video.is-frozen-source {
+  visibility: hidden;
+  position: absolute;
+  inset: 0;
+  pointer-events: none;
+}
+
+.artifact-gif-wrap .artifact-gif-frozen {
+  position: relative;
+  z-index: 0;
+}
+
+.artifact-gif-play {
+  position: absolute;
+  inset: 0;
+  margin: auto;
+  width: 44px;
+  height: 44px;
+  border-radius: 999px;
+  border: 1px solid var(--background-modifier-border);
+  background: color-mix(in srgb, var(--background-primary) 80%, transparent);
+  color: var(--text-normal);
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  cursor: pointer;
+  z-index: 1;
+  transition: transform 120ms ease, background-color 120ms ease;
+}
+
+.artifact-gif-play:hover,
+.artifact-gif-play:focus-visible {
+  transform: scale(1.05);
+  background: var(--background-primary);
+  outline: none;
+}
+
+.artifact-gif-play:focus-visible {
+  box-shadow: 0 0 0 2px var(--accent-primary);
+}
+
+.artifact-video-controls,
+.artifact-audio-controls {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  flex-wrap: wrap;
+  font-size: 12px;
+  color: var(--text-muted);
+}
+
+.artifact-video-duration,
+.artifact-audio-duration {
+  color: var(--text-normal);
+}
+
+.artifact-video-speed,
+.artifact-audio-speed {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+}
+
+.artifact-video-speed select,
+.artifact-audio-speed select {
+  padding: 2px 6px;
+  border-radius: 4px;
+  border: 1px solid var(--background-modifier-border);
+  background: var(--background-primary);
+  color: var(--text-normal);
+  font: inherit;
+}
+
+.artifact-audio-wrap {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  width: 100%;
+  max-width: 560px;
+  padding: 12px;
+  border-radius: 8px;
+  border: 1px solid var(--background-modifier-border);
+  background: var(--background-secondary);
+}
+
+.artifact-audio-wrap .artifact-audio {
+  width: 100%;
+  display: block;
+}
+
+.artifact-audio-waveform {
+  width: 100%;
+  height: 40px;
+  color: var(--text-muted);
+  fill: currentColor;
+  display: block;
+}
+
+.artifact-audio-transcript-toggle {
+  padding: 2px 8px;
+  border-radius: 4px;
+  border: 1px solid var(--background-modifier-border);
+  background: var(--background-primary);
+  color: var(--text-normal);
+  font: inherit;
+  cursor: pointer;
+}
+
+.artifact-audio-transcript-toggle:focus-visible {
+  outline: none;
+  box-shadow: 0 0 0 2px var(--accent-primary);
+}
+
+.artifact-audio-transcript {
+  padding: 10px 12px;
+  border-radius: 6px;
+  border: 1px solid var(--background-modifier-border);
+  background: var(--background-primary);
+  color: var(--text-normal);
+  font-size: 13px;
+  line-height: 1.5;
+  white-space: pre-wrap;
+  max-height: 240px;
+  overflow: auto;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .artifact-gif-play {
+    transition: none !important;
+  }
+}
+
 
 .visual-diff-stage {
   position: relative;

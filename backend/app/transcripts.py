@@ -34,8 +34,11 @@ from pathlib import Path, PurePosixPath
 
 from .image_scrub import ImageScrubError, probe_normalized_dimensions
 from .wiki_artifacts import (
+    AUDIO_MIMES,
     ArtifactValidationError,
     IMAGE_TYPES,
+    PDF_MIME,
+    VIDEO_MIMES,
     VISUAL_DIFF_VARIANTS,
     _validate_text_payload,
     artifact_from_codex_mcp_tool_result,
@@ -64,6 +67,13 @@ EVENT_DISPOSITION_RENDERED = "rendered"
 EVENT_DISPOSITION_SUMMARIZED = "summarized"
 EVENT_DISPOSITION_IGNORED = "intentionally_ignored"
 EVENT_DISPOSITION_UNKNOWN = "unknown"
+
+_STRUCTURED_BINARY_MIMES = {
+    "image": frozenset(IMAGE_TYPES),
+    "pdf": frozenset({PDF_MIME}),
+    "video": frozenset(VIDEO_MIMES),
+    "audio": frozenset(AUDIO_MIMES),
+}
 
 
 def cache_image(media_type: str, b64_data: str) -> str | None:
@@ -544,9 +554,12 @@ def _codex_tool_input(name: str, arguments: object) -> str:
 
 
 def _is_artifact_tool(name: object) -> bool:
-    return isinstance(name, str) and (
-        name == "render_artifact" or name.endswith("__render_artifact")
-    )
+    return isinstance(name, str) and name in {
+        "render_artifact",
+        "wiki_artifacts__render_artifact",
+        "mcp__wiki_artifacts__render_artifact",
+        "mcp__wiki-artifacts__render_artifact",
+    }
 
 
 def _tool_arguments(arguments: object) -> dict | None:
@@ -673,42 +686,31 @@ def _artifact_from_structured_result(meta: dict, output: str) -> dict | None:
     payload = raw_input.get("payload")
     if not isinstance(kind, str) or not isinstance(payload, dict):
         return None
-    if kind == "image":
-        artifact = {
-            "kind": "image",
-            "ref": f"artifact://{artifact_id}",
-            "mime": payload.get("mime"),
-        }
-    elif kind == "visual-diff":
-        variants: dict[str, dict[str, object]] = {}
-        for variant in VISUAL_DIFF_VARIANTS:
-            side = payload.get(variant)
-            if not isinstance(side, dict):
+    if kind in _STRUCTURED_BINARY_MIMES:
+        normalized = result.get("artifact")
+        if isinstance(normalized, dict):
+            artifact = dict(normalized)
+            if artifact.get("kind") != kind:
                 return None
-            mime = side.get("mime")
-            encoded = side.get("data_base64")
-            if mime not in IMAGE_TYPES or not isinstance(encoded, str):
+        else:
+            # Older providers only returned an id for image and PDF results.
+            # These kinds have no media metadata that the renderer needs.
+            if kind not in {"image", "pdf"}:
                 return None
-            try:
-                data = base64.b64decode(encoded, validate=True)
-            except (binascii.Error, ValueError):
+            default_mime = PDF_MIME if kind == "pdf" else None
+            mime = payload.get("mime", default_mime)
+            if mime not in _STRUCTURED_BINARY_MIMES[kind]:
                 return None
-            try:
-                # Match scrub_image: EXIF orientation is baked into pixels at
-                # write time, so the fallback must report the *stored* size,
-                # not the raw header size. A 120x80 Orientation=6 JPEG stores
-                # as 80x120 and must render in a portrait stage.
-                width, height = probe_normalized_dimensions(data, mime)
-            except ImageScrubError:
-                return None
-            variants[variant] = {
-                "ref": f"artifact://{artifact_id}/{variant}",
+            artifact = {
+                "kind": kind,
+                "ref": f"artifact://{artifact_id}",
                 "mime": mime,
-                "byte_size": len(data),
-                "width": width,
-                "height": height,
             }
-        artifact = {"kind": "visual-diff", **variants}
+    elif kind == "visual-diff":
+        normalized = result.get("artifact")
+        if not isinstance(normalized, dict) or normalized.get("kind") != kind:
+            return None
+        artifact = dict(normalized)
     else:
         try:
             validated_payload = _validate_text_payload(kind, payload)
@@ -748,6 +750,8 @@ def _complete_artifact(
     protocol_event = None if failed else artifact_from_text(output)
     if protocol_event is None and not failed:
         protocol_event = _artifact_from_structured_result(meta, output)
+    if protocol_event is not None and not _is_artifact_tool(meta.get("name")):
+        protocol_event = None
     if protocol_event is not None:
         _append_artifact_event(state, protocol_event, ts)
     else:

@@ -5,6 +5,7 @@ import asyncio
 import io
 import json
 import os
+import struct
 import subprocess
 import sys
 import tempfile
@@ -14,7 +15,7 @@ from unittest import mock
 
 from PIL import Image
 
-from backend.app import main, wiki_agent_tools, wiki_artifacts
+from backend.app import binary_artifacts, main, media_scrub, wiki_agent_tools, wiki_artifacts
 from backend.app.agent_runtime import next_review as next_review_runtime
 from backend.app.agent_runtime.autopilot import AutopilotController, AutopilotStore
 from backend.app.agent_runtime.diversity_orchestration import collect_diversity_verdict
@@ -24,15 +25,19 @@ from backend.app.next_review_schema import NextReviewIn, mcp_input_schema
 RUN_ID = "00000000-0000-4000-8000-000000000085"
 
 
-def _fixture_png_bytes(color: tuple[int, int, int] = (255, 128, 0), size: tuple[int, int] = (2, 2)) -> bytes:
+def _fixture_png_bytes() -> bytes:
     buffer = io.BytesIO()
-    Image.new("RGB", size, color=color).save(buffer, format="PNG")
+    Image.new("RGB", (2, 2), color=(255, 128, 0)).save(buffer, format="PNG")
     return buffer.getvalue()
 
 
 FIXTURE_PNG_BYTES = _fixture_png_bytes()
-FIXTURE_PNG_BYTES_ALT = _fixture_png_bytes(color=(0, 128, 255))
-FIXTURE_PNG_BYTES_LARGER = _fixture_png_bytes(color=(0, 128, 255), size=(4, 4))
+
+
+from backend.tests.test_media_scrub import REAL_MP4, REAL_WAV
+
+FIXTURE_MP4_BYTES = REAL_MP4.read_bytes()
+FIXTURE_WAV_BYTES = REAL_WAV.read_bytes()
 
 
 def _payload(kind: str) -> dict:
@@ -90,13 +95,21 @@ def _payload(kind: str) -> dict:
         "pdf": {
             "data_base64": base64.b64encode(b"%PDF-1.4\n%fixture bytes\n").decode(),
         },
+        "video": {
+            "data_base64": base64.b64encode(FIXTURE_MP4_BYTES).decode(),
+            "mime": "video/mp4",
+        },
+        "audio": {
+            "data_base64": base64.b64encode(FIXTURE_WAV_BYTES).decode(),
+            "mime": "audio/wav",
+        },
         "visual-diff": {
             "before": {
                 "data_base64": base64.b64encode(FIXTURE_PNG_BYTES).decode(),
                 "mime": "image/png",
             },
             "after": {
-                "data_base64": base64.b64encode(FIXTURE_PNG_BYTES_ALT).decode(),
+                "data_base64": base64.b64encode(FIXTURE_PNG_BYTES).decode(),
                 "mime": "image/png",
             },
         },
@@ -155,30 +168,6 @@ class WikiArtifactsTests(unittest.TestCase):
                         reopened.load()
                         self.assertEqual(reopened.size, (2, 2))
                     self.assertEqual(image.stat().st_mode & 0o777, 0o600)
-                elif kind == "visual-diff":
-                    for variant in ("before", "after"):
-                        self.assertNotIn("data_base64", event["artifact"][variant])
-                        image = (
-                            self.root
-                            / "runtime"
-                            / "runs"
-                            / RUN_ID
-                            / "artifacts"
-                            / f"{event['id']}.{variant}.png"
-                        )
-                        stored = image.read_bytes()
-                        self.assertTrue(stored.startswith(b"\x89PNG\r\n\x1a\n"))
-                        with Image.open(io.BytesIO(stored)) as reopened:
-                            reopened.load()
-                            self.assertEqual(reopened.size, (2, 2))
-                        self.assertEqual(image.stat().st_mode & 0o777, 0o600)
-                        self.assertEqual(event["artifact"][variant]["mime"], "image/png")
-                        self.assertEqual(event["artifact"][variant]["width"], 2)
-                        self.assertEqual(event["artifact"][variant]["height"], 2)
-                        self.assertEqual(
-                            event["artifact"][variant]["ref"],
-                            f"artifact://{event['id']}/{variant}",
-                        )
                 elif kind == "pdf":
                     self.assertNotIn("data_base64", event["artifact"])
                     self.assertNotIn("path", event["artifact"])
@@ -193,6 +182,39 @@ class WikiArtifactsTests(unittest.TestCase):
                     )
                     self.assertTrue(pdf.read_bytes().startswith(b"%PDF-"))
                     self.assertEqual(pdf.stat().st_mode & 0o777, 0o600)
+                elif kind == "video":
+                    self.assertNotIn("data_base64", event["artifact"])
+                    self.assertEqual(event["artifact"]["mime"], "video/mp4")
+                    # Real fixture: 160x120, ~0.5s runtime.
+                    self.assertEqual(event["artifact"]["width"], 160)
+                    self.assertEqual(event["artifact"]["height"], 120)
+                    self.assertEqual(event["artifact"]["duration_ms"], 533)
+                    video = (
+                        self.root
+                        / "runtime"
+                        / "runs"
+                        / RUN_ID
+                        / "artifacts"
+                        / f"{event['id']}.mp4"
+                    )
+                    self.assertTrue(video.read_bytes()[4:8] == b"ftyp")
+                    self.assertEqual(video.stat().st_mode & 0o777, 0o600)
+                elif kind == "audio":
+                    self.assertNotIn("data_base64", event["artifact"])
+                    self.assertEqual(event["artifact"]["mime"], "audio/wav")
+                    audio = (
+                        self.root
+                        / "runtime"
+                        / "runs"
+                        / RUN_ID
+                        / "artifacts"
+                        / f"{event['id']}.wav"
+                    )
+                    self.assertTrue(audio.read_bytes().startswith(b"RIFF"))
+                    self.assertEqual(audio.stat().st_mode & 0o777, 0o600)
+                elif kind == "visual-diff":
+                    self.assertEqual(event["artifact"]["before"]["width"], 2)
+                    self.assertEqual(event["artifact"]["after"]["height"], 2)
                 else:
                     for key, value in _payload(kind).items():
                         self.assertEqual(event["artifact"][key], value)
@@ -212,12 +234,13 @@ class WikiArtifactsTests(unittest.TestCase):
             "file-list": {"files": [{"label": "missing path"}]},
             "json": {},
             "pdf": {"data_base64": base64.b64encode(b"not a pdf").decode()},
-            "visual-diff": {
-                "before": {
-                    "data_base64": base64.b64encode(FIXTURE_PNG_BYTES).decode(),
-                    "mime": "image/png",
-                },
-                # missing 'after'
+            "video": {
+                "data_base64": base64.b64encode(b"not a video").decode(),
+                "mime": "video/mp4",
+            },
+            "audio": {
+                "data_base64": base64.b64encode(b"not audio").decode(),
+                "mime": "audio/wav",
             },
         }
         for kind, payload in malformed.items():
@@ -260,378 +283,254 @@ class WikiArtifactsTests(unittest.TestCase):
                 }
             )
 
-    def test_visual_diff_rejects_dimension_mismatch(self) -> None:
+        video = base64.b64encode(b"x" * (wiki_artifacts.VIDEO_LIMIT + 1)).decode()
         with self.assertRaisesRegex(
-            wiki_artifacts.ArtifactValidationError, "identical dimensions"
+            wiki_artifacts.ArtifactValidationError, "40MB video limit"
         ):
             wiki_artifacts.render_artifact(
                 {
-                    "kind": "visual-diff",
-                    "payload": {
-                        "before": {
-                            "data_base64": base64.b64encode(FIXTURE_PNG_BYTES).decode(),
-                            "mime": "image/png",
-                        },
-                        "after": {
-                            "data_base64": base64.b64encode(
-                                FIXTURE_PNG_BYTES_LARGER
-                            ).decode(),
-                            "mime": "image/png",
-                        },
-                    },
+                    "kind": "video",
+                    "payload": {"data_base64": video, "mime": "video/mp4"},
                 }
             )
 
-    def test_visual_diff_over_limit_variant_returns_isError_and_server_survives(self) -> None:
-        # A PNG declaring 10000x10000 in its IHDR chunk trips PIL's
-        # decompression-bomb detection (MAX_IMAGE_PIXELS = 40M). Before this
-        # fix, _reject_multi_frame opened the payload with PIL BEFORE any
-        # size cap, so DecompressionBombError (bare Exception, not
-        # ValueError) escaped every except clause on the stack and
-        # terminated the per-run MCP server. Now the pre-cap header probe
-        # bails out before PIL sees the bytes.
-        import struct
-        import zlib
-
-        def _oversized_png() -> bytes:
-            ihdr_payload = struct.pack(
-                ">IIBBBBB", 10000, 10000, 8, 2, 0, 0, 0,
-            )
-            crc = zlib.crc32(b"IHDR" + ihdr_payload).to_bytes(4, "big")
-            return (
-                b"\x89PNG\r\n\x1a\n"
-                + b"\x00\x00\x00\x0d"  # IHDR length
-                + b"IHDR"
-                + ihdr_payload
-                + crc
+        audio = base64.b64encode(b"x" * (wiki_artifacts.AUDIO_LIMIT + 1)).decode()
+        with self.assertRaisesRegex(
+            wiki_artifacts.ArtifactValidationError, "20MB audio limit"
+        ):
+            wiki_artifacts.render_artifact(
+                {
+                    "kind": "audio",
+                    "payload": {"data_base64": audio, "mime": "audio/wav"},
+                }
             )
 
-        bomb = _oversized_png()
-        requests = [
+    def test_video_rejects_wrong_mime(self) -> None:
+        payload = {
+            "data_base64": base64.b64encode(FIXTURE_MP4_BYTES).decode(),
+            "mime": "application/octet-stream",
+        }
+        with self.assertRaisesRegex(
+            wiki_artifacts.ArtifactValidationError, "payload.mime must be one of"
+        ):
+            wiki_artifacts.render_artifact({"kind": "video", "payload": payload})
+
+    def test_audio_transcript_length_is_capped(self) -> None:
+        payload = {
+            "data_base64": base64.b64encode(FIXTURE_WAV_BYTES).decode(),
+            "mime": "audio/wav",
+            "transcript": "x" * (wiki_artifacts.TEXT_LIMIT + 1),
+        }
+        with self.assertRaisesRegex(
+            wiki_artifacts.ArtifactValidationError, "audio transcript exceeds"
+        ):
+            wiki_artifacts.render_artifact({"kind": "audio", "payload": payload})
+
+    def test_audio_multibyte_transcript_length_is_capped_by_utf8_bytes(self) -> None:
+        payload = {
+            "data_base64": base64.b64encode(FIXTURE_WAV_BYTES).decode(),
+            "mime": "audio/wav",
+            "transcript": "𐍈" * (wiki_artifacts.TEXT_LIMIT // 4 + 1),
+        }
+        with self.assertRaisesRegex(
+            wiki_artifacts.ArtifactValidationError, "audio transcript exceeds"
+        ):
+            wiki_artifacts.render_artifact({"kind": "audio", "payload": payload})
+
+    def test_audio_rejected_transcript_does_not_orphan_media_file(self) -> None:
+        # Round-2 review flagged: an oversized transcript fires AFTER
+        # _write_binary, leaving a scrubbed .wav resident on disk while
+        # the caller sees a failure. Validation must run before the write.
+        payload = {
+            "data_base64": base64.b64encode(FIXTURE_WAV_BYTES).decode(),
+            "mime": "audio/wav",
+            "transcript": "x" * (wiki_artifacts.TEXT_LIMIT + 1),
+        }
+        artifact_dir = self.root / "runtime" / "runs" / RUN_ID / "artifacts"
+        with self.assertRaises(wiki_artifacts.ArtifactValidationError):
+            wiki_artifacts.render_artifact({"kind": "audio", "payload": payload})
+        # No .wav should exist in the artifact dir.
+        if artifact_dir.exists():
+            leftover = list(artifact_dir.glob("*.wav"))
+            self.assertEqual(
+                leftover, [], msg=f"orphaned media files: {leftover}",
+            )
+
+    def test_audio_non_string_transcript_does_not_orphan_media_file(self) -> None:
+        payload = {
+            "data_base64": base64.b64encode(FIXTURE_WAV_BYTES).decode(),
+            "mime": "audio/wav",
+            "transcript": ["not", "a", "string"],
+        }
+        artifact_dir = self.root / "runtime" / "runs" / RUN_ID / "artifacts"
+        with self.assertRaisesRegex(
+            wiki_artifacts.ArtifactValidationError, "transcript must be a string"
+        ):
+            wiki_artifacts.render_artifact({"kind": "audio", "payload": payload})
+        if artifact_dir.exists():
+            self.assertEqual(list(artifact_dir.glob("*.wav")), [])
+
+    def test_video_over_limit_duration_does_not_orphan_media_file(self) -> None:
+        payload = bytearray(FIXTURE_MP4_BYTES)
+        mvhd_pos = payload.find(b"mvhd")
+        self.assertGreater(mvhd_pos, 0)
+        # v0 mvhd: version+flags, creation, modification, timescale, duration.
+        payload[mvhd_pos + 20:mvhd_pos + 24] = struct.pack(">I", 0xFFFFFFFF)
+        artifact_dir = self.root / "runtime" / "runs" / RUN_ID / "artifacts"
+        with self.assertRaisesRegex(
+            wiki_artifacts.ArtifactValidationError,
+            "duration_ms is out of bounds|mvhd and tkhd durations differ",
+        ):
+            wiki_artifacts.render_artifact(
+                {
+                    "kind": "video",
+                    "payload": {
+                        "data_base64": base64.b64encode(payload).decode(),
+                        "mime": "video/mp4",
+                    },
+                }
+            )
+        if artifact_dir.exists():
+            self.assertEqual(list(artifact_dir.iterdir()), [])
+
+    def test_audio_over_limit_duration_does_not_orphan_media_file(self) -> None:
+        scrubbed = media_scrub.MediaScrubResult(
+            data=FIXTURE_WAV_BYTES,
+            mime="audio/wav",
+            width=None,
+            height=None,
+            duration_ms=wiki_artifacts._BINARY_ARTIFACT_MAX_DURATION_MS + 1,
+            peaks=[1],
+        )
+        artifact_dir = self.root / "runtime" / "runs" / RUN_ID / "artifacts"
+        with mock.patch.object(wiki_artifacts, "scrub_audio", return_value=scrubbed):
+            with self.assertRaisesRegex(
+                wiki_artifacts.ArtifactValidationError, "duration_ms is out of bounds"
+            ):
+                wiki_artifacts.render_artifact(
+                    {
+                        "kind": "audio",
+                        "payload": {
+                            "data_base64": base64.b64encode(FIXTURE_WAV_BYTES).decode(),
+                            "mime": "audio/wav",
+                        },
+                    }
+                )
+        if artifact_dir.exists():
+            self.assertEqual(list(artifact_dir.iterdir()), [])
+
+    def test_video_accepts_path_payload_alongside_data_base64(self) -> None:
+        # Reject "both" and "neither".
+        with self.assertRaisesRegex(
+            wiki_artifacts.ArtifactValidationError, "exactly one"
+        ):
+            wiki_artifacts.render_artifact(
+                {"kind": "video", "payload": {"mime": "video/mp4"}}
+            )
+        with self.assertRaisesRegex(
+            wiki_artifacts.ArtifactValidationError, "exactly one"
+        ):
+            wiki_artifacts.render_artifact(
+                {
+                    "kind": "video",
+                    "payload": {
+                        "mime": "video/mp4",
+                        "data_base64": base64.b64encode(FIXTURE_MP4_BYTES).decode(),
+                        "path": str(self.root),
+                    },
+                }
+            )
+        # Accept a path inside the allowed roots.
+        runtime_root = self.root / "runtime"
+        runtime_root.mkdir(exist_ok=True)
+        mp4_path = runtime_root / "path-fixture.mp4"
+        mp4_path.write_bytes(FIXTURE_MP4_BYTES)
+        event = wiki_artifacts.render_artifact(
+            {
+                "kind": "video",
+                "payload": {"mime": "video/mp4", "path": str(mp4_path)},
+            }
+        )
+        self.assertEqual(event["artifact"]["mime"], "video/mp4")
+
+    def test_audio_normalizes_bounded_peaks_array(self) -> None:
+        payload = {
+            "data_base64": base64.b64encode(FIXTURE_WAV_BYTES).decode(),
+            "mime": "audio/wav",
+        }
+        event = wiki_artifacts.render_artifact({"kind": "audio", "payload": payload})
+        peaks = event["artifact"].get("peaks")
+        self.assertIsInstance(peaks, list)
+        self.assertLessEqual(len(peaks), 512)
+        self.assertTrue(any(peak > 0 for peak in peaks))
+
+    def test_video_accepts_scrubbed_poster_frame(self) -> None:
+        import io as pil_io
+        buffer = pil_io.BytesIO()
+        Image.new("RGB", (160, 120), color=(10, 20, 30)).save(buffer, format="PNG")
+        poster_bytes = buffer.getvalue()
+        payload = {
+            "data_base64": base64.b64encode(FIXTURE_MP4_BYTES).decode(),
+            "mime": "video/mp4",
+            "poster_base64": base64.b64encode(poster_bytes).decode(),
+            "poster_mime": "image/png",
+        }
+        event = wiki_artifacts.render_artifact({"kind": "video", "payload": payload})
+        self.assertIn("poster_base64", event["artifact"])
+        poster_url = event["artifact"]["poster_base64"]
+        self.assertTrue(poster_url.startswith("data:image/"))
+        _header, _separator, encoded = poster_url.partition(",")
+        with Image.open(io.BytesIO(base64.b64decode(encoded))) as poster:
+            poster.load()
+            self.assertEqual(poster.size, (160, 120))
+
+    def test_transport_cap_covers_video_with_poster(self) -> None:
+        request = json.dumps(
             {
                 "jsonrpc": "2.0",
                 "id": 1,
-                "method": "initialize",
-                "params": {"protocolVersion": "2025-06-18"},
-            },
-            {
-                "jsonrpc": "2.0",
-                "id": 2,
                 "method": "tools/call",
                 "params": {
                     "name": "render_artifact",
                     "arguments": {
-                        "kind": "visual-diff",
+                        "kind": "video",
                         "payload": {
-                            "before": {
-                                "data_base64": base64.b64encode(bomb).decode(),
-                                "mime": "image/png",
-                            },
-                            "after": {
-                                "data_base64": base64.b64encode(bomb).decode(),
-                                "mime": "image/png",
-                            },
+                            "mime": "video/mp4",
+                            "data_base64": "",
+                            "poster_base64": "",
+                            "poster_mime": "image/png",
                         },
                     },
                 },
             },
-            {
-                "jsonrpc": "2.0",
-                "id": 3,
-                "method": "tools/call",
-                "params": {
-                    "name": "render_artifact",
-                    "arguments": {"kind": "mermaid", "payload": _payload("mermaid")},
-                },
-            },
-        ]
+            separators=(",", ":"),
+        ).encode()
+        video_encoded_limit = ((wiki_artifacts.VIDEO_LIMIT + 2) // 3) * 4 + 4
+        poster_encoded_limit = ((wiki_artifacts.IMAGE_LIMIT + 2) // 3) * 4 + 4
+        required = len(request) + video_encoded_limit + poster_encoded_limit + 1
+        self.assertGreaterEqual(wiki_artifacts.MAX_REQUEST_BYTES, required)
 
-        env = os.environ.copy()
-        process = subprocess.run(
-            [sys.executable, "-m", "backend.app.wiki_artifacts"],
-            input="".join(json.dumps(request) + "\n" for request in requests),
-            text=True,
-            capture_output=True,
-            env=env,
-            timeout=10,
-            check=True,
+    def test_video_rejects_ogg_and_webm(self) -> None:
+        for mime in ("video/webm", "audio/ogg", "audio/webm"):
+            with self.subTest(mime=mime):
+                payload = {
+                    "data_base64": base64.b64encode(b"\x00" * 32).decode(),
+                    "mime": mime,
+                }
+                kind = "audio" if mime.startswith("audio/") else "video"
+                with self.assertRaises(wiki_artifacts.ArtifactValidationError):
+                    wiki_artifacts.render_artifact({"kind": kind, "payload": payload})
+
+    def test_audio_transcript_flows_through(self) -> None:
+        payload = {
+            "data_base64": base64.b64encode(FIXTURE_WAV_BYTES).decode(),
+            "mime": "audio/wav",
+            "transcript": "hello from the fixture",
+        }
+        event = wiki_artifacts.render_artifact(
+            {"kind": "audio", "payload": payload}
         )
-        responses = [json.loads(line) for line in process.stdout.splitlines()]
-        # First tool call: isError with the canonical size-cap message.
-        bomb_result = responses[1]["result"]
-        self.assertTrue(bomb_result.get("isError"))
-        self.assertRegex(
-            bomb_result["content"][0]["text"],
-            r"artifact rejected.*(pixel limit|side limit|40MP)",
-        )
-        # Second tool call: the server survived and served the next request.
-        alive_result = responses[2]["result"]
-        self.assertNotIn("isError", alive_result)
-        event = wiki_artifacts.artifact_from_text(alive_result["content"][0]["text"])
-        self.assertIsNotNone(event)
-        self.assertEqual(event["artifact"]["kind"], "mermaid")
-
-    def test_visual_diff_rejects_animated_apng(self) -> None:
-        def _apng_bytes(frames: int = 2) -> bytes:
-            buffer = io.BytesIO()
-            first = Image.new("RGB", (4, 4), color=(255, 0, 0))
-            rest = [Image.new("RGB", (4, 4), color=(0, i * 40 % 255, 0)) for i in range(1, frames)]
-            first.save(
-                buffer,
-                format="PNG",
-                save_all=True,
-                append_images=rest,
-                default_image=False,
-                duration=100,
-                loop=0,
-            )
-            return buffer.getvalue()
-
-        apng = _apng_bytes(3)
-        # Sanity-check the fixture actually became multi-frame.
-        with Image.open(io.BytesIO(apng)) as probe:
-            self.assertGreater(getattr(probe, "n_frames", 1), 1)
-
-        with self.assertRaisesRegex(
-            wiki_artifacts.ArtifactValidationError, "multi-frame"
-        ):
-            wiki_artifacts.render_artifact(
-                {
-                    "kind": "visual-diff",
-                    "payload": {
-                        "before": {
-                            "data_base64": base64.b64encode(apng).decode(),
-                            "mime": "image/png",
-                        },
-                        "after": {
-                            "data_base64": base64.b64encode(FIXTURE_PNG_BYTES).decode(),
-                            "mime": "image/png",
-                        },
-                    },
-                }
-            )
-
-    def test_visual_diff_rejects_animated_webp(self) -> None:
-        buffer = io.BytesIO()
-        first = Image.new("RGB", (4, 4), color=(0, 0, 255))
-        rest = [Image.new("RGB", (4, 4), color=(0, 255, 0)) for _ in range(2)]
-        try:
-            first.save(
-                buffer,
-                format="WEBP",
-                save_all=True,
-                append_images=rest,
-                duration=100,
-                loop=0,
-                lossless=True,
-            )
-        except (OSError, ValueError) as exc:
-            self.skipTest(f"Pillow WEBP encoder without animation support: {exc}")
-        animated = buffer.getvalue()
-        try:
-            with Image.open(io.BytesIO(animated)) as probe:
-                if getattr(probe, "n_frames", 1) <= 1:
-                    self.skipTest("Pillow WEBP encoder produced single-frame output")
-        except Exception as exc:  # noqa: BLE001
-            self.skipTest(f"could not probe encoded animated WEBP: {exc}")
-
-        upright_webp = io.BytesIO()
-        Image.new("RGB", (4, 4), color=(0, 0, 0)).save(upright_webp, format="WEBP", lossless=True)
-
-        with self.assertRaisesRegex(
-            wiki_artifacts.ArtifactValidationError, "multi-frame"
-        ):
-            wiki_artifacts.render_artifact(
-                {
-                    "kind": "visual-diff",
-                    "payload": {
-                        "before": {
-                            "data_base64": base64.b64encode(animated).decode(),
-                            "mime": "image/webp",
-                        },
-                        "after": {
-                            "data_base64": base64.b64encode(upright_webp.getvalue()).decode(),
-                            "mime": "image/webp",
-                        },
-                    },
-                }
-            )
-
-    def test_visual_diff_rejects_truncated_jpeg_per_side(self) -> None:
-        # PIL's Image.verify() walks JPEG marker structure but does NOT
-        # decompress scan data — a JPEG missing its final EOI bytes passes
-        # verify(), then fails inside _generate_preview's load() where the
-        # exception is silently swallowed. The tool used to report success
-        # while the client received an image the browser could not decode.
-        def _valid_jpeg(size: tuple[int, int] = (16, 16)) -> bytes:
-            buffer = io.BytesIO()
-            Image.new("RGB", size, color=(255, 128, 0)).save(
-                buffer, format="JPEG", quality=95
-            )
-            return buffer.getvalue()
-
-        def _truncated_jpeg() -> bytes:
-            valid = _valid_jpeg()
-            # Drop the closing EOI marker (last 2 bytes) so scan data cannot
-            # be completed by the decoder.
-            return valid[:-2]
-
-        truncated = _truncated_jpeg()
-        upright = _valid_jpeg()
-
-        # Truncation on the before side.
-        with self.assertRaisesRegex(
-            wiki_artifacts.ArtifactValidationError, "payload.before rejected"
-        ):
-            wiki_artifacts.render_artifact(
-                {
-                    "kind": "visual-diff",
-                    "payload": {
-                        "before": {
-                            "data_base64": base64.b64encode(truncated).decode(),
-                            "mime": "image/jpeg",
-                        },
-                        "after": {
-                            "data_base64": base64.b64encode(upright).decode(),
-                            "mime": "image/jpeg",
-                        },
-                    },
-                }
-            )
-
-        # Truncation on the after side.
-        with self.assertRaisesRegex(
-            wiki_artifacts.ArtifactValidationError, "payload.after rejected"
-        ):
-            wiki_artifacts.render_artifact(
-                {
-                    "kind": "visual-diff",
-                    "payload": {
-                        "before": {
-                            "data_base64": base64.b64encode(upright).decode(),
-                            "mime": "image/jpeg",
-                        },
-                        "after": {
-                            "data_base64": base64.b64encode(truncated).decode(),
-                            "mime": "image/jpeg",
-                        },
-                    },
-                }
-            )
-
-    def test_visual_diff_rejects_valid_header_corrupt_crc_per_side(self) -> None:
-        # PNG structure: 8-byte signature, then chunks each shaped
-        # length(4) + type(4) + data(length) + crc(4). The IHDR chunk sits at
-        # offset 8 with a 13-byte payload and a CRC at bytes 29..33.
-        def _corrupt_ihdr_crc() -> bytes:
-            corrupted = bytearray(FIXTURE_PNG_BYTES)
-            for i in range(29, 33):
-                corrupted[i] ^= 0xFF
-            return bytes(corrupted)
-
-        corrupt = _corrupt_ihdr_crc()
-        upright = FIXTURE_PNG_BYTES
-
-        # Corrupt on the 'before' side.
-        with self.assertRaisesRegex(
-            wiki_artifacts.ArtifactValidationError, "payload.before rejected"
-        ):
-            wiki_artifacts.render_artifact(
-                {
-                    "kind": "visual-diff",
-                    "payload": {
-                        "before": {
-                            "data_base64": base64.b64encode(corrupt).decode(),
-                            "mime": "image/png",
-                        },
-                        "after": {
-                            "data_base64": base64.b64encode(upright).decode(),
-                            "mime": "image/png",
-                        },
-                    },
-                }
-            )
-
-        # Corrupt on the 'after' side.
-        with self.assertRaisesRegex(
-            wiki_artifacts.ArtifactValidationError, "payload.after rejected"
-        ):
-            wiki_artifacts.render_artifact(
-                {
-                    "kind": "visual-diff",
-                    "payload": {
-                        "before": {
-                            "data_base64": base64.b64encode(upright).decode(),
-                            "mime": "image/png",
-                        },
-                        "after": {
-                            "data_base64": base64.b64encode(corrupt).decode(),
-                            "mime": "image/png",
-                        },
-                    },
-                }
-            )
-
-    def test_visual_diff_rejects_non_image_bytes(self) -> None:
-        with self.assertRaisesRegex(
-            wiki_artifacts.ArtifactValidationError, "payload.after rejected"
-        ):
-            wiki_artifacts.render_artifact(
-                {
-                    "kind": "visual-diff",
-                    "payload": {
-                        "before": {
-                            "data_base64": base64.b64encode(FIXTURE_PNG_BYTES).decode(),
-                            "mime": "image/png",
-                        },
-                        "after": {
-                            "data_base64": base64.b64encode(b"not an image").decode(),
-                            "mime": "image/png",
-                        },
-                    },
-                }
-            )
-
-    def test_visual_diff_rejects_unsupported_mime(self) -> None:
-        with self.assertRaisesRegex(
-            wiki_artifacts.ArtifactValidationError, "payload.before.mime"
-        ):
-            wiki_artifacts.render_artifact(
-                {
-                    "kind": "visual-diff",
-                    "payload": {
-                        "before": {
-                            "data_base64": base64.b64encode(FIXTURE_PNG_BYTES).decode(),
-                            "mime": "image/gif",
-                        },
-                        "after": {
-                            "data_base64": base64.b64encode(FIXTURE_PNG_BYTES).decode(),
-                            "mime": "image/png",
-                        },
-                    },
-                }
-            )
-
-    def test_visual_diff_enforces_per_variant_size_cap(self) -> None:
-        oversize = base64.b64encode(b"x" * (wiki_artifacts.IMAGE_LIMIT + 1)).decode()
-        with self.assertRaisesRegex(
-            wiki_artifacts.ArtifactValidationError, "payload.after exceeds"
-        ):
-            wiki_artifacts.render_artifact(
-                {
-                    "kind": "visual-diff",
-                    "payload": {
-                        "before": {
-                            "data_base64": base64.b64encode(FIXTURE_PNG_BYTES).decode(),
-                            "mime": "image/png",
-                        },
-                        "after": {
-                            "data_base64": oversize,
-                            "mime": "image/png",
-                        },
-                    },
-                }
-            )
+        self.assertEqual(event["artifact"]["transcript"], "hello from the fixture")
 
     def test_sentinel_parser_revalidates_text_payload_caps(self) -> None:
         event = {
@@ -644,6 +543,43 @@ class WikiArtifactsTests(unittest.TestCase):
         }
 
         self.assertIsNone(wiki_artifacts.artifact_from_text(wiki_artifacts.sentinel_text(event)))
+
+    def test_sentinel_parser_revalidates_binary_artifact_fields(self) -> None:
+        artifact_id = RUN_ID
+        preview = "data:image/png;base64," + base64.b64encode(FIXTURE_PNG_BYTES).decode()
+
+        def event(kind: str, **fields: object) -> dict:
+            artifact = {
+                "kind": kind,
+                "ref": f"artifact://{artifact_id}",
+                "mime": "audio/wav" if kind == "audio" else "video/mp4",
+                **fields,
+            }
+            return {"kind": "artifact", "id": artifact_id, "artifact": artifact}
+
+        invalid_events = (
+            event("audio", peaks="not-an-array"),
+            event("audio", peaks=[256]),
+            event("audio", peaks=[0] * 513),
+            event("audio", transcript="é" * (wiki_artifacts.TEXT_LIMIT // 2 + 1)),
+            event("video", mime="text/html"),
+            event("video", poster_base64="https://attacker.invalid/poster.png"),
+            event("video", width=True),
+            event("audio", ref="artifact://00000000-0000-4000-8000-000000000086"),
+            event("audio", unexpected="marker"),
+        )
+        for invalid in invalid_events:
+            with self.subTest(artifact=invalid["artifact"]):
+                self.assertIsNone(
+                    wiki_artifacts.artifact_from_text(
+                        wiki_artifacts.sentinel_text(invalid)
+                    )
+                )
+
+        valid = event("video", poster_base64=preview, width=2, height=2)
+        self.assertIsNotNone(
+            wiki_artifacts.artifact_from_text(wiki_artifacts.sentinel_text(valid))
+        )
 
     def test_sentinel_parser_rejects_wrong_typed_table_column_types(self) -> None:
         for column_type in ([], {}, None, 42):
@@ -698,38 +634,55 @@ class WikiArtifactsTests(unittest.TestCase):
         responses = [json.loads(line) for line in process.stdout.splitlines()]
         self.assertEqual(responses[1]["result"]["tools"][0]["name"], "render_artifact")
         result = responses[2]["result"]
-        self.assertNotIn("structuredContent", result)
         event = wiki_artifacts.artifact_from_text(result["content"][0]["text"])
         self.assertIsNotNone(event)
+        self.assertEqual(result["structuredContent"]["ok"], True)
+        self.assertEqual(
+            result["structuredContent"]["artifact"],
+            event["artifact"],
+        )
         self.assertEqual(event["artifact"]["kind"], "mermaid")
 
-    def test_tools_list_describes_visual_diff_payload_contract(self) -> None:
+    def test_tools_list_describes_every_artifact_payload_contract(self) -> None:
         response = wiki_artifacts._response(  # noqa: SLF001 - MCP contract test
             {"jsonrpc": "2.0", "id": 1, "method": "tools/list", "params": {}}
         )
         assert response is not None
-        tools = {tool["name"]: tool for tool in response["result"]["tools"]}
-        render_artifact = tools["render_artifact"]
-        # The kind enum lists visual-diff so agents can discover the mode.
-        self.assertIn("visual-diff", render_artifact["inputSchema"]["properties"]["kind"]["enum"])
-        # The payload description spells out the visual-diff contract — before
-        # and after objects, MIME allowlist, size cap, matching dimensions,
-        # single-frame requirement. Without this, agents can invoke the kind
-        # but not the shape.
-        payload_property = render_artifact["inputSchema"]["properties"]["payload"]
-        description = payload_property.get("description", "")
-        self.assertIn("visual-diff", description)
-        self.assertIn("before", description)
-        self.assertIn("after", description)
-        self.assertIn("data_base64", description)
-        self.assertIn("mime", description)
-        self.assertIn("image/png", description)
-        self.assertIn("5MB", description)
-        self.assertIn("dimensions", description)
-        self.assertRegex(description, r"APNG|animated")
-        # Top-level tool description reiterates the shape so agents that only
-        # read the description (not the schema) still get the contract.
-        self.assertIn("visual-diff", render_artifact["description"])
+        render = next(tool for tool in response["result"]["tools"] if tool["name"] == "render_artifact")
+        schema = render["inputSchema"]
+        self.assertEqual(set(schema["properties"]["kind"]["enum"]), wiki_artifacts.ARTIFACT_KINDS)
+        description = schema["properties"]["payload"]["description"]
+        for kind in sorted(wiki_artifacts.ARTIFACT_KINDS):
+            self.assertIn(f"{kind}:", description, kind)
+        self.assertIn("video/mp4|image/gif", description)
+        self.assertIn("audio/wav|audio/mpeg", description)
+        self.assertIn("40MB", description)
+        self.assertIn("20MB", description)
+        self.assertIn("poster_base64", description)
+        self.assertIn("transcript", description)
+
+    def test_extracted_media_ingest_has_one_normalized_result_boundary(self) -> None:
+        written: list[tuple[str, str, bytes]] = []
+        validated: list[tuple[str, str, dict[str, object]]] = []
+
+        def write_binary(_directory: Path, artifact_id: str, extension: str, data: bytes) -> Path:
+            written.append((artifact_id, extension, data))
+            return self.root / f"{artifact_id}.{extension}"
+
+        for kind in ("video", "audio"):
+            with self.subTest(kind=kind):
+                normalized = binary_artifacts.ingest_binary_artifact(
+                    kind,
+                    _payload(kind),
+                    f"00000000-0000-4000-8000-{kind == 'video' and '000000000101' or '000000000102'}",
+                    read_path=lambda *args, **kwargs: self.fail("base64 fixture should not read a path"),
+                    artifact_dir=lambda: self.root,
+                    write_binary=write_binary,
+                    validate_normalized=lambda k, artifact_id, value: validated.append((k, artifact_id, value)),
+                )
+                self.assertEqual(normalized["kind"] if "kind" in normalized else kind, kind)
+                self.assertEqual(validated[-1][0], kind)
+                self.assertEqual(written[-1][0], validated[-1][1])
 
     def test_orchestrator_lists_native_ops_but_worker_does_not(self) -> None:
         worker = wiki_artifacts._response(  # noqa: SLF001 - MCP contract test
@@ -789,61 +742,6 @@ class WikiArtifactsTests(unittest.TestCase):
         self.assertEqual(calls[0][2]["orch"], "wiki")
         self.assertEqual(calls[0][2]["request_id"], "mcp-next-review-1")
         self.assertEqual(calls[0][2]["diversity"], ["correctness", "security"])
-
-    def test_slow_agent_operations_use_extended_backend_timeout(self) -> None:
-        timeouts: list[float] = []
-
-        def request_json(
-            _base_url: str,
-            _method: str,
-            _path: str,
-            _payload: dict | None = None,
-            *,
-            timeout: float,
-        ) -> dict:
-            timeouts.append(timeout)
-            return {"status": "accepted", "run_id": "slow-start"}
-
-        with (
-            mock.patch.dict(
-                os.environ,
-                {
-                    "WIKI_AGENT_ROLE": "orchestrator",
-                    "WIKI_AGENT_ID": "wiki",
-                    "WIKI_BACKEND_URL": "http://127.0.0.1:43112",
-                },
-            ),
-            mock.patch.object(
-                wiki_agent_tools.backend_runtime,
-                "request_json",
-                side_effect=request_json,
-            ),
-        ):
-            wiki_agent_tools.spawn_agent(
-                {
-                    "ticket": "WIKI-SLOW-SPAWN",
-                    "kind": "cdx",
-                    "role": "implement",
-                    "model": "gpt-5.4",
-                    "effort": "high",
-                    "workdir": "/tmp/worktree",
-                    "prompt": "start slowly",
-                    "orch": "wiki",
-                }
-            )
-            wiki_agent_tools.next_review(
-                {
-                    "ticket": "WIKI-SLOW-REVIEW",
-                    "pr_number": 226,
-                    "expected_sha": "a" * 40,
-                }
-            )
-
-        self.assertEqual(
-            timeouts,
-            [wiki_agent_tools.SLOW_AGENT_OPERATION_TIMEOUT_SECONDS] * 2,
-        )
-        self.assertGreater(timeouts[0], 15)
 
     def test_next_review_canonical_handler_routes_combined_verdict(self) -> None:
         runtime_dir = self.root / "runtime"
@@ -1334,7 +1232,10 @@ class WikiArtifactsTests(unittest.TestCase):
             with self.assertRaisesRegex(
                 wiki_artifacts.ArtifactValidationError, "MB pdf limit"
             ):
-                wiki_artifacts._read_fd_bounded(fd, wiki_artifacts.PDF_LIMIT)
+                wiki_artifacts._read_fd_bounded(
+                    fd, wiki_artifacts.PDF_LIMIT, "pdf",
+                    f"{wiki_artifacts.PDF_LIMIT // (1024 * 1024)}MB pdf limit",
+                )
         finally:
             os.close(fd)
 

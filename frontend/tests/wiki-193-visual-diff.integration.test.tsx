@@ -374,6 +374,46 @@ describe("visual-diff in ArtifactPanel", () => {
   });
 });
 
+describe("media artifacts in ArtifactPanel", () => {
+  test.each([
+    ["video", { kind: "video", mime: "video/mp4", ref: "artifact://video" }],
+    ["audio", { kind: "audio", mime: "audio/wav", ref: "artifact://audio" }],
+  ] as const)("renders %s after a restored deep link", async (kind, artifact) => {
+    const event: SessionEvent = {
+      id: 1,
+      kind: "artifact",
+      ts: null,
+      text: "",
+      disposition: "rendered",
+      artifact_id: `restored-${kind}`,
+      title: `${kind} fixture`,
+      artifact,
+    };
+    render(
+      <ArtifactPanel
+        artifacts={new Map([[event.artifact_id!, event]])}
+        onClosePanel={() => {}}
+        onCloseTab={() => {}}
+        onFocusTab={() => {}}
+        onReopen={() => {}}
+        onResizeStart={() => {}}
+        onUpdateViewState={() => {}}
+        state={{
+          tabs: [event.artifact_id!],
+          focusedTab: event.artifact_id!,
+          recentlyClosed: [],
+          viewState: {},
+        }}
+        ticket="WIKI-190"
+        width={640}
+      />,
+    );
+    expect(await screen.findByLabelText(`${kind} fixture`)).toBeTruthy();
+    expect(screen.queryByText(/artifact unavailable/i)).toBeNull();
+    expect(document.querySelector(`[data-artifact-detail-kind="${kind}"]`)).toBeTruthy();
+  });
+});
+
 describe("visual-diff pixel-diff at oversized native resolution", () => {
   test("localized one-pixel regression survives the bounded overlay cap", async () => {
     // 2400 x 1200 = 2.88 MP — above the 2 MP overlay cap, so the naive

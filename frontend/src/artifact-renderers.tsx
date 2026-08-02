@@ -20,6 +20,16 @@ import {
 import { PlotRenderer, type PlotView } from "./plot-renderer";
 import { ShikiCode, useCurrentTheme } from "./shiki";
 import { StatusBadge, statusToTone } from "./status-badge";
+import { AudioRenderer, VideoRenderer } from "./artifact-media-renderers";
+import {
+  artifactUrl,
+  type ArtifactRendererProps,
+  type ArtifactRenderFailure,
+} from "./artifact-renderers-shared";
+
+export { AudioRenderer, VideoRenderer };
+export { artifactUrl };
+export type { ArtifactRendererProps, ArtifactRenderFailure };
 import { STREAM_CLAMP_PX, STREAM_CLAMP_SLACK_PX } from "./stream-clamp";
 import { VisualDiffRenderer } from "./visual-diff-renderer";
 
@@ -40,27 +50,6 @@ const SVG_TAGS = [
   "style", "lineargradient", "radialgradient", "stop", "pattern",
   "clippath", "mask", "image", "marker",
 ];
-
-export type ArtifactRenderFailure = {
-  failureClass: "mermaid-render" | "svg-render";
-  errorCode: string;
-  position?: string;
-};
-
-export type ArtifactRendererProps = {
-  artifact: SessionArtifact;
-  compact?: boolean;
-  event: SessionEvent;
-  onExpand?: () => void;
-  onImageLoad?: (image: HTMLImageElement) => void;
-  onOpenFile?: (entry: ArtifactFileEntry) => void;
-  onRenderError?: (failure: ArtifactRenderFailure) => void;
-  ticket: string;
-};
-
-export function artifactUrl(ticket: string, event: SessionEvent): string {
-  return `/api/agents/${encodeURIComponent(ticket)}/artifact/${encodeURIComponent(event.artifact_id ?? "")}`;
-}
 
 function normalizeRenderFailure(
   failureClass: ArtifactRenderFailure["failureClass"],
@@ -802,6 +791,7 @@ export function PdfCompactRenderer({
   );
 }
 
+
 export function ArtifactRenderer(props: ArtifactRendererProps): ReactNode {
   const { artifact } = props;
   const effectiveKind = classifyArtifact(artifact);
@@ -826,6 +816,10 @@ export function ArtifactRenderer(props: ArtifactRendererProps): ReactNode {
       return <CodeRenderer artifact={artifact} />;
     case "pdf":
       return <PdfCompactRenderer event={props.event} ticket={props.ticket} />;
+    case "video":
+      return <VideoRenderer {...props} />;
+    case "audio":
+      return <AudioRenderer {...props} />;
     case "visual-diff":
       return <VisualDiffRenderer artifact={artifact} event={props.event} ticket={props.ticket} />;
   }
