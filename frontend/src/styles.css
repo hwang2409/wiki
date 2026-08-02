@@ -94,6 +94,8 @@
     Helvetica, Arial, sans-serif;
   --font-text: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, "Helvetica Neue",
     Helvetica, Arial, sans-serif;
+  --font-agent-prose: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, "Helvetica Neue",
+    Helvetica, Arial, sans-serif;
   --font-monospace: "JetBrains Mono", ui-monospace, SFMono-Regular, "SF Mono", Menlo, Consolas,
     "Roboto Mono", monospace;
 
@@ -7192,7 +7194,9 @@ body.is-resizing-panes .pane-cell {
 .session-assistant {
   padding: 2px 0;
   color: var(--text-normal);
-  font-size: var(--font-ui-small);
+  font-family: var(--font-agent-prose);
+  font-weight: var(--font-text-weight);
+  font-size: var(--font-text-size);
   line-height: 1.65;
   overflow-wrap: break-word;
 }
@@ -7216,21 +7220,83 @@ body.is-resizing-panes .pane-cell {
 }
 
 .session-activity-head {
-  display: inline-flex;
+  display: flex;
   align-items: center;
   gap: 6px;
-  align-self: flex-start;
+  width: 100%;
+  min-height: 40px;
   min-width: 0;
-  padding: 3px 4px;
-  color: var(--text-muted);
+  padding: 7px 10px;
+  color: var(--text-subtle-readable);
   font-family: var(--font-monospace);
   font-weight: var(--font-monospace-weight);
   font-size: var(--font-ui-smaller);
   text-align: left;
+  transition-property: background-color, color;
+  transition-duration: 150ms;
+  transition-timing-function: ease-out;
 }
 
 .session-activity-head:hover {
+  background-color: var(--background-modifier-hover);
   color: var(--text-normal);
+}
+
+.session-activity {
+  min-width: 0;
+  border: 1px solid var(--background-modifier-border);
+  background-color: var(--background-primary-alt);
+}
+
+.session-activity-summary {
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: 12px;
+  min-width: 0;
+  width: 100%;
+}
+
+.session-activity-primary {
+  display: flex;
+  align-items: baseline;
+  gap: 8px;
+  min-width: 0;
+}
+
+.session-activity-state {
+  flex-shrink: 0;
+  color: var(--text-subtle-readable);
+  font-size: var(--fs-xs);
+  font-weight: var(--fw-semibold);
+  letter-spacing: 0.04em;
+  text-transform: uppercase;
+}
+
+.session-activity-state.is-working {
+  color: var(--accent-primary);
+}
+
+.session-activity-state.is-failed {
+  color: var(--accent-danger);
+}
+
+.session-activity-state.is-waiting-for-you {
+  color: var(--accent-warning);
+}
+
+.session-activity-semantic {
+  overflow: hidden;
+  color: var(--text-normal);
+  font-size: var(--font-ui-small);
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.session-activity-meta {
+  flex-shrink: 0;
+  color: var(--text-subtle-readable);
+  font-size: var(--fs-xs);
 }
 
 .session-tool-head {
@@ -7278,10 +7344,8 @@ body.is-resizing-panes .pane-cell {
 .session-activity-body {
   display: flex;
   flex-direction: column;
-  gap: 6px;
-  margin: 8px 0 4px 0;
-  padding-left: 12px;
-  border-left: 2px solid var(--background-modifier-border);
+  margin: 0;
+  border-top: 1px solid var(--background-modifier-border);
 }
 
 .session-tool {
@@ -7290,6 +7354,7 @@ body.is-resizing-panes .pane-cell {
 
 .session-tool-head {
   width: 100%;
+  min-height: 40px;
 }
 
 .session-tool-icon {
@@ -7322,6 +7387,57 @@ body.is-resizing-panes .pane-cell {
   margin-top: 4px;
 }
 
+.session-activity-row {
+  display: grid;
+  grid-template-columns: minmax(78px, 96px) minmax(0, 1fr);
+  min-width: 0;
+  border-bottom: 1px solid var(--background-modifier-border);
+}
+
+.session-activity-body > .session-activity-row:last-child,
+.session-tool:last-child > .session-activity-row:last-child {
+  border-bottom: 0;
+}
+
+.session-activity-row-label {
+  padding: 10px 9px;
+  border-right: 1px solid var(--background-modifier-border);
+  background-color: var(--code-background);
+  color: var(--text-subtle-readable);
+  font-family: var(--font-monospace);
+  font-weight: var(--font-monospace-weight);
+  font-size: var(--fs-xs);
+  letter-spacing: 0.04em;
+  text-transform: uppercase;
+}
+
+.session-activity-row-content {
+  min-width: 0;
+  padding: 0 9px;
+}
+
+.session-activity-row-meta {
+  color: var(--text-subtle-readable);
+  font-family: var(--font-monospace);
+  font-weight: var(--font-monospace-weight);
+  font-size: var(--fs-xs);
+}
+
+.session-tool-result {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  min-height: 40px;
+  color: var(--text-normal);
+  font-family: var(--font-monospace);
+  font-weight: var(--font-monospace-weight);
+  font-size: var(--font-ui-smaller);
+}
+
+.session-activity-row.is-failed .session-tool-result {
+  color: var(--accent-danger);
+}
+
 .session-tool-body pre {
   margin: 0;
   padding: 8px 10px;
@@ -7337,7 +7453,7 @@ body.is-resizing-panes .pane-cell {
 }
 
 .session-tool-body pre.session-tool-output {
-  color: var(--text-faint);
+  color: var(--text-subtle-readable);
   white-space: pre-wrap;
   overflow-wrap: anywhere;
 }
@@ -7353,14 +7469,19 @@ body.is-resizing-panes .pane-cell {
 }
 
 .session-thinking {
-  padding: 4px 0 4px 10px;
-  border-left: 2px dashed var(--background-modifier-border);
-  color: var(--text-faint);
-  font-size: var(--font-ui-smaller);
-  font-style: italic;
-  line-height: 1.55;
+  padding: 3px 0 10px;
+  color: var(--text-subtle-readable);
+  font-family: var(--font-agent-prose);
+  font-weight: var(--font-text-weight);
+  font-size: var(--font-ui-small);
+  font-style: normal;
+  line-height: 1.6;
   white-space: pre-wrap;
   overflow-wrap: break-word;
+}
+
+.session-activity-row.is-reasoning .session-activity-row-meta {
+  padding-top: 8px;
 }
 
 .session-thinking-chip {

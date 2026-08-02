@@ -102,6 +102,13 @@ import { CodexStreamHighlights } from "./codex-stream-renderers";
 import { markerRule } from "./hook-message-registry";
 import type { MarkerSeverity } from "./hook-message-registry";
 import {
+  activityCountsLabel,
+  activityElapsedLabel,
+  activitySemanticSummary,
+  activityStateLabel,
+  type ActivityRunState,
+} from "./agent-events";
+import {
   addPendingUserMessage,
   composerTextMatches,
   invalidateTranscript,
@@ -1062,72 +1069,94 @@ function ToolRow({
   const summary = tool.summary || tool.input.split("\n")[0].slice(0, 120);
   const running = tool.output === null && tool.ok === null;
   const hasGitHubPreview = !!tool.output && containsGitHubPreviewUrl(tool.output);
+  const resultLabel = running ? "working" : tool.ok === false ? "failed" : "done";
+  const rawResult = running ? "pending" : tool.ok === false ? "error" : "ok";
   return (
     <div className={`session-tool${open ? " is-open" : ""}`}>
-      <button className="session-tool-head" type="button" onClick={() => setOpen(!open)}>
-        <ChevronRight className={`collapse-icon${open ? "" : " is-collapsed"}`} size={12} />
-        <Icon className="session-tool-icon" size={12} />
-        <span className="session-tool-summary" title={tool.name}>
-          {summary}
-        </span>
-        {running ? <span className="session-tool-running" title="running" /> : null}
-        {tool.ok === false ? <span className="session-tool-err">failed</span> : null}
-        {tool.agent_id && onInspect ? (
-          <span
-            className="session-tool-inspect"
-            role="button"
-            tabIndex={0}
-            onClick={(e) => {
-              e.stopPropagation();
-              onInspect(tool.agent_id!);
-            }}
-            onKeyDown={(e) => {
-              if (e.key === "Enter") {
-                e.stopPropagation();
-                onInspect(tool.agent_id!);
-              }
-            }}
-          >
-            inspect
-          </span>
-        ) : null}
-      </button>
-      <div className={`session-collapsible session-tool-collapsible${open ? " is-open" : ""}`}>
-        <div className="session-collapsible-inner">
-          <div className="session-tool-body">
-            {tool.name === "Bash" && tool.input ? (
-              <BoundedPreview
-                label="input"
-                text={tool.input}
-                renderBody={({ text }) => (
-                  <ShikiCode className="session-tool-input" code={text} lang="bash" transparent />
-                )}
-              />
-            ) : tool.input ? (
-              <BoundedPreview label="input" text={tool.input} />
+      <div className="session-activity-row is-tool">
+        <span className="session-activity-row-label">tool</span>
+        <div className="session-activity-row-content">
+          <button aria-expanded={open} className="session-tool-head" type="button" onClick={() => setOpen(!open)}>
+            <ChevronRight className={`collapse-icon${open ? "" : " is-collapsed"}`} size={12} />
+            <Icon className="session-tool-icon" size={12} />
+            <span className="session-tool-summary" title={tool.name}>
+              {summary}
+            </span>
+            {running ? <span className="session-tool-running" title="running" /> : null}
+            {tool.ok === false ? <span className="session-tool-err">failed</span> : null}
+            {tool.agent_id && onInspect ? (
+              <span
+                className="session-tool-inspect"
+                role="button"
+                tabIndex={0}
+                onClick={(e) => {
+                  e.stopPropagation();
+                  onInspect(tool.agent_id!);
+                }}
+                onKeyDown={(e) => {
+                  if (e.key === "Enter") {
+                    e.stopPropagation();
+                    onInspect(tool.agent_id!);
+                  }
+                }}
+              >
+                inspect
+              </span>
             ) : null}
-            {hasGitHubPreview ? (
-              <BoundedPreview
-                ansi
-                label="output"
-                text={tool.output ?? ""}
-                tone={tool.ok === false ? "error" : "normal"}
-                renderBody={({ text }) => (
-                  <div className="session-tool-output-blocks">
-                    <span className="session-tool-output-text">
-                      {renderAnsiWithGitHubPreviews(text)}
-                    </span>
-                  </div>
-                )}
-              />
-            ) : tool.output ? (
-              <BoundedPreview
-                ansi
-                label="output"
-                text={tool.output}
-                tone={tool.ok === false ? "error" : "normal"}
-              />
-            ) : null}
+          </button>
+          <div className={`session-collapsible session-tool-input-collapsible${open ? " is-open" : ""}`}>
+            <div className="session-collapsible-inner">
+              <div className="session-tool-body">
+                {tool.name === "Bash" && tool.input ? (
+                  <BoundedPreview
+                    label="input"
+                    text={tool.input}
+                    renderBody={({ text }) => (
+                      <ShikiCode className="session-tool-input" code={text} lang="bash" transparent />
+                    )}
+                  />
+                ) : tool.input ? (
+                  <BoundedPreview label="input" text={tool.input} />
+                ) : null}
+              </div>
+            </div>
+          </div>
+        </div>
+      </div>
+      <div className={`session-activity-row is-result${tool.ok === false ? " is-failed" : ""}`}>
+        <span className="session-activity-row-label">result</span>
+        <div className="session-activity-row-content">
+          <div className="session-tool-result">
+            <span>{resultLabel}</span>
+            <span className="session-activity-row-meta">{rawResult}</span>
+          </div>
+          <div className={`session-collapsible session-tool-collapsible${open ? " is-open" : ""}`}>
+            <div className="session-collapsible-inner">
+              <div className="session-tool-body">
+                {hasGitHubPreview ? (
+                  <BoundedPreview
+                    ansi
+                    label="output"
+                    text={tool.output ?? ""}
+                    tone={tool.ok === false ? "error" : "normal"}
+                    renderBody={({ text }) => (
+                      <div className="session-tool-output-blocks">
+                        <span className="session-tool-output-text">
+                          {renderAnsiWithGitHubPreviews(text)}
+                        </span>
+                      </div>
+                    )}
+                  />
+                ) : tool.output ? (
+                  <BoundedPreview
+                    ansi
+                    label="output"
+                    text={tool.output}
+                    tone={tool.ok === false ? "error" : "normal"}
+                  />
+                ) : null}
+              </div>
+            </div>
           </div>
         </div>
       </div>
@@ -1762,24 +1791,38 @@ function ActivityGroupBase({
   events,
   groupKey,
   onInspect,
+  runState,
   uiState,
 }: {
   events: SessionEvent[];
   groupKey: number;
   onInspect?: (agentId: string) => void;
+  runState: ActivityRunState;
   uiState: SessionUiState;
 }) {
   const [open, setOpen] = useStoredBooleanState(uiState, `activity:${groupKey}`, false);
-  const tools = events.filter((e) => e.kind === "tool");
-  const thinking = events.filter((e) => e.kind === "thinking");
-  const parts: string[] = [];
-  if (tools.length) parts.push(`${tools.length} tool call${tools.length > 1 ? "s" : ""}`);
-  if (thinking.length) parts.push(`${thinking.length} thinking`);
+  const counts = activityCountsLabel(events);
+  const semanticSummary = activitySemanticSummary(events);
+  const state = activityStateLabel(events, runState);
+  const elapsed = activityElapsedLabel(events);
+  const stateClass = state.replace(/\s+/g, "-");
   return (
     <div className="session-activity">
-      <button className="session-activity-head" type="button" onClick={() => setOpen(!open)}>
+      <button aria-expanded={open} className="session-activity-head" type="button" onClick={() => setOpen(!open)}>
         <ChevronRight className={`collapse-icon${open ? "" : " is-collapsed"}`} size={12} />
-        {parts.join(" · ") || "activity"}
+        <span className="session-activity-summary">
+          <span className="session-activity-primary">
+            <span className={`session-activity-state is-${stateClass}`}>{state}</span>
+            <span className="session-activity-semantic">{semanticSummary ?? counts}</span>
+          </span>
+          {semanticSummary ? (
+            <span className="session-activity-meta tabular-nums">
+              {counts}{elapsed ? ` · ${elapsed}` : ""}
+            </span>
+          ) : elapsed ? (
+            <span className="session-activity-meta tabular-nums">{elapsed}</span>
+          ) : null}
+        </span>
       </button>
       <div className={`session-collapsible session-activity-collapsible${open ? " is-open" : ""}`}>
         <div className="session-collapsible-inner">
@@ -1798,11 +1841,17 @@ function ActivityGroupBase({
               }
               if (!event.text) return null;
               return (
-                <div className="session-thinking" key={groupKey + index}>
-                  <StreamClamp>
-                    {event.encrypted ? <span className="session-thinking-chip">encrypted</span> : null}
-                    {event.text}
-                  </StreamClamp>
+                <div className="session-activity-row is-reasoning" key={groupKey + index}>
+                  <span className="session-activity-row-label">reasoning</span>
+                  <div className="session-activity-row-content">
+                    <div className="session-activity-row-meta">thinking</div>
+                    <div className="session-thinking">
+                      <StreamClamp>
+                        {event.encrypted ? <span className="session-thinking-chip">encrypted</span> : null}
+                        {event.text}
+                      </StreamClamp>
+                    </div>
+                  </div>
                 </div>
               );
             })}
@@ -1816,6 +1865,7 @@ function ActivityGroupBase({
 const ActivityGroup = memo(ActivityGroupBase, (prev, next) =>
   prev.groupKey === next.groupKey &&
   prev.onInspect === next.onInspect &&
+  prev.runState === next.runState &&
   prev.uiState === next.uiState &&
   prev.events.length === next.events.length &&
   prev.events.every((event, index) => event === next.events[index])
@@ -1878,7 +1928,18 @@ function computeTimestampKeys(groups: EventGroup[]): Set<number> {
   return keys;
 }
 
+function currentActivityRunState(session: TranscriptSession | null): ActivityRunState {
+  const inspector = session?.providerInspector;
+  const providerState = inspector?.state.toLowerCase() ?? "";
+  if ((inspector?.pending_requests.length ?? 0) > 0 || /waiting|approval|input/.test(providerState)) {
+    return "waiting-for-you";
+  }
+  if (/failed|error|blocked/.test(providerState)) return "failed";
+  return session?.working ? "working" : "idle";
+}
+
 const VirtualSessionRow = memo(function VirtualSessionRow({
+  activityRunState,
   group,
   imageNums,
   onHeightChange,
@@ -1891,6 +1952,7 @@ const VirtualSessionRow = memo(function VirtualSessionRow({
   ticket,
   uiState,
 }: {
+  activityRunState: ActivityRunState;
   group: EventGroup;
   imageNums?: number[];
   onHeightChange: (group: EventGroup, height: number) => void;
@@ -1916,7 +1978,13 @@ const VirtualSessionRow = memo(function VirtualSessionRow({
       style={style}
     >
       {group.kind === "activity" ? (
-        <ActivityGroup events={group.events} groupKey={group.key} onInspect={onInspect} uiState={uiState} />
+        <ActivityGroup
+          events={group.events}
+          groupKey={group.key}
+          onInspect={onInspect}
+          runState={activityRunState}
+          uiState={uiState}
+        />
       ) : (
         <MessageBlock
           event={group.event}
@@ -1934,6 +2002,7 @@ const VirtualSessionRow = memo(function VirtualSessionRow({
   );
 }, (prev, next) => {
   if (
+    prev.activityRunState !== next.activityRunState ||
     prev.top !== next.top ||
     prev.onHeightChange !== next.onHeightChange ||
     prev.onInspect !== next.onInspect ||
@@ -2583,6 +2652,10 @@ export function SessionTab({
     return rows;
   }, [groups, layout.tops, visibleRange.end, visibleRange.start]);
   const timestampKeys = useMemo(() => computeTimestampKeys(groups), [groups]);
+  const activityRunState = currentActivityRunState(session);
+  const currentActivityKey = activityRunState === "idle"
+    ? null
+    : [...groups].reverse().find((group) => group.kind === "activity")?.key ?? null;
 
   const imageNumbers = useMemo(() => {
     const map = new Map<SessionEvent, number[]>();
@@ -2715,6 +2788,7 @@ export function SessionTab({
           <div className="session-virtual-list" style={{ height: layout.totalHeight }}>
             {visibleGroups.map(({ group, top }) => (
               <VirtualSessionRow
+                activityRunState={group.kind === "activity" && group.key === currentActivityKey ? activityRunState : "idle"}
                 group={group}
                 imageNums={group.kind === "message" ? imageNumbers.get(group.event) : undefined}
                 key={group.key}
