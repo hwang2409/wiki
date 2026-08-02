@@ -64,6 +64,10 @@ describe("semantic model activity groups", () => {
     expect(activityStateLabel(completed)).toBe("done");
     expect(activityStateLabel([toolEvent("read", "read api.ts", { output: null, ok: null })])).toBe("working");
     expect(activityStateLabel(failed)).toBe("failed");
+    expect(activityStateLabel([
+      toolEvent("validate", "pytest first attempt", { ok: false }),
+      toolEvent("validate", "pytest retry", { ok: true }),
+    ])).toBe("done");
     expect(activityStateLabel(failed, "working")).toBe("working");
     expect(activityStateLabel(failed, "waiting-for-you")).toBe("waiting for you");
     expect(activityStateLabel(completed, "waiting-for-you")).toBe("waiting for you");

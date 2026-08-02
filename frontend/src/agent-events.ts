@@ -111,7 +111,7 @@ export function activityStateLabel(
   const latestTool = tools.at(-1);
   if (latestTool?.archetype === "ask" && latestTool.output === null) return "waiting for you";
   if (latestTool?.output === null && latestTool.ok === null) return "working";
-  if (tools.some((tool) => tool.ok === false)) return "failed";
+  if (latestTool?.ok === false) return "failed";
   return "done";
 }
 

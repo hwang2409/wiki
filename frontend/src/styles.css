@@ -7287,7 +7287,7 @@ body.is-resizing-panes .pane-cell {
 
 .session-activity-semantic {
   overflow: hidden;
-  color: var(--text-normal);
+  color: var(--activity-metadata-color);
   font-size: var(--font-ui-small);
   text-overflow: ellipsis;
   white-space: nowrap;
@@ -7297,6 +7297,18 @@ body.is-resizing-panes .pane-cell {
   flex-shrink: 0;
   color: var(--activity-metadata-color);
   font-size: var(--fs-xs);
+}
+
+.session-turn-live-state {
+  display: inline-flex;
+  align-items: baseline;
+  gap: 8px;
+  margin-top: 6px;
+  padding: 7px 10px;
+  border: 1px solid var(--background-modifier-border);
+  background-color: var(--background-primary-alt);
+  font-family: var(--font-monospace);
+  font-weight: var(--font-monospace-weight);
 }
 
 .session-tool-head {
@@ -7364,7 +7376,7 @@ body.is-resizing-panes .pane-cell {
 
 .session-tool-summary {
   overflow: hidden;
-  color: var(--text-normal);
+  color: var(--activity-metadata-color);
   text-overflow: ellipsis;
   white-space: nowrap;
 }
@@ -7374,7 +7386,7 @@ body.is-resizing-panes .pane-cell {
   padding: 1px 7px;
   border: 1px solid var(--text-muted);
   border-radius: var(--radius-xs);
-  color: var(--text-muted);
+  color: var(--activity-state-failed-color);
   font-size: var(--fs-xs);
   letter-spacing: 0.02em;
   text-transform: uppercase;
@@ -7428,14 +7440,21 @@ body.is-resizing-panes .pane-cell {
   align-items: center;
   gap: 8px;
   min-height: 40px;
-  color: var(--text-normal);
+  color: var(--activity-metadata-color);
   font-family: var(--font-monospace);
   font-weight: var(--font-monospace-weight);
   font-size: var(--font-ui-smaller);
 }
 
+.session-tool-result-summary {
+  overflow: hidden;
+  color: var(--activity-metadata-color);
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
 .session-activity-row.is-failed .session-tool-result {
-  color: var(--accent-danger);
+  color: var(--activity-state-failed-color);
 }
 
 .session-tool-body pre {
@@ -11828,6 +11847,14 @@ textarea.composer-command-input {
   overflow: hidden;
   -webkit-mask-image: linear-gradient(to bottom, black calc(100% - 48px), transparent);
   mask-image: linear-gradient(to bottom, black calc(100% - 48px), transparent);
+}
+
+.session-activity .transcript-preview-label,
+.session-activity .transcript-preview-summary,
+.session-activity .transcript-preview-body,
+.session-activity .transcript-preview.is-error .transcript-preview-label,
+.session-activity .transcript-preview.is-error .transcript-preview-body {
+  color: var(--activity-metadata-color);
 }
 
 /* WIKI-222: shared stream-output clamp (stream-clamp.tsx) */

@@ -36,6 +36,23 @@ const THEMES = [
   "tokyo-night",
   "catppuccin-mocha",
 ];
+const ESSENTIAL_CONTRAST_ROLES = [
+  ["state done", ".session-activity-state:not(.is-working):not(.is-failed):not(.is-waiting-for-you)"],
+  ["state working", ".session-activity-state.is-working"],
+  ["state failed", ".session-activity-state.is-failed"],
+  ["state waiting", ".session-activity-state.is-waiting-for-you"],
+  ["semantic summary", ".session-activity-semantic"],
+  ["activity metadata", ".session-activity-meta"],
+  ["timeline label", ".session-activity-row-label"],
+  ["timeline metadata", ".session-activity-row-meta"],
+  ["reasoning", ".session-thinking"],
+  ["tool summary", ".session-tool-summary"],
+  ["result status", ".session-tool-result > span:first-child"],
+  ["result correlation", ".session-tool-result-summary"],
+  ["raw preview label", ".transcript-preview-label"],
+  ["raw preview body", ".transcript-preview-body"],
+  ["failure badge", ".session-tool-err"],
+];
 
 function assert(condition, message) {
   if (!condition) throw new Error(message);
@@ -115,24 +132,31 @@ async function main() {
     codexUser("make model work readable without hiding evidence", "2026-08-02T12:00:00.000Z"),
     reasoning("I will inspect the transcript renderer and its tests.", "2026-08-02T12:00:01.000Z"),
     codexToolCall("call-read", "Read", '{"path":"frontend/src/session.tsx"}', "2026-08-02T12:00:02.000Z"),
-    codexToolOutput("call-read", "activity group source exact", "2026-08-02T12:00:04.000Z"),
-    reasoning(longReasoning, "2026-08-02T12:00:05.000Z"),
-    codexToolCall("call-test", "exec_command", '{"cmd":"npm test -- semantic-activity"}', "2026-08-02T12:00:06.000Z"),
-    codexToolOutput("call-test", "6 tests passed", "2026-08-02T12:00:09.000Z"),
-    codexAssistant("The semantic map and hierarchy pass focused checks.", "2026-08-02T12:00:10.000Z"),
-    codexToolCall("call-unknown", "mcp__private__launch_thing", '{"payload":"opaque"}', "2026-08-02T12:00:11.000Z"),
-    codexToolOutput("call-unknown", "opaque result", "2026-08-02T12:00:12.000Z"),
-    codexAssistant("Unknown tool meaning stays hidden.", "2026-08-02T12:00:13.000Z"),
-    reasoning("The first validation attempt failed.", "2026-08-02T12:00:14.000Z"),
-    codexToolCall("call-failed", "exec_command", '{"cmd":"npm test -- failing-case"}', "2026-08-02T12:00:15.000Z"),
-    failedToolResult("call-failed", "1 test failed", "2026-08-02T12:00:17.000Z"),
-    codexAssistant("The failed attempt remains visible.", "2026-08-02T12:00:18.000Z"),
-    reasoning("The run needs approval before it can continue.", "2026-08-02T12:00:19.000Z"),
-    codexToolCall("call-ask", "AskUserQuestion", '{"question":"Continue with the safe retry?"}', "2026-08-02T12:00:20.000Z"),
-    codexAssistant("Approval stays visible as a separate state.", "2026-08-02T12:00:21.000Z"),
-    reasoning("The provider started a retry after the failed tool.", "2026-08-02T12:00:22.000Z"),
-    codexToolCall("call-retry-failed", "exec_command", '{"cmd":"npm test -- retry-case"}', "2026-08-02T12:00:23.000Z"),
-    failedToolResult("call-retry-failed", "retry input failed", "2026-08-02T12:00:25.000Z"),
+    codexToolOutput("call-read", "activity group source exact", "2026-08-02T12:00:03.000Z"),
+    reasoning(longReasoning, "2026-08-02T12:00:04.000Z"),
+    codexToolCall("call-order-a", "Read", '{"path":"frontend/src/agent-events.ts"}', "2026-08-02T12:00:05.000Z"),
+    codexToolCall("call-order-b", "exec_command", '{"cmd":"npm test -- order-b"}', "2026-08-02T12:00:06.000Z"),
+    codexToolOutput("call-order-b", "order B finished", "2026-08-02T12:00:07.000Z"),
+    codexToolOutput("call-order-a", "order A finished", "2026-08-02T12:00:08.000Z"),
+    codexAssistant("The semantic map and hierarchy pass focused checks.", "2026-08-02T12:00:09.000Z"),
+    codexToolCall("call-unknown", "mcp__private__launch_thing", '{"payload":"opaque"}', "2026-08-02T12:00:10.000Z"),
+    codexToolOutput("call-unknown", "opaque result", "2026-08-02T12:00:11.000Z"),
+    codexAssistant("Unknown tool meaning stays hidden.", "2026-08-02T12:00:12.000Z"),
+    reasoning("The first validation attempt failed.", "2026-08-02T12:00:13.000Z"),
+    codexToolCall("call-failed", "exec_command", '{"cmd":"npm test -- failing-case"}', "2026-08-02T12:00:14.000Z"),
+    failedToolResult("call-failed", "1 test failed", "2026-08-02T12:00:16.000Z"),
+    codexAssistant("The failed attempt remains visible.", "2026-08-02T12:00:17.000Z"),
+    reasoning("The run needs approval before it can continue.", "2026-08-02T12:00:18.000Z"),
+    codexToolCall("call-ask", "AskUserQuestion", '{"question":"Continue with the safe retry?"}', "2026-08-02T12:00:19.000Z"),
+    codexAssistant("Approval stays visible as a separate state.", "2026-08-02T12:00:20.000Z"),
+    reasoning("The first retry failed.", "2026-08-02T12:00:21.000Z"),
+    codexToolCall("call-retry-failed", "exec_command", '{"cmd":"npm test -- retry-case"}', "2026-08-02T12:00:22.000Z"),
+    failedToolResult("call-retry-failed", "retry input failed", "2026-08-02T12:00:24.000Z"),
+    reasoning("The provider started a safe retry.", "2026-08-02T12:00:25.000Z"),
+    codexToolCall("call-retry-success", "exec_command", '{"cmd":"npm test -- retry-case"}', "2026-08-02T12:00:26.000Z"),
+    codexToolOutput("call-retry-success", "retry passed\nexited with code 0", "2026-08-02T12:00:28.000Z"),
+    codexAssistant("The successful retry completed the turn.", "2026-08-02T12:00:29.000Z"),
+    codexUser("start the next turn", "2026-08-02T12:00:30.000Z"),
   ];
   await fs.writeFile(transcript, rows.map((row) => JSON.stringify(row)).join("\n") + "\n");
   writeRegistry(fixtures.registryPath, [[TICKET, transcript]]);
@@ -205,17 +229,30 @@ async function main() {
     await assertPrimary(1, "DONE", "1 tool call");
     await assertPrimary(2, "FAILED", "running tests");
     await assertPrimary(3, "WAITING FOR YOU", "asking for input");
-    await assertPrimary(4, "WORKING", "running tests");
+    await assertPrimary(4, "DONE", "running tests");
     assert((await groups.nth(1).locator(".session-activity-semantic").innerText()) === "1 tool call",
       "unknown tool archetype must use count fallback");
-    assert((await groups.nth(0).locator(".session-activity-meta").innerText()).endsWith("8s"),
+    assert((await groups.nth(0).locator(".session-activity-meta").innerText()).endsWith("7s"),
       "elapsed metadata must include the final tool result time");
+    assert((await groups.nth(2).locator(".session-activity-meta").innerText()).endsWith("3s"),
+      "failed event-message results must retain their completion time");
+
+    runtime = { providerState: "idle", pendingRequestCount: 0, working: false };
+    await page.reload({ waitUntil: "domcontentloaded" });
+    await page.waitForSelector(".session-activity-head");
+    await assertPrimary(4, "DONE", "running tests");
+    assert((await page.locator(".session-turn-live-state").count()) === 0,
+      "idle provider state must not render a current-turn placeholder");
 
     const assertLiveState = async (providerState, pendingRequestCount, working, expected) => {
       runtime = { providerState, pendingRequestCount, working };
       await page.reload({ waitUntil: "domcontentloaded" });
       await page.waitForSelector(".session-activity-head");
-      await assertPrimary(4, expected, "running tests");
+      await assertPrimary(4, "DONE", "running tests");
+      const liveState = page.locator(".session-turn-live-state .session-activity-state");
+      assert((await liveState.count()) === 1, "current turn must render one separate live-state placeholder");
+      assert((await liveState.innerText()) === expected,
+        `current turn state mismatch: expected ${expected}, got ${await liveState.innerText()}`);
     };
     await assertLiveState("waiting-approval", 1, true, "WAITING FOR YOU");
     await assertLiveState("working", 1, true, "WAITING FOR YOU");
@@ -230,11 +267,26 @@ async function main() {
     await groups.nth(0).locator(".session-activity-collapsible.is-open .session-activity-row-label").first().waitFor();
     const firstLabels = await groups.nth(0).locator(".session-activity-row-label").allInnerTexts();
     assert(JSON.stringify(firstLabels) === JSON.stringify([
-      "REASONING", "TOOL", "RESULT", "REASONING", "TOOL", "RESULT",
+      "REASONING", "TOOL", "RESULT", "REASONING", "TOOL", "TOOL", "RESULT", "RESULT",
     ]),
       `timeline reading order is wrong: ${firstLabels.join("/")}`);
+    const resultOutputs = await groups.nth(0).locator(
+      ".session-activity-row.is-result .transcript-preview-body",
+    ).evaluateAll((elements) => elements.map((element) => element.textContent?.trim() ?? ""));
+    assert(JSON.stringify(resultOutputs) === JSON.stringify([
+      "activity group source exact", "order B finished", "order A finished",
+    ]), `result completion order is wrong: ${resultOutputs.join(" / ")}`);
+    const resultSummaries = await groups.nth(0).locator(".session-tool-result-summary").allInnerTexts();
+    assert(JSON.stringify(resultSummaries) === JSON.stringify([
+      "read session.tsx", "npm test -- order-b", "read agent-events.ts",
+    ]), `result-to-call correlation order is wrong: ${resultSummaries.join(" / ")}`);
 
     const firstTool = groups.nth(0).locator(".session-tool").first();
+    const firstToolId = await firstTool.getAttribute("data-tool-event-id");
+    assert(firstToolId, "first tool must expose its event identity for result correlation");
+    const firstResult = groups.nth(0).locator(
+      `.session-activity-row.is-result[data-tool-event-id="${firstToolId}"]`,
+    );
     await firstTool.locator(".session-tool-head").click();
     await firstTool.locator(".session-tool-input-collapsible.is-open .transcript-preview-body").waitFor();
     assert(
@@ -243,10 +295,14 @@ async function main() {
       "expanded tool input must retain exact raw evidence",
     );
     assert(
-      (await firstTool.locator(".session-tool-collapsible .transcript-preview-body").innerText()).trim()
+      (await firstResult.locator(".session-tool-collapsible .transcript-preview-body").innerText()).trim()
         === "activity group source exact",
       "expanded tool output must retain exact raw evidence",
     );
+    assert((await firstResult.locator(".session-tool-result > span:first-child").innerText()) === "completed",
+      "ok=null results must render a neutral completed label");
+    assert((await firstResult.locator(".session-activity-row-meta").innerText()) === "unknown",
+      "ok=null results must not invent an ok outcome");
 
     const longThinking = groups.nth(0).locator(".session-thinking").nth(1);
     const reasoningStyle = await longThinking.evaluate((element) => {
@@ -273,29 +329,29 @@ async function main() {
       `assistant prose and metadata need distinct type roles: ${JSON.stringify({ assistantStyle, metadataStyle })}`);
     assert(assistantStyle.size > metadataStyle.size, "assistant prose must be larger than metadata");
 
+    await page.mouse.move(0, 0);
     const contrastAudit = {};
     for (const theme of THEMES) {
       await page.evaluate((themeId) => {
         document.documentElement.dataset.theme = themeId;
       }, theme);
-      const roles = groups.locator([
-        ".session-activity-state",
-        ".session-activity-meta",
-        ".session-activity-row-label",
-        ".session-activity-row-meta",
-        ".session-thinking",
-      ].join(", "));
-      const ratios = [];
-      for (let index = 0; index < await roles.count(); index += 1) {
-        const role = roles.nth(index);
-        const sample = await colors(role);
-        const ratio = contrastRatio(sample.foreground, sample.background);
-        ratios.push(ratio);
-        const roleName = await role.evaluate((element) => `${element.className}: ${element.textContent?.trim()}`);
-        assert(ratio >= 4.5,
-          `${theme} ${roleName} contrast must be at least 4.5:1, got ${ratio.toFixed(2)} from ${JSON.stringify(sample)}`);
+      const themeAudit = {};
+      for (const [roleName, selector] of ESSENTIAL_CONTRAST_ROLES) {
+        const roles = page.locator(selector);
+        const count = await roles.count();
+        assert(count > 0, `${theme} contrast role has no rendered sample: ${roleName} (${selector})`);
+        const ratios = [];
+        for (let index = 0; index < count; index += 1) {
+          const role = roles.nth(index);
+          const sample = await colors(role);
+          const ratio = contrastRatio(sample.foreground, sample.background);
+          ratios.push(ratio);
+          assert(ratio >= 4.5,
+            `${theme} ${roleName} contrast must be at least 4.5:1, got ${ratio.toFixed(2)} from ${JSON.stringify(sample)}`);
+        }
+        themeAudit[roleName] = Math.min(...ratios);
       }
-      contrastAudit[theme] = Math.min(...ratios);
+      contrastAudit[theme] = themeAudit;
     }
     await page.evaluate(() => { document.documentElement.dataset.theme = "opencode"; });
 
@@ -306,7 +362,7 @@ async function main() {
     }));
     assert(normalDensity.scrollWidth <= normalDensity.clientWidth,
       `expanded normal group overflows: ${normalDensity.scrollWidth} > ${normalDensity.clientWidth}`);
-    assert(normalDensity.rows === 6, `expected 6 timeline rows, got ${normalDensity.rows}`);
+    assert(normalDensity.rows === 8, `expected 8 timeline rows, got ${normalDensity.rows}`);
     await groups.nth(0).screenshot({ path: SCREENSHOTS.expandedNormal });
 
     await groups.nth(0).locator(".session-activity-head").click();

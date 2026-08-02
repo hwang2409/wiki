@@ -173,7 +173,14 @@ class SessionDeltaTests(unittest.TestCase):
             self.assertEqual(fixed["events"], [])
             self.assertEqual(
                 fixed["patches"],
-                [{"id": initial["events"][0]["id"], "output": "done\nexited with code 0", "ok": True}],
+                [
+                    {
+                        "id": initial["events"][0]["id"],
+                        "output": "done\nexited with code 0",
+                        "ok": True,
+                        "completed_at": "2026-07-09T01:00:02Z",
+                    }
+                ],
             )
 
     def test_output_patch_is_emitted_exactly_once(self) -> None:
