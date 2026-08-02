@@ -3,7 +3,7 @@ import { cleanup, fireEvent, render, screen, within } from "@testing-library/rea
 import { afterEach, beforeEach, describe, expect, test } from "vitest";
 
 import { AgentsSidebar } from "../src/agents";
-import type { AgentWorker, Orchestrator } from "../src/api";
+import type { AgentWorker, ArchivedWorker, Orchestrator } from "../src/api";
 
 function worker(ticket: string, state: string, orch: string | null): AgentWorker {
   return {
@@ -57,6 +57,17 @@ const workers = [
   worker("FREE-1", "working", null),
 ];
 const orchestrators = [orchestrator("wiki"), orchestrator("phoebe")];
+const archivedWorker: ArchivedWorker = {
+  ticket: "WIKI-ARCHIVED",
+  archived_at: "2026-08-01T00:00:00Z",
+  kind: "cdx",
+  role: "implement",
+  model: "gpt-5.6-luna",
+  outcome: "completed",
+  state: "completed",
+  pr: null,
+  step: "done",
+};
 
 beforeEach(() => localStorage.clear());
 afterEach(() => cleanup());
@@ -118,6 +129,35 @@ describe("WIKI-235 runs sidebar", () => {
     expect(screen.queryByTestId("nav-orch-workers-wiki")).toBeNull();
   });
 
+  test("keeps owned-worker unread attention visible while its group is collapsed", () => {
+    const unreadWorkers = workers.map((item) =>
+      item.ticket === "WIKI-WORK"
+        ? { ...item, latest_event_seq: 2, last_viewed_seq: 1 }
+        : item,
+    );
+    render(
+      <AgentsSidebar
+        activeTicket={null}
+        data={{ workers: unreadWorkers, orchestrators, error: null }}
+        refreshTick={0}
+        onOpen={() => {}}
+      />,
+    );
+
+    const wiki = screen.getByText("wiki").closest("button");
+    expect(wiki).not.toBeNull();
+    expect(wiki?.classList.contains("has-unread")).toBe(true);
+    expect(within(wiki!).getByTestId("nav-orch-unread")).toBeTruthy();
+    expect(within(wiki!).getByText("workers have unread updates")).toBeTruthy();
+    expect(screen.queryByText("WIKI-WORK")).toBeNull();
+
+    fireEvent.click(wiki!);
+    const workerRow = screen.getByText("WIKI-WORK").closest("button");
+    expect(workerRow).not.toBeNull();
+    expect(within(workerRow!).getByTestId("nav-agent-unread")).toBeTruthy();
+    expect(within(wiki!).getByTestId("nav-orch-unread")).toBeTruthy();
+  });
+
   test("persists expanded orchestrators across remounts", () => {
     const props = {
       activeTicket: null,
@@ -131,5 +171,19 @@ describe("WIKI-235 runs sidebar", () => {
 
     render(<AgentsSidebar {...props} />);
     expect(screen.getByTestId("nav-orch-workers-wiki")).toBeTruthy();
+  });
+
+  test("uses active-run copy when only archived runs exist", () => {
+    render(
+      <AgentsSidebar
+        activeTicket={null}
+        data={{ workers: [], orchestrators: [], archived: [archivedWorker], error: null }}
+        refreshTick={0}
+        onOpen={() => {}}
+      />,
+    );
+
+    expect(screen.getByTestId("nav-agents-empty").textContent).toContain("No active runs");
+    expect(screen.queryByText("No runs yet")).toBeNull();
   });
 });

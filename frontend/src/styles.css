@@ -7821,11 +7821,24 @@ body.is-resizing-panes .pane-cell {
   text-align: left;
 }
 
-/* Unread/failed markers stay in the DOM for tests + screen readers, but the
-   colored dot itself is not rendered (Henry 2026-07-22) — unread state reads
-   through the brighter ticket text via .has-unread instead. */
+/* Worker unread/failed markers stay in the DOM for tests + screen readers,
+   but the colored dot itself is not rendered (Henry 2026-07-22). Collapsed
+   orchestrators use a rectangular attention rail instead. */
 .nav-agent-unread {
   display: none;
+}
+
+.nav-orch-attention {
+  position: absolute;
+  top: 10px;
+  bottom: 10px;
+  left: 1px;
+  width: 2px;
+  background-color: var(--accent-primary);
+}
+
+.nav-orch-attention.is-failed {
+  background-color: var(--accent-danger);
 }
 
 .sr-only {

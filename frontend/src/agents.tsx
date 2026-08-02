@@ -2448,6 +2448,7 @@ export function AgentsSidebar({
   data?: {
     workers: AgentWorker[] | null;
     orchestrators: Orchestrator[];
+    archived?: ArchivedWorker[];
     error: string | null;
   };
   refreshTick: number;
@@ -2638,7 +2639,7 @@ export function AgentsSidebar({
   if (workers.length === 0 && orchestrators.length === 0) {
     return (
       <div className="nav-empty-cta" data-testid="nav-agents-empty">
-        <div className="nav-empty-title">No runs yet</div>
+        <div className="nav-empty-title">No active runs</div>
         <div className="nav-empty-body">Runs you spawn will appear here.</div>
         <button
           className="nav-empty-primary"
@@ -2681,9 +2682,12 @@ export function AgentsSidebar({
     return latest > viewed;
   };
 
+  const hasViewedFailure = (worker: AgentWorker): boolean =>
+    worker.run_id ? viewedFailed[worker.run_id] === true : false;
+
   const workerRow = (worker: AgentWorker, owned: boolean) => {
     const unread = hasUnread(worker);
-    const failed = worker.run_id ? viewedFailed[worker.run_id] === true : false;
+    const failed = hasViewedFailure(worker);
     const stateKey = worker.state ?? "unknown";
     const stateText = navStateLabel(worker);
     const stateTitle = stateLabel(worker);
@@ -2726,18 +2730,21 @@ export function AgentsSidebar({
     );
   };
 
-  const orchestratorRow = (orch: Orchestrator, workerCount: number) => {
+  const orchestratorRow = (orch: Orchestrator, ownedWorkers: AgentWorker[]) => {
     const meta = orch.run_id
       ? orch.runtime_state ?? "orchestrator"
       : orch.window && !orch.window_alive
         ? "window gone"
         : "orchestrator";
     const expanded = expandedOrchs[orch.id] === true;
+    const workerCount = ownedWorkers.length;
+    const unread = ownedWorkers.some(hasUnread);
+    const failed = !unread && ownedWorkers.some(hasViewedFailure);
     return (
       <button
         aria-controls={workerCount > 0 ? `nav-orch-workers-${orch.id}` : undefined}
         aria-expanded={workerCount > 0 ? expanded : undefined}
-        className={`nav-agent is-orch${workerCount === 0 ? " is-empty" : ""}${expanded ? " is-expanded" : ""}${activeTicket === orch.id ? " is-active" : ""}`}
+        className={`nav-agent is-orch${workerCount === 0 ? " is-empty" : ""}${expanded ? " is-expanded" : ""}${activeTicket === orch.id ? " is-active" : ""}${unread ? " has-unread" : ""}${failed ? " has-viewed-failure" : ""}`}
         data-state="orchestrator"
         key={orch.id}
         type="button"
@@ -2748,6 +2755,21 @@ export function AgentsSidebar({
         title={workerCount > 0 ? `${expanded ? "Collapse" : "Expand"} ${orch.id} workers` : `${orch.id} has no active workers`}
         {...dragProps(orch.id)}
       >
+        {unread ? (
+          <>
+            <span aria-hidden="true" className="nav-orch-attention" data-testid="nav-orch-unread" />
+            <span className="sr-only">workers have unread updates</span>
+          </>
+        ) : failed ? (
+          <>
+            <span
+              aria-hidden="true"
+              className="nav-orch-attention is-failed"
+              data-testid="nav-orch-viewed-failed"
+            />
+            <span className="sr-only">worker read state failed to save</span>
+          </>
+        ) : null}
         <ChevronRight aria-hidden="true" className="nav-orch-chevron" size={12} />
         <span className="nav-agent-ticket">{orch.id}</span>
         <span className="nav-agent-meta" data-state="orchestrator">{meta}</span>
@@ -2804,7 +2826,7 @@ export function AgentsSidebar({
         const expanded = expandedOrchs[orch.id] === true;
         return (
           <div className="nav-orch-group" key={orch.id}>
-            {orchestratorRow(orch, owned.length)}
+            {orchestratorRow(orch, owned)}
             {expanded && owned.length > 0 ? (
               <div
                 className="nav-orch-workers"

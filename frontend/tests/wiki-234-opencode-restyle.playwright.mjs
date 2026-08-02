@@ -72,6 +72,7 @@ try {
     window: null,
     spawned_at: "2026-07-22T15:00:00Z",
   };
+  const unreadRunId = "00000000-0000-4000-8000-000000000235";
   const registry = {
     _orchestrators: {
       phoebe: {
@@ -85,12 +86,24 @@ try {
         transcript,
       },
     },
-    "WIKI-301": { history: [], current: { ...workerBase, ticket: "WIKI-301" } },
+    "WIKI-301": { history: [], current: { ...workerBase, ticket: "WIKI-301", run_id: unreadRunId } },
     "WIKI-302": { history: [], current: { ...workerBase, ticket: "WIKI-302", state: "blocked" } },
     "WIKI-303": { history: [], current: { ...workerBase, ticket: "WIKI-303", state: "merge-ready" } },
     "FREE-1": { history: [], current: { ...workerBase, ticket: "FREE-1", orch: null } },
   };
   await fs.writeFile(fixtures.registryPath, JSON.stringify(registry, null, 2));
+  await fs.writeFile(path.join(fixtures.root, "deploy-timestamp.txt"), "2026-07-22T14:00:00.000Z");
+  const unreadRunDir = path.join(fixtures.runtimeDir, "runs", unreadRunId);
+  await fs.mkdir(unreadRunDir, { recursive: true });
+  await fs.writeFile(
+    path.join(unreadRunDir, "run.json"),
+    JSON.stringify({
+      run_id: unreadRunId,
+      normalized_event_count: 1,
+      created_at: "2026-07-22T15:00:00.000Z",
+      updated_at: "2026-07-22T15:00:05.000Z",
+    }),
+  );
   writeQueue(fixtures.queuePath, "WIKI-301", []);
   for (const ticket of ["WIKI-301", "WIKI-302", "WIKI-303", "FREE-1"]) {
     await fs.writeFile(
@@ -133,7 +146,9 @@ try {
   const page = await browser.newPage({ viewport: { width: 1440, height: 900 } });
 
   logStep("state 1: default theme is opencode");
-  await page.goto(`${backend.baseUrl}/`, { waitUntil: "domcontentloaded" });
+  // Start on a different worker so the viewed effect cannot clear WIKI-301
+  // before the collapsed parent assertion runs.
+  await page.goto(`${backend.baseUrl}/#/agent/FREE-1`, { waitUntil: "domcontentloaded" });
   await page.waitForSelector("#root > *");
   const theme = await page.evaluate(() => document.documentElement.dataset.theme);
   assert(theme === "opencode", `default theme must be opencode, got ${theme}`);
@@ -166,6 +181,16 @@ try {
 
   const wikiRow = page.locator('.nav-agent.is-orch', { hasText: "wiki" });
   assert((await wikiRow.getAttribute("aria-expanded")) === "false", "wiki workers must start collapsed");
+  const unreadWorkerPayload = await page.evaluate(async () => {
+    const response = await fetch("/api/agents", { cache: "no-store" });
+    const payload = await response.json();
+    return payload.workers.find((worker) => worker.ticket === "WIKI-301");
+  });
+  assert((await wikiRow.locator('[data-testid="nav-orch-unread"]').count()) === 1,
+    `collapsed wiki row must expose owned-worker unread attention; payload=${JSON.stringify(unreadWorkerPayload)}`);
+  assert((await wikiRow.innerText()).includes("workers have unread updates"),
+    "collapsed wiki row must name unread worker attention for assistive technology");
+  await page.screenshot({ path: path.join(OUT_DIR, "00-sidebar-collapsed-unread.png") });
   await wikiRow.click();
   const wikiWorkers = page.locator('[data-testid="nav-orch-workers-wiki"]');
   await wikiWorkers.waitFor();
@@ -174,6 +199,11 @@ try {
     JSON.stringify(expandedTickets) === JSON.stringify(["WIKI-302", "WIKI-303", "WIKI-301"]),
     `attention order must be blocked, merge-ready, working; got ${expandedTickets.join("/")}`,
   );
+  const unreadWorkerRow = wikiWorkers.locator(".nav-agent", { hasText: "WIKI-301" });
+  assert((await unreadWorkerRow.locator('[data-testid="nav-agent-unread"]').count()) === 1,
+    "expanded unread worker must keep its child marker");
+  assert((await wikiRow.locator('[data-testid="nav-orch-unread"]').count()) === 1,
+    "expanded orchestrator must retain its aggregate unread marker");
   const disclosureStyle = await wikiRow.evaluate((el) => ({
     radius: Number.parseFloat(getComputedStyle(el).borderRadius),
     height: el.getBoundingClientRect().height,
