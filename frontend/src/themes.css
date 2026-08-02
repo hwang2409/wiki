@@ -16,6 +16,12 @@
   --text-on-accent: #ffffff;
   --text-selection: rgba(0, 0, 0, 0.12);
 
+  --activity-metadata-color: var(--text-normal);
+  --activity-state-done-color: var(--text-normal);
+  --activity-state-working-color: var(--text-normal);
+  --activity-state-failed-color: var(--text-normal);
+  --activity-state-waiting-color: var(--text-normal);
+
   --link-color: var(--text-normal);
   --link-color-hover: #000000;
   --link-unresolved-opacity: 0.6;
@@ -516,6 +522,12 @@
   --text-faint: #839496;
   --text-on-accent: #fdf6e3;
   --text-selection: rgba(147, 161, 161, 0.38);
+
+  --activity-metadata-color: #435a61;
+  --activity-state-done-color: #435a61;
+  --activity-state-working-color: #435a61;
+  --activity-state-failed-color: #435a61;
+  --activity-state-waiting-color: #435a61;
 
   --link-color: #268bd2;
   --link-color-hover: #2aa198;

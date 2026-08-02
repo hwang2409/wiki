@@ -4,6 +4,7 @@ import type { SessionEvent, SessionTool } from "../src/api";
 import {
   activityCountsLabel,
   activityElapsedLabel,
+  activityRunStateFromProvider,
   activitySemanticSummary,
   activityStateLabel,
 } from "../src/agent-events";
@@ -58,14 +59,29 @@ describe("semantic model activity groups", () => {
 
   test("labels working, done, failed, and waiting-for-you states", () => {
     const completed = [toolEvent("read", "read api.ts")];
+    const failed = [toolEvent("validate", "pytest", { ok: false })];
     expect(activityStateLabel(completed, "working")).toBe("working");
     expect(activityStateLabel(completed)).toBe("done");
     expect(activityStateLabel([toolEvent("read", "read api.ts", { output: null, ok: null })])).toBe("working");
-    expect(activityStateLabel([toolEvent("validate", "pytest", { ok: false })])).toBe("failed");
+    expect(activityStateLabel(failed)).toBe("failed");
+    expect(activityStateLabel(failed, "working")).toBe("working");
+    expect(activityStateLabel(failed, "waiting-for-you")).toBe("waiting for you");
     expect(activityStateLabel(completed, "waiting-for-you")).toBe("waiting for you");
     expect(
       activityStateLabel([toolEvent("ask", "ask henry", { output: null, ok: null })]),
     ).toBe("waiting for you");
+  });
+
+  test("maps active, approval, pending, and terminal provider states", () => {
+    expect(activityRunStateFromProvider("working", 0, false)).toBe("working");
+    expect(activityRunStateFromProvider("working", 1, true)).toBe("waiting-for-you");
+    expect(activityRunStateFromProvider("waiting-approval", 0, false)).toBe("waiting-for-you");
+    expect(activityRunStateFromProvider("idle", 1, false)).toBe("waiting-for-you");
+    expect(activityRunStateFromProvider("dead", 0, true)).toBe("failed");
+    expect(activityRunStateFromProvider("dead", 1, true)).toBe("failed");
+    expect(activityRunStateFromProvider("error", 0, false)).toBe("failed");
+    expect(activityRunStateFromProvider("blocked", 0, false)).toBe("failed");
+    expect(activityRunStateFromProvider("completed", 0, true)).toBe("idle");
   });
 
   test("does not invent meaning for an unsafe unknown archetype", () => {
@@ -76,8 +92,13 @@ describe("semantic model activity groups", () => {
 
   test("keeps elapsed time as secondary metadata", () => {
     expect(activityElapsedLabel([
-      toolEvent("read", "read api.ts", {}, "2026-08-02T12:00:00.000Z"),
-      thinkingEvent("done", "2026-08-02T12:01:04.000Z"),
-    ])).toBe("1m 4s");
+      toolEvent(
+        "read",
+        "read api.ts",
+        { completed_at: "2026-08-02T12:00:03.000Z" },
+        "2026-08-02T12:00:00.000Z",
+      ),
+      thinkingEvent("still working", "2026-08-02T12:00:01.000Z"),
+    ])).toBe("3s");
   });
 });

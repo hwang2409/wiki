@@ -77,6 +77,26 @@ test("mergeSession appends events whose tail starts at the current end", () => {
   assert.equal(merged.eventsChangedFrom, current.events.length);
 });
 
+test("mergeSession retains a tool result completion timestamp from a patch", () => {
+  const pendingTool = event(0, "tool");
+  const current = buildSession(sessionData([pendingTool]));
+  const result = {
+    ...sessionData([]),
+    cursor: current.cursor + 1,
+    tail_from: current.base + current.events.length,
+    base: current.base,
+    patches: [{
+      id: 0,
+      output: "tests passed",
+      ok: true,
+      completed_at: "2026-08-02T12:00:04Z",
+    }],
+  };
+
+  const merged = mergeSession(current, result);
+  assert.equal(merged.events[0].tool.completed_at, "2026-08-02T12:00:04Z");
+});
+
 test("mergeSession applies metadata-only changes without replacing events", () => {
   const current = buildSession({
     ...sessionData([event(0), event(1)]),

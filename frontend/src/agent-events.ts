@@ -33,6 +33,11 @@ export function isAgentTopologyEvent(type: string): boolean {
 export type ActivityStateLabel = "working" | "done" | "failed" | "waiting for you";
 export type ActivityRunState = "idle" | "working" | "failed" | "waiting-for-you";
 
+const ACTIVE_PROVIDER_STATES = new Set(["starting", "working", "running", "resuming"]);
+const WAITING_PROVIDER_STATES = new Set(["waiting", "waiting-approval", "approval", "input"]);
+const FAILED_PROVIDER_STATES = new Set(["dead", "failed", "error", "blocked", "crashed"]);
+const IDLE_PROVIDER_STATES = new Set(["idle", "completed"]);
+
 type ToolSummaryMapper = (summary: string) => string;
 
 function cleanSummary(summary: string): string {
@@ -100,19 +105,33 @@ export function activityStateLabel(
   runState: ActivityRunState = "idle",
 ): ActivityStateLabel {
   const tools = events.filter((event) => event.kind === "tool" && event.tool).map((event) => event.tool!);
-  if (tools.some((tool) => tool.ok === false)) return "failed";
+  if (runState === "waiting-for-you") return "waiting for you";
+  if (runState === "working") return "working";
   if (runState === "failed") return "failed";
-  const latestTool = [...tools].reverse()[0];
-  if (runState === "waiting-for-you" || (latestTool?.archetype === "ask" && latestTool.output === null)) {
-    return "waiting for you";
-  }
-  if (runState === "working" || (latestTool?.output === null && latestTool.ok === null)) return "working";
+  const latestTool = tools.at(-1);
+  if (latestTool?.archetype === "ask" && latestTool.output === null) return "waiting for you";
+  if (latestTool?.output === null && latestTool.ok === null) return "working";
+  if (tools.some((tool) => tool.ok === false)) return "failed";
   return "done";
+}
+
+export function activityRunStateFromProvider(
+  providerState: string | null | undefined,
+  pendingRequestCount: number,
+  working: boolean,
+): ActivityRunState {
+  const state = providerState?.trim().toLowerCase() ?? "";
+  if (FAILED_PROVIDER_STATES.has(state)) return "failed";
+  if (WAITING_PROVIDER_STATES.has(state) || pendingRequestCount > 0) return "waiting-for-you";
+  if (ACTIVE_PROVIDER_STATES.has(state)) return "working";
+  if (IDLE_PROVIDER_STATES.has(state)) return "idle";
+  return working ? "working" : "idle";
 }
 
 export function activityElapsedLabel(events: readonly SessionEvent[]): string | null {
   const times = events
-    .map((event) => event.ts ? Date.parse(event.ts) : Number.NaN)
+    .flatMap((event) => [event.ts, event.tool?.completed_at])
+    .map((timestamp) => timestamp ? Date.parse(timestamp) : Number.NaN)
     .filter(Number.isFinite);
   if (times.length < 2) return null;
   const elapsedMs = Math.max(...times) - Math.min(...times);

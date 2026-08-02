@@ -104,6 +104,7 @@ import type { MarkerSeverity } from "./hook-message-registry";
 import {
   activityCountsLabel,
   activityElapsedLabel,
+  activityRunStateFromProvider,
   activitySemanticSummary,
   activityStateLabel,
   type ActivityRunState,
@@ -1930,12 +1931,11 @@ function computeTimestampKeys(groups: EventGroup[]): Set<number> {
 
 function currentActivityRunState(session: TranscriptSession | null): ActivityRunState {
   const inspector = session?.providerInspector;
-  const providerState = inspector?.state.toLowerCase() ?? "";
-  if ((inspector?.pending_requests.length ?? 0) > 0 || /waiting|approval|input/.test(providerState)) {
-    return "waiting-for-you";
-  }
-  if (/failed|error|blocked/.test(providerState)) return "failed";
-  return session?.working ? "working" : "idle";
+  return activityRunStateFromProvider(
+    inspector?.state,
+    inspector?.pending_requests.length ?? 0,
+    session?.working ?? false,
+  );
 }
 
 const VirtualSessionRow = memo(function VirtualSessionRow({

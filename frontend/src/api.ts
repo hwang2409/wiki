@@ -524,6 +524,7 @@ export type SessionTool = {
   ok: boolean | null;
   archetype: string;
   summary: string;
+  completed_at?: string | null;
   agent_id?: string;
 };
 
@@ -779,6 +780,7 @@ export type SessionPatch = {
   id: number;
   output: string | null;
   ok: boolean | null;
+  completed_at?: string | null;
 };
 
 export type AgentSessionData = {

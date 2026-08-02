@@ -233,6 +233,36 @@ class ArtifactTranscriptTests(unittest.TestCase):
             "render_artifact completed without a parseable artifact",
         )
 
+    def test_codex_tool_retains_result_completion_time(self) -> None:
+        rows = [
+            {
+                "type": "response_item",
+                "timestamp": "2026-08-02T12:00:01Z",
+                "payload": {
+                    "type": "function_call",
+                    "call_id": "call-with-late-result",
+                    "name": "exec_command",
+                    "arguments": json.dumps({"cmd": "npm test"}),
+                },
+            },
+            {
+                "type": "response_item",
+                "timestamp": "2026-08-02T12:00:04Z",
+                "payload": {
+                    "type": "function_call_output",
+                    "call_id": "call-with-late-result",
+                    "output": "tests passed\nexited with code 0",
+                },
+            },
+        ]
+        with TemporaryDirectory() as tmp:
+            path = Path(tmp) / "codex-result-time.jsonl"
+            path.write_text("".join(json.dumps(row) + "\n" for row in rows))
+            parsed = transcripts.read_session_events("codex", path)
+
+        tool = parsed["events"][0]["tool"]
+        self.assertEqual(tool["completed_at"], "2026-08-02T12:00:04Z")
+
     def test_claude_structured_content_result_reconstructs_artifact_event(self) -> None:
         path = FIXTURES_DIR / "claude_artifact_structured_content.jsonl"
 

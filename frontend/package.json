@@ -15,6 +15,7 @@
     "pretest:wiki-235": "npm run build",
     "test:wiki-235": "vitest run tests/wiki-235-runs-declutter.integration.test.tsx && node tests/wiki-234-opencode-restyle.playwright.mjs",
     "test:wiki-237": "node tests/wiki-237-prompt-dock.playwright.mjs",
+    "pretest:wiki-238": "npm run build",
     "test:wiki-238": "vitest run tests/wiki-238-semantic-activity.integration.test.tsx && node tests/wiki-238-semantic-activity.playwright.mjs",
     "pretest:wiki-240": "npm run build",
     "test:wiki-240": "node --test tests/wiki32-harness.unit.mjs && vitest run tests/loop-state-chrome.integration.test.tsx && node tests/wiki-240-run-header.playwright.mjs",

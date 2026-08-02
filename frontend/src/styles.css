@@ -7266,7 +7266,7 @@ body.is-resizing-panes .pane-cell {
 
 .session-activity-state {
   flex-shrink: 0;
-  color: var(--text-subtle-readable);
+  color: var(--activity-state-done-color);
   font-size: var(--fs-xs);
   font-weight: var(--fw-semibold);
   letter-spacing: 0.04em;
@@ -7274,15 +7274,15 @@ body.is-resizing-panes .pane-cell {
 }
 
 .session-activity-state.is-working {
-  color: var(--accent-primary);
+  color: var(--activity-state-working-color);
 }
 
 .session-activity-state.is-failed {
-  color: var(--accent-danger);
+  color: var(--activity-state-failed-color);
 }
 
 .session-activity-state.is-waiting-for-you {
-  color: var(--accent-warning);
+  color: var(--activity-state-waiting-color);
 }
 
 .session-activity-semantic {
@@ -7295,7 +7295,7 @@ body.is-resizing-panes .pane-cell {
 
 .session-activity-meta {
   flex-shrink: 0;
-  color: var(--text-subtle-readable);
+  color: var(--activity-metadata-color);
   font-size: var(--fs-xs);
 }
 
@@ -7403,7 +7403,7 @@ body.is-resizing-panes .pane-cell {
   padding: 10px 9px;
   border-right: 1px solid var(--background-modifier-border);
   background-color: var(--code-background);
-  color: var(--text-subtle-readable);
+  color: var(--activity-metadata-color);
   font-family: var(--font-monospace);
   font-weight: var(--font-monospace-weight);
   font-size: var(--fs-xs);
@@ -7417,7 +7417,7 @@ body.is-resizing-panes .pane-cell {
 }
 
 .session-activity-row-meta {
-  color: var(--text-subtle-readable);
+  color: var(--activity-metadata-color);
   font-family: var(--font-monospace);
   font-weight: var(--font-monospace-weight);
   font-size: var(--fs-xs);
@@ -7453,7 +7453,7 @@ body.is-resizing-panes .pane-cell {
 }
 
 .session-tool-body pre.session-tool-output {
-  color: var(--text-subtle-readable);
+  color: var(--activity-metadata-color);
   white-space: pre-wrap;
   overflow-wrap: anywhere;
 }
@@ -7470,7 +7470,7 @@ body.is-resizing-panes .pane-cell {
 
 .session-thinking {
   padding: 3px 0 10px;
-  color: var(--text-subtle-readable);
+  color: var(--activity-metadata-color);
   font-family: var(--font-agent-prose);
   font-weight: var(--font-text-weight);
   font-size: var(--font-ui-small);
