@@ -2664,18 +2664,57 @@ class SupervisorTests(unittest.IsolatedAsyncioTestCase):
         )
         retired_adapter = self.supervisor.adapters[record.run_id]
         retired_generation = retired_adapter.snapshot().generation
+        message = "same alarm after upgrade"
+        orphan_pending_id = str(uuid4())
+        orphan_request_id = "review24-retired-orphan"
+        orphan_command = AgentCommand.steer(
+            agent_id=record.agent_id,
+            request_id=orphan_request_id,
+            payload={
+                "method": "run/send_now",
+                "run_id": record.run_id,
+                "text": message,
+                "source": "orphan-source",
+                "pending_id": orphan_pending_id,
+            },
+        )
+        self.store.command_log.append_intent(
+            orphan_command,
+            self.store.command_state_for(record.agent_id),
+        )
+        self.store.command_log.steer_effect(
+            method="run/send_now",
+            request_id=orphan_request_id,
+            agent_id=record.agent_id,
+            command_hash=orphan_command.command_hash,
+            run_id=record.run_id,
+            pending_id=orphan_pending_id,
+            message=message,
+            mode="now",
+        )
+        self.store.command_log.mark_steer_sending_for_pending(
+            record.run_id, orphan_pending_id
+        )
         await self.supervisor.close()
 
-        message = "same alarm after upgrade"
         legacy = self.store.get(record.run_id).to_dict()
+        legacy["provider_generation"] = retired_generation + 1
         legacy["pending_user_messages"] = [
             {
-                "pending_id": f"legacy-pending-{index}",
+                "pending_id": orphan_pending_id,
                 "text": message,
-                "sent_at": "2026-08-02T12:00:00+00:00",
-                "source": f"legacy-source-{index}",
-            }
-            for index in range(MAX_PENDING_USER_MESSAGES + 5)
+                "sent_at": "2026-08-02T11:59:59+00:00",
+                "source": "orphan-source",
+            },
+            *[
+                {
+                    "pending_id": f"legacy-pending-{index}",
+                    "text": message,
+                    "sent_at": "2026-08-02T12:00:00+00:00",
+                    "source": f"legacy-source-{index}",
+                }
+                for index in range(MAX_PENDING_USER_MESSAGES + 4)
+            ],
         ]
         legacy["automatic_resume_suppressed"] = True
         legacy["automatic_resume_guarded_at"] = "2026-08-02T12:00:00+00:00"
@@ -2683,6 +2722,21 @@ class SupervisorTests(unittest.IsolatedAsyncioTestCase):
         self.store.run_path(record.run_id).write_text(
             json.dumps(legacy),
             encoding="utf-8",
+        )
+        orphan_raw = self.store.append_raw(
+            record.run_id,
+            provider=ProviderKind.CODEX.value,
+            direction="provider",
+            payload={
+                "method": "item/completed",
+                "params": {
+                    "item": {
+                        "type": "userMessage",
+                        "content": [{"type": "text", "text": message}],
+                    }
+                },
+            },
+            generation=retired_generation,
         )
 
         provider_calls: list[str] = []
@@ -2736,6 +2790,43 @@ class SupervisorTests(unittest.IsolatedAsyncioTestCase):
             len(recovered.pending_user_messages), MAX_PENDING_USER_MESSAGES
         )
         self.assertEqual(resume_pending_counts, [])
+        orphan_normalized = [
+            item
+            for item in restarted_store.read_normalized_events(record.run_id)
+            if int(item.get("raw_seq", 0)) == int(orphan_raw["seq"])
+        ]
+        self.assertEqual(len(orphan_normalized), 1)
+        self.assertEqual(
+            orphan_normalized[0]["kind"], "retired_generation_event"
+        )
+        self.assertEqual(
+            orphan_normalized[0]["disposition"],
+            EventDisposition.IGNORED.value,
+        )
+        self.assertEqual(
+            orphan_normalized[0]["payload"],
+            {
+                "event_generation": retired_generation,
+                "provider_generation": retired_generation + 1,
+            },
+        )
+        self.assertIsNone(
+            restarted_store.command_log.receipt(
+                "run/send_now", orphan_request_id
+            )
+        )
+        orphan_effect = restarted_store.command_log.steer_effect_for_request(
+            "run/send_now", orphan_request_id
+        )
+        self.assertIsNotNone(orphan_effect)
+        assert orphan_effect is not None
+        self.assertEqual(orphan_effect["status"], "acknowledged")
+        self.assertEqual(orphan_effect["result"]["status"], "uncertain")
+        self.assertNotEqual(orphan_effect["result"]["status"], "sent")
+        self.assertEqual(provider_calls, [])
+        self.assertEqual(
+            restarted_store.command_log.pending(), [orphan_command]
+        )
 
         # Seed a second legacy snapshot after startup retirement. The shared
         # explicit-resume path must enforce the same boundary before adapter
@@ -2759,6 +2850,11 @@ class SupervisorTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(
             restarted_store.get(record.run_id).pending_user_messages,
             [],
+        )
+        self.assertIsNone(
+            restarted_store.command_log.receipt(
+                "run/send_now", orphan_request_id
+            )
         )
 
         restarted_adapter = restarted.adapters[record.run_id]
@@ -2821,6 +2917,14 @@ class SupervisorTests(unittest.IsolatedAsyncioTestCase):
         self.assertIsInstance(first_pending_id, str)
         self.assertEqual(first["status"], "sent")
         self.assertEqual(provider_calls, [message])
+        orphan_receipt = restarted_store.command_log.receipt(
+            "run/send_now", orphan_request_id
+        )
+        self.assertIsNotNone(orphan_receipt)
+        assert orphan_receipt is not None
+        self.assertTrue(orphan_receipt.ok)
+        self.assertEqual(orphan_receipt.result["status"], "uncertain")
+        self.assertNotEqual(orphan_receipt.result["status"], "sent")
         self.assertEqual(
             pending_pairs(),
             [(first_pending_id, "current-source")],
@@ -2874,7 +2978,8 @@ class SupervisorTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(len(correlated), len(set(correlated)))
         self.assertFalse(
             any(
-                str(item.get("pending_id", "")).startswith("legacy-pending-")
+                item.get("pending_id") == orphan_pending_id
+                or str(item.get("pending_id", "")).startswith("legacy-pending-")
                 for item in final_record.composer_messages
             )
         )

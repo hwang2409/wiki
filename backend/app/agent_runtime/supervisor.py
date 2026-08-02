@@ -2651,6 +2651,24 @@ Preserve the same identity, role, worktree, orchestrator grouping, PR gates, and
 
         payload = envelope.get("payload")
         raw_seq = int(envelope.get("seq", 0))
+        raw_generation = envelope.get("generation")
+        record = self.store.get(run_id)
+        if (
+            type(raw_generation) is int
+            and raw_generation > 0
+            and raw_generation < record.provider_generation
+        ):
+            self.store.append_normalized(
+                run_id,
+                raw_seq=raw_seq,
+                disposition=EventDisposition.IGNORED,
+                kind="retired_generation_event",
+                payload={
+                    "event_generation": raw_generation,
+                    "provider_generation": record.provider_generation,
+                },
+            )
+            return True
         direction = str(envelope.get("direction") or "provider")
         provider_value = str(envelope.get("provider") or "")
         if provider_value == "supervisor" and isinstance(payload, dict):
