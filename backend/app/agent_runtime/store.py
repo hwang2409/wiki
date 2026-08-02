@@ -2526,12 +2526,27 @@ class RunStore:
         self,
         run_id: str,
         dedupe_key: str,
+        *,
+        owner: str | None = None,
     ) -> tuple[RunRecord, bool]:
         with self._lock:
             record = self.get(run_id)
-            if dedupe_key in record.message_dedupe_keys:
+            for entry in record.message_dedupe_keys:
+                if entry.get("key") != dedupe_key:
+                    continue
+                # An owner-scoped re-claim by the same effect_id succeeds so a
+                # crash between the dedupe write and the provider delivery can
+                # replay through the same effect (WIKI-232). Un-owned claims
+                # (or a different owner) still reject as before so unrelated
+                # retries stay deduplicated.
+                existing_owner = entry.get("owner")
+                if owner is not None and existing_owner == owner:
+                    return record, True
                 return record, False
-            record.message_dedupe_keys.append(dedupe_key)
+            entry: dict[str, str] = {"key": dedupe_key}
+            if owner is not None:
+                entry["owner"] = owner
+            record.message_dedupe_keys.append(entry)
             if len(record.message_dedupe_keys) > MAX_MESSAGE_DEDUPE_KEYS:
                 del record.message_dedupe_keys[:-MAX_MESSAGE_DEDUPE_KEYS]
             self._write_record(record)
@@ -2545,7 +2560,9 @@ class RunStore:
         with self._lock:
             record = self.get(run_id)
             record.message_dedupe_keys = [
-                key for key in record.message_dedupe_keys if key != dedupe_key
+                entry
+                for entry in record.message_dedupe_keys
+                if entry.get("key") != dedupe_key
             ]
             self._write_record(record)
             return record

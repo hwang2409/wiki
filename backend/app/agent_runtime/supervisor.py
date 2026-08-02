@@ -402,6 +402,11 @@ class Supervisor:
         self.codex_rotation_task: asyncio.Task[dict[str, Any]] | None = None
         self.codex_rotation_operation_id: str | None = None
         self.recovery_scan_lock = asyncio.Lock()
+        # A supervisor boot invalidates any provider stdin write that had not
+        # completed before shutdown: even if the row is at "sending", the
+        # previous transport is gone. Sweep once per boot so the on-idle
+        # queue drain does not wedge on a stale head (WIKI-232).
+        self._sending_effects_reconciled = False
         self.pipeline_failures: dict[str, str] = {}
         self.expected_stream_ends: set[int] = set()
         self.subscribers: set[asyncio.Queue[dict[str, Any]]] = set()
@@ -1492,6 +1497,9 @@ Preserve the same identity, role, worktree, orchestrator grouping, PR gates, and
                         self.store.remove_queued_message_by_pending_id(
                             run_id, pending_id
                         )
+                    # No echo yet. The recover_on_start sweep resolves
+                    # sending effects whose transport died; here we just
+                    # wait so the healthy in-flight case can still finish.
                     return
             if pending_id is not None:
                 self.store.track_pending_user_message(
@@ -1509,9 +1517,34 @@ Preserve the same identity, role, worktree, orchestrator grouping, PR gates, and
             except Exception as exc:
                 if pending_id is not None:
                     self.store.discard_pending_user_message(run_id, pending_id)
-                # Provider refusal/races are delivery failures, not event
-                # persistence failures. Retain the durable message for the
-                # next idle edge and keep the provider control stream alive.
+                    # The "sending" marker was written above and, per state
+                    # machine, cannot revert to "queued"; if we do not
+                    # terminate this effect it wedges every later queued
+                    # message behind an effect whose provider echo can
+                    # never arrive (WIKI-232 H2). Report uncertainty and
+                    # drop the head so the queue can drain.
+                    effect_for_pending = (
+                        self.store.command_log.steer_effect_for_pending(
+                            run_id, pending_id
+                        )
+                    )
+                    if (
+                        effect_for_pending is not None
+                        and effect_for_pending["status"] == "sending"
+                    ):
+                        self.store.command_log.update_steer_effect(
+                            str(effect_for_pending["method"]),
+                            str(effect_for_pending["request_id"]),
+                            "acknowledged",
+                            {
+                                "status": "uncertain",
+                                "pending_id": pending_id,
+                                "reason": f"adapter send failed: {exc}",
+                            },
+                        )
+                        self.store.remove_queued_message_by_pending_id(
+                            run_id, pending_id
+                        )
                 record = self.store.get(run_id)
                 record = self.store.transition(
                     run_id,
@@ -2170,6 +2203,7 @@ Preserve the same identity, role, worktree, orchestrator grouping, PR gates, and
             async with self.recovery_scan_lock:
                 self.store.abort_uncommitted_starts()
                 results = await self._recover_once()
+                await self._reconcile_sending_steer_effects()
                 await self.command_queue.recover_pending()
                 if self._reaper_due():
                     by_run_id = {
@@ -2182,6 +2216,74 @@ Preserve the same identity, role, worktree, orchestrator grouping, PR gates, and
                         else:
                             results[index] = reaped
                 return results
+
+    async def _reconcile_sending_steer_effects(self) -> None:
+        """Resolve every steer effect left at status='sending' by a prior boot.
+
+        A daemon stop between ``mark_steer_sending_for_pending`` and the
+        provider echo leaves the on-idle queue head bound to a `sending`
+        effect that no new echo can reach: the previous adapter transport
+        is dead. Without this sweep the drain returns without changing
+        the effect or removing the head, and every later queued message
+        is starved (WIKI-232 H2).
+
+        Called once per boot from ``recover_on_start`` after per-run
+        recovery has replayed persisted events (so ``steer_delivery_observed``
+        sees any composer echo that was already durable). Effects whose
+        delivery is observed are promoted to ``acknowledged`` normally;
+        effects whose delivery is not observed are marked ``acknowledged``
+        with an ``uncertain`` payload, and the queued message plus the
+        pending user message are dropped so the queue can drain.
+        """
+
+        if self._sending_effects_reconciled:
+            return
+        self._sending_effects_reconciled = True
+        for effect in self.store.command_log.sending_steer_effects():
+            run_id = str(effect.get("run_id") or "")
+            pending_id = effect.get("pending_id")
+            method = str(effect.get("method") or "")
+            request_id = str(effect.get("request_id") or "")
+            if not run_id or not method or not request_id:
+                continue
+            pending_id_str = str(pending_id) if isinstance(pending_id, str) else None
+            async with self._run_lock(run_id):
+                try:
+                    self.store.get(run_id)
+                except RunNotFound:
+                    continue
+                observed = False
+                if pending_id_str is not None:
+                    try:
+                        observed = self.store.steer_delivery_observed(
+                            run_id, pending_id_str
+                        )
+                    except RunNotFound:
+                        continue
+                if observed:
+                    result: dict[str, Any] = {"status": "sent"}
+                    if pending_id_str is not None:
+                        result["pending_id"] = pending_id_str
+                    self.store.command_log.update_steer_effect(
+                        method, request_id, "acknowledged", result
+                    )
+                    if pending_id_str is not None:
+                        self.store.remove_queued_message_by_pending_id(
+                            run_id, pending_id_str
+                        )
+                    continue
+                uncertain: dict[str, Any] = {"status": "uncertain"}
+                if pending_id_str is not None:
+                    uncertain["pending_id"] = pending_id_str
+                uncertain["reason"] = "supervisor_restart_dropped_send"
+                self.store.command_log.update_steer_effect(
+                    method, request_id, "acknowledged", uncertain
+                )
+                if pending_id_str is not None:
+                    self.store.remove_queued_message_by_pending_id(
+                        run_id, pending_id_str
+                    )
+                    self.store.discard_pending_user_message(run_id, pending_id_str)
 
     async def _reap_lost_runs(self) -> list[dict[str, str]]:
         self.last_reaper_at = time.monotonic()
@@ -3286,7 +3388,13 @@ Preserve the same identity, role, worktree, orchestrator grouping, PR gates, and
                 )
                 return result
         if dedupe_key is not None:
-            _, claimed = self.store.claim_message_dedupe_key(run_id, dedupe_key)
+            # Bind the dedupe claim to the steer effect so replay after a
+            # crash between the claim and provider delivery can resume
+            # (WIKI-232). Non-command paths (effect_id is None) keep the
+            # legacy owner-less behavior and remain single-shot.
+            _, claimed = self.store.claim_message_dedupe_key(
+                run_id, dedupe_key, owner=effect_id
+            )
             if not claimed:
                 return {"status": "deduplicated", "dedupe_key": dedupe_key}
         if pending_id is None and source is not None:
@@ -3412,7 +3520,9 @@ Preserve the same identity, role, worktree, orchestrator grouping, PR gates, and
                     return result
                 return {"status": "uncertain", "pending_id": pending_id}
         if dedupe_key is not None:
-            record, claimed = self.store.claim_message_dedupe_key(run_id, dedupe_key)
+            record, claimed = self.store.claim_message_dedupe_key(
+                run_id, dedupe_key, owner=effect_id
+            )
             if not claimed:
                 return {
                     "status": "deduplicated",

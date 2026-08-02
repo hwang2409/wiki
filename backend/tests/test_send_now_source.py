@@ -553,7 +553,10 @@ class SendNowSourceTests(unittest.IsolatedAsyncioTestCase):
                 )
             # Rollback: dedupe claim released, pending row discarded.
             record = self.store.get(run_id)
-            self.assertNotIn(dedupe_key, record.message_dedupe_keys)
+            self.assertNotIn(
+                dedupe_key,
+                [entry["key"] for entry in record.message_dedupe_keys],
+            )
             self.assertEqual(record.pending_user_messages, [])
         finally:
             self.store.track_pending_user_message = real_track  # type: ignore[method-assign]

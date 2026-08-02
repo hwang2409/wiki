@@ -312,6 +312,9 @@ class CommandLog:
     def mark_steer_sending_for_pending(self, run_id: str, pending_id: str) -> None:
         self.effects.mark_steer_sending(run_id, pending_id)
 
+    def sending_steer_effects(self) -> list[dict[str, Any]]:
+        return self.effects.list_sending_steer_effects()
+
     def complete_effect(
         self,
         command: AgentCommand,

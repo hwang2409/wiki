@@ -407,3 +407,22 @@ class EffectStore:
                 (_now(), run_id, pending_id),
             )
             connection.commit()
+
+    def list_sending_steer_effects(self) -> list[dict[str, Any]]:
+        """Return every steer effect currently at status='sending'.
+
+        Used by recovery to reconcile effects that were mid-flight when the
+        supervisor stopped: without a sweep those wedge the on-idle queue
+        forever because the provider echo can never arrive from a dead
+        transport (WIKI-232).
+        """
+
+        with self._connect() as connection:
+            rows = connection.execute(
+                """
+                SELECT * FROM steer_effects
+                WHERE status = 'sending'
+                ORDER BY updated_at
+                """
+            ).fetchall()
+        return [self._decode(row) for row in rows]

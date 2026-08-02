@@ -638,17 +638,27 @@ class SupervisorTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(first["status"], "queued")
         self.assertEqual(second["status"], "deduplicated")
         self.assertEqual(len(self.store.queued_messages(record.run_id)), 1)
-        self.assertEqual(
-            self.store.get(record.run_id).message_dedupe_keys,
-            [dedupe_key],
-        )
+        stored_keys = [
+            entry["key"]
+            for entry in self.store.get(record.run_id).message_dedupe_keys
+        ]
+        self.assertEqual(stored_keys, [dedupe_key])
 
         reloaded = RunStore(self.paths)
-        self.assertEqual(reloaded.get(record.run_id).message_dedupe_keys, [dedupe_key])
+        reloaded_keys = [
+            entry["key"]
+            for entry in reloaded.get(record.run_id).message_dedupe_keys
+        ]
+        self.assertEqual(reloaded_keys, [dedupe_key])
 
         for index in range(MAX_MESSAGE_DEDUPE_KEYS + 1):
-            self.store.claim_message_dedupe_key(record.run_id, f"artifact-render:key-{index}:svg-render")
-        keys = self.store.get(record.run_id).message_dedupe_keys
+            self.store.claim_message_dedupe_key(
+                record.run_id, f"artifact-render:key-{index}:svg-render"
+            )
+        keys = [
+            entry["key"]
+            for entry in self.store.get(record.run_id).message_dedupe_keys
+        ]
         self.assertEqual(len(keys), MAX_MESSAGE_DEDUPE_KEYS)
         self.assertNotIn("artifact-render:key-0:svg-render", keys)
         self.assertIn(
@@ -1147,6 +1157,157 @@ class SupervisorTests(unittest.IsolatedAsyncioTestCase):
             )["status"],
             "acknowledged",
         )
+
+    async def test_send_now_replay_after_dedupe_claim_delivers_once(self) -> None:
+        """WIKI-232 H1: a crash between the dedupe-claim write and the
+        provider send used to leave the effect at 'queued' with the dedupe
+        key claimed. Replay saw its own key and returned deduplicated
+        without ever calling the provider (provider_send_count=0). Bind the
+        claim to the steer effect so the retry can resume."""
+
+        record = await self.supervisor.start_run(
+            agent_id="WIKI-232-H1",
+            provider=ProviderKind.CODEX,
+            role="implement",
+            model="fixture-codex",
+            effort="high",
+            worktree=str(self.worktree),
+            prompt="dedupe claim replay",
+        )
+        adapter = self.supervisor.adapters[record.run_id]
+        pending_id = str(uuid4())
+        effect_id = "send-now-h1"
+        dedupe_key = "wiki-232-h1:artifact-render:1"
+
+        real_update = self.store.command_log.update_steer_effect
+
+        def crash_on_sending(method, request_id, status, result=None):
+            if status == "sending":
+                # Simulate the daemon dying immediately after the dedupe
+                # claim persisted but before the provider was invoked.
+                raise asyncio.CancelledError()
+            return real_update(method, request_id, status, result)
+
+        with mock.patch.object(
+            adapter, "send_now", wraps=adapter.send_now
+        ) as provider_send:
+            with mock.patch.object(
+                self.store.command_log,
+                "update_steer_effect",
+                side_effect=crash_on_sending,
+            ):
+                with self.assertRaises(asyncio.CancelledError):
+                    await self.supervisor.send_now(
+                        record.run_id,
+                        "deliver exactly once",
+                        pending_id=pending_id,
+                        dedupe_key=dedupe_key,
+                        effect_id=effect_id,
+                    )
+
+            # Nothing reached the provider; the dedupe claim is bound to
+            # this effect so a replay can complete instead of being told
+            # "deduplicated" by its own earlier claim.
+            self.assertEqual(provider_send.await_count, 0)
+            keys = self.store.get(record.run_id).message_dedupe_keys
+            self.assertEqual(len(keys), 1)
+            self.assertEqual(keys[0].get("key"), dedupe_key)
+            self.assertEqual(keys[0].get("owner"), effect_id)
+            queued_effect = self.store.command_log.steer_effect_for_pending(
+                record.run_id, pending_id
+            )
+            self.assertIsNotNone(queued_effect)
+            self.assertEqual(
+                queued_effect["status"] if queued_effect else None, "queued"
+            )
+
+            result = await self.supervisor.send_now(
+                record.run_id,
+                "deliver exactly once",
+                pending_id=pending_id,
+                dedupe_key=dedupe_key,
+                effect_id=effect_id,
+            )
+
+        self.assertEqual(result["status"], "sent")
+        self.assertEqual(provider_send.await_count, 1)
+        self.assertEqual(
+            self.store.command_log.steer_effect_for_pending(
+                record.run_id, pending_id
+            )["status"],
+            "sent",
+        )
+
+    async def test_recover_on_start_reconciles_wedged_sending_effect(self) -> None:
+        """WIKI-232 H2: an on-idle effect stuck at 'sending' after a daemon
+        crash used to wedge the queue forever because no fresh transport
+        could produce the missing echo. The recover_on_start sweep now
+        promotes each such effect to a terminal 'uncertain' result and
+        drops the head so later queued messages can drain."""
+
+        record = await self.supervisor.start_run(
+            agent_id="WIKI-232-H2",
+            provider=ProviderKind.CODEX,
+            role="implement",
+            model="fixture-codex",
+            effort="high",
+            worktree=str(self.worktree),
+            prompt="sending recovery",
+        )
+        adapter = self.supervisor.adapters[record.run_id]
+        pending_id = str(uuid4())
+
+        with mock.patch.object(
+            adapter, "send_on_idle", wraps=adapter.send_on_idle
+        ) as provider_send:
+            with mock.patch.object(
+                self.store.command_log,
+                "mark_steer_sent_for_pending",
+                side_effect=asyncio.CancelledError,
+            ):
+                with self.assertRaises(asyncio.CancelledError):
+                    await self.supervisor.send_on_idle(
+                        record.run_id,
+                        "wedge me",
+                        pending_id=pending_id,
+                        effect_id="send-on-idle-h2",
+                    )
+
+            # Pre-sweep: exactly the wedge scenario the finding describes.
+            wedged = self.store.command_log.steer_effect_for_pending(
+                record.run_id, pending_id
+            )
+            self.assertEqual(wedged["status"] if wedged else None, "sending")
+            self.assertEqual(len(self.store.queued_messages(record.run_id)), 1)
+            self.assertEqual(provider_send.await_count, 1)
+
+            # Force a boot so recover_on_start does the sweep.
+            self.supervisor._sending_effects_reconciled = False  # noqa: SLF001
+            await self.supervisor._reconcile_sending_steer_effects()  # noqa: SLF001
+
+        # Post-sweep: effect is terminal, queue drained, no double-send.
+        resolved = self.store.command_log.steer_effect_for_pending(
+            record.run_id, pending_id
+        )
+        self.assertEqual(resolved["status"], "acknowledged")
+        self.assertEqual(resolved["result"]["status"], "uncertain")
+        self.assertEqual(self.store.queued_messages(record.run_id), [])
+        self.assertEqual(self.store.get(record.run_id).pending_user_messages, [])
+
+        # And a fresh queued message drains normally through the same run.
+        follow_up_pending = str(uuid4())
+        follow_up = await self.supervisor.send_on_idle(
+            record.run_id,
+            "queue drains after wedge",
+            pending_id=follow_up_pending,
+            effect_id="send-on-idle-h2-followup",
+        )
+        self.assertIn(follow_up["status"], {"sent", "queued"})
+        await self.supervisor._deliver_next_queued_locked(  # noqa: SLF001
+            record.run_id,
+            self.supervisor.adapters[record.run_id],
+        )
+        self.assertEqual(self.store.queued_messages(record.run_id), [])
 
     async def test_delivered_pending_id_survives_replace_until_late_echo(self) -> None:
         record = await self.supervisor.start_run(

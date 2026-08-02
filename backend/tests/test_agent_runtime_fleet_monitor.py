@@ -1248,6 +1248,83 @@ class FleetMonitorTests(unittest.IsolatedAsyncioTestCase):
             [n for n in again if n.event_type == "status-transition"], []
         )
 
+    async def test_status_transition_writes_command_log_intent_and_receipt(self) -> None:
+        """WIKI-232 H3: production daemon wraps the fleet-monitor callable in
+        supervisor.dispatch so each monitor steer joins the durable total
+        order. Prove one tick produces a `run/send_now` intent + receipt
+        keyed by the notification's dedupe identity."""
+
+        await self._spawn("WIKI-ORCH", role="orchestrator", orch=None)
+        await self._spawn("WIKI-232-H3", role="implement", orch="WIKI-ORCH")
+        _write_status(
+            self.store,
+            "WIKI-232-H3",
+            {"state": "working", "pr": None, "step": "coding", "blocker": None},
+        )
+
+        # Same shape the daemon installs — route the monitor callable
+        # through supervisor.dispatch("run/send_now", ...).
+        supervisor = self.supervisor
+
+        async def dispatch_send(
+            run_id: str,
+            message: str,
+            dedupe_key: str | None,
+            source: str | None = None,
+        ):
+            return await supervisor.dispatch(
+                "run/send_now",
+                {
+                    "run_id": run_id,
+                    "text": message,
+                    "dedupe_key": dedupe_key,
+                    "source": source,
+                    "request_id": f"fleet-monitor:{dedupe_key}",
+                },
+            )
+
+        durable_monitor = FleetMonitor(
+            self.store,
+            dispatch_send,
+            clock=self.clock,
+            interval=0.01,
+            unrouted_verdict_realarm=300.0,
+            review_gap_threshold=300.0,
+            review_gap_realarm=600.0,
+            staleness_threshold=1800.0,
+            ownership_lock=self.supervisor._agent_lock,  # noqa: SLF001
+        )
+
+        # Seed (no transitions), then observe the working -> merge-ready jump.
+        await durable_monitor.tick()
+        _write_status(
+            self.store,
+            "WIKI-232-H3",
+            {
+                "state": "merge-ready",
+                "pr": "https://gh/x/pull/232",
+                "step": "PR open",
+                "blocker": None,
+            },
+        )
+        notes = await durable_monitor.tick()
+        status_notes = [n for n in notes if n.event_type == "status-transition"]
+        self.assertEqual(len(status_notes), 1, f"got: {notes}")
+
+        request_id = f"fleet-monitor:{status_notes[0].dedupe_key}"
+        receipt = self.store.command_log.receipt("run/send_now", request_id)
+        self.assertIsNotNone(
+            receipt,
+            "monitor-originated steer must produce a durable receipt",
+        )
+        assert receipt is not None
+        self.assertTrue(receipt.ok)
+        intent_methods = {
+            event["method"]
+            for event in self.store.command_log.events(method="run/send_now")
+        }
+        self.assertIn("run/send_now", intent_methods)
+
     async def test_no_change_between_ticks_emits_nothing(self) -> None:
         await self._spawn("WIKI-ORCH", role="orchestrator", orch=None)
         await self._spawn("WIKI-101", role="implement", orch="WIKI-ORCH")

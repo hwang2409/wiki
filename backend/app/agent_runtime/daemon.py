@@ -131,8 +131,19 @@ async def run_daemon(args: argparse.Namespace) -> None:
         )
         fleet_monitor = FleetMonitor(
             supervisor.store,
-            lambda run_id, message, dedupe_key, source: supervisor.send_now(
-                run_id, message, dedupe_key=dedupe_key, source=source
+            # WIKI-232 H3: route monitor steers through the command queue
+            # so they join the durable total order — a daemon stop between
+            # queue admission and provider delivery replays exactly once
+            # instead of vanishing without a receipt.
+            lambda run_id, message, dedupe_key, source: supervisor.dispatch(
+                "run/send_now",
+                {
+                    "run_id": run_id,
+                    "text": message,
+                    "dedupe_key": dedupe_key,
+                    "source": source,
+                    "request_id": f"fleet-monitor:{dedupe_key}",
+                },
             ),
             ownership_lock=supervisor._agent_lock,  # noqa: SLF001
             on_transition=AutopilotController(

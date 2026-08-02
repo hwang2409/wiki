@@ -49,6 +49,21 @@ TERMINAL_STATES = frozenset({LifecycleState.DEAD, LifecycleState.COMPLETED})
 MAX_MESSAGE_DEDUPE_KEYS = 256
 
 
+def _dedupe_entry(item: Any) -> dict[str, str] | None:
+    if isinstance(item, str) and item:
+        return {"key": item}
+    if isinstance(item, dict):
+        key = item.get("key")
+        if not isinstance(key, str) or not key:
+            return None
+        entry: dict[str, str] = {"key": key}
+        owner = item.get("owner")
+        if isinstance(owner, str) and owner:
+            entry["owner"] = owner
+        return entry
+    return None
+
+
 ALLOWED_STATE_TRANSITIONS: dict[LifecycleState, frozenset[LifecycleState]] = {
     LifecycleState.STARTING: frozenset(
         {
@@ -196,7 +211,11 @@ class RunRecord:
     pending_user_messages: list[dict[str, str]] = field(default_factory=list)
     composer_messages: list[dict[str, Any]] = field(default_factory=list)
     queued_messages: list[dict[str, str]] = field(default_factory=list)
-    message_dedupe_keys: list[str] = field(default_factory=list)
+    # Entries: {"key": str, "owner": str | None}. Older on-disk snapshots
+    # stored bare strings; from_dict() promotes them to owner-less entries so
+    # a legacy claim remains unretryable, while post-WIKI-232 claims can bind
+    # a stable owner (steer effect_id) and safely replay after a crash.
+    message_dedupe_keys: list[dict[str, str]] = field(default_factory=list)
     schema_version: int = 1
 
     @classmethod
@@ -385,9 +404,12 @@ class RunRecord:
             ],
             queued_messages=[dict(item) for item in value.get("queued_messages") or []],
             message_dedupe_keys=[
-                str(item)
-                for item in value.get("message_dedupe_keys") or []
-                if isinstance(item, str) and item
+                entry
+                for entry in (
+                    _dedupe_entry(item)
+                    for item in value.get("message_dedupe_keys") or []
+                )
+                if entry is not None
             ],
         )
 
