@@ -34,10 +34,11 @@ def _fixture_png_bytes() -> bytes:
 FIXTURE_PNG_BYTES = _fixture_png_bytes()
 
 
-from backend.tests.test_media_scrub import REAL_MP4, REAL_WAV
+from backend.tests.test_media_scrub import REAL_MP4, REAL_WAV, REAL_WEBM_VIDEO_ONLY
 
 FIXTURE_MP4_BYTES = REAL_MP4.read_bytes()
 FIXTURE_WAV_BYTES = REAL_WAV.read_bytes()
+FIXTURE_WEBM_BYTES = REAL_WEBM_VIDEO_ONLY.read_bytes()
 
 
 def _payload(kind: str) -> dict:
@@ -510,16 +511,76 @@ class WikiArtifactsTests(unittest.TestCase):
         required = len(request) + video_encoded_limit + poster_encoded_limit + 1
         self.assertGreaterEqual(wiki_artifacts.MAX_REQUEST_BYTES, required)
 
-    def test_video_rejects_ogg_and_webm(self) -> None:
-        for mime in ("video/webm", "audio/ogg", "audio/webm"):
+    def test_audio_rejects_ogg_and_webm(self) -> None:
+        for mime in ("audio/ogg", "audio/webm"):
             with self.subTest(mime=mime):
                 payload = {
                     "data_base64": base64.b64encode(b"\x00" * 32).decode(),
                     "mime": mime,
                 }
-                kind = "audio" if mime.startswith("audio/") else "video"
                 with self.assertRaises(wiki_artifacts.ArtifactValidationError):
-                    wiki_artifacts.render_artifact({"kind": kind, "payload": payload})
+                    wiki_artifacts.render_artifact({"kind": "audio", "payload": payload})
+
+    def _render_webm(self) -> tuple[dict, Path]:
+        event = wiki_artifacts.render_artifact(
+            {
+                "kind": "video",
+                "payload": {
+                    "data_base64": base64.b64encode(FIXTURE_WEBM_BYTES).decode(),
+                    "mime": "video/webm",
+                },
+            }
+        )
+        target = (
+            self.root / "runtime" / "runs" / RUN_ID / "artifacts"
+            / f"{event['id']}.webm"
+        )
+        self.assertTrue(target.is_file())
+        self.assertEqual(event["artifact"]["mime"], "video/webm")
+        return event, target
+
+    def test_valid_webm_renders_and_serves_from_live_run(self) -> None:
+        event, target = self._render_webm()
+        registry = self.root / "registry.json"
+        registry.write_text(
+            json.dumps(
+                {
+                    "WIKI-225": {
+                        "current": {"run_id": RUN_ID, "kind": "cdx"},
+                        "history": [],
+                    }
+                }
+            ),
+            encoding="utf-8",
+        )
+        supervisor = mock.Mock()
+        supervisor.paths.runtime_dir = self.root / "runtime"
+        with (
+            mock.patch.object(main, "AGENT_REGISTRY_PATH", registry),
+            mock.patch.object(main, "SUPERVISOR_CLIENT", supervisor),
+        ):
+            response = main.get_agent_artifact("WIKI-225", event["id"])
+        self.assertEqual(Path(response.path), target)
+        self.assertEqual(response.media_type, "video/webm")
+
+    def test_valid_webm_renders_and_serves_from_archive(self) -> None:
+        event, live_target = self._render_webm()
+        archive = self.root / "archive"
+        target = (
+            archive / "WIKI-225" / "20260802-120000" / "artifacts"
+            / live_target.name
+        )
+        target.parent.mkdir(parents=True)
+        target.write_bytes(live_target.read_bytes())
+        registry = self.root / "registry.json"
+        registry.write_text("{}", encoding="utf-8")
+        with (
+            mock.patch.object(main, "AGENT_REGISTRY_PATH", registry),
+            mock.patch.object(main, "AGENT_ARCHIVE_DIR", archive),
+        ):
+            response = main.get_agent_artifact("WIKI-225", event["id"])
+        self.assertEqual(Path(response.path), target)
+        self.assertEqual(response.media_type, "video/webm")
 
     def test_audio_transcript_flows_through(self) -> None:
         payload = {
@@ -654,7 +715,11 @@ class WikiArtifactsTests(unittest.TestCase):
         description = schema["properties"]["payload"]["description"]
         for kind in sorted(wiki_artifacts.ARTIFACT_KINDS):
             self.assertIn(f"{kind}:", description, kind)
-        self.assertIn("video/mp4|image/gif", description)
+        self.assertIn("video/mp4|video/webm|image/gif", description)
+        self.assertIn("video/mp4, video/webm, or image/gif", wiki_artifacts.TOOL_DESCRIPTION)
+        self.assertIn("exactly one VP8 video track", description)
+        self.assertIn("keyframes only and no audio", description)
+        self.assertIn("exactly one VP8 video track", wiki_artifacts.TOOL_DESCRIPTION)
         self.assertIn("audio/wav|audio/mpeg", description)
         self.assertIn("40MB", description)
         self.assertIn("20MB", description)

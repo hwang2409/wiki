@@ -63,7 +63,7 @@ def _rebuild_stsd(
         entry_bytes = payload[offset:offset + entry_size]
         if handler_type != b"vide":
             raise MediaScrubError(
-                "mp4 audio tracks, including mp4a, are deferred to WIKI-225"
+                "mp4 audio tracks are outside the video-only MP4 scrubber"
             )
         expected_entry_type = b"avc1"
         if entry_type != expected_entry_type:

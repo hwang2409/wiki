@@ -31,6 +31,7 @@ from .wav import (
     _wav_stream_peaks,
     scrub_wav,
 )
+from .webm import scrub_webm
 
 __all__ = [
     "AUDIO_MIMES",
@@ -48,6 +49,8 @@ def scrub_video(data: bytes, mime: str) -> MediaScrubResult:
         return scrub_mp4(data)
     if mime == "image/gif":
         return scrub_gif(data)
+    if mime == "video/webm":
+        return scrub_webm(data)
     raise MediaScrubError(f"unsupported video mime: {mime}")
 
 

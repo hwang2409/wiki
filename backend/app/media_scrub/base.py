@@ -8,8 +8,9 @@ from typing import Final
 VIDEO_MIMES: Final = {
     "video/mp4": "mp4",
     "image/gif": "gif",
+    "video/webm": "webm",
 }
-# WebM and Ogg are outside this strict parser scope and are rejected.
+# Ogg is outside this strict parser scope and is rejected.
 AUDIO_MIMES: Final = {
     "audio/wav": "wav",
     "audio/mpeg": "mp3",
