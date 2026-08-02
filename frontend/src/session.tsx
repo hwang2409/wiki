@@ -2145,6 +2145,7 @@ function resolveScrollAnchorTarget(
 export function SessionTab({
   ticket,
   subagent,
+  archivedAt,
   showComposer = true,
   onInspect,
   onArtifactsChange,
@@ -2154,6 +2155,7 @@ export function SessionTab({
 }: {
   ticket: string;
   subagent?: string;
+  archivedAt?: string;
   showComposer?: boolean;
   onInspect?: (agentId: string) => void;
   onArtifactsChange?: (events: SessionEvent[]) => void;
@@ -2161,7 +2163,7 @@ export function SessionTab({
   onOpenArtifact?: (event: SessionEvent) => void;
   stateKey?: string;
 }) {
-  const resetKey = `${ticket}:${subagent ?? ""}`;
+  const resetKey = `${ticket}:${subagent ?? ""}:${archivedAt ?? ""}`;
   const sessionStateKey = `${stateKey ?? resetKey}:${resetKey}`;
   const rowHeightsKeyRef = useRef(resetKey);
   const rowHeightsRef = useRef<Map<number, RowMeasurement>>(new Map());
@@ -2192,8 +2194,13 @@ export function SessionTab({
   }
 
   const target = useMemo(
-    () => (subagent ? { ticket, subagent } : { ticket }),
-    [subagent, ticket]
+    () =>
+      subagent
+        ? { ticket, subagent }
+        : archivedAt
+          ? { ticket, archivedAt }
+          : { ticket },
+    [archivedAt, subagent, ticket]
   );
   const visible = useElementVisible(containerRef);
   const { session, pendingUserMessages, error, loading } = useTranscriptSession(target, visible);
@@ -4010,6 +4017,12 @@ export type SidebarTarget = {
   model?: string | null;
   pr?: string | null;
   canReview?: boolean;
+  // WIKI-229: reserved for per-archive selection when a ticket has
+  // multiple archives. Threaded end-to-end (SidebarTarget → SessionTab →
+  // TranscriptTarget → getAgentSession → /session?archived_at=…) but not
+  // set in this PR — the backend route currently returns the newest
+  // archive regardless, and WIKI-229 delivers the discriminated route.
+  archivedAt?: string;
 };
 
 export function SessionSidebar({
@@ -4081,7 +4094,11 @@ export function SessionSidebar({
             <X size={14} />
           </button>
         </header>
-        <InspectableSessionTab showComposer={false} ticket={worker.ticket} />
+        <InspectableSessionTab
+          showComposer={false}
+          ticket={worker.ticket}
+          archivedAt={worker.archivedAt}
+        />
       </div>
     </aside>
   );

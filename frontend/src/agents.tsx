@@ -6,6 +6,7 @@ import {
   ChevronDown,
   ExternalLink,
   GitPullRequest,
+  MoreHorizontal,
   Plus,
   RefreshCw,
   ScrollText,
@@ -22,6 +23,7 @@ import {
   spawnAgentWorker,
 } from "./api";
 import type {
+  AccountEvent,
   AgentModelOption,
   AgentControlAction,
   AgentControlResult,
@@ -34,6 +36,7 @@ import type {
   SpawnWorkerRole,
 } from "./api";
 import { DisclosureContent } from "./disclosure";
+import { ROLE_PRESETS, defaultWorkerModel, modelsForKind, presetWorkerModel } from "./role-pipeline";
 import { externalLinkProps } from "./external-links";
 import { LoadingPlaceholder } from "./loading";
 import { ReplaceAgentModal, type ReplaceAgentTarget } from "./replace-agent-modal";
@@ -57,7 +60,7 @@ const STALE_SECONDS = 5 * 60;
 
 const SPAWN_TICKET_PATTERN = /^[A-Z][A-Z0-9]+-[0-9]+(?:-[A-Z0-9]+)*$/;
 const ORCH_ID_PATTERN = /^[A-Za-z0-9][A-Za-z0-9_-]*$/;
-const DEFAULT_WORKDIR = "/Users/henry/me/fun/wiki";
+export const DEFAULT_WORKDIR = "/Users/henry/me/fun/wiki";
 const REASONING_EFFORTS: SpawnWorkerEffort[] = ["minimal", "low", "medium", "high", "xhigh"];
 const DEAD_RUN_COPY = "adapter detached — archive to reset";
 
@@ -90,15 +93,6 @@ type OrchestratorSpawnNotice = {
 };
 
 type SpawnNotice = WorkerSpawnNotice | OrchestratorSpawnNotice;
-
-function modelsForKind(models: AgentModelOption[], kind: SpawnWorkerKind): AgentModelOption[] {
-  return models.filter((option) => option.kind === kind);
-}
-
-function defaultWorkerModel(models: AgentModelOption[], kind: SpawnWorkerKind): string {
-  const byKind = modelsForKind(models, kind);
-  return byKind.find((option) => option.default_worker)?.id ?? byKind[0]?.id ?? "";
-}
 
 function defaultOrchestratorModel(models: AgentModelOption[], kind: SpawnWorkerKind): string {
   const byKind = modelsForKind(models, kind);
@@ -143,6 +137,44 @@ function healthFlag(worker: AgentWorker): string | null {
   if ((worker.status_age_seconds ?? 0) > STALE_SECONDS && worker.state === "working")
     return "status stale >5m";
   if (!worker.state) return "not reporting yet";
+  return null;
+}
+
+// Friendly, task-facing provider names. The internal kind codes ("cc", "cdx")
+// stay in the API contract and appear in Technical details, but every
+// operator-facing surface uses the product names.
+function providerLabel(kind: string | null | undefined): string {
+  if (kind === "cc") return "Claude";
+  if (kind === "cdx") return "Codex";
+  return kind ?? "unknown";
+}
+
+// One state-specific primary action per card (WIKI-154 finding 3). Everything
+// else (Replace, other lifecycle controls, output preview) lives in the card
+// overflow menu. Card-body click always opens the session preview, so an
+// implicit "open session" primary is not surfaced as a button.
+//
+// Interrupt/Revive are TRANSPORT controls: they act on the live provider
+// adapter, so eligibility must key off runtime_state (what the adapter is
+// actually doing), never the manual worker.state (what the worker last
+// claimed in its status file). Confusing the two on Claude leads to hitting
+// Interrupt on an idle adapter and marking it interrupted for no reason.
+// Review is a TASK control (opens the PR review flow), so it correctly keys
+// off worker.state.
+type PrimaryActionKind = "archive-dead" | "interrupt" | "resume" | "review" | null;
+
+function primaryActionForWorker(worker: AgentWorker, deadRun: boolean): PrimaryActionKind {
+  if (deadRun) return "archive-dead";
+  if (worker.pr && worker.state === "merge-ready") return "review";
+  if (!worker.run_id) return null;
+  const runtime = worker.runtime_state;
+  const controlAttached = Boolean(worker.control_attached);
+  if (controlAttached && (runtime === "starting" || runtime === "working" || runtime === "waiting-approval")) {
+    return "interrupt";
+  }
+  if (!controlAttached && (runtime === "working" || runtime === "idle" || runtime === "blocked")) {
+    return "resume";
+  }
   return null;
 }
 
@@ -195,6 +227,7 @@ export function SpawnWorkerModal({
   const [submitting, setSubmitting] = useState(false);
   const [confirming, setConfirming] = useState(false);
   const [error, setError] = useState<string | null>(null);
+  const [advancedOpen, setAdvancedOpen] = useState(false);
 
   function requestClose() {
     if (submitting) return;
@@ -224,9 +257,22 @@ export function SpawnWorkerModal({
   useEffect(() => {
     const allowed = modelsForKind(models, kind);
     setModel((current) =>
-      allowed.some((option) => option.id === current) ? current : defaultWorkerModel(models, kind)
+      allowed.some((option) => option.id === current)
+        ? current
+        : presetWorkerModel(models, kind, role)
     );
+    // role is read for the preset fallback only; role changes apply their
+    // preset explicitly in the role <select> handler.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [kind, models]);
+
+  function applyRolePreset(nextRole: SpawnWorkerRole) {
+    const preset = ROLE_PRESETS[nextRole];
+    setRole(nextRole);
+    setKind(preset.kind);
+    setModel(presetWorkerModel(models, preset.kind, nextRole));
+    setEffort(preset.effort);
+  }
 
   useEffect(() => {
     if (orchestrators.length === 0) {
@@ -247,7 +293,6 @@ export function SpawnWorkerModal({
   const preludeTooLarge = prelude.length > 4096;
   const ticketValid = SPAWN_TICKET_PATTERN.test(normalizedTicket);
   const workdirValid = workdir.trim().length > 0;
-  const confirmLabel = `spawn ${kind} · ${model} · ${role} in ${workdir.trim()}?`;
   const canSubmit =
     ticketValid &&
     workdirValid &&
@@ -355,12 +400,13 @@ export function SpawnWorkerModal({
       <div className="settings-backdrop" onClick={requestClose} />
       <form
         aria-modal
+        aria-labelledby="spawn-worker-dialog-title"
         className="dialog agent-spawn-modal"
         role="dialog"
         onSubmit={submit}
       >
         <div className="settings-header">
-          <div className="dialog-title">Spawn worker</div>
+          <div className="dialog-title" id="spawn-worker-dialog-title">Spawn worker</div>
           <button
             aria-label="Close spawn dialog"
             className="session-close"
@@ -372,8 +418,9 @@ export function SpawnWorkerModal({
         </div>
 
         <div className="agent-spawn-fields">
+          {/* Lead: what task, and what the worker should do. */}
           <label className="agent-spawn-field">
-            <span className="agent-spawn-label">Ticket id</span>
+            <span className="agent-spawn-label">Ticket</span>
             <input
               required
               className="dialog-input"
@@ -388,108 +435,11 @@ export function SpawnWorkerModal({
             <span className="agent-spawn-hint">Uppercase letters, numbers, and dashes only.</span>
           </label>
 
-          <div className="agent-spawn-row">
-            <label className="agent-spawn-field">
-              <span className="agent-spawn-label">Kind</span>
-              <select
-                className="agent-spawn-select"
-                value={kind}
-                onChange={(event) => {
-                  resetConfirmation();
-                  setKind(event.target.value as SpawnWorkerKind);
-                }}
-              >
-                <option value="cdx">cdx</option>
-                <option value="cc">cc</option>
-              </select>
-            </label>
-
-            <label className="agent-spawn-field">
-              <span className="agent-spawn-label">Role</span>
-              <select
-                className="agent-spawn-select"
-                value={role}
-                onChange={(event) => {
-                  resetConfirmation();
-                  setRole(event.target.value as SpawnWorkerRole);
-                }}
-              >
-                <option value="plan">plan</option>
-                <option value="implement">implement</option>
-                <option value="review">review</option>
-              </select>
-            </label>
-          </div>
-
-          <div className="agent-spawn-row">
-            <label className="agent-spawn-field">
-              <span className="agent-spawn-label">Model</span>
-              <select
-                className="agent-spawn-select"
-                disabled={allowedModels.length === 0}
-                value={model}
-                onChange={(event) => {
-                  resetConfirmation();
-                  setModel(event.target.value);
-                }}
-              >
-                {allowedModels.length === 0 ? (
-                  <option value="">No models available</option>
-                ) : (
-                  allowedModels.map((option) => (
-                    <option key={option.id} value={option.id}>
-                      {option.label}
-                    </option>
-                  ))
-                )}
-              </select>
-            </label>
-
-            {kind === "cdx" ? (
-              <label className="agent-spawn-field">
-                <span className="agent-spawn-label">Reasoning effort</span>
-                <select
-                  className="agent-spawn-select"
-                  value={effort}
-                  onChange={(event) => {
-                    resetConfirmation();
-                    setEffort(event.target.value as SpawnWorkerEffort);
-                  }}
-                >
-                  {REASONING_EFFORTS.map((option) => (
-                    <option key={option} value={option}>
-                      {option}
-                    </option>
-                  ))}
-                </select>
-              </label>
-            ) : (
-              <div className="agent-spawn-field">
-                <span className="agent-spawn-label">Reasoning effort</span>
-                <div className="agent-spawn-static">Not used for Claude workers.</div>
-              </div>
-            )}
-          </div>
-
           <label className="agent-spawn-field">
-            <span className="agent-spawn-label">Working dir</span>
-            <input
-              required
-              className="dialog-input"
-              value={workdir}
-              onChange={(event) => {
-                resetConfirmation();
-                setWorkdir(event.target.value);
-                invalidatePrelude();
-              }}
-            />
-          </label>
-
-          <label className="agent-spawn-field">
-            <span className="agent-spawn-label">Ticket title</span>
+            <span className="agent-spawn-label">Title</span>
             <input
               className="dialog-input"
-              placeholder="Optional title or short description"
+              placeholder="Short description of the task"
               value={title}
               onChange={(event) => {
                 resetConfirmation();
@@ -497,25 +447,6 @@ export function SpawnWorkerModal({
                 invalidatePrelude();
               }}
             />
-          </label>
-
-          <label className="agent-spawn-field">
-            <span className="agent-spawn-label">Orchestrator id</span>
-            <select
-              className="agent-spawn-select"
-              value={orch}
-              onChange={(event) => {
-                resetConfirmation();
-                setOrch(event.target.value);
-              }}
-            >
-              {orchestrators.map((candidate) => (
-                <option key={candidate.id} value={candidate.id}>
-                  {candidate.id}
-                </option>
-              ))}
-              <option value="">{orchestrators.length > 0 ? "ungrouped" : "none"}</option>
-            </select>
           </label>
 
           <label className="agent-spawn-field">
@@ -532,51 +463,229 @@ export function SpawnWorkerModal({
               }}
             />
             <span className="agent-spawn-hint">
-              {promptTooLarge ? "Prompt must stay under 100KB." : `${promptBytes} bytes`}
+              {promptTooLarge
+                ? "Prompt must stay under 100KB."
+                : promptBytes >= 80_000
+                ? `${promptBytes} bytes · nearing the 100KB limit`
+                : ""}
             </span>
           </label>
 
-          <label className="agent-spawn-field">
-            <span className="agent-spawn-label">
-              <input
-                type="checkbox"
-                checked={contextEnabled}
-                onChange={(event) => {
-                  const enabled = event.target.checked;
-                  resetConfirmation();
-                  setContextEnabled(enabled);
-                  setPreludeReady(false);
-                  setPreludeError(null);
-                  setPreludeLoading(enabled);
-                  if (!enabled) setPrelude("");
-                }}
-              />{" "}
-              Add context prelude
-            </span>
-            <textarea
-              aria-label="Context prelude"
-              className="dialog-input agent-spawn-textarea agent-context-prelude"
-              placeholder="Enter a ticket and working dir to preview local context."
-              value={prelude}
-              disabled={!contextEnabled || preludeLoading}
-              onChange={(event) => {
-                resetConfirmation();
-                setPrelude(event.target.value);
-                setPreludeError(null);
-                setPreludeReady(true);
-              }}
-            />
-            <span className="agent-spawn-hint">
-              {!contextEnabled
-                ? "Optional. Enable to retrieve local context."
-                : preludeLoading
-                ? "Building deterministic local context…"
-                : preludeError ||
-                  (preludeTooLarge
-                    ? "Context prelude must stay within 4096 characters."
-                    : `${prelude.length} / 4096 characters · editable before send`)}
-            </span>
-          </label>
+          {/* Everything else is provider/model/context tuning. Hide by
+              default (WIKI-154 finding 4 — Advanced disclosure). The role
+              preset already applied sensible defaults on open. */}
+          <div className="agent-spawn-advanced">
+            <button
+              aria-controls="spawn-advanced-body"
+              aria-expanded={advancedOpen}
+              className="agent-spawn-advanced-toggle"
+              type="button"
+              onClick={() => setAdvancedOpen((value) => !value)}
+            >
+              <ChevronDown
+                className={`disclosure-chevron${advancedOpen ? "" : " is-collapsed"}`}
+                size={13}
+              />
+              Advanced
+              <span className="agent-spawn-advanced-summary">
+                {role} · {providerLabel(kind)} · {model || "default model"}
+                {kind === "cdx" ? ` · ${effort}` : ""}
+              </span>
+            </button>
+            <DisclosureContent open={advancedOpen}>
+              <div className="agent-spawn-advanced-body" id="spawn-advanced-body">
+                <div className="agent-spawn-row">
+                  <label className="agent-spawn-field">
+                    <span className="agent-spawn-label">Role</span>
+                    <select
+                      aria-label="Role"
+                      className="agent-spawn-select"
+                      value={role}
+                      onChange={(event) => {
+                        resetConfirmation();
+                        applyRolePreset(event.target.value as SpawnWorkerRole);
+                      }}
+                    >
+                      <option value="plan">plan</option>
+                      <option value="implement">implement</option>
+                      <option value="review">review</option>
+                    </select>
+                    <span className="agent-spawn-hint">
+                      Sets the pipeline default provider, model, and effort.
+                    </span>
+                  </label>
+
+                  <label className="agent-spawn-field">
+                    <span className="agent-spawn-label">Provider</span>
+                    <select
+                      aria-label="Provider"
+                      className="agent-spawn-select"
+                      value={kind}
+                      onChange={(event) => {
+                        resetConfirmation();
+                        setKind(event.target.value as SpawnWorkerKind);
+                      }}
+                    >
+                      <option value="cdx">Codex</option>
+                      <option value="cc">Claude</option>
+                    </select>
+                  </label>
+                </div>
+
+                <div className="agent-spawn-row">
+                  <label className="agent-spawn-field">
+                    <span className="agent-spawn-label">Model</span>
+                    <select
+                      aria-label="Model"
+                      className="agent-spawn-select"
+                      disabled={allowedModels.length === 0}
+                      value={model}
+                      onChange={(event) => {
+                        resetConfirmation();
+                        setModel(event.target.value);
+                      }}
+                    >
+                      {allowedModels.length === 0 ? (
+                        <option value="">No models available</option>
+                      ) : (
+                        allowedModels.map((option) => (
+                          <option key={option.id} value={option.id}>
+                            {option.label}
+                          </option>
+                        ))
+                      )}
+                    </select>
+                  </label>
+
+                  {kind === "cdx" ? (
+                    <label className="agent-spawn-field">
+                      <span className="agent-spawn-label">Reasoning effort</span>
+                      <select
+                        aria-label="Reasoning effort"
+                        className="agent-spawn-select"
+                        value={effort}
+                        onChange={(event) => {
+                          resetConfirmation();
+                          setEffort(event.target.value as SpawnWorkerEffort);
+                        }}
+                      >
+                        {REASONING_EFFORTS.map((option) => (
+                          <option key={option} value={option}>
+                            {option}
+                          </option>
+                        ))}
+                      </select>
+                    </label>
+                  ) : null}
+                </div>
+
+                <label className="agent-spawn-field">
+                  <span className="agent-spawn-label">Working dir</span>
+                  <input
+                    required
+                    className="dialog-input"
+                    value={workdir}
+                    onChange={(event) => {
+                      resetConfirmation();
+                      setWorkdir(event.target.value);
+                      invalidatePrelude();
+                    }}
+                  />
+                </label>
+
+                <label className="agent-spawn-field">
+                  <span className="agent-spawn-label">Orchestrator</span>
+                  <select
+                    aria-label="Orchestrator"
+                    className="agent-spawn-select"
+                    value={orch}
+                    onChange={(event) => {
+                      resetConfirmation();
+                      setOrch(event.target.value);
+                    }}
+                  >
+                    {orchestrators.map((candidate) => (
+                      <option key={candidate.id} value={candidate.id}>
+                        {candidate.id}
+                      </option>
+                    ))}
+                    <option value="">{orchestrators.length > 0 ? "ungrouped" : "none"}</option>
+                  </select>
+                </label>
+
+                <label className="agent-spawn-field">
+                  <span className="agent-spawn-label">
+                    <input
+                      type="checkbox"
+                      checked={contextEnabled}
+                      onChange={(event) => {
+                        const enabled = event.target.checked;
+                        resetConfirmation();
+                        setContextEnabled(enabled);
+                        setPreludeReady(false);
+                        setPreludeError(null);
+                        setPreludeLoading(enabled);
+                        if (!enabled) setPrelude("");
+                      }}
+                    />{" "}
+                    Add context prelude
+                  </span>
+                  <textarea
+                    aria-label="Context prelude"
+                    className="dialog-input agent-spawn-textarea agent-context-prelude"
+                    placeholder="Enter a ticket and working dir to preview local context."
+                    value={prelude}
+                    disabled={!contextEnabled || preludeLoading}
+                    onChange={(event) => {
+                      resetConfirmation();
+                      setPrelude(event.target.value);
+                      setPreludeError(null);
+                      setPreludeReady(true);
+                    }}
+                  />
+                  <span className="agent-spawn-hint">
+                    {!contextEnabled
+                      ? "Optional. Enable to retrieve local context."
+                      : preludeLoading
+                      ? "Building deterministic local context…"
+                      : preludeError ||
+                        (preludeTooLarge
+                          ? "Context prelude must stay within 4096 characters."
+                          : prelude.length > 3400
+                          ? `${prelude.length} / 4096 characters · nearing limit`
+                          : "editable before send")}
+                  </span>
+                </label>
+              </div>
+            </DisclosureContent>
+          </div>
+        </div>
+
+        <div className="agent-spawn-preview">
+          <div className="agent-spawn-preview-title">This will create</div>
+          <div className="agent-spawn-preview-primary">
+            <code>{normalizedTicket || "…"}</code> · {role} worker on{" "}
+            {providerLabel(kind)}
+          </div>
+          <div className="agent-spawn-preview-line">
+            {model || "default model"}
+            {kind === "cdx" ? ` · ${effort} reasoning effort` : ""}
+          </div>
+          <div className="agent-spawn-preview-line">
+            {orch ? (
+              <>
+                under orchestrator <code>{orch}</code>
+              </>
+            ) : (
+              "ungrouped — no orchestrator"
+            )}{" "}
+            · in <code>{workdir.trim() || "…"}</code>
+          </div>
+          {contextEnabled ? (
+            <div className="agent-spawn-preview-line">
+              context prelude enabled ({prelude.length} chars)
+            </div>
+          ) : null}
         </div>
 
         {!ticketValid && normalizedTicket ? (
@@ -591,7 +700,7 @@ export function SpawnWorkerModal({
             Cancel
           </button>
           <button className="dialog-button dialog-confirm" disabled={!canSubmit} type="submit">
-            {submitting ? "Spawning…" : confirming ? confirmLabel : "Spawn"}
+            {submitting ? "Spawning…" : confirming ? "Confirm spawn" : "Spawn"}
           </button>
         </div>
       </form>
@@ -599,17 +708,21 @@ export function SpawnWorkerModal({
   );
 }
 
-function SpawnOrchestratorModal({
+export function SpawnOrchestratorModal({
   models,
+  workspaceRoot,
+  workspaceRootReady = true,
   onClose,
   onSpawn,
 }: {
   models: AgentModelOption[];
+  workspaceRoot?: string | null;
+  workspaceRootReady?: boolean;
   onClose: () => void;
   onSpawn: (notice: OrchestratorSpawnNotice) => void;
 }) {
   const [id, setId] = useState("");
-  const [projectDir, setProjectDir] = useState("");
+  const [projectDir, setProjectDir] = useState(workspaceRoot?.trim() ?? "");
   const [kind, setKind] = useState<SpawnWorkerKind>("cc");
   const [model, setModel] = useState("");
   const [effort, setEffort] = useState<SpawnWorkerEffort>("high");
@@ -617,6 +730,14 @@ function SpawnOrchestratorModal({
   const [submitting, setSubmitting] = useState(false);
   const [confirming, setConfirming] = useState(false);
   const [error, setError] = useState<string | null>(null);
+  const [advancedOpen, setAdvancedOpen] = useState(false);
+  const projectDirTouched = useRef(false);
+  const workspaceRootProvided = workspaceRootReady && Boolean(workspaceRoot?.trim());
+
+  useEffect(() => {
+    if (projectDirTouched.current) return;
+    setProjectDir(workspaceRoot?.trim() ?? "");
+  }, [workspaceRoot]);
 
   function requestClose() {
     if (submitting) return;
@@ -649,8 +770,27 @@ function SpawnOrchestratorModal({
   const goalTooLarge = goalBytes >= 20_000;
   const idValid = ORCH_ID_PATTERN.test(normalizedId);
   const projectDirValid = projectDir.trim().length > 0;
-  const confirmLabel = `launch ${kind} · ${normalizedId} · ${model} in ${projectDir.trim()}?`;
   const canSubmit = idValid && projectDirValid && model.length > 0 && !goalTooLarge && !submitting;
+
+  const projectDirField = (
+    <label className="agent-spawn-field">
+      <span className="agent-spawn-label">Project directory</span>
+      <input
+        required
+        className="dialog-input"
+        placeholder="/tmp/project"
+        value={projectDir}
+        onChange={(event) => {
+          projectDirTouched.current = true;
+          resetConfirmation();
+          setProjectDir(event.target.value);
+        }}
+      />
+      {!workspaceRootProvided ? (
+        <span className="agent-spawn-hint">Choose the active workspace root before launching.</span>
+      ) : null}
+    </label>
+  );
 
   async function submit(event: FormEvent<HTMLFormElement>) {
     event.preventDefault();
@@ -691,12 +831,13 @@ function SpawnOrchestratorModal({
       <div className="settings-backdrop" onClick={requestClose} />
       <form
         aria-modal
+        aria-labelledby="spawn-orchestrator-dialog-title"
         className="dialog agent-spawn-modal"
         role="dialog"
         onSubmit={submit}
       >
         <div className="settings-header">
-          <div className="dialog-title">Spawn orchestrator</div>
+          <div className="dialog-title" id="spawn-orchestrator-dialog-title">Spawn orchestrator</div>
           <button
             aria-label="Close orchestrator dialog"
             className="session-close"
@@ -708,8 +849,11 @@ function SpawnOrchestratorModal({
         </div>
 
         <div className="agent-spawn-fields">
+          {/* Lead: who this orchestrator is and what it should do. Provider
+              tuning lives inside Advanced (WIKI-154 finding 4 → round-5
+              family sweep, orchestrator dialog). */}
           <label className="agent-spawn-field">
-            <span className="agent-spawn-label">Orchestrator id</span>
+            <span className="agent-spawn-label">Name</span>
             <input
               required
               className="dialog-input"
@@ -726,85 +870,6 @@ function SpawnOrchestratorModal({
           </label>
 
           <label className="agent-spawn-field">
-            <span className="agent-spawn-label">Project directory</span>
-            <input
-              required
-              className="dialog-input"
-              placeholder="/tmp/project"
-              value={projectDir}
-              onChange={(event) => {
-                resetConfirmation();
-                setProjectDir(event.target.value);
-              }}
-            />
-          </label>
-
-          <label className="agent-spawn-field">
-            <span className="agent-spawn-label">Kind</span>
-            <select
-              className="agent-spawn-select"
-              value={kind}
-              onChange={(event) => {
-                resetConfirmation();
-                setKind(event.target.value as SpawnWorkerKind);
-              }}
-            >
-              <option value="cc">cc</option>
-              <option value="cdx">cdx</option>
-            </select>
-          </label>
-
-          <div className="agent-spawn-row">
-            <label className="agent-spawn-field">
-              <span className="agent-spawn-label">Model</span>
-              <select
-                className="agent-spawn-select"
-                disabled={allowedModels.length === 0}
-                value={model}
-                onChange={(event) => {
-                  resetConfirmation();
-                  setModel(event.target.value);
-                }}
-              >
-                {allowedModels.length === 0 ? (
-                  <option value="">No models available</option>
-                ) : (
-                  allowedModels.map((option) => (
-                    <option key={option.id} value={option.id}>
-                      {option.label}
-                    </option>
-                  ))
-                )}
-              </select>
-            </label>
-
-            {kind === "cdx" ? (
-              <label className="agent-spawn-field">
-                <span className="agent-spawn-label">Reasoning effort</span>
-                <select
-                  className="agent-spawn-select"
-                  value={effort}
-                  onChange={(event) => {
-                    resetConfirmation();
-                    setEffort(event.target.value as SpawnWorkerEffort);
-                  }}
-                >
-                  {REASONING_EFFORTS.map((option) => (
-                    <option key={option} value={option}>
-                      {option}
-                    </option>
-                  ))}
-                </select>
-              </label>
-            ) : (
-              <div className="agent-spawn-field">
-                <span className="agent-spawn-label">Reasoning effort</span>
-                <div className="agent-spawn-static">Not used for Claude orchestrators.</div>
-              </div>
-            )}
-          </div>
-
-          <label className="agent-spawn-field">
             <span className="agent-spawn-label">Initial goal</span>
             <textarea
               className="dialog-input agent-spawn-textarea"
@@ -816,9 +881,122 @@ function SpawnOrchestratorModal({
               }}
             />
             <span className="agent-spawn-hint">
-              {goalTooLarge ? "Goal must stay under 20KB." : `${goalBytes} bytes`}
+              {goalTooLarge
+                ? "Goal must stay under 20KB."
+                : goalBytes >= 16_000
+                ? `${goalBytes} bytes · nearing the 20KB limit`
+                : ""}
             </span>
           </label>
+
+          {!workspaceRootProvided ? projectDirField : null}
+
+          <div className="agent-spawn-advanced">
+            <button
+              aria-controls="spawn-orch-advanced-body"
+              aria-expanded={advancedOpen}
+              className="agent-spawn-advanced-toggle"
+              type="button"
+              onClick={() => setAdvancedOpen((value) => !value)}
+            >
+              <ChevronDown
+                className={`disclosure-chevron${advancedOpen ? "" : " is-collapsed"}`}
+                size={13}
+              />
+              Advanced
+              <span className="agent-spawn-advanced-summary">
+                {providerLabel(kind)} · {model || "default model"}
+                {kind === "cdx" ? ` · ${effort}` : ""}
+              </span>
+            </button>
+            <DisclosureContent open={advancedOpen}>
+              <div className="agent-spawn-advanced-body" id="spawn-orch-advanced-body">
+                {workspaceRootProvided ? projectDirField : null}
+
+                <label className="agent-spawn-field">
+                  <span className="agent-spawn-label">Provider</span>
+                  <select
+                    aria-label="Provider"
+                    className="agent-spawn-select"
+                    value={kind}
+                    onChange={(event) => {
+                      resetConfirmation();
+                      setKind(event.target.value as SpawnWorkerKind);
+                    }}
+                  >
+                    <option value="cc">Claude</option>
+                    <option value="cdx">Codex</option>
+                  </select>
+                </label>
+
+                <div className="agent-spawn-row">
+                  <label className="agent-spawn-field">
+                    <span className="agent-spawn-label">Model</span>
+                    <select
+                      aria-label="Model"
+                      className="agent-spawn-select"
+                      disabled={allowedModels.length === 0}
+                      value={model}
+                      onChange={(event) => {
+                        resetConfirmation();
+                        setModel(event.target.value);
+                      }}
+                    >
+                      {allowedModels.length === 0 ? (
+                        <option value="">No models available</option>
+                      ) : (
+                        allowedModels.map((option) => (
+                          <option key={option.id} value={option.id}>
+                            {option.label}
+                          </option>
+                        ))
+                      )}
+                    </select>
+                  </label>
+
+                  {kind === "cdx" ? (
+                    <label className="agent-spawn-field">
+                      <span className="agent-spawn-label">Reasoning effort</span>
+                      <select
+                        aria-label="Reasoning effort"
+                        className="agent-spawn-select"
+                        value={effort}
+                        onChange={(event) => {
+                          resetConfirmation();
+                          setEffort(event.target.value as SpawnWorkerEffort);
+                        }}
+                      >
+                        {REASONING_EFFORTS.map((option) => (
+                          <option key={option} value={option}>
+                            {option}
+                          </option>
+                        ))}
+                      </select>
+                    </label>
+                  ) : null}
+                </div>
+              </div>
+            </DisclosureContent>
+          </div>
+        </div>
+
+        <div className="agent-spawn-preview">
+          <div className="agent-spawn-preview-title">This will create</div>
+          <div className="agent-spawn-preview-primary">
+            <code>{normalizedId || "…"}</code> · orchestrator on {providerLabel(kind)}
+          </div>
+          <div className="agent-spawn-preview-line">
+            {model || "default model"}
+            {kind === "cdx" ? ` · ${effort} reasoning effort` : ""}
+          </div>
+          <div className="agent-spawn-preview-line">
+            in <code>{projectDir.trim() || "…"}</code>
+          </div>
+          <div className="agent-spawn-preview-line">
+            {goal.trim().length > 0
+              ? `initial goal ${goalBytes} bytes`
+              : "no initial goal — reports ready and waits"}
+          </div>
         </div>
 
         {!idValid && normalizedId ? (
@@ -834,7 +1012,7 @@ function SpawnOrchestratorModal({
             Cancel
           </button>
           <button className="dialog-button dialog-confirm" disabled={!canSubmit} type="submit">
-            {submitting ? "Launching…" : confirming ? confirmLabel : "Launch"}
+            {submitting ? "Launching…" : confirming ? "Confirm launch" : "Launch"}
           </button>
         </div>
       </form>
@@ -842,78 +1020,60 @@ function SpawnOrchestratorModal({
   );
 }
 
-export type AccountEvent =
-  | {
-      type: "codex_rotation";
-      from: string | null;
-      to: string;
-      revived: string[];
-      failed: string[];
-      failed_reasons?: Record<string, string>;
-      ts: string;
-    }
-  | {
-      type: "codex_limit_no_eligible";
-      tickets: string[];
-      reset_at: string | null;
-      ts: string;
-    }
-  | {
-      type: "codex_rotation_failed";
-      error: string;
-      ts: string;
-    }
-  | {
-      type: "codex_auth_dead_revival";
-      revived: string[];
-      failed: string[];
-      failed_reasons?: Record<string, string>;
-      ts: string;
-    }
-  | {
-      type: "codex_auth_dead_exhausted";
-      tickets: string[];
-      ts: string;
-    }
-  | {
-      type: "claude_limit_hit";
-      ticket: string;
-      window: string;
-      ts: string;
-    };
+export type { AccountEvent } from "./api";
 
-function failedReasonsSuffix(reasons?: Record<string, string>): string {
-  if (!reasons) return "";
-  const entries = Object.entries(reasons);
-  if (entries.length === 0) return "";
-  return ` — ${entries.map(([ticket, reason]) => `${ticket}: ${reason}`).join("; ")}`;
+function countWorkers(count: number): string {
+  return `${count} worker${count === 1 ? "" : "s"}`;
 }
 
-function accountBannerLine(event: AccountEvent): string {
+// Impact-first copy: what happened to the fleet, then the next action.
+function accountBannerCopy(event: AccountEvent): { impact: string; action: string | null } {
   switch (event.type) {
     case "codex_rotation": {
       const from = event.from ? event.from : "(unset)";
-      const revived = event.revived.length;
       const failed = event.failed.length;
-      const tail = failed > 0 ? `, ${failed} failed to revive` : "";
-      return `rotated codex account ${from} → ${event.to}, revived ${revived} worker${revived === 1 ? "" : "s"}${tail}${failedReasonsSuffix(event.failed_reasons)}`;
+      return {
+        impact: `Codex account switched ${from} → ${event.to}; ${countWorkers(event.revived.length)} resumed automatically.`,
+        action:
+          failed > 0
+            ? `${countWorkers(failed)} did not resume — revive or replace them from their cards.`
+            : null,
+      };
     }
     case "codex_limit_no_eligible":
-      return event.reset_at
-        ? `codex usage limit hit, no eligible account until ${event.reset_at}`
-        : "codex usage limit hit, no eligible account";
+      return {
+        impact: `Codex usage limit reached on every account — ${event.tickets.length > 0 ? `${event.tickets.join(", ")} are` : "Codex workers are"} paused.`,
+        action: event.reset_at
+          ? `When the limit resets at ${event.reset_at}, revive these workers. To keep moving now, replace them with Claude workers.`
+          : "Revive these workers after the limit resets, or replace them with Claude workers.",
+      };
     case "codex_rotation_failed":
-      return `codex rotation failed: ${event.error}`;
+      return {
+        impact: "Codex account rotation failed — paused Codex workers stay paused.",
+        action: "Fix Codex auth, then revive workers from their cards.",
+      };
     case "codex_auth_dead_revival": {
-      const revived = event.revived.length;
       const failed = event.failed.length;
-      const tail = failed > 0 ? `, ${failed} failed` : "";
-      return `codex auth-dead: revived ${revived} worker${revived === 1 ? "" : "s"}${tail}${failedReasonsSuffix(event.failed_reasons)}`;
+      return {
+        impact: `Codex sign-in recovered; ${countWorkers(event.revived.length)} restarted.`,
+        action:
+          failed > 0
+            ? `${countWorkers(failed)} did not restart — replace them from their cards.`
+            : null,
+      };
     }
     case "codex_auth_dead_exhausted":
-      return `codex auth-dead: revival cap hit on ${event.tickets.join(", ")} — manual attention needed`;
+      return {
+        impact: `Codex sign-in is dead and automatic restarts ran out for ${event.tickets.join(", ")}.`,
+        action: "Sign in to Codex again, then replace these workers.",
+      };
     case "claude_limit_hit":
-      return `claude usage limit hit on ${event.ticket}`;
+      // A confirmed successful Claude turn clears this notice for the same
+      // run. Replacement remains the continue-now option.
+      return {
+        impact: `Claude usage limit hit — ${event.ticket} is paused.`,
+        action: "Retry after the limit resets; the next successful turn clears this notice. To continue now, replace it with a Codex worker.",
+      };
   }
 }
 
@@ -926,43 +1086,125 @@ function bannerTone(event: AccountEvent): "info" | "warn" | "danger" {
   return "danger";
 }
 
+function TechDetails({ rows }: { rows: Array<[string, ReactNode] | null | false> }) {
+  const visible = rows.filter(Boolean) as Array<[string, ReactNode]>;
+  if (visible.length === 0) {
+    return <div className="agent-tech-empty">No technical details recorded.</div>;
+  }
+  return (
+    <dl className="agent-tech">
+      {visible.map(([term, value]) => (
+        <div className="agent-tech-row" key={term}>
+          <dt>{term}</dt>
+          <dd>{value}</dd>
+        </div>
+      ))}
+    </dl>
+  );
+}
+
+// Raw diagnostics (backend exception text, per-worker failure reasons) stay
+// out of the default banner and render only inside the details disclosure.
+function bannerDiagnostics(event: AccountEvent): string[] {
+  const lines: string[] = [];
+  if (event.type === "codex_rotation_failed" && event.error) {
+    lines.push(event.error);
+  }
+  if (event.type === "codex_rotation" || event.type === "codex_auth_dead_revival") {
+    const reasons = event.failed_reasons ?? {};
+    for (const ticket of event.failed) {
+      lines.push(reasons[ticket] ? `${ticket}: ${reasons[ticket]}` : ticket);
+    }
+  }
+  return lines;
+}
+
 function AccountEventsBanner({ events }: { events: AccountEvent[] }) {
+  const [openDiagnostics, setOpenDiagnostics] = useState<Set<string>>(new Set());
   if (events.length === 0) return null;
   return (
     <div aria-live="polite" className="agents-account-banner">
-      {events.map((event, index) => (
-        <div className={`agents-account-banner-row is-${bannerTone(event)}`} key={`${event.ts}-${index}`}>
-          <AlertTriangle size={13} />
-          <span>{accountBannerLine(event)}</span>
-        </div>
-      ))}
+      {events.map((event, index) => {
+        const copy = accountBannerCopy(event);
+        const diagnostics = bannerDiagnostics(event);
+        const key = `${event.ts}-${event.type}-${index}`;
+        const open = openDiagnostics.has(key);
+        return (
+          <div
+            className={`agents-account-banner-row is-${bannerTone(event)}`}
+            key={key}
+          >
+            <AlertTriangle size={13} />
+            <span className="agents-account-banner-copy">
+              <span className="agents-account-banner-impact">{copy.impact}</span>
+              {copy.action ? (
+                <span className="agents-account-banner-action">{copy.action}</span>
+              ) : null}
+              {diagnostics.length > 0 ? (
+                <>
+                  <button
+                    aria-expanded={open}
+                    className="agents-account-banner-details-toggle"
+                    type="button"
+                    onClick={() =>
+                      setOpenDiagnostics((prev) => {
+                        const next = new Set(prev);
+                        if (next.has(key)) next.delete(key);
+                        else next.add(key);
+                        return next;
+                      })
+                    }
+                  >
+                    <ChevronDown
+                      className={`disclosure-chevron${open ? "" : " is-collapsed"}`}
+                      size={12}
+                    />
+                    Technical details
+                  </button>
+                  <DisclosureContent open={open}>
+                    <ul className="agents-account-banner-diagnostics">
+                      {diagnostics.map((line, lineIndex) => (
+                        <li key={lineIndex}>{line}</li>
+                      ))}
+                    </ul>
+                  </DisclosureContent>
+                </>
+              ) : null}
+            </span>
+          </div>
+        );
+      })}
     </div>
   );
 }
 
 export function AgentsView({
   data,
+  workspaceRoot,
+  workspaceRootReady = true,
   onOpenAgent,
   refreshTick,
   openTicket,
   onOpenTicket,
-  accountEvents = [],
 }: {
   data?: {
     workers: AgentWorker[] | null;
     orchestrators: Orchestrator[];
     archived: ArchivedWorker[];
     error: string | null;
+    account_notices?: AccountEvent[];
   };
+  workspaceRoot?: string | null;
+  workspaceRootReady?: boolean;
   onOpenAgent: (ticket: string, panel?: "review") => void;
   refreshTick: number;
   openTicket: string | null;
   onOpenTicket: (ticket: string | null) => void;
-  accountEvents?: AccountEvent[];
 }) {
   const [fetchedWorkers, setFetchedWorkers] = useState<AgentWorker[] | null>(null);
   const [fetchedOrchestrators, setFetchedOrchestrators] = useState<Orchestrator[]>([]);
   const [fetchedArchived, setFetchedArchived] = useState<ArchivedWorker[]>([]);
+  const [fetchedNotices, setFetchedNotices] = useState<AccountEvent[]>([]);
   const [fetchedError, setFetchedError] = useState<string | null>(null);
   const [availableModels, setAvailableModels] = useState<AgentModelOption[]>([]);
   const [modelsError, setModelsError] = useState<string | null>(null);
@@ -985,10 +1227,48 @@ export function AgentsView({
     orchestrators: Orchestrator[];
     archived: ArchivedWorker[];
     error: string | null;
+    account_notices?: AccountEvent[];
   } | null>(null);
   const [expandedScreencasts, setExpandedScreencasts] = useState<Set<string>>(
     readStoredExpandedScreencasts
   );
+  const [expandedDetails, setExpandedDetails] = useState<Set<string>>(new Set());
+  const [openMenuTicket, setOpenMenuTicket] = useState<string | null>(null);
+  // Per-archive selection is WIKI-229: the backend session route currently
+  // prefers a live run for the same ticket and consults a ticket-only
+  // transcript-path cache before the archived_at hint, so promising a
+  // specific archive here would be a false affordance. The stable
+  // (ticket, archived_at) identifier still rides through SidebarTarget →
+  // SessionTab → getAgentSession → /session?archived_at=… so WIKI-229 can
+  // switch on it once the route is discriminated; until then history rows
+  // open the ticket's transcript view (as they did pre-WIKI-154).
+
+  useEffect(() => {
+    if (openMenuTicket === null) return;
+    function onDown(event: MouseEvent) {
+      const target = event.target as HTMLElement | null;
+      if (target && target.closest(`[data-agent-menu-for="${openMenuTicket}"]`)) return;
+      setOpenMenuTicket(null);
+    }
+    function onKey(event: KeyboardEvent) {
+      if (event.key === "Escape") setOpenMenuTicket(null);
+    }
+    window.addEventListener("mousedown", onDown);
+    window.addEventListener("keydown", onKey);
+    return () => {
+      window.removeEventListener("mousedown", onDown);
+      window.removeEventListener("keydown", onKey);
+    };
+  }, [openMenuTicket]);
+
+  function toggleDetails(id: string) {
+    setExpandedDetails((prev) => {
+      const next = new Set(prev);
+      if (next.has(id)) next.delete(id);
+      else next.add(id);
+      return next;
+    });
+  }
 
   useEffect(() => {
     localStorage.setItem(SCREENCAST_EXPANDED_KEY, JSON.stringify([...expandedScreencasts]));
@@ -1012,6 +1292,7 @@ export function AgentsView({
           setFetchedWorkers(result.workers);
           setFetchedOrchestrators(result.orchestrators ?? []);
           setFetchedArchived(result.archived ?? []);
+          setFetchedNotices(result.account_notices ?? []);
           setFetchedError(null);
         }
       })
@@ -1051,6 +1332,8 @@ export function AgentsView({
   const workers = overrideData?.workers ?? data?.workers ?? fetchedWorkers;
   const orchestrators = overrideData?.orchestrators ?? data?.orchestrators ?? fetchedOrchestrators;
   const archived = overrideData?.archived ?? data?.archived ?? fetchedArchived;
+  const accountNotices =
+    overrideData?.account_notices ?? data?.account_notices ?? fetchedNotices;
   const error = overrideData?.error ?? data?.error ?? fetchedError;
 
   useEffect(() => {
@@ -1071,6 +1354,10 @@ export function AgentsView({
   const openOrch = orchestrators.find((orch) => orch.id === openTicket);
   const liveWorkers = workers ?? [];
   const liveWorker = liveWorkers.find((worker) => worker.ticket === openTicket) ?? null;
+  // Per-archive selection lands with WIKI-229 (the backend route currently
+  // wins on any live run and consults a ticket-only transcript cache
+  // before archived_at). Until then a history click resolves to the first
+  // (newest) archive for the ticket — same behavior as before this PR.
   const archivedWorker = archived.find((entry) => entry.ticket === openTicket) ?? null;
   const openWorker: SidebarTarget | null = liveWorker
     ? {
@@ -1154,6 +1441,7 @@ export function AgentsView({
         workers: result.workers,
         orchestrators: result.orchestrators ?? [],
         archived: result.archived ?? [],
+        account_notices: result.account_notices ?? [],
         error: null,
       });
     } catch (err) {
@@ -1258,14 +1546,500 @@ export function AgentsView({
     );
   }
 
+  function renderHistoryRow(entry: ArchivedWorker) {
+    // History rows are a QUIET outcome/date summary (WIKI-154 finding 3 →
+    // round-5 family sweep). Ticket + outcome badge + archived age +
+    // "View transcript" are the only default surface. Kind/role/model/step
+    // and every technical field live behind the details disclosure.
+    //
+    // Selecting a specific archive for a ticket with multiple entries is
+    // WIKI-229. Until the backend route is discriminated, all history rows
+    // for the same ticket open the same transcript (the newest, as this
+    // PR does), so per-row selection is deliberately not surfaced here.
+    const key = `${entry.ticket}-${entry.archived_at}`;
+    const isOpen = openTicket === entry.ticket;
+    const detailsOpen = expandedDetails.has(key);
+    return (
+      <article
+        className={`agent-card is-archived${isOpen ? " is-selected" : ""}`}
+        key={key}
+        onClick={(event) => {
+          const target = event.target as HTMLElement;
+          if (target.closest("button, a, .agent-tech")) return;
+          onOpenTicket(isOpen ? null : entry.ticket);
+        }}
+      >
+        <header className="agent-card-header">
+          <a
+            className="agent-ticket"
+            href={`https://linear.app/phoebework/issue/${entry.ticket}`}
+            {...externalLinkProps(`https://linear.app/phoebework/issue/${entry.ticket}`)}
+          >
+            {entry.ticket}
+          </a>
+          {entry.outcome ? (
+            <StatusBadge label={entry.outcome} state={`outcome-${entry.outcome}`} />
+          ) : entry.state ? (
+            <StatusBadge label={entry.state} state={entry.state} />
+          ) : null}
+          <span className="agent-age tabular-nums">{archivedAge(entry.archived_at)}</span>
+        </header>
+        <div className="agent-meta">
+          <span className="agent-actions">
+            <button
+              className="agent-primary-action"
+              type="button"
+              onClick={() => onOpenTicket(isOpen ? null : entry.ticket)}
+            >
+              <ScrollText size={13} />
+              View transcript
+            </button>
+            <button
+              aria-expanded={detailsOpen}
+              className={`agent-log-toggle${detailsOpen ? " is-active" : ""}`}
+              type="button"
+              onClick={() => toggleDetails(key)}
+            >
+              <ChevronDown
+                className={`disclosure-chevron${detailsOpen ? "" : " is-collapsed"}`}
+                size={13}
+              />
+              details
+            </button>
+          </span>
+        </div>
+        <DisclosureContent open={detailsOpen}>
+          <TechDetails
+            rows={[
+              entry.kind ? ["provider", `${providerLabel(entry.kind)} (${entry.kind})`] : null,
+              entry.role ? ["role", entry.role] : null,
+              entry.model ? ["model", entry.model] : null,
+              entry.pr ? ["PR", entry.pr] : null,
+              entry.step ? ["last step", entry.step] : null,
+              entry.archived_at ? ["archived at", entry.archived_at] : null,
+            ]}
+          />
+        </DisclosureContent>
+      </article>
+    );
+  }
+
+  function renderOrchGroup(orch: Orchestrator, owned: AgentWorker[]) {
+    // Orchestrator row applies the same acceptance rules as the worker card
+    // (WIKI-154 finding 3 → round-5 family sweep): id + state + age +
+    // one state-specific primary action + Technical details disclosure +
+    // overflow menu for Replace/lifecycle secondary actions. Raw kind /
+    // model / cwd all live under Technical details.
+    const deadRun = isDeadRun(orch);
+    const headlessRun = Boolean(orch.run_id);
+    const menuOpen = openMenuTicket === orch.id;
+    const detailsOpen = expandedDetails.has(orch.id);
+    const runtime = orch.runtime_state;
+    const controlAttached = Boolean(orch.control_attached);
+    const canInterrupt =
+      headlessRun &&
+      controlAttached &&
+      (runtime === "starting" || runtime === "working" || runtime === "waiting-approval");
+    const canResume =
+      headlessRun &&
+      !controlAttached &&
+      (runtime === "working" || runtime === "idle" || runtime === "blocked");
+    const canComplete =
+      headlessRun && controlAttached && (runtime === "idle" || runtime === "interrupted");
+    const terminal = runtime === "dead" || runtime === "completed";
+    const replaceDisabled = !headlessRun;
+    const replaceTarget: ReplaceAgentTarget = {
+      id: orch.id,
+      kind: orch.kind === "cdx" ? "cdx" : "cc",
+      model: orch.model ?? "",
+      effort: orch.effort,
+      role: "orchestrator",
+    };
+    // Primary: dead → Archive; attached working/starting/waiting → Interrupt;
+    // detached working/idle/blocked → Revive; otherwise none (session is
+    // implicitly primary via the row/click chain).
+    let primary: "archive-dead" | "interrupt" | "resume" | null = null;
+    if (deadRun) primary = "archive-dead";
+    else if (canInterrupt) primary = "interrupt";
+    else if (canResume) primary = "resume";
+    const menuItems: Array<{
+      key: string;
+      label: string;
+      disabled?: boolean;
+      title?: string;
+      run: () => void;
+    }> = [];
+    if (canInterrupt && primary !== "interrupt") {
+      menuItems.push({
+        key: "interrupt",
+        label: "Interrupt",
+        run: () => void requestControl(orch.id, "interrupt", false),
+      });
+    }
+    if (canResume && primary !== "resume") {
+      menuItems.push({
+        key: "resume",
+        label: "Revive",
+        run: () => void requestControl(orch.id, "resume", false),
+      });
+    }
+    if (canComplete) {
+      const key = `${orch.id}:archive`;
+      const confirming = controlConfirm === key;
+      menuItems.push({
+        key: "complete",
+        label: confirming ? "Confirm complete" : "Complete",
+        run: () => void requestControl(orch.id, "archive", true),
+      });
+    }
+    if (!terminal) {
+      const key = `${orch.id}:stop`;
+      const confirming = controlConfirm === key;
+      menuItems.push({
+        key: "stop",
+        label: confirming ? "Confirm stop" : "Stop",
+        disabled: !headlessRun,
+        title: !headlessRun
+          ? "Legacy tmux runs must be migrated before Stop is available"
+          : undefined,
+        run: () => {
+          if (!headlessRun) return;
+          void requestControl(orch.id, "stop", true);
+        },
+      });
+    }
+    menuItems.push({
+      key: "replace",
+      label: "Replace",
+      disabled: replaceDisabled,
+      title: replaceDisabled
+        ? headlessRun
+          ? "Registered runtime is not live"
+          : "Legacy tmux runs must be migrated before Replace is available"
+        : "Stop this run and spawn a replacement",
+      run: () => {
+        if (replaceDisabled) return;
+        setReplaceNotice(null);
+        setReplaceTarget(replaceTarget);
+      },
+    });
+
+    function renderOrchPrimary(): ReactNode {
+      if (primary === "archive-dead") return <DeadRunAffordance id={orch.id} />;
+      if (primary === "interrupt") {
+        const pending = controlPending === `${orch.id}:interrupt`;
+        return (
+          <button
+            className="agent-primary-action"
+            disabled={Boolean(controlPending)}
+            type="button"
+            onClick={() => void requestControl(orch.id, "interrupt", false)}
+          >
+            {pending ? "Interrupting…" : "Interrupt"}
+          </button>
+        );
+      }
+      if (primary === "resume") {
+        const pending = controlPending === `${orch.id}:resume`;
+        return (
+          <button
+            className="agent-primary-action"
+            disabled={Boolean(controlPending)}
+            type="button"
+            onClick={() => void requestControl(orch.id, "resume", false)}
+          >
+            {pending ? "Reviving…" : "Revive"}
+          </button>
+        );
+      }
+      return null;
+    }
+
+    return (
+      <div className="agents-orch-group" key={orch.id}>
+        <div className="agents-orch-head">
+          <Bot size={13} />
+          <span className="agents-orch-id">{orch.id}</span>
+          {orch.run_id && !deadRun ? (
+            <StatusBadge
+              label={stateValueLabel(orch.runtime_state)}
+              state={orch.runtime_state ?? "unknown"}
+            />
+          ) : null}
+          <span className="agents-orch-actions">
+            {renderOrchPrimary()}
+            <button
+              className={`agent-log-toggle${openTicket === orch.id ? " is-active" : ""}`}
+              type="button"
+              onClick={() => onOpenTicket(openTicket === orch.id ? null : orch.id)}
+            >
+              <ScrollText size={13} />
+              session
+            </button>
+            <button
+              aria-expanded={detailsOpen}
+              className={`agent-log-toggle${detailsOpen ? " is-active" : ""}`}
+              type="button"
+              onClick={() => toggleDetails(orch.id)}
+            >
+              <ChevronDown
+                className={`disclosure-chevron${detailsOpen ? "" : " is-collapsed"}`}
+                size={13}
+              />
+              details
+            </button>
+            {menuItems.length > 0 ? (
+              <span className="agent-card-menu" data-agent-menu-for={orch.id}>
+                <button
+                  aria-expanded={menuOpen}
+                  aria-haspopup="menu"
+                  aria-label={`More actions for ${orch.id}`}
+                  className="agent-log-toggle agent-card-menu-toggle"
+                  type="button"
+                  onClick={() => setOpenMenuTicket(menuOpen ? null : orch.id)}
+                >
+                  <MoreHorizontal size={13} />
+                </button>
+                {menuOpen ? (
+                  <div className="agent-card-menu-popover" role="menu">
+                    {menuItems.map((item) => {
+                      const reasonId = item.disabled ? `agent-menu-${orch.id}-${item.key}-reason` : undefined;
+                      return (
+                        <span key={item.key}>
+                          {item.disabled && item.title ? (
+                            <span className="sr-only" id={reasonId}>
+                              {item.title}
+                            </span>
+                          ) : null}
+                          <button
+                            aria-describedby={reasonId}
+                            aria-disabled={item.disabled ? "true" : undefined}
+                            className="agent-card-menu-item"
+                            key={item.key}
+                            role="menuitem"
+                            title={item.title}
+                            type="button"
+                            onClick={() => {
+                              if (item.disabled) return;
+                              setOpenMenuTicket(null);
+                              item.run();
+                            }}
+                          >
+                            {item.label}
+                          </button>
+                        </span>
+                      );
+                    })}
+                  </div>
+                ) : null}
+              </span>
+            ) : null}
+          </span>
+        </div>
+        <DisclosureContent open={detailsOpen}>
+          <TechDetails
+            rows={[
+              orch.kind ? ["provider", `${providerLabel(orch.kind)} (${orch.kind})`] : null,
+              orch.model ? ["model", orch.model] : null,
+              orch.effort ? ["effort", orch.effort] : null,
+              orch.cwd ? ["project dir", orch.cwd] : null,
+              orch.run_id
+                ? [
+                    "run",
+                    `${orch.run_id} · ${orch.runtime_state ?? "unknown"} · control ${orch.control_attached ? "attached" : "detached"}`,
+                  ]
+                : null,
+              orch.window
+                ? ["tmux", `${orch.window}${orch.window_alive ? "" : " · window gone"}`]
+                : null,
+              orch.log ? ["log", orch.log] : null,
+            ]}
+          />
+        </DisclosureContent>
+        {archiveErrors[orch.id] ? (
+          <div className="agent-inline-error">{archiveErrors[orch.id]}</div>
+        ) : null}
+        {owned.map(renderWorker)}
+        {owned.length === 0 ? (
+          <div className="agents-orch-empty">no registered workers</div>
+        ) : null}
+      </div>
+    );
+  }
+
   function renderWorker(worker: AgentWorker) {
     const deadRun = isDeadRun(worker);
     const flag = healthFlag(worker);
     const state = stateLabel(worker);
     const isOpen = openTicket === worker.ticket;
     const previewOpen = expandedScreencasts.has(worker.ticket);
+    const detailsOpen = expandedDetails.has(worker.ticket);
+    const menuOpen = openMenuTicket === worker.ticket;
+    const replaceTargetForCard: ReplaceAgentTarget = {
+      id: worker.ticket,
+      kind: worker.kind === "cdx" ? "cdx" : "cc",
+      model: worker.model ?? "",
+      effort: worker.effort,
+      role: worker.role,
+    };
+    const headlessRun = Boolean(worker.run_id);
+    const replaceDisabled = !headlessRun;
+    // Same runtime_state vs state split as primaryActionForWorker: transport
+    // controls key off runtime_state; every other menu entry (Complete /
+    // Stop / Replace / Review) keys off whichever field is semantically
+    // correct for that action.
+    const runtime = worker.runtime_state;
+    const controlAttached = Boolean(worker.control_attached);
+    const primary = primaryActionForWorker(worker, deadRun);
+    const canInterrupt =
+      headlessRun &&
+      controlAttached &&
+      (runtime === "starting" ||
+        runtime === "working" ||
+        runtime === "waiting-approval");
+    const canResume =
+      headlessRun &&
+      !controlAttached &&
+      (runtime === "working" || runtime === "idle" || runtime === "blocked");
+    const canComplete =
+      headlessRun && controlAttached && (runtime === "idle" || runtime === "interrupted");
+    const terminal = runtime === "dead" || runtime === "completed";
+    // Menu items = every applicable lifecycle action MINUS whichever action is
+    // already surfaced as the card's primary button. Destructive actions
+    // (Complete, Stop, Replace) always live in the menu.
+    const menuItems: Array<{
+      key: string;
+      label: string;
+      disabled?: boolean;
+      title?: string;
+      run: () => void;
+    }> = [];
+    if (canInterrupt && primary !== "interrupt") {
+      menuItems.push({
+        key: "interrupt",
+        label: "Interrupt",
+        run: () => void requestControl(worker.ticket, "interrupt", false),
+      });
+    }
+    if (canResume && primary !== "resume") {
+      menuItems.push({
+        key: "resume",
+        label: "Revive",
+        run: () => void requestControl(worker.ticket, "resume", false),
+      });
+    }
+    if (canComplete) {
+      const key = `${worker.ticket}:archive`;
+      const confirming = controlConfirm === key;
+      menuItems.push({
+        key: "complete",
+        label: confirming ? "Confirm complete" : "Complete",
+        run: () => void requestControl(worker.ticket, "archive", true),
+      });
+    }
+    if (!terminal) {
+      const key = `${worker.ticket}:stop`;
+      const confirming = controlConfirm === key;
+      menuItems.push({
+        key: "stop",
+        label: confirming ? "Confirm stop" : "Stop",
+        disabled: !headlessRun,
+        title: !headlessRun
+          ? "Legacy tmux runs must be migrated before Stop is available"
+          : undefined,
+        run: () => {
+          if (!headlessRun) return;
+          void requestControl(worker.ticket, "stop", true);
+        },
+      });
+    }
+    menuItems.push({
+      key: "replace",
+      label: "Replace",
+      disabled: replaceDisabled,
+      title: replaceDisabled
+        ? headlessRun
+          ? "Registered runtime is not live"
+          : "Legacy tmux runs must be migrated before Replace is available"
+        : "Stop this run and spawn a replacement",
+      run: () => {
+        if (replaceDisabled) return;
+        setReplaceNotice(null);
+        setReplaceTarget(replaceTargetForCard);
+      },
+    });
+    // Only add Review PR to the menu when Review is not already the primary
+    // action — otherwise the same action would appear twice.
+    if (worker.pr && primary !== "review") {
+      menuItems.push({
+        key: "review",
+        label: "Review PR",
+        run: () => onOpenAgent(worker.ticket, "review"),
+      });
+    }
+
+    function renderPrimary(): ReactNode {
+      if (primary === "archive-dead") {
+        return <DeadRunAffordance id={worker.ticket} />;
+      }
+      if (primary === "interrupt") {
+        const key = `${worker.ticket}:interrupt`;
+        const pending = controlPending === key;
+        return (
+          <button
+            className="agent-primary-action"
+            disabled={Boolean(controlPending)}
+            type="button"
+            onClick={() => void requestControl(worker.ticket, "interrupt", false)}
+          >
+            {pending ? "Interrupting…" : "Interrupt"}
+          </button>
+        );
+      }
+      if (primary === "resume") {
+        const key = `${worker.ticket}:resume`;
+        const pending = controlPending === key;
+        return (
+          <button
+            className="agent-primary-action"
+            disabled={Boolean(controlPending)}
+            type="button"
+            onClick={() => void requestControl(worker.ticket, "resume", false)}
+          >
+            {pending ? "Reviving…" : "Revive"}
+          </button>
+        );
+      }
+      if (primary === "review") {
+        return (
+          <button
+            className="agent-primary-action"
+            type="button"
+            onClick={() => onOpenAgent(worker.ticket, "review")}
+          >
+            <GitPullRequest size={12} />
+            Review
+          </button>
+        );
+      }
+      return null;
+    }
+
     return (
-      <article className={`agent-card${isOpen ? " is-selected" : ""}`} key={worker.ticket}>
+      <article
+        className={`agent-card${isOpen ? " is-selected" : ""}`}
+        key={worker.ticket}
+        onClick={(event) => {
+          const target = event.target as HTMLElement;
+          if (
+            target.closest(
+              "button, a, input, textarea, select, .agent-screencast, .agent-tech, .agent-card-menu"
+            )
+          )
+            return;
+          onOpenTicket(isOpen ? null : worker.ticket);
+        }}
+      >
         <header className="agent-card-header">
           <a
             className="agent-ticket"
@@ -1274,12 +2048,7 @@ export function AgentsView({
           >
             {worker.ticket}
           </a>
-          {worker.kind ? <StatusBadge compact label={worker.kind} state="neutral" /> : null}
-          {worker.role ? <StatusBadge compact label={worker.role} state="neutral" /> : null}
-          {worker.model ? <StatusBadge compact label={worker.model} state="faint" /> : null}
-          {deadRun ? (
-            <DeadRunAffordance id={worker.ticket} />
-          ) : (
+          {deadRun ? null : (
             <StatusBadge label={state} state={worker.state ?? "unknown"} />
           )}
           <span className="agent-age tabular-nums">{ageLabel(worker.status_age_seconds)}</span>
@@ -1303,73 +2072,15 @@ export function AgentsView({
         ) : null}
 
         <div className="agent-meta">
-          {worker.window ? (
-            <span className={`agent-window${worker.window_alive ? "" : " is-dead"}`}>
-              tmux {worker.window}
-            </span>
-          ) : null}
-          {worker.run_id ? (
-            <span className={`agent-window${worker.control_attached ? "" : " is-dead"}`}>
-              run {worker.run_id.slice(0, 8)} · {worker.runtime_state ?? "unknown"}
-            </span>
-          ) : null}
-          {worker.session && worker.history.length > 0 ? (
-            <span className="agent-chain">
-              session {worker.session} · prev:{" "}
-              {worker.history
-                .map((s) => `${s.role ?? "?"} (${s.kind ?? "?"}, ${s.outcome ?? "?"})`)
-                .join(" → ")}
-            </span>
-          ) : null}
-          {worker.worktree ? (
-            <BranchPill
-              branch={worker.worktree.split("/").slice(-1)[0] ?? worker.worktree}
-              title={worker.worktree}
-            />
-          ) : null}
-          {worker.pr ? (
-            <a className="agent-pr" href={worker.pr} {...externalLinkProps(worker.pr)}>
-              <ExternalLink size={11} />
-              PR
-            </a>
-          ) : null}
-          {worker.pr ? (
-            <button
-              className="agent-pr"
-              type="button"
-              onClick={() => {
-                onOpenAgent(worker.ticket, "review");
-              }}
-            >
-              <GitPullRequest size={11} />
-              Review
-            </button>
-          ) : null}
           <span className="agent-actions">
-            {worker.run_id && !deadRun ? (
-              <LifecycleControls
-                id={worker.ticket}
-                state={worker.runtime_state ?? worker.state}
-                controlAttached={Boolean(worker.control_attached)}
-              />
-            ) : null}
-            <ReplaceButton
-              target={{
-                id: worker.ticket,
-                kind: worker.kind === "cdx" ? "cdx" : "cc",
-                model: worker.model ?? "",
-                effort: worker.effort,
-                role: worker.role,
-              }}
-              disabled={!worker.run_id && (!worker.window || !worker.window_alive)}
-            />
+            {renderPrimary()}
             <button
               className={`agent-log-toggle${isOpen ? " is-active" : ""}`}
               type="button"
               onClick={() => onOpenTicket(isOpen ? null : worker.ticket)}
             >
               <ScrollText size={13} />
-              log
+              session
             </button>
             {worker.run_id ? (
               <button
@@ -1385,8 +2096,106 @@ export function AgentsView({
                 output
               </button>
             ) : null}
+            <button
+              aria-expanded={detailsOpen}
+              className={`agent-log-toggle${detailsOpen ? " is-active" : ""}`}
+              type="button"
+              onClick={() => toggleDetails(worker.ticket)}
+            >
+              <ChevronDown
+                className={`disclosure-chevron${detailsOpen ? "" : " is-collapsed"}`}
+                size={13}
+              />
+              details
+            </button>
+            {menuItems.length > 0 ? (
+              <span className="agent-card-menu" data-agent-menu-for={worker.ticket}>
+                <button
+                  aria-expanded={menuOpen}
+                  aria-haspopup="menu"
+                  aria-label={`More actions for ${worker.ticket}`}
+                  className="agent-log-toggle agent-card-menu-toggle"
+                  type="button"
+                  onClick={() =>
+                    setOpenMenuTicket(menuOpen ? null : worker.ticket)
+                  }
+                >
+                  <MoreHorizontal size={13} />
+                </button>
+                {menuOpen ? (
+                  <div className="agent-card-menu-popover" role="menu">
+                    {menuItems.map((item) => {
+                      const reasonId = item.disabled ? `agent-menu-${worker.ticket}-${item.key}-reason` : undefined;
+                      return (
+                        <span key={item.key}>
+                          {item.disabled && item.title ? (
+                            <span className="sr-only" id={reasonId}>
+                              {item.title}
+                            </span>
+                          ) : null}
+                          <button
+                            aria-describedby={reasonId}
+                            aria-disabled={item.disabled ? "true" : undefined}
+                            className="agent-card-menu-item"
+                            key={item.key}
+                            role="menuitem"
+                            title={item.title}
+                            type="button"
+                            onClick={() => {
+                              if (item.disabled) return;
+                              setOpenMenuTicket(null);
+                              item.run();
+                            }}
+                          >
+                            {item.label}
+                          </button>
+                        </span>
+                      );
+                    })}
+                  </div>
+                ) : null}
+              </span>
+            ) : null}
           </span>
         </div>
+
+        <DisclosureContent open={detailsOpen}>
+          <TechDetails
+            rows={[
+              worker.kind ? ["provider", `${providerLabel(worker.kind)} (${worker.kind})`] : null,
+              worker.role ? ["role", worker.role] : null,
+              worker.model ? ["model", worker.model] : null,
+              worker.pr ? ["PR", worker.pr] : null,
+              worker.worktree
+                ? [
+                    "branch",
+                    worker.worktree.split("/").slice(-1)[0] ?? worker.worktree,
+                  ]
+                : null,
+              worker.run_id
+                ? [
+                    "run",
+                    `${worker.run_id} · ${worker.runtime_state ?? "unknown"} · control ${worker.control_attached ? "attached" : "detached"}`,
+                  ]
+                : null,
+              worker.window
+                ? ["tmux", `${worker.window}${worker.window_alive ? "" : " · window gone"}`]
+                : null,
+              worker.session !== null
+                ? [
+                    "session",
+                    worker.history.length > 0
+                      ? `${worker.session} · prev: ${worker.history
+                          .map((s) => `${s.role ?? "?"} (${s.kind ?? "?"}, ${s.outcome ?? "?"})`)
+                          .join(" → ")}`
+                      : `${worker.session}`,
+                  ]
+                : null,
+              worker.worktree ? ["worktree", worker.worktree] : null,
+              worker.log ? ["log", worker.log] : null,
+            ]}
+          />
+        </DisclosureContent>
 
         {worker.run_id ? (
           <DisclosureContent open={previewOpen}>
@@ -1416,138 +2225,30 @@ export function AgentsView({
       </div>
     );
   } else {
+    const activeCount = orchestrators.length + liveWorkers.length;
     body = (
       <>
-        {grouped.map(({ orch, owned }) => {
-          const deadRun = isDeadRun(orch);
-          return (
-            <div className="agents-orch-group" key={orch.id}>
-              <div className="agents-orch-head">
-                <Bot size={13} />
-                <span className="agents-orch-id">{orch.id}</span>
-                {orch.kind ? <StatusBadge compact label={orch.kind} state="neutral" /> : null}
-                {orch.model ? <StatusBadge compact label={orch.model} state="faint" /> : null}
-                {orch.cwd ? (
-                  <span className="agents-orch-cwd">{orch.cwd.split("/").slice(-1)[0]}</span>
-                ) : null}
-                {orch.run_id ? (
-                  deadRun ? (
-                    <DeadRunAffordance id={orch.id} />
-                  ) : (
-                    <StatusBadge
-                      label={stateValueLabel(orch.runtime_state)}
-                      state={orch.runtime_state ?? "unknown"}
-                    />
-                  )
-                ) : null}
-                {orch.run_id ? (
-                  <span className={`agent-window${orch.control_attached ? "" : " is-dead"}`}>
-                    run {orch.run_id.slice(0, 8)} · {orch.runtime_state ?? "unknown"}
-                  </span>
-                ) : null}
-                {orch.window && !orch.window_alive ? (
-                  <span className="agents-orch-dead">window gone</span>
-                ) : null}
-                <span className="agents-orch-actions">
-                  {orch.run_id && !deadRun ? (
-                    <LifecycleControls
-                      id={orch.id}
-                      state={orch.runtime_state}
-                      controlAttached={Boolean(orch.control_attached)}
-                    />
-                  ) : null}
-                  <ReplaceButton
-                    target={{
-                      id: orch.id,
-                      kind: orch.kind ?? "cc",
-                      model: orch.model ?? "",
-                      effort: orch.effort,
-                      role: "orchestrator",
-                    }}
-                    disabled={!orch.run_id && (!orch.window || !orch.window_alive)}
-                  />
-                  <button
-                    className={`agent-log-toggle${openTicket === orch.id ? " is-active" : ""}`}
-                    type="button"
-                    onClick={() => onOpenTicket(openTicket === orch.id ? null : orch.id)}
-                  >
-                    <ScrollText size={13} />
-                    log
-                  </button>
-                </span>
-              </div>
-              {archiveErrors[orch.id] ? (
-                <div className="agent-inline-error">{archiveErrors[orch.id]}</div>
-              ) : null}
-            {owned.map(renderWorker)}
-            {owned.length === 0 ? (
-              <div className="agents-orch-empty">no registered workers</div>
-            ) : null}
-            </div>
-          );
-        })}
+        {activeCount > 0 ? (
+          <div className="agents-section-head is-primary" data-testid="agents-section-active">
+            <span className="agents-section-title">Active</span>
+            <span className="agents-section-count tabular-nums">{activeCount}</span>
+          </div>
+        ) : null}
+        {grouped.map(({ orch, owned }) => renderOrchGroup(orch, owned))}
 
         {ungrouped.length > 0 && grouped.length > 0 ? (
-          <div className="agents-section-head">workers</div>
+          <div className="agents-section-head">unassigned workers</div>
         ) : null}
         {ungrouped.map(renderWorker)}
 
         {archived.length > 0 ? (
           <>
-            <div className="agents-section-head">
+            <div className="agents-section-head is-primary" data-testid="agents-section-history">
               <Archive size={13} />
-              archived
+              <span className="agents-section-title">History</span>
+              <span className="agents-section-count tabular-nums">{archived.length}</span>
             </div>
-            {archived.map((entry) => {
-              const key = `${entry.ticket}-${entry.archived_at}`;
-              const isOpen = openTicket === entry.ticket;
-              return (
-                <article
-                  className={`agent-card is-archived${isOpen ? " is-selected" : ""}`}
-                  key={key}
-                >
-                  <header className="agent-card-header">
-                    <a
-                      className="agent-ticket"
-                      href={`https://linear.app/phoebework/issue/${entry.ticket}`}
-                      {...externalLinkProps(`https://linear.app/phoebework/issue/${entry.ticket}`)}
-                    >
-                      {entry.ticket}
-                    </a>
-                    {entry.kind ? <StatusBadge compact label={entry.kind} state="neutral" /> : null}
-                    {entry.role ? <StatusBadge compact label={entry.role} state="neutral" /> : null}
-                    {entry.model ? <StatusBadge compact label={entry.model} state="faint" /> : null}
-                    {entry.outcome ? (
-                      <StatusBadge label={entry.outcome} state={`outcome-${entry.outcome}`} />
-                    ) : entry.state ? (
-                      <StatusBadge label={entry.state} state={entry.state} />
-                    ) : null}
-                    <span className="agent-age tabular-nums">{archivedAge(entry.archived_at)}</span>
-                  </header>
-                  <div className="agent-meta">
-                    {entry.step ? <span className="agent-chain">{entry.step}</span> : null}
-                    {entry.pr ? (
-                      <a
-                        className="agent-pr"
-                        href={entry.pr}
-                        {...externalLinkProps(entry.pr)}
-                      >
-                        <ExternalLink size={11} />
-                        PR
-                      </a>
-                    ) : null}
-                    <button
-                      className={`agent-log-toggle${isOpen ? " is-active" : ""}`}
-                      type="button"
-                      onClick={() => onOpenTicket(isOpen ? null : entry.ticket)}
-                    >
-                      <ScrollText size={13} />
-                      log
-                    </button>
-                  </div>
-                </article>
-              );
-            })}
+            {archived.map(renderHistoryRow)}
           </>
         ) : null}
       </>
@@ -1560,10 +2261,11 @@ export function AgentsView({
       <div className="agents-view">
         <div className="agents-toolbar">
           <div>
-            <div className="agents-toolbar-title">Workers</div>
+            <div className="agents-toolbar-title">Runs</div>
             <div className="agents-toolbar-meta">
               {orchestrators.length} orchestrator{orchestrators.length === 1 ? "" : "s"} ·{" "}
-              {liveWorkers.length} live worker{liveWorkers.length === 1 ? "" : "s"}
+              {liveWorkers.length} live worker{liveWorkers.length === 1 ? "" : "s"} ·{" "}
+              {archived.length} in history
             </div>
           </div>
           <div className="dialog-actions">
@@ -1593,7 +2295,7 @@ export function AgentsView({
             </button>
           </div>
         </div>
-        <AccountEventsBanner events={accountEvents} />
+        <AccountEventsBanner events={accountNotices} />
         {spawnNotice ? (
           spawnNotice.kind === "worker" ? (
             <div className="agents-notice">
@@ -1668,6 +2370,8 @@ export function AgentsView({
       {spawnOrchestratorOpen ? (
         <SpawnOrchestratorModal
           models={availableModels}
+          workspaceRoot={workspaceRoot}
+          workspaceRootReady={workspaceRootReady}
           onClose={() => setSpawnOrchestratorOpen(false)}
           onSpawn={(notice) => {
             setSpawnNotice(notice);

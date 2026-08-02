@@ -1,12 +1,20 @@
 import { useEffect, useState, type FormEvent } from "react";
-import { RefreshCw, X } from "lucide-react";
+import { ChevronDown, RefreshCw, X } from "lucide-react";
 import { getAgentModels, replaceAgent } from "./api";
+import { DisclosureContent } from "./disclosure";
+import { isWorkerRole, presetWorkerModel } from "./role-pipeline";
 import type {
   AgentModelOption,
   ReplaceAgentResult,
   SpawnWorkerEffort,
   SpawnWorkerKind,
 } from "./api";
+
+function providerLabel(kind: SpawnWorkerKind | null | undefined): string {
+  if (kind === "cc") return "Claude";
+  if (kind === "cdx") return "Codex";
+  return "unknown";
+}
 
 const REASONING_EFFORTS: SpawnWorkerEffort[] = ["minimal", "low", "medium", "high", "xhigh"];
 
@@ -23,6 +31,7 @@ function defaultModel(
   kind: SpawnWorkerKind,
   role: string | null | undefined,
 ) {
+  if (isWorkerRole(role)) return presetWorkerModel(models, kind, role);
   const byKind = models.filter((option) => option.kind === kind);
   const field = role === "orchestrator" ? "default_orchestrator" : "default_worker";
   return byKind.find((option) => option[field])?.id ?? byKind[0]?.id ?? "";
@@ -45,6 +54,7 @@ export function ReplaceAgentModal({
   const [effort, setEffort] = useState<SpawnWorkerEffort>(target.effort ?? "high");
   const [submitting, setSubmitting] = useState(false);
   const [error, setError] = useState<string | null>(null);
+  const [advancedOpen, setAdvancedOpen] = useState(false);
 
   useEffect(() => {
     if (models) {
@@ -136,60 +146,101 @@ export function ReplaceAgentModal({
         </div>
 
         <div className="agent-spawn-fields">
-          <div className="agent-spawn-field">
-            <span className="agent-spawn-label">Provider kind</span>
-            <div aria-label="Provider kind" className="agent-kind-toggle" role="group">
-              {(["cc", "cdx"] as const).map((option) => (
-                <button
-                  aria-pressed={kind === option}
-                  className={kind === option ? "is-active" : ""}
-                  key={option}
-                  type="button"
-                  onClick={() => selectKind(option)}
-                >
-                  <span>{option}</span>
-                  <small>{option === "cc" ? "Claude" : "Codex"}</small>
-                </button>
-              ))}
+          {/* Default view leads with the task and the change preview. Provider /
+              model / effort tuning lives inside Advanced. */}
+          <div className="agent-spawn-preview">
+            <div className="agent-spawn-preview-title">Change</div>
+            <div className="agent-spawn-preview-primary">
+              <code>
+                {providerLabel(target.kind)} · {target.model || "unknown"}
+                {target.kind === "cdx" && target.effort ? ` · ${target.effort}` : ""}
+              </code>
+              <span className="agent-replace-arrow" aria-hidden="true">
+                {" → "}
+              </span>
+              <code>
+                {providerLabel(kind)} · {model || "…"}
+                {kind === "cdx" ? ` · ${effort}` : ""}
+              </code>
             </div>
           </div>
 
-          <label className="agent-spawn-field">
-            <span className="agent-spawn-label">Model</span>
-            <select
-              aria-label="Model"
-              className="agent-spawn-select"
-              disabled={filteredModels.length === 0 || submitting}
-              value={model}
-              onChange={(event) => setModel(event.target.value)}
+          <div className="agent-spawn-advanced">
+            <button
+              aria-controls="replace-advanced-body"
+              aria-expanded={advancedOpen}
+              className="agent-spawn-advanced-toggle"
+              type="button"
+              onClick={() => setAdvancedOpen((value) => !value)}
             >
-              {filteredModels.length === 0 ? <option value="">Loading models</option> : null}
-              {filteredModels.map((option) => (
-                <option key={option.id} value={option.id}>
-                  {option.label} · {option.id}
-                </option>
-              ))}
-            </select>
-          </label>
+              <ChevronDown
+                className={`disclosure-chevron${advancedOpen ? "" : " is-collapsed"}`}
+                size={13}
+              />
+              Advanced
+              <span className="agent-spawn-advanced-summary">
+                {providerLabel(kind)} · {model || "default model"}
+                {kind === "cdx" ? ` · ${effort}` : ""}
+              </span>
+            </button>
+            <DisclosureContent open={advancedOpen}>
+              <div className="agent-spawn-advanced-body" id="replace-advanced-body">
+                <div className="agent-spawn-field">
+                  <span className="agent-spawn-label">Provider</span>
+                  <div aria-label="Provider" className="agent-kind-toggle" role="group">
+                    {(["cc", "cdx"] as const).map((option) => (
+                      <button
+                        aria-pressed={kind === option}
+                        className={kind === option ? "is-active" : ""}
+                        key={option}
+                        type="button"
+                        onClick={() => selectKind(option)}
+                      >
+                        <span>{providerLabel(option)}</span>
+                      </button>
+                    ))}
+                  </div>
+                </div>
 
-          {kind === "cdx" ? (
-            <label className="agent-spawn-field">
-              <span className="agent-spawn-label">Reasoning effort</span>
-              <select
-                aria-label="Reasoning effort"
-                className="agent-spawn-select"
-                disabled={submitting}
-                value={effort}
-                onChange={(event) => setEffort(event.target.value as SpawnWorkerEffort)}
-              >
-                {REASONING_EFFORTS.map((option) => (
-                  <option key={option} value={option}>
-                    {option}
-                  </option>
-                ))}
-              </select>
-            </label>
-          ) : null}
+                <label className="agent-spawn-field">
+                  <span className="agent-spawn-label">Model</span>
+                  <select
+                    aria-label="Model"
+                    className="agent-spawn-select"
+                    disabled={filteredModels.length === 0 || submitting}
+                    value={model}
+                    onChange={(event) => setModel(event.target.value)}
+                  >
+                    {filteredModels.length === 0 ? <option value="">Loading models</option> : null}
+                    {filteredModels.map((option) => (
+                      <option key={option.id} value={option.id}>
+                        {option.label}
+                      </option>
+                    ))}
+                  </select>
+                </label>
+
+                {kind === "cdx" ? (
+                  <label className="agent-spawn-field">
+                    <span className="agent-spawn-label">Reasoning effort</span>
+                    <select
+                      aria-label="Reasoning effort"
+                      className="agent-spawn-select"
+                      disabled={submitting}
+                      value={effort}
+                      onChange={(event) => setEffort(event.target.value as SpawnWorkerEffort)}
+                    >
+                      {REASONING_EFFORTS.map((option) => (
+                        <option key={option} value={option}>
+                          {option}
+                        </option>
+                      ))}
+                    </select>
+                  </label>
+                ) : null}
+              </div>
+            </DisclosureContent>
+          </div>
         </div>
 
         <div className="agent-replace-warning">

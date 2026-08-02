@@ -83,6 +83,7 @@ import {
 import { SettingsModal, applyStoredFonts } from "./settings";
 import { ActivityFeed } from "./activity";
 import { AgentsSidebar, AgentsView, type AccountEvent } from "./agents";
+import { isAgentRefreshEvent, isAgentTopologyEvent } from "./agent-events";
 import {
   AgentSessionView,
   clearSurfacePaneState,
@@ -202,6 +203,7 @@ type AgentsSnapshot = {
   orchestrators: Orchestrator[];
   archived: ArchivedWorker[];
   error: string | null;
+  account_notices?: AccountEvent[];
 };
 
 type FleetItem = {
@@ -1330,6 +1332,7 @@ export default function App() {
   const [settingsOpen, setSettingsOpen] = useState(false);
   const [ribbonMoreOpen, setRibbonMoreOpen] = useState(false);
   const [workspaceDiscoveryError, setWorkspaceDiscoveryError] = useState<string | null>(null);
+  const [workspaceDiscoveryReady, setWorkspaceDiscoveryReady] = useState(false);
 
   useEffect(() => {
     applyStoredFonts();
@@ -1359,13 +1362,12 @@ export default function App() {
     error: null,
   });
   const [refreshTick, setRefreshTick] = useState(0);
-  // WIKI-151: dedicated nonce for the file-explorer retry. Bumping the shared
-  // refreshTick to re-run the file effect also re-triggers workspace
-  // discovery, agent listing, note listing, etc., and (per round-2 review)
-  // caused Retry to issue TWO /api/files/tree requests instead of one. This
-  // nonce is only in the file-loading effect's dep list, so a retry is
-  // strictly scoped to the file fetch.
+  // WIKI-151: dedicated nonce for the file-explorer retry. This keeps a file
+  // retry scoped to its fetch instead of changing unrelated refresh state.
   const [filesRetryNonce, setFilesRetryNonce] = useState(0);
+  // Workspace discovery has its own trigger. Background SSE refreshes must
+  // not clear a verified root while a new discovery request is pending.
+  const [workspaceDiscoveryNonce, setWorkspaceDiscoveryNonce] = useState(0);
   // WIKI-157 (round-2 BLOCKING#1): drive HealthView's loading/error/retry
   // from the same boot state so it never renders "empty vault" during boot
   // or hides a boot failure behind an empty list.
@@ -1404,6 +1406,7 @@ export default function App() {
   const closedTicketsRef = useRef<Set<string>>(new Set());
   const filesRequestTrackerRef = useRef(new WorkspaceRequestTracker());
   const workspaceRefreshVersionRef = useRef(0);
+  const workspaceDiscoveryStartedRef = useRef(false);
 
   function nextPaneId() {
     paneIdRef.current += 1;
@@ -1449,7 +1452,6 @@ export default function App() {
     };
   }, [contextMenu]);
 
-  const [accountEvents, setAccountEvents] = useState<AccountEvent[]>([]);
   const sessionRefreshTimeoutRef = useRef<number | null>(null);
   useEffect(() => {
     const source = new EventSource("/api/events");
@@ -1471,27 +1473,15 @@ export default function App() {
           }
           return;
         }
-        if (
-          payload.type === "vault" ||
-          payload.type === "agents" ||
-          payload.type === "codex_rotation" ||
-          payload.type === "codex_limit_no_eligible" ||
-          payload.type === "codex_rotation_failed" ||
-          payload.type === "codex_auth_dead_revival" ||
-          payload.type === "codex_auth_dead_exhausted" ||
-          payload.type === "claude_limit_hit"
-        ) {
+        if (isAgentTopologyEvent(payload.type)) {
+          setWorkspaceDiscoveryNonce((nonce) => nonce + 1);
           setRefreshTick((tick) => tick + 1);
+          return;
         }
-        if (
-          payload.type === "codex_rotation" ||
-          payload.type === "codex_limit_no_eligible" ||
-          payload.type === "codex_rotation_failed" ||
-          payload.type === "codex_auth_dead_revival" ||
-          payload.type === "codex_auth_dead_exhausted" ||
-          payload.type === "claude_limit_hit"
-        ) {
-          setAccountEvents((prior) => [payload as AccountEvent, ...prior].slice(0, 4));
+        // Account events refresh /api/agents; the durable notice list rides
+        // in that payload, so no in-memory event accumulation here.
+        if (isAgentRefreshEvent(payload.type)) {
+          setRefreshTick((tick) => tick + 1);
         }
       } catch {
         /* ignore malformed frames */
@@ -1531,8 +1521,15 @@ export default function App() {
   }, [activeWorkspace]);
 
   useEffect(() => {
-    if (!shouldDiscoverWorkspaces(sidebarTab, switcherOpen)) return;
+    if (!shouldDiscoverWorkspaces(sidebarTab, switcherOpen, mode === "agents")) {
+      return;
+    }
     let ignore = false;
+    const backgroundRefresh = workspaceDiscoveryStartedRef.current;
+    workspaceDiscoveryStartedRef.current = true;
+    if (!backgroundRefresh) {
+      setWorkspaceDiscoveryReady(false);
+    }
     listWorkspaces()
       .then((result) => {
         if (ignore) return;
@@ -1540,9 +1537,15 @@ export default function App() {
         filesRequestTrackerRef.current.invalidate();
         setWorkspaces(result.workspaces);
         setWorkspaceDiscoveryError(null);
-        setActiveWorkspace((current) =>
-          reconcileWorkspaceState(result.workspaces, current, {}).activeWorkspace
+        const reconciled = reconcileWorkspaceState(result.workspaces, activeWorkspace, {});
+        const activeWorkspaceIsLive = result.workspaces.some(
+          (workspace) =>
+            workspace.id === reconciled.activeWorkspace &&
+            workspace.live &&
+            Boolean(workspace.root),
         );
+        setWorkspaceDiscoveryReady(activeWorkspaceIsLive);
+        setActiveWorkspace(reconciled.activeWorkspace);
         setFilesByWorkspace((current) =>
           reconcileWorkspaceState(result.workspaces, "wiki", current).cache
         );
@@ -1558,11 +1561,14 @@ export default function App() {
             ? error.message
             : "Could not reach workspace discovery.";
         setWorkspaceDiscoveryError(message);
+        if (!backgroundRefresh) {
+          setWorkspaceDiscoveryReady(false);
+        }
       });
     return () => {
       ignore = true;
     };
-  }, [refreshTick, sidebarTab, switcherOpen]);
+  }, [workspaceDiscoveryNonce, sidebarTab, switcherOpen, mode, activeWorkspace]);
 
   useEffect(() => {
     localStorage.setItem(
@@ -1587,6 +1593,7 @@ export default function App() {
           workers: result.workers,
           orchestrators: result.orchestrators ?? [],
           archived: result.archived ?? [],
+          account_notices: result.account_notices ?? [],
           error: null,
         });
       })
@@ -1672,6 +1679,7 @@ export default function App() {
   const filesTruncated = activeFileState?.truncated ?? false;
   const filesError = activeFileState?.error ?? null;
   const workspaceUnavailable = !activeWorkspaceInfo || !activeWorkspaceInfo.live;
+  const spawnWorkspaceRoot = workspaceDiscoveryReady ? activeWorkspaceInfo?.root || null : null;
   const retryFiles = () => {
     if (!activeFileCacheKey) return;
     workspaceRefreshVersionRef.current += 1;
@@ -3508,8 +3516,9 @@ export default function App() {
     if (mode === "agents") {
       return (
         <AgentsView
-          accountEvents={accountEvents}
           data={agentsState}
+          workspaceRoot={spawnWorkspaceRoot}
+          workspaceRootReady={workspaceDiscoveryReady}
           onOpenAgent={openAgent}
           onOpenTicket={setAgentsOpenTicket}
           openTicket={agentsOpenTicket}
@@ -3869,7 +3878,7 @@ export default function App() {
                   onClick={() => {
                     setWorkspaceDiscoveryError(null);
                     workspaceRefreshVersionRef.current += 1;
-                    setRefreshTick((tick) => tick + 1);
+                    setWorkspaceDiscoveryNonce((nonce) => nonce + 1);
                   }}
                 >
                   <RefreshCw size={12} />
@@ -4112,6 +4121,8 @@ export default function App() {
               ) : mode === "agents" ? (
                 <AgentsView
                   data={agentsState}
+                  workspaceRoot={spawnWorkspaceRoot}
+                  workspaceRootReady={workspaceDiscoveryReady}
                   onOpenAgent={openAgent}
                   refreshTick={refreshTick}
                   openTicket={agentsOpenTicket}

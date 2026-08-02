@@ -215,11 +215,59 @@ export type Orchestrator = {
   log?: string | null;
 };
 
+export type AccountEvent =
+  | {
+      type: "codex_rotation";
+      from: string | null;
+      to: string;
+      revived: string[];
+      failed: string[];
+      failed_reasons?: Record<string, string>;
+      ts: string;
+    }
+  | {
+      type: "codex_limit_no_eligible";
+      tickets: string[];
+      run_ids?: Record<string, string>;
+      reset_at: string | null;
+      ts: string;
+    }
+  | {
+      type: "codex_rotation_failed";
+      error: string;
+      tickets?: string[];
+      run_ids?: Record<string, string>;
+      ts: string;
+    }
+  | {
+      type: "codex_auth_dead_revival";
+      revived: string[];
+      failed: string[];
+      failed_reasons?: Record<string, string>;
+      ts: string;
+    }
+  | {
+      type: "codex_auth_dead_exhausted";
+      tickets: string[];
+      ts: string;
+    }
+  | {
+      type: "claude_limit_hit";
+      ticket: string;
+      window: string;
+      ts: string;
+      // Present when the event is emitted by the headless supervisor;
+      // legacy tmux emissions omit it. See account_notices.reconcile.
+      provider?: string;
+      run_id?: string;
+    };
+
 export function getAgents() {
   return request<{
     workers: AgentWorker[];
     orchestrators: Orchestrator[];
     archived: ArchivedWorker[];
+    account_notices?: AccountEvent[];
   }>("/api/agents");
 }
 
@@ -883,9 +931,20 @@ export function cancelQueuedMessage(ticket: string, index: number) {
   );
 }
 
-export function getAgentSession(ticket: string, after = 0, path?: string) {
+export function getAgentSession(
+  ticket: string,
+  after = 0,
+  path?: string,
+  archivedAt?: string,
+) {
   const params = new URLSearchParams({ cursor: String(after) });
   if (path) params.set("path", path);
+  // WIKI-229: the ``archived_at`` param is honored by the backend
+  // ``_archive_hint`` helper but ignored by the session route unless the
+  // ticket has no live run and no cached transcript. Callers do not set
+  // it in this PR; WIKI-229 delivers the discriminated session route
+  // that will select the exact archive.
+  if (archivedAt) params.set("archived_at", archivedAt);
   return request<AgentSessionData>(
     `/api/agents/${encodeURIComponent(ticket)}/session?${params.toString()}`
   );

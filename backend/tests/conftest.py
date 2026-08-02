@@ -17,6 +17,9 @@ def pytest_configure() -> None:
 
     os.environ["WIKI_AGENT_RUNTIME_DIR"] = str(_ISOLATED_RUNTIME_DIR)
     os.environ["WIKI_REBASE_TEST_MODE"] = "1"
+    os.environ["WIKI_ACCOUNT_NOTICES_PATH"] = str(
+        _ISOLATED_RUNTIME_DIR / "account-notices.json"
+    )
 
 
 @pytest.fixture(scope="session", autouse=True)

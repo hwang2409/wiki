@@ -406,6 +406,11 @@ class Supervisor:
         self.auth_dead_alert_at: dict[str, float] = {}
         self.auth_dead_recoveries: dict[str, asyncio.Task[None]] = {}
         self.codex_turn_fingerprints: dict[tuple[str, str], str | None] = {}
+        # Claude usage-limit alerts are throttled per RUN, not per ticket.
+        # Keying by ticket would suppress a fresh limit hit on a
+        # replacement run under the same ticket (the round-7 lifecycle
+        # cleared the old notice by run_id, so B's hit must not be
+        # silenced by A's alert timestamp). Pruned in _terminal_cleanup.
         self.last_limit_alert_at: dict[str, float] = {}
         self.last_no_eligible_alert: float = 0.0
         self.idempotency_cache_size = idempotency_cache_size
@@ -488,15 +493,17 @@ class Supervisor:
         return time.monotonic() - ts if ts else float("inf")
 
     def _current_codex_tickets(self) -> list[str]:
-        tickets = {
-            record.agent_id
+        return sorted(self._current_codex_run_ids())
+
+    def _current_codex_run_ids(self) -> dict[str, str]:
+        return {
+            record.agent_id: record.run_id
             for record in self.store.list_runs()
             if record.provider is ProviderKind.CODEX
             and self.store.is_current(record)
             and not record.replaced_by_run_id
             and record.state not in TERMINAL_STATES
         }
-        return sorted(tickets)
 
     def _active_worker_count(self) -> int:
         return sum(
@@ -944,18 +951,45 @@ Preserve the same identity, role, worktree, orchestrator grouping, PR gates, and
                 "provider": "codex",
                 "credential_source": "current",
                 "success": True,
+                # Per-ticket proof: only THIS worker made a Codex turn, so the
+                # notice store must clear only this ticket from the exhausted /
+                # revive-failed rollups. A ticketless event proves nothing
+                # about any other worker still awaiting recovery.
+                "ticket": record.agent_id,
+                "run_id": run_id,
                 "ts": datetime.now(timezone.utc).isoformat(),
             }
             if credential_fingerprint is not None:
                 verified_event["credential_fingerprint"] = credential_fingerprint
             await self._publish(verified_event)
-        if schedule_monitor_actions:
+        claude_turn_succeeded = (
+            event.provider is ProviderKind.CLAUDE
+            and event.direction != "stdin"
+            and accounts.claude_turn_succeeded(event.payload)
+        )
+        if schedule_monitor_actions and not claude_turn_succeeded:
             self._schedule_monitor_actions(
                 run_id,
                 adapter,
                 event,
                 prior_state=prior.state,
                 record=record,
+            )
+        if claude_turn_succeeded:
+            # A successful Claude result is a provider response from this
+            # run. Pane redraws and generic session events are not proof.
+            # Emit a run-scoped clear even after supervisor restart; the
+            # durable notice store owns whether this run has a notice.
+            self.last_limit_alert_at.pop(run_id, None)
+            await self._publish(
+                {
+                    "type": "claude_limit_cleared",
+                    "provider": "claude",
+                    "ticket": record.agent_id,
+                    "run_id": run_id,
+                    "window": "",
+                    "ts": datetime.now(timezone.utc).isoformat(),
+                }
             )
 
         if schedule_monitor_actions and (
@@ -1109,16 +1143,26 @@ Preserve the same identity, role, worktree, orchestrator grouping, PR gates, and
         if (
             event.provider is ProviderKind.CLAUDE
             and event.direction != "stdin"
+            and not accounts.claude_turn_succeeded(event.payload)
             and accounts.detect_claude_limit_payload(event.payload)
         ):
-            if self._seconds_since(self.last_limit_alert_at.get(record.agent_id, 0.0)) < 3600:
+            # Throttle per run_id so a replacement run under the same
+            # ticket can emit its own limit notice within the hour. See
+            # last_limit_alert_at comment.
+            if self._seconds_since(self.last_limit_alert_at.get(record.run_id, 0.0)) < 3600:
                 return
-            self.last_limit_alert_at[record.agent_id] = time.monotonic()
+            self.last_limit_alert_at[record.run_id] = time.monotonic()
             self._spawn_monitor_task(
                 self._publish(
                     {
                         "type": "claude_limit_hit",
+                        "provider": "claude",
                         "ticket": record.agent_id,
+                        # Per-ticket run_id lets the notice store reconcile
+                        # against the live registry: a replaced Claude worker
+                        # gets a new run_id and its stale-limit banner
+                        # drops on the next refresh.
+                        "run_id": record.run_id,
                         "window": "",
                         "ts": datetime.now(timezone.utc).isoformat(),
                     }
@@ -1143,10 +1187,13 @@ Preserve the same identity, role, worktree, orchestrator grouping, PR gates, and
         except StoreConflict as exc:
             if "another Codex account rotation is active" in str(exc):
                 return
+            run_ids = self._current_codex_run_ids()
             await self._publish(
                 {
                     "type": "codex_rotation_failed",
                     "error": str(exc),
+                    "tickets": sorted(run_ids),
+                    "run_ids": run_ids,
                     "ts": datetime.now(timezone.utc).isoformat(),
                 }
             )
@@ -1154,25 +1201,32 @@ Preserve the same identity, role, worktree, orchestrator grouping, PR gates, and
             if self._seconds_since(self.last_no_eligible_alert) < 3600:
                 return
             self.last_no_eligible_alert = time.monotonic()
-            tickets = self._current_codex_tickets()
+            run_ids = self._current_codex_run_ids()
+            tickets = sorted(run_ids)
             if not tickets:
                 try:
-                    tickets = [self.store.get(run_id).agent_id]
+                    record = self.store.get(run_id)
+                    tickets = [record.agent_id]
+                    run_ids = {record.agent_id: record.run_id}
                 except RunNotFound:
                     tickets = []
             await self._publish(
                 {
                     "type": "codex_limit_no_eligible",
                     "tickets": tickets,
+                    "run_ids": run_ids,
                     "reset_at": outgoing_reset_at,
                     "ts": datetime.now(timezone.utc).isoformat(),
                 }
             )
         except accounts.RotationError as exc:
+            run_ids = self._current_codex_run_ids()
             await self._publish(
                 {
                     "type": "codex_rotation_failed",
                     "error": str(exc),
+                    "tickets": sorted(run_ids),
+                    "run_ids": run_ids,
                     "ts": datetime.now(timezone.utc).isoformat(),
                 }
             )
@@ -1191,24 +1245,26 @@ Preserve the same identity, role, worktree, orchestrator grouping, PR gates, and
         except RunNotFound:
             return
         now_mono = time.monotonic()
-        history = self.auth_dead_attempts.setdefault(initial.agent_id, [])
+        history = self.auth_dead_attempts.setdefault(initial.run_id, [])
         history[:] = [
             ts
             for ts in history
             if now_mono - ts < accounts.AUTH_DEAD_WINDOW_SECONDS
         ]
         if history and now_mono - history[-1] < accounts.AUTH_DEAD_COOLDOWN_SECONDS:
-            await self._publish_auth_dead_exhausted(initial.agent_id, now_mono)
+            await self._publish_auth_dead_exhausted(initial.agent_id, initial.run_id, now_mono)
             return
         if len(history) >= accounts.AUTH_DEAD_MAX_ATTEMPTS:
-            await self._publish_auth_dead_exhausted(initial.agent_id, now_mono)
+            await self._publish_auth_dead_exhausted(initial.agent_id, initial.run_id, now_mono)
             return
         history.append(now_mono)
 
         operation_id = str(uuid4())
         revived: list[str] = []
+        revived_run_ids: dict[str, str] = {}
         failed: list[str] = []
         failed_reasons: dict[str, str] = {}
+        failed_run_ids: dict[str, str] = {}
 
         async with self._run_mutation_admission():
             async with self._run_lock(run_id):
@@ -1240,6 +1296,7 @@ Preserve the same identity, role, worktree, orchestrator grouping, PR gates, and
                     await self._publish_agent_change(detached.agent_id)
                     await self._resume_run_without_admission(run_id, automatic=False)
                     revived.append(record.agent_id)
+                    revived_run_ids[record.agent_id] = record.run_id
                 except Exception as exc:
                     try:
                         current = self.store.transition(
@@ -1253,9 +1310,11 @@ Preserve the same identity, role, worktree, orchestrator grouping, PR gates, and
                         await self._publish_agent_change(current.agent_id)
                         failed.append(current.agent_id)
                         failed_reasons[current.agent_id] = str(exc)
+                        failed_run_ids[current.agent_id] = current.run_id
                     else:
                         failed.append(initial.agent_id)
                         failed_reasons[initial.agent_id] = str(exc)
+                        failed_run_ids[initial.agent_id] = initial.run_id
 
         if revived or failed:
             await self._publish(
@@ -1267,6 +1326,12 @@ Preserve the same identity, role, worktree, orchestrator grouping, PR gates, and
                     "revived": revived,
                     "failed": failed,
                     "failed_reasons": failed_reasons,
+                    # Per-ticket run_id lets the notice store reconcile
+                    # against the live registry: a replaced ticket has a new
+                    # run_id and its notice can then be dropped. See
+                    # AccountNoticeStore.reconcile_with_live and WIKI-228.
+                    "failed_run_ids": failed_run_ids,
+                    "revived_run_ids": revived_run_ids,
                     "ts": datetime.now(timezone.utc).isoformat(),
                 }
             )
@@ -1274,14 +1339,15 @@ Preserve the same identity, role, worktree, orchestrator grouping, PR gates, and
     async def _publish_auth_dead_exhausted(
         self,
         agent_id: str,
+        run_id: str,
         now_mono: float,
     ) -> None:
         if (
-            now_mono - self.auth_dead_alert_at.get(agent_id, 0.0)
+            now_mono - self.auth_dead_alert_at.get(run_id, 0.0)
             < accounts.AUTH_DEAD_ALERT_INTERVAL_SECONDS
         ):
             return
-        self.auth_dead_alert_at[agent_id] = now_mono
+        self.auth_dead_alert_at[run_id] = now_mono
         await self._publish(
             {
                 "type": "codex_auth_dead_exhausted",
@@ -1290,6 +1356,10 @@ Preserve the same identity, role, worktree, orchestrator grouping, PR gates, and
                 "credential_source": "current",
                 "exhausted": True,
                 "tickets": [agent_id],
+                # Per-ticket run_id lets the notice store recognize a
+                # replaced worker (same ticket, different run_id) and drop
+                # the stale notice on reconciliation. See WIKI-228.
+                "run_ids": {agent_id: run_id},
                 "ts": datetime.now(timezone.utc).isoformat(),
             }
         )
@@ -1517,6 +1587,10 @@ Preserve the same identity, role, worktree, orchestrator grouping, PR gates, and
         self, run_id: str, *, preserve_event_routes: bool = False
     ) -> None:
         self._clear_adapter_loss(run_id)
+        # Prune the per-run Claude limit-alert timestamp so a replacement
+        # run under the same ticket can emit its own limit notice inside
+        # the hour (round-8 finding 5).
+        self.last_limit_alert_at.pop(run_id, None)
         adapter = self.adapters.pop(run_id, None)
         if adapter is not None:
             try:
@@ -1534,6 +1608,10 @@ Preserve the same identity, role, worktree, orchestrator grouping, PR gates, and
                 for key, target in self.event_routes.items()
                 if key[0] != adapter_key
             }
+
+    def _clear_auth_dead_recovery_state(self, run_id: str) -> None:
+        self.auth_dead_attempts.pop(run_id, None)
+        self.auth_dead_alert_at.pop(run_id, None)
 
     async def _close_and_drain_adapter(
         self,
@@ -1694,6 +1772,8 @@ Preserve the same identity, role, worktree, orchestrator grouping, PR gates, and
                     )
             except BaseException:
                 pass
+        self._clear_auth_dead_recovery_state(old.run_id)
+        self._clear_auth_dead_recovery_state(replacement.run_id)
         try:
             await self._publish_agent_change(old.agent_id)
         except BaseException:
@@ -1744,6 +1824,7 @@ Preserve the same identity, role, worktree, orchestrator grouping, PR gates, and
                     reason="provider launch cancelled",
                     adapter_status=terminal_status,
                 )
+            self._clear_auth_dead_recovery_state(record.run_id)
             await self._publish_agent_change(current.agent_id)
         except BaseException:
             pass
@@ -1878,6 +1959,7 @@ Preserve the same identity, role, worktree, orchestrator grouping, PR gates, and
                     LifecycleState.DEAD,
                     reason=reason,
                 )
+                self._clear_auth_dead_recovery_state(record.run_id)
                 await self._publish_agent_change(record.agent_id)
             raise
         self.store.commit_start(record.run_id)
@@ -2233,6 +2315,8 @@ Preserve the same identity, role, worktree, orchestrator grouping, PR gates, and
                 "revived": revival["revived"],
                 "failed": revival["failed"],
                 "failed_reasons": revival["failed_reasons"],
+                "failed_run_ids": revival["failed_run_ids"],
+                "revived_run_ids": revival["revived_run_ids"],
             }
             journal.update(
                 {
@@ -2246,6 +2330,7 @@ Preserve the same identity, role, worktree, orchestrator grouping, PR gates, and
             account_result.revived = list(result["revived"])
             account_result.failed = list(result["failed"])
             account_result.failed_reasons = dict(result["failed_reasons"])
+            account_result.failed_run_ids = dict(result["failed_run_ids"])
             await asyncio.to_thread(accounts.record_rotation_log, account_result)
             await self._publish(
                 {
@@ -2366,6 +2451,7 @@ Preserve the same identity, role, worktree, orchestrator grouping, PR gates, and
                         LifecycleState.DEAD,
                         reason="stale provider closed for account rotation",
                     )
+                self._clear_auth_dead_recovery_state(run_id)
 
         for row in rows:
             run_id = row["run_id"]
@@ -2441,6 +2527,8 @@ Preserve the same identity, role, worktree, orchestrator grouping, PR gates, and
                     "revived": revival["revived"],
                     "failed": revival["failed"],
                     "failed_reasons": reasons,
+                    "failed_run_ids": revival["failed_run_ids"],
+                    "revived_run_ids": revival["revived_run_ids"],
                 },
                 "error": detail,
             }
@@ -2477,14 +2565,17 @@ Preserve the same identity, role, worktree, orchestrator grouping, PR gates, and
         journal: dict[str, Any],
     ) -> dict[str, Any]:
         revived: list[str] = []
+        revived_run_ids: dict[str, str] = {}
         failed: list[str] = []
         failed_reasons: dict[str, str] = {}
+        failed_run_ids: dict[str, str] = {}
         pending = False
         operation_id = str(journal["operation_id"])
         for row in journal["runs"]:
             if row.get("resumed") or row.get("skipped"):
                 if row.get("resumed"):
                     revived.append(row["agent_id"])
+                    revived_run_ids[row["agent_id"]] = row["run_id"]
                 continue
             run_id = row["run_id"]
             agent_id = row["agent_id"]
@@ -2513,6 +2604,7 @@ Preserve the same identity, role, worktree, orchestrator grouping, PR gates, and
                             )
                         row["resumed"] = True
                         revived.append(agent_id)
+                        revived_run_ids[agent_id] = run_id
                         continue
                     if self.pid_alive(record.provider_pid):
                         pending = True
@@ -2521,17 +2613,24 @@ Preserve the same identity, role, worktree, orchestrator grouping, PR gates, and
                     row["resumed"] = True
                     row["failed_reason"] = None
                     revived.append(agent_id)
+                    revived_run_ids[agent_id] = run_id
                 except Exception as exc:
                     reason = str(exc)
                     row["failed_reason"] = reason
                     failed.append(agent_id)
                     failed_reasons[agent_id] = reason
+                    failed_run_ids[agent_id] = run_id
                 finally:
                     self._write_rotation_journal(journal)
         return {
             "revived": revived,
             "failed": failed,
             "failed_reasons": failed_reasons,
+            # Per-ticket run_id lets the notice store reconcile a rotation
+            # failure notice against the live registry: a replaced ticket
+            # gets a new run_id and its notice drops on the next refresh.
+            "failed_run_ids": failed_run_ids,
+            "revived_run_ids": revived_run_ids,
             "pending": pending,
         }
 
@@ -2569,6 +2668,8 @@ Preserve the same identity, role, worktree, orchestrator grouping, PR gates, and
                 "revived": revival["revived"],
                 "failed": revival["failed"],
                 "failed_reasons": revival["failed_reasons"],
+                "failed_run_ids": revival["failed_run_ids"],
+                "revived_run_ids": revival["revived_run_ids"],
             }
             journal.update(
                 {
@@ -2871,6 +2972,7 @@ Preserve the same identity, role, worktree, orchestrator grouping, PR gates, and
                 LifecycleState.COMPLETED,
             }:
                 await self._detach_adapter(record.run_id)
+                self._clear_auth_dead_recovery_state(record.run_id)
                 await adapter.close()
                 return {
                     "run_id": record.run_id,
@@ -3149,6 +3251,7 @@ Preserve the same identity, role, worktree, orchestrator grouping, PR gates, and
                 record = self.store.transition(
                     run_id, LifecycleState.DEAD, reason="stopped"
                 )
+            self._clear_auth_dead_recovery_state(run_id)
             return record
         try:
             status = await self._close_and_drain_adapter(
@@ -3167,6 +3270,7 @@ Preserve the same identity, role, worktree, orchestrator grouping, PR gates, and
         if status is None:
             raise StoreConflict("provider stop returned no status")
         record = self.store.update_adapter_status(run_id, status)
+        self._clear_auth_dead_recovery_state(run_id)
         await self._publish_agent_change(record.agent_id)
         return record
 
@@ -3236,6 +3340,7 @@ Preserve the same identity, role, worktree, orchestrator grouping, PR gates, and
             archived, _ = self.store.archive_current(run_id, outcome=outcome)
             self._forget_implicit_idempotency_for_run(run_id)
             self._clear_adapter_loss(run_id)
+            self._clear_auth_dead_recovery_state(run_id)
             await self._publish_agent_change(archived.agent_id)
             return archived
         try:
@@ -3258,6 +3363,7 @@ Preserve the same identity, role, worktree, orchestrator grouping, PR gates, and
         archived, _ = self.store.archive_current(run_id, outcome=outcome)
         self._forget_implicit_idempotency_for_run(run_id)
         self._clear_adapter_loss(run_id)
+        self._clear_auth_dead_recovery_state(run_id)
         await self._publish_agent_change(archived.agent_id)
         return archived
 
@@ -3280,6 +3386,7 @@ Preserve the same identity, role, worktree, orchestrator grouping, PR gates, and
                 or record.state is target
             ):
                 record = self.store.transition(run_id, target, reason=reason)
+            self._clear_auth_dead_recovery_state(run_id)
             await self._publish_agent_change(record.agent_id)
         except Exception:
             # Preserve the original provider/control error for the caller. A
@@ -3428,6 +3535,7 @@ Preserve the same identity, role, worktree, orchestrator grouping, PR gates, and
                 )
             self._reset_status_for_replacement(old.agent_id)
             self.store.replace(old.run_id, replacement, reset_status=False)
+            self._clear_auth_dead_recovery_state(old.run_id)
             return await self._launch_record(replacement, prompt)
 
         if target_provider is not old.provider:
@@ -3448,6 +3556,7 @@ Preserve the same identity, role, worktree, orchestrator grouping, PR gates, and
                 raise
             self._reset_status_for_replacement(old.agent_id)
             self.store.replace(old.run_id, replacement, reset_status=False)
+            self._clear_auth_dead_recovery_state(old.run_id)
             return await self._launch_record(replacement, prompt)
         published = False
         try:
@@ -3455,6 +3564,7 @@ Preserve the same identity, role, worktree, orchestrator grouping, PR gates, and
             self._reset_status_for_replacement(old.agent_id)
             old_adapter.prepare_replacement(replacement)
             self.store.replace(old.run_id, replacement, reset_status=False)
+            self._clear_auth_dead_recovery_state(old.run_id)
             published = True
         except asyncio.CancelledError:
             await self._cleanup_cancelled_replacement(
@@ -3488,6 +3598,7 @@ Preserve the same identity, role, worktree, orchestrator grouping, PR gates, and
                 )
             except (ValueError, StoreConflict):
                 pass
+            self._clear_auth_dead_recovery_state(old.run_id)
             await self._publish_agent_change(old.agent_id)
             raise
 
@@ -3523,6 +3634,8 @@ Preserve the same identity, role, worktree, orchestrator grouping, PR gates, and
                 )
             except Exception:
                 pass
+            self._clear_auth_dead_recovery_state(old.run_id)
+            self._clear_auth_dead_recovery_state(replacement.run_id)
             await self._publish_agent_change(old.agent_id)
             raise
         replacement = self.store.update_adapter_status(replacement.run_id, status)

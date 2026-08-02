@@ -339,7 +339,7 @@ async function main() {
     await retryCard.getByRole("button", { name: "Archive", exact: true }).waitFor();
     await retryCard.getByRole("button", { name: "Archive", exact: true }).click();
     await retryCard.waitFor({ state: "detached" });
-    await page.getByRole("button", { name: /log/i }).first().waitFor();
+    await page.getByRole("button", { name: /session/i }).first().waitFor();
 
     logStep("archiving detached worker");
     await agentCard(page, DEAD_WORKER).getByRole("button", { name: "Archive", exact: true }).click();
@@ -361,7 +361,10 @@ async function main() {
         payload.archived.some((entry) => entry.ticket === DEAD_ORCH),
     );
     await page.reload({ waitUntil: "domcontentloaded" });
-    await page.locator(".agents-view .agents-section-head").filter({ hasText: /^archived$/ }).waitFor();
+    await page
+      .locator(".agents-view .agents-section-head")
+      .filter({ hasText: "History" })
+      .waitFor();
     await page.getByText(RETRY_WORKER, { exact: true }).last().waitFor();
     await page.getByText(DEAD_WORKER, { exact: true }).last().waitFor();
     await page.getByText(DEAD_ORCH, { exact: true }).last().waitFor();
