@@ -3933,16 +3933,22 @@ Preserve the same identity, role, worktree, orchestrator grouping, PR gates, and
                         and old_result.get("status") == "uncertain"
                     )
                 )
-                if accepted or inherited_from_replacement:
-                    # A successful transport effect has already delivered its
-                    # command, and an inherited matcher cannot receive an echo
-                    # from the replaced transport. Retire either matcher at
-                    # the next exact-text collision so recurring fleet alarms
-                    # cannot starve. The command journal remains the durable
-                    # source record for the accepted send (REVIEW19 H1).
+                if inherited_from_replacement:
+                    # Store replacement drops old-transport matchers. Keep
+                    # this legacy guard for snapshots written before that
+                    # migration. The old transport was quiesced and drained,
+                    # so its matcher cannot consume the new alarm's echo.
                     self.store.discard_pending_user_message(
                         run_id, old_pending_id
                     )
+                    continue
+                if accepted:
+                    # Keep accepted same-run matchers in FIFO order. They are
+                    # echo tombstones: a delayed first echo must consume the
+                    # first pending_id/source before the later equal-text echo
+                    # consumes the second (REVIEW20 H1). Accepted matchers do
+                    # not block another send because provider acceptance is
+                    # already durable.
                     continue
                 unresolved_match = item
                 break

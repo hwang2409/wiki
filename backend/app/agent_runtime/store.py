@@ -2620,13 +2620,12 @@ class RunStore:
                 # quiescing the old provider and resetting under that lock.
                 self.status_path(old.agent_id).unlink(missing_ok=True)
 
-            # Replacements are a continuation of the same logical composer
-            # session. Provider echoes can arrive after the run-id swap, and
-            # the frontend may not have polled an acknowledgement journaled
-            # just before it, so both sides of reconciliation must carry over.
-            new_record.pending_user_messages = [
-                dict(message) for message in old.pending_user_messages
-            ]
+            # Replacement quiesces and drains the old transport before this
+            # run becomes current. Its unresolved text matchers cannot receive
+            # a later echo. Do not copy them into the new transport, where an
+            # equal-text alarm could otherwise stay blocked or consume the
+            # old source identity (REVIEW19/20 H1).
+            new_record.pending_user_messages = []
             new_record.composer_messages = [
                 dict(message) for message in old.composer_messages
             ]

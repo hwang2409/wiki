@@ -2053,6 +2053,304 @@ class SupervisorTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(len(matching_composer), 1)
         self.assertEqual(matching_composer[0].get("source"), "fleet-monitor")
 
+    async def test_send_now_equal_text_echo_order_survives_restart(
+        self,
+    ) -> None:
+        """REVIEW20 H1: accepted equal-text tombstones remain FIFO."""
+
+        record = await self.supervisor.start_run(
+            agent_id="WIKI-232-R20-EQUAL",
+            provider=ProviderKind.CODEX,
+            role="implement",
+            model="fixture-codex",
+            effort="high",
+            worktree=str(self.worktree),
+            prompt="preserve equal echo order across restart",
+        )
+        adapter = self.supervisor.adapters[record.run_id]
+        original_send = adapter.send_now
+        provider_calls: list[str] = []
+
+        async def tracked_send(message: str) -> AdapterStatus:
+            provider_calls.append(message)
+            return await original_send(message)
+
+        adapter.send_now = tracked_send  # type: ignore[method-assign]
+        message = "recurring alarm with exact text"
+        first_params = {
+            "run_id": record.run_id,
+            "text": message,
+            "source": "first-source",
+            "request_id": "review20-equal-first",
+        }
+        second_params = {
+            "run_id": record.run_id,
+            "text": message,
+            "source": "second-source",
+            "request_id": "review20-equal-second",
+        }
+        try:
+            first = await self.supervisor.dispatch("run/send_now", first_params)
+            second = await self.supervisor.dispatch("run/send_now", second_params)
+        finally:
+            adapter.send_now = original_send  # type: ignore[method-assign]
+
+        first_pending_id = first.get("pending_id")
+        second_pending_id = second.get("pending_id")
+        self.assertIsInstance(first_pending_id, str)
+        self.assertIsInstance(second_pending_id, str)
+        self.assertNotEqual(first_pending_id, second_pending_id)
+        self.assertEqual(provider_calls, [message, message])
+        self.assertEqual(
+            [
+                item.get("pending_id")
+                for item in self.store.get(record.run_id).pending_user_messages
+            ],
+            [first_pending_id, second_pending_id],
+        )
+        self.assertEqual(self.store.command_log.pending(), [])
+
+        await self.supervisor.close()
+        restarted_store = RunStore(self.paths)
+        restarted = Supervisor(
+            restarted_store,
+            FixtureAdapterFactory(FIXTURES, pid=os.getpid()),
+            pid_alive=lambda _pid: False,
+        )
+        self.store = restarted_store
+        self.supervisor = restarted
+        await restarted.recover_on_start()
+        restarted_adapter = restarted.adapters[record.run_id]
+
+        for _ in range(2):
+            await restarted._handle_provider_event(  # noqa: SLF001
+                record.run_id,
+                restarted_adapter,
+                ProviderEvent(
+                    ProviderKind.CODEX,
+                    {
+                        "method": "item/completed",
+                        "params": {
+                            "item": {
+                                "type": "userMessage",
+                                "content": [{"type": "text", "text": message}],
+                            }
+                        },
+                    },
+                    generation=restarted_adapter.snapshot().generation,
+                ),
+            )
+
+        recovered = restarted_store.get(record.run_id)
+        self.assertEqual(recovered.pending_user_messages, [])
+        matching_composer = [
+            item
+            for item in recovered.composer_messages
+            if item.get("pending_id")
+            in {first_pending_id, second_pending_id}
+        ]
+        self.assertEqual(
+            [item.get("pending_id") for item in matching_composer],
+            [first_pending_id, second_pending_id],
+        )
+        self.assertEqual(
+            [item.get("source") for item in matching_composer],
+            ["first-source", "second-source"],
+        )
+        self.assertEqual(provider_calls, [message, message])
+        self.assertEqual(restarted_store.command_log.pending(), [])
+        for request_id in (
+            "review20-equal-first",
+            "review20-equal-second",
+        ):
+            receipt = restarted_store.command_log.receipt("run/send_now", request_id)
+            self.assertIsNotNone(receipt)
+            assert receipt is not None
+            self.assertTrue(receipt.ok)
+            self.assertEqual(receipt.result["status"], "sent")
+
+    async def test_send_now_equal_text_delayed_echoes_stay_fifo(self) -> None:
+        """REVIEW20 H1: two accepted sends keep ordered source tombstones."""
+
+        record = await self.supervisor.start_run(
+            agent_id="WIKI-232-R20-FIFO",
+            provider=ProviderKind.CODEX,
+            role="implement",
+            model="fixture-codex",
+            effort="high",
+            worktree=str(self.worktree),
+            prompt="preserve delayed equal echo order",
+        )
+        adapter = self.supervisor.adapters[record.run_id]
+        original_send = adapter.send_now
+        provider_calls: list[str] = []
+
+        async def tracked_send(message: str) -> AdapterStatus:
+            provider_calls.append(message)
+            return await original_send(message)
+
+        adapter.send_now = tracked_send  # type: ignore[method-assign]
+        message = "delayed recurring alarm"
+        requests = [
+            {
+                "run_id": record.run_id,
+                "text": message,
+                "source": source,
+                "request_id": f"review20-fifo-{index}",
+            }
+            for index, source in enumerate(("first-source", "second-source"), 1)
+        ]
+        try:
+            results = [
+                await self.supervisor.dispatch("run/send_now", params)
+                for params in requests
+            ]
+        finally:
+            adapter.send_now = original_send  # type: ignore[method-assign]
+
+        pending_ids = [result.get("pending_id") for result in results]
+        self.assertTrue(all(isinstance(item, str) for item in pending_ids))
+        self.assertEqual(provider_calls, [message, message])
+        self.assertEqual(
+            [
+                item.get("pending_id")
+                for item in self.store.get(record.run_id).pending_user_messages
+            ],
+            pending_ids,
+        )
+        self.assertEqual(self.store.command_log.pending(), [])
+
+        for _ in range(2):
+            await self.supervisor._handle_provider_event(  # noqa: SLF001
+                record.run_id,
+                adapter,
+                ProviderEvent(
+                    ProviderKind.CODEX,
+                    {
+                        "method": "item/completed",
+                        "params": {
+                            "item": {
+                                "type": "userMessage",
+                                "content": [{"type": "text", "text": message}],
+                            }
+                        },
+                    },
+                ),
+            )
+
+        current = self.store.get(record.run_id)
+        self.assertEqual(current.pending_user_messages, [])
+        matching_composer = [
+            item
+            for item in current.composer_messages
+            if item.get("pending_id") in set(pending_ids)
+        ]
+        self.assertEqual(
+            [item.get("pending_id") for item in matching_composer], pending_ids
+        )
+        self.assertEqual(
+            [item.get("source") for item in matching_composer],
+            ["first-source", "second-source"],
+        )
+
+    async def test_send_now_late_first_echo_cannot_ack_failed_equal_send(
+        self,
+    ) -> None:
+        """REVIEW20 H1: an old echo cannot prove a rejected later send."""
+
+        record = await self.supervisor.start_run(
+            agent_id="WIKI-232-R20-REJECT",
+            provider=ProviderKind.CODEX,
+            role="implement",
+            model="fixture-codex",
+            effort="high",
+            worktree=str(self.worktree),
+            prompt="reject the second equal send safely",
+        )
+        adapter = self.supervisor.adapters[record.run_id]
+        original_send = adapter.send_now
+        provider_calls: list[str] = []
+        message = "same alarm before rejection"
+
+        async def accept_then_reject(message_text: str) -> AdapterStatus:
+            provider_calls.append(message_text)
+            if len(provider_calls) == 1:
+                return await original_send(message_text)
+            asyncio.get_running_loop().call_soon(
+                adapter._events.put_nowait,  # noqa: SLF001 - pump boundary fixture
+                ProviderEvent(
+                    ProviderKind.CODEX,
+                    {
+                        "method": "item/completed",
+                        "params": {
+                            "item": {
+                                "type": "userMessage",
+                                "content": [{"type": "text", "text": message}],
+                            }
+                        },
+                    },
+                    generation=adapter.snapshot().generation,
+                ),
+            )
+            raise RuntimeError("second transport rejected the alarm")
+
+        adapter.send_now = accept_then_reject  # type: ignore[method-assign]
+        first_params = {
+            "run_id": record.run_id,
+            "text": message,
+            "source": "first-source",
+            "request_id": "review20-reject-first",
+        }
+        second_params = {
+            "run_id": record.run_id,
+            "text": message,
+            "source": "second-source",
+            "request_id": "review20-reject-second",
+        }
+        try:
+            first = await self.supervisor.dispatch("run/send_now", first_params)
+            second = await self.supervisor.dispatch("run/send_now", second_params)
+        finally:
+            adapter.send_now = original_send  # type: ignore[method-assign]
+
+        first_pending_id = first.get("pending_id")
+        second_pending_id = second.get("pending_id")
+        self.assertEqual(provider_calls, [message, message])
+        self.assertEqual(first["status"], "sent")
+        self.assertEqual(second["status"], "uncertain")
+        self.assertNotEqual(first_pending_id, second_pending_id)
+        receipt = self.store.command_log.receipt(
+            "run/send_now", "review20-reject-second"
+        )
+        self.assertIsNotNone(receipt)
+        assert receipt is not None
+        self.assertTrue(receipt.ok)
+        self.assertEqual(receipt.result, second)
+        current = self.store.get(record.run_id)
+        self.assertEqual(
+            [item.get("pending_id") for item in current.pending_user_messages],
+            [second_pending_id],
+        )
+        matching_composer = [
+            item
+            for item in current.composer_messages
+            if item.get("pending_id") in {first_pending_id, second_pending_id}
+        ]
+        self.assertEqual(
+            [item.get("pending_id") for item in matching_composer],
+            [first_pending_id],
+        )
+        self.assertEqual(
+            [item.get("source") for item in matching_composer], ["first-source"]
+        )
+        second_effect = self.store.command_log.steer_effect_for_pending(
+            record.run_id, str(second_pending_id)
+        )
+        self.assertIsNotNone(second_effect)
+        assert second_effect is not None
+        self.assertEqual(second_effect["status"], "sending")
+        self.assertEqual(second_effect["result"]["status"], "uncertain")
+
     async def test_recover_on_start_reconciles_wedged_sending_effect(self) -> None:
         """WIKI-232 H2: an on-idle effect stuck at 'sending' after a daemon
         crash used to wedge the queue forever because no fresh transport
@@ -4168,76 +4466,224 @@ class SupervisorTests(unittest.IsolatedAsyncioTestCase):
             f"retry must terminalize the effect as sent/acknowledged, got {delivered['status']!r}",
         )
 
-    async def test_delivered_pending_id_survives_replace_until_late_echo(self) -> None:
+    async def test_replace_routes_late_old_echo_away_from_failed_equal_send(
+        self,
+    ) -> None:
+        """REVIEW20 H1: an old transport echo cannot prove a new failure."""
+
         record = await self.supervisor.start_run(
-            agent_id="WIKI-96-REPLACE",
+            agent_id="WIKI-232-R20-REPLACE-FAIL",
             provider=ProviderKind.CODEX,
             role="implement",
             model="fixture-codex",
             effort="high",
             worktree=str(self.worktree),
-            prompt="Work on ticket WIKI-96-REPLACE",
-        )
-        await self.supervisor.send_now(record.run_id, "begin a long turn")
-        pending_id = str(uuid4())
-        await self.supervisor.send_on_idle(
-            record.run_id,
-            "survive replacement",
-            pending_id,
+            prompt="route old echoes across replacement",
         )
         adapter = self.supervisor.adapters[record.run_id]
+        original_send = adapter.send_now
+        provider_calls: list[str] = []
+        old_generation = adapter.snapshot().generation
+        message = "same alarm across replacement"
 
-        # The provider has accepted the queued message, but its user echo has
-        # not arrived yet: it has moved from queued to pending reconciliation.
-        await self.supervisor._deliver_next_queued_locked(  # noqa: SLF001
-            record.run_id,
-            adapter,
-        )
-        delivered = self.store.get(record.run_id)
-        self.assertEqual(delivered.queued_messages, [])
-        self.assertEqual(
-            [message["pending_id"] for message in delivered.pending_user_messages],
-            [pending_id],
-        )
+        async def accept_then_reject(message_text: str) -> AdapterStatus:
+            provider_calls.append(message_text)
+            if len(provider_calls) == 1:
+                return await original_send(message_text)
+            asyncio.get_running_loop().call_soon(
+                adapter._events.put_nowait,  # noqa: SLF001 - routing fixture
+                ProviderEvent(
+                    ProviderKind.CODEX,
+                    {
+                        "method": "item/completed",
+                        "params": {
+                            "item": {
+                                "type": "userMessage",
+                                "content": [{"type": "text", "text": message}],
+                            }
+                        },
+                    },
+                    generation=old_generation,
+                ),
+            )
+            raise RuntimeError("replacement transport rejected the alarm")
+
+        adapter.send_now = accept_then_reject  # type: ignore[method-assign]
+        first_params = {
+            "run_id": record.run_id,
+            "text": message,
+            "source": "old-source",
+            "request_id": "review20-replace-fail-first",
+        }
+        first = await self.supervisor.dispatch("run/send_now", first_params)
+        first_pending_id = first.get("pending_id")
 
         replacement = await self.supervisor.replace(
             record.run_id,
-            "Continue ticket WIKI-96-REPLACE after revival",
+            "continue after replacement",
+        )
+        self.assertEqual(
+            self.store.get(replacement.run_id).pending_user_messages,
+            [],
+        )
+        second_params = {
+            "run_id": replacement.run_id,
+            "text": message,
+            "source": "new-source",
+            "request_id": "review20-replace-fail-second",
+        }
+        try:
+            second = await self.supervisor.dispatch("run/send_now", second_params)
+        finally:
+            adapter.send_now = original_send  # type: ignore[method-assign]
+
+        second_pending_id = second.get("pending_id")
+        self.assertEqual(provider_calls, [message, message])
+        self.assertEqual(first["status"], "sent")
+        self.assertEqual(second["status"], "uncertain")
+        old_record = self.store.get(record.run_id)
+        new_record = self.store.get(replacement.run_id)
+        self.assertEqual(old_record.pending_user_messages, [])
+        self.assertEqual(
+            [
+                item.get("pending_id")
+                for item in old_record.composer_messages
+                if item.get("pending_id") == first_pending_id
+            ],
+            [first_pending_id],
         )
         self.assertEqual(
             [
-                message["pending_id"]
-                for message in self.store.get(replacement.run_id).pending_user_messages
+                item.get("source")
+                for item in old_record.composer_messages
+                if item.get("pending_id") == first_pending_id
             ],
-            [pending_id],
+            ["old-source"],
         )
-
-        replacement_adapter = self.supervisor.adapters[replacement.run_id]
-        await self.supervisor._handle_provider_event(  # noqa: SLF001
-            replacement.run_id,
-            replacement_adapter,
-            ProviderEvent(
-                ProviderKind.CODEX,
-                {
-                    "method": "item/completed",
-                    "params": {
-                        "item": {
-                            "type": "userMessage",
-                            "content": [
-                                {"type": "text", "text": "survive replacement"}
-                            ],
-                        }
-                    },
-                },
-                generation=replacement.provider_generation,
-            ),
-        )
-
-        reconciled = self.store.get(replacement.run_id)
-        self.assertEqual(reconciled.pending_user_messages, [])
         self.assertEqual(
-            [message["pending_id"] for message in reconciled.composer_messages],
-            [pending_id],
+            [item.get("pending_id") for item in new_record.pending_user_messages],
+            [second_pending_id],
+        )
+        self.assertFalse(
+            any(
+                item.get("pending_id") == second_pending_id
+                for item in new_record.composer_messages
+            )
+        )
+        receipt = self.store.command_log.receipt(
+            "run/send_now", "review20-replace-fail-second"
+        )
+        self.assertIsNotNone(receipt)
+        assert receipt is not None
+        self.assertEqual(receipt.result["status"], "uncertain")
+
+    async def test_equal_text_delayed_echoes_keep_sources_across_replace(
+        self,
+    ) -> None:
+        """REVIEW20 H1: replacement routes each transport echo to its send."""
+
+        record = await self.supervisor.start_run(
+            agent_id="WIKI-232-R20-REPLACE-FIFO",
+            provider=ProviderKind.CODEX,
+            role="implement",
+            model="fixture-codex",
+            effort="high",
+            worktree=str(self.worktree),
+            prompt="preserve source order across replacement",
+        )
+        adapter = self.supervisor.adapters[record.run_id]
+        original_send = adapter.send_now
+        provider_calls: list[str] = []
+        message = "recurring replacement alarm"
+
+        async def tracked_send(message_text: str) -> AdapterStatus:
+            provider_calls.append(message_text)
+            return await original_send(message_text)
+
+        adapter.send_now = tracked_send  # type: ignore[method-assign]
+        old_generation = adapter.snapshot().generation
+        first = await self.supervisor.dispatch(
+            "run/send_now",
+            {
+                "run_id": record.run_id,
+                "text": message,
+                "source": "old-source",
+                "request_id": "review20-replace-fifo-first",
+            },
+        )
+        replacement = await self.supervisor.replace(
+            record.run_id, "continue equal alarms on replacement"
+        )
+        try:
+            second = await self.supervisor.dispatch(
+                "run/send_now",
+                {
+                    "run_id": replacement.run_id,
+                    "text": message,
+                    "source": "new-source",
+                    "request_id": "review20-replace-fifo-second",
+                },
+            )
+        finally:
+            adapter.send_now = original_send  # type: ignore[method-assign]
+
+        first_pending_id = first.get("pending_id")
+        second_pending_id = second.get("pending_id")
+        self.assertEqual(provider_calls, [message, message])
+        replacement_pending = self.store.get(
+            replacement.run_id
+        ).pending_user_messages
+        self.assertEqual(
+            [item.get("pending_id") for item in replacement_pending],
+            [second_pending_id],
+        )
+        self.assertEqual(
+            [item.get("source") for item in replacement_pending],
+            ["new-source"],
+        )
+
+        for generation in (old_generation, replacement.provider_generation):
+            await adapter._events.put(  # noqa: SLF001 - production routing fixture
+                ProviderEvent(
+                    ProviderKind.CODEX,
+                    {
+                        "method": "item/completed",
+                        "params": {
+                            "item": {
+                                "type": "userMessage",
+                                "content": [{"type": "text", "text": message}],
+                            }
+                        },
+                    },
+                    generation=generation,
+                )
+            )
+        for _ in range(200):
+            if (
+                not self.store.get(record.run_id).pending_user_messages
+                and not self.store.get(replacement.run_id).pending_user_messages
+            ):
+                break
+            await asyncio.sleep(0.01)
+        else:
+            self.fail("replacement echo routes did not drain pending matchers")
+
+        old_record = self.store.get(record.run_id)
+        new_record = self.store.get(replacement.run_id)
+        self.assertEqual(old_record.pending_user_messages, [])
+        self.assertEqual(new_record.pending_user_messages, [])
+        correlated = [
+            (item.get("pending_id"), item.get("source"))
+            for source_record in (old_record, new_record)
+            for item in source_record.composer_messages
+            if item.get("pending_id") in {first_pending_id, second_pending_id}
+        ]
+        self.assertEqual(
+            correlated,
+            [
+                (first_pending_id, "old-source"),
+                (second_pending_id, "new-source"),
+            ],
         )
 
     async def test_codex_question_before_turn_response_can_be_answered(self) -> None:
