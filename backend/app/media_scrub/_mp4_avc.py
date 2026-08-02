@@ -56,7 +56,7 @@ def _sample_description_configs(
     """Return one codec configuration per stsd sample-description index."""
     if handler_type != b"vide":
         raise MediaScrubError(
-            "mp4 audio tracks, including mp4a, are deferred to WIKI-225"
+            "mp4 audio tracks are outside the video-only MP4 scrubber"
         )
     stsd_atoms = [
         atom for atom in _parse_container(data, body_start, body_end)
@@ -256,4 +256,3 @@ def _canonicalise_avc_sample(
 
 
 # ---------------------------------------------------------------------------
-

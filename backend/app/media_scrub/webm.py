@@ -126,6 +126,7 @@ _ID_FLAG_INTERLACED: Final = 0x9A
 _ID_STEREO_MODE: Final = 0x53B8
 _ID_ALPHA_MODE: Final = 0x53C0
 _ID_COLOUR: Final = 0x55B0
+_ID_RANGE: Final = 0x55B9
 
 # Cluster children
 _ID_TIMESTAMP: Final = 0xE7
@@ -696,6 +697,10 @@ def _rebuild_tracks(
         track_bytes.append(entry_bytes)
     if not parsed:
         raise MediaScrubError("webm Tracks contains no TrackEntry")
+    if len(parsed) != 1:
+        raise MediaScrubError(
+            "webm strict VP8 subset requires exactly one TrackEntry"
+        )
     return _emit_element(_ID_TRACKS, b"".join(track_bytes)), parsed
 
 
@@ -717,6 +722,7 @@ def _rebuild_track_entry(
     flag_lacing = 0
     language_seen = False
     video_bytes = b""
+    video_element: _WebmElement | None = None
     video_seen = False
     audio_seen = False
     width: int | None = None
@@ -773,7 +779,7 @@ def _rebuild_track_entry(
             if video_seen:
                 raise MediaScrubError("webm TrackEntry has duplicate Video")
             video_seen = True
-            video_bytes, width, height = _rebuild_video(view, child)
+            video_element = child
         elif cid == _ID_AUDIO:
             if audio_seen:
                 raise MediaScrubError("webm TrackEntry has duplicate Audio")
@@ -833,6 +839,8 @@ def _rebuild_track_entry(
         1 <= default_duration <= _WEBM_MAX_DURATION_MS * 1_000_000
     ):
         raise MediaScrubError("webm DefaultDuration exceeds seven-day cap")
+    assert video_element is not None
+    video_bytes, width, height = _rebuild_video(view, video_element)
 
     body = (
         _emit_uint(_ID_TRACK_NUMBER, number)
@@ -873,6 +881,7 @@ def _rebuild_video(
     display_width: int | None = None
     display_height: int | None = None
     display_unit: int | None = None
+    colour_bytes = b""
     flag_interlaced = 2  # 0 = progressive (WebM legacy), 2 = spec default progressive
     for child in children:
         cid = child.identifier
@@ -893,9 +902,26 @@ def _rebuild_video(
         elif cid in (
             _ID_PIXEL_CROP_BOTTOM, _ID_PIXEL_CROP_TOP,
             _ID_PIXEL_CROP_LEFT, _ID_PIXEL_CROP_RIGHT,
-            _ID_STEREO_MODE, _ID_ALPHA_MODE, _ID_COLOUR,
-            _ID_VOID, _ID_CRC32,
         ):
+            if _parse_uint(view, child, "PixelCrop") != 0:
+                raise MediaScrubError(
+                    "webm nonzero PixelCrop is outside the strict VP8 subset"
+                )
+        elif cid == _ID_STEREO_MODE:
+            if _parse_uint(view, child, "StereoMode") != 0:
+                raise MediaScrubError(
+                    "webm nonzero StereoMode is outside the strict VP8 subset"
+                )
+        elif cid == _ID_ALPHA_MODE:
+            if _parse_uint(view, child, "AlphaMode") != 0:
+                raise MediaScrubError(
+                    "webm nonzero AlphaMode is outside the strict VP8 subset"
+                )
+        elif cid == _ID_COLOUR:
+            if colour_bytes:
+                raise MediaScrubError("webm Video has duplicate Colour")
+            colour_bytes = _rebuild_colour(view, child)
+        elif cid in (_ID_VOID, _ID_CRC32):
             continue
         else:
             raise MediaScrubError(
@@ -924,7 +950,23 @@ def _rebuild_video(
         body += _emit_uint(_ID_DISPLAY_HEIGHT, display_height)
     if display_unit is not None:
         body += _emit_uint(_ID_DISPLAY_UNIT, display_unit)
+    body += colour_bytes
     return _emit_element(_ID_VIDEO, body), pixel_width, pixel_height
+
+
+def _rebuild_colour(view: memoryview, colour: _WebmElement) -> bytes:
+    """Accept only VP8's canonical limited-range declaration."""
+    children = _iter_children(view, colour.body_start, colour.body_end)
+    if len(children) != 1 or children[0].identifier != _ID_RANGE:
+        raise MediaScrubError(
+            "webm Colour is outside the strict VP8 subset"
+        )
+    colour_range = _parse_uint(view, children[0], "Colour/Range")
+    if colour_range != 1:
+        raise MediaScrubError(
+            "webm Colour Range must be canonical limited range 1"
+        )
+    return _emit_element(_ID_COLOUR, _emit_uint(_ID_RANGE, 1))
 
 
 # ---------------------------------------------------------------------------
@@ -1189,7 +1231,11 @@ def _rebuild_block_group(
             raise MediaScrubError(
                 "webm DiscardPadding is outside the video-only subset"
             )
-        elif cid in (_ID_BLOCK_ADDITIONS, _ID_VOID, _ID_CRC32):
+        elif cid == _ID_BLOCK_ADDITIONS:
+            raise MediaScrubError(
+                "webm BlockAdditions are outside the VP8 keyframe-only subset"
+            )
+        elif cid in (_ID_VOID, _ID_CRC32):
             continue
         else:
             raise MediaScrubError(
