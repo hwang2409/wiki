@@ -555,6 +555,39 @@ describe("helpers", () => {
   });
 });
 
+describe("ArtifactBlock copy affordance", () => {
+  // WIKI-223: the Copy button used to fall through to textPayload for
+  // video/audio kinds, copying the internal artifact:// UUID. Hide Copy
+  // for both — Download is the correct affordance for media bytes.
+  const videoEvent = artifactEvent({
+    artifact_id: "video-1",
+    title: "Clip",
+    artifact: { kind: "video", mime: "video/mp4", ref: "artifact://vid" },
+  });
+  const audioEvent = artifactEvent({
+    artifact_id: "audio-1",
+    title: "Take",
+    artifact: { kind: "audio", mime: "audio/mpeg", ref: "artifact://aud" },
+  });
+
+  test("Copy button is present for text-shaped artifacts (baseline)", () => {
+    render(<ArtifactBlock event={codeEvent} ticket="WIKI-223" />);
+    expect(screen.getByText("Copy")).toBeTruthy();
+  });
+
+  test("Copy button is hidden for video artifacts", () => {
+    render(<ArtifactBlock event={videoEvent} ticket="WIKI-223" />);
+    expect(screen.queryByText("Copy")).toBeNull();
+    expect(screen.getByText("Download")).toBeTruthy();
+  });
+
+  test("Copy button is hidden for audio artifacts", () => {
+    render(<ArtifactBlock event={audioEvent} ticket="WIKI-223" />);
+    expect(screen.queryByText("Copy")).toBeNull();
+    expect(screen.getByText("Download")).toBeTruthy();
+  });
+});
+
 describe("ArtifactBlock fullscreen affordance", () => {
   test("fullscreen button calls onInspect with the event", () => {
     const onInspect = vi.fn();

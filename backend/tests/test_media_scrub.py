@@ -405,19 +405,23 @@ class Mp3Id3v24FooterTests(unittest.TestCase):
             (value >> shift) & 0x7F for shift in (21, 14, 7, 0)
         )
 
-    @unittest.skipIf(FFMPEG is None, "ffmpeg not installed")
-    def test_id3v24_footer_is_consumed_and_audio_decodes(self) -> None:
+    @staticmethod
+    def _real_audio() -> bytes:
+        """The bare frame stream from the real MP3 fixture — no ID3 tags."""
         original = REAL_MP3.read_bytes()
-        tag_size = 16
-        tag_body = b"round41-id3-footer"
-        tag_size = len(tag_body)
-        header = b"ID3\x04\x00\x10" + self._syncsafe(tag_size)
-        footer = b"3DI\x04\x00\x10" + self._syncsafe(tag_size)
         original_tag_size = sum(
             (byte & 0x7F) << shift
             for byte, shift in zip(original[6:10], (21, 14, 7, 0))
         )
-        audio = original[10 + original_tag_size:]
+        return original[10 + original_tag_size:]
+
+    @unittest.skipIf(FFMPEG is None, "ffmpeg not installed")
+    def test_id3v24_footer_is_consumed_and_audio_decodes(self) -> None:
+        tag_body = b"round41-id3-footer"
+        tag_size = len(tag_body)
+        header = b"ID3\x04\x00\x10" + self._syncsafe(tag_size)
+        footer = b"3DI\x04\x00\x10" + self._syncsafe(tag_size)
+        audio = self._real_audio()
         payload = header + tag_body + footer + audio
         result = media_scrub.scrub_audio(payload, "audio/mpeg")
         self.assertNotIn(b"3DI", result.data)
@@ -433,6 +437,96 @@ class Mp3Id3v24FooterTests(unittest.TestCase):
             self.assertEqual(probe.returncode, 0, probe.stderr.decode(errors="replace"))
         finally:
             Path(path).unlink(missing_ok=True)
+
+    def test_id3v24_footer_strip_matches_untagged_scrub_byte_for_byte(self) -> None:
+        """WIKI-223: the ID3v2.4 footer strip must advance past the 10-byte
+        3DI footer so the frame walk starts on the audio. The strongest
+        byte-correct check is that scrub(header+body+footer+audio) is
+        exactly scrub(audio) — if the footer wasn't consumed, the frame
+        walk would either fail at offset 0 or emit different bytes.
+        """
+        audio = self._real_audio()
+        tag_body = b"WIKI-223 footer body"
+        tag_size = len(tag_body)
+        header = b"ID3\x04\x00\x10" + self._syncsafe(tag_size)
+        footer = b"3DI\x04\x00\x10" + self._syncsafe(tag_size)
+        tagged = header + tag_body + footer + audio
+        tagged_result = media_scrub.scrub_audio(tagged, "audio/mpeg")
+        untagged_result = media_scrub.scrub_audio(audio, "audio/mpeg")
+        self.assertEqual(tagged_result.data, untagged_result.data)
+        self.assertNotIn(b"ID3", tagged_result.data)
+        self.assertNotIn(b"3DI", tagged_result.data)
+        self.assertNotIn(tag_body, tagged_result.data)
+
+    def test_id3v23_with_footer_flag_is_rejected(self) -> None:
+        """The footer is a v2.4-only feature. A v2.3 header with the
+        footer-present flag set (0x10) must not be accepted — otherwise
+        the strip would advance 10 bytes into the audio without a real
+        3DI trailer to validate.
+        """
+        audio = self._real_audio()
+        tag_body = b"v23-footer-not-allowed"
+        tag_size = len(tag_body)
+        header = b"ID3\x03\x00\x10" + self._syncsafe(tag_size)
+        payload = header + tag_body + audio
+        with self.assertRaises(media_scrub.MediaScrubError):
+            media_scrub.scrub_audio(payload, "audio/mpeg")
+
+    def test_id3v24_footer_version_byte_mismatch_is_rejected(self) -> None:
+        """The footer's major-version byte must equal the header's.
+        Regression guard: a comparison that only checked flags/size would
+        let a footer with a different version byte survive.
+        """
+        audio = self._real_audio()
+        tag_body = b"footer-version-mismatch"
+        tag_size = len(tag_body)
+        header = b"ID3\x04\x00\x10" + self._syncsafe(tag_size)
+        bad_footer = b"3DI\x03\x00\x10" + self._syncsafe(tag_size)
+        payload = header + tag_body + bad_footer + audio
+        with self.assertRaises(media_scrub.MediaScrubError):
+            media_scrub.scrub_audio(payload, "audio/mpeg")
+
+    def test_id3v24_footer_flags_byte_mismatch_is_rejected(self) -> None:
+        """The footer's flags byte must equal the header's.
+        Regression guard: a comparison that only checked version/size would
+        let a footer with different flags survive.
+        """
+        audio = self._real_audio()
+        tag_body = b"footer-flags-mismatch"
+        tag_size = len(tag_body)
+        header = b"ID3\x04\x00\x10" + self._syncsafe(tag_size)
+        bad_footer = b"3DI\x04\x00\x00" + self._syncsafe(tag_size)
+        payload = header + tag_body + bad_footer + audio
+        with self.assertRaises(media_scrub.MediaScrubError):
+            media_scrub.scrub_audio(payload, "audio/mpeg")
+
+    def test_id3v24_footer_syncsafe_size_mismatch_is_rejected(self) -> None:
+        """The footer's 4-byte synchsafe size must equal the header's.
+        Regression guard: a comparison that only checked version/flags would
+        let a footer with a divergent size survive — and the strip would
+        then advance by the wrong number of bytes.
+        """
+        audio = self._real_audio()
+        tag_body = b"footer-size-mismatch"
+        tag_size = len(tag_body)
+        header = b"ID3\x04\x00\x10" + self._syncsafe(tag_size)
+        bad_footer = b"3DI\x04\x00\x10" + self._syncsafe(tag_size + 1)
+        payload = header + tag_body + bad_footer + audio
+        with self.assertRaises(media_scrub.MediaScrubError):
+            media_scrub.scrub_audio(payload, "audio/mpeg")
+
+    def test_id3v24_footer_declared_but_truncated_is_rejected(self) -> None:
+        """Header declares footer-present but the trailing 10 bytes aren't
+        actually a 3DI footer (payload ends early). The strip must not
+        silently consume the last 10 audio bytes.
+        """
+        audio = self._real_audio()
+        tag_body = b"truncated-footer"
+        tag_size = len(tag_body)
+        header = b"ID3\x04\x00\x10" + self._syncsafe(tag_size)
+        payload = header + tag_body + audio[:5]
+        with self.assertRaises(media_scrub.MediaScrubError):
+            media_scrub.scrub_audio(payload, "audio/mpeg")
 
 
 class Mp3StructuralGuards(unittest.TestCase):
