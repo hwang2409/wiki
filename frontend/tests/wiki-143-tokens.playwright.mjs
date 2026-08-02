@@ -42,6 +42,10 @@ try {
   const page = await browser.newPage({ viewport: { width: 1440, height: 1000 } });
 
   await page.addInitScript(() => {
+    // WIKI-234: the opencode default theme intentionally re-skins radii to
+    // 0. Pin the base theme here — this test guards the canonical token
+    // scale, not per-theme overrides.
+    localStorage.setItem("wiki-theme", "mono-light");
     localStorage.setItem("wiki-sidebar-visible", "false");
     localStorage.setItem(
       "wiki-window-layout-v2",

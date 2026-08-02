@@ -4,6 +4,7 @@ import { createHighlighter } from "shiki";
 import { DEFAULT_THEME, normalizeTheme, type ThemeId } from "./themes";
 
 const APP_THEME_TO_SHIKI: Record<ThemeId, BundledTheme> = {
+  opencode: "everforest-dark",
   "mono-light": "github-light",
   "mono-dark": "github-dark",
   "gruvbox-light": "gruvbox-light-medium",

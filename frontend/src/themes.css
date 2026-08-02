@@ -75,6 +75,90 @@
   --syntax-variable: var(--text-normal);
 }
 
+/* WIKI-234: opencode-inspired terminal language. Dark olive-charcoal
+   surfaces, warm off-white mono type, one violet accent, flat geometry.
+   The theme also flips the chrome font to the mono stack (via
+   --font-chrome) and zeroes every radius: panels are told apart by one
+   tint step and a left accent bar, not by rounding or shadows. */
+[data-theme="opencode"] {
+  color-scheme: dark;
+
+  --background-primary: #1e1e17;
+  --background-primary-alt: #24241b;
+  --background-secondary: #2c2c21;
+  --background-modifier-border: #35352a;
+  --background-modifier-hover: rgba(236, 233, 216, 0.06);
+  --background-modifier-active: rgba(177, 139, 244, 0.14);
+
+  --text-normal: #ece9d8;
+  --text-muted: #a19e88;
+  --text-faint: #716f5e;
+  --text-on-accent: #1e1e17;
+  --text-selection: rgba(236, 233, 216, 0.16);
+
+  --link-color: #b18bf4;
+  --link-color-hover: #c6a9f7;
+
+  --code-background: #24241b;
+  --image-outline: rgba(236, 233, 216, 0.1);
+  --kanban-backdrop: #191912;
+  --kanban-lane: #24241b;
+  --kanban-card: #2c2c21;
+  --kanban-card-shadow: 0 1px 2px rgba(0, 0, 0, 0.4);
+  --blockquote-border-color: #4c4a3a;
+  --scrollbar-thumb: #3a382c;
+  --scrollbar-thumb-hover: #4c4a3a;
+
+  --accent-primary: #b18bf4;
+  --accent-success: #a9c957;
+  --accent-warning: #d5d878;
+  --accent-danger: #e2685c;
+
+  --shadow-floating: 0 0 0 1px #35352a, 0 8px 28px rgba(0, 0, 0, 0.4);
+  --shadow-modal: 0 0 0 1px #35352a, 0 12px 40px rgba(0, 0, 0, 0.5);
+  --shadow-lifted: 0 0 0 1px #35352a, 0 6px 24px rgba(0, 0, 0, 0.32);
+  --shadow-top: 0 -4px 16px rgba(0, 0, 0, 0.24);
+
+  --status-working-background: color-mix(in srgb, var(--accent-primary) 14%, transparent);
+  --status-working-border: var(--accent-primary);
+  --status-working-color: var(--accent-primary);
+  --status-merge-ready-background: var(--accent-success);
+  --status-merge-ready-border: var(--accent-success);
+  --status-merge-ready-color: var(--text-on-accent);
+  --status-blocked-background: transparent;
+  --status-blocked-border: var(--accent-danger);
+  --status-blocked-color: var(--accent-danger);
+
+  --diff-add-background: color-mix(in srgb, var(--accent-success) 16%, transparent);
+  --diff-add-foreground: #ece9d8;
+  --diff-remove-background: color-mix(in srgb, var(--accent-danger) 14%, transparent);
+  --diff-remove-foreground: #e2685c;
+  --diff-hatch-color: color-mix(in srgb, var(--accent-danger) 20%, var(--background-primary));
+
+  --selection-inverse-background: #b18bf4;
+  --selection-inverse-color: #1e1e17;
+
+  --syntax-text: #ece9d8;
+  --syntax-comment: #716f5e;
+  --syntax-keyword: #b18bf4;
+  --syntax-function: #d5d878;
+  --syntax-string: #a9c957;
+  --syntax-number: #e29a5c;
+  --syntax-type: #7fc9b8;
+  --syntax-variable: #ece9d8;
+
+  --font-chrome: var(--font-monospace);
+
+  --radius-xs: 0px;
+  --radius-s: 0px;
+  --radius-m: 0px;
+  --radius-sm: 0px;
+  --radius-md: 0px;
+  --radius-lg: 0px;
+  --radius-xl: 0px;
+  --radius-full: 0px;
+}
+
 [data-theme="mono-dark"] {
   color-scheme: dark;
 
