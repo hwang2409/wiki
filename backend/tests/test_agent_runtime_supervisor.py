@@ -1597,6 +1597,112 @@ class SupervisorTests(unittest.IsolatedAsyncioTestCase):
             "sent",
         )
 
+    async def test_send_now_echo_before_error_records_successful_receipt(
+        self,
+    ) -> None:
+        """REVIEW15 H1: durable echo wins over a later transport error."""
+
+        record = await self.supervisor.start_run(
+            agent_id="WIKI-232-R15-NOW",
+            provider=ProviderKind.CODEX,
+            role="implement",
+            model="fixture-codex",
+            effort="high",
+            worktree=str(self.worktree),
+            prompt="accepted then error send_now",
+        )
+        adapter = self.supervisor.adapters[record.run_id]
+        original_send = adapter.send_now
+        provider_calls: list[str] = []
+
+        async def echo_then_raise(message: str) -> AdapterStatus:
+            provider_calls.append(message)
+            await self.supervisor._handle_provider_event(  # noqa: SLF001
+                record.run_id,
+                adapter,
+                ProviderEvent(
+                    ProviderKind.CODEX,
+                    {
+                        "method": "item/completed",
+                        "params": {
+                            "item": {
+                                "type": "userMessage",
+                                "content": [{"type": "text", "text": message}],
+                            }
+                        },
+                    },
+                ),
+            )
+            raise RuntimeError("response failed after provider acceptance")
+
+        adapter.send_now = echo_then_raise  # type: ignore[method-assign]
+        params = {
+            "run_id": record.run_id,
+            "text": "accepted exactly once",
+            "dedupe_key": "review15-now-dedupe",
+            "request_id": "review15-now-request",
+        }
+        try:
+            result = await self.supervisor.dispatch("run/send_now", params)
+            replay = await self.supervisor.dispatch("run/send_now", dict(params))
+        finally:
+            adapter.send_now = original_send  # type: ignore[method-assign]
+
+        self.assertEqual(result["status"], "sent")
+        self.assertEqual(replay, result)
+        self.assertEqual(provider_calls, ["accepted exactly once"])
+        receipt = self.store.command_log.receipt(
+            "run/send_now", "review15-now-request"
+        )
+        self.assertIsNotNone(receipt)
+        assert receipt is not None
+        self.assertTrue(receipt.ok)
+        self.assertEqual(receipt.result, result)
+
+    async def test_send_now_error_without_echo_stays_failed(
+        self,
+    ) -> None:
+        """REVIEW15 H1 control: no durable evidence keeps the error receipt."""
+
+        record = await self.supervisor.start_run(
+            agent_id="WIKI-232-R15-NOW-FAIL",
+            provider=ProviderKind.CODEX,
+            role="implement",
+            model="fixture-codex",
+            effort="high",
+            worktree=str(self.worktree),
+            prompt="rejected send_now",
+        )
+        adapter = self.supervisor.adapters[record.run_id]
+        original_send = adapter.send_now
+        provider_calls: list[str] = []
+
+        async def raise_without_echo(message: str) -> AdapterStatus:
+            provider_calls.append(message)
+            raise RuntimeError("provider never accepted")
+
+        adapter.send_now = raise_without_echo  # type: ignore[method-assign]
+        params = {
+            "run_id": record.run_id,
+            "text": "must stay failed",
+            "request_id": "review15-now-failed-request",
+        }
+        try:
+            with self.assertRaisesRegex(RuntimeError, "provider never accepted"):
+                await self.supervisor.dispatch("run/send_now", params)
+            with self.assertRaisesRegex(RuntimeError, "provider never accepted"):
+                await self.supervisor.dispatch("run/send_now", dict(params))
+        finally:
+            adapter.send_now = original_send  # type: ignore[method-assign]
+
+        self.assertEqual(provider_calls, ["must stay failed"])
+        receipt = self.store.command_log.receipt(
+            "run/send_now", "review15-now-failed-request"
+        )
+        self.assertIsNotNone(receipt)
+        assert receipt is not None
+        self.assertFalse(receipt.ok)
+
     async def test_recover_on_start_reconciles_wedged_sending_effect(self) -> None:
         """WIKI-232 H2: an on-idle effect stuck at 'sending' after a daemon
         crash used to wedge the queue forever because no fresh transport
@@ -1681,6 +1787,82 @@ class SupervisorTests(unittest.IsolatedAsyncioTestCase):
             follow_up_adapter,
         )
         self.assertEqual(self.store.queued_messages(record.run_id), [])
+
+    async def test_startup_reconcile_skips_missing_run_then_handles_live(
+        self,
+    ) -> None:
+        """REVIEW15 H3: an archived effect cannot abort the startup scan."""
+
+        stale = await self.supervisor.start_run(
+            agent_id="WIKI-232-R15-STALE",
+            provider=ProviderKind.CODEX,
+            role="implement",
+            model="fixture-codex",
+            effort="high",
+            worktree=str(self.worktree),
+            prompt="stale sending effect",
+        )
+        stale_pending = str(uuid4())
+        self.store.command_log.steer_effect(
+            method="run/send_now",
+            request_id="review15-stale-effect",
+            agent_id=stale.agent_id,
+            command_hash="",
+            run_id=stale.run_id,
+            pending_id=stale_pending,
+            message="stale",
+            mode="now",
+        )
+        self.store.command_log.mark_steer_sending_for_pending(
+            stale.run_id, stale_pending
+        )
+        await self.supervisor.archive(stale.run_id, outcome="closed")
+
+        live = await self.supervisor.start_run(
+            agent_id="WIKI-232-R15-LIVE",
+            provider=ProviderKind.CODEX,
+            role="implement",
+            model="fixture-codex",
+            effort="high",
+            worktree=str(self.worktree),
+            prompt="live sending effect",
+        )
+        live_pending = str(uuid4())
+        self.store.command_log.steer_effect(
+            method="run/send_now",
+            request_id="review15-live-effect",
+            agent_id=live.agent_id,
+            command_hash="",
+            run_id=live.run_id,
+            pending_id=live_pending,
+            message="live",
+            mode="now",
+        )
+        self.store.command_log.mark_steer_sending_for_pending(
+            live.run_id, live_pending
+        )
+
+        self.supervisor._sending_effects_reconciled = False  # noqa: SLF001
+        await self.supervisor._reconcile_sending_steer_effects()  # noqa: SLF001
+
+        self.assertTrue(self.supervisor._sending_effects_reconciled)  # noqa: SLF001
+        stale_effect = self.store.command_log.steer_effect_for_request(
+            "run/send_now", "review15-stale-effect"
+        )
+        live_effect = self.store.command_log.steer_effect_for_request(
+            "run/send_now", "review15-live-effect"
+        )
+        assert stale_effect is not None and live_effect is not None
+        self.assertEqual(stale_effect["status"], "acknowledged")
+        self.assertEqual(
+            stale_effect["result"]["reason"],
+            "run_missing_during_startup_reconcile",
+        )
+        self.assertEqual(live_effect["status"], "acknowledged")
+        self.assertEqual(
+            live_effect["result"]["reason"],
+            "supervisor_restart_dropped_send",
+        )
 
     async def test_recover_on_start_normalizes_orphan_raw_before_reconcile(
         self,
@@ -3043,6 +3225,101 @@ class SupervisorTests(unittest.IsolatedAsyncioTestCase):
         assert terminal is not None
         self.assertEqual(terminal["status"], "acknowledged")
         self.assertEqual(terminal["result"]["status"], "uncertain")
+
+    async def test_send_on_idle_echo_before_error_records_sent(
+        self,
+    ) -> None:
+        """REVIEW15 H2: deferred echo proves queued delivery before error."""
+
+        record = await self.supervisor.start_run(
+            agent_id="WIKI-232-R15-IDLE",
+            provider=ProviderKind.CODEX,
+            role="implement",
+            model="fixture-codex",
+            effort="high",
+            worktree=str(self.worktree),
+            prompt="accepted then error send_on_idle",
+        )
+        adapter = self.supervisor.adapters[record.run_id]
+        snapshot = adapter.snapshot()
+        idle = AdapterStatus(
+            LifecycleState.IDLE,
+            snapshot.session_id,
+            os.getpid(),
+            generation=snapshot.generation,
+        )
+        adapter._status = idle  # noqa: SLF001 - inline drain fixture
+        self.store.update_adapter_status(record.run_id, idle)
+        original_send = adapter.send_on_idle
+        provider_calls: list[str] = []
+
+        async def echo_then_raise(message: str) -> AdapterStatus:
+            provider_calls.append(message)
+            await self.supervisor._handle_provider_event(  # noqa: SLF001
+                record.run_id,
+                adapter,
+                ProviderEvent(
+                    ProviderKind.CODEX,
+                    {
+                        "method": "item/completed",
+                        "params": {
+                            "item": {
+                                "type": "userMessage",
+                                "content": [{"type": "text", "text": message}],
+                            }
+                        },
+                    },
+                ),
+            )
+            raise RuntimeError("response failed after queued acceptance")
+
+        adapter.send_on_idle = echo_then_raise  # type: ignore[method-assign]
+        request_id = "review15-idle-request"
+        try:
+            result = await self.supervisor.dispatch(
+                "run/send_on_idle",
+                {
+                    "run_id": record.run_id,
+                    "text": "queued accepted exactly once",
+                    "source": "fleet-monitor",
+                    "request_id": request_id,
+                },
+            )
+        finally:
+            adapter.send_on_idle = original_send  # type: ignore[method-assign]
+
+        self.assertEqual(provider_calls, ["queued accepted exactly once"])
+        self.assertEqual(result["status"], "sent")
+        pending_id = result.get("pending_id")
+        self.assertIsInstance(pending_id, str)
+        self.assertEqual(self.store.queued_messages(record.run_id), [])
+        composer = self.store.get(record.run_id).composer_messages
+        matching_composer = [
+            message for message in composer if message.get("pending_id") == pending_id
+        ]
+        self.assertEqual(len(matching_composer), 1)
+        self.assertEqual(matching_composer[0].get("source"), "fleet-monitor")
+        matching_normalized = [
+            event
+            for event in self.store.read_normalized_events(record.run_id)
+            if isinstance(event.get("payload"), dict)
+            and event["payload"].get("pending_id") == pending_id
+        ]
+        self.assertEqual(len(matching_normalized), 1)
+        terminal = self.store.command_log.steer_effect_for_pending(
+            record.run_id, str(pending_id)
+        )
+        self.assertIsNotNone(terminal)
+        assert terminal is not None
+        self.assertEqual(terminal["status"], "acknowledged")
+        self.assertEqual(terminal["result"]["status"], "sent")
+        receipt = self.store.command_log.receipt(
+            "run/send_on_idle", request_id
+        )
+        self.assertIsNotNone(receipt)
+        assert receipt is not None
+        self.assertTrue(receipt.ok)
+        self.assertEqual(receipt.result, result)
 
     async def test_r5_provider_busy_after_idle_snapshot_preserves_queue(
         self,

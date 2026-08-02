@@ -1669,21 +1669,45 @@ Preserve the same identity, role, worktree, orchestrator grouping, PR gates, and
             except Exception as exc:
                 if attempt_key is not None:
                     self._queued_delivery_attempts.discard(attempt_key)
+                # Provider events that arrive during a queued attempt are
+                # durable raw rows but remain deferred until the transport
+                # outcome is known. Flush while the pending matcher still
+                # exists so an accepted-then-error echo keeps its pending_id
+                # and composer source correlation (REVIEW15 H2).
+                await self._flush_deferred_provider_events(run_id)
+                delivery_observed = False
                 if pending_id is not None:
-                    self.store.discard_pending_user_message(run_id, pending_id)
-                    # The "sending" marker was written above and, per state
-                    # machine, cannot revert to "queued"; if we do not
-                    # terminate this effect it wedges every later queued
-                    # message behind an effect whose provider echo can
-                    # never arrive (WIKI-232 H2). Report uncertainty and
-                    # drop the head so the queue can drain.
                     effect_for_pending = (
                         self.store.command_log.steer_effect_for_pending(
                             run_id, pending_id
                         )
                     )
+                    delivery_observed = self.store.steer_delivery_observed(
+                        run_id, pending_id
+                    )
+                    if delivery_observed:
+                        result = {"status": "sent", "pending_id": pending_id}
+                        if effect_for_pending is not None:
+                            self.store.command_log.update_steer_effect(
+                                str(effect_for_pending["method"]),
+                                str(effect_for_pending["request_id"]),
+                                "acknowledged",
+                                result,
+                            )
+                        self.store.remove_queued_message_by_pending_id(
+                            run_id, pending_id
+                        )
+                    else:
+                        self.store.discard_pending_user_message(
+                            run_id, pending_id
+                        )
+                    # The "sending" marker was written above and cannot
+                    # revert to "queued" after an unknown transport result.
+                    # Without durable delivery evidence, record uncertainty
+                    # and drop the head so later messages can drain.
                     if (
-                        effect_for_pending is not None
+                        not delivery_observed
+                        and effect_for_pending is not None
                         and effect_for_pending["status"] == "sending"
                     ):
                         self.store.command_log.update_steer_effect(
@@ -1699,13 +1723,13 @@ Preserve the same identity, role, worktree, orchestrator grouping, PR gates, and
                         self.store.remove_queued_message_by_pending_id(
                             run_id, pending_id
                         )
-                await self._flush_deferred_provider_events(run_id)
                 record = self.store.get(run_id)
-                record = self.store.transition(
-                    run_id,
-                    record.state,
-                    reason=f"queued message delivery failed: {exc}",
-                )
+                if not delivery_observed:
+                    record = self.store.transition(
+                        run_id,
+                        record.state,
+                        reason=f"queued message delivery failed: {exc}",
+                    )
                 await self._publish(
                     {"type": "session", "ticket": record.agent_id, "surface": "queue"}
                 )
@@ -2580,17 +2604,42 @@ Preserve the same identity, role, worktree, orchestrator grouping, PR gates, and
 
         if self._sending_effects_reconciled:
             return
-        self._sending_effects_reconciled = True
         for effect in self.store.command_log.sending_steer_effects():
             run_id = str(effect.get("run_id") or "")
             method = str(effect.get("method") or "")
             request_id = str(effect.get("request_id") or "")
             if not run_id or not method or not request_id:
                 continue
-            async with self._run_lock(run_id):
+            pending_id = effect.get("pending_id")
+            pending_id_str = (
+                str(pending_id) if isinstance(pending_id, str) else None
+            )
+            try:
+                record = self.store.get(run_id)
+            except RunNotFound:
+                missing: dict[str, Any] = {
+                    "status": "uncertain",
+                    "reason": "run_missing_during_startup_reconcile",
+                }
+                if pending_id_str is not None:
+                    missing["pending_id"] = pending_id_str
+                self.store.command_log.update_steer_effect(
+                    method, request_id, "acknowledged", missing
+                )
+                continue
+            async with self._agent_lock(record.agent_id):
                 try:
                     self.store.get(run_id)
                 except RunNotFound:
+                    missing = {
+                        "status": "uncertain",
+                        "reason": "run_missing_during_startup_reconcile",
+                    }
+                    if pending_id_str is not None:
+                        missing["pending_id"] = pending_id_str
+                    self.store.command_log.update_steer_effect(
+                        method, request_id, "acknowledged", missing
+                    )
                     continue
                 # The initial list is only a candidate snapshot. A live
                 # drain can finish this exact effect before this run lock is
@@ -2674,6 +2723,7 @@ Preserve the same identity, role, worktree, orchestrator grouping, PR gates, and
                         self._deliver_next_queued(run_id, adapter),
                         name=f"agent-recover-queue-drain-{run_id}",
                     )
+        self._sending_effects_reconciled = True
 
     async def _reap_lost_runs(self) -> list[dict[str, str]]:
         self.last_reaper_at = time.monotonic()
@@ -3802,7 +3852,6 @@ Preserve the same identity, role, worktree, orchestrator grouping, PR gates, and
         # while releasing the dedupe key — a retry would then land a second
         # pending row for the same pending_id, and the stale first row could
         # consume the retry's provider echo.
-        accepted = False
         try:
             if pending_id is not None:
                 try:
@@ -3819,11 +3868,40 @@ Preserve the same identity, role, worktree, orchestrator grouping, PR gates, and
                     "run/send_now", effect_id, "sending"
                 )
             status = await adapter.send_now(message)
-            accepted = True
         except Exception:
-            if dedupe_key is not None and not accepted:
+            delivery_observed = False
+            if pending_id is not None:
+                terminal = self.store.command_log.steer_effect_for_pending(
+                    run_id, pending_id
+                )
+                terminal_result = (
+                    terminal.get("result") if isinstance(terminal, dict) else None
+                )
+                terminal_sent = bool(
+                    isinstance(terminal, dict)
+                    and terminal.get("status") in {"sent", "acknowledged"}
+                    and not (
+                        isinstance(terminal_result, dict)
+                        and terminal_result.get("status") == "uncertain"
+                    )
+                )
+                delivery_observed = terminal_sent or (
+                    self.store.steer_delivery_observed(run_id, pending_id)
+                )
+            if delivery_observed:
+                response: dict[str, Any] = {"status": "sent"}
+                if pending_id is not None and expose_pending_id:
+                    response["pending_id"] = pending_id
+                if dedupe_key is not None:
+                    response["dedupe_key"] = dedupe_key
+                if effect_id is not None:
+                    self.store.command_log.update_steer_effect(
+                        "run/send_now", effect_id, "acknowledged", response
+                    )
+                return response
+            if dedupe_key is not None:
                 self.store.release_message_dedupe_key(run_id, dedupe_key)
-            if pending_id is not None and not accepted:
+            if pending_id is not None:
                 self.store.discard_pending_user_message(run_id, pending_id)
             raise
         if effect_id is not None:
