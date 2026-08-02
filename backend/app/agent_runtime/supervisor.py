@@ -892,8 +892,9 @@ Preserve the same identity, role, worktree, orchestrator grouping, PR gates, and
         normalized: NormalizedProviderEvent | None = None,
         prior_state: LifecycleState | None = None,
     ) -> None:
+        record_before_event = self.store.get(run_id)
         if prior_state is None:
-            prior_state = self.store.get(run_id).state
+            prior_state = record_before_event.state
         if raw is None:
             raw = self.store.append_raw(
                 run_id,
@@ -903,6 +904,31 @@ Preserve the same identity, role, worktree, orchestrator grouping, PR gates, and
                 generation=event.generation,
                 received_at=event.received_at,
             )
+        if (
+            event.generation > 0
+            and event.generation < record_before_event.provider_generation
+        ):
+            # A stopped transport cannot prove delivery for a matcher owned
+            # by the resumed generation. Keep the raw event for audit, but
+            # terminalize its normalization as ignored before text matching.
+            self.store.append_normalized(
+                run_id,
+                raw_seq=int(raw["seq"]),
+                disposition=EventDisposition.IGNORED,
+                kind="retired_generation_event",
+                payload={
+                    "event_generation": event.generation,
+                    "provider_generation": record_before_event.provider_generation,
+                },
+            )
+            await self._publish(
+                {
+                    "type": "session",
+                    "ticket": record_before_event.agent_id,
+                    "surface": "session",
+                }
+            )
+            return
         if normalized is None:
             try:
                 normalized = normalize_provider_event(
@@ -2421,6 +2447,11 @@ Preserve the same identity, role, worktree, orchestrator grouping, PR gates, and
             raise StoreConflict(
                 "provider PID is live without attached control; refusing duplicate resume"
             )
+        # All resume callers share this dead-transport boundary: explicit
+        # resume, account rotation, auth recovery, and startup recovery must
+        # retire pre-upgrade overflow before a new adapter can emit events.
+        self.store.retire_overbound_pending_user_messages(run_id)
+        record = self.store.get(run_id)
         resolve_safe_worktree(record.worktree)
         # Request ids belong to the old transport generation. A resumed
         # provider must re-emit any still-actionable request before the UI can
@@ -3687,6 +3718,16 @@ Preserve the same identity, role, worktree, orchestrator grouping, PR gates, and
         # Decision inputs are refreshed per run; no stale list snapshot can
         # override a replacement that happened while recovery was running.
         record = self.store.get(run_id)
+        adapter = self.adapters.get(record.run_id)
+        provider_pid_alive = (
+            self.pid_alive(record.provider_pid) if adapter is None else True
+        )
+        if adapter is None and not provider_pid_alive:
+            # A daemon restart has no attached stream and the saved provider
+            # PID is dead. Retire legacy overflow before suppression, detach,
+            # or other safe early returns can preserve it indefinitely.
+            self.store.retire_overbound_pending_user_messages(record.run_id)
+            record = self.store.get(run_id)
         pipeline_failure = self.pipeline_failures.get(record.run_id)
         if pipeline_failure:
             return {
@@ -3694,7 +3735,6 @@ Preserve the same identity, role, worktree, orchestrator grouping, PR gates, and
                 "action": RecoveryAction.BLOCK.value,
                 "reason": pipeline_failure,
             }
-        adapter = self.adapters.get(record.run_id)
         if adapter is not None:
             if record.state in {
                 LifecycleState.DEAD,
@@ -3756,7 +3796,7 @@ Preserve the same identity, role, worktree, orchestrator grouping, PR gates, and
         decision = restart_recovery_decision(
             record,
             is_current=self.store.is_current(record),
-            provider_pid_alive=self.pid_alive(record.provider_pid),
+            provider_pid_alive=provider_pid_alive,
             provider_control_attached=record.run_id in self.adapters,
         )
         result = {
@@ -3767,13 +3807,6 @@ Preserve the same identity, role, worktree, orchestrator grouping, PR gates, and
         if decision.action is RecoveryAction.RESUME:
             recovery_state = record.recovery_from_state or record.state
             try:
-                # RESUME is selected only when the detached provider PID is
-                # dead. That is the safe upgrade boundary for legacy records
-                # that exceed the matcher cap: clear them before the resumed
-                # transport can emit an echo into a reused text slot.
-                self.store.retire_overbound_pending_user_messages(
-                    record.run_id
-                )
                 await self._resume_run_without_admission(
                     record.run_id,
                     automatic=True,
