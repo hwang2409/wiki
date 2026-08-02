@@ -17,6 +17,8 @@ const SCREENSHOTS = {
   idleNormal: "/tmp/WIKI-237-idle-normal.png",
   workingNarrow: "/tmp/WIKI-237-working-narrow.png",
   idleNarrow: "/tmp/WIKI-237-idle-narrow.png",
+  workingSplit: "/tmp/WIKI-237-working-split.png",
+  idleSplit: "/tmp/WIKI-237-idle-split.png",
 };
 
 function assert(condition, message) {
@@ -128,20 +130,22 @@ async function main() {
       if (localStorage.getItem("wiki-sidebar-visible") === null) {
         localStorage.setItem("wiki-sidebar-visible", "false");
       }
-      localStorage.setItem(
-        "wiki-window-layout-v2",
-        JSON.stringify({
-          version: 2,
-          activeWindowId: "window-0",
-          windows: [
-            {
-              id: "window-0",
-              focusedPaneId: "pane-1",
-              layout: { kind: "pane", id: "pane-1", path: `agent://${ticket}` },
-            },
-          ],
-        }),
-      );
+      if (localStorage.getItem("wiki-window-layout-v2") === null) {
+        localStorage.setItem(
+          "wiki-window-layout-v2",
+          JSON.stringify({
+            version: 2,
+            activeWindowId: "window-0",
+            windows: [
+              {
+                id: "window-0",
+                focusedPaneId: "pane-1",
+                layout: { kind: "pane", id: "pane-1", path: `agent://${ticket}` },
+              },
+            ],
+          }),
+        );
+      }
     }, { ticket: TICKET });
 
     const openSession = async () => {
@@ -193,6 +197,55 @@ async function main() {
       assert(helpText === expected, `accessible guidance mismatch: ${helpText}`);
     };
 
+    const assertCompactSend = async (context) => {
+      const composerRoot = page.locator(".session-composer");
+      await page.waitForFunction(() =>
+        document.querySelector(".session-composer")?.getAttribute("data-compact") === "true",
+      );
+      const compactState = await composerRoot.evaluate((root) => {
+        const sendButton = root.querySelector(".session-send");
+        const sendLabel = root.querySelector(".session-send-label");
+        const buttonRect = sendButton.getBoundingClientRect();
+        return {
+          composerWidth: root.getBoundingClientRect().width,
+          buttonWidth: buttonRect.width,
+          buttonHeight: buttonRect.height,
+          labelDisplay: getComputedStyle(sendLabel).display,
+        };
+      });
+      assert(
+        compactState.composerWidth <= 480,
+        `${context} composer must be at most 480px: ${compactState.composerWidth}`,
+      );
+      assert(
+        compactState.buttonWidth === 40 && compactState.buttonHeight === 40,
+        `${context} send action must be 40px: ${compactState.buttonWidth}x${compactState.buttonHeight}`,
+      );
+      assert(
+        compactState.labelDisplay === "none",
+        `${context} send text must be hidden: ${compactState.labelDisplay}`,
+      );
+    };
+
+    const assertNoHorizontalOverflow = async (context) => {
+      const bounds = await page.locator(".session-tab").evaluate((root) => {
+        const composerRoot = root.querySelector(".session-composer");
+        const footer = root.querySelector(".session-footer");
+        return {
+          composer: [composerRoot.scrollWidth, composerRoot.clientWidth],
+          footer: [footer.scrollWidth, footer.clientWidth],
+        };
+      });
+      assert(
+        bounds.composer[0] <= bounds.composer[1],
+        `${context} composer must not overflow: ${bounds.composer.join("/")}`,
+      );
+      assert(
+        bounds.footer[0] <= bounds.footer[1],
+        `${context} guidance must not overflow: ${bounds.footer.join("/")}`,
+      );
+    };
+
     logStep("working state at normal width");
     await openSession();
     await assertTarget();
@@ -231,9 +284,26 @@ async function main() {
       hasText: "make the agent composer clear",
     });
     await durableHistoryRow.waitFor({ state: "visible" });
+    await page.waitForFunction(() =>
+      document.querySelector(".session-composer")?.getAttribute("data-history-count") === "1",
+    );
     await composer.fill("");
+    await page.evaluate(
+      () => new Promise((resolve) => requestAnimationFrame(() => requestAnimationFrame(resolve))),
+    );
+    await page.waitForFunction(() => {
+      const node = document.querySelector(".session-composer textarea");
+      return node?.value === "" && node?.selectionStart === 0 && node?.selectionEnd === 0;
+    });
     await composer.press("Escape");
     await page.locator(".session-vim-mode", { hasText: "-- NORMAL --" }).waitFor();
+    await page.evaluate(
+      () => new Promise((resolve) => requestAnimationFrame(() => requestAnimationFrame(resolve))),
+    );
+    await page.waitForFunction(() => {
+      const node = document.querySelector(".session-composer textarea");
+      return node?.selectionStart === 0 && node?.selectionEnd === 0;
+    });
     await composer.press("k");
     await page.waitForFunction(
       ({ selector, value }) => document.querySelector(selector)?.value === value,
@@ -324,29 +394,61 @@ async function main() {
     await openSession();
     await assertTarget(`Steer ${TICKET}…`);
     await assertGuidance("enter send now · shift+enter queue until idle · esc vim");
+    await assertCompactSend("narrow viewport working");
+    await assertNoHorizontalOverflow("narrow viewport working");
     await page.screenshot({ path: SCREENSHOTS.workingNarrow, fullPage: true });
 
     working = false;
     await openSession();
     await assertTarget(`Ask ${TICKET}…`);
     await assertGuidance("enter send · shift+enter newline · esc vim");
-    const bounds = await page.locator(".session-tab").evaluate((root) => {
-      const composerRoot = root.querySelector(".session-composer");
-      const footer = root.querySelector(".session-footer");
-      return {
-        composer: [composerRoot.scrollWidth, composerRoot.clientWidth],
-        footer: [footer.scrollWidth, footer.clientWidth],
-      };
-    });
-    assert(
-      bounds.composer[0] <= bounds.composer[1],
-      `narrow composer must not overflow: ${bounds.composer.join("/")}`,
-    );
-    assert(
-      bounds.footer[0] <= bounds.footer[1],
-      `narrow guidance must not overflow: ${bounds.footer.join("/")}`,
-    );
+    await assertCompactSend("narrow viewport idle");
+    await assertNoHorizontalOverflow("narrow viewport idle");
     await page.screenshot({ path: SCREENSHOTS.idleNarrow, fullPage: true });
+
+    logStep("working and idle states in a narrow desktop split pane");
+    await page.setViewportSize({ width: 1280, height: 900 });
+    await page.evaluate(({ ticket }) => {
+      localStorage.setItem("wiki-sidebar-visible", "false");
+      localStorage.setItem(
+        "wiki-window-layout-v2",
+        JSON.stringify({
+          version: 2,
+          activeWindowId: "window-0",
+          windows: [
+            {
+              id: "window-0",
+              focusedPaneId: "pane-2",
+              layout: {
+                kind: "split",
+                direction: "row",
+                ratio: 0.72,
+                first: { kind: "pane", id: "pane-1", path: null },
+                second: { kind: "pane", id: "pane-2", path: `agent://${ticket}` },
+              },
+            },
+          ],
+        }),
+      );
+    }, { ticket: TICKET });
+
+    working = true;
+    await openSession();
+    assert(page.viewportSize().width === 1280, "split-pane case must keep a wide viewport");
+    await page.locator(".pane-frame[data-pane-key='pane-2']").waitFor({ state: "visible" });
+    await assertTarget(`Steer ${TICKET}…`);
+    await assertGuidance("enter send now · shift+enter queue until idle · esc vim");
+    await assertCompactSend("narrow split working");
+    await assertNoHorizontalOverflow("narrow split working");
+    await page.screenshot({ path: SCREENSHOTS.workingSplit, fullPage: true });
+
+    working = false;
+    await openSession();
+    await assertTarget(`Ask ${TICKET}…`);
+    await assertGuidance("enter send · shift+enter newline · esc vim");
+    await assertCompactSend("narrow split idle");
+    await assertNoHorizontalOverflow("narrow split idle");
+    await page.screenshot({ path: SCREENSHOTS.idleSplit, fullPage: true });
 
     logStep("PASS");
   } finally {

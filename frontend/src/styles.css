@@ -8328,16 +8328,14 @@ body.is-resizing-panes .pane-cell {
   opacity: 0.55;
 }
 
-@media (max-width: 480px) {
-  .session-send {
-    min-width: 40px;
-    width: 40px;
-    padding: 0;
-  }
+.session-composer[data-compact="true"] .session-send {
+  min-width: 40px;
+  width: 40px;
+  padding: 0;
+}
 
-  .session-send-label {
-    display: none;
-  }
+.session-composer[data-compact="true"] .session-send-label {
+  display: none;
 }
 
 .session-queued {

@@ -3701,7 +3701,12 @@ function MessageComposer({
   }
 
   return (
-    <div className="session-composer" ref={composerRef}>
+    <div
+      className="session-composer"
+      data-compact={narrowComposer ? "true" : undefined}
+      data-history-count={history.length}
+      ref={composerRef}
+    >
       {pending.map((message) => (
         <div
           className={`session-user session-pending-user is-${message.status}`}
