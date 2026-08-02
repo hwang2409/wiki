@@ -56,6 +56,95 @@ function loopState(round, cap = 8, danger = "normal") {
   };
 }
 
+async function resizeAgentPane(page, label, targetRatio) {
+  const split = page.locator(".pane-split.row");
+  const divider = split.locator(".pane-divider.row");
+  const bounds = await split.boundingBox();
+  if (!bounds) throw new Error(`${label}: split pane has no bounds`);
+  await divider.hover();
+  await page.mouse.down();
+  await page.mouse.move(
+    bounds.x + bounds.width * targetRatio,
+    bounds.y + bounds.height / 2,
+    { steps: 8 },
+  );
+  await page.mouse.up();
+  await page.waitForFunction(({ expected }) => {
+    const pane = document.querySelector(".pane-frame[data-pane-key='pane-1']");
+    if (!(pane instanceof HTMLElement)) return false;
+    const splitRoot = pane.closest(".pane-split");
+    if (!(splitRoot instanceof HTMLElement)) return false;
+    const ratio = pane.getBoundingClientRect().width / splitRoot.getBoundingClientRect().width;
+    return Math.abs(ratio - expected) <= 0.02;
+  }, { expected: targetRatio });
+}
+
+async function assertLoopDetailFitsPane(detail, label) {
+  const result = await detail.evaluate((dialog) => {
+    const pane = dialog.closest(".pane-frame[data-pane-key='pane-1']");
+    if (!(pane instanceof HTMLElement)) return { missingPane: true };
+    const paneRect = pane.getBoundingClientRect();
+    const dock = pane.querySelector(".session-composer");
+    const dockRect = dock instanceof HTMLElement ? dock.getBoundingClientRect() : null;
+    const dialogRect = dialog.getBoundingClientRect();
+    const elements = [dialog, ...dialog.querySelectorAll("*")]
+      .filter((element) => element instanceof HTMLElement);
+    const escaped = elements
+      .map((element) => {
+        const rect = element.getBoundingClientRect();
+        return {
+          name: element.className || element.tagName.toLowerCase(),
+          left: Math.round(rect.left),
+          right: Math.round(rect.right),
+          top: Math.round(rect.top),
+          bottom: Math.round(rect.bottom),
+        };
+      })
+      .filter((rect) =>
+        rect.left < Math.floor(paneRect.left)
+        || rect.right > Math.ceil(paneRect.right));
+    const horizontalOverflow = elements
+      .filter((element) => element.scrollWidth > element.clientWidth + 1)
+      .map((element) => ({
+        name: element.className || element.tagName.toLowerCase(),
+        clientWidth: element.clientWidth,
+        scrollWidth: element.scrollWidth,
+      }));
+    return {
+      missingPane: false,
+      dialog: {
+        left: Math.round(dialogRect.left),
+        right: Math.round(dialogRect.right),
+        bottom: Math.round(dialogRect.bottom),
+        width: Math.round(dialogRect.width),
+      },
+      pane: {
+        left: Math.round(paneRect.left),
+        right: Math.round(paneRect.right),
+        width: Math.round(paneRect.width),
+      },
+      dialogEscaped:
+        dialogRect.left < paneRect.left
+        || dialogRect.right > paneRect.right
+        || dialogRect.top < paneRect.top
+        || dialogRect.bottom > paneRect.bottom,
+      dockTop: dockRect ? Math.round(dockRect.top) : null,
+      escaped,
+      horizontalOverflow,
+      overlapsDock: dockRect ? dialogRect.bottom > dockRect.top + 1 : false,
+    };
+  });
+  if (
+    result.missingPane
+    || result.dialogEscaped
+    || result.escaped?.length
+    || result.horizontalOverflow?.length
+    || result.overlapsDock
+  ) {
+    throw new Error(`${label}: loop detail escaped its pane ${JSON.stringify(result)}`);
+  }
+}
+
 async function main() {
   await fs.mkdir(OUT_DIR, { recursive: true });
   const fixtures = makeFixtureRoot("wiki-240-header-");
@@ -250,36 +339,21 @@ async function main() {
       currentStatus = fixture.status;
       currentLoop = fixture.loop;
       await writeStatus(fixtures, currentStatus);
-      for (const viewport of [
+      const viewports = [
         { name: "normal", width: 1440, height: 900, splitRatio: null },
         { name: "split-35", width: 1280, height: 900, splitRatio: 0.35 },
-      ]) {
+      ];
+      if (fixture.name === "over-cap") {
+        viewports.push({ name: "split-15", width: 1280, height: 900, splitRatio: 0.15 });
+      }
+      for (const viewport of viewports) {
         await page.setViewportSize({ width: viewport.width, height: viewport.height });
         await page.goto("about:blank");
         await page.goto(`${backend.baseUrl}/#/agent/${TICKET}`, { waitUntil: "domcontentloaded" });
         const header = page.locator(".agent-session-surface-head");
         await header.waitFor({ state: "visible" });
         if (viewport.splitRatio !== null) {
-          const split = page.locator(".pane-split.row");
-          const divider = split.locator(".pane-divider.row");
-          const bounds = await split.boundingBox();
-          if (!bounds) throw new Error(`${fixture.name}: split pane has no bounds`);
-          await divider.hover();
-          await page.mouse.down();
-          await page.mouse.move(
-            bounds.x + bounds.width * viewport.splitRatio,
-            bounds.y + bounds.height / 2,
-            { steps: 8 },
-          );
-          await page.mouse.up();
-          await page.waitForFunction(() => {
-            const pane = document.querySelector(".pane-frame[data-pane-key='pane-1']");
-            if (!(pane instanceof HTMLElement)) return false;
-            const splitRoot = pane.closest(".pane-split");
-            if (!(splitRoot instanceof HTMLElement)) return false;
-            const ratio = pane.getBoundingClientRect().width / splitRoot.getBoundingClientRect().width;
-            return ratio >= 0.33 && ratio <= 0.37;
-          });
+          await resizeAgentPane(page, `${fixture.name}/${viewport.name}`, viewport.splitRatio);
         }
         await header.locator('[data-testid="session-state-pill"]').filter({ hasText: fixture.status.state }).waitFor();
         const expectedRound = fixture.loop.round > fixture.loop.cap
@@ -365,24 +439,59 @@ async function main() {
         if (escapedControls.length > 0) {
           throw new Error(`${fixture.name}/${viewport.name}: controls escaped header ${JSON.stringify(escapedControls)}`);
         }
+        const clippedControls = await header.locator(
+          ".loop-chrome-trigger, .loop-autopilot-toggle, .agent-surface-action, .session-close",
+        ).evaluateAll((controls) => controls
+          .filter((control) => control.scrollWidth > control.clientWidth + 1)
+          .map((control) => ({
+            name: control.getAttribute("aria-label") || control.textContent?.trim() || "control",
+            clientWidth: control.clientWidth,
+            scrollWidth: control.scrollWidth,
+          })));
+        if (clippedControls.length > 0) {
+          throw new Error(`${fixture.name}/${viewport.name}: controls clipped content ${JSON.stringify(clippedControls)}`);
+        }
 
-        await header.screenshot({
-          path: path.join(OUT_DIR, `${fixture.name}-${viewport.name}.png`),
-        });
+        if (viewport.name !== "split-15") {
+          await header.screenshot({
+            path: path.join(OUT_DIR, `${fixture.name}-${viewport.name}.png`),
+          });
+        }
+
+        if (fixture.name === "over-cap" && viewport.splitRatio !== null) {
+          const loopTrigger = header.getByRole("button", { name: /show merge-ready loop history/i });
+          await loopTrigger.click();
+          const detail = header.locator(".loop-chrome-detail");
+          await detail.getByText("latest finding").waitFor();
+          await detail.getByText("The header hid the current run step.").first().waitFor();
+          await detail.locator(".loop-history-row").waitFor();
+          await detail.getByText("autopilot log").waitFor();
+          await assertLoopDetailFitsPane(detail, `${fixture.name}/${viewport.name}`);
+          const agentPane = page.locator(".pane-frame[data-pane-key='pane-1']");
+          await agentPane.screenshot({
+            path: path.join(OUT_DIR, `${fixture.name}-dialog-${viewport.name}.png`),
+          });
+          const autopilotLog = detail.locator(".loop-autopilot-log");
+          await autopilotLog.scrollIntoViewIfNeeded();
+          const logVisibility = await autopilotLog.evaluate((log) => {
+            const dialog = log.closest(".loop-chrome-detail");
+            if (!(dialog instanceof HTMLElement)) return false;
+            const logRect = log.getBoundingClientRect();
+            const dialogRect = dialog.getBoundingClientRect();
+            return logRect.top >= dialogRect.top && logRect.bottom <= dialogRect.bottom;
+          });
+          if (!logVisibility) {
+            throw new Error(`${fixture.name}/${viewport.name}: autopilot log is not reachable in loop detail`);
+          }
+          if (viewport.name === "split-15") {
+            await agentPane.screenshot({
+              path: path.join(OUT_DIR, `${fixture.name}-dialog-log-${viewport.name}.png`),
+            });
+          }
+        }
       }
     }
 
-    await page.setViewportSize({ width: 1440, height: 900 });
-    currentStatus = states[0].status;
-    currentLoop = states[0].loop;
-    await page.goto("about:blank");
-    await page.goto(`${backend.baseUrl}/#/agent/${TICKET}`, { waitUntil: "domcontentloaded" });
-    const loopTrigger = page.getByRole("button", { name: /show merge-ready loop history/i });
-    await loopTrigger.click();
-    const detail = page.locator(".loop-chrome-detail");
-    await detail.getByText("latest finding").waitFor();
-    await detail.getByText("The header hid the current run step.").first().waitFor();
-    await detail.getByText("autopilot log").waitFor();
     if ((await page.locator('[data-testid="session-run-details"]').count()) !== 0) {
       throw new Error("WIKI-240: Run details must stay removed");
     }
@@ -396,12 +505,16 @@ async function main() {
         screenshots: states.flatMap((fixture) => [
           `${fixture.name}-normal.png`,
           `${fixture.name}-split-35.png`,
+        ]).concat([
+          "over-cap-dialog-split-35.png",
+          "over-cap-dialog-split-15.png",
+          "over-cap-dialog-log-split-15.png",
         ]),
         audit: [
-          "two clear header levels at normal width and in a real 35% split pane",
+          "two clear header levels at normal width and in real 35% and 15% split panes",
           "current step remains readable without horizontal clipping",
           "Replace, Review, Graph, Replay, Close, and autopilot remain discoverable",
-          "loop history, findings, plateau state, and autopilot log remain available",
+          "open loop history, findings, plateau state, and autopilot log stay inside narrow panes",
           "dense controls keep at least 32px height and visible focus",
           "cost and Run details remain absent",
         ],
@@ -409,7 +522,10 @@ async function main() {
     );
     console.error(`[wiki-240-playwright] evidence written to ${OUT_DIR}`);
   } finally {
-    await page.close();
+    if (!page.isClosed()) {
+      await page.unrouteAll({ behavior: "ignoreErrors" });
+      await page.close();
+    }
     await browser.close();
     await backend.stop();
   }

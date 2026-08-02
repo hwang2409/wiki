@@ -9,13 +9,16 @@
     "at-cap-normal.png",
     "at-cap-split-35.png",
     "over-cap-normal.png",
-    "over-cap-split-35.png"
+    "over-cap-split-35.png",
+    "over-cap-dialog-split-35.png",
+    "over-cap-dialog-split-15.png",
+    "over-cap-dialog-log-split-15.png"
   ],
   "audit": [
-    "two clear header levels at normal width and in a real 35% split pane",
+    "two clear header levels at normal width and in real 35% and 15% split panes",
     "current step remains readable without horizontal clipping",
     "Replace, Review, Graph, Replay, Close, and autopilot remain discoverable",
-    "loop history, findings, plateau state, and autopilot log remain available",
+    "open loop history, findings, plateau state, and autopilot log stay inside narrow panes",
     "dense controls keep at least 32px height and visible focus",
     "cost and Run details remain absent"
   ]

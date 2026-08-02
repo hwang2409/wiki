@@ -14228,6 +14228,38 @@ textarea.composer-command-input {
     flex-wrap: wrap;
     width: 100%;
     max-width: 100%;
+    overflow: visible;
+  }
+
+  .loop-chrome-chip {
+    max-width: 100%;
+    white-space: normal;
+    line-height: 1.25;
+  }
+
+  .loop-chrome-detail {
+    width: min(520px, 100%);
+    min-width: 0;
+    max-height: min(40vh, 360px);
+  }
+
+  .loop-chrome-detail-head {
+    align-items: flex-start;
+    flex-direction: column;
+    gap: 2px;
+  }
+
+  .loop-chrome-detail-sub,
+  .loop-autopilot-log-head,
+  .loop-autopilot-log-details {
+    width: 100%;
+    min-width: 0;
+    overflow-wrap: anywhere;
+  }
+
+  .loop-autopilot-log-head,
+  .loop-autopilot-log-details {
+    flex-wrap: wrap;
   }
 
   .loop-chrome-caret {
@@ -14241,6 +14273,12 @@ textarea.composer-command-input {
     border-top: 1px solid var(--background-modifier-border);
     flex-wrap: wrap;
     overflow-x: visible;
+  }
+}
+
+@container agent-session (max-width: 260px) {
+  .loop-chrome-detail {
+    max-height: min(30vh, 280px);
   }
 }
 
