@@ -27,6 +27,7 @@ from backend.app.agent_runtime.client import (
     SupervisorRemoteError,
     SupervisorUnavailable,
 )
+from backend.app.agent_runtime.command_log import AgentCommand, CommandRetryable
 from backend.app.agent_runtime import daemon as agent_daemon
 from backend.app.agent_runtime import supervisor as supervisor_module
 from backend.app.agent_runtime.claude import ClaudeStreamAdapter
@@ -54,6 +55,7 @@ from backend.app.agent_runtime.provider import (
 from backend.app.agent_runtime.store import RunNotFound, RunStore, RuntimePaths, StoreConflict
 from backend.app.agent_runtime.supervisor import Supervisor, resolve_safe_worktree
 from backend.app.agent_runtime.types import (
+    EventDisposition,
     MAX_MESSAGE_DEDUPE_KEYS,
     LifecycleState,
     ProviderKind,
@@ -1068,6 +1070,84 @@ class SupervisorTests(unittest.IsolatedAsyncioTestCase):
             pending_id,
         )
 
+    async def test_on_idle_crash_after_provider_acceptance_does_not_resend(self) -> None:
+        record = await self.supervisor.start_run(
+            agent_id="WIKI-ON-IDLE-CRASH",
+            provider=ProviderKind.CODEX,
+            role="implement",
+            model="fixture-codex",
+            effort="high",
+            worktree=str(self.worktree),
+            prompt="on-idle crash boundary",
+        )
+        adapter = self.supervisor.adapters[record.run_id]
+        pending_id = str(uuid4())
+
+        with mock.patch.object(
+            adapter,
+            "send_on_idle",
+            wraps=adapter.send_on_idle,
+        ) as provider_send:
+            with mock.patch.object(
+                self.store.command_log,
+                "mark_steer_sent_for_pending",
+                side_effect=asyncio.CancelledError,
+            ):
+                with self.assertRaises(asyncio.CancelledError):
+                    await self.supervisor.send_on_idle(
+                        record.run_id,
+                        "deliver once",
+                        pending_id=pending_id,
+                        effect_id="on-idle-crash",
+                    )
+
+            self.assertEqual(provider_send.await_count, 1)
+            effect = self.store.command_log.steer_effect_for_pending(
+                record.run_id, pending_id
+            )
+            self.assertIsNotNone(effect)
+            self.assertEqual(effect["status"] if effect else None, "sending")
+
+            # A restart has the queued message and the durable sending marker,
+            # but no provider echo yet. Recovery must wait instead of sending.
+            await self.supervisor._deliver_next_queued_locked(  # noqa: SLF001
+                record.run_id,
+                adapter,
+            )
+            self.assertEqual(provider_send.await_count, 1)
+
+            pending = self.store.get(record.run_id).pending_user_messages[0]
+            raw = self.store.append_raw(
+                record.run_id,
+                provider="codex",
+                direction="server",
+                payload={"method": "item/completed"},
+            )
+            self.store.append_normalized(
+                record.run_id,
+                raw_seq=int(raw["seq"]),
+                disposition=EventDisposition.RENDERED,
+                kind="user_message",
+                payload={
+                    "pending_id": pending_id,
+                    "composer_text": pending["text"],
+                    "composer_sent_at": pending["sent_at"],
+                },
+            )
+            await self.supervisor._deliver_next_queued_locked(  # noqa: SLF001
+                record.run_id,
+                adapter,
+            )
+
+        self.assertEqual(provider_send.await_count, 1)
+        self.assertEqual(self.store.get(record.run_id).queued_messages, [])
+        self.assertEqual(
+            self.store.command_log.steer_effect_for_pending(
+                record.run_id, pending_id
+            )["status"],
+            "acknowledged",
+        )
+
     async def test_delivered_pending_id_survives_replace_until_late_echo(self) -> None:
         record = await self.supervisor.start_run(
             agent_id="WIKI-96-REPLACE",
@@ -1678,6 +1758,534 @@ class SupervisorTests(unittest.IsolatedAsyncioTestCase):
         recovery = await self.supervisor.recover_on_start()
         old_result = next(item for item in recovery if item["run_id"] == old.run_id)
         self.assertEqual(old_result["action"], "skip")
+
+    async def test_replace_replay_waits_for_replacement_provider_control(self) -> None:
+        old = await self.supervisor.start_run(
+            agent_id="WIKI-REPLACE-OWNERSHIP",
+            provider=ProviderKind.CODEX,
+            role="implement",
+            model="fixture-codex",
+            effort="high",
+            worktree=str(self.worktree),
+            prompt="original ownership prompt",
+        )
+        replacement_id = str(uuid4())
+        payload = {
+            "run_id": old.run_id,
+            "replacement_run_id": replacement_id,
+            "prompt": "replacement ownership prompt",
+        }
+        command = AgentCommand.replace(
+            agent_id=old.agent_id,
+            request_id="replace-ownership",
+            payload=payload,
+        )
+        replacement = await self.supervisor.replace(
+            old.run_id,
+            payload["prompt"],
+            replacement_run_id=replacement_id,
+            effect_id=command.request_id,
+            command_hash=command.command_hash,
+        )
+        adapter = self.supervisor.adapters[replacement.run_id]
+        await self.supervisor._detach_adapter(replacement.run_id)  # noqa: SLF001
+
+        with self.assertRaises(CommandRetryable):
+            await self.supervisor._dispatch(  # noqa: SLF001
+                "run/replace",
+                {
+                    **payload,
+                    "agent_id": old.agent_id,
+                    "request_id": command.request_id,
+                },
+                command_hash=command.command_hash,
+            )
+
+        self.supervisor._attach_adapter(replacement.run_id, adapter)  # noqa: SLF001
+        replayed = await self.supervisor._dispatch(  # noqa: SLF001
+            "run/replace",
+            {
+                **payload,
+                "agent_id": old.agent_id,
+                "request_id": command.request_id,
+            },
+            command_hash=command.command_hash,
+        )
+        self.assertEqual(replayed["run_id"], replacement.run_id)
+        self.assertEqual(
+            self.store.command_log.replace_effect(
+                "run/replace",
+                command.request_id,
+                agent_id=old.agent_id,
+                command_hash=command.command_hash,
+            )["status"],
+            "completed",
+        )
+
+    async def test_start_replay_keeps_uncommitted_retained_run_pending_after_restart(
+        self,
+    ) -> None:
+        request_id = "start-retained-uncommitted"
+        record = RunRecord.new(
+            agent_id="WIKI-START-RETAINED",
+            provider=ProviderKind.CODEX,
+            role="implement",
+            model="fixture-codex",
+            worktree=str(self.worktree),
+            prompt="retained uncommitted start",
+            run_id=str(uuid4()),
+            start_request_id=request_id,
+        )
+        command = AgentCommand.spawn(
+            agent_id=record.agent_id,
+            request_id=request_id,
+            payload={
+                "agent_id": record.agent_id,
+                "provider": record.provider.value,
+                "role": record.role,
+                "model": record.model,
+                "worktree": record.worktree,
+                "prompt": record.initial_prompt or "retained uncommitted start",
+                "run_id": record.run_id,
+            },
+        )
+        self.store.command_log.append_intent(command, {record.agent_id: None})
+        self.store.create(record, transactional_start=True)
+        record = self.store.get(record.run_id)
+        record.provider_pid = os.getpid()
+        self.store._write_record(record)  # noqa: SLF001 - uncertain live provider fixture
+        self.store.transition(
+            record.run_id,
+            LifecycleState.BLOCKED,
+            reason="provider identity is uncertain after restart",
+        )
+
+        restarted_store = RunStore(self.paths)
+        restarted = Supervisor(
+            restarted_store,
+            FixtureAdapterFactory(FIXTURES, pid=os.getpid()),
+        )
+        try:
+            await restarted.command_queue.recover_pending()
+            self.assertEqual(restarted_store.command_log.pending(), [command])
+            self.assertIsNone(
+                restarted_store.command_log.receipt("run/start", request_id)
+            )
+            retained = restarted_store.get(record.run_id)
+            self.assertEqual(retained.state, LifecycleState.BLOCKED)
+            self.assertIsNotNone(retained.start_transaction)
+            self.assertIsNone(restarted_store.find_start_request(request_id))
+        finally:
+            await restarted.close()
+
+    async def test_recovery_retries_uncommitted_start_cleanup_after_pid_exit(
+        self,
+    ) -> None:
+        request_id = "start-retry-after-pid-exit"
+        record = RunRecord.new(
+            agent_id="WIKI-START-RETRY-AFTER-EXIT",
+            provider=ProviderKind.CODEX,
+            role="implement",
+            model="fixture-codex",
+            worktree=str(self.worktree),
+            prompt="retry uncommitted start after provider exit",
+            run_id=str(uuid4()),
+            start_request_id=request_id,
+        )
+        command = AgentCommand.spawn(
+            agent_id=record.agent_id,
+            request_id=request_id,
+            payload={
+                "agent_id": record.agent_id,
+                "provider": record.provider.value,
+                "role": record.role,
+                "model": record.model,
+                "worktree": record.worktree,
+                "prompt": record.initial_prompt or "retry uncommitted start after provider exit",
+                "run_id": record.run_id,
+            },
+        )
+        self.store.command_log.append_intent(command, {record.agent_id: None})
+        self.store.create(record, transactional_start=True)
+        provider = subprocess.Popen(
+            [sys.executable, "-c", "import time; time.sleep(30)"],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+        )
+        restarted: Supervisor | None = None
+        try:
+            record = self.store.get(record.run_id)
+            record.provider_pid = provider.pid
+            self.store._write_record(record)  # noqa: SLF001 - uncertain live provider fixture
+            self.store.transition(
+                record.run_id,
+                LifecycleState.BLOCKED,
+                reason="provider identity is uncertain after restart",
+            )
+
+            restarted_store = RunStore(self.paths)
+            restarted = Supervisor(
+                restarted_store,
+                FixtureAdapterFactory(FIXTURES, pid=os.getpid()),
+            )
+            first = await restarted.recover_on_start()
+            self.assertEqual(first[0]["action"], "block")
+            self.assertIsNotNone(restarted_store.get(record.run_id).start_transaction)
+            self.assertEqual(restarted_store.command_log.pending(), [command])
+            self.assertIsNone(
+                restarted_store.command_log.receipt("run/start", request_id)
+            )
+
+            provider.terminate()
+            provider.wait(timeout=5)
+            second = await restarted.recover_on_start()
+
+            self.assertEqual(restarted_store.list_runs(), [restarted_store.get(record.run_id)])
+            current = restarted_store.get(record.run_id)
+            self.assertEqual(current.run_id, record.run_id)
+            self.assertIsNone(current.start_transaction)
+            self.assertEqual(second, [])
+            self.assertEqual(restarted_store.command_log.pending(), [])
+            receipt = restarted_store.command_log.receipt("run/start", request_id)
+            self.assertIsNotNone(receipt)
+            assert receipt is not None
+            self.assertTrue(receipt.ok)
+        finally:
+            if provider.poll() is None:
+                provider.kill()
+                provider.wait(timeout=5)
+            if restarted is not None:
+                await restarted.close()
+
+    async def test_recovery_poll_skips_in_flight_local_start(self) -> None:
+        release_start = asyncio.Event()
+        start_entered = asyncio.Event()
+
+        class PausedStartClaudeAdapter(ClaudeFixtureAdapter):
+            async def start(self, request: StartRequest) -> AdapterStatus:
+                start_entered.set()
+                await release_start.wait()
+                return await super().start(request)
+
+        class PausedStartFactory(FixtureAdapterFactory):
+            def __call__(self, record: RunRecord) -> ProviderAdapter:
+                if record.provider is ProviderKind.CLAUDE:
+                    return PausedStartClaudeAdapter(
+                        self.fixture_dir / "claude_stream_native_surfaces.jsonl",
+                        pid=self.pid,
+                        generation=record.provider_generation,
+                    )
+                return super().__call__(record)
+
+        await self.supervisor.close()
+        self.supervisor = Supervisor(
+            self.store,
+            PausedStartFactory(FIXTURES, pid=os.getpid()),
+        )
+
+        start_task = asyncio.create_task(
+            self.supervisor.start_run(
+                agent_id="WIKI-PAUSED-START-INFLIGHT",
+                provider=ProviderKind.CLAUDE,
+                role="implement",
+                model="fixture-claude",
+                effort=None,
+                worktree=str(self.worktree),
+                prompt="paused start survives recovery poll",
+            )
+        )
+        recovery_task: asyncio.Task[list[dict[str, str]]] | None = None
+        try:
+            await asyncio.wait_for(start_entered.wait(), timeout=2)
+
+            runs = self.store.list_runs()
+            self.assertEqual(len(runs), 1)
+            in_flight = runs[0]
+            self.assertIsNotNone(in_flight.start_transaction)
+            self.assertIn(in_flight.run_id, self.supervisor.adapters)
+            run_dir = self.store.run_dir(in_flight.run_id)
+            self.assertTrue(run_dir.exists())
+
+            abort_called = asyncio.Event()
+            original_abort = self.store.abort_uncommitted_starts
+
+            def instrumented_abort() -> list[str]:
+                result = original_abort()
+                abort_called.set()
+                return result
+
+            self.store.abort_uncommitted_starts = instrumented_abort  # type: ignore[method-assign]
+
+            recovery_task = asyncio.create_task(self.supervisor.recover_on_start())
+            await asyncio.wait_for(abort_called.wait(), timeout=2)
+
+            # The periodic recovery must not race the launch it does not own.
+            self.assertIn(in_flight.run_id, self.supervisor.adapters)
+            self.assertTrue(run_dir.exists())
+            persisted = self.store.get(in_flight.run_id)
+            self.assertIsNotNone(persisted.start_transaction)
+            self.assertEqual(
+                self.store.current_run_id(in_flight.agent_id),
+                in_flight.run_id,
+            )
+            self.assertIsNone(self.store.command_log.receipt("run/start", None))
+
+            # Release the paused provider start; commit_start must still succeed.
+            release_start.set()
+            record = await asyncio.wait_for(start_task, timeout=5)
+            await asyncio.wait_for(recovery_task, timeout=5)
+
+            self.assertIsNone(self.store.get(record.run_id).start_transaction)
+            self.assertIn(record.run_id, self.supervisor.adapters)
+            self.assertTrue(self.store.run_dir(record.run_id).exists())
+        finally:
+            release_start.set()
+            for task in (start_task, recovery_task):
+                if task is None or task.done():
+                    continue
+                try:
+                    await asyncio.wait_for(task, timeout=2)
+                except Exception:
+                    task.cancel()
+                    await asyncio.gather(task, return_exceptions=True)
+
+    async def test_recovery_aborts_uncommitted_start_when_pid_dies_mid_scan(
+        self,
+    ) -> None:
+        """PID exit between abort scan and _recover_once must not RESUME."""
+
+        request_id = "start-race-scan-then-exit"
+        record = RunRecord.new(
+            agent_id="WIKI-START-RACE-SCAN-EXIT",
+            provider=ProviderKind.CODEX,
+            role="implement",
+            model="fixture-codex",
+            worktree=str(self.worktree),
+            prompt="uncommitted start with post-scan PID exit",
+            run_id=str(uuid4()),
+            start_request_id=request_id,
+        )
+        command = AgentCommand.spawn(
+            agent_id=record.agent_id,
+            request_id=request_id,
+            payload={
+                "agent_id": record.agent_id,
+                "provider": record.provider.value,
+                "role": record.role,
+                "model": record.model,
+                "worktree": record.worktree,
+                "prompt": record.initial_prompt or "uncommitted start with post-scan PID exit",
+                "run_id": record.run_id,
+            },
+        )
+        self.store.command_log.append_intent(command, {record.agent_id: None})
+        self.store.create(record, transactional_start=True)
+        provider = subprocess.Popen(
+            [sys.executable, "-c", "import time; time.sleep(30)"],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+        )
+        restarted: Supervisor | None = None
+        try:
+            record = self.store.get(record.run_id)
+            record.provider_pid = provider.pid
+            # Simulate a crash between adapter.start() and commit_start(): the
+            # provider is durably attributed, state is IDLE, session id is
+            # visible — every RESUME predicate is satisfied except the
+            # uncommitted start_transaction we own here.
+            record.provider_session_id = "codex-race-session"
+            record.state = LifecycleState.IDLE
+            self.store._write_record(record)  # noqa: SLF001 - restore crash-time snapshot
+
+            restarted_store = RunStore(self.paths)
+            restarted = Supervisor(
+                restarted_store,
+                FixtureAdapterFactory(FIXTURES, pid=os.getpid()),
+            )
+
+            original_abort = restarted_store.abort_uncommitted_starts
+
+            def abort_then_kill() -> list[str]:
+                aborted = original_abort()
+                # Force the PID to exit strictly between the abort scan
+                # (which sees live-unverifiable identity and skips) and
+                # _recover_once (which now sees a dead PID).
+                if provider.poll() is None:
+                    provider.terminate()
+                    provider.wait(timeout=5)
+                return aborted
+
+            restarted_store.abort_uncommitted_starts = abort_then_kill  # type: ignore[method-assign]
+
+            results = await restarted.recover_on_start()
+
+            self.assertEqual(len(results), 1)
+            self.assertEqual(results[0]["run_id"], record.run_id)
+            self.assertEqual(results[0]["action"], "skip")
+            self.assertEqual(results[0]["reason"], "uncommitted start aborted")
+            # The command intent replays cleanly: the aborted record is
+            # recreated as a fresh, committed start; no start_transaction
+            # remains and the receipt is durable.
+            self.assertEqual(restarted_store.command_log.pending(), [])
+            receipt = restarted_store.command_log.receipt("run/start", request_id)
+            self.assertIsNotNone(receipt)
+            assert receipt is not None
+            self.assertTrue(receipt.ok)
+            current = restarted_store.get(record.run_id)
+            self.assertEqual(current.run_id, record.run_id)
+            self.assertIsNone(current.start_transaction)
+            self.assertIn(record.run_id, restarted.adapters)
+        finally:
+            if provider.poll() is None:
+                provider.kill()
+                provider.wait(timeout=5)
+            if restarted is not None:
+                await restarted.close()
+
+    async def _crash_replace_with_published_effect(
+        self,
+        *,
+        agent_id: str,
+        request_id: str,
+        cross_provider: bool,
+    ) -> tuple[RunRecord, RunRecord, AgentCommand, dict[str, Any]]:
+        """Drive one fresh/cross-provider replace to a durably committed
+        replacement, then rewind the effect to "published" to simulate a
+        crash between _launch_record and the completed marker."""
+
+        old = await self.supervisor.start_run(
+            agent_id=agent_id,
+            provider=ProviderKind.CLAUDE if cross_provider else ProviderKind.CODEX,
+            role="implement",
+            model="fixture-claude" if cross_provider else "fixture-codex",
+            effort=None if cross_provider else "high",
+            worktree=str(self.worktree),
+            prompt="original prompt",
+        )
+        if not cross_provider:
+            # Force the fresh replacement branch: detach and drop the old PID
+            # so _replace_without_admission sees old_adapter is None with no
+            # orphan handling required.
+            old_adapter = self.supervisor.adapters[old.run_id]
+            await self.supervisor._detach_adapter(old.run_id)  # noqa: SLF001
+            await old_adapter.close()
+            old = self.store.transition(
+                old.run_id,
+                LifecycleState.DEAD,
+                reason="prepare fresh replace",
+            )
+            record = self.store.get(old.run_id)
+            record.provider_pid = None
+            self.store._write_record(record)  # noqa: SLF001 - clear PID for fresh path
+
+        replacement_id = str(uuid4())
+        target_provider = ProviderKind.CODEX if cross_provider else ProviderKind.CODEX
+        payload: dict[str, Any] = {
+            "agent_id": old.agent_id,
+            "run_id": old.run_id,
+            "replacement_run_id": replacement_id,
+            "prompt": "replacement prompt",
+        }
+        if cross_provider:
+            payload["provider"] = target_provider.value
+            payload["model"] = "fixture-codex"
+        command = AgentCommand.replace(
+            agent_id=old.agent_id,
+            request_id=request_id,
+            payload=payload,
+        )
+
+        replacement = await self.supervisor.replace(
+            old.run_id,
+            payload["prompt"],
+            provider=target_provider if cross_provider else None,
+            replacement_run_id=replacement_id,
+            effect_id=command.request_id,
+            command_hash=command.command_hash,
+        )
+        self.assertIn(replacement.run_id, self.supervisor.adapters)
+        self.assertIsNone(self.store.get(replacement.run_id).start_transaction)
+
+        # Rewind the effect status to "published" — simulates a crash after
+        # store.replace()+publish and inside _launch_record's window.
+        self.store.command_log.update_replace_effect(
+            "run/replace", command.request_id, "published"
+        )
+        effect = self.store.command_log.replace_effect(
+            "run/replace",
+            command.request_id,
+            agent_id=old.agent_id,
+            command_hash=command.command_hash,
+        )
+        self.assertIsNotNone(effect)
+        assert effect is not None
+        self.assertEqual(effect["status"], "published")
+        return old, replacement, command, payload
+
+    async def _replay_published_replace_and_assert_promoted(
+        self,
+        *,
+        old: RunRecord,
+        replacement: RunRecord,
+        command: AgentCommand,
+        payload: dict[str, Any],
+    ) -> None:
+        # The supervisor still owns the replacement adapter — the reviewer's
+        # crash-recovery invariant is that a durably committed replacement
+        # must be promoted, not killed. Replay the command via _dispatch to
+        # exercise the exact code path recover_pending would drive.
+        self.assertIn(replacement.run_id, self.supervisor.adapters)
+
+        replayed = await self.supervisor._dispatch(  # noqa: SLF001
+            "run/replace",
+            {**payload, "request_id": command.request_id},
+            command_hash=command.command_hash,
+        )
+        self.assertEqual(replayed["run_id"], replacement.run_id)
+        self.assertIn(replacement.run_id, self.supervisor.adapters)
+        current = self.store.get(replacement.run_id)
+        self.assertNotEqual(current.state, LifecycleState.BLOCKED)
+        self.assertEqual(
+            self.store.current_run_id(old.agent_id), replacement.run_id
+        )
+        effect = self.store.command_log.replace_effect(
+            "run/replace",
+            command.request_id,
+            agent_id=old.agent_id,
+            command_hash=command.command_hash,
+        )
+        self.assertIsNotNone(effect)
+        assert effect is not None
+        self.assertEqual(effect["status"], "completed")
+        self.assertTrue(self.store.run_dir(replacement.run_id).exists())
+
+    async def test_replace_replay_promotes_published_effect_fresh_path(self) -> None:
+        old, replacement, command, payload = await self._crash_replace_with_published_effect(
+            agent_id="WIKI-PUBLISHED-FRESH-CRASH",
+            request_id="published-fresh-crash",
+            cross_provider=False,
+        )
+        await self._replay_published_replace_and_assert_promoted(
+            old=old,
+            replacement=replacement,
+            command=command,
+            payload=payload,
+        )
+
+    async def test_replace_replay_promotes_published_effect_cross_provider_path(
+        self,
+    ) -> None:
+        old, replacement, command, payload = await self._crash_replace_with_published_effect(
+            agent_id="WIKI-PUBLISHED-CROSS-CRASH",
+            request_id="published-cross-crash",
+            cross_provider=True,
+        )
+        await self._replay_published_replace_and_assert_promoted(
+            old=old,
+            replacement=replacement,
+            command=command,
+            payload=payload,
+        )
 
     async def test_replace_cancellation_during_quiesce_terminalizes_old_run(self) -> None:
         old = await self.supervisor.start_run(
@@ -5624,6 +6232,139 @@ class DaemonProcessTests(unittest.TestCase):
                     process.stderr.close()
             self.assertFalse(paths.socket_path.exists())
             self.assertFalse(paths.pid_path.exists())
+
+    def test_daemon_subprocess_restart_replays_spawn_steer_replace_archive(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            paths = _paths(root)
+            worktree = root / "worktree"
+            worktree.mkdir()
+            repo_root = Path(__file__).resolve().parents[2]
+            processes: list[subprocess.Popen[str]] = []
+
+            def start_daemon() -> subprocess.Popen[str]:
+                process = subprocess.Popen(
+                    [
+                        sys.executable,
+                        "-m",
+                        "backend.app.agent_runtime.daemon",
+                        "--runtime-dir",
+                        str(paths.runtime_dir),
+                        "--socket",
+                        str(paths.socket_path),
+                        "--registry",
+                        str(paths.registry_path),
+                        "--fake-fixture-dir",
+                        str(FIXTURES),
+                    ],
+                    cwd=repo_root,
+                    env={
+                        **os.environ,
+                        "TMUX": "",
+                        "WIKI_AGENT_ARCHIVE_DIR": str(paths.archive_dir),
+                        "WIKI_AGENT_STATUS_DIR": str(paths.status_dir),
+                    },
+                    stdin=subprocess.DEVNULL,
+                    stdout=subprocess.DEVNULL,
+                    stderr=subprocess.PIPE,
+                    text=True,
+                )
+                processes.append(process)
+                client = SupervisorClient(paths, timeout=5)
+                deadline = time.monotonic() + 8
+                while time.monotonic() < deadline:
+                    try:
+                        if client.ping().get("status") == "ok":
+                            return process
+                    except SupervisorUnavailable:
+                        time.sleep(0.05)
+                stderr = process.stderr.read() if process.stderr else ""
+                self.fail(f"daemon did not restart: {stderr}")
+
+            def stop_daemon(process: subprocess.Popen[str]) -> None:
+                if process.poll() is None:
+                    process.terminate()
+                    process.wait(timeout=8)
+                if process.stderr:
+                    process.stderr.close()
+
+            client = SupervisorClient(paths, timeout=5)
+            process = start_daemon()
+            try:
+                start_params = {
+                    "agent_id": "WIKI-219-SUBPROCESS",
+                    "provider": "codex",
+                    "role": "implement",
+                    "model": "fixture-codex",
+                    "effort": "high",
+                    "worktree": str(worktree),
+                    "prompt": "subprocess restart spawn",
+                    "request_id": "subprocess-spawn",
+                }
+                started = client.request("run/start", start_params)
+                start_run_id = started["run_id"]
+                stop_daemon(process)
+                process = start_daemon()
+                replayed_start = client.request("run/start", start_params)
+                self.assertEqual(replayed_start["run_id"], start_run_id)
+
+                steer_params = {
+                    "agent_id": "WIKI-219-SUBPROCESS",
+                    "run_id": start_run_id,
+                    "text": "subprocess restart steer",
+                    "request_id": "subprocess-steer",
+                }
+                steered = client.request("run/send_now", steer_params)
+                stop_daemon(process)
+                process = start_daemon()
+                replayed_steer = client.request("run/send_now", steer_params)
+                self.assertEqual(replayed_steer, steered)
+
+                replace_params = {
+                    "agent_id": "WIKI-219-SUBPROCESS",
+                    "run_id": start_run_id,
+                    "prompt": "subprocess restart replace",
+                    "request_id": "subprocess-replace",
+                }
+                replaced = client.request("run/replace", replace_params)
+                replacement_run_id = replaced["run_id"]
+                self.assertNotEqual(replacement_run_id, start_run_id)
+                stop_daemon(process)
+                process = start_daemon()
+                replayed_replace = client.request("run/replace", replace_params)
+                self.assertEqual(replayed_replace["run_id"], replacement_run_id)
+
+                archive_params = {
+                    "agent_id": "WIKI-219-SUBPROCESS",
+                    "run_id": replacement_run_id,
+                    "outcome": "subprocess-test",
+                    "request_id": "subprocess-archive",
+                }
+                archived = client.request("run/archive", archive_params)
+                stop_daemon(process)
+                process = start_daemon()
+                replayed_archive = client.request("run/archive", archive_params)
+                self.assertEqual(replayed_archive["run_id"], archived["run_id"])
+                self.assertEqual(
+                    json.loads(paths.registry_path.read_text(encoding="utf-8")),
+                    {},
+                )
+
+                log = RunStore(paths).command_log
+                for method, request_id in (
+                    ("run/start", "subprocess-spawn"),
+                    ("run/send_now", "subprocess-steer"),
+                    ("run/replace", "subprocess-replace"),
+                    ("run/archive", "subprocess-archive"),
+                ):
+                    receipt = log.receipt(method, request_id)
+                    self.assertIsNotNone(receipt)
+                    assert receipt is not None
+                    self.assertTrue(receipt.ok)
+            finally:
+                stop_daemon(process)
+                for item in processes:
+                    self.assertIsNotNone(item.poll())
 
     def test_fingerprint_swap_replaces_live_runs_under_fresh_daemon(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

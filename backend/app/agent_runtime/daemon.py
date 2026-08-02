@@ -123,8 +123,8 @@ async def run_daemon(args: argparse.Namespace) -> None:
     recovery_task: asyncio.Task[None] | None = None
     fleet_task: asyncio.Task[None] | None = None
     try:
-        await server.start()
         await supervisor.recover_on_start()
+        await server.start()
         recovery_task = asyncio.create_task(
             _recovery_loop(supervisor, stop),
             name="agent-supervisor-recovery",

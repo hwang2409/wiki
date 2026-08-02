@@ -153,6 +153,10 @@ class RunRecord:
     orchestrator_id: str | None = None
     provider_session_id: str | None = None
     provider_pid: int | None = None
+    provider_pid_started_at: float | None = None
+    provider_executable: str | None = None
+    provider_process_group_id: int | None = None
+    provider_process_group_members: list[dict[str, Any]] = field(default_factory=list)
     provider_generation: int = 0
     active_turn_id: str | None = None
     current_turn_diff_turn_id: str | None = None
@@ -172,6 +176,11 @@ class RunRecord:
     replaced_by_run_id: str | None = None
     replaced_legacy_provider: str | None = None
     outcome: str | None = None
+    start_request_id: str | None = None
+    implicit_start_request: bool = False
+    # Set before a fresh start is published. It contains the exact registry
+    # and status preimage needed to undo a start after a daemon restart.
+    start_transaction: dict[str, Any] | None = None
     raw_event_count: int = 0
     normalized_event_count: int = 0
     # Every normalized event bumps ``normalized_event_count`` — including the
@@ -204,9 +213,12 @@ class RunRecord:
         orchestrator_id: str | None = None,
         replaces_run_id: str | None = None,
         backend_base_url: str | None = None,
+        run_id: str | None = None,
+        start_request_id: str | None = None,
+        implicit_start_request: bool = False,
     ) -> RunRecord:
         return cls(
-            run_id=str(uuid4()),
+            run_id=run_id or str(uuid4()),
             agent_id=agent_id,
             provider=provider,
             role=role,
@@ -217,6 +229,8 @@ class RunRecord:
             effort=effort,
             orchestrator_id=orchestrator_id,
             replaces_run_id=replaces_run_id,
+            start_request_id=start_request_id,
+            implicit_start_request=implicit_start_request,
         )
 
     def to_dict(self) -> dict[str, Any]:
@@ -245,6 +259,10 @@ class RunRecord:
             "automatic_resume_guarded_at": self.automatic_resume_guarded_at,
             "provider_session_id": self.provider_session_id,
             "provider_pid": self.provider_pid,
+            "provider_pid_started_at": self.provider_pid_started_at,
+            "provider_executable": self.provider_executable,
+            "provider_process_group_id": self.provider_process_group_id,
+            "provider_process_group_members": list(self.provider_process_group_members),
             "provider_generation": self.provider_generation,
             "active_turn_id": self.active_turn_id,
             "current_turn_diff_turn_id": self.current_turn_diff_turn_id,
@@ -258,6 +276,9 @@ class RunRecord:
             "replaced_by_run_id": self.replaced_by_run_id,
             "replaced_legacy_provider": self.replaced_legacy_provider,
             "outcome": self.outcome,
+            "start_request_id": self.start_request_id,
+            "implicit_start_request": self.implicit_start_request,
+            "start_transaction": self.start_transaction,
             "raw_event_count": self.raw_event_count,
             "normalized_event_count": self.normalized_event_count,
             "unread_event_seq": self.unread_event_seq,
@@ -308,6 +329,14 @@ class RunRecord:
             automatic_resume_guarded_at=value.get("automatic_resume_guarded_at"),
             provider_session_id=value.get("provider_session_id"),
             provider_pid=value.get("provider_pid"),
+            provider_pid_started_at=value.get("provider_pid_started_at"),
+            provider_executable=value.get("provider_executable"),
+            provider_process_group_id=value.get("provider_process_group_id"),
+            provider_process_group_members=[
+                dict(item)
+                for item in value.get("provider_process_group_members", [])
+                if isinstance(item, dict)
+            ],
             provider_generation=int(value.get("provider_generation", 0)),
             active_turn_id=value.get("active_turn_id"),
             current_turn_diff_turn_id=value.get("current_turn_diff_turn_id"),
@@ -321,6 +350,13 @@ class RunRecord:
             replaced_by_run_id=value.get("replaced_by_run_id"),
             replaced_legacy_provider=value.get("replaced_legacy_provider"),
             outcome=value.get("outcome"),
+            start_request_id=value.get("start_request_id"),
+            implicit_start_request=bool(value.get("implicit_start_request", False)),
+            start_transaction=(
+                dict(value["start_transaction"])
+                if isinstance(value.get("start_transaction"), dict)
+                else None
+            ),
             raw_event_count=int(value.get("raw_event_count", 0)),
             normalized_event_count=int(value.get("normalized_event_count", 0)),
             unread_event_seq=int(

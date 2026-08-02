@@ -62,6 +62,7 @@ from .agent_runtime.client import (
     SupervisorUnavailable,
     replacement_prompt,
 )
+from .agent_runtime.command_log import AgentCommand
 from .agent_runtime import costs
 from .agent_runtime import graph_health
 from .agent_runtime.loop_state import derive_loop_state
@@ -4090,6 +4091,7 @@ class SpawnReplaceIn(BaseModel):
     model: str | None = Field(default=None, max_length=64)
     kind: str | None = Field(default=None, max_length=8)
     effort: str | None = Field(default=None, max_length=16)
+    request_id: str | None = Field(default=None, min_length=1, max_length=200)
 
 
 class SpawnWorkerIn(BaseModel):
@@ -4151,6 +4153,7 @@ class SpawnOrchestratorIn(BaseModel):
 
 class AgentArchiveIn(BaseModel):
     outcome: str = Field(pattern="^(merged|closed|abandoned)$")
+    request_id: str | None = Field(default=None, min_length=1, max_length=200)
 
 
 class AutopilotEnableIn(BaseModel):
@@ -4262,6 +4265,8 @@ def _supervisor_request(method: str, params: dict | None = None) -> Any:
             "ProviderBusy": 409,
             "ProviderProcessError": 409,
             "ProviderProtocolError": 409,
+            "CommandConflict": 409,
+            "CommandReceiptError": 409,
         }.get(exc.error_type, 502)
         raise HTTPException(status_code=status_code, detail=str(exc)) from exc
 
@@ -4305,6 +4310,15 @@ def _stable_spawn_request_id(payload: dict[str, Any]) -> str:
     return f"spawn-{hashlib.sha256(canonical.encode('utf-8')).hexdigest()}"
 
 
+def _command_hash(
+    method: str,
+    agent_id: str,
+    request_id: str,
+    payload: dict[str, Any],
+) -> str:
+    return AgentCommand(method, agent_id, request_id, payload).command_hash
+
+
 def resolve_window(ticket: str) -> str | None:
     """Live tmux window for a worker ticket or orchestrator id."""
     registry = _read_agent_registry()
@@ -4337,10 +4351,45 @@ def _control_headless_agent(
     action: str,
     *,
     outcome: str | None = None,
+    request_id: str | None = None,
 ) -> dict[str, object]:
     raw_id = agent_id.strip()
     if not raw_id or not valid_agent_id(raw_id):
         raise HTTPException(status_code=400, detail="Bad agent id")
+
+    if action == "archive" and request_id is not None:
+        binding = {"outcome": outcome}
+        status = _supervisor_request(
+            "idempotency/status",
+            {
+                "method": "run/archive",
+                "request_id": request_id,
+                "agent_id": raw_id,
+                "command_hash": _command_hash(
+                    "run/archive", raw_id, request_id, {"command_hash_payload": binding}
+                ),
+            },
+        )
+        receipt = status.get("receipt") if isinstance(status, dict) else None
+        prior_result = receipt.get("result") if isinstance(receipt, dict) else None
+        if isinstance(prior_result, dict):
+            prior_agent_id = prior_result.get("agent_id")
+            if not isinstance(prior_agent_id, str):
+                prior_agent_id = prior_result.get("ticket")
+            if not isinstance(prior_agent_id, str):
+                prior_agent_id = raw_id
+            prior_role = prior_result.get("role")
+            prior_orch = prior_result.get("orchestrator_id")
+            if prior_role in WORKER_ROLES:
+                workgraph_service.record_archive(
+                    agent_id=prior_agent_id,
+                    orch=prior_orch if isinstance(prior_orch, str) else None,
+                    outcome=prior_result.get("outcome")
+                    if isinstance(prior_result.get("outcome"), str)
+                    else outcome,
+                    status_dir=AGENT_STATUS_DIR,
+                )
+            return dict(prior_result)
     resolved = _registry_agent(_read_agent_registry(), raw_id)
     if resolved is None:
         raise HTTPException(status_code=404, detail="No registered agent")
@@ -4353,6 +4402,10 @@ def _control_headless_agent(
     params: dict[str, object] = {"agent_id": resolved_id}
     if action == "archive":
         params["outcome"] = outcome
+    if request_id is not None:
+        params["request_id"] = request_id
+    if action == "archive":
+        params["command_hash_payload"] = {"outcome": outcome}
     result = _supervisor_request(f"run/{action}", params)
     if not isinstance(result, dict):
         raise HTTPException(
@@ -4362,8 +4415,18 @@ def _control_headless_agent(
     if action == "archive" and current.get("role") in WORKER_ROLES:
         workgraph_service.record_archive(
             agent_id=resolved_id,
-            orch=current.get("orch") if isinstance(current.get("orch"), str) else None,
-            outcome=outcome,
+            orch=(
+                result.get("orchestrator_id")
+                if isinstance(result.get("orchestrator_id"), str)
+                else current.get("orch")
+                if isinstance(current.get("orch"), str)
+                else None
+            ),
+            outcome=(
+                result.get("outcome")
+                if isinstance(result.get("outcome"), str)
+                else outcome
+            ),
             status_dir=AGENT_STATUS_DIR,
         )
     return dict(result)
@@ -4393,6 +4456,7 @@ def archive_agent(
         agent_id,
         "archive",
         outcome=body.outcome if body is not None else None,
+        request_id=body.request_id if body is not None else None,
     )
 
 
@@ -4444,6 +4508,54 @@ def replace_agent(
         TICKET_PATTERN.fullmatch(raw_id) or ORCH_ID_PATTERN.fullmatch(raw_id)
     ):
         raise HTTPException(status_code=400, detail="Bad agent id")
+    request_id = body.request_id if body is not None else None
+    if request_id is not None:
+        binding = {
+            "kind": (body.kind or "") if body is not None else "",
+            "model": (body.model or "") if body is not None else "",
+            "effort": (body.effort or "") if body is not None else "",
+        }
+        status = _supervisor_request(
+            "idempotency/status",
+            {
+                "method": "run/replace",
+                "request_id": request_id,
+                "agent_id": raw_id,
+                "command_hash": _command_hash(
+                    "run/replace",
+                    raw_id,
+                    request_id,
+                    {"command_hash_payload": binding},
+                ),
+            },
+        )
+        receipt = status.get("receipt") if isinstance(status, dict) else None
+        if isinstance(receipt, dict):
+            receipt_agent = receipt.get("agent_id")
+            if isinstance(receipt_agent, str) and receipt_agent.upper() != raw_id.upper():
+                raise HTTPException(
+                    status_code=409,
+                    detail="Replace request belongs to another agent",
+                )
+            prior_result = receipt.get("result")
+            if isinstance(prior_result, dict):
+                prior_agent = prior_result.get("agent_id")
+                if isinstance(prior_agent, str) and prior_agent.upper() != raw_id.upper():
+                    raise HTTPException(
+                        status_code=409,
+                        detail="Replace receipt belongs to another agent",
+                    )
+                role = prior_result.get("role")
+                return {
+                    "id": prior_agent if isinstance(prior_agent, str) else raw_id,
+                    "type": "orchestrator" if role == "orchestrator" else "worker",
+                    "window": None,
+                    "run_id": prior_result.get("run_id"),
+                    "log": prior_result.get("log"),
+                    "prompt_path": None,
+                    "model": prior_result.get("model"),
+                    "registration": dict(prior_result),
+                }
     registry = _read_agent_registry()
     resolved = _registry_agent(registry, raw_id)
     if resolved is None:
@@ -4509,6 +4621,12 @@ def replace_agent(
             "model": model,
             "effort": effort,
             "backend_base_url": backend_base_url,
+            "request_id": request_id,
+            "command_hash_payload": {
+                "kind": requested_kind,
+                "model": requested_model,
+                "effort": requested_effort,
+            },
         },
     )
     if not isinstance(result, dict):
@@ -4814,6 +4932,20 @@ def spawn_agent(
             "migrate_legacy": migrate_legacy_flag,
             "request_id": request_id,
             "implicit_request_id": implicit_request_id,
+            "command_hash_payload": {
+                "agent_id": ticket,
+                "provider": "codex" if kind == "cdx" else "claude",
+                "role": role,
+                "model": model,
+                "effort": effort,
+                "worktree": str(workdir_path),
+                "prompt": body.prompt,
+                "title": body.title,
+                "context_prelude": body.context_prelude,
+                "include_context": body.include_context,
+                "context_prelude_override": body.context_prelude_override,
+                "orchestrator_id": orch or None,
+            },
             "backend_base_url": backend_base_url,
         },
     )
@@ -5062,6 +5194,15 @@ def spawn_orchestrator(
             "migrate_legacy": migrate_legacy,
             "request_id": request_id,
             "implicit_request_id": implicit_request_id,
+            "command_hash_payload": {
+                "agent_id": orch_id,
+                "provider": "codex" if kind == "cdx" else "claude",
+                "role": "orchestrator",
+                "model": model,
+                "effort": body.effort,
+                "worktree": str(workdir_path),
+                "goal": goal,
+            },
             "backend_base_url": backend_base_url,
         },
     )

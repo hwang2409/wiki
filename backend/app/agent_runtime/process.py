@@ -26,6 +26,7 @@ class ProviderProcessStatus:
     parent_pid: int
     created_at: float
     process_group_id: int
+    executable: str | None = None
 
 
 def select_transcript_identity(
@@ -189,19 +190,310 @@ async def provider_process_status(
             parent_pid = process.ppid()
             created_at = process.create_time()
             process_group_id = os.getpgid(pid)
-        except (ProcessLookupError, PermissionError, psutil.Error):
+            executable = process.exe()
+        except (ProcessLookupError, PermissionError, psutil.Error, OSError):
             return None
         return ProviderProcessStatus(
             pid=pid,
             parent_pid=parent_pid,
             created_at=created_at,
             process_group_id=process_group_id,
+            executable=executable,
         )
 
     try:
         return await asyncio.wait_for(asyncio.to_thread(inspect_process), timeout=timeout)
     except TimeoutError:
         return None
+
+
+def provider_process_status_sync(pid: int | None) -> ProviderProcessStatus | None:
+    """Return a synchronous process identity for durable run metadata."""
+
+    if pid is None or pid <= 1:
+        return None
+    try:
+        process = psutil.Process(pid)
+        return ProviderProcessStatus(
+            pid=pid,
+            parent_pid=process.ppid(),
+            created_at=process.create_time(),
+            process_group_id=os.getpgid(pid),
+            executable=process.exe(),
+        )
+    except (ProcessLookupError, PermissionError, psutil.Error, OSError):
+        return None
+
+
+def provider_processes_for_run_sync(
+    run_id: str,
+    agent_id: str,
+) -> list[ProviderProcessStatus]:
+    """Find provider processes carrying the exact durable run identity."""
+
+    matches: list[ProviderProcessStatus] = []
+    for process in psutil.process_iter(["pid", "create_time", "exe"]):
+        try:
+            pid = int(process.info["pid"])
+            if pid <= 1:
+                continue
+            environment = process.environ()
+            if (
+                environment.get("WIKI_RUN_ID") != run_id
+                or environment.get("WIKI_AGENT_ID") != agent_id
+            ):
+                continue
+            status = provider_process_status_sync(pid)
+            if status is not None:
+                matches.append(status)
+        except (
+            ProcessLookupError,
+            PermissionError,
+            psutil.Error,
+            OSError,
+            TypeError,
+            ValueError,
+        ):
+            continue
+    return matches
+
+
+def provider_process_group_members_sync(
+    process_group_id: int,
+) -> list[dict[str, int | float | str | None]]:
+    """Capture process identities that share one provider process group."""
+
+    members: list[dict[str, int | float | str | None]] = []
+    if process_group_id <= 1:
+        return members
+    for process in psutil.process_iter(["pid", "create_time", "exe"]):
+        try:
+            pid = int(process.info["pid"])
+            if pid <= 1:
+                continue
+            if os.getpgid(pid) != process_group_id:
+                continue
+            members.append(
+                {
+                    "pid": pid,
+                    "created_at": float(process.info["create_time"]),
+                    "executable": process.info.get("exe"),
+                }
+            )
+        except (
+            ProcessLookupError,
+            PermissionError,
+            psutil.Error,
+            OSError,
+            TypeError,
+            ValueError,
+        ):
+            continue
+    return members
+
+
+def terminate_verified_provider_group(
+    *,
+    pid: int,
+    created_at: float,
+    executable: str,
+    process_group_id: int,
+    group_members: list[dict[str, int | float | str | None]] | None = None,
+    run_id: str | None = None,
+    agent_id: str | None = None,
+    grace: float = 0.5,
+    kill_timeout: float = 1.0,
+) -> bool:
+    """Terminate a recorded provider group only after identity checks."""
+
+    if pid <= 1 or process_group_id <= 1 or process_group_id == os.getpgrp():
+        return False
+
+    def matching() -> bool | None:
+        current = provider_process_status_sync(pid)
+        if current is None:
+            try:
+                if psutil.Process(pid).status() == psutil.STATUS_ZOMBIE:
+                    return False
+                os.kill(pid, 0)
+            except ProcessLookupError:
+                return False
+            except psutil.NoSuchProcess:
+                return False
+            except PermissionError:
+                return None
+            return None
+        if (
+            current.created_at != created_at
+            or current.executable != executable
+            or current.process_group_id != process_group_id
+        ):
+            return None
+        return True
+
+    def group_alive() -> bool:
+        inspected = False
+        for process in psutil.process_iter(["pid", "status"]):
+            try:
+                if os.getpgid(int(process.info["pid"])) != process_group_id:
+                    continue
+                inspected = True
+                if process.info.get("status") != psutil.STATUS_ZOMBIE:
+                    return True
+            except (
+                ProcessLookupError,
+                PermissionError,
+                psutil.Error,
+                OSError,
+                TypeError,
+                ValueError,
+            ):
+                continue
+        if inspected:
+            return False
+        return False
+
+    def group_verified() -> bool:
+        if not group_members:
+            return False
+        expected = {
+            (
+                int(item["pid"]),
+                float(item["created_at"]),
+                item.get("executable"),
+            )
+            for item in group_members
+            if "pid" in item and "created_at" in item
+        }
+        current = provider_process_group_members_sync(process_group_id)
+        if not current:
+            return False
+        dedicated_session_group = process_group_id == pid
+
+        def is_later_owned_member(item: dict[str, int | float | str | None]) -> bool:
+            try:
+                member_pid = int(item["pid"])
+                member_created_at = float(item["created_at"])
+            except (
+                KeyError,
+                TypeError,
+                ValueError,
+            ):
+                return False
+            if member_created_at < created_at:
+                return False
+            if dedicated_session_group:
+                # The recorded PID is also the session leader. Its PGID is a
+                # dedicated ownership boundary for children started later.
+                return True
+            if run_id is None or agent_id is None:
+                return False
+            try:
+                environment = psutil.Process(member_pid).environ()
+            except (
+                ProcessLookupError,
+                PermissionError,
+                psutil.Error,
+                OSError,
+            ):
+                return False
+            # A child may use a different executable, but it must carry the
+            # exact run identity when no dedicated session boundary exists.
+            return (
+                environment.get("WIKI_RUN_ID") == run_id
+                and environment.get("WIKI_AGENT_ID") == agent_id
+            )
+
+        return all(
+            (
+                (
+                    int(item["pid"]),
+                    float(item["created_at"]),
+                    item.get("executable"),
+                )
+                in expected
+                or is_later_owned_member(item)
+            )
+            for item in current
+        )
+
+    def kill_group_and_wait() -> bool:
+        if not group_verified():
+            return False
+        try:
+            os.killpg(process_group_id, signal.SIGKILL)
+        except ProcessLookupError:
+            return True
+        except PermissionError:
+            return False
+        deadline = time.monotonic() + kill_timeout
+        while time.monotonic() < deadline:
+            if not group_alive():
+                return True
+            time.sleep(0.02)
+        return not group_alive()
+
+    identity = matching()
+    if identity is False:
+        if not group_alive():
+            return True
+        if not group_verified():
+            return False
+        return kill_group_and_wait()
+    if identity is not True:
+        return False
+    if not group_verified():
+        return False
+
+    try:
+        os.killpg(process_group_id, signal.SIGTERM)
+    except ProcessLookupError:
+        return True
+    except PermissionError:
+        return False
+
+    deadline = time.monotonic() + grace
+    while time.monotonic() < deadline:
+        identity = matching()
+        if identity is False:
+            if not group_alive():
+                return True
+            if not group_verified():
+                return False
+            return kill_group_and_wait()
+        if identity is None:
+            if not group_alive():
+                return True
+            if group_verified():
+                return kill_group_and_wait()
+            return False
+        time.sleep(0.02)
+
+    # Verify the recorded PID again before escalating. If only an unverified
+    # process remains in the group, retain the run for manual inspection.
+    identity = matching()
+    if identity is None:
+        return False
+    if identity is True:
+        if not group_verified():
+            return False
+        try:
+            os.killpg(process_group_id, signal.SIGKILL)
+        except ProcessLookupError:
+            return True
+        except PermissionError:
+            return False
+    elif group_alive():
+        if not group_verified():
+            return False
+        return kill_group_and_wait()
+
+    deadline = time.monotonic() + kill_timeout
+    while time.monotonic() < deadline:
+        if not group_alive():
+            return True
+        time.sleep(0.02)
+    return not group_alive()
 
 
 async def provider_parent_pid(

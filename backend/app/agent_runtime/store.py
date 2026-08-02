@@ -1,11 +1,13 @@
 from __future__ import annotations
 
+import errno
 import json
 import os
 import shutil
 import stat
 import tempfile
 import threading
+import base64
 from copy import deepcopy
 from dataclasses import dataclass
 from datetime import datetime, timedelta
@@ -14,6 +16,13 @@ from typing import Any
 from uuid import UUID
 
 from .. import knowledge
+from .command_log import CommandLog
+from .process import (
+    provider_process_group_members_sync,
+    provider_processes_for_run_sync,
+    provider_process_status_sync,
+    terminate_verified_provider_group,
+)
 from .provider import AdapterStatus
 from .types import (
     EventDisposition,
@@ -393,6 +402,10 @@ class RuntimePaths:
     def codex_rotation_journal_path(self) -> Path:
         return self.runtime_dir / "codex-rotation-journal.json"
 
+    @property
+    def command_log_path(self) -> Path:
+        return self.runtime_dir / "command-log.sqlite3"
+
     def run_dir(self, run_id: str) -> Path:
         return self.runs_dir / _validated_run_id(run_id)
 
@@ -578,6 +591,8 @@ class RunStore:
         self._start_registry_snapshots: dict[str, dict[str, Any]] = {}
         _ensure_private_dir(paths.runtime_dir)
         _ensure_private_dir(paths.runs_dir)
+        self.command_log = CommandLog(paths.command_log_path)
+        self._abort_uncommitted_starts()
         self._reconcile_existing_runs()
         self._reconcile_registry_from_runs()
 
@@ -601,6 +616,144 @@ class RunStore:
 
     def archive_ticket_dir(self, agent_id: str) -> Path:
         return self.paths.archive_dir / agent_id
+
+    def _find_archived_run_entry(
+        self, run_id: str
+    ) -> tuple[RunRecord, Path] | None:
+        """Return one archive record and its session directory."""
+
+        for path in self.paths.archive_dir.glob("*/*/archive-complete.json"):
+            try:
+                marker = _read_json(path)
+                if not isinstance(marker, dict) or marker.get("run_id") != run_id:
+                    continue
+                value = _read_json(path.parent / "run.json")
+                if isinstance(value, dict):
+                    return RunRecord.from_dict(value), path.parent
+            except (OSError, StoreError, TypeError, ValueError):
+                continue
+        return None
+
+    def find_archived_run(self, run_id: str) -> RunRecord | None:
+        """Find one completed archive for a replayed archive effect."""
+
+        with self._lock:
+            entry = self._find_archived_run_entry(run_id)
+            return entry[0] if entry is not None else None
+
+    def finalize_archived_run(self, run_id: str) -> RunRecord | None:
+        """Resume archive cleanup and return only after live state is gone."""
+
+        with self._lock:
+            archived_entry = self._find_archived_run_entry(run_id)
+            if archived_entry is None:
+                return None
+            archived, session_dir = archived_entry
+
+            live_path = self.run_path(run_id)
+            if live_path.is_file():
+                try:
+                    live = RunRecord.from_dict(_read_json(live_path))
+                except (OSError, StoreError, TypeError, ValueError) as exc:
+                    raise StoreConflict(
+                        "archive marker has an unreadable live run"
+                    ) from exc
+                if live.created_at != archived.created_at:
+                    raise StoreConflict(
+                        "older archive marker cannot remove a newer live run"
+                    )
+            registry = self._read_registry()
+            entry = registry.get(archived.agent_id)
+            current = entry.get("current") if isinstance(entry, dict) else None
+            if isinstance(current, dict) and current.get("run_id") not in {
+                None,
+                run_id,
+            }:
+                raise StoreConflict("older archive marker cannot remove a live current run")
+
+            if archived.implicit_start_request and archived.start_request_id:
+                # Repair this index before deleting the implicit receipt. A
+                # restart can otherwise reuse the old deterministic run id.
+                self.command_log.archive_start_request(
+                    archived.start_request_id,
+                    archived.run_id,
+                    str(session_dir),
+                )
+
+            run_dir = self.run_dir(run_id)
+            if run_dir.exists():
+                shutil.rmtree(run_dir)
+            if run_dir.exists():
+                raise StoreConflict("archived run directory remains after cleanup")
+            self.command_log.forget_implicit_for_run(run_id)
+
+            if isinstance(current, dict) and current.get("run_id") == run_id:
+                registry.pop(archived.agent_id, None)
+                self._write_registry(registry)
+                self.command_log.replace_projection(archived.agent_id, {})
+            elif not isinstance(current, dict):
+                self.command_log.replace_projection(archived.agent_id, {})
+
+            entry = self._read_registry().get(archived.agent_id)
+            current = entry.get("current") if isinstance(entry, dict) else None
+            if run_dir.exists() or (
+                isinstance(current, dict) and current.get("run_id") == run_id
+            ):
+                raise StoreConflict("archived run remains live after cleanup")
+            return archived
+
+    def discover_provider_process(self, run_id: str) -> RunRecord:
+        """Persist a provider found by its exact inherited run identity."""
+
+        with self._lock:
+            record = self.get(run_id)
+            if record.provider_pid is not None:
+                return record
+            candidates = provider_processes_for_run_sync(
+                record.run_id,
+                record.agent_id,
+            )
+            if not candidates:
+                return record
+            candidate_pids = {item.pid for item in candidates}
+            roots = [
+                item for item in candidates if item.parent_pid not in candidate_pids
+            ]
+            identity = min(roots or candidates, key=lambda item: item.pid)
+            record.provider_pid = identity.pid
+            record.provider_pid_started_at = identity.created_at
+            record.provider_executable = identity.executable
+            record.provider_process_group_id = identity.process_group_id
+            record.provider_process_group_members = (
+                provider_process_group_members_sync(identity.process_group_id)
+            )
+            self._write_record(record)
+            registry = self._read_registry()
+            current = (registry.get(record.agent_id) or {}).get("current") or {}
+            if current.get("run_id") == record.run_id:
+                registry[record.agent_id]["current"] = self._registry_current(record)
+                self._write_registry(registry)
+                self.command_log.replace_projection(
+                    record.agent_id,
+                    {record.agent_id: registry[record.agent_id]},
+                )
+            return record
+
+    def find_archived_start_request(self, request_id: str) -> RunRecord | None:
+        """Find an implicit start that was already archived and is reusable."""
+
+        with self._lock:
+            indexed = self.command_log.archived_start_request(request_id)
+            if indexed is None:
+                return None
+            try:
+                value = _read_json(Path(indexed["session_path"]) / "run.json")
+            except (OSError, StoreError, TypeError, ValueError):
+                return None
+            if not isinstance(value, dict):
+                return None
+            record = RunRecord.from_dict(value)
+            return record if record.run_id == indexed["run_id"] else None
 
     def status_path(self, agent_id: str) -> Path:
         return self.paths.status_dir / f"{agent_id}.json"
@@ -644,6 +797,216 @@ class RunStore:
 
     def _write_registry(self, registry: dict[str, Any]) -> None:
         _atomic_write_json(self.paths.registry_path, registry)
+
+    def command_state(self) -> dict[str, Any]:
+        """Return the registry projection used by the command decider."""
+
+        with self._lock:
+            return deepcopy(self._read_registry())
+
+    def command_state_for(self, agent_id: str) -> dict[str, Any]:
+        """Return one agent projection for a keyed command transaction."""
+
+        with self._lock:
+            projected = self.command_log.projection_for(agent_id)
+            if projected:
+                return deepcopy(projected)
+            entry = self._read_registry().get(agent_id)
+            if entry is None:
+                return {agent_id: None}
+            seeded = {agent_id: deepcopy(entry)}
+            self.command_log.seed_projection(agent_id, seeded)
+            return seeded
+
+    def authoritative_command_state_for(self, agent_id: str) -> dict[str, Any]:
+        """Read one agent from the registry without using the command projection."""
+
+        with self._lock:
+            entry = self._read_registry().get(agent_id)
+            return {agent_id: deepcopy(entry)} if entry is not None else {agent_id: None}
+
+    def find_start_request(self, request_id: str) -> RunRecord | None:
+        """Find a durable successful start after cache eviction or restart."""
+
+        if not isinstance(request_id, str) or not request_id:
+            return None
+        with self._lock:
+            indexed = self.command_log.start_request(request_id)
+            if indexed is None:
+                return None
+            try:
+                record = self.get(str(indexed["run_id"]))
+            except RunNotFound:
+                return None
+            if (
+                record.agent_id == indexed["agent_id"]
+                and self.is_current(record)
+                and record.start_transaction is None
+            ):
+                return record
+        return None
+
+    def _restore_start_snapshot(
+        self,
+        record: RunRecord,
+        snapshot: dict[str, Any] | None,
+    ) -> None:
+        """Restore the pre-start registry and status file from durable data."""
+
+        registry = self._read_registry()
+        current = registry.get(record.agent_id)
+        current_run_id = (
+            current.get("current", {}).get("run_id")
+            if isinstance(current, dict)
+            and isinstance(current.get("current"), dict)
+            else None
+        )
+        if snapshot is None:
+            if current_run_id == record.run_id:
+                registry.pop(record.agent_id, None)
+            self.status_path(record.agent_id).unlink(missing_ok=True)
+            self._write_registry(registry)
+            return
+
+        if bool(snapshot.get("agent_present")):
+            previous = snapshot.get("agent_entry")
+            if isinstance(previous, dict):
+                registry[record.agent_id] = deepcopy(previous)
+        elif current_run_id == record.run_id:
+            registry.pop(record.agent_id, None)
+
+        legacy = registry.get("_orchestrators")
+        if bool(snapshot.get("legacy_present")):
+            previous_legacy = snapshot.get("legacy_entry")
+            if not isinstance(legacy, dict):
+                legacy = {}
+                registry["_orchestrators"] = legacy
+            if isinstance(previous_legacy, dict):
+                legacy[record.agent_id] = deepcopy(previous_legacy)
+        elif isinstance(legacy, dict) and current_run_id == record.run_id:
+            legacy.pop(record.agent_id, None)
+            if not legacy:
+                registry.pop("_orchestrators", None)
+
+        status_path = self.status_path(record.agent_id)
+        if bool(snapshot.get("status_present")):
+            encoded = snapshot.get("status_content")
+            if isinstance(encoded, str):
+                _atomic_write_bytes(status_path, base64.b64decode(encoded))
+        else:
+            status_path.unlink(missing_ok=True)
+        if not snapshot.get("registry_file_present", True) and not registry:
+            self.paths.registry_path.unlink(missing_ok=True)
+        else:
+            self._write_registry(registry)
+        self.command_log.replace_projection(
+            record.agent_id,
+            {record.agent_id: registry.get(record.agent_id)}
+            if record.agent_id in registry
+            else {},
+        )
+
+    def _abort_uncommitted_starts(self) -> None:
+        """Abort fresh starts that were published before provider commit."""
+
+        self.abort_uncommitted_starts()
+
+    def abort_uncommitted_starts(self) -> list[str]:
+        """Abort safe uncommitted starts and return the removed run ids.
+
+        Skips runs whose adapter this supervisor owns — such runs are between
+        create() and commit_start() in an in-flight local launch. Aborting one
+        of those would race the launching coroutine, terminating the verified
+        provider group and deleting the run directory before commit_start().
+        A restarted supervisor's set is empty, so the constructor pass still
+        cleans up starts that crashed before commit.
+        """
+
+        aborted: list[str] = []
+        with self._lock:
+            for path in sorted(self.paths.runs_dir.glob("*/run.json")):
+                try:
+                    value = _read_json(path)
+                    if not isinstance(value, dict):
+                        continue
+                    record = RunRecord.from_dict(value)
+                    if not record.start_transaction:
+                        continue
+                    if self._try_abort_uncommitted_start_locked(record):
+                        aborted.append(record.run_id)
+                except (OSError, StoreError, TypeError, ValueError):
+                    # Leave damaged metadata for the normal inspector path.
+                    continue
+        return aborted
+
+    def abort_uncommitted_start(self, run_id: str) -> bool:
+        """Abort one uncommitted start; retry recovery when the PID exits."""
+
+        with self._lock:
+            try:
+                record = self.get(run_id)
+            except RunNotFound:
+                return False
+            if not record.start_transaction:
+                return False
+            try:
+                return self._try_abort_uncommitted_start_locked(record)
+            except (OSError, StoreError, TypeError, ValueError):
+                return False
+
+    def _try_abort_uncommitted_start_locked(self, record: RunRecord) -> bool:
+        if record.run_id in self._control_attached_run_ids:
+            return False
+        if record.provider_pid is None:
+            record = self.discover_provider_process(record.run_id)
+        if not self._terminate_recorded_provider_pid(record):
+            return False
+        self._restore_start_snapshot(record, record.start_transaction)
+        if record.start_request_id:
+            self.command_log.remove_start_request(record.start_request_id)
+        self._start_registry_snapshots.pop(record.run_id, None)
+        shutil.rmtree(self.run_dir(record.run_id), ignore_errors=True)
+        return True
+
+    @staticmethod
+    def _terminate_recorded_provider_pid(
+        record: RunRecord,
+        *,
+        allow_dead_without_identity: bool = True,
+    ) -> bool:
+        """Verify and stop a provider before deleting its uncommitted run."""
+
+        if record.provider_pid is None or record.provider_pid <= 1:
+            return True
+        pid_dead = False
+        try:
+            os.kill(record.provider_pid, 0)
+        except ProcessLookupError:
+            # A dead child needs no identity. This also handles a crash before
+            # process inspection persisted the executable and start time.
+            pid_dead = True
+        except OSError as exc:
+            if exc.errno == errno.ESRCH:
+                pid_dead = True
+            # Permission errors and all other failures are live/uncertain.
+        if pid_dead and allow_dead_without_identity:
+            return True
+        if (
+            record.provider_pid_started_at is None
+            or not record.provider_executable
+            or record.provider_process_group_id is None
+        ):
+            # A numeric PID without an identity is unsafe after a restart.
+            return False
+        return terminate_verified_provider_group(
+            pid=record.provider_pid,
+            created_at=record.provider_pid_started_at,
+            executable=record.provider_executable,
+            process_group_id=record.provider_process_group_id,
+            group_members=record.provider_process_group_members,
+            run_id=record.run_id,
+            agent_id=record.agent_id,
+        )
 
     def legacy_codex_agent_ids(self) -> list[str]:
         """Return tmux-era Codex currents, failing closed on corrupt entries."""
@@ -703,6 +1066,10 @@ class RunStore:
             "session_id": record.provider_session_id,
             "provider_session_id": record.provider_session_id,
             "provider_pid": record.provider_pid,
+            "provider_pid_started_at": record.provider_pid_started_at,
+            "provider_executable": record.provider_executable,
+            "provider_process_group_id": record.provider_process_group_id,
+            "provider_process_group_members": list(record.provider_process_group_members),
             "control_attached": record.run_id in self._control_attached_run_ids,
             "provider_generation": record.provider_generation,
             "active_turn_id": record.active_turn_id,
@@ -712,6 +1079,7 @@ class RunStore:
             "window": None,
             "spawned_at": record.created_at,
             "updated_at": record.updated_at,
+            "start_request_id": record.start_request_id,
             # Projected so /api/agents can clear ticket-only legacy Codex
             # notices without needing a spawn replay (round 27 completion of
             # the round-26 migration marker). The value survives supervisor
@@ -760,6 +1128,14 @@ class RunStore:
                 if not isinstance(value, dict):
                     continue
                 record = RunRecord.from_dict(value)
+                if record.start_request_id and record.start_transaction is None:
+                    self.command_log.register_start_request(
+                        record.start_request_id,
+                        record.agent_id,
+                        record.run_id,
+                        implicit=record.implicit_start_request,
+                        committed=True,
+                    )
                 raw_path = self.raw_events_path(record.run_id)
                 normalized_path = self.normalized_events_path(record.run_id)
                 _repair_jsonl_tail(raw_path)
@@ -911,11 +1287,31 @@ class RunStore:
         records_by_agent: dict[str, list[RunRecord]] = {}
         for record in self.list_runs():
             records_by_agent.setdefault(record.agent_id, []).append(record)
+        archived_run_ids: set[str] = set()
+        for marker_path in self.paths.archive_dir.glob("*/*/archive-complete.json"):
+            try:
+                marker = _read_json(marker_path)
+            except (OSError, StoreError, TypeError, ValueError):
+                continue
+            if isinstance(marker, dict) and isinstance(marker.get("run_id"), str):
+                archived_run_ids.add(marker["run_id"])
         if not records_by_agent:
             if changed:
                 self._write_registry(registry)
             return
         for agent_id, records in records_by_agent.items():
+            live_records = [
+                record
+                for record in records
+                if record.run_id not in archived_run_ids
+                and record.replaced_by_run_id not in archived_run_ids
+            ]
+            if not live_records:
+                if agent_id in registry:
+                    registry.pop(agent_id, None)
+                    changed = True
+                continue
+            records = live_records
             records.sort(key=lambda item: (item.created_at, item.run_id))
             by_id = {record.run_id: record for record in records}
             child_by_parent = {
@@ -1052,6 +1448,14 @@ class RunStore:
     ) -> tuple[RunRecord, Path]:
         with self._lock:
             record = self.get(run_id)
+            archived_entry = self._find_archived_run_entry(run_id)
+            if (
+                archived_entry is not None
+                and archived_entry[0].created_at != record.created_at
+            ):
+                raise StoreConflict(
+                    "older archive marker cannot remove a newer live run"
+                )
             registry = self._read_registry()
             entry = registry.get(record.agent_id)
             current = entry.get("current") if isinstance(entry, dict) else None
@@ -1143,12 +1547,26 @@ class RunStore:
                 {"run_id": run_id, "completed_at": ended_at},
             )
 
+            if record.start_request_id and record.implicit_start_request:
+                self.command_log.archive_start_request(
+                    record.start_request_id,
+                    run_id,
+                    str(session_dir),
+                )
             shutil.rmtree(self.run_dir(run_id))
+            self.command_log.forget_implicit_for_run(run_id)
             registry.pop(record.agent_id, None)
             self._write_registry(registry)
+            self.command_log.replace_projection(record.agent_id, {})
             return record, session_dir
 
-    def create(self, record: RunRecord, *, migrate_legacy: bool = False) -> RunRecord:
+    def create(
+        self,
+        record: RunRecord,
+        *,
+        migrate_legacy: bool = False,
+        transactional_start: bool = False,
+    ) -> RunRecord:
         with self._lock:
             registry = self._read_registry()
             entry = registry.get(record.agent_id)
@@ -1180,13 +1598,12 @@ class RunStore:
                     "agent has a legacy orchestrator registration requiring "
                     f"explicit migration: {record.agent_id}"
                 )
-            # A status file belongs to the run that creates it. Clear any
-            # orphan from a prior run before this record becomes current; the
-            # supervisor calls create() while holding the per-agent lock.
+            # A status file belongs to the run that creates it. Capture the
+            # old status and registry before publishing any start side effect.
+            # The supervisor calls create() while holding the per-agent lock.
             status_path = self.status_path(record.agent_id)
             _ensure_parent_dir(status_path.parent)
             status_present, status_content = _read_start_status(status_path)
-            status_path.unlink(missing_ok=True)
             registry_before = deepcopy(registry)
             registry_was_present = self.paths.registry_path.exists()
             legacy_orchestrators = registry.get("_orchestrators")
@@ -1196,7 +1613,24 @@ class RunStore:
                 else None
             )
             # WIKI-219 owns durable snapshots and journal-before-side-effect
-            # recovery across supervisor exits; this PR keeps rollback in memory.
+            # recovery across supervisor exits.
+            start_snapshot = {
+                "version": 1,
+                "agent_present": record.agent_id in registry,
+                "agent_entry": deepcopy(registry.get(record.agent_id)),
+                "legacy_present": isinstance(legacy_orchestrators, dict)
+                and record.agent_id in legacy_orchestrators,
+                "legacy_entry": deepcopy(legacy_entry),
+                "status_present": status_present,
+                "status_content": (
+                    base64.b64encode(status_content).decode("ascii")
+                    if status_content is not None
+                    else None
+                ),
+                "registry_file_present": registry_was_present,
+            }
+            if transactional_start:
+                record.start_transaction = start_snapshot
             self._start_registry_snapshots[record.run_id] = {
                 "agent_present": record.agent_id in registry,
                 "agent_entry": deepcopy(registry.get(record.agent_id)),
@@ -1233,7 +1667,18 @@ class RunStore:
                 record.replaced_legacy_provider = "claude"
             run_dir_was_absent = not self.run_dir(record.run_id).exists()
             try:
+                # The run record contains the preimage and transaction marker.
+                # It must reach disk before the previous status can disappear.
                 self._create_run_files(record)
+                status_path.unlink(missing_ok=True)
+                if record.start_request_id:
+                    self.command_log.register_start_request(
+                        record.start_request_id,
+                        record.agent_id,
+                        record.run_id,
+                        implicit=record.implicit_start_request,
+                        committed=not transactional_start,
+                    )
                 history = (
                     list((entry or {}).get("history") or [])
                     if isinstance(entry, dict)
@@ -1275,6 +1720,8 @@ class RunStore:
                 }
                 self._write_registry(registry)
             except BaseException:
+                if record.start_request_id:
+                    self.command_log.remove_start_request(record.start_request_id)
                 self._start_registry_snapshots.pop(record.run_id, None)
                 if run_dir_was_absent:
                     shutil.rmtree(self.run_dir(record.run_id), ignore_errors=True)
@@ -1290,10 +1737,16 @@ class RunStore:
             return record
 
     def commit_start(self, run_id: str) -> None:
-        """Forget the pre-start registry snapshot after provider launch succeeds."""
+        """Commit a start and remove its durable pre-start transaction marker."""
 
         with self._lock:
             self._start_registry_snapshots.pop(run_id, None)
+            record = self.get(run_id)
+            if record.start_transaction is not None:
+                record.start_transaction = None
+                self._write_record(record)
+            if record.start_request_id:
+                self.command_log.commit_start_request(record.start_request_id)
 
     def abort_start(self, run_id: str, *, reason: str) -> None:
         """Remove a failed start and restore the registry before that start."""
@@ -1302,38 +1755,25 @@ class RunStore:
         with self._lock:
             record = self.get(run_id)
             snapshot = self._start_registry_snapshots.pop(run_id, None)
-            registry = self._read_registry()
-            if snapshot is None:
-                entry = registry.get(record.agent_id)
-                if isinstance(entry, dict) and (
-                    (entry.get("current") or {}).get("run_id") == run_id
-                ):
-                    registry.pop(record.agent_id, None)
-            elif snapshot["agent_present"]:
-                registry[record.agent_id] = deepcopy(snapshot["agent_entry"])
-            else:
-                registry.pop(record.agent_id, None)
-
-            legacy_orchestrators = registry.get("_orchestrators")
-            if snapshot is not None and snapshot["legacy_present"]:
-                if not isinstance(legacy_orchestrators, dict):
-                    legacy_orchestrators = {}
-                    registry["_orchestrators"] = legacy_orchestrators
-                legacy_orchestrators[record.agent_id] = deepcopy(
-                    snapshot["legacy_entry"]
-                )
-            elif isinstance(legacy_orchestrators, dict):
-                legacy_orchestrators.pop(record.agent_id, None)
-                if not legacy_orchestrators:
-                    registry.pop("_orchestrators", None)
-            status_path = self.status_path(record.agent_id)
-            if snapshot is not None and snapshot["status_present"]:
-                _atomic_write_bytes(status_path, snapshot["status_content"])
-            else:
-                status_path.unlink(missing_ok=True)
+            durable_snapshot = record.start_transaction
+            if durable_snapshot is None and snapshot is not None:
+                durable_snapshot = {
+                    "agent_present": snapshot["agent_present"],
+                    "agent_entry": snapshot["agent_entry"],
+                    "legacy_present": snapshot["legacy_present"],
+                    "legacy_entry": snapshot["legacy_entry"],
+                    "status_present": snapshot["status_present"],
+                    "status_content": (
+                        base64.b64encode(snapshot["status_content"]).decode("ascii")
+                        if snapshot["status_content"] is not None
+                        else None
+                    ),
+                }
+            self._restore_start_snapshot(record, durable_snapshot)
             self._control_attached_run_ids.discard(run_id)
+            if record.start_request_id:
+                self.command_log.remove_start_request(record.start_request_id)
             shutil.rmtree(self.run_dir(run_id))
-            self._write_registry(registry)
 
     def get(self, run_id: str) -> RunRecord:
         with self._lock:
@@ -1410,6 +1850,25 @@ class RunStore:
                 if adapter_status.session_id is not None:
                     record.provider_session_id = adapter_status.session_id
                 record.provider_pid = adapter_status.pid
+                if adapter_status.pid is None:
+                    record.provider_pid_started_at = None
+                    record.provider_executable = None
+                    record.provider_process_group_id = None
+                    record.provider_process_group_members = []
+                else:
+                    identity = provider_process_status_sync(adapter_status.pid)
+                    if identity is None or identity.executable is None:
+                        record.provider_pid_started_at = None
+                        record.provider_executable = None
+                        record.provider_process_group_id = None
+                        record.provider_process_group_members = []
+                    else:
+                        record.provider_pid_started_at = identity.created_at
+                        record.provider_executable = identity.executable
+                        record.provider_process_group_id = identity.process_group_id
+                        record.provider_process_group_members = (
+                            provider_process_group_members_sync(identity.process_group_id)
+                        )
                 record.provider_generation = adapter_status.generation
                 record.active_turn_id = adapter_status.active_turn_id
                 if adapter_status.transcript_path is not None:
@@ -1425,6 +1884,10 @@ class RunStore:
             if current.get("run_id") == record.run_id:
                 registry[record.agent_id]["current"] = self._registry_current(record)
                 self._write_registry(registry)
+                self.command_log.replace_projection(
+                    record.agent_id,
+                    {record.agent_id: registry[record.agent_id]},
+                )
             return record
 
     def mark_recovery_blocked(self, run_id: str, *, reason: str) -> RunRecord:
@@ -1459,6 +1922,10 @@ class RunStore:
             if current.get("run_id") == record.run_id:
                 registry[record.agent_id]["current"] = self._registry_current(record)
                 self._write_registry(registry)
+                self.command_log.replace_projection(
+                    record.agent_id,
+                    {record.agent_id: registry[record.agent_id]},
+                )
             return record
 
     def mark_automatic_resume_failed(
@@ -1527,6 +1994,39 @@ class RunStore:
             adapter_status=status,
             guard_automatic_resume=guard_automatic_resume,
         )
+
+    def record_provider_process_created(self, run_id: str, pid: int) -> RunRecord:
+        """Persist process identity before provider startup can do more work."""
+
+        if not isinstance(pid, int) or isinstance(pid, bool) or pid <= 1:
+            raise StoreConflict("provider process id is invalid")
+        with self._lock:
+            record = self.get(run_id)
+            identity = provider_process_status_sync(pid)
+            record.provider_pid = pid
+            if identity is None or identity.executable is None:
+                record.provider_pid_started_at = None
+                record.provider_executable = None
+                record.provider_process_group_id = None
+                record.provider_process_group_members = []
+            else:
+                record.provider_pid_started_at = identity.created_at
+                record.provider_executable = identity.executable
+                record.provider_process_group_id = identity.process_group_id
+                record.provider_process_group_members = (
+                    provider_process_group_members_sync(identity.process_group_id)
+                )
+            self._write_record(record)
+            registry = self._read_registry()
+            current = (registry.get(record.agent_id) or {}).get("current") or {}
+            if current.get("run_id") == record.run_id:
+                registry[record.agent_id]["current"] = self._registry_current(record)
+                self._write_registry(registry)
+                self.command_log.replace_projection(
+                    record.agent_id,
+                    {record.agent_id: registry[record.agent_id]},
+                )
+            return record
 
     def finalize_handover_detach(
         self,
@@ -1912,6 +2412,18 @@ class RunStore:
     ) -> RunRecord:
         with self._lock:
             record = self.get(run_id)
+            existing = next(
+                (
+                    message
+                    for message in record.pending_user_messages
+                    if message.get("pending_id") == pending_id
+                ),
+                None,
+            )
+            if existing is not None:
+                if existing.get("text") != text:
+                    raise StoreConflict("pending message id was reused with different text")
+                return record
             entry: dict[str, Any] = {
                 "pending_id": pending_id,
                 "text": text,
@@ -1956,6 +2468,26 @@ class RunStore:
                 ):
                     return dict(message)
             return None
+
+    def steer_delivery_observed(self, run_id: str, pending_id: str) -> bool:
+        """Check durable composer state before retrying an uncertain delivery."""
+
+        with self._lock:
+            record = self.get(run_id)
+            if any(
+                message.get("pending_id") == pending_id
+                for message in record.composer_messages
+            ):
+                return True
+            try:
+                events = self.read_normalized_events(run_id)
+            except RunNotFound:
+                return False
+            return any(
+                isinstance(event.get("payload"), dict)
+                and event["payload"].get("pending_id") == pending_id
+                for event in events
+            )
 
     def discard_pending_user_message(
         self,
@@ -2038,6 +2570,21 @@ class RunStore:
             self._write_record(record)
             return message
 
+    def remove_queued_message_by_pending_id(
+        self,
+        run_id: str,
+        pending_id: str,
+    ) -> RunRecord:
+        with self._lock:
+            record = self.get(run_id)
+            record.queued_messages = [
+                message
+                for message in record.queued_messages
+                if message.get("pending_id") != pending_id
+            ]
+            self._write_record(record)
+            return record
+
     def peek_queued_message(self, run_id: str) -> dict[str, str] | None:
         with self._lock:
             record = self.get(run_id)
@@ -2116,6 +2663,10 @@ class RunStore:
                 "current": self._registry_current(new_record),
             }
             self._write_registry(registry)
+            self.command_log.replace_projection(
+                old.agent_id,
+                {old.agent_id: registry[old.agent_id]},
+            )
             return old, new_record
 
     def abort_replace(
@@ -2138,6 +2689,14 @@ class RunStore:
             current = entry.get("current") or {}
             if current.get("run_id") != replacement_run_id:
                 raise StoreConflict("replacement target is no longer current")
+            replacement = self.discover_provider_process(replacement_run_id)
+            if not self._terminate_recorded_provider_pid(
+                replacement,
+                allow_dead_without_identity=False,
+            ):
+                raise StoreConflict(
+                    "replacement provider identity is uncertain; rollback retained"
+                )
 
             self.status_path(old.agent_id).unlink(missing_ok=True)
             old.replaced_by_run_id = None
@@ -2167,6 +2726,10 @@ class RunStore:
             }
             shutil.rmtree(self.run_dir(replacement_run_id))
             self._write_registry(registry)
+            self.command_log.replace_projection(
+                old.agent_id,
+                {old.agent_id: registry[old.agent_id]},
+            )
             return old
 
     def read_raw_events(

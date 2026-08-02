@@ -115,6 +115,7 @@ class CodexAppServerAdapter(ProviderAdapter):
         self._active_turn_id = record.active_turn_id
         self._transcript_path = record.transcript_path
         self._provider_pid: int | None = None
+        self._process_created_callback: Callable[[int], None] | None = None
         self._detail: str | None = None
         self._request: StartRequest | None = None
         self._write_lock = asyncio.Lock()
@@ -150,6 +151,9 @@ class CodexAppServerAdapter(ProviderAdapter):
     def prepare_replacement(self, record: RunRecord) -> None:
         self._configure_runtime(record)
         self._restart_for_runtime_change = True
+
+    def set_process_created_callback(self, callback: Callable[[int], None]) -> None:
+        self._process_created_callback = callback
 
     def _status(self) -> AdapterStatus:
         return AdapterStatus(
@@ -208,6 +212,8 @@ class CodexAppServerAdapter(ProviderAdapter):
                 f"could not start Codex App Server: {exc}"
             ) from exc
         self._process = process
+        if self._process_created_callback is not None:
+            self._process_created_callback(process.pid)
         self._generation = generation
         self._provider_pid = None
         self._state = LifecycleState.STARTING
