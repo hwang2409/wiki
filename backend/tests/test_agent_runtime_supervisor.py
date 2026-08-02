@@ -3439,6 +3439,96 @@ class SupervisorTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(receipt.ok)
         self.assertEqual(receipt.result, result)
 
+    async def test_send_on_idle_next_turn_echo_after_error_records_sent(
+        self,
+    ) -> None:
+        """REVIEW17 H1: queued delivery waits for the event-pump echo."""
+
+        record = await self.supervisor.start_run(
+            agent_id="WIKI-232-R17-IDLE",
+            provider=ProviderKind.CODEX,
+            role="implement",
+            model="fixture-codex",
+            effort="high",
+            worktree=str(self.worktree),
+            prompt="next-turn echo after send_on_idle error",
+        )
+        adapter = self.supervisor.adapters[record.run_id]
+        snapshot = adapter.snapshot()
+        idle = AdapterStatus(
+            LifecycleState.IDLE,
+            snapshot.session_id,
+            os.getpid(),
+            generation=snapshot.generation,
+        )
+        adapter._status = idle  # noqa: SLF001 - inline drain fixture
+        self.store.update_adapter_status(record.run_id, idle)
+        original_send = adapter.send_on_idle
+        provider_calls: list[str] = []
+
+        async def schedule_echo_then_raise(message: str) -> AdapterStatus:
+            provider_calls.append(message)
+            event = ProviderEvent(
+                ProviderKind.CODEX,
+                {
+                    "method": "item/completed",
+                    "params": {
+                        "item": {
+                            "type": "userMessage",
+                            "content": [{"type": "text", "text": message}],
+                        }
+                    },
+                },
+            )
+            asyncio.get_running_loop().call_soon(
+                adapter._events.put_nowait,  # noqa: SLF001 - pump boundary fixture
+                event,
+            )
+            raise RuntimeError("response failed before queued echo drained")
+
+        adapter.send_on_idle = schedule_echo_then_raise  # type: ignore[method-assign]
+        request_id = "review17-idle-next-turn-request"
+        try:
+            result = await self.supervisor.dispatch(
+                "run/send_on_idle",
+                {
+                    "run_id": record.run_id,
+                    "text": "queued echo on next turn",
+                    "source": "fleet-monitor",
+                    "request_id": request_id,
+                },
+            )
+        finally:
+            adapter.send_on_idle = original_send  # type: ignore[method-assign]
+
+        self.assertEqual(provider_calls, ["queued echo on next turn"])
+        self.assertEqual(result["status"], "sent")
+        pending_id = result.get("pending_id")
+        self.assertIsInstance(pending_id, str)
+        receipt = self.store.command_log.receipt("run/send_on_idle", request_id)
+        self.assertIsNotNone(receipt)
+        assert receipt is not None
+        self.assertTrue(receipt.ok)
+        self.assertEqual(receipt.result, result)
+        self.assertEqual(self.store.queued_messages(record.run_id), [])
+
+        composer = self.store.get(record.run_id).composer_messages
+        matching_composer = [
+            message for message in composer if message.get("pending_id") == pending_id
+        ]
+        self.assertEqual(len(matching_composer), 1)
+        self.assertEqual(matching_composer[0].get("source"), "fleet-monitor")
+        matching_normalized = [
+            event
+            for event in self.store.read_normalized_events(record.run_id)
+            if isinstance(event.get("payload"), dict)
+            and event["payload"].get("pending_id") == pending_id
+        ]
+        self.assertEqual(len(matching_normalized), 1)
+        self.assertEqual(
+            matching_normalized[0]["payload"].get("source"), "fleet-monitor"
+        )
+
     async def test_r5_provider_busy_after_idle_snapshot_preserves_queue(
         self,
     ) -> None:

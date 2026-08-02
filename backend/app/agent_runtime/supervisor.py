@@ -1639,6 +1639,7 @@ Preserve the same identity, role, worktree, orchestrator grouping, PR gates, and
                     source=queued_source if isinstance(queued_source, str) else None,
                 )
             attempt_key: tuple[str, str] | None = None
+            echo_boundary: asyncio.Future[None] | None = None
             try:
                 if pending_id is not None:
                     self.store.command_log.mark_steer_sending_for_pending(
@@ -1646,10 +1647,13 @@ Preserve the same identity, role, worktree, orchestrator grouping, PR gates, and
                     )
                     attempt_key = (run_id, pending_id)
                     self._queued_delivery_attempts.add(attempt_key)
+                    echo_boundary = asyncio.get_running_loop().create_future()
+                    self._delivery_attempt_echoes[attempt_key] = echo_boundary
                 status = await adapter.send_on_idle(queued["text"])
             except asyncio.CancelledError:
                 if attempt_key is not None:
                     self._queued_delivery_attempts.discard(attempt_key)
+                    self._delivery_attempt_echoes.pop(attempt_key, None)
                 raise
             except ProviderBusy:
                 # WIKI-232 R5 H1: the R3 idle-snapshot gate above is TOCTOU.
@@ -1666,6 +1670,7 @@ Preserve the same identity, role, worktree, orchestrator grouping, PR gates, and
                 # drive the retry.
                 if attempt_key is not None:
                     self._queued_delivery_attempts.discard(attempt_key)
+                    self._delivery_attempt_echoes.pop(attempt_key, None)
                 if pending_id is not None:
                     self.store.discard_pending_user_message(run_id, pending_id)
                     self.store.command_log.revert_steer_sending_to_queued_for_pending(
@@ -1674,8 +1679,22 @@ Preserve the same identity, role, worktree, orchestrator grouping, PR gates, and
                 await self._flush_deferred_provider_events(run_id)
                 return
             except Exception as exc:
+                # Match send_now's ambiguous transport boundary. A provider
+                # can queue an echo for the next event-loop turn before its
+                # transport reports failure. Keep the matcher active until
+                # that already-arriving event either signals or times out
+                # (REVIEW17 H1).
+                if echo_boundary is not None:
+                    try:
+                        await asyncio.wait_for(
+                            asyncio.shield(echo_boundary),
+                            timeout=AMBIGUOUS_SEND_ECHO_GRACE_SECONDS,
+                        )
+                    except TimeoutError:
+                        pass
                 if attempt_key is not None:
                     self._queued_delivery_attempts.discard(attempt_key)
+                    self._delivery_attempt_echoes.pop(attempt_key, None)
                 # Provider events that arrive during a queued attempt are
                 # durable raw rows but remain deferred until the transport
                 # outcome is known. Flush while the pending matcher still
@@ -1757,6 +1776,7 @@ Preserve the same identity, role, worktree, orchestrator grouping, PR gates, and
                 return
             if attempt_key is not None:
                 self._queued_delivery_attempts.discard(attempt_key)
+                self._delivery_attempt_echoes.pop(attempt_key, None)
             if pending_id is not None:
                 self.store.command_log.mark_steer_sent_for_pending(run_id, pending_id)
             await self._flush_deferred_provider_events(run_id)
