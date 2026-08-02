@@ -17,9 +17,23 @@ import {
   renderPageToCanvas,
   type LoadedPdf,
 } from "./pdfjs-runtime";
+import { PlotRenderer, type PlotView } from "./plot-renderer";
 import { ShikiCode, useCurrentTheme } from "./shiki";
 import { StatusBadge, statusToTone } from "./status-badge";
+import { AudioRenderer, VideoRenderer } from "./artifact-media-renderers";
+import {
+  artifactUrl,
+  type ArtifactRendererProps,
+  type ArtifactRenderFailure,
+} from "./artifact-renderers-shared";
+
+export { AudioRenderer, VideoRenderer };
+export { artifactUrl };
+export type { ArtifactRendererProps, ArtifactRenderFailure };
 import { STREAM_CLAMP_PX, STREAM_CLAMP_SLACK_PX } from "./stream-clamp";
+import { VisualDiffRenderer } from "./visual-diff-renderer";
+
+export { PlotRenderer, type PlotRendererProps, type PlotView } from "./plot-renderer";
 
 const IMAGE_EXTENSION_PATTERN = /\.(png|jpe?g|gif|webp|svg)(\?.*)?$/i;
 
@@ -36,27 +50,6 @@ const SVG_TAGS = [
   "style", "lineargradient", "radialgradient", "stop", "pattern",
   "clippath", "mask", "image", "marker",
 ];
-
-export type ArtifactRenderFailure = {
-  failureClass: "mermaid-render" | "svg-render";
-  errorCode: string;
-  position?: string;
-};
-
-export type ArtifactRendererProps = {
-  artifact: SessionArtifact;
-  compact?: boolean;
-  event: SessionEvent;
-  onExpand?: () => void;
-  onImageLoad?: (image: HTMLImageElement) => void;
-  onOpenFile?: (entry: ArtifactFileEntry) => void;
-  onRenderError?: (failure: ArtifactRenderFailure) => void;
-  ticket: string;
-};
-
-export function artifactUrl(ticket: string, event: SessionEvent): string {
-  return `/api/agents/${encodeURIComponent(ticket)}/artifact/${encodeURIComponent(event.artifact_id ?? "")}`;
-}
 
 function normalizeRenderFailure(
   failureClass: ArtifactRenderFailure["failureClass"],
@@ -393,86 +386,6 @@ export function ImageRenderer({ artifact, event, onExpand, onImageLoad, ticket }
       source={source}
       width={artifact.width}
     />
-  );
-}
-
-export function PlotRenderer({ actions = false, spec }: { actions?: boolean; spec: Record<string, unknown> }) {
-  const theme = useCurrentTheme();
-  const container = useRef<HTMLDivElement>(null);
-  const [error, setError] = useState<string | null>(null);
-  const [ready, setReady] = useState(false);
-  const [nonce, setNonce] = useState(0);
-  useEffect(() => {
-    setReady(false);
-    const target = container.current;
-    if (!target) return;
-    let finalized = false;
-    let finalize: (() => void) | undefined;
-    const styles = getComputedStyle(document.documentElement);
-    const text = styles.getPropertyValue("--text-normal").trim();
-    const muted = styles.getPropertyValue("--text-muted").trim();
-    const border = styles.getPropertyValue("--background-modifier-border").trim();
-    const background = styles.getPropertyValue("--background-primary").trim();
-    const accent = styles.getPropertyValue("--accent-primary").trim();
-    const font = styles.getPropertyValue("--font-monospace").trim();
-    const sourceConfig: Record<string, unknown> =
-      typeof spec.config === "object" && spec.config ? spec.config as Record<string, unknown> : {};
-    const sourceAxis = typeof sourceConfig.axis === "object" && sourceConfig.axis ? sourceConfig.axis : {};
-    const sourceLegend = typeof sourceConfig.legend === "object" && sourceConfig.legend ? sourceConfig.legend : {};
-    const sourceTitle = typeof sourceConfig.title === "object" && sourceConfig.title ? sourceConfig.title : {};
-    const sourceRange = typeof sourceConfig.range === "object" && sourceConfig.range ? sourceConfig.range : {};
-    const themedSpec = {
-      ...spec,
-      background,
-      config: {
-        ...sourceConfig,
-        font,
-        background,
-        axis: { ...sourceAxis, domainColor: border, gridColor: border, labelColor: muted, titleColor: text },
-        legend: { ...sourceLegend, labelColor: muted, titleColor: text },
-        title: { ...sourceTitle, color: text, font },
-        range: { ...sourceRange, category: [accent, text, muted, border] },
-      },
-    };
-    const reportPlotFailure = (reason: unknown) => {
-      if (finalized) return;
-      setError(reason instanceof Error ? reason.message : "Plot could not render this spec.");
-    };
-    import("vega-embed").then(async ({ default: embed }) => {
-      try {
-        const result = await embed(target, themedSpec, { actions, renderer: "svg" });
-        finalize = result.finalize;
-        if (!finalized) {
-          setError(null);
-          setReady(true);
-        }
-      } catch (reason) {
-        reportPlotFailure(reason);
-      }
-    }).catch(reportPlotFailure);
-    return () => {
-      finalized = true;
-      finalize?.();
-      target.replaceChildren();
-    };
-  }, [actions, nonce, spec, theme]);
-  if (error) {
-    return (
-      <ArtifactError
-        detail={error}
-        onRetry={() => {
-          setError(null);
-          setNonce((value) => value + 1);
-        }}
-        title="Plot couldn’t render."
-      />
-    );
-  }
-  return (
-    <div className="artifact-plot-wrap">
-      {!ready ? <ArtifactPlaceholder label="Rendering plot…" shape="plot" /> : null}
-      <div className="artifact-plot" ref={container} style={ready ? undefined : { visibility: "hidden", position: "absolute" }} />
-    </div>
   );
 }
 
@@ -878,6 +791,7 @@ export function PdfCompactRenderer({
   );
 }
 
+
 export function ArtifactRenderer(props: ArtifactRendererProps): ReactNode {
   const { artifact } = props;
   const effectiveKind = classifyArtifact(artifact);
@@ -902,6 +816,12 @@ export function ArtifactRenderer(props: ArtifactRendererProps): ReactNode {
       return <CodeRenderer artifact={artifact} />;
     case "pdf":
       return <PdfCompactRenderer event={props.event} ticket={props.ticket} />;
+    case "video":
+      return <VideoRenderer {...props} />;
+    case "audio":
+      return <AudioRenderer {...props} />;
+    case "visual-diff":
+      return <VisualDiffRenderer artifact={artifact} event={props.event} ticket={props.ticket} />;
   }
 }
 
@@ -968,6 +888,9 @@ export function CompactPreview({ artifact, event, onRenderError, ticket }: Artif
   }
   if (effectiveKind === "pdf") {
     return <PdfCompactRenderer event={event} ticket={ticket} />;
+  }
+  if (effectiveKind === "visual-diff") {
+    return <VisualDiffRenderer artifact={artifact} compact event={event} readOnly ticket={ticket} />;
   }
   return <ArtifactRenderer artifact={artifact} event={event} ticket={ticket} />;
 }

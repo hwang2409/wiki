@@ -20,6 +20,7 @@ from unittest import mock
 from uuid import uuid4
 
 from backend.app import accounts
+from backend.app.account_notices import AccountNoticeStore
 from backend.app import provider_health
 from backend.app.agent_runtime.client import (
     SupervisorClient,
@@ -597,7 +598,7 @@ class SupervisorTests(unittest.IsolatedAsyncioTestCase):
         with mock.patch.object(
             provider_health, "credential_fingerprint", return_value="fp-old"
         ):
-            await self.supervisor.start_run(
+            record = await self.supervisor.start_run(
                 agent_id="WIKI-AUTH-FINGERPRINT",
                 provider=ProviderKind.CODEX,
                 role="implement",
@@ -608,6 +609,7 @@ class SupervisorTests(unittest.IsolatedAsyncioTestCase):
             )
             verified = await _wait_for_published(queue, "codex_auth_verified")
         self.assertEqual(verified["credential_fingerprint"], "fp-old")
+        self.assertEqual(verified["run_id"], record.run_id)
         self.supervisor.unsubscribe(queue)
 
     async def test_artifact_failure_message_deduplicates_durably(self) -> None:
@@ -4142,6 +4144,8 @@ class SupervisorTests(unittest.IsolatedAsyncioTestCase):
                 "revived": ["WIKI-CODEX-ROTATE"],
                 "failed": [],
                 "failed_reasons": {},
+                "failed_run_ids": {},
+                "revived_run_ids": {"WIKI-CODEX-ROTATE": codex.run_id},
             },
         )
         resumed = self.store.get(codex.run_id)
@@ -4244,6 +4248,8 @@ class SupervisorTests(unittest.IsolatedAsyncioTestCase):
                 "revived": ["WIKI-RATE-LIMIT"],
                 "failed": [],
                 "failed_reasons": {},
+                "failed_run_ids": {},
+                "revived_run_ids": {"WIKI-RATE-LIMIT": codex.run_id},
                 "ts": published["ts"],
             },
         )
@@ -4297,9 +4303,85 @@ class SupervisorTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(accounts.read_state().active, "alpha")
 
         self.assertEqual(published["tickets"], ["WIKI-NO-ELIGIBLE"])
+        self.assertEqual(published["run_ids"], {"WIKI-NO-ELIGIBLE": record.run_id})
         self.assertEqual(
             published["reset_at"],
             datetime.fromtimestamp(1_750_009_999, tz=timezone.utc).isoformat(),
+        )
+        self.supervisor.unsubscribe(queue)
+
+    async def test_rate_limit_rotation_failures_publish_all_current_codex_run_ids(self) -> None:
+        records = [
+            await self.supervisor.start_run(
+                agent_id=f"WIKI-ROTATION-FAIL-{index}",
+                provider=ProviderKind.CODEX,
+                role="implement",
+                model="fixture-codex",
+                effort="high",
+                worktree=str(self.worktree),
+                prompt="fixture",
+            )
+            for index in (1, 2)
+        ]
+        expected = {record.agent_id: record.run_id for record in records}
+        queue = self.supervisor.subscribe()
+
+        for error in (
+            StoreConflict("fixture store conflict"),
+            accounts.RotationError("fixture rotation error"),
+        ):
+            with mock.patch.object(
+                self.supervisor,
+                "request_codex_rotation",
+                new=mock.AsyncMock(side_effect=error),
+            ):
+                await self.supervisor._handle_codex_rate_limit_event(  # noqa: SLF001
+                    records[0].run_id,
+                    outgoing_reset_at="2099-01-01T00:00:00+00:00",
+                )
+            published = await _wait_for_published(queue, "codex_rotation_failed")
+            self.assertEqual(published["tickets"], sorted(expected))
+            self.assertEqual(published["run_ids"], expected)
+
+        self.supervisor.unsubscribe(queue)
+
+    async def test_auth_dead_exact_session_failure_blocks_and_publishes_run_identity(self) -> None:
+        queue = self.supervisor.subscribe()
+        record = await self.supervisor.start_run(
+            agent_id="WIKI-AUTH-RESUME-FAIL",
+            provider=ProviderKind.CODEX,
+            role="implement",
+            model="fixture-codex",
+            effort="high",
+            worktree=str(self.worktree),
+            prompt="fixture",
+        )
+        adapter = self.supervisor.adapters[record.run_id]
+        failure = RuntimeError("fixture exact-session resume failure")
+
+        with mock.patch.object(
+            self.supervisor,
+            "_resume_run_without_admission",
+            new=mock.AsyncMock(side_effect=failure),
+        ):
+            await self.supervisor._recover_codex_auth_dead(  # noqa: SLF001
+                record.run_id,
+                adapter,
+                prior_state=LifecycleState.WORKING,
+            )
+
+        published = await _wait_for_published(queue, "codex_auth_dead_revival")
+        current = self.store.get(record.run_id)
+        self.assertEqual(current.state, LifecycleState.BLOCKED)
+        self.assertEqual(published["revived"], [])
+        self.assertEqual(published["revived_run_ids"], {})
+        self.assertEqual(published["failed"], [record.agent_id])
+        self.assertEqual(
+            published["failed_reasons"],
+            {record.agent_id: str(failure)},
+        )
+        self.assertEqual(
+            published["failed_run_ids"], {record.agent_id: record.run_id}
         )
         self.supervisor.unsubscribe(queue)
 
@@ -4357,6 +4439,69 @@ class SupervisorTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(old_codex_adapter.closed)
         self.assertEqual(published["revived"], ["WIKI-AUTH-DEAD"])
         self.assertEqual(published["failed"], [])
+        self.assertEqual(
+            published["revived_run_ids"], {"WIKI-AUTH-DEAD": record.run_id}
+        )
+        self.supervisor.unsubscribe(queue)
+
+    async def test_auth_dead_cap_survives_exact_session_resumes(self) -> None:
+        queue = self.supervisor.subscribe()
+        record = await self.supervisor.start_run(
+            agent_id="WIKI-AUTH-SAME-RUN-CAP",
+            provider=ProviderKind.CODEX,
+            role="implement",
+            model="fixture-codex",
+            effort="high",
+            worktree=str(self.worktree),
+            prompt="fixture",
+        )
+        session_id = record.provider_session_id
+        prior_adapter: ProviderAdapter | None = None
+
+        for attempt in range(accounts.AUTH_DEAD_MAX_ATTEMPTS):
+            adapter = self.supervisor.adapters[record.run_id]
+            self.assertIsNot(adapter, prior_adapter)
+            await self.supervisor._recover_codex_auth_dead(  # noqa: SLF001
+                record.run_id,
+                adapter,
+                prior_state=LifecycleState.WORKING,
+            )
+            published = await _wait_for_published(queue, "codex_auth_dead_revival")
+            self.assertEqual(published["revived"], [record.agent_id])
+            self.assertEqual(
+                published["revived_run_ids"], {record.agent_id: record.run_id}
+            )
+            current = self.store.get(record.run_id)
+            self.assertEqual(current.provider_session_id, session_id)
+            self.assertEqual(
+                len(self.supervisor.auth_dead_attempts[record.run_id]), attempt + 1
+            )
+            prior_adapter = adapter
+            if attempt + 1 < accounts.AUTH_DEAD_MAX_ATTEMPTS:
+                self.supervisor.auth_dead_attempts[record.run_id][-1] -= (
+                    accounts.AUTH_DEAD_COOLDOWN_SECONDS + 1
+                )
+
+        adapter = self.supervisor.adapters[record.run_id]
+        await self.supervisor._recover_codex_auth_dead(  # noqa: SLF001
+            record.run_id,
+            adapter,
+            prior_state=LifecycleState.WORKING,
+        )
+        exhausted = await _wait_for_published(queue, "codex_auth_dead_exhausted")
+        self.assertEqual(exhausted["tickets"], [record.agent_id])
+        self.assertIs(self.supervisor.adapters[record.run_id], adapter)
+        self.assertFalse(cast(CodexFixtureAdapter, adapter).closed)
+
+        await self.supervisor._recover_codex_auth_dead(  # noqa: SLF001
+            record.run_id,
+            adapter,
+            prior_state=LifecycleState.WORKING,
+        )
+        with self.assertRaises(asyncio.TimeoutError):
+            await _wait_for_published(
+                queue, "codex_auth_dead_exhausted", timeout=0.05
+            )
         self.supervisor.unsubscribe(queue)
 
     async def test_auth_dead_exhaustion_alerts_without_restarting_run(self) -> None:
@@ -4372,7 +4517,7 @@ class SupervisorTests(unittest.IsolatedAsyncioTestCase):
         )
         adapter = self.supervisor.adapters[record.run_id]
         now = time.monotonic()
-        self.supervisor.auth_dead_attempts[record.agent_id] = [
+        self.supervisor.auth_dead_attempts[record.run_id] = [
             now - 400,
             now - 500,
             now - 600,
@@ -4404,6 +4549,37 @@ class SupervisorTests(unittest.IsolatedAsyncioTestCase):
         codex_adapter = cast(CodexFixtureAdapter, adapter)
         self.assertIs(self.supervisor.adapters[record.run_id], adapter)
         self.assertFalse(codex_adapter.closed)
+        self.supervisor.unsubscribe(queue)
+
+    async def test_auth_dead_recovery_state_is_fresh_after_replacement(self) -> None:
+        queue = self.supervisor.subscribe()
+        old = await self.supervisor.start_run(
+            agent_id="WIKI-AUTH-REPLACE",
+            provider=ProviderKind.CODEX,
+            role="implement",
+            model="fixture-codex",
+            effort="high",
+            worktree=str(self.worktree),
+            prompt="fixture",
+        )
+        now = time.monotonic()
+        self.supervisor.auth_dead_attempts[old.run_id] = [now - 10, now - 20, now - 30]
+        self.supervisor.auth_dead_alert_at[old.run_id] = now
+
+        replacement = await self.supervisor.replace(old.run_id, "replacement prompt")
+
+        self.assertNotIn(old.run_id, self.supervisor.auth_dead_attempts)
+        self.assertNotIn(old.run_id, self.supervisor.auth_dead_alert_at)
+        self.assertNotIn(replacement.run_id, self.supervisor.auth_dead_attempts)
+        self.assertNotIn(replacement.run_id, self.supervisor.auth_dead_alert_at)
+
+        await self.supervisor._recover_codex_auth_dead(  # noqa: SLF001
+            replacement.run_id,
+            self.supervisor.adapters[replacement.run_id],
+            prior_state=LifecycleState.WORKING,
+        )
+        published = await _wait_for_published(queue, "codex_auth_dead_revival")
+        self.assertEqual(published["revived"], ["WIKI-AUTH-REPLACE"])
         self.supervisor.unsubscribe(queue)
 
     async def test_claude_limit_event_alerts_once_per_hour(self) -> None:
@@ -4439,8 +4615,210 @@ class SupervisorTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual(first["ticket"], "WIKI-CLAUDE-LIMIT")
         self.assertEqual(first["window"], "")
+        # Round-7: run_id + provider ride along so the notice store can
+        # reconcile a Claude-to-Codex replacement without needing a
+        # ticket-scoped recovery event.
+        self.assertEqual(first["run_id"], record.run_id)
+        self.assertEqual(first["provider"], "claude")
         with self.assertRaises(TimeoutError):
             await _wait_for_published(queue, "claude_limit_hit", timeout=0.1)
+        self.supervisor.unsubscribe(queue)
+
+    async def test_claude_limit_alerts_per_run_not_per_ticket(self) -> None:
+        # Round-8: throttling was previously keyed by ticket, so a
+        # replacement run under the same ticket would silently drop its
+        # own limit notice within the hour. Now keyed by run_id and
+        # pruned in _detach_adapter.
+        queue = self.supervisor.subscribe()
+        first_record = await self.supervisor.start_run(
+            agent_id="WIKI-CLAUDE-RETRY",
+            provider=ProviderKind.CLAUDE,
+            role="review",
+            model="fixture-claude",
+            effort=None,
+            worktree=str(self.worktree),
+            prompt="fixture",
+        )
+        first_adapter = self.supervisor.adapters[first_record.run_id]
+        payload = {
+            "type": "result",
+            "subtype": "error",
+            "is_error": True,
+            "result": "Claude usage limit reached. Try again at 4pm.",
+        }
+        await self.supervisor._handle_provider_event(  # noqa: SLF001
+            first_record.run_id,
+            first_adapter,
+            ProviderEvent(ProviderKind.CLAUDE, payload),
+        )
+        first = await _wait_for_published(queue, "claude_limit_hit")
+        self.assertEqual(first["run_id"], first_record.run_id)
+
+        # Terminate + archive the first run so the ticket becomes eligible
+        # for a replacement start_run. _detach_adapter (called from
+        # archive) must have pruned the per-run throttle timestamp.
+        self.assertIn(first_record.run_id, self.supervisor.last_limit_alert_at)
+        await self.supervisor.archive(first_record.run_id)
+        self.assertNotIn(first_record.run_id, self.supervisor.last_limit_alert_at)
+
+        second_record = await self.supervisor.start_run(
+            agent_id="WIKI-CLAUDE-RETRY",
+            provider=ProviderKind.CLAUDE,
+            role="review",
+            model="fixture-claude",
+            effort=None,
+            worktree=str(self.worktree),
+            prompt="fixture",
+        )
+        self.assertNotEqual(second_record.run_id, first_record.run_id)
+        second_adapter = self.supervisor.adapters[second_record.run_id]
+        await self.supervisor._handle_provider_event(  # noqa: SLF001
+            second_record.run_id,
+            second_adapter,
+            ProviderEvent(ProviderKind.CLAUDE, payload),
+        )
+        second = await _wait_for_published(queue, "claude_limit_hit")
+        self.assertEqual(second["run_id"], second_record.run_id)
+        self.supervisor.unsubscribe(queue)
+
+    async def test_claude_success_with_limit_warning_only_clears_notice(self) -> None:
+        queue = self.supervisor.subscribe()
+        notice_store = AccountNoticeStore(path=self.root / "account-notices.json")
+        record = await self.supervisor.start_run(
+            agent_id="WIKI-CLAUDE-RECOVERY",
+            provider=ProviderKind.CLAUDE,
+            role="review",
+            model="fixture-claude",
+            effort=None,
+            worktree=str(self.worktree),
+            prompt="fixture",
+        )
+        adapter = self.supervisor.adapters[record.run_id]
+        await self.supervisor._handle_provider_event(  # noqa: SLF001
+            record.run_id,
+            adapter,
+            ProviderEvent(
+                ProviderKind.CLAUDE,
+                {
+                    "type": "result",
+                    "subtype": "error",
+                    "is_error": True,
+                    "result": "Claude usage limit reached. Try again at 4pm.",
+                },
+            ),
+        )
+        hit = await _wait_for_published(queue, "claude_limit_hit")
+        notice_store.apply_event(hit)
+
+        # A failed provider request is not recovery proof.
+        await self.supervisor._handle_provider_event(  # noqa: SLF001
+            record.run_id,
+            adapter,
+            ProviderEvent(
+                ProviderKind.CLAUDE,
+                {
+                    "type": "result",
+                    "subtype": "error",
+                    "is_error": True,
+                    "result": "Claude usage limit reached again.",
+                },
+            ),
+        )
+        with self.assertRaises(TimeoutError):
+            await _wait_for_published(queue, "claude_limit_cleared", timeout=0.1)
+
+        await self.supervisor._handle_provider_event(  # noqa: SLF001
+            record.run_id,
+            adapter,
+            ProviderEvent(
+                ProviderKind.CLAUDE,
+                {
+                    "type": "result",
+                    "subtype": "success",
+                    "is_error": False,
+                    "result": "Turn completed; approaching usage limit warning shown.",
+                },
+            ),
+        )
+        cleared = await _wait_for_published(queue, "claude_limit_cleared")
+        notice_store.apply_event(cleared)
+        self.assertEqual(cleared["ticket"], "WIKI-CLAUDE-RECOVERY")
+        self.assertEqual(cleared["run_id"], record.run_id)
+        self.assertEqual(notice_store.snapshot(), [])
+
+        # A successful turn clears the per-run throttle so a later limit on
+        # the same run produces a fresh actionable notice.
+        self.assertNotIn(record.run_id, self.supervisor.last_limit_alert_at)
+        await self.supervisor._handle_provider_event(  # noqa: SLF001
+            record.run_id,
+            adapter,
+            ProviderEvent(
+                ProviderKind.CLAUDE,
+                {
+                    "type": "result",
+                    "subtype": "error",
+                    "is_error": True,
+                    "result": "Claude usage limit reached after recovery.",
+                },
+            ),
+        )
+        second_hit = await _wait_for_published(queue, "claude_limit_hit")
+        notice_store.apply_event(second_hit)
+        self.assertEqual(second_hit["run_id"], record.run_id)
+        self.assertIn(record.run_id, self.supervisor.last_limit_alert_at)
+        self.assertEqual(notice_store.snapshot()[0]["type"], "claude_limit_hit")
+        self.supervisor.unsubscribe(queue)
+
+    async def test_claude_limit_clear_survives_supervisor_restart(self) -> None:
+        notice_store = AccountNoticeStore(path=self.root / "account-notices.json")
+        queue = self.supervisor.subscribe()
+        record = await self.supervisor.start_run(
+            agent_id="WIKI-CLAUDE-RESTART",
+            provider=ProviderKind.CLAUDE,
+            role="review",
+            model="fixture-claude",
+            effort=None,
+            worktree=str(self.worktree),
+            prompt="fixture",
+        )
+        adapter = self.supervisor.adapters[record.run_id]
+        await self.supervisor._handle_provider_event(  # noqa: SLF001
+            record.run_id,
+            adapter,
+            ProviderEvent(
+                ProviderKind.CLAUDE,
+                {
+                    "type": "result",
+                    "subtype": "error",
+                    "is_error": True,
+                    "result": "Claude usage limit reached. Try again at 4pm.",
+                },
+            ),
+        )
+        hit = await _wait_for_published(queue, "claude_limit_hit")
+        notice_store.apply_event(hit)
+        self.supervisor.unsubscribe(queue)
+
+        await self.supervisor.close()
+        self.supervisor = Supervisor(
+            self.store,
+            FixtureAdapterFactory(FIXTURES, pid=os.getpid()),
+        )
+        queue = self.supervisor.subscribe()
+        adapter = FixtureAdapterFactory(FIXTURES, pid=os.getpid())(record)
+        self.supervisor._attach_adapter(record.run_id, adapter)  # noqa: SLF001
+        await self.supervisor._handle_provider_event(  # noqa: SLF001
+            record.run_id,
+            adapter,
+            ProviderEvent(
+                ProviderKind.CLAUDE,
+                {"type": "result", "subtype": "success", "is_error": False},
+            ),
+        )
+        cleared = await _wait_for_published(queue, "claude_limit_cleared")
+        notice_store.apply_event(cleared)
+        self.assertEqual(cleared["run_id"], record.run_id)
+        self.assertEqual(notice_store.snapshot(), [])
         self.supervisor.unsubscribe(queue)
 
     async def test_rotation_failure_restores_auth_and_resumes_quiesced_run(

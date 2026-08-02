@@ -24,6 +24,8 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Awaitable, Callable, Iterator
 
+from .account_notices import AccountNoticeStore
+
 
 # ---------------------------------------------------------------------------
 # Env-overridable paths.
@@ -174,6 +176,17 @@ def detect_codex_limit(pane: str) -> bool:
 
 def detect_claude_limit(pane: str) -> bool:
     return bool(pane and CLAUDE_LIMIT_PATTERN.search(pane))
+
+
+def claude_turn_succeeded(payload: object) -> bool:
+    """True only for a successful provider result, not terminal redraw text."""
+
+    return (
+        isinstance(payload, dict)
+        and payload.get("type") == "result"
+        and payload.get("subtype") == "success"
+        and payload.get("is_error") is False
+    )
 
 
 def detect_codex_auth_dead(pane: str) -> bool:
@@ -629,6 +642,7 @@ class WorkerEntry:
     orch: str | None
     spawned_at: str | None = None
     session_id: str | None = None  # codex rollout session id (registry-tracked)
+    run_id: str | None = None  # headless supervisor run identity
 
 
 def read_registry() -> dict:
@@ -710,6 +724,7 @@ def _worker_from_registry_entry(
     orch_value = current.get("orch")
     spawned_at_value = current.get("spawned_at")
     session_id_value = current.get("session_id")
+    run_id_value = current.get("run_id")
     return WorkerEntry(
         ticket=ticket,
         window=window,
@@ -720,6 +735,7 @@ def _worker_from_registry_entry(
         orch=orch_value if isinstance(orch_value, str) else None,
         spawned_at=spawned_at_value if isinstance(spawned_at_value, str) else None,
         session_id=session_id_value if isinstance(session_id_value, str) else None,
+        run_id=run_id_value if isinstance(run_id_value, str) else None,
     ), None
 
 
@@ -1019,6 +1035,13 @@ class RotationResult:
     failed: list[str]  # ticket ids that couldn't be revived
     reset_at: str | None  # reset time recorded for outgoing account
     failed_reasons: dict[str, str] = field(default_factory=dict)
+    # Ticket -> run_id for the failing run at the moment the rotation
+    # decided the worker could not be revived. The notice store uses this
+    # to reconcile against the live registry: a replaced ticket has a new
+    # run_id and its notice drops on the next refresh. Empty for legacy
+    # tmux workers that have no run_id.
+    failed_run_ids: dict[str, str] = field(default_factory=dict)
+    revived_run_ids: dict[str, str] = field(default_factory=dict)
 
 
 @dataclass
@@ -1026,6 +1049,7 @@ class RevivalResult:
     revived: list[str]
     failed: list[str]
     failed_reasons: dict[str, str] = field(default_factory=dict)
+    revived_run_ids: dict[str, str] = field(default_factory=dict)
 
 
 def rotate(
@@ -1084,6 +1108,7 @@ def rotate(
     write_state(state)
 
     revived: list[str] = []
+    revived_run_ids: dict[str, str] = {}
     failed: list[str] = []
     reasons: dict[str, str] = {}
     for snapshot in to_revive:
@@ -1096,6 +1121,8 @@ def rotate(
         new_window, reason = _revive_worker(worker, session_by_window.get(snapshot.window))
         if new_window:
             revived.append(worker.ticket)
+            if snapshot.run_id:
+                revived_run_ids[worker.ticket] = snapshot.run_id
         else:
             failed.append(worker.ticket)
             if reason:
@@ -1109,6 +1136,7 @@ def rotate(
         failed=failed,
         reset_at=outgoing_reset_at,
         failed_reasons=reasons,
+        revived_run_ids=revived_run_ids,
     )
 
 
@@ -1297,6 +1325,7 @@ def revive_auth_dead(workers: list[WorkerEntry]) -> RevivalResult:
     for worker in to_revive:
         tmux_kill_window(worker.window)
     revived: list[str] = []
+    revived_run_ids: dict[str, str] = {}
     failed: list[str] = []
     reasons: dict[str, str] = {}
     for snapshot in to_revive:
@@ -1309,11 +1338,18 @@ def revive_auth_dead(workers: list[WorkerEntry]) -> RevivalResult:
         new_window, reason = _revive_worker(worker, session_by_window.get(snapshot.window))
         if new_window:
             revived.append(worker.ticket)
+            if snapshot.run_id:
+                revived_run_ids[worker.ticket] = snapshot.run_id
         else:
             failed.append(worker.ticket)
             if reason:
                 reasons[worker.ticket] = reason
-    return RevivalResult(revived=revived, failed=failed, failed_reasons=reasons)
+    return RevivalResult(
+        revived=revived,
+        failed=failed,
+        failed_reasons=reasons,
+        revived_run_ids=revived_run_ids,
+    )
 
 
 def _append_rotation_log(outgoing: str | None, incoming: str, revived: list[str], failed: list[str]) -> None:
@@ -1468,7 +1504,7 @@ EventEmitter = Callable[[dict], Awaitable[None]]
 @dataclass
 class WatchdogInternalState:
     last_rotation_attempt: float = 0.0
-    last_alert_at: dict[str, float] = field(default_factory=dict)
+    last_alert_at: dict[tuple[str, str], float] = field(default_factory=dict)
     last_no_eligible_alert: float = 0.0
     # Per-ticket auth-dead revival timestamps (monotonic). Bounded loop:
     # after AUTH_DEAD_MAX_ATTEMPTS attempts inside AUTH_DEAD_WINDOW_SECONDS,
@@ -1477,6 +1513,38 @@ class WatchdogInternalState:
     # broken token loops kill+resume every poll cycle forever.
     auth_dead_attempts: dict[str, list[float]] = field(default_factory=dict)
     auth_dead_alert_at: dict[str, float] = field(default_factory=dict)
+    # Tickets whose pane currently shows the Claude usage-limit banner. Pane
+    # redraws are not recovery proof, so these notices clear only after a
+    # successful provider result from the headless supervisor.
+    claude_limited: set[tuple[str, str]] = field(default_factory=set)
+    # Legacy Codex panes have no run_id. Track every ticket named by a fleet
+    # notice, with its current window. Ticket scope survives window changes.
+    codex_limited: dict[str, str] = field(default_factory=dict)
+
+
+def _restore_legacy_codex_tickets() -> set[str]:
+    """Restore legacy tickets from unresolved durable fleet notices."""
+
+    try:
+        notices = AccountNoticeStore().snapshot()
+    except Exception:  # noqa: BLE001 — notice storage must not stop watchdogs
+        return set()
+
+    tickets: set[str] = set()
+    for notice in notices:
+        if notice.get("type") not in {"codex_limit_no_eligible", "codex_rotation_failed"}:
+            continue
+        notice_tickets = notice.get("tickets")
+        if not isinstance(notice_tickets, list):
+            continue
+        run_ids = notice.get("run_ids")
+        run_id_map = run_ids if isinstance(run_ids, dict) else {}
+        for ticket in notice_tickets:
+            if not isinstance(ticket, str) or not ticket:
+                continue
+            if not isinstance(run_id_map.get(ticket), str) or not run_id_map.get(ticket):
+                tickets.add(ticket)
+    return tickets
 
 
 AUTH_DEAD_MAX_ATTEMPTS = 3
@@ -1498,15 +1566,30 @@ async def _check_once(
     claude_workers = await asyncio.to_thread(iter_workers, "cc")
 
     codex_hits: list[tuple[WorkerEntry, str]] = []
+    live_codex_workers: list[WorkerEntry] = []
+    for ticket in _restore_legacy_codex_tickets():
+        watch.codex_limited.setdefault(ticket, "")
+    live_legacy_codex_workers = {
+        worker.ticket: worker.window
+        for worker in codex_workers
+        if worker.window in live and not worker.run_id
+    }
     auth_dead: list[WorkerEntry] = []
     for worker in codex_workers:
         if worker.window not in live:
             continue
+        live_codex_workers.append(worker)
         pane = await asyncio.to_thread(tmux_capture, worker.window, 80)
         if detect_codex_limit(pane):
             codex_hits.append((worker, pane))
-        elif detect_codex_auth_dead(pane):
-            auth_dead.append(worker)
+            if not worker.run_id:
+                if worker.ticket in watch.codex_limited:
+                    watch.codex_limited[worker.ticket] = worker.window
+        else:
+            # Legacy tmux transport has no quota-capable provider response.
+            # Keep the notice until rotation, replacement, or operator action.
+            if detect_codex_auth_dead(pane):
+                auth_dead.append(worker)
 
     # Auth-dead workers get killed + resumed on the CURRENT auth.json — no
     # account swap, so no debounce interaction with the rotation loop below.
@@ -1548,7 +1631,7 @@ async def _check_once(
                 })
         if eligible:
             result = await asyncio.to_thread(revive_auth_dead, eligible)
-            await emit({
+            event = {
                 "type": "codex_auth_dead_revival",
                 "provider": "codex",
                 "failure": "auth",
@@ -1557,23 +1640,42 @@ async def _check_once(
                 "failed": result.failed,
                 "failed_reasons": result.failed_reasons,
                 "ts": datetime.now(timezone.utc).isoformat(),
-            })
+            }
+            if result.revived_run_ids:
+                event["revived_run_ids"] = result.revived_run_ids
+            await emit(event)
+
+    live_claude_identities = {
+        (worker.ticket, worker.window)
+        for worker in claude_workers
+        if worker.window in live
+    }
+    watch.claude_limited.intersection_update(live_claude_identities)
+    for identity in set(watch.last_alert_at) - live_claude_identities:
+        watch.last_alert_at.pop(identity, None)
 
     for worker in claude_workers:
         if worker.window not in live:
             continue
+        identity = (worker.ticket, worker.window)
         pane = await asyncio.to_thread(tmux_capture, worker.window, 80)
         if detect_claude_limit(pane):
-            # Alert once per hour per ticket.
-            if _seconds_since(watch.last_alert_at.get(worker.ticket, 0.0)) < 3600:
+            watch.claude_limited.add(identity)
+            # Alert once per hour per worker identity.
+            if _seconds_since(watch.last_alert_at.get(identity, 0.0)) < 3600:
                 continue
-            watch.last_alert_at[worker.ticket] = time.monotonic()
+            watch.last_alert_at[identity] = time.monotonic()
             await emit({
                 "type": "claude_limit_hit",
                 "ticket": worker.ticket,
                 "window": worker.window,
                 "ts": datetime.now(timezone.utc).isoformat(),
             })
+        elif identity in watch.claude_limited:
+            # A redraw can hide the banner while the next provider request is
+            # still rate-limited. Legacy tmux has no positive recovery proof.
+            # Keep the notice, but permit a later banner to re-alert.
+            watch.last_alert_at.pop(identity, None)
 
     if not codex_hits:
         return
@@ -1610,33 +1712,66 @@ async def _check_once(
     except RotationDebouncedError:
         return
     except NoEligibleAccountError:
+        # Rotation affects every live legacy Codex worker, not only workers
+        # whose panes showed the first limit signature.
+        affected_tickets = [worker.ticket for worker in live_codex_workers]
+        for worker in live_codex_workers:
+            if not worker.run_id:
+                watch.codex_limited[worker.ticket] = worker.window
+        affected_run_ids = {
+            worker.ticket: worker.run_id
+            for worker in live_codex_workers
+            if worker.run_id
+        }
         if _seconds_since(watch.last_no_eligible_alert) >= 3600:
             watch.last_no_eligible_alert = time.monotonic()
             reset_hint = outgoing_reset or _earliest_pending_reset(state)
             await emit({
                 "type": "codex_limit_no_eligible",
-                "tickets": [w.ticket for w, _ in codex_hits],
+                "tickets": affected_tickets,
+                "run_ids": affected_run_ids,
                 "reset_at": reset_hint,
                 "ts": datetime.now(timezone.utc).isoformat(),
             })
         return
     except RotationError as exc:
+        # Keep the same fleet scope when the account swap itself fails.
+        affected_tickets = [worker.ticket for worker in live_codex_workers]
+        for worker in live_codex_workers:
+            if not worker.run_id:
+                watch.codex_limited[worker.ticket] = worker.window
+        affected_run_ids = {
+            worker.ticket: worker.run_id
+            for worker in live_codex_workers
+            if worker.run_id
+        }
         await emit({
             "type": "codex_rotation_failed",
             "error": str(exc),
+            "tickets": affected_tickets,
+            "run_ids": affected_run_ids,
             "ts": datetime.now(timezone.utc).isoformat(),
         })
         return
 
-    await emit({
+    event = {
         "type": "codex_rotation",
         "from": result.outgoing,
         "to": result.incoming,
         "revived": result.revived,
         "failed": result.failed,
         "failed_reasons": result.failed_reasons,
+        # Legacy tmux workers have no run_id, so this map is empty for
+        # this path. The headless supervisor populates it; notices with
+        # no stored run_id fall back to ticket-only reconciliation
+        # (archive clears, replace does not) — legacy replace flows
+        # publish codex_worker_replaced to cover that case.
+        "failed_run_ids": result.failed_run_ids,
         "ts": datetime.now(timezone.utc).isoformat(),
-    })
+    }
+    if result.revived_run_ids:
+        event["revived_run_ids"] = result.revived_run_ids
+    await emit(event)
 
 
 def _earliest_pending_reset(state: AccountState) -> str | None:

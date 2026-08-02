@@ -51,6 +51,13 @@ class ArtifactTranscriptTests(unittest.TestCase):
     def setUp(self) -> None:
         transcripts._cache.clear()
 
+    def test_only_wiki_render_artifact_tool_names_are_accepted(self) -> None:
+        self.assertTrue(transcripts._is_artifact_tool("render_artifact"))
+        self.assertTrue(
+            transcripts._is_artifact_tool("mcp__wiki_artifacts__render_artifact")
+        )
+        self.assertFalse(transcripts._is_artifact_tool("other_server__render_artifact"))
+
     def test_codex_and_claude_artifact_tools_emit_specialized_events(self) -> None:
         kinds = ["mermaid", "svg", "image", "table", "plot", "code"]
         with TemporaryDirectory() as tmp:
@@ -400,6 +407,87 @@ class ArtifactTranscriptTests(unittest.TestCase):
             },
         )
         self.assertNotIn("data_base64", event["artifact"])
+
+    def test_structured_binary_results_use_only_server_artifact_reference(self) -> None:
+        artifact_id = "33b1c159-9d1e-4804-9b14-3d880ac2e3c7"
+        cases = {
+            "image": "image/png",
+            "pdf": "application/pdf",
+            "video": "video/mp4",
+            "audio": "audio/mpeg",
+        }
+        for kind, mime in cases.items():
+            with self.subTest(kind=kind):
+                payload = {
+                    "data_base64": "UNSCRUBBED-INPUT-BYTES",
+                    "path": "/attacker/input.bin",
+                    "mime": mime,
+                    "poster_base64": "UNSCRUBBED-POSTER",
+                    "transcript": "input transcript",
+                }
+                result = {"artifact_id": artifact_id, "ok": True}
+                if kind == "video":
+                    result["artifact"] = {
+                        "kind": "video",
+                        "ref": f"artifact://{artifact_id}",
+                        "mime": mime,
+                        "byte_size": 1234,
+                        "width": 160,
+                        "height": 120,
+                        "duration_ms": 533,
+                        "poster_base64": "data:image/png;base64,AA==",
+                    }
+                elif kind == "audio":
+                    result["artifact"] = {
+                        "kind": "audio",
+                        "ref": f"artifact://{artifact_id}",
+                        "mime": mime,
+                        "byte_size": 1234,
+                        "duration_ms": 500,
+                        "peaks": [0, 128, 255],
+                        "transcript": "validated transcript",
+                    }
+                event = transcripts._artifact_from_structured_result(
+                    {"input": {"kind": kind, "payload": payload}},
+                    json.dumps(result),
+                )
+                self.assertIsNotNone(event)
+                if kind in {"video", "audio"}:
+                    self.assertEqual(event["artifact"], result["artifact"])
+                else:
+                    self.assertEqual(
+                        event["artifact"],
+                        {
+                            "kind": kind,
+                            "ref": f"artifact://{artifact_id}",
+                            "mime": mime,
+                        },
+                    )
+                self.assertNotIn("UNSCRUBBED-INPUT-BYTES", json.dumps(event))
+                self.assertNotIn("UNSCRUBBED-POSTER", json.dumps(event))
+
+    def test_structured_binary_result_rejects_unallowed_mime(self) -> None:
+        for kind in ("image", "pdf", "video", "audio"):
+            with self.subTest(kind=kind):
+                self.assertIsNone(
+                    transcripts._artifact_from_structured_result(
+                        {
+                            "input": {
+                                "kind": kind,
+                                "payload": {
+                                    "mime": "application/octet-stream",
+                                    "data_base64": "input-bytes",
+                                },
+                            }
+                        },
+                        json.dumps(
+                            {
+                                "artifact_id": "33b1c159-9d1e-4804-9b14-3d880ac2e3c7",
+                                "ok": True,
+                            }
+                        ),
+                    )
+                )
 
     def test_structured_artifact_fallback_rejects_errors_and_invalid_metadata(self) -> None:
         valid_input = {

@@ -46,6 +46,8 @@ test("context preview is off by default", () => {
       onSpawn={() => undefined}
     />,
   );
+  // Context prelude lives inside Advanced (WIKI-154 finding 4); open it.
+  fireEvent.click(screen.getByRole("button", { name: /Advanced/ }));
 
   expect((screen.getByRole("checkbox") as HTMLInputElement).checked).toBe(false);
   expect(
@@ -70,6 +72,7 @@ test("spawn stays disabled while the enabled preview is loading", async () => {
   fireEvent.change(screen.getByPlaceholderText("Tell the worker exactly what to do."), {
     target: { value: "run tests" },
   });
+  fireEvent.click(screen.getByRole("button", { name: /Advanced/ }));
   fireEvent.click(screen.getByRole("checkbox"));
 
   await vi.advanceTimersByTimeAsync(250);

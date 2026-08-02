@@ -174,6 +174,7 @@ class RunRecord:
     automatic_resume_guarded_at: str | None = None
     replaces_run_id: str | None = None
     replaced_by_run_id: str | None = None
+    replaced_legacy_provider: str | None = None
     outcome: str | None = None
     start_request_id: str | None = None
     implicit_start_request: bool = False
@@ -273,6 +274,7 @@ class RunRecord:
             "updated_at": self.updated_at,
             "replaces_run_id": self.replaces_run_id,
             "replaced_by_run_id": self.replaced_by_run_id,
+            "replaced_legacy_provider": self.replaced_legacy_provider,
             "outcome": self.outcome,
             "start_request_id": self.start_request_id,
             "implicit_start_request": self.implicit_start_request,
@@ -346,6 +348,7 @@ class RunRecord:
             updated_at=str(value.get("updated_at") or utc_now()),
             replaces_run_id=value.get("replaces_run_id"),
             replaced_by_run_id=value.get("replaced_by_run_id"),
+            replaced_legacy_provider=value.get("replaced_legacy_provider"),
             outcome=value.get("outcome"),
             start_request_id=value.get("start_request_id"),
             implicit_start_request=bool(value.get("implicit_start_request", False)),

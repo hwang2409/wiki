@@ -63,8 +63,12 @@ export function isActiveFilePath(activePath: string | null, workspace: string, p
   return activePath === filePanePath(workspace, path);
 }
 
-export function shouldDiscoverWorkspaces(sidebarTab: string, switcherOpen: boolean): boolean {
-  return sidebarTab === "files" || switcherOpen;
+export function shouldDiscoverWorkspaces(
+  sidebarTab: string,
+  switcherOpen: boolean,
+  agentsOpen = false,
+): boolean {
+  return sidebarTab === "files" || sidebarTab === "agents" || switcherOpen || agentsOpen;
 }
 
 export function workspaceCacheKey(workspace: WorkspaceStatus): string {

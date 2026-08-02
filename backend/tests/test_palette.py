@@ -99,9 +99,27 @@ def _artifact_event(kind: str, artifact_id: str, title: str) -> dict:
         "svg": {"source": "<svg/>"},
         "image": {"ref": f"artifact://{artifact_id}", "mime": "image/png", "byte_size": 4},
         "table": {"columns": [{"key": "a", "label": "A", "type": "string"}], "rows": [["hi"]]},
-        "plot": {"spec_vega_lite": {"mark": "point"}},
-        "json": {"data": {"ok": True}},
-        "file-list": {"files": [{"path": "a"}]},
+            "plot": {"spec_vega_lite": {"mark": "point"}},
+            "json": {"data": {"ok": True}},
+            "file-list": {"files": [{"path": "a"}]},
+            "video": {"ref": f"artifact://{artifact_id}", "mime": "video/mp4", "byte_size": 4},
+            "audio": {"ref": f"artifact://{artifact_id}", "mime": "audio/wav", "byte_size": 4},
+            "visual-diff": {
+            "before": {
+                "ref": f"artifact://{artifact_id}/before",
+                "mime": "image/png",
+                "byte_size": 4,
+                "width": 2,
+                "height": 2,
+            },
+            "after": {
+                "ref": f"artifact://{artifact_id}/after",
+                "mime": "image/png",
+                "byte_size": 4,
+                "width": 2,
+                "height": 2,
+            },
+        },
     }
     return {
         "kind": "artifact",
@@ -332,7 +350,10 @@ class PaletteSearchTests(unittest.TestCase):
             archive = root / "archive"
             events = archive / "WIKI-99" / "20260721-120000" / "events.jsonl"
             entries = []
-            for kind in ("code", "mermaid", "diff", "svg", "table", "plot", "json"):
+            for kind in (
+                "code", "mermaid", "diff", "svg", "table", "plot", "json",
+                "video", "audio", "visual-diff",
+            ):
                 artifact_id = f"aaaaaaaa-{kind[:4]:<4}-4000-8000-000000000000".replace(" ", "0")
                 entries.append(_artifact_event(kind, artifact_id, f"{kind} title"))
             _write_events_jsonl(events, entries)
@@ -345,7 +366,10 @@ class PaletteSearchTests(unittest.TestCase):
                 archive_dir=archive,
             )
             kinds_seen = {row.get("subtitle", "").split(" ")[0] for row in results if row["kind"] == "artifact"}
-            for expected in ("code", "mermaid", "diff", "svg", "table", "plot", "json"):
+            for expected in (
+                "code", "mermaid", "diff", "svg", "table", "plot", "json",
+                "video", "audio", "visual-diff",
+            ):
                 self.assertIn(expected, kinds_seen, f"missing artifact kind {expected} in {kinds_seen}")
 
     def test_symlink_outside_vault_ignored(self):

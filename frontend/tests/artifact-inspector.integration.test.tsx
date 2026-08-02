@@ -103,6 +103,29 @@ describe("ArtifactInspector chrome", () => {
     expect(screen.getByTitle("Close (Esc)")).toBeTruthy();
   });
 
+  test.each([
+    ["video", { kind: "video", mime: "video/mp4", ref: "artifact://video" }],
+    ["audio", { kind: "audio", mime: "audio/wav", ref: "artifact://audio" }],
+  ] as const)("opens %s fullscreen with its media renderer", (kind, artifact) => {
+    const event = artifactEvent({
+      artifact_id: `media-${kind}`,
+      title: `${kind} fixture`,
+      artifact,
+    });
+    render(
+      <ArtifactInspector
+        events={[event]}
+        index={0}
+        onClose={() => undefined}
+        onIndexChange={() => undefined}
+        ticket="WIKI-190"
+      />,
+    );
+    expect(document.querySelector(kind)).not.toBeNull();
+    expect(screen.queryByTitle("Copy raw payload")).toBeNull();
+    expect(screen.queryByText("Artifact unavailable")).toBeNull();
+  });
+
   test("code artifact carrying a unified diff gets Diff chrome and the diff viewer", () => {
     const diffInCode = artifactEvent({
       artifact_id: "diff-1",

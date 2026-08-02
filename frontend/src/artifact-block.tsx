@@ -2,6 +2,7 @@ import { useCallback, useEffect, useRef, useState, useSyncExternalStore } from "
 import {
   BarChart3,
   Code2,
+  Columns2,
   Copy,
   Download,
   FileJson,
@@ -10,9 +11,11 @@ import {
   Image as ImageIcon,
   Info,
   Maximize2,
+  Music,
   PanelRightOpen,
   Shapes,
   Table2,
+  Video,
   X,
 } from "lucide-react";
 import type { LucideIcon } from "lucide-react";
@@ -51,8 +54,10 @@ export const KIND_ICONS: Record<ArtifactKind, LucideIcon> = {
   "file-list": FileJson,
   json: FileJson,
   pdf: FileText,
+  video: Video,
+  audio: Music,
+  "visual-diff": Columns2,
 };
-
 
 
 function mermaidNodeCount(source: string): number {
@@ -99,6 +104,13 @@ export function artifactExceedsInlineThreshold(
       return text.length > 4000;
     }
     case "pdf": return true;
+    case "video": return false;
+    case "audio": return false;
+    case "visual-diff": {
+      const width = artifact.before?.width ?? artifact.after?.width ?? 0;
+      const height = artifact.before?.height ?? artifact.after?.height ?? 0;
+      return width > 400 || height > 400;
+    }
   }
 }
 
@@ -274,7 +286,7 @@ export function ArtifactBlock({
             ) : null}
             {resolvedArtifact.kind === "table" ? (
               <TableCopyMenu artifact={resolvedArtifact} onCopied={showCopied} />
-            ) : (
+            ) : resolvedArtifact.kind === "video" || resolvedArtifact.kind === "audio" ? null : (
               <button className="artifact-action" type="button" onClick={() => void copy()}>
                 <Copy aria-hidden="true" size={12} />
                 <span className="artifact-action-label">{copied ? "Copied" : "Copy"}</span>

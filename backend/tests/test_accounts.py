@@ -16,6 +16,7 @@ from tempfile import TemporaryDirectory
 from unittest import mock
 
 from backend.app import accounts
+from backend.app.account_notices import AccountNoticeStore
 
 
 REAL_LIMIT_STRING = (
@@ -1128,6 +1129,7 @@ class WatchdogLoopTests(unittest.IsolatedAsyncioTestCase):
                         "window": "@42",
                         "kind": "cdx",
                         "role": "implement",
+                        "run_id": "run-wiki-15",
                         "worktree": str(paths["root"] / "wt-15"),
                         "log": "/tmp/cdx-WIKI-15.log",
                     }
@@ -1147,6 +1149,287 @@ class WatchdogLoopTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(len(emitted), 1)
             self.assertEqual(emitted[0]["type"], "codex_limit_no_eligible")
             self.assertIn("WIKI-15", emitted[0]["tickets"])
+            self.assertEqual(emitted[0]["run_ids"], {"WIKI-15": "run-wiki-15"})
+
+    async def test_legacy_codex_pane_recovery_keeps_durable_no_eligible_notice(self) -> None:
+        with _EnvOverride() as paths:
+            (paths["accounts"] / "alpha").mkdir()
+            (paths["accounts"] / "alpha" / "auth.json").write_text("{}")
+            paths["auth"].write_text("{}")
+            worker = accounts.WorkerEntry(
+                ticket="WIKI-15",
+                window="@42",
+                worktree="/tmp/wt-15",
+                log="/tmp/cdx-WIKI-15.log",
+                kind="cdx",
+                role="implement",
+                orch=None,
+            )
+            pane_text = REAL_LIMIT_STRING
+            store = AccountNoticeStore(path=paths["root"] / "notices.json")
+            emitted: list[dict] = []
+
+            async def emit(evt: dict) -> None:
+                emitted.append(evt)
+                store.apply_event(evt)
+
+            def iter_worker_kind(kind: str) -> list[accounts.WorkerEntry]:
+                return [worker] if kind == "cdx" else []
+
+            with (
+                mock.patch.object(accounts, "tmux_live_windows", lambda: {"@42"}),
+                mock.patch.object(accounts, "iter_workers", iter_worker_kind),
+                mock.patch.object(accounts, "tmux_capture", lambda w, lines=60: pane_text),
+                mock.patch.object(
+                    accounts, "read_state", return_value=accounts.AccountState(active="alpha")
+                ),
+                mock.patch.object(
+                    accounts, "ensure_state_initialized", side_effect=lambda state: state
+                ),
+                mock.patch.object(
+                    accounts,
+                    "rotate_locked",
+                    side_effect=accounts.NoEligibleAccountError("no eligible account"),
+                ),
+            ):
+                watch = accounts.WatchdogInternalState()
+                await accounts._check_once(watch, emit)
+                self.assertEqual(store.snapshot()[0]["tickets"], ["WIKI-15"])
+                pane_text = "> working on the next step"
+                await accounts._check_once(watch, emit)
+
+            self.assertEqual(
+                [event["type"] for event in emitted],
+                ["codex_limit_no_eligible"],
+            )
+            self.assertEqual(store.snapshot()[0]["tickets"], ["WIKI-15"])
+
+    async def test_legacy_codex_fleet_recovery_keeps_every_affected_ticket(self) -> None:
+        with TemporaryDirectory() as tmp:
+            workers = [
+                accounts.WorkerEntry(
+                    ticket="WIKI-15",
+                    window="@42",
+                    worktree="/tmp/wt-15",
+                    log="/tmp/cdx-WIKI-15.log",
+                    kind="cdx",
+                    role="implement",
+                    orch=None,
+                ),
+                accounts.WorkerEntry(
+                    ticket="WIKI-16",
+                    window="@43",
+                    worktree="/tmp/wt-16",
+                    log="/tmp/cdx-WIKI-16.log",
+                    kind="cdx",
+                    role="implement",
+                    orch=None,
+                ),
+            ]
+            panes = {"@42": REAL_LIMIT_STRING, "@43": "> working"}
+            store = AccountNoticeStore(path=Path(tmp) / "notices.json")
+            emitted: list[dict] = []
+
+            async def emit(evt: dict) -> None:
+                emitted.append(evt)
+                store.apply_event(evt)
+
+            def iter_worker_kind(kind: str) -> list[accounts.WorkerEntry]:
+                return workers if kind == "cdx" else []
+
+            with (
+                mock.patch.object(
+                    accounts,
+                    "tmux_live_windows",
+                    lambda: {worker.window for worker in workers},
+                ),
+                mock.patch.object(accounts, "iter_workers", iter_worker_kind),
+                mock.patch.object(
+                    accounts, "tmux_capture", lambda window, lines=60: panes[window]
+                ),
+                mock.patch.object(accounts, "read_state", return_value=accounts.AccountState()),
+                mock.patch.object(
+                    accounts, "ensure_state_initialized", side_effect=lambda state: state
+                ),
+                mock.patch.object(
+                    accounts,
+                    "rotate_locked",
+                    side_effect=accounts.NoEligibleAccountError("no eligible account"),
+                ),
+            ):
+                watch = accounts.WatchdogInternalState()
+                await accounts._check_once(watch, emit)
+                self.assertEqual(store.snapshot()[0]["tickets"], ["WIKI-15", "WIKI-16"])
+
+                # The first pane changes windows before it becomes usable.
+                # Ticket tracking must survive that registry handoff.
+                workers[0].window = "@44"
+                panes["@44"] = REAL_LIMIT_STRING
+                panes["@43"] = "> working"
+                await accounts._check_once(watch, emit)
+                panes["@44"] = "> working"
+                await accounts._check_once(watch, emit)
+
+            self.assertEqual(
+                [event["type"] for event in emitted],
+                ["codex_limit_no_eligible"],
+            )
+            self.assertEqual(store.snapshot()[0]["tickets"], ["WIKI-15", "WIKI-16"])
+
+    async def test_legacy_codex_scrolled_banner_needs_quota_capable_proof(self) -> None:
+        with TemporaryDirectory() as tmp:
+            store = AccountNoticeStore(path=Path(tmp) / "notices.json")
+            worker = accounts.WorkerEntry(
+                ticket="WIKI-17",
+                window="@47",
+                worktree="/tmp/wt-17",
+                log="/tmp/cdx-WIKI-17.log",
+                kind="cdx",
+                role="implement",
+                orch=None,
+            )
+            pane = REAL_LIMIT_STRING
+            emitted: list[dict] = []
+
+            async def emit(evt: dict) -> None:
+                emitted.append(evt)
+                store.apply_event(evt)
+
+            def iter_worker_kind(kind: str) -> list[accounts.WorkerEntry]:
+                return [worker] if kind == "cdx" else []
+
+            with mock.patch.object(accounts, "AccountNoticeStore", return_value=store), mock.patch.object(
+                accounts, "tmux_live_windows", return_value={"@47"}
+            ), mock.patch.object(accounts, "iter_workers", side_effect=iter_worker_kind), mock.patch.object(
+                accounts, "tmux_capture", side_effect=lambda window, lines=60: pane
+            ), mock.patch.object(accounts, "codex_login_status", return_value=True), mock.patch.object(
+                accounts, "read_state", return_value=accounts.AccountState()
+            ), mock.patch.object(accounts, "ensure_state_initialized", side_effect=lambda state: state), mock.patch.object(
+                accounts,
+                "rotate_locked",
+                side_effect=accounts.NoEligibleAccountError("no eligible account"),
+            ):
+                watch = accounts.WatchdogInternalState()
+                await accounts._check_once(watch, emit)
+                self.assertEqual([event["type"] for event in emitted], ["codex_limit_no_eligible"])
+
+                # A redraw hides the banner, but no quota-capable proof exists.
+                pane = "old output scrolled above the visible terminal"
+                await accounts._check_once(watch, emit)
+
+            self.assertEqual([event["type"] for event in emitted], ["codex_limit_no_eligible"])
+            self.assertEqual(store.snapshot()[0]["tickets"], ["WIKI-17"])
+
+    async def test_legacy_codex_recovery_restores_tracking_after_restart_and_window_gap(self) -> None:
+        for notice_type in ("codex_limit_no_eligible", "codex_rotation_failed"):
+            with TemporaryDirectory() as tmp:
+                store = AccountNoticeStore(path=Path(tmp) / "notices.json")
+                notice = {
+                    "type": notice_type,
+                    "tickets": ["WIKI-15"],
+                    "ts": "t1",
+                }
+                if notice_type == "codex_limit_no_eligible":
+                    notice["reset_at"] = None
+                else:
+                    notice["error"] = "rotation failed"
+                store.apply_event(notice)
+                worker = accounts.WorkerEntry(
+                    ticket="WIKI-15",
+                    window="@42",
+                    worktree="/tmp/wt-15",
+                    log="/tmp/cdx-WIKI-15.log",
+                    kind="cdx",
+                    role="implement",
+                    orch=None,
+                )
+                live_windows: set[str] = set()
+                emitted: list[dict] = []
+
+                async def emit(evt: dict) -> None:
+                    emitted.append(evt)
+                    store.apply_event(evt)
+
+                def iter_worker_kind(kind: str) -> list[accounts.WorkerEntry]:
+                    return [worker] if kind == "cdx" else []
+
+                with mock.patch.object(accounts, "AccountNoticeStore", return_value=store), mock.patch.object(
+                    accounts, "tmux_live_windows", lambda: live_windows
+                ), mock.patch.object(accounts, "iter_workers", iter_worker_kind), mock.patch.object(
+                    accounts, "tmux_capture", lambda window, lines=60: "> working"
+                ):
+                    # A fresh watchdog starts while the legacy window is absent.
+                    # Durable tracking must survive that temporary gap.
+                    watch = accounts.WatchdogInternalState()
+                    await accounts._check_once(watch, emit)
+                    self.assertEqual(emitted, [])
+
+                    live_windows.add("@42")
+                    await accounts._check_once(watch, emit)
+
+                self.assertEqual(emitted, [])
+                self.assertEqual(store.snapshot()[0]["tickets"], ["WIKI-15"])
+
+    async def test_no_eligible_lists_every_live_codex_worker(self) -> None:
+        workers = [
+            accounts.WorkerEntry(
+                ticket="WIKI-15",
+                window="@42",
+                worktree="/tmp/wt-15",
+                log="/tmp/cdx-WIKI-15.log",
+                kind="cdx",
+                role="implement",
+                orch=None,
+                run_id="run-wiki-15",
+            ),
+            accounts.WorkerEntry(
+                ticket="WIKI-16",
+                window="@43",
+                worktree="/tmp/wt-16",
+                log="/tmp/cdx-WIKI-16.log",
+                kind="cdx",
+                role="implement",
+                orch=None,
+                run_id="run-wiki-16",
+            ),
+        ]
+        panes = {"@42": REAL_LIMIT_STRING, "@43": "> working"}
+        emitted: list[dict] = []
+
+        async def emit(evt: dict) -> None:
+            emitted.append(evt)
+
+        def iter_worker_kind(kind: str) -> list[accounts.WorkerEntry]:
+            return workers if kind == "cdx" else []
+
+        with mock.patch.object(accounts, "tmux_live_windows", lambda: {"@42", "@43"}), \
+             mock.patch.object(accounts, "iter_workers", iter_worker_kind), \
+             mock.patch.object(accounts, "tmux_capture", lambda window, lines=60: panes[window]), \
+             mock.patch.object(accounts, "read_state", return_value=accounts.AccountState()), \
+             mock.patch.object(accounts, "ensure_state_initialized", side_effect=lambda state: state), \
+             mock.patch.object(
+                 accounts,
+                 "rotate_locked",
+                 side_effect=[
+                     accounts.NoEligibleAccountError("no eligible account"),
+                     accounts.RotationError("rotation failed"),
+                 ],
+             ):
+            watch = accounts.WatchdogInternalState()
+            await accounts._check_once(watch, emit)
+            watch.last_rotation_attempt = 0.0
+            await accounts._check_once(watch, emit)
+
+        self.assertEqual(
+            [event["type"] for event in emitted],
+            ["codex_limit_no_eligible", "codex_rotation_failed"],
+        )
+        for event in emitted:
+            self.assertEqual(event["tickets"], ["WIKI-15", "WIKI-16"])
+            self.assertEqual(
+                event["run_ids"],
+                {"WIKI-15": "run-wiki-15", "WIKI-16": "run-wiki-16"},
+            )
 
     async def test_limit_rotation_pins_fallback_reset_when_parse_missing(self) -> None:
         with _EnvOverride() as paths:
@@ -1228,6 +1511,97 @@ class WatchdogLoopTests(unittest.IsolatedAsyncioTestCase):
 
             self.assertEqual(len(emitted), 1)
             self.assertEqual(emitted[0]["type"], "claude_limit_hit")
+
+    async def test_claude_limit_realerts_ticket_on_replacement_window(self) -> None:
+        old_worker = accounts.WorkerEntry(
+            ticket="WIKI-15",
+            window="@44",
+            worktree="/tmp/wt-15",
+            log="/tmp/cc-WIKI-15.log",
+            kind="cc",
+            role="implement",
+            orch=None,
+        )
+        new_worker = accounts.WorkerEntry(
+            ticket="WIKI-15",
+            window="@45",
+            worktree="/tmp/wt-15",
+            log="/tmp/cc-WIKI-15.log",
+            kind="cc",
+            role="implement",
+            orch=None,
+        )
+        workers = [old_worker]
+        live = {"@44"}
+        emitted: list[dict] = []
+
+        async def emit(evt: dict) -> None:
+            emitted.append(evt)
+
+        def iter_worker_kind(kind: str) -> list[accounts.WorkerEntry]:
+            return workers if kind == "cc" else []
+
+        with mock.patch.object(accounts, "tmux_live_windows", lambda: live), \
+             mock.patch.object(accounts, "iter_workers", iter_worker_kind), \
+             mock.patch.object(accounts, "tmux_capture", lambda w, lines=60: CLAUDE_LIMIT_STRING):
+            watch = accounts.WatchdogInternalState()
+            await accounts._check_once(watch, emit)
+
+            # The old window is archived and the ticket is reused by a new
+            # worker. Its identity must have a fresh alert budget.
+            workers[:] = [new_worker]
+            live.clear()
+            live.add("@45")
+            await accounts._check_once(watch, emit)
+
+        self.assertEqual(
+            [evt["type"] for evt in emitted],
+            ["claude_limit_hit", "claude_limit_hit"],
+        )
+        self.assertEqual([evt["window"] for evt in emitted], ["@44", "@45"])
+        self.assertNotIn(("WIKI-15", "@44"), watch.claude_limited)
+        self.assertNotIn(("WIKI-15", "@44"), watch.last_alert_at)
+
+    async def test_claude_limit_banner_redraw_keeps_notice_without_provider_proof(self) -> None:
+        with _EnvOverride() as paths:
+            (paths["accounts"] / "alpha").mkdir()
+            (paths["accounts"] / "alpha" / "auth.json").write_text("{}")
+            paths["auth"].write_text("{}")
+            registry = paths["registry"]
+            registry.write_text(json.dumps({
+                "WIKI-15": {
+                    "current": {
+                        "ticket": "WIKI-15",
+                        "window": "@44",
+                        "kind": "cc",
+                        "role": "implement",
+                        "worktree": str(paths["root"] / "wt-15"),
+                        "log": "/tmp/cc-WIKI-15.log",
+                    }
+                }
+            }))
+
+            store = AccountNoticeStore(path=paths["root"] / "notices.json")
+            emitted: list[dict] = []
+
+            async def emit(evt: dict) -> None:
+                emitted.append(evt)
+                store.apply_event(evt)
+
+            watch = accounts.WatchdogInternalState()
+            pane_text = CLAUDE_LIMIT_STRING
+            with mock.patch.object(accounts, "tmux_live_windows", lambda: {"@44"}), \
+                 mock.patch.object(accounts, "tmux_capture", lambda w, lines=60: pane_text):
+                await accounts._check_once(watch, emit)
+                # Still limited on the next poll: no duplicate events.
+                await accounts._check_once(watch, emit)
+                # The banner leaves the pane, but the next provider request
+                # still reports the limit. Pane absence is not proof.
+                pane_text = "provider request failed: Claude usage limit reached"
+                await accounts._check_once(watch, emit)
+
+            self.assertEqual([evt["type"] for evt in emitted], ["claude_limit_hit"])
+            self.assertEqual(store.snapshot()[0]["ticket"], "WIKI-15")
 
 
 REAL_AUTH_DEAD_STRING = (

@@ -21,6 +21,8 @@ Normalized event:
 
 from __future__ import annotations
 
+import base64
+import binascii
 import json
 import os
 import re
@@ -30,8 +32,14 @@ from copy import deepcopy
 from datetime import datetime, timedelta, timezone
 from pathlib import Path, PurePosixPath
 
+from .image_scrub import ImageScrubError, probe_normalized_dimensions
 from .wiki_artifacts import (
+    AUDIO_MIMES,
     ArtifactValidationError,
+    IMAGE_TYPES,
+    PDF_MIME,
+    VIDEO_MIMES,
+    VISUAL_DIFF_VARIANTS,
     _validate_text_payload,
     artifact_from_codex_mcp_tool_result,
     artifact_from_text,
@@ -59,6 +67,13 @@ EVENT_DISPOSITION_RENDERED = "rendered"
 EVENT_DISPOSITION_SUMMARIZED = "summarized"
 EVENT_DISPOSITION_IGNORED = "intentionally_ignored"
 EVENT_DISPOSITION_UNKNOWN = "unknown"
+
+_STRUCTURED_BINARY_MIMES = {
+    "image": frozenset(IMAGE_TYPES),
+    "pdf": frozenset({PDF_MIME}),
+    "video": frozenset(VIDEO_MIMES),
+    "audio": frozenset(AUDIO_MIMES),
+}
 
 
 def cache_image(media_type: str, b64_data: str) -> str | None:
@@ -539,9 +554,12 @@ def _codex_tool_input(name: str, arguments: object) -> str:
 
 
 def _is_artifact_tool(name: object) -> bool:
-    return isinstance(name, str) and (
-        name == "render_artifact" or name.endswith("__render_artifact")
-    )
+    return isinstance(name, str) and name in {
+        "render_artifact",
+        "wiki_artifacts__render_artifact",
+        "mcp__wiki_artifacts__render_artifact",
+        "mcp__wiki-artifacts__render_artifact",
+    }
 
 
 def _tool_arguments(arguments: object) -> dict | None:
@@ -668,12 +686,31 @@ def _artifact_from_structured_result(meta: dict, output: str) -> dict | None:
     payload = raw_input.get("payload")
     if not isinstance(kind, str) or not isinstance(payload, dict):
         return None
-    if kind == "image":
-        artifact = {
-            "kind": "image",
-            "ref": f"artifact://{artifact_id}",
-            "mime": payload.get("mime"),
-        }
+    if kind in _STRUCTURED_BINARY_MIMES:
+        normalized = result.get("artifact")
+        if isinstance(normalized, dict):
+            artifact = dict(normalized)
+            if artifact.get("kind") != kind:
+                return None
+        else:
+            # Older providers only returned an id for image and PDF results.
+            # These kinds have no media metadata that the renderer needs.
+            if kind not in {"image", "pdf"}:
+                return None
+            default_mime = PDF_MIME if kind == "pdf" else None
+            mime = payload.get("mime", default_mime)
+            if mime not in _STRUCTURED_BINARY_MIMES[kind]:
+                return None
+            artifact = {
+                "kind": kind,
+                "ref": f"artifact://{artifact_id}",
+                "mime": mime,
+            }
+    elif kind == "visual-diff":
+        normalized = result.get("artifact")
+        if not isinstance(normalized, dict) or normalized.get("kind") != kind:
+            return None
+        artifact = dict(normalized)
     else:
         try:
             validated_payload = _validate_text_payload(kind, payload)
@@ -713,6 +750,8 @@ def _complete_artifact(
     protocol_event = None if failed else artifact_from_text(output)
     if protocol_event is None and not failed:
         protocol_event = _artifact_from_structured_result(meta, output)
+    if protocol_event is not None and not _is_artifact_tool(meta.get("name")):
+        protocol_event = None
     if protocol_event is not None:
         _append_artifact_event(state, protocol_event, ts)
     else:

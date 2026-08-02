@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import base64
 import binascii
+import io
 import json
 import os
 import re
@@ -9,26 +10,60 @@ import stat
 import sys
 from datetime import datetime, timezone
 from pathlib import Path
+
+from PIL import Image
 from typing import Any, Mapping
 from uuid import UUID, uuid4
 
 from . import knowledge
 from . import wiki_agent_tools
+from .binary_artifacts import ArtifactValidationError, ingest_binary_artifact
 from .image_scrub import ImageScrubError, scrub_image
+from .media_scrub import (
+    AUDIO_MIMES,
+    VIDEO_MIMES,
+    scrub_audio,
+    scrub_video,
+)
+from .image_scrub import (
+    MAX_PIXELS as IMAGE_MAX_PIXELS,
+    MAX_SIDE as IMAGE_MAX_SIDE,
+    probe_dimensions,
+)
 from .pathwalk import open_relative_file
 
 
 TEXT_LIMIT = 100_000
 IMAGE_LIMIT = 5 * 1024 * 1024
 PDF_LIMIT = 25 * 1024 * 1024
+VIDEO_LIMIT = 40 * 1024 * 1024
+AUDIO_LIMIT = 20 * 1024 * 1024
 PDF_MAGIC = b"%PDF-"
 # Transport-level cap on a single MCP request line. Sized to fit the largest
-# base64-encoded PDF payload (4/3 inflation) plus JSON envelope headroom, so
-# json.loads never sees an unbounded buffer even when a caller sends garbage.
-MAX_REQUEST_BYTES = ((PDF_LIMIT + 2) // 3) * 4 + 64 * 1024
+# valid aggregate binary payload: a video plus its image poster. Base64 adds
+# 4/3 inflation; JSON envelope headroom keeps valid boundary requests intact.
+MEDIA_TRANSPORT_MAX = max(
+    PDF_LIMIT, VIDEO_LIMIT + IMAGE_LIMIT, AUDIO_LIMIT, IMAGE_LIMIT,
+)
+MAX_REQUEST_BYTES = ((MEDIA_TRANSPORT_MAX + 2) // 3) * 4 + 64 * 1024
 SENTINEL_START = "<<wiki-artifact:v1>>"
 SENTINEL_END = "<<end>>"
-ARTIFACT_KINDS = {"mermaid", "svg", "image", "table", "plot", "code", "diff", "file-list", "json", "pdf"}
+ARTIFACT_KINDS = {
+    "mermaid",
+    "svg",
+    "image",
+    "table",
+    "plot",
+    "code",
+    "diff",
+    "file-list",
+    "json",
+    "pdf",
+    "video",
+    "audio",
+}
+VISUAL_DIFF_VARIANTS = ("before", "after")
+ARTIFACT_KINDS.add("visual-diff")
 IMAGE_TYPES = {
     "image/png": "png",
     "image/jpeg": "jpg",
@@ -36,10 +71,17 @@ IMAGE_TYPES = {
 }
 PDF_MIME = "application/pdf"
 TABLE_COLUMN_TYPES = {"string", "number", "date", "link"}
-
-
-class ArtifactValidationError(ValueError):
-    pass
+_BINARY_ARTIFACT_MAX_DIMENSION = 100_000
+_BINARY_ARTIFACT_MAX_DURATION_MS = 7 * 24 * 60 * 60 * 1000
+_BINARY_ARTIFACT_KEYS = {
+    "image": {"kind", "ref", "mime", "byte_size", "width", "height", "preview_base64"},
+    "pdf": {"kind", "ref", "mime", "byte_size"},
+    "video": {
+        "kind", "ref", "mime", "byte_size", "duration_ms", "width", "height",
+        "poster_base64",
+    },
+    "audio": {"kind", "ref", "mime", "byte_size", "duration_ms", "peaks", "transcript"},
+}
 
 
 TOOL_DESCRIPTION = (
@@ -47,7 +89,44 @@ TOOL_DESCRIPTION = (
     "dumping /tmp file paths: the artifact is inspectable, downloadable, and lives "
     "with the transcript. Use table artifacts only for 20+ rows or data the user will "
     "want to sort, export, or inspect. For prose comparisons with at most 6 rows and "
-    "3 columns, use a plain markdown table instead."
+    "3 columns, use a plain markdown table instead. For visual-diff (paired before/after "
+    "screenshots), the payload is {before: {data_base64, mime}, after: {data_base64, mime}}; "
+    "each side accepts image/png, image/jpeg, or image/webp up to 5MB, and both sides must "
+    "have identical dimensions and be single-frame (no APNG/animated WebP). "
+    "video payloads use {mime, data_base64|path, poster_base64?, poster_mime?}; mime is "
+    "video/mp4 or image/gif, video bytes are capped at 40MB, and the optional poster "
+    "uses base64 image bytes with poster_mime image/png|jpeg|webp, capped at 5MB. audio payloads use "
+    "{mime, data_base64|path, transcript?}; mime is audio/wav or audio/mpeg, audio bytes "
+    "are capped at 20MB, and transcript is optional text capped at 100KB."
+)
+
+# The payload description is agent-facing — the enclosing schema keeps payload
+# as a generic object (validated in-process against the per-kind rules in
+# _validate_text_payload / _write_image / _write_pdf / _write_visual_diff),
+# but LLMs generating tool calls read this description to shape the payload.
+_PAYLOAD_DESCRIPTION = (
+    "Per-kind payload shape. "
+    "mermaid: {source}. "
+    "svg: {source} — must contain <svg> root. "
+    "image: {data_base64, mime} — mime in image/png|jpeg|webp, up to 5MB. "
+    "table: {columns:[{key,label,type}], rows:[[...]]} — type in string|number|date|link. "
+    "plot: {spec_vega_lite: object}. "
+    "code: {language, source, filename?, diff_from?}. "
+    "diff: {source} — unified diff text. "
+    "file-list: {files:[{path, label?, size?, status?}]}. "
+    "json: {json_data}. "
+    "pdf: {data_base64} or {path} — 25MB cap. "
+    "video: {mime, data_base64|path, poster_base64?, poster_mime?} — mime in "
+    "video/mp4|image/gif; data_base64 or path is required; video is capped at 40MB; "
+    "poster_base64 is optional base64 image data; poster_mime is optional and defaults "
+    "to image/png, with image/png|jpeg|webp capped at 5MB. "
+    "audio: {mime, data_base64|path, transcript?} — mime in audio/wav|audio/mpeg; "
+    "data_base64 or path is required; audio is capped at 20MB; transcript is optional "
+    "UTF-8 text capped at 100KB. "
+    "visual-diff: {before: {data_base64, mime}, after: {data_base64, mime}} — each side "
+    "image/png|jpeg|webp up to 5MB; before and after must share dimensions; multi-frame "
+    "sources (APNG, animated WebP) are rejected. "
+    "All text-kind payloads combined must fit in 100KB."
 )
 
 TOOL_SCHEMA: dict[str, Any] = {
@@ -58,7 +137,10 @@ TOOL_SCHEMA: dict[str, Any] = {
         "kind": {"enum": sorted(ARTIFACT_KINDS)},
         "title": {"type": "string", "maxLength": 200},
         "caption": {"type": "string", "maxLength": 500},
-        "payload": {"type": "object"},
+        "payload": {
+            "type": "object",
+            "description": _PAYLOAD_DESCRIPTION,
+        },
     },
 }
 
@@ -203,6 +285,82 @@ def _validated_run_id(raw: str) -> str:
     return raw
 
 
+def _validate_binary_data_image(value: Any, field: str) -> None:
+    if not isinstance(value, str) or not value.startswith("data:image/"):
+        raise ArtifactValidationError(f"{field} must be a data-image URL")
+    header, separator, encoded = value.partition(",")
+    if separator != "," or not re.fullmatch(
+        r"data:image/(?:png|jpeg|webp);base64", header
+    ):
+        raise ArtifactValidationError(f"{field} must be a base64 data-image URL")
+    if len(encoded) > ((IMAGE_LIMIT + 2) // 3) * 4 + 4:
+        raise ArtifactValidationError(f"{field} exceeds the image limit")
+    try:
+        decoded = base64.b64decode(encoded, validate=True)
+    except (binascii.Error, ValueError) as exc:
+        raise ArtifactValidationError(f"{field} is not valid base64") from exc
+    if not decoded or len(decoded) > IMAGE_LIMIT:
+        raise ArtifactValidationError(f"{field} exceeds the image limit")
+
+
+def _validate_binary_artifact(event: dict[str, Any], artifact: dict[str, Any]) -> None:
+    kind = artifact.get("kind")
+    if not isinstance(kind, str) or kind not in _BINARY_ARTIFACT_KEYS:
+        raise ArtifactValidationError("unsupported binary artifact kind")
+    if set(artifact) - _BINARY_ARTIFACT_KEYS[kind]:
+        raise ArtifactValidationError("binary artifact contains an unknown field")
+    event_id = _validated_run_id(str(event.get("id") or ""))
+    if artifact.get("ref") != f"artifact://{event_id}":
+        raise ArtifactValidationError("binary artifact ref does not match event id")
+    allowed_mimes = {
+        "image": set(IMAGE_TYPES),
+        "pdf": {PDF_MIME},
+        "video": set(VIDEO_MIMES),
+        "audio": set(AUDIO_MIMES),
+    }[kind]
+    if artifact.get("mime") not in allowed_mimes:
+        raise ArtifactValidationError("binary artifact mime is not allowed")
+
+    for field, limit in (
+        ("byte_size", max(IMAGE_LIMIT, PDF_LIMIT, VIDEO_LIMIT, AUDIO_LIMIT)),
+        ("width", _BINARY_ARTIFACT_MAX_DIMENSION),
+        ("height", _BINARY_ARTIFACT_MAX_DIMENSION),
+        ("duration_ms", _BINARY_ARTIFACT_MAX_DURATION_MS),
+    ):
+        if field not in artifact:
+            continue
+        value = artifact[field]
+        if type(value) is not int or value < 0 or value > limit:
+            raise ArtifactValidationError(f"binary artifact {field} is out of bounds")
+        if field in {"width", "height"} and value == 0:
+            raise ArtifactValidationError(f"binary artifact {field} must be positive")
+
+    peaks = artifact.get("peaks")
+    if peaks is not None:
+        if not isinstance(peaks, list) or len(peaks) > 512:
+            raise ArtifactValidationError("binary artifact peaks must contain at most 512 values")
+        if any(type(peak) is not int or not 0 <= peak <= 255 for peak in peaks):
+            raise ArtifactValidationError("binary artifact peaks must be integers from 0 to 255")
+
+    transcript = artifact.get("transcript")
+    if transcript is not None:
+        if not isinstance(transcript, str) or len(transcript.encode("utf-8")) > TEXT_LIMIT:
+            raise ArtifactValidationError("binary artifact transcript exceeds the text limit")
+
+    for field in ("poster_base64", "preview_base64"):
+        if field in artifact:
+            _validate_binary_data_image(artifact[field], f"binary artifact {field}")
+
+
+def _validate_normalized_binary_artifact(
+    kind: str, artifact_id: str, normalized: dict[str, Any],
+) -> None:
+    _validate_binary_artifact(
+        {"id": artifact_id},
+        {"kind": kind, **normalized},
+    )
+
+
 def _artifact_run_dir() -> Path:
     runtime_value = os.environ.get("WIKI_AGENT_RUNTIME_DIR")
     if not runtime_value:
@@ -259,7 +417,7 @@ def _pdf_path_allowed_roots() -> list[Path]:
     return roots
 
 
-def _read_fd_bounded(fd: int, limit: int) -> bytes:
+def _read_fd_bounded(fd: int, limit: int, kind: str, limit_label: str) -> bytes:
     """Read up to `limit` bytes from `fd`. Reject if the source has more."""
     chunks: list[bytes] = []
     remaining = limit + 1  # +1 lets us detect overflow without buffering it
@@ -271,9 +429,7 @@ def _read_fd_bounded(fd: int, limit: int) -> bytes:
         remaining -= len(chunk)
     data = b"".join(chunks)
     if len(data) > limit:
-        raise ArtifactValidationError(
-            f"pdf payload exceeds the {limit // (1024 * 1024)}MB pdf limit"
-        )
+        raise ArtifactValidationError(f"{kind} payload exceeds the {limit_label}")
     return data
 
 
@@ -289,14 +445,15 @@ def _open_root_fd(root: Path) -> int:
     return os.open(root, flags)
 
 
-def _read_pdf_path(raw: str) -> bytes:
+def _read_media_path(raw: str, *, kind: str, byte_limit: int, limit_label: str) -> bytes:
+    """Bounded, dir-fd-walking read of a payload path inside an allowed root."""
     if not raw or not isinstance(raw, str):
         raise ArtifactValidationError("payload.path must be a non-empty string")
     candidate = Path(raw).expanduser()
     if not candidate.is_absolute():
         raise ArtifactValidationError("payload.path must be an absolute filesystem path")
     if candidate.is_symlink():
-        raise ArtifactValidationError("refusing symlink pdf source")
+        raise ArtifactValidationError(f"refusing symlink {kind} source")
     try:
         resolved = candidate.resolve(strict=True)
     except (OSError, RuntimeError) as exc:
@@ -345,15 +502,22 @@ def _read_pdf_path(raw: str) -> bytes:
                 raise ArtifactValidationError(
                     "payload.path must reference a regular file"
                 )
-            if info.st_size > PDF_LIMIT:
-                raise ArtifactValidationError(
-                    f"pdf payload exceeds the {PDF_LIMIT // (1024 * 1024)}MB pdf limit"
-                )
-            return _read_fd_bounded(fd, PDF_LIMIT)
+            if info.st_size > byte_limit:
+                raise ArtifactValidationError(f"{kind} payload exceeds the {limit_label}")
+            return _read_fd_bounded(fd, byte_limit, kind, limit_label)
         finally:
             os.close(fd)
     finally:
         os.close(root_fd)
+
+
+def _read_pdf_path(raw: str) -> bytes:
+    return _read_media_path(
+        raw,
+        kind="pdf",
+        byte_limit=PDF_LIMIT,
+        limit_label=f"{PDF_LIMIT // (1024 * 1024)}MB pdf limit",
+    )
 
 
 def _write_pdf(payload: dict[str, Any], artifact_id: str) -> dict[str, Any]:
@@ -429,6 +593,146 @@ def _write_image(payload: dict[str, Any], artifact_id: str) -> dict[str, Any]:
     return normalized
 
 
+def _write_video(payload: dict[str, Any], artifact_id: str) -> dict[str, Any]:
+    return ingest_binary_artifact(
+        "video",
+        payload,
+        artifact_id,
+        read_path=_read_media_path,
+        artifact_dir=_artifact_run_dir,
+        write_binary=_write_binary,
+        validate_normalized=_validate_normalized_binary_artifact,
+        scrub_video_fn=scrub_video,
+    )
+
+
+def _write_audio(payload: dict[str, Any], artifact_id: str) -> dict[str, Any]:
+    return ingest_binary_artifact(
+        "audio",
+        payload,
+        artifact_id,
+        read_path=_read_media_path,
+        artifact_dir=_artifact_run_dir,
+        write_binary=_write_binary,
+        validate_normalized=_validate_normalized_binary_artifact,
+        scrub_audio_fn=scrub_audio,
+    )
+
+def _decode_image_payload(payload: dict[str, Any], field: str) -> tuple[bytes, str]:
+    if not isinstance(payload, dict):
+        raise ArtifactValidationError(f"payload.{field} must be an object")
+    _require_keys(payload, required={"data_base64", "mime"})
+    encoded = _require_string(payload["data_base64"], f"payload.{field}.data_base64")
+    mime = payload["mime"]
+    if mime not in IMAGE_TYPES:
+        raise ArtifactValidationError(
+            f"payload.{field}.mime must be image/png, image/jpeg, or image/webp"
+        )
+    if len(encoded) > ((IMAGE_LIMIT + 2) // 3) * 4 + 4:
+        raise ArtifactValidationError(
+            f"payload.{field} exceeds the 5MB image limit"
+        )
+    try:
+        data = base64.b64decode(encoded, validate=True)
+    except (binascii.Error, ValueError) as exc:
+        raise ArtifactValidationError(
+            f"payload.{field}.data_base64 is not valid base64"
+        ) from exc
+    if len(data) > IMAGE_LIMIT:
+        raise ArtifactValidationError(
+            f"payload.{field} exceeds the 5MB image limit"
+        )
+    return data, mime
+
+
+def _reject_multi_frame(data: bytes, mime: str, variant: str) -> None:
+    """Reject APNG / animated WebP payloads for visual-diff.
+
+    An animated payload survives scrub_image (metadata strippers preserve
+    APNG fcTL/fdAT and WebP ANIM/ANMF chunks), and the two <img> tags each
+    animate on their own clock, so equal source frames would still report
+    phase-difference "changes" during compare. Fail loud at ingest.
+
+    Pillow's Image.open runs decompression-bomb detection on the *declared*
+    dimensions and raises DecompressionBombError (bare Exception, not
+    ValueError) — that used to escape this helper and terminate the whole
+    per-run MCP server on a malformed 10000x10000 declaration. So gate the
+    Pillow call behind header-side and pixel caps, and treat every other
+    probe failure as "defer to scrub_image for the canonical error."
+    """
+    try:
+        width, height = probe_dimensions(data, mime)
+    except ImageScrubError:
+        return
+    if (
+        width <= 0
+        or height <= 0
+        or width > IMAGE_MAX_SIDE
+        or height > IMAGE_MAX_SIDE
+        or width * height > IMAGE_MAX_PIXELS
+    ):
+        # Out-of-bounds sizes will surface via scrub_image with its
+        # canonical error message a moment later; do not open with Pillow.
+        return
+    try:
+        with Image.open(io.BytesIO(data)) as image:
+            if getattr(image, "n_frames", 1) > 1:
+                raise ArtifactValidationError(
+                    f"payload.{variant} rejected: multi-frame images are not"
+                    f" supported for visual-diff"
+                )
+    except ArtifactValidationError:
+        raise
+    except Exception:  # noqa: BLE001 — Pillow raises many types; canonical error comes from scrub_image
+        return
+
+
+def _write_visual_diff(payload: dict[str, Any], artifact_id: str) -> dict[str, Any]:
+    _require_keys(payload, required={"before", "after"})
+    scrubbed: dict[str, Any] = {}
+    for variant in VISUAL_DIFF_VARIANTS:
+        data, mime = _decode_image_payload(payload[variant], variant)
+        _reject_multi_frame(data, mime, variant)
+        try:
+            result = scrub_image(data, mime)
+        except ImageScrubError as exc:
+            raise ArtifactValidationError(
+                f"payload.{variant} rejected: {exc}"
+            ) from exc
+        if len(result.data) > IMAGE_LIMIT:
+            raise ArtifactValidationError(
+                f"payload.{variant} exceeds the 5MB image limit"
+            )
+        scrubbed[variant] = result
+    if scrubbed["before"].width != scrubbed["after"].width or (
+        scrubbed["before"].height != scrubbed["after"].height
+    ):
+        raise ArtifactValidationError(
+            "visual-diff before and after images must have identical dimensions"
+        )
+    artifact_dir = _artifact_run_dir()
+    normalized: dict[str, Any] = {}
+    for variant in VISUAL_DIFF_VARIANTS:
+        result = scrubbed[variant]
+        _write_binary(
+            artifact_dir,
+            f"{artifact_id}.{variant}",
+            IMAGE_TYPES[result.mime],
+            result.data,
+        )
+        entry: dict[str, Any] = {
+            "ref": f"artifact://{artifact_id}/{variant}",
+            "mime": result.mime,
+            "byte_size": len(result.data),
+            "width": result.width,
+            "height": result.height,
+        }
+        if result.preview_base64:
+            entry["preview_base64"] = result.preview_base64
+        normalized[variant] = entry
+    return normalized
+
+
 def render_artifact(arguments: Any) -> dict[str, Any]:
     if not isinstance(arguments, dict):
         raise ArtifactValidationError("tool input must be an object")
@@ -455,6 +759,12 @@ def render_artifact(arguments: Any) -> dict[str, Any]:
         artifact.update(_write_image(payload, artifact_id))
     elif kind == "pdf":
         artifact.update(_write_pdf(payload, artifact_id))
+    elif kind == "video":
+        artifact.update(_write_video(payload, artifact_id))
+    elif kind == "audio":
+        artifact.update(_write_audio(payload, artifact_id))
+    elif kind == "visual-diff":
+        artifact.update(_write_visual_diff(payload, artifact_id))
     else:
         artifact.update(_validate_text_payload(kind, payload))
     event: dict[str, Any] = {
@@ -502,7 +812,12 @@ def artifact_from_text(value: Any) -> dict[str, Any] | None:
         ):
             return None
     kind = artifact["kind"]
-    if kind not in {"image", "pdf"}:
+    if kind in _BINARY_ARTIFACT_KEYS:
+        try:
+            _validate_binary_artifact(event, artifact)
+        except ArtifactValidationError:
+            return None
+    elif kind != "visual-diff":
         payload = {key: item for key, item in artifact.items() if key != "kind"}
         try:
             _validate_text_payload(kind, payload)
@@ -577,7 +892,14 @@ def _tool_result(request_id: Any, arguments: Any) -> dict[str, Any]:
             "isError": True,
         }
     else:
-        result = {"content": [{"type": "text", "text": sentinel_text(event)}]}
+        result = {
+            "content": [{"type": "text", "text": sentinel_text(event)}],
+            "structuredContent": {
+                "artifact_id": event["id"],
+                "ok": True,
+                "artifact": event["artifact"],
+            },
+        }
     return {"jsonrpc": "2.0", "id": request_id, "result": result}
 
 

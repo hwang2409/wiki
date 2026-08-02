@@ -30,6 +30,7 @@ from fastapi.responses import FileResponse, JSONResponse, StreamingResponse
 from pydantic import BaseModel, Field, ValidationError, model_validator
 
 from . import (
+    account_notices,
     accounts,
     backend_runtime,
     context_prelude,
@@ -109,6 +110,7 @@ IGNORED_FILE_PARTS = {
 VAULT_DIR.mkdir(parents=True, exist_ok=True)
 
 PROVIDER_HEALTH = provider_health.ProviderHealthTracker()
+ACCOUNT_NOTICES = account_notices.AccountNoticeStore()
 UNKNOWN_KIND_TELEMETRY: UnknownKindTelemetry | None = None
 logger = logging.getLogger(__name__)
 
@@ -166,7 +168,8 @@ def _rebase_bot_notification_sender(
 
 @asynccontextmanager
 async def lifespan(_app: FastAPI):
-    global UNKNOWN_KIND_TELEMETRY
+    global UNKNOWN_KIND_TELEMETRY, _MAIN_EVENT_LOOP
+    _MAIN_EVENT_LOOP = asyncio.get_running_loop()
     runtime_paths = RuntimePaths.from_env()
     from .agent_runtime import rebase_bot
 
@@ -1749,17 +1752,44 @@ def list_archived(
     return entries[:limit]
 
 
-def _archive_hint(ticket: str) -> tuple[str | None, str | None, Path | None]:
-    """(kind, spawned_at-ish iso, session dir) from the newest archive of a ticket."""
+def _archive_hint(
+    ticket: str,
+    archived_at: str | None = None,
+) -> tuple[str | None, str | None, Path | None]:
+    """(kind, spawned_at iso, session dir) for a ticket's archive.
+
+    Without ``archived_at`` returns the newest archive (unchanged behavior).
+    With ``archived_at`` returns the archive whose iso timestamp matches
+    exactly, or (None, None, None) for a stale identifier.
+
+    WIKI-229: this helper honors ``archived_at`` but the surrounding
+    session route currently consults it only in the no-live-run branch
+    (after the ticket-only ``_session_paths`` cache), so history-row
+    selection can be surfaced only once the route becomes discriminated.
+    The plumbing is retained here so WIKI-229 has less to add.
+    """
+
     ticket_dir = AGENT_ARCHIVE_DIR / ticket
     if not ticket_dir.is_dir():
         return (None, None, None)
     sessions = _archive_sessions(ticket_dir)
     if not sessions:
         return (None, None, None)
-    archived_at, session_dir = sessions[0]
+    if archived_at is not None:
+        for candidate_at, session_dir in sessions:
+            if candidate_at.isoformat() == archived_at:
+                kind = (
+                    "cdx"
+                    if any(session_dir.glob("cdx-*"))
+                    else "cc"
+                    if any(session_dir.glob("cc-*"))
+                    else None
+                )
+                return (kind, candidate_at.isoformat(), session_dir)
+        return (None, None, None)
+    archived_at_dt, session_dir = sessions[0]
     kind = "cdx" if any(session_dir.glob("cdx-*")) else "cc" if any(session_dir.glob("cc-*")) else None
-    return (kind, archived_at.isoformat(), session_dir)
+    return (kind, archived_at_dt.isoformat(), session_dir)
 
 
 def _read_json_object(path: Path) -> dict[str, Any]:
@@ -1922,14 +1952,50 @@ def list_workspaces() -> WorkspaceList:
 def agents() -> dict[str, object]:
     registry: dict = {}
     registry_refreshed_at: str | None = None
+    # Notice reconciliation compares against live registry identity, but the
+    # registry file may be transiently missing (backend/supervisor startup
+    # race), unreadable, or a non-object payload. On any of those failure
+    # shapes we MUST leave the notice store alone — reconciling from {}
+    # would treat every worker-scoped notice as archived and permanently
+    # delete durable operator guidance.
+    registry_loaded = False
     try:
-        registry = json.loads(AGENT_REGISTRY_PATH.read_text(encoding="utf-8"))
-        registry_refreshed_at = datetime.fromtimestamp(
-            AGENT_REGISTRY_PATH.stat().st_mtime,
-            tz=timezone.utc,
-        ).isoformat()
+        loaded = json.loads(AGENT_REGISTRY_PATH.read_text(encoding="utf-8"))
+        if isinstance(loaded, dict):
+            registry = loaded
+            registry_loaded = True
+            registry_refreshed_at = datetime.fromtimestamp(
+                AGENT_REGISTRY_PATH.stat().st_mtime,
+                tz=timezone.utc,
+            ).isoformat()
     except (OSError, ValueError):
         pass
+    # Consume the durable legacy-migration marker before capturing the notice
+    # revision. If the backend crashed between supervisor commit and the spawn
+    # route's synchronous _publish_codex_worker_replaced call, the ticket-only
+    # Codex notice would remain forever without this self-heal. The publish
+    # is idempotent (apply_event returns False when there is nothing to
+    # clear), so a marked ticket that already had its notice cleared incurs
+    # no work and does not emit a refresh event. Running before we capture
+    # notice_revision keeps the revision guard aligned with a snapshot that
+    # already reflects the self-heal.
+    if registry_loaded:
+        for ticket, entry in registry.items():
+            if ticket.startswith("_") or not isinstance(entry, dict):
+                continue
+            current = entry.get("current")
+            if not isinstance(current, dict):
+                continue
+            if current.get("replaced_legacy_provider") == "codex":
+                _publish_codex_worker_replaced(ticket)
+    # Capture the notice revision BEFORE reading the registry. A failure
+    # event that lands between the registry snapshot and the reconcile
+    # call would otherwise carry a run_id or ticket that live_runs does
+    # not know about, and reconcile_with_live would delete the fresh
+    # notice. Passing this revision to reconcile makes it a no-op when
+    # something landed after the snapshot; the next refresh reconciles
+    # from a paired pair.
+    notice_revision = ACCOUNT_NOTICES.revision
 
     legacy_windows: set[str] = set()
     headless_ids: set[str] = set()
@@ -1972,7 +2038,11 @@ def agents() -> dict[str, object]:
     viewed_map = _read_viewed_map()
     workers = []
     orchestrators = []
-    seen_tickets = set()
+    seen_tickets: set[str] = set()
+    # Live-run identity for notice reconciliation. Provider identity matters
+    # when a ticket moves from Codex to Claude during replacement.
+    live_runs: dict[str, str | None] = {}
+    live_providers: dict[str, str | None] = {}
 
     for ticket, entry in sorted(registry.items()):
         if ticket.startswith("_") or not isinstance(entry, dict):
@@ -1990,6 +2060,9 @@ def agents() -> dict[str, object]:
         )
         status = read_agent_status(ticket)
         seen_tickets.add(ticket)
+        live_runs[ticket] = current.get("run_id") if isinstance(current.get("run_id"), str) else None
+        current_kind = _normalize_kind(current.get("kind"))
+        live_providers[ticket] = _normalize_provider(current.get("provider")) or _provider_for_kind(current_kind)
         window_alive = (
             control_attached if headless else current.get("window") in live_windows
         )
@@ -2131,11 +2204,27 @@ def agents() -> dict[str, object]:
             }
         )
 
+    # Reconcile worker-scoped notices against the live registry. Only run
+    # when the registry loaded as a valid object — a missing / unreadable /
+    # non-object registry would otherwise pass {} here and permanently
+    # delete every notice. Replace and archive flows publish only
+    # session/agents events, which the notice store correctly ignores;
+    # without this reconciliation, banners for removed tickets would remain
+    # forever. WIKI-228 will drive this from durable supervisor events
+    # instead of an ambient snapshot check.
+    if registry_loaded:
+        ACCOUNT_NOTICES.reconcile_with_live(
+            live_runs,
+            live_providers=live_providers,
+            expected_revision=notice_revision,
+        )
+
     return {
         "workers": workers,
         "orchestrators": orchestrators,
         "archived": list_archived(),
         "supervisor": supervisor_health,
+        "account_notices": ACCOUNT_NOTICES.snapshot(),
     }
 
 
@@ -3449,6 +3538,7 @@ def agent_session(
     ticket: str,
     cursor: int = Query(0, ge=0),
     client_path: str | None = Query(None, alias="path"),
+    archived_at: str | None = None,
 ) -> dict[str, object]:
     if not valid_agent_id(ticket):
         raise HTTPException(status_code=400, detail="Bad ticket")
@@ -3493,7 +3583,7 @@ def agent_session(
     registry_session_id = current.get("session_id") if isinstance(current.get("session_id"), str) else None
     archive_dir: Path | None = None
     if not current:
-        archive_kind, spawned_at, archive_dir = _archive_hint(ticket)
+        archive_kind, spawned_at, archive_dir = _archive_hint(ticket, archived_at)
         current_kind = current_kind or archive_kind
 
     found = None
@@ -3795,6 +3885,10 @@ ARTIFACT_MEDIA_TYPES = {
     "jpg": "image/jpeg",
     "webp": "image/webp",
     "pdf": "application/pdf",
+    "mp4": "video/mp4",
+    "gif": "image/gif",
+    "wav": "audio/wav",
+    "mp3": "audio/mpeg",
 }
 
 
@@ -3806,19 +3900,29 @@ def _canonical_artifact_id(value: str) -> str | None:
     return value if str(parsed) == value else None
 
 
-def _artifact_file(directory: Path, artifact_id: str) -> tuple[Path, str] | None:
+ARTIFACT_VARIANTS = frozenset({"before", "after"})
+
+
+def _artifact_file(
+    directory: Path, artifact_id: str, variant: str | None = None
+) -> tuple[Path, str] | None:
     if directory.is_symlink() or not directory.is_dir():
         return None
+    stem = f"{artifact_id}.{variant}" if variant else artifact_id
     for extension, media_type in ARTIFACT_MEDIA_TYPES.items():
-        candidate = directory / f"{artifact_id}.{extension}"
+        candidate = directory / f"{stem}.{extension}"
         if candidate.is_file() and not candidate.is_symlink():
             return candidate, media_type
     return None
 
 
 @app.get("/api/agents/{ticket}/artifact/{artifact_id}")
-def get_agent_artifact(ticket: str, artifact_id: str) -> FileResponse:
+def get_agent_artifact(
+    ticket: str, artifact_id: str, variant: str | None = None
+) -> FileResponse:
     if not valid_agent_id(ticket) or _canonical_artifact_id(artifact_id) is None:
+        raise HTTPException(status_code=404, detail="Artifact not found")
+    if variant is not None and variant not in ARTIFACT_VARIANTS:
         raise HTTPException(status_code=404, detail="Artifact not found")
 
     registry_match = _registry_agent(_read_agent_registry(), ticket)
@@ -3836,6 +3940,7 @@ def get_agent_artifact(ticket: str, artifact_id: str) -> FileResponse:
                 / canonical_run_id
                 / "artifacts",
                 artifact_id,
+                variant,
             )
             if live is not None:
                 target, media_type = live
@@ -3849,7 +3954,7 @@ def get_agent_artifact(ticket: str, artifact_id: str) -> FileResponse:
 
     _, _, archive_dir = _archive_hint(canonical_ticket)
     if archive_dir is not None:
-        archived = _artifact_file(archive_dir / "artifacts", artifact_id)
+        archived = _artifact_file(archive_dir / "artifacts", artifact_id, variant)
         if archived is not None:
             target, media_type = archived
             return FileResponse(
@@ -4812,6 +4917,7 @@ def spawn_agent(
     if isinstance(live_window, str) and live_window in tmux_live_windows():
         raise HTTPException(status_code=409, detail=f"{ticket} already has a live worker window")
 
+    migrate_legacy_flag = bool(current) and not current_is_headless
     result = _supervisor_request(
         "run/start",
         {
@@ -4823,7 +4929,7 @@ def spawn_agent(
             "worktree": str(workdir_path),
             "prompt": prompt,
             "orchestrator_id": orch or None,
-            "migrate_legacy": bool(current) and not current_is_headless,
+            "migrate_legacy": migrate_legacy_flag,
             "request_id": request_id,
             "implicit_request_id": implicit_request_id,
             "command_hash_payload": {
@@ -4845,6 +4951,14 @@ def spawn_agent(
     )
     if not isinstance(result, dict):
         raise HTTPException(status_code=502, detail="Agent supervisor returned a bad run")
+    # Key the ticket-only Codex-notice cleanup off the REPLACED legacy identity
+    # (persisted in the supervisor result), not the new destination kind. A
+    # cdx-to-cc migration still needs to clear the Codex banner for the ticket.
+    # The supervisor stamps the flag inside store.create and projects it into
+    # the registry snapshot, so /api/agents self-heals on the next refresh
+    # even without a spawn retry.
+    if result.get("replaced_legacy_provider") == "codex":
+        _publish_codex_worker_replaced(ticket)
     # Recorded on supervisor replays too: append_edge dedupes by request id
     # across the full edge history, so a replay whose first append failed
     # heals the graph while a successful one stays a no-op.
@@ -5094,6 +5208,12 @@ def spawn_orchestrator(
     )
     if not isinstance(result, dict):
         raise HTTPException(status_code=502, detail="Agent supervisor returned a bad run")
+    # Orchestrator migrations follow the same replaced-identity rule as workers:
+    # gate off the supervisor's persisted flag so cross-provider cdx-to-cc
+    # replacements clear the legacy Codex notice and idempotent replays reapply
+    # cleanup after a post-commit crash.
+    if result.get("replaced_legacy_provider") == "codex":
+        _publish_codex_worker_replaced(orch_id)
     refreshed = _registry_agent(_read_agent_registry(), orch_id)
     registration = refreshed[2] if refreshed is not None else {}
 
@@ -5655,10 +5775,15 @@ def agent_queue_delete(ticket: str, index: int) -> dict[str, object]:
 # Agent event broker: watchdog + manual endpoints push, /api/events streams.
 # ---------------------------------------------------------------------------
 _event_subscribers: set[asyncio.Queue[dict]] = set()
+# Captured in `lifespan` so sync route handlers (spawn_agent lives in the
+# FastAPI thread pool) can schedule loop-bound work — asyncio.Queue is
+# single-loop, so a bare put_nowait from the thread pool is unsafe.
+_MAIN_EVENT_LOOP: asyncio.AbstractEventLoop | None = None
 
 
 async def publish_agent_event(event: dict) -> None:
     _consume_provider_health_signal(event)
+    ACCOUNT_NOTICES.apply_event(event)
     dead: list[asyncio.Queue[dict]] = []
     for queue_ in list(_event_subscribers):
         try:
@@ -5667,6 +5792,85 @@ async def publish_agent_event(event: dict) -> None:
             dead.append(queue_)
     for queue_ in dead:
         _event_subscribers.discard(queue_)
+
+
+def _publish_codex_worker_replaced(ticket: str) -> bool:
+    """Clear ticket-only legacy Codex notices after a legacy-to-headless commit.
+
+    Runs on every /api/agents/spawn (and /spawn-orchestrator) invocation whose
+    supervisor result carries ``replaced_legacy_provider == "codex"``, and on
+    every /api/agents refresh whose registry current entry projects the same
+    marker (so a post-commit backend crash heals without a spawn replay).
+    Only ticket-only entries (no stored run_id) are affected — the apply_event
+    handler leaves headless run-scoped entries alone.
+
+    Emits an ``agents`` SSE refresh AFTER the notice mutation lands so the
+    frontend refetches ``/api/agents`` and sees the cleared notice. Without
+    this the only "agents changed" event fires when the supervisor commits
+    (BEFORE cleanup), and the frontend can settle on the stale pre-clean
+    snapshot. Gated on ``apply_event`` returning True so the /api/agents
+    self-heal loop is one-shot per marked ticket instead of re-firing a
+    refresh on every subsequent poll.
+
+    Returns True when the notice store actually changed.
+    """
+
+    changed = ACCOUNT_NOTICES.apply_event(
+        {
+            "type": "codex_worker_replaced",
+            "provider": "codex",
+            "ticket": ticket,
+            "ts": datetime.now(timezone.utc).isoformat(),
+        }
+    )
+    if changed:
+        _schedule_agents_refresh({ticket})
+    return changed
+
+
+def _schedule_agents_refresh(tickets: set[str]) -> None:
+    """Push an ``agents`` invalidation onto SSE subscribers from any thread.
+
+    FastAPI runs sync ``def`` route handlers in a thread pool, but asyncio.Queue
+    is loop-bound. Route the emission through ``run_coroutine_threadsafe`` when
+    a main loop is registered; fall back to a direct in-loop schedule for tests
+    that call from the running loop directly.
+    """
+
+    ticket_list = sorted(t for t in tickets if isinstance(t, str) and t)
+    if not ticket_list:
+        return
+    event = {"type": "agents", "surface": "agents", "tickets": ticket_list[:20]}
+
+    async def _emit() -> None:
+        _invalidate_session_paths(set(ticket_list))
+        dead: list[asyncio.Queue[dict]] = []
+        for queue_ in list(_event_subscribers):
+            try:
+                queue_.put_nowait(event)
+            except asyncio.QueueFull:
+                dead.append(queue_)
+        for queue_ in dead:
+            _event_subscribers.discard(queue_)
+
+    loop = _MAIN_EVENT_LOOP
+    running: asyncio.AbstractEventLoop | None
+    try:
+        running = asyncio.get_running_loop()
+    except RuntimeError:
+        running = None
+    if loop is None or not loop.is_running():
+        loop = running
+    if loop is not None and loop.is_running():
+        if running is loop:
+            loop.create_task(_emit())
+        else:
+            asyncio.run_coroutine_threadsafe(_emit(), loop)
+        return
+    # No loop at all — session cache still invalidates so the next in-process
+    # refresh reads the cleared notice. Purely-synchronous callers (offline
+    # scripts) take this path.
+    _invalidate_session_paths(set(ticket_list))
 
 
 def _subscribe_agent_events() -> asyncio.Queue[dict]:

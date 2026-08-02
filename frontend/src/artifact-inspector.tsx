@@ -22,7 +22,9 @@ import { PdfArtifactDetail } from "./artifact-detail/pdf";
 import { PlotArtifactDetail } from "./artifact-detail/plot";
 import { SvgArtifactDetail } from "./artifact-detail/svg";
 import { TableArtifactDetail } from "./artifact-detail/table";
+import { VisualDiffArtifactDetail } from "./artifact-detail/visual-diff";
 import { classifyArtifact, humanizeArtifactKind } from "./artifact-kind";
+import { AudioRenderer, VideoRenderer } from "./artifact-media-renderers";
 import { downloadArtifact, imageBase64, textPayload } from "./artifact-payload";
 import { artifactUrl } from "./artifact-renderers";
 import { ArtifactFallback } from "./artifact-state";
@@ -394,12 +396,15 @@ export function ArtifactInspector({
       case "image": return <ImageArtifactDetail artifact={artifact} event={active} onChange={onViewChange} state={viewState} ticket={ticket} />;
       case "mermaid": return <MermaidArtifactDetail onChange={onViewChange} source={artifact.source ?? ""} state={viewState} />;
       case "svg": return <SvgArtifactDetail onChange={onViewChange} source={artifact.source ?? ""} state={viewState} />;
-      case "plot": return <PlotArtifactDetail spec={artifact.spec_vega_lite ?? {}} />;
+      case "plot": return <PlotArtifactDetail key={active.artifact_id ?? undefined} spec={artifact.spec_vega_lite ?? {}} title={active.title ?? artifact.filename ?? null} />;
       case "diff": return <DiffArtifactDetail artifact={artifact} onChange={onViewChange} state={viewState} />;
       case "file-list": return <FileListArtifactDetail artifact={artifact} />;
       case "json": return <JsonArtifactDetail artifact={artifact} />;
       case "code": return <CodeArtifactDetail artifact={artifact} onChange={onViewChange} state={viewState} />;
       case "pdf": return <PdfArtifactDetail artifact={artifact} event={active} onChange={onViewChange} state={viewState} ticket={ticket} />;
+      case "video": return <VideoRenderer artifact={artifact} event={active} ticket={ticket} />;
+      case "audio": return <AudioRenderer artifact={artifact} event={active} ticket={ticket} />;
+      case "visual-diff": return <VisualDiffArtifactDetail artifact={artifact} event={active} ticket={ticket} />;
     }
   })() : null;
 
@@ -453,17 +458,19 @@ export function ArtifactInspector({
               <span className="artifact-inspector-divider" aria-hidden="true" />
             </>
           ) : null}
-          <button
-            className="artifact-inspector-action"
-            onClick={() => void copySource()}
-            title="Copy raw payload"
-            type="button"
-          >
-            <Copy size={13} />
-            <span className="artifact-inspector-action-label">
-              {copied === "source" ? "Copied" : "Copy source"}
-            </span>
-          </button>
+          {kind !== "video" && kind !== "audio" ? (
+            <button
+              className="artifact-inspector-action"
+              onClick={() => void copySource()}
+              title="Copy raw payload"
+              type="button"
+            >
+              <Copy size={13} />
+              <span className="artifact-inspector-action-label">
+                {copied === "source" ? "Copied" : "Copy source"}
+              </span>
+            </button>
+          ) : null}
           {kind === "image" ? (
             <button
               className="artifact-inspector-action"
