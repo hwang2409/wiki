@@ -390,6 +390,10 @@ class Supervisor:
         self.event_drain_condition = asyncio.Condition()
         self.event_routes: dict[tuple[int, int], str] = {}
         self.queue_locks: dict[str, asyncio.Lock] = {}
+        self._queued_delivery_attempts: set[tuple[str, str]] = set()
+        self._deferred_provider_events: dict[
+            str, list[tuple[ProviderAdapter, ProviderEvent]]
+        ] = {}
         self.agent_locks: dict[str, asyncio.Lock] = {}
         self.handover_condition = asyncio.Condition()
         self.active_run_mutations = 0
@@ -898,6 +902,12 @@ Preserve the same identity, role, worktree, orchestrator grouping, PR gates, and
                 echoed_text,
             )
             if pending_message is not None:
+                attempt_key = (run_id, pending_message["pending_id"])
+                if attempt_key in self._queued_delivery_attempts:
+                    self._deferred_provider_events.setdefault(run_id, []).append(
+                        (adapter, event)
+                    )
+                    return
                 self.store.command_log.acknowledge_steer_for_pending(
                     run_id, pending_message["pending_id"]
                 )
@@ -1019,6 +1029,15 @@ Preserve the same identity, role, worktree, orchestrator grouping, PR gates, and
             self._spawn_monitor_task(
                 self._deliver_next_queued(run_id, adapter),
                 name=f"agent-idle-boundary-{run_id}",
+            )
+
+    async def _flush_deferred_provider_events(self, run_id: str) -> None:
+        events = self._deferred_provider_events.pop(run_id, [])
+        for adapter, event in events:
+            await self._handle_provider_event_without_admission(
+                run_id,
+                adapter,
+                event,
             )
 
     async def _flush_handover_events(
@@ -1571,12 +1590,19 @@ Preserve the same identity, role, worktree, orchestrator grouping, PR gates, and
                     queued["text"],
                     source=queued_source if isinstance(queued_source, str) else None,
                 )
+            attempt_key: tuple[str, str] | None = None
             try:
                 if pending_id is not None:
                     self.store.command_log.mark_steer_sending_for_pending(
                         run_id, pending_id
                     )
+                    attempt_key = (run_id, pending_id)
+                    self._queued_delivery_attempts.add(attempt_key)
                 status = await adapter.send_on_idle(queued["text"])
+            except asyncio.CancelledError:
+                if attempt_key is not None:
+                    self._queued_delivery_attempts.discard(attempt_key)
+                raise
             except ProviderBusy:
                 # WIKI-232 R5 H1: the R3 idle-snapshot gate above is TOCTOU.
                 # The provider can flip WORKING between our fresh
@@ -1590,13 +1616,18 @@ Preserve the same identity, role, worktree, orchestrator grouping, PR gates, and
                 # revert the steer effect from ``sending`` back to
                 # ``queued``, and let the next real WORKING->IDLE transition
                 # drive the retry.
+                if attempt_key is not None:
+                    self._queued_delivery_attempts.discard(attempt_key)
                 if pending_id is not None:
                     self.store.discard_pending_user_message(run_id, pending_id)
                     self.store.command_log.revert_steer_sending_to_queued_for_pending(
                         run_id, pending_id
                     )
+                await self._flush_deferred_provider_events(run_id)
                 return
             except Exception as exc:
+                if attempt_key is not None:
+                    self._queued_delivery_attempts.discard(attempt_key)
                 if pending_id is not None:
                     self.store.discard_pending_user_message(run_id, pending_id)
                     # The "sending" marker was written above and, per state
@@ -1627,6 +1658,7 @@ Preserve the same identity, role, worktree, orchestrator grouping, PR gates, and
                         self.store.remove_queued_message_by_pending_id(
                             run_id, pending_id
                         )
+                await self._flush_deferred_provider_events(run_id)
                 record = self.store.get(run_id)
                 record = self.store.transition(
                     run_id,
@@ -1651,8 +1683,11 @@ Preserve the same identity, role, worktree, orchestrator grouping, PR gates, and
                     name="agent-queue-drain",
                 )
                 return
+            if attempt_key is not None:
+                self._queued_delivery_attempts.discard(attempt_key)
             if pending_id is not None:
                 self.store.command_log.mark_steer_sent_for_pending(run_id, pending_id)
+            await self._flush_deferred_provider_events(run_id)
             self.store.pop_queued_message(run_id)
             record = self.store.update_adapter_status(run_id, status)
             record = self.store.clear_automatic_resume_suppression(run_id)
@@ -2337,17 +2372,33 @@ Preserve the same identity, role, worktree, orchestrator grouping, PR gates, and
         self._sending_effects_reconciled = True
         for effect in self.store.command_log.sending_steer_effects():
             run_id = str(effect.get("run_id") or "")
-            pending_id = effect.get("pending_id")
             method = str(effect.get("method") or "")
             request_id = str(effect.get("request_id") or "")
             if not run_id or not method or not request_id:
                 continue
-            pending_id_str = str(pending_id) if isinstance(pending_id, str) else None
             async with self._run_lock(run_id):
                 try:
                     self.store.get(run_id)
                 except RunNotFound:
                     continue
+                # The initial list is only a candidate snapshot. A live
+                # drain can finish this exact effect before this run lock is
+                # acquired, so reload it and reconcile only if it is still
+                # genuinely in-flight (WIKI-232 REVIEW6 H1).
+                current_effect = self.store.command_log.steer_effect_for_request(
+                    method,
+                    request_id,
+                )
+                if (
+                    current_effect is None
+                    or current_effect.get("run_id") != run_id
+                    or current_effect.get("status") != "sending"
+                ):
+                    continue
+                pending_id = current_effect.get("pending_id")
+                pending_id_str = (
+                    str(pending_id) if isinstance(pending_id, str) else None
+                )
                 observed = False
                 if pending_id_str is not None:
                     try:

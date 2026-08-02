@@ -334,6 +334,19 @@ class EffectStore:
             ).fetchone()
         return self._decode(row) if row is not None else None
 
+    def steer_for_request(
+        self, method: str, request_id: str
+    ) -> dict[str, Any] | None:
+        with self._connect() as connection:
+            row = connection.execute(
+                """
+                SELECT * FROM steer_effects
+                WHERE method = ? AND request_id = ?
+                """,
+                (method, request_id),
+            ).fetchone()
+        return self._decode(row) if row is not None else None
+
     def update_steer(
         self,
         method: str,

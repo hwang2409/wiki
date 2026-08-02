@@ -303,6 +303,11 @@ class CommandLog:
     ) -> dict[str, Any] | None:
         return self.effects.steer_for_pending(run_id, pending_id)
 
+    def steer_effect_for_request(
+        self, method: str, request_id: str
+    ) -> dict[str, Any] | None:
+        return self.effects.steer_for_request(method, request_id)
+
     def acknowledge_steer_for_pending(self, run_id: str, pending_id: str) -> None:
         self.effects.acknowledge_steer(run_id, pending_id)
 

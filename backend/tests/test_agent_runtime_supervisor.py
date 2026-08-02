@@ -1262,6 +1262,111 @@ class SupervisorTests(unittest.IsolatedAsyncioTestCase):
         assert second is not None
         self.assertIn(second["status"], {"sent", "acknowledged"})
 
+    async def test_reconcile_reload_preserves_live_sent_effect(self) -> None:
+        """WIKI-232 REVIEW6 H1: a stale recovery snapshot must not
+        overwrite a live drain that already marked its effect sent."""
+
+        record = await self.supervisor.start_run(
+            agent_id="WIKI-232-REVIEW6-RECONCILE",
+            provider=ProviderKind.CODEX,
+            role="implement",
+            model="fixture-codex",
+            effort="high",
+            worktree=str(self.worktree),
+            prompt="review 6 reconcile race",
+        )
+        adapter = self.supervisor.adapters[record.run_id]
+        snapshot = adapter.snapshot()
+        working = AdapterStatus(
+            LifecycleState.WORKING,
+            snapshot.session_id,
+            os.getpid(),
+            generation=snapshot.generation,
+        )
+        adapter._status = working  # noqa: SLF001 - queue fixture
+        self.store.update_adapter_status(record.run_id, working)
+        pending_id = str(uuid4())
+        await self.supervisor.send_on_idle(
+            record.run_id,
+            "live-reconcile-send",
+            pending_id=pending_id,
+            effect_id="review6-reconcile-race",
+        )
+
+        idle = AdapterStatus(
+            LifecycleState.IDLE,
+            snapshot.session_id,
+            os.getpid(),
+            generation=snapshot.generation,
+        )
+        adapter._status = idle  # noqa: SLF001 - race fixture
+        self.store.update_adapter_status(record.run_id, idle)
+
+        send_started = asyncio.Event()
+        release_send = asyncio.Event()
+        original_send = adapter.send_on_idle
+
+        async def paused_send(message: str) -> AdapterStatus:
+            send_started.set()
+            await release_send.wait()
+            return await original_send(message)
+
+        adapter.send_on_idle = paused_send  # type: ignore[method-assign]
+        live_task = asyncio.create_task(
+            self.supervisor._deliver_next_queued(  # noqa: SLF001
+                record.run_id,
+                adapter,
+            )
+        )
+        try:
+            await send_started.wait()
+            sending = self.store.command_log.steer_effect_for_pending(
+                record.run_id, pending_id,
+            )
+            self.assertIsNotNone(sending)
+            assert sending is not None
+            self.assertEqual(sending["status"], "sending")
+
+            real_list = self.store.command_log.sending_steer_effects
+            snapshot_seen = asyncio.Event()
+
+            class SnapshotRows(list[dict[str, Any]]):
+                def __iter__(self):
+                    snapshot_seen.set()
+                    return super().__iter__()
+
+            def stale_snapshot() -> list[dict[str, Any]]:
+                return SnapshotRows(real_list())
+
+            self.supervisor._sending_effects_reconciled = False  # noqa: SLF001
+            with mock.patch.object(
+                self.store.command_log,
+                "sending_steer_effects",
+                side_effect=stale_snapshot,
+            ):
+                reconcile_task = asyncio.create_task(
+                    self.supervisor._reconcile_sending_steer_effects()  # noqa: SLF001
+                )
+                await snapshot_seen.wait()
+                # The live drain owns the run lock. Reconciliation has its
+                # stale list, then waits for that live operation to finish.
+                release_send.set()
+                await live_task
+                await reconcile_task
+        finally:
+            adapter.send_on_idle = original_send  # type: ignore[method-assign]
+            if not live_task.done():
+                live_task.cancel()
+                await asyncio.gather(live_task, return_exceptions=True)
+
+        final_effect = self.store.command_log.steer_effect_for_pending(
+            record.run_id, pending_id,
+        )
+        self.assertIsNotNone(final_effect)
+        assert final_effect is not None
+        self.assertEqual(final_effect["status"], "sent")
+        self.assertEqual(self.store.queued_messages(record.run_id), [])
+
     async def test_send_now_replay_after_dedupe_claim_delivers_once(self) -> None:
         """WIKI-232 H1: a crash between the dedupe-claim write and the
         provider send used to leave the effect at 'queued' with the dedupe
@@ -2053,6 +2158,27 @@ class SupervisorTests(unittest.IsolatedAsyncioTestCase):
             # between our IDLE snapshot and this authoritative check.
             adapter._status = working  # noqa: SLF001 - simulate flip
             self.store.update_adapter_status(record.run_id, working)
+            # The provider echo can arrive before the authoritative status
+            # refresh raises ProviderBusy. It must wait for the attempt
+            # outcome instead of acknowledging this rejected send.
+            await self.supervisor._handle_provider_event(  # noqa: SLF001
+                record.run_id,
+                adapter,
+                ProviderEvent(
+                    ProviderKind.CODEX,
+                    {
+                        "method": "item/completed",
+                        "params": {
+                            "item": {
+                                "type": "userMessage",
+                                "content": [
+                                    {"type": "text", "text": "busy-race"}
+                                ],
+                            }
+                        },
+                    },
+                ),
+            )
             raise ProviderBusy("provider raced to WORKING after IDLE snapshot")
 
         adapter.send_on_idle = busy_after_snapshot  # type: ignore[method-assign]
@@ -2105,42 +2231,25 @@ class SupervisorTests(unittest.IsolatedAsyncioTestCase):
             "known rejection must discard the pending echo matcher",
         )
 
-        # An unrelated provider echo with identical text must not consume the
-        # rejected effect before its retry is accepted by the provider.
-        await self.supervisor._handle_provider_event(  # noqa: SLF001
-            record.run_id,
-            adapter,
-            ProviderEvent(
-                ProviderKind.CODEX,
-                {
-                    "method": "item/completed",
-                    "params": {
-                        "item": {
-                            "type": "userMessage",
-                            "content": [{"type": "text", "text": "busy-race"}],
-                        }
-                    },
-                },
-            ),
-        )
-        effect_after_echo = self.store.command_log.steer_effect_for_pending(
-            record.run_id, pending_id,
-        )
-        assert effect_after_echo is not None
-        self.assertEqual(effect_after_echo["status"], "queued")
-        self.assertEqual(
-            self.store.queued_messages(record.run_id)[0]["text"],
-            "busy-race",
-        )
-
         # Retry path: a natural WORKING->IDLE transition drains the same
         # entry successfully. Restore the real send_on_idle so the drain
         # actually delivers, flip to IDLE, and rerun the drain.
         adapter._status = idle  # noqa: SLF001 - retry fixture
         self.store.update_adapter_status(record.run_id, idle)
-        await self.supervisor._deliver_next_queued_locked(  # noqa: SLF001
-            record.run_id, adapter,
-        )
+        retry_calls: list[str] = []
+
+        async def tracked_retry(message: str) -> AdapterStatus:
+            retry_calls.append(message)
+            return await original_send(message)
+
+        adapter.send_on_idle = tracked_retry  # type: ignore[method-assign]
+        try:
+            await self.supervisor._deliver_next_queued_locked(  # noqa: SLF001
+                record.run_id, adapter,
+            )
+        finally:
+            adapter.send_on_idle = original_send  # type: ignore[method-assign]
+        self.assertEqual(retry_calls, ["busy-race"])
         self.assertEqual(
             self.store.queued_messages(record.run_id),
             [],
