@@ -2995,22 +2995,40 @@ class SupervisorTests(unittest.IsolatedAsyncioTestCase):
         composer_before_replay = [
             dict(item) for item in final_record.composer_messages
         ]
-        replayed_first = await restarted.dispatch(
+        await restarted.close()
+        provider_constructions = 0
+
+        def forbidden_factory(_run_record: RunRecord) -> ProviderAdapter:
+            nonlocal provider_constructions
+            provider_constructions += 1
+            raise AssertionError("receipt replay constructed a provider")
+
+        replay_store = RunStore(self.paths)
+        replayed_supervisor = Supervisor(
+            replay_store,
+            forbidden_factory,
+            pid_alive=lambda _pid: False,
+        )
+        self.store = replay_store
+        self.supervisor = replayed_supervisor
+        replayed_first = await replayed_supervisor.dispatch(
             "run/send_now", dict(first_params)
         )
-        replayed_second = await restarted.dispatch(
+        replayed_second = await replayed_supervisor.dispatch(
             "run/send_now", dict(second_params)
         )
         self.assertEqual(replayed_first, first)
         self.assertEqual(replayed_second, second)
+        self.assertEqual(provider_constructions, 0)
         self.assertEqual(provider_calls, [message, message])
+        self.assertEqual(replayed_supervisor.adapters, {})
         self.assertEqual(
-            restarted_store.get(record.run_id).composer_messages,
+            replay_store.get(record.run_id).composer_messages,
             composer_before_replay,
         )
-        self.assertEqual(restarted_store.command_log.pending(), [])
+        self.assertEqual(replay_store.command_log.pending(), [])
         self.assertEqual(
-            restarted_store.command_log.sending_steer_effects(), []
+            replay_store.command_log.sending_steer_effects(), []
         )
 
     async def test_unsuppressed_startup_retires_overflow_before_resume_echo(
