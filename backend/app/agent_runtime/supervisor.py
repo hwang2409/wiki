@@ -3899,15 +3899,53 @@ Preserve the same identity, role, worktree, orchestrator grouping, PR gates, and
                 return result
         normalized_message = message.strip()
         if normalized_message:
-            unresolved_match = next(
-                (
-                    item
-                    for item in self.store.get(run_id).pending_user_messages
-                    if item.get("pending_id") != pending_id
-                    and str(item.get("text") or "").strip() == normalized_message
-                ),
-                None,
-            )
+            current_record = self.store.get(run_id)
+            unresolved_match = None
+            for item in current_record.pending_user_messages:
+                old_pending_id = item.get("pending_id")
+                if (
+                    old_pending_id == pending_id
+                    or str(item.get("text") or "").strip()
+                    != normalized_message
+                    or not isinstance(old_pending_id, str)
+                ):
+                    continue
+                old_effect = self.store.command_log.steer_effect_for_pending(
+                    run_id, old_pending_id
+                )
+                inherited_from_replacement = False
+                if old_effect is None and current_record.replaces_run_id is not None:
+                    old_effect = self.store.command_log.steer_effect_for_pending(
+                        current_record.replaces_run_id,
+                        old_pending_id,
+                    )
+                    inherited_from_replacement = True
+                old_result = (
+                    old_effect.get("result")
+                    if isinstance(old_effect, dict)
+                    else None
+                )
+                accepted = bool(
+                    isinstance(old_effect, dict)
+                    and old_effect.get("status") in {"sent", "acknowledged"}
+                    and not (
+                        isinstance(old_result, dict)
+                        and old_result.get("status") == "uncertain"
+                    )
+                )
+                if accepted or inherited_from_replacement:
+                    # A successful transport effect has already delivered its
+                    # command, and an inherited matcher cannot receive an echo
+                    # from the replaced transport. Retire either matcher at
+                    # the next exact-text collision so recurring fleet alarms
+                    # cannot starve. The command journal remains the durable
+                    # source record for the accepted send (REVIEW19 H1).
+                    self.store.discard_pending_user_message(
+                        run_id, old_pending_id
+                    )
+                    continue
+                unresolved_match = item
+                break
             if unresolved_match is not None:
                 # FIFO text matching cannot distinguish two unresolved sends
                 # with equal normalized text. Keep the later command intent

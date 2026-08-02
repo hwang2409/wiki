@@ -1839,11 +1839,13 @@ class SupervisorTests(unittest.IsolatedAsyncioTestCase):
         original_send = adapter.send_now
         provider_calls: list[str] = []
 
-        async def ambiguous_send(message: str) -> AdapterStatus:
+        async def ambiguous_then_accept(message: str) -> AdapterStatus:
             provider_calls.append(message)
-            raise RuntimeError("ambiguous first delivery")
+            if len(provider_calls) == 1:
+                raise RuntimeError("ambiguous first delivery")
+            return await original_send(message)
 
-        adapter.send_now = ambiguous_send  # type: ignore[method-assign]
+        adapter.send_now = ambiguous_then_accept  # type: ignore[method-assign]
         first_params = {
             "run_id": record.run_id,
             "text": "same normalized text",
@@ -1862,30 +1864,86 @@ class SupervisorTests(unittest.IsolatedAsyncioTestCase):
                 CommandRetryable, "identical message delivery"
             ):
                 await self.supervisor.dispatch("run/send_now", second_params)
+
+            first_pending_id = first.get("pending_id")
+            self.assertIsInstance(first_pending_id, str)
+            await self.supervisor._handle_provider_event(  # noqa: SLF001
+                record.run_id,
+                adapter,
+                ProviderEvent(
+                    ProviderKind.CODEX,
+                    {
+                        "method": "item/completed",
+                        "params": {
+                            "item": {
+                                "type": "userMessage",
+                                "content": [
+                                    {"type": "text", "text": first_params["text"]}
+                                ],
+                            }
+                        },
+                    },
+                ),
+            )
+            await self.supervisor.command_queue.recover_pending()
+            second_effect = self.store.command_log.steer_effect_for_request(
+                "run/send_now", "review18-equal-second"
+            )
+            self.assertIsNotNone(second_effect)
+            assert second_effect is not None
+            second_pending_id = second_effect.get("pending_id")
+            self.assertIsInstance(second_pending_id, str)
+            await self.supervisor._handle_provider_event(  # noqa: SLF001
+                record.run_id,
+                adapter,
+                ProviderEvent(
+                    ProviderKind.CODEX,
+                    {
+                        "method": "item/completed",
+                        "params": {
+                            "item": {
+                                "type": "userMessage",
+                                "content": [
+                                    {"type": "text", "text": second_params["text"]}
+                                ],
+                            }
+                        },
+                    },
+                ),
+            )
+            second = await self.supervisor.dispatch(
+                "run/send_now", dict(second_params)
+            )
         finally:
             adapter.send_now = original_send  # type: ignore[method-assign]
 
         self.assertEqual(first["status"], "uncertain")
-        self.assertEqual(provider_calls, ["same normalized text"])
-        self.assertIsNone(
-            self.store.command_log.receipt(
-                "run/send_now", "review18-equal-second"
-            )
-        )
-        pending_commands = self.store.command_log.pending()
+        self.assertEqual(second["status"], "sent")
         self.assertEqual(
-            [command.request_id for command in pending_commands],
-            ["review18-equal-second"],
+            provider_calls,
+            ["same normalized text", "  same normalized text  "],
         )
-        pending_messages = self.store.get(record.run_id).pending_user_messages
-        self.assertEqual(len(pending_messages), 1)
-        self.assertEqual(pending_messages[0].get("source"), "first-source")
-        second_effect = self.store.command_log.steer_effect_for_request(
+        second_receipt = self.store.command_log.receipt(
             "run/send_now", "review18-equal-second"
         )
-        self.assertIsNotNone(second_effect)
-        assert second_effect is not None
-        self.assertEqual(second_effect["status"], "queued")
+        self.assertIsNotNone(second_receipt)
+        assert second_receipt is not None
+        self.assertTrue(second_receipt.ok)
+        self.assertEqual(second_receipt.result, second)
+        self.assertEqual(self.store.command_log.pending(), [])
+        matching_sources = {
+            message.get("pending_id"): message.get("source")
+            for message in self.store.get(record.run_id).composer_messages
+            if message.get("pending_id")
+            in {first_pending_id, second_pending_id}
+        }
+        self.assertEqual(
+            matching_sources,
+            {
+                first_pending_id: "first-source",
+                second_pending_id: "second-source",
+            },
+        )
 
     async def test_send_now_normalize_failure_recovers_sent_receipt(
         self,
