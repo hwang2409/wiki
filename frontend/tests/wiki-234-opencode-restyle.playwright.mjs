@@ -74,6 +74,11 @@ try {
   };
   const registry = {
     _orchestrators: {
+      phoebe: {
+        window: "@9998",
+        spawned_at: "2026-07-22T13:00:00Z",
+        transcript,
+      },
       wiki: {
         window: "@9999",
         spawned_at: "2026-07-22T14:00:00Z",
@@ -144,7 +149,7 @@ try {
     ),
   );
   assert(
-    JSON.stringify(initialRows) === JSON.stringify(["wiki", "FREE-1"]),
+    JSON.stringify(initialRows) === JSON.stringify(["phoebe", "wiki", "FREE-1"]),
     `collapsed sidebar must show orchestrators then ungrouped workers, got ${initialRows.join("/")}`,
   );
   const sidebarText = await page.locator(".nav-agents").innerText();
@@ -152,6 +157,12 @@ try {
     assert(!sidebarText.includes(removed), `archived sidebar chrome must omit ${removed}`);
   }
   assert((await page.locator(".nav-agent-num").count()) === 0, "session gutter numbers must be removed");
+
+  const emptyOrchRow = page.locator(".nav-agent.is-orch.is-empty", { hasText: "phoebe" });
+  const emptyChevronVisibility = await emptyOrchRow.locator(".nav-orch-chevron").evaluate(
+    (el) => getComputedStyle(el).visibility,
+  );
+  assert(emptyChevronVisibility === "hidden", `empty orchestrator chevron must be hidden, got ${emptyChevronVisibility}`);
 
   const wikiRow = page.locator('.nav-agent.is-orch', { hasText: "wiki" });
   assert((await wikiRow.getAttribute("aria-expanded")) === "false", "wiki workers must start collapsed");

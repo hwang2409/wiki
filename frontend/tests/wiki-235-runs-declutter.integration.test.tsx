@@ -62,13 +62,14 @@ beforeEach(() => localStorage.clear());
 afterEach(() => cleanup());
 
 describe("WIKI-235 runs sidebar", () => {
-  test("shows orchestrators first and keeps owned workers collapsed by default", () => {
+  test("shows orchestrators first and keeps empty orchestrators directly openable", () => {
+    const opened: string[] = [];
     render(
       <AgentsSidebar
         activeTicket={null}
         data={{ workers, orchestrators, error: null }}
         refreshTick={0}
-        onOpen={() => {}}
+        onOpen={(ticket) => opened.push(ticket)}
       />,
     );
 
@@ -79,6 +80,14 @@ describe("WIKI-235 runs sidebar", () => {
     expect(screen.queryByText("WIKI-BLOCK")).toBeNull();
     expect(screen.queryByTestId("nav-agents-group-history")).toBeNull();
     expect(document.querySelector(".nav-agent-num")).toBeNull();
+
+    const phoebe = screen.getByText("phoebe").closest("button");
+    expect(phoebe).not.toBeNull();
+    expect(phoebe?.classList.contains("is-empty")).toBe(true);
+    expect(phoebe?.hasAttribute("aria-expanded")).toBe(false);
+    expect(phoebe?.hasAttribute("aria-controls")).toBe(false);
+    fireEvent.click(phoebe!);
+    expect(opened).toEqual(["phoebe"]);
   });
 
   test("expands in attention order, opens workers, and collapses again", () => {
