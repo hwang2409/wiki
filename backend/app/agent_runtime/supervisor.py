@@ -59,6 +59,7 @@ _COMMAND_METHODS = frozenset(
     {"run/start", "run/send_now", "run/send_on_idle", "run/archive", "run/replace"}
 )
 DEFAULT_APPROVAL_RECOVERY_TIMEOUT_SECONDS = 30.0
+AMBIGUOUS_SEND_ECHO_GRACE_SECONDS = 0.05
 logger = logging.getLogger(__name__)
 
 
@@ -391,6 +392,9 @@ class Supervisor:
         self.event_routes: dict[tuple[int, int], str] = {}
         self.queue_locks: dict[str, asyncio.Lock] = {}
         self._queued_delivery_attempts: set[tuple[str, str]] = set()
+        self._delivery_attempt_echoes: dict[
+            tuple[str, str], asyncio.Future[None]
+        ] = {}
         self._deferred_provider_events: dict[
             str,
             list[
@@ -936,6 +940,9 @@ Preserve the same identity, role, worktree, orchestrator grouping, PR gates, and
                             prior_state,
                         )
                     )
+                    boundary = self._delivery_attempt_echoes.get(attempt_key)
+                    if boundary is not None and not boundary.done():
+                        boundary.set_result(None)
                     return
                 self.store.command_log.acknowledge_steer_for_pending(
                     run_id, pending_message["pending_id"]
@@ -3848,10 +3855,7 @@ Preserve the same identity, role, worktree, orchestrator grouping, PR gates, and
             pending_id = str(uuid4())
         # Cleanup obligation is established BEFORE the tracker runs. A partial
         # tracker success (atomic os.replace committed but a follow-up chmod
-        # or dir fsync raises) would otherwise leak a durable pending row
-        # while releasing the dedupe key — a retry would then land a second
-        # pending row for the same pending_id, and the stale first row could
-        # consume the retry's provider echo.
+        # or dir fsync raises) would otherwise leak a durable pending row.
         try:
             if pending_id is not None:
                 try:
@@ -3867,8 +3871,54 @@ Preserve the same identity, role, worktree, orchestrator grouping, PR gates, and
                 self.store.command_log.update_steer_effect(
                     "run/send_now", effect_id, "sending"
                 )
-            status = await adapter.send_now(message)
         except Exception:
+            if dedupe_key is not None:
+                self.store.release_message_dedupe_key(run_id, dedupe_key)
+            if pending_id is not None:
+                self.store.discard_pending_user_message(run_id, pending_id)
+            raise
+
+        attempt_key: tuple[str, str] | None = None
+        echo_boundary: asyncio.Future[None] | None = None
+        if pending_id is not None:
+            attempt_key = (run_id, pending_id)
+            self._queued_delivery_attempts.add(attempt_key)
+            echo_boundary = asyncio.get_running_loop().create_future()
+            self._delivery_attempt_echoes[attempt_key] = echo_boundary
+        try:
+            status = await adapter.send_now(message)
+        except asyncio.CancelledError:
+            if attempt_key is not None:
+                self._queued_delivery_attempts.discard(attempt_key)
+                self._delivery_attempt_echoes.pop(attempt_key, None)
+            raise
+        except ProviderBusy:
+            if attempt_key is not None:
+                self._queued_delivery_attempts.discard(attempt_key)
+                self._delivery_attempt_echoes.pop(attempt_key, None)
+            if dedupe_key is not None:
+                self.store.release_message_dedupe_key(run_id, dedupe_key)
+            if pending_id is not None:
+                self.store.discard_pending_user_message(run_id, pending_id)
+            raise
+        except Exception as exc:
+            # A transport can accept the write, schedule its echo for the next
+            # event-loop turn, then report an error. Keep the pending matcher
+            # active while the event pump crosses this bounded barrier. The
+            # matching handler persists raw input, defers normalization, and
+            # signals the future above (REVIEW16 H1).
+            if echo_boundary is not None:
+                try:
+                    await asyncio.wait_for(
+                        asyncio.shield(echo_boundary),
+                        timeout=AMBIGUOUS_SEND_ECHO_GRACE_SECONDS,
+                    )
+                except TimeoutError:
+                    pass
+            if attempt_key is not None:
+                self._queued_delivery_attempts.discard(attempt_key)
+                self._delivery_attempt_echoes.pop(attempt_key, None)
+            await self._flush_deferred_provider_events(run_id)
             delivery_observed = False
             if pending_id is not None:
                 terminal = self.store.command_log.steer_effect_for_pending(
@@ -3899,15 +3949,27 @@ Preserve the same identity, role, worktree, orchestrator grouping, PR gates, and
                         "run/send_now", effect_id, "acknowledged", response
                     )
                 return response
+            # The provider outcome is ambiguous. Preserve the sending effect,
+            # pending matcher, and dedupe claim. A later echo can still gain
+            # exact source correlation, and a replay cannot send a duplicate.
+            response = {"status": "uncertain", "reason": str(exc)}
+            if pending_id is not None and expose_pending_id:
+                response["pending_id"] = pending_id
             if dedupe_key is not None:
-                self.store.release_message_dedupe_key(run_id, dedupe_key)
-            if pending_id is not None:
-                self.store.discard_pending_user_message(run_id, pending_id)
-            raise
+                response["dedupe_key"] = dedupe_key
+            if effect_id is not None:
+                self.store.command_log.update_steer_effect(
+                    "run/send_now", effect_id, "sending", response
+                )
+            return response
+        if attempt_key is not None:
+            self._queued_delivery_attempts.discard(attempt_key)
+            self._delivery_attempt_echoes.pop(attempt_key, None)
         if effect_id is not None:
             self.store.command_log.update_steer_effect(
                 "run/send_now", effect_id, "sent"
             )
+        await self._flush_deferred_provider_events(run_id)
         record = self.store.update_adapter_status(run_id, status)
         record = self.store.clear_automatic_resume_suppression(run_id)
         await self._publish_agent_change(record.agent_id)
@@ -5336,6 +5398,8 @@ Preserve the same identity, role, worktree, orchestrator grouping, PR gates, and
         self.event_routes.clear()
         self.event_processing_locks.clear()
         self.event_inflight_counts.clear()
+        self._queued_delivery_attempts.clear()
+        self._delivery_attempt_echoes.clear()
         self.queue_locks.clear()
         self.agent_locks.clear()
         self.pipeline_failures.clear()

@@ -1659,10 +1659,99 @@ class SupervisorTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(receipt.ok)
         self.assertEqual(receipt.result, result)
 
-    async def test_send_now_error_without_echo_stays_failed(
+    async def test_send_now_next_turn_echo_after_error_records_success(
         self,
     ) -> None:
-        """REVIEW15 H1 control: no durable evidence keeps the error receipt."""
+        """REVIEW16 H1: the event pump crosses the transport boundary."""
+
+        record = await self.supervisor.start_run(
+            agent_id="WIKI-232-R16-NOW",
+            provider=ProviderKind.CODEX,
+            role="implement",
+            model="fixture-codex",
+            effort="high",
+            worktree=str(self.worktree),
+            prompt="next-turn echo after send_now error",
+        )
+        adapter = self.supervisor.adapters[record.run_id]
+        original_send = adapter.send_now
+        provider_calls: list[str] = []
+
+        async def schedule_echo_then_raise(message: str) -> AdapterStatus:
+            provider_calls.append(message)
+            event = ProviderEvent(
+                ProviderKind.CODEX,
+                {
+                    "method": "item/completed",
+                    "params": {
+                        "item": {
+                            "type": "userMessage",
+                            "content": [{"type": "text", "text": message}],
+                        }
+                    },
+                },
+            )
+            asyncio.get_running_loop().call_soon(
+                adapter._events.put_nowait,  # noqa: SLF001 - pump boundary fixture
+                event,
+            )
+            raise RuntimeError("response failed before scheduled echo drained")
+
+        adapter.send_now = schedule_echo_then_raise  # type: ignore[method-assign]
+        request_id = "review16-next-turn-request"
+        dedupe_key = "review16-next-turn-dedupe"
+        params = {
+            "run_id": record.run_id,
+            "text": "scheduled echo exactly once",
+            "source": "fleet-monitor",
+            "dedupe_key": dedupe_key,
+            "request_id": request_id,
+        }
+        try:
+            result = await self.supervisor.dispatch("run/send_now", params)
+            replay = await self.supervisor.dispatch("run/send_now", dict(params))
+        finally:
+            adapter.send_now = original_send  # type: ignore[method-assign]
+
+        self.assertEqual(provider_calls, ["scheduled echo exactly once"])
+        self.assertEqual(result["status"], "sent")
+        self.assertEqual(replay, result)
+        pending_id = result.get("pending_id")
+        self.assertIsInstance(pending_id, str)
+        receipt = self.store.command_log.receipt("run/send_now", request_id)
+        self.assertIsNotNone(receipt)
+        assert receipt is not None
+        self.assertTrue(receipt.ok)
+        self.assertEqual(receipt.result, result)
+
+        composer = self.store.get(record.run_id).composer_messages
+        matching_composer = [
+            message for message in composer if message.get("pending_id") == pending_id
+        ]
+        self.assertEqual(len(matching_composer), 1)
+        self.assertEqual(matching_composer[0].get("source"), "fleet-monitor")
+        matching_normalized = [
+            event
+            for event in self.store.read_normalized_events(record.run_id)
+            if isinstance(event.get("payload"), dict)
+            and event["payload"].get("pending_id") == pending_id
+        ]
+        self.assertEqual(len(matching_normalized), 1)
+        claims = self.store.get(record.run_id).message_dedupe_keys
+        self.assertEqual(
+            claims,
+            [
+                {
+                    "key": dedupe_key,
+                    "owner": f"run/send_now:{request_id}",
+                }
+            ],
+        )
+
+    async def test_send_now_error_without_echo_stays_uncertain(
+        self,
+    ) -> None:
+        """REVIEW16 H1 control: ambiguity keeps correlation and dedupe state."""
 
         record = await self.supervisor.start_run(
             agent_id="WIKI-232-R15-NOW-FAIL",
@@ -1684,24 +1773,53 @@ class SupervisorTests(unittest.IsolatedAsyncioTestCase):
         adapter.send_now = raise_without_echo  # type: ignore[method-assign]
         params = {
             "run_id": record.run_id,
-            "text": "must stay failed",
+            "text": "must stay uncertain",
+            "source": "fleet-monitor",
+            "dedupe_key": "review16-no-echo-dedupe",
             "request_id": "review15-now-failed-request",
         }
         try:
-            with self.assertRaisesRegex(RuntimeError, "provider never accepted"):
-                await self.supervisor.dispatch("run/send_now", params)
-            with self.assertRaisesRegex(RuntimeError, "provider never accepted"):
-                await self.supervisor.dispatch("run/send_now", dict(params))
+            result = await self.supervisor.dispatch("run/send_now", params)
+            replay = await self.supervisor.dispatch("run/send_now", dict(params))
         finally:
             adapter.send_now = original_send  # type: ignore[method-assign]
 
-        self.assertEqual(provider_calls, ["must stay failed"])
+        self.assertEqual(provider_calls, ["must stay uncertain"])
+        self.assertEqual(result["status"], "uncertain")
+        self.assertEqual(replay, result)
         receipt = self.store.command_log.receipt(
             "run/send_now", "review15-now-failed-request"
         )
         self.assertIsNotNone(receipt)
         assert receipt is not None
-        self.assertFalse(receipt.ok)
+        self.assertTrue(receipt.ok)
+        self.assertEqual(receipt.result, result)
+        pending_id = result.get("pending_id")
+        self.assertIsInstance(pending_id, str)
+        current = self.store.get(record.run_id)
+        self.assertEqual(
+            [
+                message.get("pending_id")
+                for message in current.pending_user_messages
+            ],
+            [pending_id],
+        )
+        self.assertEqual(
+            current.message_dedupe_keys,
+            [
+                {
+                    "key": "review16-no-echo-dedupe",
+                    "owner": "run/send_now:review15-now-failed-request",
+                }
+            ],
+        )
+        effect = self.store.command_log.steer_effect_for_pending(
+            record.run_id, str(pending_id)
+        )
+        self.assertIsNotNone(effect)
+        assert effect is not None
+        self.assertEqual(effect["status"], "sending")
+        self.assertEqual(effect["result"]["status"], "uncertain")
 
     async def test_recover_on_start_reconciles_wedged_sending_effect(self) -> None:
         """WIKI-232 H2: an on-idle effect stuck at 'sending' after a daemon
