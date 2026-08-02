@@ -4,6 +4,7 @@ import {
   useCallback,
   useContext,
   useEffect,
+  useId,
   useLayoutEffect,
   useMemo,
   useRef,
@@ -134,6 +135,36 @@ const VIRTUAL_OVERSCAN_MULTIPLIER = 5;
 const VIRTUAL_DEFAULT_VIEWPORT = 720;
 const MIN_ROW_HEIGHT = 24;
 const COMPOSER_MIN_HEIGHT = 44;
+
+type ComposerShortcut = {
+  key: string;
+  action: string;
+};
+
+type ComposerGuidance = {
+  shortcuts: ComposerShortcut[];
+  accessibleText: string;
+  sendAction: string;
+};
+
+function getComposerGuidance(working: boolean): ComposerGuidance {
+  const shortcuts = working
+    ? [
+        { key: "enter", action: "send now" },
+        { key: "shift+enter", action: "queue until idle" },
+        { key: "esc", action: "vim" },
+      ]
+    : [
+        { key: "enter", action: "send" },
+        { key: "shift+enter", action: "newline" },
+        { key: "esc", action: "vim" },
+      ];
+  return {
+    shortcuts,
+    accessibleText: shortcuts.map(({ key, action }) => `${key} ${action}`).join(" · "),
+    sendAction: working ? "Send now" : "Send",
+  };
+}
 
 let skillsCache: SkillInfo[] | null = null;
 function useSkills(): SkillInfo[] {
@@ -2703,6 +2734,7 @@ export function SessionTab({
     () => (session?.subagents ?? []).filter((entry) => entry.active),
     [session]
   );
+  const composerGuidance = getComposerGuidance(session?.working ?? false);
 
   // K/J recall in the composer — user messages from the transcript itself
   // (covers terminal-typed AND wiki-sent, no separate storage). Synthetic
@@ -2849,6 +2881,7 @@ export function SessionTab({
           stateKey={composerStateKeyForSession(ticket, subagent)}
           thinking={session.working}
           ticket={ticket}
+          guidance={composerGuidance}
           onInspect={onInspect}
         />
       )}
@@ -2856,18 +2889,12 @@ export function SessionTab({
         <SessionModelFooter session={session} ticket={ticket} />
         {subagent || !showComposer ? null : (
           <div aria-hidden="true" className="session-footer-hints">
-            <span className="session-hint">
-              <span className="session-hint-key">enter</span> send
-            </span>
-            <span className="session-hint">
-              {/* Mirrors the composer handler: Shift+Enter queues only while
-                  the agent is working; when idle it inserts a newline. */}
-              <span className="session-hint-key">shift+enter</span>{" "}
-              {session.working ? "queue" : "newline"}
-            </span>
-            <span className="session-hint">
-              <span className="session-hint-key">esc</span> vim
-            </span>
+            {composerGuidance.shortcuts.map((shortcut) => (
+              <span className="session-hint" key={shortcut.key}>
+                <span className="session-hint-key">{shortcut.key}</span>{" "}
+                {shortcut.action}
+              </span>
+            ))}
           </div>
         )}
       </div>
@@ -2921,6 +2948,7 @@ function MessageComposer({
   queued = [],
   runningSubagents = [],
   thinking = false,
+  guidance,
   onInspect,
 }: {
   stateKey: string;
@@ -2930,6 +2958,7 @@ function MessageComposer({
   queued?: QueuedMessage[];
   runningSubagents?: SubagentInfo[];
   thinking?: boolean;
+  guidance: ComposerGuidance;
   onInspect?: (agentId: string) => void;
 }) {
   const cachedComposer = getComposerState(stateKey);
@@ -2941,7 +2970,6 @@ function MessageComposer({
   const [text, setText] = useState(() => cachedComposer?.text ?? "");
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<string | null>(null);
-  const [inputFocused, setInputFocused] = useState(false);
   const [vimMode, setVimMode] = useState<ComposerMode>(() => cachedComposer?.vimMode ?? "insert");
   const pendingKeyRef = useRef<string | null>(null);
   const registerRef = useRef<string>("");
@@ -2978,6 +3006,8 @@ function MessageComposer({
   const visualHeadRef = useRef(0);
   const inputRef = useRef<HTMLTextAreaElement | null>(null);
   const measureRef = useRef<HTMLTextAreaElement | null>(null);
+  const composerInputId = useId();
+  const composerHelpId = `${composerInputId}-help`;
   const [caretPos, setCaretPos] = useState(selectionRef.current.start);
   const [overlayPos, setOverlayPos] = useState<{ top: number; left: number } | null>(null);
 
@@ -3799,175 +3829,174 @@ function MessageComposer({
           error={commandError}
         />
       ) : (
-      <div className="session-composer-row">
-        <div className="session-input-wrap">
-        {overlayPos ? (
-          <span
-            className="session-empty-block-cursor"
-            style={{ top: overlayPos.top, left: overlayPos.left }}
-          />
-        ) : null}
-        <textarea
-          autoCapitalize="off"
-          autoCorrect="off"
-          className={vimMode === "normal" || vimMode === "visual" ? "is-vim-normal" : undefined}
-          spellCheck={false}
-          placeholder={vimMode === "insert" ? "Message" : undefined}
-          /* R2-03: aria-label carries the accessible name ("Message"); the
-             keyboard sheet lives in a real focus-revealed element below
-             wired via aria-describedby. `title` would clobber both. */
-          aria-label="Message"
-          aria-describedby="session-composer-help"
-          ref={inputRef}
-          rows={2}
-          value={text}
-          role="combobox"
-          aria-expanded={commandMatches.length > 0}
-          aria-controls={commandMatches.length > 0 ? SLASH_MENU_ID : undefined}
-          aria-activedescendant={
-            commandMatches.length > 0
-              ? slashMenuOptionId(Math.min(menuIndex, commandMatches.length - 1))
-              : undefined
-          }
-          aria-autocomplete="list"
-          onFocus={(event) => {
-            setInputFocused(true);
-            if (vimMode !== "insert") enterInsert(event.currentTarget.selectionEnd ?? text.length);
-            else captureSelection(event.currentTarget);
-          }}
-          onBlur={() => setInputFocused(false)}
-          onChange={(event) => {
-            setText(event.target.value);
-            setMenuDismissed(false);
-            setMenuIndex(0);
-            captureSelection(event.currentTarget);
-          }}
-          onClick={(event) => captureSelection(event.currentTarget)}
-          onKeyUp={(event) => captureSelection(event.currentTarget)}
-          onSelect={(event) => captureSelection(event.currentTarget)}
-          onDragOver={(event) => event.preventDefault()}
-          onDrop={(event) => {
-            if (event.dataTransfer.files.length > 0) {
-              event.preventDefault();
-              void attachFiles(event.dataTransfer.files);
-            }
-          }}
-          onPaste={(event) => {
-            const files = Array.from(event.clipboardData.items)
-              .filter((item) => item.kind === "file")
-              .map((item) => item.getAsFile())
-              .filter((file): file is File => file !== null);
-            if (files.length > 0) {
-              event.preventDefault();
-              void attachFiles(files);
-            }
-          }}
-          onKeyDown={(event) => {
-            if (vimMode === "normal") {
-              handleNormalKey(event);
-              return;
-            }
-            if (vimMode === "visual") {
-              handleVisualKey(event);
-              return;
-            }
-            if (commandMatches.length > 0) {
-              if (event.key === "ArrowDown" || (event.ctrlKey && event.key === "j")) {
-                event.preventDefault();
-                setMenuIndex((i) => (i + 1) % commandMatches.length);
-                return;
-              }
-              if (
-                event.key === "ArrowUp" ||
-                (event.ctrlKey && event.key === "k") ||
-                (event.key === "Tab" && event.shiftKey)
-              ) {
-                event.preventDefault();
-                setMenuIndex((i) => (i - 1 + commandMatches.length) % commandMatches.length);
-                return;
-              }
-              if (event.key === "Enter" || (event.key === "Tab" && !event.shiftKey)) {
-                event.preventDefault();
-                const chosen = commandMatches[Math.min(menuIndex, commandMatches.length - 1)];
-                acceptCommand(chosen);
-                return;
-              }
-              if (event.key === "Escape") {
-                event.preventDefault();
-                setMenuDismissed(true);
-                return;
-              }
-            }
-            if (menuItems.length > 0) {
-              if (event.key === "ArrowDown" || (event.ctrlKey && event.key === "j")) {
-                event.preventDefault();
-                setMenuIndex((i) => (i + 1) % menuItems.length);
-                return;
-              }
-              if (
-                event.key === "ArrowUp" ||
-                (event.ctrlKey && event.key === "k") ||
-                (event.key === "Tab" && event.shiftKey)
-              ) {
-                event.preventDefault();
-                setMenuIndex((i) => (i - 1 + menuItems.length) % menuItems.length);
-                return;
-              }
-              if (event.key === "Enter" || (event.key === "Tab" && !event.shiftKey)) {
-                event.preventDefault();
-                acceptSkill(menuItems[Math.min(menuIndex, menuItems.length - 1)].name);
-                return;
-              }
-              if (event.key === "Escape") {
-                event.preventDefault();
-                setMenuDismissed(true);
-                return;
-              }
-            }
-            if (event.key === "Escape") {
-              event.preventDefault();
-              setVimMode("normal");
-              setBlock(caret() - 1);
-              return;
-            }
-            if (event.key === "j" && event.ctrlKey) {
-              event.preventDefault();
-              insertNewline();
-              return;
-            }
-            if (event.key !== "Enter") return;
-            if (event.shiftKey && !thinking) {
-              // agent idle — queueing is pointless, give a newline instead
-              event.preventDefault();
-              insertNewline();
-              return;
-            }
-            event.preventDefault();
-            void send(event.shiftKey ? "on-idle" : "now");
-          }}
-        />
-        </div>
-        <button
-          className="session-send"
-          disabled={busy || !text.trim()}
-          title="Send now"
-          type="button"
-          onClick={() => void send("now")}
-        >
-          <SendHorizontal size={14} />
-        </button>
-      </div>
+        <>
+          <label className="session-composer-target" htmlFor={composerInputId}>
+            <span>ask or steer</span>
+            <strong>{ticket}</strong>
+          </label>
+          <div className="session-composer-row">
+            <div className="session-input-wrap">
+              {overlayPos ? (
+                <span
+                  className="session-empty-block-cursor"
+                  style={{ top: overlayPos.top, left: overlayPos.left }}
+                />
+              ) : null}
+              <textarea
+                id={composerInputId}
+                autoCapitalize="off"
+                autoCorrect="off"
+                className={vimMode === "normal" || vimMode === "visual" ? "is-vim-normal" : undefined}
+                spellCheck={false}
+                placeholder={
+                  vimMode === "insert"
+                    ? `Ask a question or give ${ticket} a new direction…`
+                    : undefined
+                }
+                aria-describedby={composerHelpId}
+                ref={inputRef}
+                rows={2}
+                value={text}
+                role="combobox"
+                aria-expanded={commandMatches.length > 0}
+                aria-controls={commandMatches.length > 0 ? SLASH_MENU_ID : undefined}
+                aria-activedescendant={
+                  commandMatches.length > 0
+                    ? slashMenuOptionId(Math.min(menuIndex, commandMatches.length - 1))
+                    : undefined
+                }
+                aria-autocomplete="list"
+                onFocus={(event) => {
+                  if (vimMode !== "insert") enterInsert(event.currentTarget.selectionEnd ?? text.length);
+                  else captureSelection(event.currentTarget);
+                }}
+                onChange={(event) => {
+                  setText(event.target.value);
+                  setMenuDismissed(false);
+                  setMenuIndex(0);
+                  captureSelection(event.currentTarget);
+                }}
+                onClick={(event) => captureSelection(event.currentTarget)}
+                onKeyUp={(event) => captureSelection(event.currentTarget)}
+                onSelect={(event) => captureSelection(event.currentTarget)}
+                onDragOver={(event) => event.preventDefault()}
+                onDrop={(event) => {
+                  if (event.dataTransfer.files.length > 0) {
+                    event.preventDefault();
+                    void attachFiles(event.dataTransfer.files);
+                  }
+                }}
+                onPaste={(event) => {
+                  const files = Array.from(event.clipboardData.items)
+                    .filter((item) => item.kind === "file")
+                    .map((item) => item.getAsFile())
+                    .filter((file): file is File => file !== null);
+                  if (files.length > 0) {
+                    event.preventDefault();
+                    void attachFiles(files);
+                  }
+                }}
+                onKeyDown={(event) => {
+                  if (vimMode === "normal") {
+                    handleNormalKey(event);
+                    return;
+                  }
+                  if (vimMode === "visual") {
+                    handleVisualKey(event);
+                    return;
+                  }
+                  if (commandMatches.length > 0) {
+                    if (event.key === "ArrowDown" || (event.ctrlKey && event.key === "j")) {
+                      event.preventDefault();
+                      setMenuIndex((i) => (i + 1) % commandMatches.length);
+                      return;
+                    }
+                    if (
+                      event.key === "ArrowUp" ||
+                      (event.ctrlKey && event.key === "k") ||
+                      (event.key === "Tab" && event.shiftKey)
+                    ) {
+                      event.preventDefault();
+                      setMenuIndex((i) => (i - 1 + commandMatches.length) % commandMatches.length);
+                      return;
+                    }
+                    if (event.key === "Enter" || (event.key === "Tab" && !event.shiftKey)) {
+                      event.preventDefault();
+                      const chosen = commandMatches[Math.min(menuIndex, commandMatches.length - 1)];
+                      acceptCommand(chosen);
+                      return;
+                    }
+                    if (event.key === "Escape") {
+                      event.preventDefault();
+                      setMenuDismissed(true);
+                      return;
+                    }
+                  }
+                  if (menuItems.length > 0) {
+                    if (event.key === "ArrowDown" || (event.ctrlKey && event.key === "j")) {
+                      event.preventDefault();
+                      setMenuIndex((i) => (i + 1) % menuItems.length);
+                      return;
+                    }
+                    if (
+                      event.key === "ArrowUp" ||
+                      (event.ctrlKey && event.key === "k") ||
+                      (event.key === "Tab" && event.shiftKey)
+                    ) {
+                      event.preventDefault();
+                      setMenuIndex((i) => (i - 1 + menuItems.length) % menuItems.length);
+                      return;
+                    }
+                    if (event.key === "Enter" || (event.key === "Tab" && !event.shiftKey)) {
+                      event.preventDefault();
+                      acceptSkill(menuItems[Math.min(menuIndex, menuItems.length - 1)].name);
+                      return;
+                    }
+                    if (event.key === "Escape") {
+                      event.preventDefault();
+                      setMenuDismissed(true);
+                      return;
+                    }
+                  }
+                  if (event.key === "Escape") {
+                    event.preventDefault();
+                    setVimMode("normal");
+                    setBlock(caret() - 1);
+                    return;
+                  }
+                  if (event.key === "j" && event.ctrlKey) {
+                    event.preventDefault();
+                    insertNewline();
+                    return;
+                  }
+                  if (event.key !== "Enter") return;
+                  if (event.shiftKey && !thinking) {
+                    // agent idle — queueing is pointless, give a newline instead
+                    event.preventDefault();
+                    insertNewline();
+                    return;
+                  }
+                  event.preventDefault();
+                  void send(event.shiftKey ? "on-idle" : "now");
+                }}
+              />
+            </div>
+            <button
+              className="session-send"
+              disabled={busy || !text.trim()}
+              aria-label={guidance.sendAction}
+              title={guidance.sendAction}
+              type="button"
+              onClick={() => void send("now")}
+            >
+              <span className="session-send-label">send</span>
+              <SendHorizontal aria-hidden="true" size={14} />
+            </button>
+          </div>
+        </>
       )}
-      {/* R2-03: focus-revealed keyboard help. Always in the DOM (so
-          aria-describedby resolves for screen readers) but only visually
-          shown while the composer is focused, so the ambient chrome
-          stays quiet. */}
-      <div
-        id="session-composer-help"
-        className={`session-composer-help${inputFocused ? " is-visible" : ""}`}
-        aria-hidden={!inputFocused}
-      >
-        Enter sends now · Shift+Enter queues until idle · Esc = vim normal
+      <div id={composerHelpId} className="session-composer-help">
+        {guidance.accessibleText}
       </div>
       <div className="session-composer-status">
         {thinking ? <span className="session-thinking-indicator">thinking</span> : null}
