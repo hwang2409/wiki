@@ -392,8 +392,18 @@ class Supervisor:
         self.queue_locks: dict[str, asyncio.Lock] = {}
         self._queued_delivery_attempts: set[tuple[str, str]] = set()
         self._deferred_provider_events: dict[
-            str, list[tuple[ProviderAdapter, ProviderEvent]]
+            str,
+            list[
+                tuple[
+                    ProviderAdapter,
+                    ProviderEvent,
+                    dict[str, Any],
+                    NormalizedProviderEvent,
+                    LifecycleState,
+                ]
+            ],
         ] = {}
+        self._deferred_provider_event_barriers: dict[str, asyncio.Future[None]] = {}
         self.agent_locks: dict[str, asyncio.Lock] = {}
         self.handover_condition = asyncio.Condition()
         self.active_run_mutations = 0
@@ -853,6 +863,9 @@ Preserve the same identity, role, worktree, orchestrator grouping, PR gates, and
         async with self._event_mutation_admission(run_id, adapter, event) as admitted:
             if not admitted:
                 return
+            barrier = self._deferred_provider_event_barriers.get(run_id)
+            if barrier is not None and not barrier.done():
+                await asyncio.shield(barrier)
             await self._handle_provider_event_without_admission(
                 run_id,
                 adapter,
@@ -867,28 +880,34 @@ Preserve the same identity, role, worktree, orchestrator grouping, PR gates, and
         *,
         update_adapter_snapshot: bool = True,
         schedule_monitor_actions: bool = True,
+        raw: dict[str, Any] | None = None,
+        normalized: NormalizedProviderEvent | None = None,
+        prior_state: LifecycleState | None = None,
     ) -> None:
-        prior = self.store.get(run_id)
-        raw = self.store.append_raw(
-            run_id,
-            provider=event.provider.value,
-            direction=event.direction,
-            payload=event.payload,
-            generation=event.generation,
-            received_at=event.received_at,
-        )
-        try:
-            normalized = normalize_provider_event(
-                event.provider,
-                event.payload,
+        if prior_state is None:
+            prior_state = self.store.get(run_id).state
+        if raw is None:
+            raw = self.store.append_raw(
+                run_id,
+                provider=event.provider.value,
                 direction=event.direction,
+                payload=event.payload,
+                generation=event.generation,
+                received_at=event.received_at,
             )
-        except Exception as exc:
-            normalized = NormalizedProviderEvent(
-                EventDisposition.UNKNOWN,
-                "normalization_error",
-                {"error": str(exc), "raw_payload": event.payload},
-            )
+        if normalized is None:
+            try:
+                normalized = normalize_provider_event(
+                    event.provider,
+                    event.payload,
+                    direction=event.direction,
+                )
+            except Exception as exc:
+                normalized = NormalizedProviderEvent(
+                    EventDisposition.UNKNOWN,
+                    "normalization_error",
+                    {"error": str(exc), "raw_payload": event.payload},
+                )
         pending_message = None
         echoed_text = _provider_user_text(
             event.provider,
@@ -904,8 +923,18 @@ Preserve the same identity, role, worktree, orchestrator grouping, PR gates, and
             if pending_message is not None:
                 attempt_key = (run_id, pending_message["pending_id"])
                 if attempt_key in self._queued_delivery_attempts:
+                    barrier = self._deferred_provider_event_barriers.get(run_id)
+                    if barrier is None or barrier.done():
+                        barrier = asyncio.get_running_loop().create_future()
+                        self._deferred_provider_event_barriers[run_id] = barrier
                     self._deferred_provider_events.setdefault(run_id, []).append(
-                        (adapter, event)
+                        (
+                            adapter,
+                            event,
+                            raw,
+                            normalized,
+                            prior_state,
+                        )
                     )
                     return
                 self.store.command_log.acknowledge_steer_for_pending(
@@ -1002,7 +1031,7 @@ Preserve the same identity, role, worktree, orchestrator grouping, PR gates, and
                 run_id,
                 adapter,
                 event,
-                prior_state=prior.state,
+                prior_state=prior_state,
                 record=record,
             )
         if claude_turn_succeeded:
@@ -1033,12 +1062,24 @@ Preserve the same identity, role, worktree, orchestrator grouping, PR gates, and
 
     async def _flush_deferred_provider_events(self, run_id: str) -> None:
         events = self._deferred_provider_events.pop(run_id, [])
-        for adapter, event in events:
-            await self._handle_provider_event_without_admission(
-                run_id,
-                adapter,
-                event,
-            )
+        barrier = self._deferred_provider_event_barriers.pop(run_id, None)
+        try:
+            for adapter, event, raw, normalized, prior_state in events:
+                await self._handle_provider_event_without_admission(
+                    run_id,
+                    adapter,
+                    event,
+                    raw=raw,
+                    normalized=normalized,
+                    prior_state=prior_state,
+                )
+        except BaseException as exc:
+            if barrier is not None and not barrier.done():
+                barrier.set_exception(exc)
+            raise
+        else:
+            if barrier is not None and not barrier.done():
+                barrier.set_result(None)
 
     async def _flush_handover_events(
         self, run_id: str, *, schedule_monitor_actions: bool = False

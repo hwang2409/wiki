@@ -2151,6 +2151,9 @@ class SupervisorTests(unittest.IsolatedAsyncioTestCase):
 
         original_send = adapter.send_on_idle
         provider_calls: list[str] = []
+        later_event_tasks: list[asyncio.Task[None]] = []
+        before_raw = self.store.get(record.run_id).raw_event_count
+        before_normalized = self.store.get(record.run_id).normalized_event_count
 
         async def busy_after_snapshot(msg: str) -> AdapterStatus:
             provider_calls.append(msg)
@@ -2179,6 +2182,19 @@ class SupervisorTests(unittest.IsolatedAsyncioTestCase):
                     },
                 ),
             )
+            later_event_tasks.append(
+                asyncio.create_task(
+                    self.supervisor._handle_provider_event(  # noqa: SLF001
+                        record.run_id,
+                        adapter,
+                        ProviderEvent(
+                            ProviderKind.CODEX,
+                            {"method": "fixture/later-event"},
+                        ),
+                    )
+                )
+            )
+            await asyncio.sleep(0)
             raise ProviderBusy("provider raced to WORKING after IDLE snapshot")
 
         adapter.send_on_idle = busy_after_snapshot  # type: ignore[method-assign]
@@ -2188,6 +2204,45 @@ class SupervisorTests(unittest.IsolatedAsyncioTestCase):
             )
         finally:
             adapter.send_on_idle = original_send  # type: ignore[method-assign]
+        await asyncio.gather(*later_event_tasks)
+
+        def is_review7_event(event: dict[str, Any]) -> bool:
+            payload = event["payload"]
+            if payload.get("method") == "fixture/later-event":
+                return True
+            if payload.get("method") != "item/completed":
+                return False
+            params = payload.get("params")
+            item = params.get("item") if isinstance(params, dict) else None
+            content = item.get("content") if isinstance(item, dict) else None
+            return bool(
+                isinstance(content, list)
+                and content
+                and isinstance(content[0], dict)
+                and content[0].get("text") == "busy-race"
+            )
+
+        raw_events = [
+            event
+            for event in self.store.read_raw_events(record.run_id)
+            if event["seq"] > before_raw and is_review7_event(event)
+        ]
+        raw_seqs = {event["seq"] for event in raw_events}
+        normalized_events = [
+            event
+            for event in self.store.read_normalized_events(record.run_id)
+            if event["seq"] > before_normalized and event["raw_seq"] in raw_seqs
+        ]
+        self.assertEqual(len(raw_events), 2)
+        self.assertEqual(len(normalized_events), 2)
+        self.assertEqual(
+            [event["payload"].get("method") for event in raw_events],
+            ["item/completed", "fixture/later-event"],
+        )
+        self.assertEqual(
+            [event["raw_seq"] for event in normalized_events],
+            [event["seq"] for event in raw_events],
+        )
 
         # ProviderBusy was raised once — the fix must NOT retry inside the
         # same drain call.

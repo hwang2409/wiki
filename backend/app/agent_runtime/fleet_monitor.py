@@ -198,6 +198,7 @@ class FleetMonitor:
         )
         self._graph_health_snapshots = self._graph_health.snapshots
         self._sent_dedupe_keys: set[tuple[str, str, str]] = set()
+        self._pending_messages: dict[tuple[str, str, str], str] = {}
         self._send_semaphores: dict[str, asyncio.Semaphore] = {}
 
     async def run(self, stop: asyncio.Event) -> None:
@@ -264,12 +265,22 @@ class FleetMonitor:
             for identity in self._sent_dedupe_keys
             if current_run_ids.get(identity[0]) == identity[1]
         }
+        self._pending_messages = {
+            identity: message
+            for identity, message in self._pending_messages.items()
+            if current_run_ids.get(identity[0]) == identity[1]
+        }
 
     def _reset_agent_state(self, agent_id: str) -> None:
         self._snapshots.pop(agent_id, None)
         self._sent_dedupe_keys = {
             identity
             for identity in self._sent_dedupe_keys
+            if identity[0] != agent_id
+        }
+        self._pending_messages = {
+            identity: message
+            for identity, message in self._pending_messages.items()
             if identity[0] != agent_id
         }
 
@@ -605,12 +616,16 @@ class FleetMonitor:
             dedupe_identity = self._dedupe_identity(view, dedupe_key)
             if dedupe_identity in self._sent_dedupe_keys:
                 return None
+            stable_message = self._pending_messages.setdefault(
+                dedupe_identity,
+                message,
+            )
             try:
                 async with self._send_semaphore(orch_agent_id):
                     await asyncio.wait_for(
                         self.send_now(
                             orch_run_id,
-                            message,
+                            stable_message,
                             dedupe_key,
                             FLEET_MONITOR_SOURCE,
                         ),
@@ -626,12 +641,13 @@ class FleetMonitor:
                 )
                 return None
             self._sent_dedupe_keys.add(dedupe_identity)
+            self._pending_messages.pop(dedupe_identity, None)
             return Notification(
                 ticket=view.record.agent_id,
                 orch_agent_id=orch_agent_id,
                 orch_run_id=orch_run_id,
                 event_type=event_type,
-                message=message,
+                message=stable_message,
                 dedupe_key=dedupe_key,
             )
 

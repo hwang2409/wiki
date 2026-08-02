@@ -2658,6 +2658,76 @@ class FleetMonitorTests(unittest.IsolatedAsyncioTestCase):
         second = await self.monitor.tick()
         self.assertEqual([n for n in second if n.event_type == "staleness"], [])
 
+    async def test_staleness_lost_ack_replays_immutable_message(self) -> None:
+        """WIKI-232 REVIEW7 H2: a retry must reuse the first rendered
+        message when the staleness clock changes before receipt replay."""
+
+        orch = await self._spawn("WIKI-ORCH", role="orchestrator", orch=None)
+        worker = await self._spawn("WIKI-801", role="implement", orch="WIKI-ORCH")
+        stale_mtime = self.clock.now - 2100
+        _set_created_at(self.store, worker, stale_mtime - 1)
+        _write_status(
+            self.store,
+            worker.agent_id,
+            {"state": "working", "pr": None, "step": "coding", "blocker": None},
+            mtime=stale_mtime,
+        )
+
+        calls: list[str] = []
+        receipts: dict[str, dict[str, str]] = {}
+        first_attempt = True
+
+        async def dispatch_send(
+            run_id: str,
+            message: str,
+            dedupe_key: str | None,
+            source: str | None = None,
+        ):
+            nonlocal first_attempt
+            calls.append(message)
+            request_id = fleet_monitor_request_id(run_id, dedupe_key)
+            existing = receipts.get(request_id)
+            if existing is not None:
+                if message != existing["message"]:
+                    raise AssertionError("retry changed the durable command payload")
+                return {"status": existing["status"]}
+            receipts[request_id] = {"message": message, "status": "sent"}
+            if first_attempt:
+                first_attempt = False
+                raise TimeoutError("lost acknowledgement after durable dispatch")
+            return {"status": "sent"}
+
+        monitor = FleetMonitor(
+            self.store,
+            dispatch_send,
+            clock=self.clock,
+            interval=0.01,
+            staleness_threshold=1800.0,
+            ownership_lock=self.supervisor._agent_lock,  # noqa: SLF001
+        )
+        first = await monitor.tick()
+        self.assertEqual([note for note in first if note.event_type == "staleness"], [])
+        self.clock.advance(60)
+        second = await monitor.tick()
+        stale = [note for note in second if note.event_type == "staleness"]
+        self.assertEqual(
+            len(stale),
+            1,
+            f"first={first!r}, second={second!r}, calls={calls!r}",
+        )
+        stale_calls = [message for message in calls if "status file silent" in message]
+        self.assertEqual(len(stale_calls), 2)
+        self.assertEqual(stale_calls[0], stale_calls[1])
+
+        request_id = fleet_monitor_request_id(
+            orch.run_id,
+            stale[0].dedupe_key,
+        )
+        receipt = receipts.get(request_id)
+        self.assertIsNotNone(receipt)
+        assert receipt is not None
+        self.assertEqual(receipt["status"], "sent")
+
     async def test_send_failure_does_not_break_loop(self) -> None:
         await self._spawn("WIKI-ORCH", role="orchestrator", orch=None)
         await self._spawn("WIKI-900", role="implement", orch="WIKI-ORCH")
