@@ -275,8 +275,7 @@ try {
 
   // WIKI-235: orchestrator children start collapsed. Expand the wiki group
   // before checking WIKI-151 row anatomy and attention ordering.
-  const wikiOrchestrator = page.locator('.nav-agent.is-orch', { hasText: "wiki" });
-  await wikiOrchestrator.click();
+  await page.getByRole("button", { name: "Expand wiki workers" }).click();
   await page.waitForSelector('[data-testid="nav-orch-workers-wiki"]');
 
   const rowOrder = await page.evaluate(() =>

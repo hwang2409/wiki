@@ -2464,11 +2464,10 @@ export function AgentsSidebar({
   // viewed at — comparing seqs (monotonic int) sidesteps timestamp-format
   // and wall-clock issues from the round 1 implementation.
   const [viewedOverrides, setViewedOverrides] = useState<Record<string, number>>({});
-  // Runs whose mark-viewed request permanently failed (all retries exhausted).
-  // Bounded to prevent the round 2 H1 request loop: on failure we keep the
-  // optimistic override intact AND set this flag so the effect stops firing;
-  // the row renders a distinct failed indicator so the user can see why.
-  const [viewedFailed, setViewedFailed] = useState<Record<string, boolean>>({});
+  // Last event seq whose mark-viewed request exhausted all retries. This
+  // blocks loops for that seq while allowing a later event to retry and clear
+  // the failure after persistence recovers.
+  const [viewedFailed, setViewedFailed] = useState<Record<string, number>>({});
   // One controller per run kept alive across backoff. `targetSeq` coalesces
   // the HIGHEST seq observed while inflight (bursts collapse to a single
   // additional post); `attempts` counts total requests within this chain and
@@ -2509,16 +2508,26 @@ export function AgentsSidebar({
 
   useEffect(() => {
     if (!activeTicket || workers === null) return;
+    const owner = workers.find((worker) => worker.ticket === activeTicket)?.orch;
+    if (!owner || !orchestrators.some((orch) => orch.id === owner)) return;
+    setExpandedOrchs((current) => {
+      if (current[owner]) return current;
+      const next = { ...current, [owner]: true };
+      writeExpandedOrchs(next);
+      return next;
+    });
+  }, [activeTicket, orchestrators, workers]);
+
+  useEffect(() => {
+    if (!activeTicket || workers === null) return;
     const worker = workers.find((row) => row.ticket === activeTicket);
     const runId = worker?.run_id ?? null;
     const observedSeq = worker?.latest_event_seq ?? null;
     if (!runId || observedSeq === null) return;
 
-    // Round 2 H1: once a run's mark-viewed has permanently failed, do not
-    // keep firing new requests each render. The optimistic override remains
-    // (so the row still visually reflects the user's action) and the failed
-    // badge tells them the server didn't persist the state.
-    if (viewedFailed[runId]) return;
+    // Do not retry a failed seq on every render. A later observed seq starts
+    // one new bounded chain, which can clear the failure after recovery.
+    if ((viewedFailed[runId] ?? -1) >= observedSeq) return;
 
     // Skip if we (or the server) have already recorded a viewed seq that
     // covers everything visible in this refresh. Prevents the effect from
@@ -2565,10 +2574,11 @@ export function AgentsSidebar({
     viewedInflight.current.set(runId, controller);
 
     const markFailed = () => {
+      const failedSeq = viewedInflight.current.get(runId)?.targetSeq ?? observedSeq;
       viewedInflight.current.delete(runId);
       setViewedFailed((current) => {
-        if (current[runId]) return current;
-        return { ...current, [runId]: true };
+        if ((current[runId] ?? -1) >= failedSeq) return current;
+        return { ...current, [runId]: failedSeq };
       });
     };
 
@@ -2579,6 +2589,12 @@ export function AgentsSidebar({
       const seq = state.targetSeq;
       markRunViewed(runId, seq)
         .then((result) => {
+          setViewedFailed((current) => {
+            if (current[runId] === undefined) return current;
+            const next = { ...current };
+            delete next[runId];
+            return next;
+          });
           setViewedOverrides((current) => {
             const prior = current[runId] ?? -1;
             const next = Math.max(prior, result.last_viewed_seq, seq);
@@ -2683,7 +2699,7 @@ export function AgentsSidebar({
   };
 
   const hasViewedFailure = (worker: AgentWorker): boolean =>
-    worker.run_id ? viewedFailed[worker.run_id] === true : false;
+    worker.run_id ? viewedFailed[worker.run_id] !== undefined : false;
 
   const workerRow = (worker: AgentWorker, owned: boolean) => {
     const unread = hasUnread(worker);
@@ -2739,41 +2755,70 @@ export function AgentsSidebar({
     const expanded = expandedOrchs[orch.id] === true;
     const workerCount = ownedWorkers.length;
     const unread = ownedWorkers.some(hasUnread);
-    const failed = !unread && ownedWorkers.some(hasViewedFailure);
-    return (
-      <button
-        aria-controls={workerCount > 0 ? `nav-orch-workers-${orch.id}` : undefined}
-        aria-expanded={workerCount > 0 ? expanded : undefined}
-        className={`nav-agent is-orch${workerCount === 0 ? " is-empty" : ""}${expanded ? " is-expanded" : ""}${activeTicket === orch.id ? " is-active" : ""}${unread ? " has-unread" : ""}${failed ? " has-viewed-failure" : ""}`}
-        data-state="orchestrator"
-        key={orch.id}
-        type="button"
-        onClick={() => {
-          if (workerCount > 0) toggleOrch(orch.id);
-          else onOpen(orch.id);
-        }}
-        title={workerCount > 0 ? `${expanded ? "Collapse" : "Expand"} ${orch.id} workers` : `${orch.id} has no active workers`}
-        {...dragProps(orch.id)}
-      >
-        {unread ? (
-          <>
-            <span aria-hidden="true" className="nav-orch-attention" data-testid="nav-orch-unread" />
-            <span className="sr-only">workers have unread updates</span>
-          </>
-        ) : failed ? (
-          <>
-            <span
-              aria-hidden="true"
-              className="nav-orch-attention is-failed"
-              data-testid="nav-orch-viewed-failed"
-            />
-            <span className="sr-only">worker read state failed to save</span>
-          </>
+    const failed = ownedWorkers.some(hasViewedFailure);
+    const attentionContent = (
+      <>
+        {unread || failed ? (
+          <span
+            aria-hidden="true"
+            className={`nav-orch-attention${failed ? " is-failed" : ""}`}
+          />
         ) : null}
-        <ChevronRight aria-hidden="true" className="nav-orch-chevron" size={12} />
-        <span className="nav-agent-ticket">{orch.id}</span>
-        <span className="nav-agent-meta" data-state="orchestrator">{meta}</span>
-      </button>
+        {unread ? (
+          <span className="sr-only" data-testid="nav-orch-unread">
+            workers have unread updates
+          </span>
+        ) : null}
+        {failed ? (
+          <span className="sr-only" data-testid="nav-orch-viewed-failed">
+            worker read state failed to save
+          </span>
+        ) : null}
+      </>
+    );
+    if (workerCount === 0) {
+      return (
+        <button
+          className={`nav-agent is-orch is-empty${activeTicket === orch.id ? " is-active" : ""}`}
+          data-state="orchestrator"
+          key={orch.id}
+          type="button"
+          onClick={() => onOpen(orch.id)}
+          title={`${orch.id} has no active workers`}
+          {...dragProps(orch.id)}
+        >
+          <ChevronRight aria-hidden="true" className="nav-orch-chevron" size={12} />
+          <span className="nav-agent-ticket">{orch.id}</span>
+          <span className="nav-agent-meta" data-state="orchestrator">{meta}</span>
+        </button>
+      );
+    }
+    return (
+      <div className="nav-orch-row" key={orch.id}>
+        <button
+          aria-controls={`nav-orch-workers-${orch.id}`}
+          aria-expanded={expanded}
+          aria-label={`${expanded ? "Collapse" : "Expand"} ${orch.id} workers`}
+          className="nav-orch-toggle"
+          type="button"
+          onClick={() => toggleOrch(orch.id)}
+          title={`${expanded ? "Collapse" : "Expand"} ${orch.id} workers`}
+        >
+          <ChevronRight aria-hidden="true" className="nav-orch-chevron" size={12} />
+        </button>
+        <button
+          className={`nav-agent is-orch${expanded ? " is-expanded" : ""}${activeTicket === orch.id ? " is-active" : ""}${unread ? " has-unread" : ""}${failed ? " has-viewed-failure" : ""}`}
+          data-state="orchestrator"
+          type="button"
+          onClick={() => onOpen(orch.id)}
+          title={`Open ${orch.id} session`}
+          {...dragProps(orch.id)}
+        >
+          {attentionContent}
+          <span className="nav-agent-ticket">{orch.id}</span>
+          <span className="nav-agent-meta" data-state="orchestrator">{meta}</span>
+        </button>
+      </div>
     );
   };
 

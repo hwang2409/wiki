@@ -7930,13 +7930,36 @@ body.is-resizing-panes .pane-cell {
   color: var(--text-muted);
 }
 
-.nav-agent.is-orch .nav-orch-chevron {
+.nav-orch-row {
+  display: grid;
+  grid-template-columns: 40px minmax(0, 1fr);
+  min-width: 0;
+}
+
+.nav-orch-toggle {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 40px;
+  min-width: 40px;
+  min-height: 40px;
+  border-radius: var(--radius-s);
+  color: var(--text-muted);
+}
+
+.nav-orch-toggle:hover,
+.nav-orch-toggle:focus-visible {
+  background-color: var(--background-modifier-hover);
+  color: var(--text-normal);
+}
+
+.nav-orch-toggle .nav-orch-chevron {
   transition-property: transform;
   transition-duration: 140ms;
   transition-timing-function: ease-out;
 }
 
-.nav-agent.is-orch.is-expanded .nav-orch-chevron {
+.nav-orch-toggle[aria-expanded="true"] .nav-orch-chevron {
   transform: rotate(90deg);
 }
 

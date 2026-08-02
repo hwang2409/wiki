@@ -180,7 +180,8 @@ try {
   assert(emptyChevronVisibility === "hidden", `empty orchestrator chevron must be hidden, got ${emptyChevronVisibility}`);
 
   const wikiRow = page.locator('.nav-agent.is-orch', { hasText: "wiki" });
-  assert((await wikiRow.getAttribute("aria-expanded")) === "false", "wiki workers must start collapsed");
+  const wikiDisclosure = page.locator('.nav-orch-toggle[aria-controls="nav-orch-workers-wiki"]');
+  assert((await wikiDisclosure.getAttribute("aria-expanded")) === "false", "wiki workers must start collapsed");
   const unreadWorkerPayload = await page.evaluate(async () => {
     const response = await fetch("/api/agents", { cache: "no-store" });
     const payload = await response.json();
@@ -192,6 +193,11 @@ try {
     "collapsed wiki row must name unread worker attention for assistive technology");
   await page.screenshot({ path: path.join(OUT_DIR, "00-sidebar-collapsed-unread.png") });
   await wikiRow.click();
+  await page.waitForURL(/#\/agent\/wiki$/);
+  assert((await page.locator('[data-testid="nav-orch-workers-wiki"]').count()) === 0,
+    "opening the orchestrator session must not expand workers");
+  await page.screenshot({ path: path.join(OUT_DIR, "05-orchestrator-navigation.png") });
+  await wikiDisclosure.click();
   const wikiWorkers = page.locator('[data-testid="nav-orch-workers-wiki"]');
   await wikiWorkers.waitFor();
   const expandedTickets = await wikiWorkers.locator(".nav-agent-ticket").allInnerTexts();
@@ -204,7 +210,7 @@ try {
     "expanded unread worker must keep its child marker");
   assert((await wikiRow.locator('[data-testid="nav-orch-unread"]').count()) === 1,
     "expanded orchestrator must retain its aggregate unread marker");
-  const disclosureStyle = await wikiRow.evaluate((el) => ({
+  const disclosureStyle = await wikiDisclosure.evaluate((el) => ({
     radius: Number.parseFloat(getComputedStyle(el).borderRadius),
     height: el.getBoundingClientRect().height,
     chevron: el.querySelector(".nav-orch-chevron") !== null,
@@ -213,6 +219,8 @@ try {
   assert(disclosureStyle.height >= 40, `orchestrator row hit area must be >=40px, got ${disclosureStyle.height}`);
   assert(disclosureStyle.chevron, "orchestrator disclosure needs a visible chevron");
 
+  await page.reload({ waitUntil: "domcontentloaded" });
+  await wikiWorkers.waitFor();
   await page.screenshot({ path: path.join(OUT_DIR, "01-sidebar-normal.png") });
   await page.setViewportSize({ width: 1000, height: 760 });
   const narrowLayout = await page.locator(".nav-agents").evaluate((el) => ({
@@ -226,9 +234,9 @@ try {
   await page.screenshot({ path: path.join(OUT_DIR, "02-sidebar-narrow.png") });
   await page.setViewportSize({ width: 1440, height: 900 });
 
-  await wikiRow.click();
+  await wikiDisclosure.click();
   assert((await page.locator('[data-testid="nav-orch-workers-wiki"]').count()) === 0, "second click must collapse workers");
-  await wikiRow.click();
+  await wikiDisclosure.click();
   await wikiWorkers.waitFor();
   await page.reload({ waitUntil: "domcontentloaded" });
   await page.waitForSelector('[data-testid="nav-orch-workers-wiki"]');

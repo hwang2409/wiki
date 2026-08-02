@@ -1,6 +1,6 @@
 // @vitest-environment jsdom
-import { cleanup, fireEvent, render, screen, within } from "@testing-library/react";
-import { afterEach, beforeEach, describe, expect, test } from "vitest";
+import { act, cleanup, fireEvent, render, screen, within } from "@testing-library/react";
+import { afterEach, beforeEach, describe, expect, test, vi } from "vitest";
 
 import { AgentsSidebar } from "../src/agents";
 import type { AgentWorker, ArchivedWorker, Orchestrator } from "../src/api";
@@ -70,7 +70,11 @@ const archivedWorker: ArchivedWorker = {
 };
 
 beforeEach(() => localStorage.clear());
-afterEach(() => cleanup());
+afterEach(() => {
+  cleanup();
+  vi.useRealTimers();
+  vi.unstubAllGlobals();
+});
 
 describe("WIKI-235 runs sidebar", () => {
   test("shows orchestrators first and keeps empty orchestrators directly openable", () => {
@@ -84,10 +88,10 @@ describe("WIKI-235 runs sidebar", () => {
       />,
     );
 
-    const rows = screen.getAllByRole("button").map((row) => row.textContent ?? "");
-    expect(rows[0]).toContain("phoebe");
-    expect(rows[1]).toContain("wiki");
-    expect(rows[2]).toContain("FREE-1");
+    const tickets = Array.from(document.querySelectorAll(".nav-agent-ticket")).map(
+      (ticket) => ticket.textContent,
+    );
+    expect(tickets).toEqual(["phoebe", "wiki", "FREE-1"]);
     expect(screen.queryByText("WIKI-BLOCK")).toBeNull();
     expect(screen.queryByTestId("nav-agents-group-history")).toBeNull();
     expect(document.querySelector(".nav-agent-num")).toBeNull();
@@ -101,7 +105,7 @@ describe("WIKI-235 runs sidebar", () => {
     expect(opened).toEqual(["phoebe"]);
   });
 
-  test("expands in attention order, opens workers, and collapses again", () => {
+  test("opens a non-empty orchestrator separately from its worker disclosure", () => {
     const opened: string[] = [];
     render(
       <AgentsSidebar
@@ -112,10 +116,17 @@ describe("WIKI-235 runs sidebar", () => {
       />,
     );
 
-    const wiki = screen.getByRole("button", { name: /wikiworking/i });
-    expect(wiki.getAttribute("aria-expanded")).toBe("false");
-    fireEvent.click(wiki);
-    expect(wiki.getAttribute("aria-expanded")).toBe("true");
+    const wiki = screen.getByText("wiki").closest("button");
+    expect(wiki).not.toBeNull();
+    const disclosure = screen.getByRole("button", { name: "Expand wiki workers" });
+    expect(disclosure.getAttribute("aria-expanded")).toBe("false");
+
+    fireEvent.click(wiki!);
+    expect(opened).toEqual(["wiki"]);
+    expect(screen.queryByTestId("nav-orch-workers-wiki")).toBeNull();
+
+    fireEvent.click(disclosure);
+    expect(disclosure.getAttribute("aria-expanded")).toBe("true");
 
     const group = screen.getByTestId("nav-orch-workers-wiki");
     const tickets = within(group)
@@ -124,8 +135,8 @@ describe("WIKI-235 runs sidebar", () => {
     expect(tickets).toEqual(["WIKI-BLOCK", "WIKI-READY", "WIKI-WORK"]);
 
     fireEvent.click(within(group).getByText("WIKI-READY"));
-    expect(opened).toEqual(["WIKI-READY"]);
-    fireEvent.click(wiki);
+    expect(opened).toEqual(["wiki", "WIKI-READY"]);
+    fireEvent.click(disclosure);
     expect(screen.queryByTestId("nav-orch-workers-wiki")).toBeNull();
   });
 
@@ -151,11 +162,114 @@ describe("WIKI-235 runs sidebar", () => {
     expect(within(wiki!).getByText("workers have unread updates")).toBeTruthy();
     expect(screen.queryByText("WIKI-WORK")).toBeNull();
 
-    fireEvent.click(wiki!);
+    fireEvent.click(screen.getByRole("button", { name: "Expand wiki workers" }));
     const workerRow = screen.getByText("WIKI-WORK").closest("button");
     expect(workerRow).not.toBeNull();
     expect(within(workerRow!).getByTestId("nav-agent-unread")).toBeTruthy();
     expect(within(wiki!).getByTestId("nav-orch-unread")).toBeTruthy();
+  });
+
+  test("auto-expands the owner for a directly opened worker", async () => {
+    render(
+      <AgentsSidebar
+        activeTicket="WIKI-READY"
+        data={{ workers, orchestrators, error: null }}
+        refreshTick={0}
+        onOpen={() => {}}
+      />,
+    );
+
+    const group = await screen.findByTestId("nav-orch-workers-wiki");
+    const activeWorker = within(group).getByText("WIKI-READY").closest("button");
+    expect(activeWorker?.classList.contains("is-active")).toBe(true);
+    expect(screen.getByRole("button", { name: "Collapse wiki workers" })).toBeTruthy();
+  });
+
+  test("prioritizes owned-worker persistence failure and clears it after recovery", async () => {
+    vi.useFakeTimers();
+    let shouldFail = true;
+    const fetchMock = vi.fn(async () => {
+      if (shouldFail) {
+        return new Response(JSON.stringify({ detail: "failed" }), {
+          status: 500,
+          headers: { "Content-Type": "application/json" },
+        });
+      }
+      return new Response(
+        JSON.stringify({
+          run_id: "run-WIKI-WORK",
+          last_viewed_at: "2026-08-02T01:00:00Z",
+          last_viewed_seq: 3,
+          latest_event_at: "2026-08-02T01:00:00Z",
+          latest_event_seq: 3,
+        }),
+        { status: 200, headers: { "Content-Type": "application/json" } },
+      );
+    });
+    vi.stubGlobal("fetch", fetchMock);
+
+    const mixedWorkers = workers.map((item) => {
+      if (item.ticket === "WIKI-WORK") {
+        return { ...item, latest_event_seq: 2, last_viewed_seq: 1 };
+      }
+      if (item.ticket === "WIKI-READY") {
+        return { ...item, latest_event_seq: 4, last_viewed_seq: 3 };
+      }
+      return item;
+    });
+    const view = render(
+      <AgentsSidebar
+        activeTicket="WIKI-WORK"
+        data={{ workers: mixedWorkers, orchestrators, error: null }}
+        refreshTick={0}
+        onOpen={() => {}}
+      />,
+    );
+
+    await act(async () => {
+      await vi.runAllTimersAsync();
+    });
+    expect(fetchMock).toHaveBeenCalledTimes(3);
+
+    fireEvent.click(screen.getByRole("button", { name: "Collapse wiki workers" }));
+    const wiki = screen.getByText("wiki").closest("button");
+    expect(wiki).not.toBeNull();
+    expect(wiki?.classList.contains("has-unread")).toBe(true);
+    expect(wiki?.classList.contains("has-viewed-failure")).toBe(true);
+    expect(within(wiki!).getByTestId("nav-orch-unread")).toBeTruthy();
+    expect(within(wiki!).getByText("workers have unread updates")).toBeTruthy();
+    expect(within(wiki!).getByTestId("nav-orch-viewed-failed")).toBeTruthy();
+    expect(within(wiki!).getByText("worker read state failed to save")).toBeTruthy();
+    expect(wiki?.querySelector(".nav-orch-attention.is-failed")).not.toBeNull();
+
+    fireEvent.click(screen.getByRole("button", { name: "Expand wiki workers" }));
+    const failedWorker = screen.getByText("WIKI-WORK").closest("button");
+    expect(failedWorker).not.toBeNull();
+    expect(within(failedWorker!).getByTestId("nav-agent-viewed-failed")).toBeTruthy();
+
+    shouldFail = false;
+    const recoveredWorkers = mixedWorkers.map((item) => {
+      if (item.ticket === "WIKI-WORK") return { ...item, latest_event_seq: 3 };
+      if (item.ticket === "WIKI-READY") return { ...item, last_viewed_seq: 4 };
+      return item;
+    });
+    view.rerender(
+      <AgentsSidebar
+        activeTicket="WIKI-WORK"
+        data={{ workers: recoveredWorkers, orchestrators, error: null }}
+        refreshTick={1}
+        onOpen={() => {}}
+      />,
+    );
+    await act(async () => {
+      await vi.runAllTimersAsync();
+    });
+
+    expect(fetchMock).toHaveBeenCalledTimes(4);
+    expect(wiki?.classList.contains("has-unread")).toBe(false);
+    expect(wiki?.classList.contains("has-viewed-failure")).toBe(false);
+    expect(within(wiki!).queryByTestId("nav-orch-unread")).toBeNull();
+    expect(within(wiki!).queryByTestId("nav-orch-viewed-failed")).toBeNull();
   });
 
   test("persists expanded orchestrators across remounts", () => {
@@ -166,7 +280,7 @@ describe("WIKI-235 runs sidebar", () => {
       onOpen: () => {},
     };
     const first = render(<AgentsSidebar {...props} />);
-    fireEvent.click(screen.getByRole("button", { name: /wikiworking/i }));
+    fireEvent.click(screen.getByRole("button", { name: "Expand wiki workers" }));
     first.unmount();
 
     render(<AgentsSidebar {...props} />);
