@@ -8,6 +8,7 @@ import {
   codexAssistant,
   makeFixtureRoot,
   startBackend,
+  startBackendBrowserFixture,
   writeQueue,
   writeRegistry,
 } from "../scripts/wiki32-harness.mjs";
@@ -306,12 +307,13 @@ async function main() {
   let currentLoop = loopState(3);
   await writeStatus(fixtures, currentStatus);
 
-  const backend = await startBackend(fixtures);
-  let browser = null;
-  let page = null;
+  const fixture = await startBackendBrowserFixture({
+    startBackendProcess: () => startBackend(fixtures),
+    launchBrowser: () => chromium.launch({ headless: true }),
+    createPage: (browser) => browser.newPage({ viewport: { width: 1440, height: 900 } }),
+  });
+  const { backend, page } = fixture;
   try {
-    browser = await chromium.launch({ headless: true });
-    page = await browser.newPage({ viewport: { width: 1440, height: 900 } });
     let replaceRequests = 0;
     const replayRun = {
       run_id: "fixture-replay-run",
@@ -839,8 +841,19 @@ async function main() {
         await header.getByText("round 3 of 8", { exact: true }).waitFor();
 
         if (action === "Close") {
+          const liveAgentPane = page.locator(".pane-frame[data-pane-key='pane-1']");
+          await liveAgentPane.waitFor({ state: "visible" });
+          const liveSurface = liveAgentPane.locator(".agent-session-surface");
+          await liveSurface.waitFor({ state: "visible" });
+          await liveSurface.locator(".agent-session-surface-head").waitFor({ state: "visible" });
+          if ((await liveSurface.locator('[data-testid="session-run-details"]').count()) !== 0) {
+            throw new Error(`${label}: Run details must stay removed from the live agent surface`);
+          }
+          if ((await liveSurface.locator(".session-cost").count()) !== 0) {
+            throw new Error(`${label}: cost chrome must stay removed from the live agent surface`);
+          }
           await header.getByRole("button", { name: "Close pane" }).click();
-          await page.locator(".pane-frame[data-pane-key='pane-1']").waitFor({ state: "detached" });
+          await liveAgentPane.waitFor({ state: "detached" });
           const peerPane = page.locator(".pane-frame[data-pane-key='pane-2']");
           await peerPane.waitFor({ state: "visible" });
           await peerPane.getByText("This pane keeps the wide-window split open.", { exact: true }).waitFor();
@@ -940,13 +953,6 @@ async function main() {
       throw new Error(`Replace test must remain non-destructive; saw ${replaceRequests} requests`);
     }
 
-    if ((await page.locator('[data-testid="session-run-details"]').count()) !== 0) {
-      throw new Error("WIKI-240: Run details must stay removed");
-    }
-    if ((await page.locator(".session-cost").count()) !== 0) {
-      throw new Error("WIKI-240: cost chrome must stay removed");
-    }
-
     await fs.writeFile(
       path.join(OUT_DIR, "summary.json"),
       JSON.stringify({
@@ -977,26 +983,7 @@ async function main() {
     );
     console.error(`[wiki-240-playwright] evidence written to ${OUT_DIR}`);
   } finally {
-    const cleanup = await Promise.allSettled([
-      (async () => {
-        try {
-          if (page && !page.isClosed()) {
-            try {
-              await page.unrouteAll({ behavior: "ignoreErrors" });
-            } finally {
-              await page.close();
-            }
-          }
-        } finally {
-          await browser?.close();
-        }
-      })(),
-      backend.stop(),
-    ]);
-    const errors = cleanup
-      .filter((result) => result.status === "rejected")
-      .map((result) => result.reason);
-    if (errors.length > 0) throw new AggregateError(errors, "WIKI-240 fixture cleanup failed");
+    await fixture.stop();
   }
 }
 
