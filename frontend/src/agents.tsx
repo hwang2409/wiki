@@ -2497,6 +2497,14 @@ export function AgentsSidebar({
 
   const workers = data?.workers ?? fetchedWorkers;
   const orchestrators = data?.orchestrators ?? fetchedOrchestrators;
+  // Agent refreshes replace both arrays. Reduce the selected owner to a
+  // primitive so a refresh cannot undo a later manual collapse.
+  const selectedWorkerOwner = (() => {
+    if (!activeTicket || workers === null) return null;
+    const owner = workers.find((worker) => worker.ticket === activeTicket)?.orch;
+    if (!owner || !orchestrators.some((orch) => orch.id === owner)) return null;
+    return owner;
+  })();
 
   const toggleOrch = (id: string) => {
     setExpandedOrchs((current) => {
@@ -2507,16 +2515,14 @@ export function AgentsSidebar({
   };
 
   useEffect(() => {
-    if (!activeTicket || workers === null) return;
-    const owner = workers.find((worker) => worker.ticket === activeTicket)?.orch;
-    if (!owner || !orchestrators.some((orch) => orch.id === owner)) return;
+    if (!selectedWorkerOwner) return;
     setExpandedOrchs((current) => {
-      if (current[owner]) return current;
-      const next = { ...current, [owner]: true };
+      if (current[selectedWorkerOwner]) return current;
+      const next = { ...current, [selectedWorkerOwner]: true };
       writeExpandedOrchs(next);
       return next;
     });
-  }, [activeTicket, orchestrators, workers]);
+  }, [activeTicket, selectedWorkerOwner]);
 
   useEffect(() => {
     if (!activeTicket || workers === null) return;

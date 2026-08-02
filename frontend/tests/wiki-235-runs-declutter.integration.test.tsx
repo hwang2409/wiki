@@ -169,8 +169,8 @@ describe("WIKI-235 runs sidebar", () => {
     expect(within(wiki!).getByTestId("nav-orch-unread")).toBeTruthy();
   });
 
-  test("auto-expands the owner for a directly opened worker", async () => {
-    render(
+  test("auto-expands a directly opened worker once and preserves a manual collapse", async () => {
+    const view = render(
       <AgentsSidebar
         activeTicket="WIKI-READY"
         data={{ workers, orchestrators, error: null }}
@@ -182,7 +182,24 @@ describe("WIKI-235 runs sidebar", () => {
     const group = await screen.findByTestId("nav-orch-workers-wiki");
     const activeWorker = within(group).getByText("WIKI-READY").closest("button");
     expect(activeWorker?.classList.contains("is-active")).toBe(true);
-    expect(screen.getByRole("button", { name: "Collapse wiki workers" })).toBeTruthy();
+    fireEvent.click(screen.getByRole("button", { name: "Collapse wiki workers" }));
+    expect(screen.queryByTestId("nav-orch-workers-wiki")).toBeNull();
+
+    view.rerender(
+      <AgentsSidebar
+        activeTicket="WIKI-READY"
+        data={{
+          workers: workers.map((worker) => ({ ...worker })),
+          orchestrators: orchestrators.map((orchestrator) => ({ ...orchestrator })),
+          error: null,
+        }}
+        refreshTick={1}
+        onOpen={() => {}}
+      />,
+    );
+
+    expect(screen.queryByTestId("nav-orch-workers-wiki")).toBeNull();
+    expect(screen.getByRole("button", { name: "Expand wiki workers" })).toBeTruthy();
   });
 
   test("prioritizes owned-worker persistence failure and clears it after recovery", async () => {
