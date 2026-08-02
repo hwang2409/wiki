@@ -4499,6 +4499,21 @@ class Review31Mp4TimingTests(unittest.TestCase):
                     media_scrub.scrub_video(bytes(payload), "video/mp4")
 
 
+class Mp4TimingAnnotationTests(unittest.TestCase):
+    def test_module_annotations_resolve(self) -> None:
+        from typing import get_type_hints
+
+        from backend.app.media_scrub import _mp4_timing
+
+        for name in dir(_mp4_timing):
+            member = getattr(_mp4_timing, name)
+            if not callable(member) or not hasattr(member, "__annotations__"):
+                continue
+            if getattr(member, "__module__", None) != _mp4_timing.__name__:
+                continue
+            get_type_hints(member)
+
+
 class Review26Mp4StructureProbeTests(unittest.TestCase):
     def test_sbgp_one_entry_rebuild_has_one_count_word(self) -> None:
         body = (

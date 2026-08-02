@@ -219,8 +219,11 @@ async function main() {
     await previewTool.locator(".session-tool-head").click();
     await page.locator(".session-tool-collapsible.is-open").first().waitFor({ state: "visible" });
     await previewTool.locator(".gh-preview-title", { hasText: "Add GitHub URL previews" }).waitFor();
+    // WIKI-153 (#122) wrapped tool output in `.session-tool-output-text` so
+    // preview cards render inline with ANSI text; the bare fallback anchor is
+    // now a descendant of `.session-tool-output-blocks`, not a direct child.
     await previewTool
-      .locator(".session-tool-output-blocks > a.external-link", {
+      .locator(".session-tool-output-blocks a.external-link", {
         hasText: "https://github.com/hwang2409/wiki/issues/64",
       })
       .waitFor({ state: "visible" });
