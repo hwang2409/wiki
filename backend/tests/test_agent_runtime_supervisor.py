@@ -1842,6 +1842,169 @@ class SupervisorTests(unittest.IsolatedAsyncioTestCase):
             f"sweep must not duplicate the pump's normalized row: {matching}",
         )
 
+    async def test_orphan_scan_preserves_later_authoritative_state(self) -> None:
+        """WIKI-232 REVIEW10 H1: an orphaned raw row whose raw_seq sits
+        below an already-normalized lifecycle event must not regress the
+        run state. The reproduction: raw seq 1 is turn/started (WORKING)
+        with a dropped normalize; raw seq 2 is turn/completed (IDLE)
+        already normalized authoritatively. Without the guard, the
+        recovery-side ``append_normalized`` for seq 1 flips record.state
+        back to WORKING because IDLE->WORKING is a legal transition,
+        and later ``_reconcile_existing_runs`` walks the file-order
+        normalized log and re-applies the same regression."""
+
+        record = await self.supervisor.start_run(
+            agent_id="WIKI-232-R10-MIDGAP-IDLE",
+            provider=ProviderKind.CODEX,
+            role="implement",
+            model="fixture-codex",
+            effort="high",
+            worktree=str(self.worktree),
+            prompt="middle-gap idle",
+        )
+        run_id = record.run_id
+
+        # Raw seq 1: turn/started (would set lifecycle WORKING).
+        self.store.append_raw(
+            run_id,
+            provider=ProviderKind.CODEX.value,
+            direction="provider",
+            payload={
+                "method": "turn/started",
+                "params": {"turn": {"turnId": "midgap-1"}},
+            },
+            generation=1,
+        )
+        # Raw seq 2: turn/completed (sets lifecycle IDLE) — already normalized.
+        self.store.append_raw(
+            run_id,
+            provider=ProviderKind.CODEX.value,
+            direction="provider",
+            payload={
+                "method": "turn/completed",
+                "params": {"turn": {"turnId": "midgap-1", "status": "completed"}},
+            },
+            generation=1,
+        )
+        self.store.append_normalized(
+            run_id,
+            raw_seq=2,
+            disposition=EventDisposition.RENDERED,
+            kind="codex_turn_completed",
+            payload={"status": "completed"},
+            lifecycle_state=LifecycleState.IDLE,
+        )
+        # Reflect the authoritative live-path result: state has settled to IDLE.
+        idle_record = self.store.get(run_id)
+        self.assertEqual(idle_record.state, LifecycleState.IDLE)
+
+        self.supervisor._sending_effects_reconciled = False  # noqa: SLF001
+        await self.supervisor._normalize_orphan_raw_events()  # noqa: SLF001
+
+        # State stays at IDLE — the stale orphan does not flip it back.
+        post_scan = self.store.get(run_id)
+        self.assertEqual(post_scan.state, LifecycleState.IDLE)
+
+        normalized_rows = self.store.read_normalized_events(run_id)
+        by_raw_seq = {int(row.get("raw_seq", 0)): row for row in normalized_rows}
+        # Both raw seqs are now normalized (durable observability preserved).
+        self.assertIn(1, by_raw_seq)
+        self.assertIn(2, by_raw_seq)
+        # Recovered stale orphan carries no lifecycle_state so a later
+        # rebuild cannot re-apply it. Authoritative later row keeps IDLE.
+        self.assertIsNone(by_raw_seq[1].get("lifecycle_state"))
+        self.assertEqual(by_raw_seq[2].get("lifecycle_state"), "idle")
+
+        # Walking normalized events in raw_seq order gives a monotonic,
+        # regression-free lifecycle sequence: the max-raw_seq lifecycle
+        # event is authoritative.
+        ordered_lifecycles = [
+            row.get("lifecycle_state")
+            for row in sorted(
+                normalized_rows,
+                key=lambda event: int(event.get("raw_seq", 0)),
+            )
+            if isinstance(row.get("lifecycle_state"), str)
+        ]
+        self.assertEqual(ordered_lifecycles, ["idle"])
+
+        # Simulate a fresh boot: a full store rebuild must not resurrect
+        # the WORKING transition even though the recovered row is
+        # physically at the end of the JSONL file.
+        rebuilt = RunStore(self.paths)
+        rebuilt_record = rebuilt.get(run_id)
+        self.assertEqual(rebuilt_record.state, LifecycleState.IDLE)
+
+    async def test_orphan_scan_preserves_later_blocking_state(self) -> None:
+        """WIKI-232 REVIEW10 H1 variant: a blocking event (error) is more
+        dangerous than IDLE because ``recover_on_start`` uses lifecycle
+        state to decide whether to resume the provider. If the stale
+        orphan re-applies WORKING over BLOCKED, the daemon would resume
+        a run the provider already stopped."""
+
+        record = await self.supervisor.start_run(
+            agent_id="WIKI-232-R10-MIDGAP-BLOCK",
+            provider=ProviderKind.CODEX,
+            role="implement",
+            model="fixture-codex",
+            effort="high",
+            worktree=str(self.worktree),
+            prompt="middle-gap blocked",
+        )
+        run_id = record.run_id
+
+        # Raw seq 1: turn/started (would set lifecycle WORKING) — orphan.
+        self.store.append_raw(
+            run_id,
+            provider=ProviderKind.CODEX.value,
+            direction="provider",
+            payload={
+                "method": "turn/started",
+                "params": {"turn": {"turnId": "midgap-blocked"}},
+            },
+            generation=1,
+        )
+        # Raw seq 2: fatal error (sets lifecycle BLOCKED) — already normalized.
+        self.store.append_raw(
+            run_id,
+            provider=ProviderKind.CODEX.value,
+            direction="provider",
+            payload={
+                "method": "error",
+                "params": {"message": "provider crash", "willRetry": False},
+            },
+            generation=1,
+        )
+        self.store.append_normalized(
+            run_id,
+            raw_seq=2,
+            disposition=EventDisposition.RENDERED,
+            kind="codex_error",
+            payload={"message": "provider crash"},
+            lifecycle_state=LifecycleState.BLOCKED,
+        )
+        blocked_record = self.store.get(run_id)
+        self.assertEqual(blocked_record.state, LifecycleState.BLOCKED)
+
+        self.supervisor._sending_effects_reconciled = False  # noqa: SLF001
+        await self.supervisor._normalize_orphan_raw_events()  # noqa: SLF001
+
+        post_scan = self.store.get(run_id)
+        self.assertEqual(post_scan.state, LifecycleState.BLOCKED)
+
+        normalized_rows = self.store.read_normalized_events(run_id)
+        by_raw_seq = {int(row.get("raw_seq", 0)): row for row in normalized_rows}
+        self.assertIn(1, by_raw_seq)
+        self.assertIn(2, by_raw_seq)
+        self.assertIsNone(by_raw_seq[1].get("lifecycle_state"))
+        self.assertEqual(by_raw_seq[2].get("lifecycle_state"), "blocked")
+
+        # Fresh boot rebuild must not resurrect WORKING and mislead
+        # ``recover_on_start`` into resuming a stopped provider.
+        rebuilt = RunStore(self.paths)
+        rebuilt_record = rebuilt.get(run_id)
+        self.assertEqual(rebuilt_record.state, LifecycleState.BLOCKED)
+
     async def test_dedupe_owner_is_scoped_by_command_method(self) -> None:
         """WIKI-232 R2 H1: request IDs are legal once per supervisor
         method, so the dedupe owner must be method-scoped. A bare

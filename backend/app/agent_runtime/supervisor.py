@@ -2457,15 +2457,50 @@ Preserve the same identity, role, worktree, orchestrator grouping, PR gates, and
                 normalized_seqs = {
                     int(event.get("raw_seq", 0)) for event in normalized_events
                 }
+                # An orphan whose raw_seq sits below an already-normalized
+                # lifecycle event is a stale-order recovery: applying its
+                # lifecycle transition now would overwrite the later
+                # authoritative state (e.g. a raw_seq=1 turn/started
+                # recovered after raw_seq=2 turn/completed already landed
+                # would flip an idle run back to working, or worse, undo a
+                # blocked/interrupted terminal state). Track the max
+                # raw_seq of any already-normalized event that carries a
+                # lifecycle transition so the recovery path can suppress
+                # projection updates for older rows (WIKI-232 REVIEW10 H1).
+                max_lifecycle_raw_seq = max(
+                    (
+                        int(event.get("raw_seq", 0))
+                        for event in normalized_events
+                        if isinstance(event.get("lifecycle_state"), str)
+                    ),
+                    default=0,
+                )
                 for envelope in orphans:
-                    if int(envelope.get("seq", 0)) in normalized_seqs:
+                    orphan_seq = int(envelope.get("seq", 0))
+                    if orphan_seq in normalized_seqs:
                         continue
-                    await self._recover_orphan_raw_event(run_id, envelope)
+                    stale_order = orphan_seq < max_lifecycle_raw_seq
+                    await self._recover_orphan_raw_event(
+                        run_id, envelope, stale_order=stale_order
+                    )
 
     async def _recover_orphan_raw_event(
-        self, run_id: str, envelope: dict[str, Any]
+        self,
+        run_id: str,
+        envelope: dict[str, Any],
+        *,
+        stale_order: bool = False,
     ) -> None:
-        """Replay one orphan raw event through the normalize + match path."""
+        """Replay one orphan raw event through the normalize + match path.
+
+        ``stale_order`` marks recoveries whose raw_seq sits below an
+        already-normalized authoritative lifecycle event. The normalized
+        row is still appended for durable observability, but its
+        derived lifecycle_state is dropped so neither this write nor a
+        later ``_reconcile_existing_runs`` rebuild can regress the
+        run's state past the newer authoritative event
+        (WIKI-232 REVIEW10 H1).
+        """
 
         try:
             provider = ProviderKind(str(envelope.get("provider")))
@@ -2512,13 +2547,16 @@ Preserve the same identity, role, worktree, orchestrator grouping, PR gates, and
                 pending_source = pending_message.get("source")
                 if isinstance(pending_source, str) and pending_source:
                     normalized_payload["source"] = pending_source
+        effective_lifecycle_state = (
+            None if stale_order else normalized.lifecycle_state
+        )
         self.store.append_normalized(
             run_id,
             raw_seq=raw_seq,
             disposition=normalized.disposition,
             kind=normalized.kind,
             payload=normalized_payload,
-            lifecycle_state=normalized.lifecycle_state,
+            lifecycle_state=effective_lifecycle_state,
         )
 
     async def _reconcile_sending_steer_effects(self) -> None:
