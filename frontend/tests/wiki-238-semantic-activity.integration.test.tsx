@@ -69,6 +69,11 @@ describe("semantic model activity groups", () => {
       toolEvent("validate", "pytest retry", { ok: true }),
     ])).toBe("done");
     expect(activityStateLabel(failed, "working")).toBe("working");
+    expect(activityStateLabel(completed, "interrupted")).toBe("interrupted");
+    expect(activityStateLabel(
+      [toolEvent("read", "read api.ts", { output: null, ok: null })],
+      "interrupted",
+    )).toBe("interrupted");
     expect(activityStateLabel(failed, "waiting-for-you")).toBe("waiting for you");
     expect(activityStateLabel(completed, "waiting-for-you")).toBe("waiting for you");
     expect(
@@ -83,6 +88,8 @@ describe("semantic model activity groups", () => {
     expect(activityRunStateFromProvider("idle", 1, false)).toBe("waiting-for-you");
     expect(activityRunStateFromProvider("dead", 0, true)).toBe("failed");
     expect(activityRunStateFromProvider("dead", 1, true)).toBe("failed");
+    expect(activityRunStateFromProvider("interrupted", 0, false)).toBe("interrupted");
+    expect(activityRunStateFromProvider("interrupted", 1, true)).toBe("interrupted");
     expect(activityRunStateFromProvider("error", 0, false)).toBe("failed");
     expect(activityRunStateFromProvider("blocked", 0, false)).toBe("failed");
     expect(activityRunStateFromProvider("completed", 0, true)).toBe("idle");

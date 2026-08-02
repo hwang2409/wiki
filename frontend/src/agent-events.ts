@@ -30,12 +30,13 @@ export function isAgentTopologyEvent(type: string): boolean {
   return AGENT_TOPOLOGY_EVENT_TYPES.has(type);
 }
 
-export type ActivityStateLabel = "working" | "done" | "failed" | "waiting for you";
-export type ActivityRunState = "idle" | "working" | "failed" | "waiting-for-you";
+export type ActivityStateLabel = "working" | "done" | "failed" | "interrupted" | "waiting for you";
+export type ActivityRunState = "idle" | "working" | "failed" | "interrupted" | "waiting-for-you";
 
 const ACTIVE_PROVIDER_STATES = new Set(["starting", "working", "running", "resuming"]);
 const WAITING_PROVIDER_STATES = new Set(["waiting", "waiting-approval", "approval", "input"]);
 const FAILED_PROVIDER_STATES = new Set(["dead", "failed", "error", "blocked", "crashed"]);
+const INTERRUPTED_PROVIDER_STATES = new Set(["interrupted"]);
 const IDLE_PROVIDER_STATES = new Set(["idle", "completed"]);
 
 type ToolSummaryMapper = (summary: string) => string;
@@ -108,6 +109,7 @@ export function activityStateLabel(
   if (runState === "waiting-for-you") return "waiting for you";
   if (runState === "working") return "working";
   if (runState === "failed") return "failed";
+  if (runState === "interrupted") return "interrupted";
   const latestTool = tools.at(-1);
   if (latestTool?.archetype === "ask" && latestTool.output === null) return "waiting for you";
   if (latestTool?.output === null && latestTool.ok === null) return "working";
@@ -122,6 +124,7 @@ export function activityRunStateFromProvider(
 ): ActivityRunState {
   const state = providerState?.trim().toLowerCase() ?? "";
   if (FAILED_PROVIDER_STATES.has(state)) return "failed";
+  if (INTERRUPTED_PROVIDER_STATES.has(state)) return "interrupted";
   if (WAITING_PROVIDER_STATES.has(state) || pendingRequestCount > 0) return "waiting-for-you";
   if (ACTIVE_PROVIDER_STATES.has(state)) return "working";
   if (IDLE_PROVIDER_STATES.has(state)) return "idle";

@@ -20,6 +20,7 @@
   --activity-state-done-color: var(--text-normal);
   --activity-state-working-color: var(--text-normal);
   --activity-state-failed-color: var(--text-normal);
+  --activity-state-interrupted-color: var(--text-normal);
   --activity-state-waiting-color: var(--text-normal);
 
   --link-color: var(--text-normal);
@@ -527,6 +528,7 @@
   --activity-state-done-color: #435a61;
   --activity-state-working-color: #435a61;
   --activity-state-failed-color: #435a61;
+  --activity-state-interrupted-color: #435a61;
   --activity-state-waiting-color: #435a61;
 
   --link-color: #268bd2;

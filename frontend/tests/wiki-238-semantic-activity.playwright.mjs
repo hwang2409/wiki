@@ -37,9 +37,9 @@ const THEMES = [
   "catppuccin-mocha",
 ];
 const ESSENTIAL_CONTRAST_ROLES = [
-  ["state done", ".session-activity-state:not(.is-working):not(.is-failed):not(.is-waiting-for-you)"],
-  ["state working", ".session-activity-state.is-working"],
+  ["state done", ".session-activity-state:not(.is-working):not(.is-failed):not(.is-interrupted):not(.is-waiting-for-you)"],
   ["state failed", ".session-activity-state.is-failed"],
+  ["state interrupted", ".session-activity-state.is-interrupted"],
   ["state waiting", ".session-activity-state.is-waiting-for-you"],
   ["semantic summary", ".session-activity-semantic"],
   ["activity metadata", ".session-activity-meta"],
@@ -53,6 +53,7 @@ const ESSENTIAL_CONTRAST_ROLES = [
   ["raw preview body", ".transcript-preview-body"],
   ["failure badge", ".session-tool-err"],
 ];
+const WORKING_CONTRAST_ROLE = ["state working", ".session-activity-state.is-working"];
 
 function assert(condition, message) {
   if (!condition) throw new Error(message);
@@ -158,7 +159,13 @@ async function main() {
     codexAssistant("The successful retry completed the turn.", "2026-08-02T12:00:29.000Z"),
     codexUser("start the next turn", "2026-08-02T12:00:30.000Z"),
   ];
-  await fs.writeFile(transcript, rows.map((row) => JSON.stringify(row)).join("\n") + "\n");
+  const writeTranscript = async (extraRows = []) => {
+    await fs.writeFile(
+      transcript,
+      [...rows, ...extraRows].map((row) => JSON.stringify(row)).join("\n") + "\n",
+    );
+  };
+  await writeTranscript();
   writeRegistry(fixtures.registryPath, [[TICKET, transcript]]);
   writeQueue(fixtures.queuePath, TICKET, []);
 
@@ -225,6 +232,10 @@ async function main() {
       assert(children[0] === state, `group ${index} state must render first: ${children.join(" / ")}`);
       assert(children[1] === summary, `group ${index} summary must follow state: ${children.join(" / ")}`);
     };
+    const assertPrimaryState = async (index, state) => {
+      const actual = await groups.nth(index).locator(".session-activity-state").innerText();
+      assert(actual === state, `group ${index} state mismatch: expected ${state}, got ${actual}`);
+    };
     await assertPrimary(0, "DONE", "running tests");
     await assertPrimary(1, "DONE", "1 tool call");
     await assertPrimary(2, "FAILED", "running tests");
@@ -261,6 +272,35 @@ async function main() {
     await assertLiveState("blocked", 0, false, "FAILED");
     await assertLiveState("dead", 1, true, "FAILED");
     await assertLiveState("working", 0, true, "WORKING");
+
+    const pendingInterruptedTool = codexToolCall(
+      "call-interrupted-pending",
+      "Read",
+      '{"path":"frontend/src/agent-events.ts"}',
+      "2026-08-02T12:00:31.000Z",
+    );
+    runtime = { providerState: "interrupted", pendingRequestCount: 0, working: false };
+    await writeTranscript([pendingInterruptedTool]);
+    await page.reload({ waitUntil: "domcontentloaded" });
+    await page.waitForSelector(".session-activity-head");
+    await assertPrimaryState(5, "INTERRUPTED");
+
+    const completedInterruptedTool = codexToolCall(
+      "call-interrupted-completed",
+      "Read",
+      '{"path":"frontend/src/session.tsx"}',
+      "2026-08-02T12:00:33.000Z",
+    );
+    const completedInterruptedResult = codexToolOutput(
+      "call-interrupted-completed",
+      "session source exact",
+      "2026-08-02T12:00:34.000Z",
+    );
+    await writeTranscript([completedInterruptedTool, completedInterruptedResult]);
+    await page.reload({ waitUntil: "domcontentloaded" });
+    await page.waitForSelector(".session-activity-head");
+    await assertPrimaryState(5, "INTERRUPTED");
+
     await page.locator(".session-scroll").screenshot({ path: SCREENSHOTS.collapsedNormal });
 
     await groups.nth(0).locator(".session-activity-head").click();
@@ -353,7 +393,29 @@ async function main() {
       }
       contrastAudit[theme] = themeAudit;
     }
+
+    await writeTranscript();
+    runtime = { providerState: "working", pendingRequestCount: 0, working: true };
+    await page.reload({ waitUntil: "domcontentloaded" });
+    await page.waitForSelector(".session-turn-live-state .session-activity-state.is-working");
+    const [workingRoleName, workingSelector] = WORKING_CONTRAST_ROLE;
+    for (const theme of THEMES) {
+      await page.evaluate((themeId) => {
+        document.documentElement.dataset.theme = themeId;
+      }, theme);
+      const workingRole = page.locator(workingSelector);
+      const sample = await colors(workingRole);
+      const ratio = contrastRatio(sample.foreground, sample.background);
+      assert(ratio >= 4.5,
+        `${theme} ${workingRoleName} contrast must be at least 4.5:1, got ${ratio.toFixed(2)} from ${JSON.stringify(sample)}`);
+      contrastAudit[theme][workingRoleName] = ratio;
+    }
     await page.evaluate(() => { document.documentElement.dataset.theme = "opencode"; });
+    const firstActivityHead = groups.nth(0).locator(".session-activity-head");
+    if (await firstActivityHead.getAttribute("aria-expanded") !== "true") {
+      await firstActivityHead.click();
+    }
+    await groups.nth(0).locator('.session-activity-head[aria-expanded="true"]').waitFor();
 
     const normalDensity = await groups.nth(0).evaluate((element) => ({
       clientWidth: element.clientWidth,

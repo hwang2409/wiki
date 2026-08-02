@@ -7281,6 +7281,10 @@ body.is-resizing-panes .pane-cell {
   color: var(--activity-state-failed-color);
 }
 
+.session-activity-state.is-interrupted {
+  color: var(--activity-state-interrupted-color);
+}
+
 .session-activity-state.is-waiting-for-you {
   color: var(--activity-state-waiting-color);
 }
