@@ -1881,6 +1881,145 @@ class SupervisorTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(terminal["status"], "acknowledged")
         self.assertEqual(terminal["result"]["status"], "uncertain")
 
+    async def test_r5_provider_busy_after_idle_snapshot_preserves_queue(
+        self,
+    ) -> None:
+        """WIKI-232 R5 H1: the R3 idle-snapshot gate is TOCTOU. The
+        provider can flip WORKING between ``snapshot() == IDLE`` and
+        ``send_on_idle``'s authoritative state check, which then raises
+        ``ProviderBusy``. Prior to the fix, that raise landed in the
+        generic ``except Exception`` handler: the effect was terminalized
+        ``uncertain`` and the queue head was popped even though the
+        provider explicitly rejected the send. ``ProviderBusy`` must be
+        treated as known non-acceptance — the queue entry stays and the
+        steer effect returns to ``queued`` so the next real WORKING->IDLE
+        transition retries it."""
+
+        record = await self.supervisor.start_run(
+            agent_id="WIKI-232-R5A",
+            provider=ProviderKind.CODEX,
+            role="implement",
+            model="fixture-codex",
+            effort="high",
+            worktree=str(self.worktree),
+            prompt="r5 provider-busy after idle snapshot",
+        )
+        adapter = self.supervisor.adapters[record.run_id]
+        snapshot = adapter.snapshot()
+
+        # Prime the durable queue with an effect-bound entry. Force the
+        # adapter to WORKING first so ``send_on_idle`` queues instead of
+        # inline-delivers.
+        working = AdapterStatus(
+            LifecycleState.WORKING,
+            snapshot.session_id,
+            os.getpid(),
+            generation=snapshot.generation,
+        )
+        adapter._status = working  # noqa: SLF001 - queueing fixture
+        self.store.update_adapter_status(record.run_id, working)
+
+        pending_id = str(uuid4())
+        resp = await self.supervisor.send_on_idle(
+            record.run_id,
+            "busy-race",
+            pending_id=pending_id,
+            effect_id="r5-busy-1",
+        )
+        self.assertEqual(resp["status"], "queued")
+
+        # Flip the adapter to IDLE so both the drain's entry-snapshot gate
+        # AND the fresh-snapshot recheck above ``mark_sending`` observe
+        # IDLE. The race lives in the tiny window between that recheck
+        # and the actual ``send_on_idle`` call.
+        idle = AdapterStatus(
+            LifecycleState.IDLE,
+            snapshot.session_id,
+            os.getpid(),
+            generation=snapshot.generation,
+        )
+        adapter._status = idle  # noqa: SLF001 - drain fixture
+        self.store.update_adapter_status(record.run_id, idle)
+
+        original_send = adapter.send_on_idle
+        provider_calls: list[str] = []
+
+        async def busy_after_snapshot(msg: str) -> AdapterStatus:
+            provider_calls.append(msg)
+            # Simulate the race: the provider raced back to WORKING
+            # between our IDLE snapshot and this authoritative check.
+            adapter._status = working  # noqa: SLF001 - simulate flip
+            self.store.update_adapter_status(record.run_id, working)
+            raise ProviderBusy("provider raced to WORKING after IDLE snapshot")
+
+        adapter.send_on_idle = busy_after_snapshot  # type: ignore[method-assign]
+        try:
+            await self.supervisor._deliver_next_queued_locked(  # noqa: SLF001
+                record.run_id, adapter,
+            )
+        finally:
+            adapter.send_on_idle = original_send  # type: ignore[method-assign]
+
+        # ProviderBusy was raised once — the fix must NOT retry inside the
+        # same drain call.
+        self.assertEqual(provider_calls, ["busy-race"])
+
+        # Queue entry preserved: the provider REJECTED, so the entry was
+        # never delivered and must stay for a later drain to retry.
+        remaining = self.store.queued_messages(record.run_id)
+        self.assertEqual(
+            [m["text"] for m in remaining],
+            ["busy-race"],
+            "known-rejected head must stay in the durable queue",
+        )
+        self.assertEqual(
+            remaining[0].get("pending_id"),
+            pending_id,
+            "queue entry identity preserved for retry",
+        )
+
+        # Steer effect returned to ``queued`` — NOT acknowledged/uncertain.
+        # The R3 comment explicitly notes that any ``sending`` effect
+        # would otherwise be terminalized in the R2 uncertain-drop branch.
+        effect = self.store.command_log.steer_effect_for_pending(
+            record.run_id, pending_id,
+        )
+        self.assertIsNotNone(effect)
+        assert effect is not None
+        self.assertEqual(
+            effect["status"],
+            "queued",
+            f"ProviderBusy must revert sending->queued, got {effect['status']!r}",
+        )
+        self.assertNotEqual(
+            effect["status"],
+            "acknowledged",
+            "known non-acceptance must NOT terminalize the effect",
+        )
+
+        # Retry path: a natural WORKING->IDLE transition drains the same
+        # entry successfully. Restore the real send_on_idle so the drain
+        # actually delivers, flip to IDLE, and rerun the drain.
+        adapter._status = idle  # noqa: SLF001 - retry fixture
+        self.store.update_adapter_status(record.run_id, idle)
+        await self.supervisor._deliver_next_queued_locked(  # noqa: SLF001
+            record.run_id, adapter,
+        )
+        self.assertEqual(
+            self.store.queued_messages(record.run_id),
+            [],
+            "the retry drain must deliver the preserved head once the provider is really IDLE",
+        )
+        delivered = self.store.command_log.steer_effect_for_pending(
+            record.run_id, pending_id,
+        )
+        assert delivered is not None
+        self.assertIn(
+            delivered["status"],
+            {"sent", "acknowledged"},
+            f"retry must terminalize the effect as sent/acknowledged, got {delivered['status']!r}",
+        )
+
     async def test_delivered_pending_id_survives_replace_until_late_echo(self) -> None:
         record = await self.supervisor.start_run(
             agent_id="WIKI-96-REPLACE",

@@ -30,6 +30,7 @@ from .runtime_card import inject_runtime_card
 from .provider import (
     AdapterStatus,
     ProviderAdapter,
+    ProviderBusy,
     ProviderEvent,
     ProviderProcessError,
     StartRequest,
@@ -1543,6 +1544,24 @@ Preserve the same identity, role, worktree, orchestrator grouping, PR gates, and
                         run_id, pending_id
                     )
                 status = await adapter.send_on_idle(queued["text"])
+            except ProviderBusy:
+                # WIKI-232 R5 H1: the R3 idle-snapshot gate above is TOCTOU.
+                # The provider can flip WORKING between our fresh
+                # ``snapshot() == IDLE`` observation and ``send_on_idle``'s
+                # authoritative state check. That check raises ProviderBusy —
+                # a known non-acceptance, not an unknown-outcome error. The
+                # generic handler below terminates the effect ``uncertain``
+                # and pops the head, silently discarding a message the
+                # provider explicitly refused. Instead, treat it like the
+                # pre-``mark_sending`` snapshot gate: keep the queue entry,
+                # revert the steer effect from ``sending`` back to
+                # ``queued``, and let the next real WORKING->IDLE transition
+                # drive the retry.
+                if pending_id is not None:
+                    self.store.command_log.revert_steer_sending_to_queued_for_pending(
+                        run_id, pending_id
+                    )
+                return
             except Exception as exc:
                 if pending_id is not None:
                     self.store.discard_pending_user_message(run_id, pending_id)

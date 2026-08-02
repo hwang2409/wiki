@@ -408,6 +408,32 @@ class EffectStore:
             )
             connection.commit()
 
+    def revert_steer_sending_to_queued(
+        self, run_id: str, pending_id: str
+    ) -> None:
+        """Reverse a ``sending`` marker when the provider rejected the send.
+
+        ``update_steer`` blocks the ``sending -> queued`` transition to prevent
+        accidental back-slide once a send has been dispatched. That invariant
+        assumes provider acceptance is only ever confirmed or unknown. A known
+        non-acceptance (``ProviderBusy`` after we snapshotted IDLE but the
+        provider raced to WORKING before the actual send) is a third case:
+        the effect never left the queue, so restoring ``queued`` is the
+        correct durable outcome. Reserved for that narrow known-rejection
+        path (WIKI-232 R5).
+        """
+
+        with self._connect() as connection:
+            connection.execute(
+                """
+                UPDATE steer_effects
+                SET status = 'queued', updated_at = ?
+                WHERE run_id = ? AND pending_id = ? AND status = 'sending'
+                """,
+                (_now(), run_id, pending_id),
+            )
+            connection.commit()
+
     def list_sending_steer_effects(self) -> list[dict[str, Any]]:
         """Return every steer effect currently at status='sending'.
 
