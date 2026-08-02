@@ -472,16 +472,45 @@ class Mp3Id3v24FooterTests(unittest.TestCase):
         with self.assertRaises(media_scrub.MediaScrubError):
             media_scrub.scrub_audio(payload, "audio/mpeg")
 
-    def test_id3v24_footer_version_mismatch_is_rejected(self) -> None:
-        """The footer's version/flags/size fields must equal the header's.
-        If a scrubber only stripped by header-declared tag_size and skipped
-        the 3DI check, an attacker could smuggle bytes into the footer.
+    def test_id3v24_footer_version_byte_mismatch_is_rejected(self) -> None:
+        """The footer's major-version byte must equal the header's.
+        Regression guard: a comparison that only checked flags/size would
+        let a footer with a different version byte survive.
         """
         audio = self._real_audio()
-        tag_body = b"footer-mismatch"
+        tag_body = b"footer-version-mismatch"
+        tag_size = len(tag_body)
+        header = b"ID3\x04\x00\x10" + self._syncsafe(tag_size)
+        bad_footer = b"3DI\x03\x00\x10" + self._syncsafe(tag_size)
+        payload = header + tag_body + bad_footer + audio
+        with self.assertRaises(media_scrub.MediaScrubError):
+            media_scrub.scrub_audio(payload, "audio/mpeg")
+
+    def test_id3v24_footer_flags_byte_mismatch_is_rejected(self) -> None:
+        """The footer's flags byte must equal the header's.
+        Regression guard: a comparison that only checked version/size would
+        let a footer with different flags survive.
+        """
+        audio = self._real_audio()
+        tag_body = b"footer-flags-mismatch"
         tag_size = len(tag_body)
         header = b"ID3\x04\x00\x10" + self._syncsafe(tag_size)
         bad_footer = b"3DI\x04\x00\x00" + self._syncsafe(tag_size)
+        payload = header + tag_body + bad_footer + audio
+        with self.assertRaises(media_scrub.MediaScrubError):
+            media_scrub.scrub_audio(payload, "audio/mpeg")
+
+    def test_id3v24_footer_syncsafe_size_mismatch_is_rejected(self) -> None:
+        """The footer's 4-byte synchsafe size must equal the header's.
+        Regression guard: a comparison that only checked version/flags would
+        let a footer with a divergent size survive — and the strip would
+        then advance by the wrong number of bytes.
+        """
+        audio = self._real_audio()
+        tag_body = b"footer-size-mismatch"
+        tag_size = len(tag_body)
+        header = b"ID3\x04\x00\x10" + self._syncsafe(tag_size)
+        bad_footer = b"3DI\x04\x00\x10" + self._syncsafe(tag_size + 1)
         payload = header + tag_body + bad_footer + audio
         with self.assertRaises(media_scrub.MediaScrubError):
             media_scrub.scrub_audio(payload, "audio/mpeg")
