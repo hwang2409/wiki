@@ -48,6 +48,7 @@ from backend.app.agent_runtime.protocol import UnixSupervisorServer
 from backend.app.agent_runtime.provider import (
     AdapterStatus,
     ProviderAdapter,
+    ProviderBusy,
     ProviderEvent,
     ProviderProcessError,
     StartRequest,
@@ -1296,7 +1297,21 @@ class SupervisorTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(self.store.queued_messages(record.run_id), [])
         self.assertEqual(self.store.get(record.run_id).pending_user_messages, [])
 
-        # And a fresh queued message drains normally through the same run.
+        # And a fresh queued message drains normally through the same run
+        # once the provider returns to idle. Return the adapter to IDLE so
+        # the drain proceeds instead of preserving the head for a still-busy
+        # provider (WIKI-232 R3 gate).
+        follow_up_adapter = self.supervisor.adapters[record.run_id]
+        follow_up_snapshot = follow_up_adapter.snapshot()
+        idle = AdapterStatus(
+            LifecycleState.IDLE,
+            follow_up_snapshot.session_id,
+            os.getpid(),
+            generation=follow_up_snapshot.generation,
+        )
+        follow_up_adapter._status = idle  # noqa: SLF001 - drain fixture
+        self.store.update_adapter_status(record.run_id, idle)
+
         follow_up_pending = str(uuid4())
         follow_up = await self.supervisor.send_on_idle(
             record.run_id,
@@ -1307,7 +1322,7 @@ class SupervisorTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn(follow_up["status"], {"sent", "queued"})
         await self.supervisor._deliver_next_queued_locked(  # noqa: SLF001
             record.run_id,
-            self.supervisor.adapters[record.run_id],
+            follow_up_adapter,
         )
         self.assertEqual(self.store.queued_messages(record.run_id), [])
 
@@ -1554,6 +1569,216 @@ class SupervisorTests(unittest.IsolatedAsyncioTestCase):
             record.run_id, pid1,
         )
         self.assertIsNotNone(resolved)
+        assert resolved is not None
+        self.assertEqual(resolved["status"], "acknowledged")
+        self.assertEqual(resolved["result"]["status"], "uncertain")
+
+    async def test_r3_in_session_drain_preserves_queue_when_provider_busy(
+        self,
+    ) -> None:
+        """WIKI-232 R3 H1: after an uncertain head drop the follow-up drain
+        must NOT re-enter send_on_idle while the provider is still WORKING.
+        Otherwise ProviderBusy re-enters the exception path, marks the next
+        item uncertain, removes it, and cascades until the queue is empty.
+        The queued items must be preserved until a real WORKING->IDLE
+        transition drains them."""
+
+        record = await self.supervisor.start_run(
+            agent_id="WIKI-232-R3A",
+            provider=ProviderKind.CODEX,
+            role="implement",
+            model="fixture-codex",
+            effort="high",
+            worktree=str(self.worktree),
+            prompt="r3 in-session drain",
+        )
+        adapter = self.supervisor.adapters[record.run_id]
+        snapshot = adapter.snapshot()
+
+        working = AdapterStatus(
+            LifecycleState.WORKING,
+            snapshot.session_id,
+            os.getpid(),
+            generation=snapshot.generation,
+        )
+        adapter._status = working  # noqa: SLF001 - queueing fixture
+        self.store.update_adapter_status(record.run_id, working)
+
+        pid1 = str(uuid4())
+        pid2 = str(uuid4())
+        pid3 = str(uuid4())
+        for text, pid, eid in (
+            ("queued-1", pid1, "r3a-1"),
+            ("queued-2", pid2, "r3a-2"),
+            ("queued-3", pid3, "r3a-3"),
+        ):
+            resp = await self.supervisor.send_on_idle(
+                record.run_id, text, pending_id=pid, effect_id=eid,
+            )
+            self.assertEqual(resp["status"], "queued")
+        self.assertEqual(len(self.store.queued_messages(record.run_id)), 3)
+
+        # Enter the drain with the adapter IDLE so the first send is
+        # attempted; the send fails, drops the head, and schedules a
+        # follow-up drain. Between the head drop and the drain running
+        # the adapter is switched to WORKING to simulate the provider
+        # taking a new turn (or never returning to IDLE) — the drain
+        # must observe WORKING and stop instead of stripping the queue.
+        idle = AdapterStatus(
+            LifecycleState.IDLE,
+            snapshot.session_id,
+            os.getpid(),
+            generation=snapshot.generation,
+        )
+        adapter._status = idle  # noqa: SLF001 - drain fixture
+        self.store.update_adapter_status(record.run_id, idle)
+
+        original_send = adapter.send_on_idle
+        call_log: list[str] = []
+
+        async def flaky_send(msg: str) -> AdapterStatus:
+            call_log.append(msg)
+            if msg == "queued-1":
+                # Fail the first send AND flip the adapter to WORKING so
+                # the exception handler observes a busy provider by the
+                # time the drain check runs.
+                adapter._status = working  # noqa: SLF001 - simulate flip
+                self.store.update_adapter_status(record.run_id, working)
+                raise RuntimeError("simulated transient adapter failure")
+            # Any subsequent send_on_idle from the drain must reject
+            # because the provider is still working.
+            raise ProviderBusy(
+                f"provider is {adapter._status.state.value}, not idle"  # noqa: SLF001
+            )
+
+        adapter.send_on_idle = flaky_send  # type: ignore[method-assign]
+        try:
+            await self.supervisor._deliver_next_queued_locked(  # noqa: SLF001
+                record.run_id, adapter,
+            )
+            # Give any scheduled drain task time to run (and to no-op).
+            for _ in range(50):
+                await asyncio.sleep(0.01)
+        finally:
+            adapter.send_on_idle = original_send  # type: ignore[method-assign]
+
+        # Only the first send was attempted. The drain saw WORKING and
+        # backed off — queued-2 and queued-3 stay in the durable queue.
+        self.assertEqual(call_log, ["queued-1"])
+        remaining = self.store.queued_messages(record.run_id)
+        self.assertEqual([m["text"] for m in remaining], ["queued-2", "queued-3"])
+
+        # queued-2 and queued-3 effects stay queued (not sending / not
+        # acknowledged) so a later natural idle transition retries them.
+        for pid in (pid2, pid3):
+            effect = self.store.command_log.steer_effect_for_pending(
+                record.run_id, pid,
+            )
+            self.assertIsNotNone(effect)
+            assert effect is not None
+            self.assertEqual(effect["status"], "queued")
+
+        # Sanity: the dropped head IS terminated uncertain, matching R2.
+        first = self.store.command_log.steer_effect_for_pending(
+            record.run_id, pid1,
+        )
+        assert first is not None
+        self.assertEqual(first["status"], "acknowledged")
+        self.assertEqual(first["result"]["status"], "uncertain")
+
+    async def test_r3_recover_on_start_drain_preserves_queue_when_provider_busy(
+        self,
+    ) -> None:
+        """WIKI-232 R3 H1 restart path: same guarantee for the recovery
+        sweep. After the sweep terminalizes a wedged head, the follow-up
+        drain must gate on adapter IDLE. Otherwise ProviderBusy strips
+        the entire queue one item at a time."""
+
+        record = await self.supervisor.start_run(
+            agent_id="WIKI-232-R3B",
+            provider=ProviderKind.CODEX,
+            role="implement",
+            model="fixture-codex",
+            effort="high",
+            worktree=str(self.worktree),
+            prompt="r3 restart drain",
+        )
+        adapter = self.supervisor.adapters[record.run_id]
+        pid1 = str(uuid4())
+
+        # Wedge the first message in `sending` state (same trick as R2).
+        with mock.patch.object(
+            self.store.command_log,
+            "mark_steer_sent_for_pending",
+            side_effect=asyncio.CancelledError,
+        ):
+            with self.assertRaises(asyncio.CancelledError):
+                await self.supervisor.send_on_idle(
+                    record.run_id,
+                    "wedged-1",
+                    pending_id=pid1,
+                    effect_id="r3b-1",
+                )
+
+        wedged = self.store.command_log.steer_effect_for_pending(
+            record.run_id, pid1,
+        )
+        assert wedged is not None
+        self.assertEqual(wedged["status"], "sending")
+
+        # Queue additional items behind the wedged head; adapter is WORKING
+        # after the wedge so these all queue durably.
+        pid2 = str(uuid4())
+        pid3 = str(uuid4())
+        for text, pid, eid in (
+            ("queued-2", pid2, "r3b-2"),
+            ("queued-3", pid3, "r3b-3"),
+        ):
+            resp = await self.supervisor.send_on_idle(
+                record.run_id, text, pending_id=pid, effect_id=eid,
+            )
+            self.assertEqual(resp["status"], "queued")
+        self.assertEqual(len(self.store.queued_messages(record.run_id)), 3)
+
+        # Adapter stays WORKING through the recovery sweep — the drain
+        # scheduled by the sweep must not re-enter send_on_idle.
+        self.assertIs(adapter.snapshot().state, LifecycleState.WORKING)
+
+        original_send = adapter.send_on_idle
+        call_log: list[str] = []
+
+        async def busy_send(msg: str) -> AdapterStatus:
+            call_log.append(msg)
+            raise ProviderBusy("provider still working")
+
+        adapter.send_on_idle = busy_send  # type: ignore[method-assign]
+        try:
+            self.supervisor._sending_effects_reconciled = False  # noqa: SLF001
+            await self.supervisor._reconcile_sending_steer_effects()  # noqa: SLF001
+            for _ in range(50):
+                await asyncio.sleep(0.01)
+        finally:
+            adapter.send_on_idle = original_send  # type: ignore[method-assign]
+
+        # The sweep terminated the wedged head as uncertain and dropped
+        # it, but did NOT attempt any further send_on_idle while the
+        # adapter is still WORKING. Queue tail is preserved.
+        self.assertEqual(call_log, [])
+        remaining = self.store.queued_messages(record.run_id)
+        self.assertEqual([m["text"] for m in remaining], ["queued-2", "queued-3"])
+
+        # queued-2 and queued-3 effects stay queued for the natural
+        # WORKING->IDLE transition to drain later.
+        for pid in (pid2, pid3):
+            effect = self.store.command_log.steer_effect_for_pending(
+                record.run_id, pid,
+            )
+            assert effect is not None
+            self.assertEqual(effect["status"], "queued")
+
+        resolved = self.store.command_log.steer_effect_for_pending(
+            record.run_id, pid1,
+        )
         assert resolved is not None
         self.assertEqual(resolved["status"], "acknowledged")
         self.assertEqual(resolved["result"]["status"], "uncertain")

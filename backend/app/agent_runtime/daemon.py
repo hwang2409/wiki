@@ -3,6 +3,7 @@ from __future__ import annotations
 import argparse
 import asyncio
 import fcntl
+import hashlib
 import os
 import signal
 import time
@@ -17,6 +18,28 @@ from .autopilot import AutopilotController
 from .protocol import UnixSupervisorServer
 from .store import RunStore, RuntimePaths
 from .supervisor import Supervisor
+
+
+def fleet_monitor_request_id(run_id: str, dedupe_key: str | None) -> str:
+    """Scope the durable FleetMonitor request id to the target orchestrator run.
+
+    The notification ``dedupe_key`` alone is stable across daemon boots and
+    across orchestrator run replacements (several monitor keys hash only the
+    ticket + event). If the target orchestrator gets a replacement run, the
+    monitor retries reuse the same ``request_id`` with a different ``run_id``
+    in the payload, and the command log rejects it as a conflicting payload
+    (``CommandConflict``). Steers can no longer reach the new orchestrator
+    run (WIKI-232 R3 H2).
+
+    Bind the request id to the current run instead — a bounded SHA-256 digest
+    of ``run_id + dedupe_key`` — so a replacement run receives its own
+    request-id namespace, while ``dedupe_key`` itself stays unchanged for
+    per-run message dedupe.
+    """
+
+    payload = f"{run_id or ''}:{dedupe_key or ''}"
+    digest = hashlib.sha256(payload.encode("utf-8")).hexdigest()[:32]
+    return f"fleet-monitor:{digest}"
 
 
 def parse_args() -> argparse.Namespace:
@@ -134,7 +157,9 @@ async def run_daemon(args: argparse.Namespace) -> None:
             # WIKI-232 H3: route monitor steers through the command queue
             # so they join the durable total order — a daemon stop between
             # queue admission and provider delivery replays exactly once
-            # instead of vanishing without a receipt.
+            # instead of vanishing without a receipt. R3 H2 scopes the
+            # request id to run_id so orchestrator replacement does not
+            # collide on the same dedupe_key.
             lambda run_id, message, dedupe_key, source: supervisor.dispatch(
                 "run/send_now",
                 {
@@ -142,7 +167,7 @@ async def run_daemon(args: argparse.Namespace) -> None:
                     "text": message,
                     "dedupe_key": dedupe_key,
                     "source": source,
-                    "request_id": f"fleet-monitor:{dedupe_key}",
+                    "request_id": fleet_monitor_request_id(run_id, dedupe_key),
                 },
             ),
             ownership_lock=supervisor._agent_lock,  # noqa: SLF001

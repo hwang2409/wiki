@@ -1478,6 +1478,7 @@ Preserve the same identity, role, worktree, orchestrator grouping, PR gates, and
                 return
             pending_id = queued.get("pending_id")
             queued_source = queued.get("source")
+            effect: dict[str, Any] | None = None
             if pending_id is not None:
                 effect = self.store.command_log.steer_effect_for_pending(
                     run_id, pending_id
@@ -1500,6 +1501,34 @@ Preserve the same identity, role, worktree, orchestrator grouping, PR gates, and
                     # No echo yet. The recover_on_start sweep resolves
                     # sending effects whose transport died; here we just
                     # wait so the healthy in-flight case can still finish.
+                    return
+            # WIKI-232 R3 H1: preserve the queued item and its (still
+            # queued) effect when the provider is busy. Every entry point
+            # that reaches here for a fresh delivery already had reason
+            # to believe the adapter is IDLE — the natural WORKING->IDLE
+            # transition, an inline send_on_idle path that verified
+            # ``adapter.status()``, or the resume/recovery path that
+            # checked ``status.state`` — but the state can flip between
+            # that check and the queue-lock acquisition. Confirm with a
+            # fresh snapshot: if the provider is no longer idle, back off
+            # so ``send_on_idle`` never raises ProviderBusy inside the
+            # exception handler, which would terminate the effect
+            # uncertain and cascade through the queue.
+            #
+            # Only gate when we have a durable effect to preserve
+            # (``effect`` is not None and status is ``queued``). Ad-hoc
+            # deliveries with no bound effect fall through to the
+            # historical behavior so the fixture-driven "adapter queues
+            # internally" tests keep passing.
+            if effect is not None and effect["status"] == "queued":
+                try:
+                    fresh_status = adapter.snapshot()
+                except Exception:
+                    fresh_status = None
+                if (
+                    fresh_status is not None
+                    and fresh_status.state is not LifecycleState.IDLE
+                ):
                     return
             if pending_id is not None:
                 self.store.track_pending_user_message(
@@ -1557,13 +1586,21 @@ Preserve the same identity, role, worktree, orchestrator grouping, PR gates, and
                 # Dropping an uncertain head does not itself emit any later
                 # idle transition, so anything queued behind it would stay
                 # stranded until the next external trigger (WIKI-232 R2).
-                # Schedule a fresh drain if there is more work and this
-                # adapter is still the one attached — the monitor task waits
-                # on the run+queue locks we hold here, so it runs strictly
-                # after this exception path releases them.
+                # Schedule a fresh drain if there is more work, this adapter
+                # is still the one attached, AND the provider is currently
+                # IDLE — otherwise the spawned task would hit ProviderBusy
+                # on the next head, terminate it uncertain, and cascade
+                # (WIKI-232 R3 H1). The natural WORKING->IDLE transition
+                # schedules the drain when the provider frees up.
+                try:
+                    drain_status = adapter.snapshot()
+                except Exception:
+                    drain_status = None
                 if (
                     self.store.peek_queued_message(run_id) is not None
                     and self.adapters.get(run_id) is adapter
+                    and drain_status is not None
+                    and drain_status.state is LifecycleState.IDLE
                 ):
                     self._spawn_monitor_task(
                         self._deliver_next_queued(run_id, adapter),
@@ -2302,13 +2339,23 @@ Preserve the same identity, role, worktree, orchestrator grouping, PR gates, and
                 # Removing the wedged head does not fire a new idle event,
                 # so anything queued behind it would remain stranded until
                 # the next external trigger (WIKI-232 R2). If the recovered
-                # adapter is attached and there is more work, schedule a
-                # drain — the monitor task will re-enter through the normal
-                # queue lock once this reconcile step releases its run lock.
+                # adapter is attached, the provider is IDLE, and there is
+                # more work, schedule a drain — the monitor task will re-enter
+                # through the normal queue lock once this reconcile step
+                # releases its run lock. Gate on IDLE so a still-WORKING
+                # adapter does not cascade uncertain-drops through the queue
+                # via ProviderBusy (WIKI-232 R3 H1); the natural
+                # WORKING->IDLE transition drains later.
                 adapter = self.adapters.get(run_id)
+                try:
+                    drain_status = adapter.snapshot() if adapter is not None else None
+                except Exception:
+                    drain_status = None
                 if (
                     adapter is not None
                     and self.store.peek_queued_message(run_id) is not None
+                    and drain_status is not None
+                    and drain_status.state is LifecycleState.IDLE
                 ):
                     self._spawn_monitor_task(
                         self._deliver_next_queued(run_id, adapter),

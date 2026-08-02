@@ -15,6 +15,7 @@ from unittest import mock
 
 from backend.app import workgraph, workgraph_service
 from backend.app.agent_runtime import graph_health
+from backend.app.agent_runtime.daemon import fleet_monitor_request_id
 from backend.app.agent_runtime.fake import FixtureAdapterFactory
 from backend.app.agent_runtime.fleet_monitor import FleetMonitor, Notification, _WorkerView
 from backend.app.agent_runtime.store import RunStore, RuntimePaths
@@ -1279,7 +1280,7 @@ class FleetMonitorTests(unittest.IsolatedAsyncioTestCase):
                     "text": message,
                     "dedupe_key": dedupe_key,
                     "source": source,
-                    "request_id": f"fleet-monitor:{dedupe_key}",
+                    "request_id": fleet_monitor_request_id(run_id, dedupe_key),
                 },
             )
 
@@ -1311,7 +1312,9 @@ class FleetMonitorTests(unittest.IsolatedAsyncioTestCase):
         status_notes = [n for n in notes if n.event_type == "status-transition"]
         self.assertEqual(len(status_notes), 1, f"got: {notes}")
 
-        request_id = f"fleet-monitor:{status_notes[0].dedupe_key}"
+        request_id = fleet_monitor_request_id(
+            status_notes[0].orch_run_id, status_notes[0].dedupe_key
+        )
         receipt = self.store.command_log.receipt("run/send_now", request_id)
         self.assertIsNotNone(
             receipt,
@@ -1324,6 +1327,131 @@ class FleetMonitorTests(unittest.IsolatedAsyncioTestCase):
             for event in self.store.command_log.events(method="run/send_now")
         }
         self.assertIn("run/send_now", intent_methods)
+
+    async def test_orchestrator_replace_scopes_monitor_request_id(self) -> None:
+        """WIKI-232 R3 H2: the durable FleetMonitor request_id must be scoped
+        to the target orchestrator run. Several monitor dedupe keys are
+        stable across daemon boots and across replacement runs — a naive
+        ``fleet-monitor:<dedupe_key>`` request id then reuses the same
+        command-log slot for the replacement run's payload, and the store
+        rejects the retry as a conflicting payload (CommandConflict).
+        Steers stop reaching the current orchestrator until the alarm
+        key rotates.
+
+        Bind request_id to (run_id, dedupe_key) so a replacement run has
+        its own request-id namespace while dedupe_key itself is unchanged."""
+
+        from backend.app.agent_runtime.command_log import CommandConflict
+
+        orch = await self._spawn("WIKI-ORCH", role="orchestrator", orch=None)
+        supervisor = self.supervisor
+        first_run_id = orch.run_id
+
+        # Regression witness first, before we lose the ability to dispatch
+        # against first_run_id. A single stable dedupe_key from a monitor
+        # alarm (staleness / unrouted-verdict / graph-health) hashes into
+        # the SAME legacy request_id across boots. Dispatch it once on the
+        # pre-replacement run so the receipt exists.
+        stable_dedupe = "fleet:WIKI-ORCH:staleness:1700000000"
+        legacy_request_id = f"fleet-monitor:{stable_dedupe}"
+        legacy_first = await supervisor.dispatch(
+            "run/send_now",
+            {
+                "run_id": first_run_id,
+                "text": "stable-alarm on pre-replacement run",
+                "dedupe_key": stable_dedupe,
+                "source": "fleet-monitor",
+                "request_id": legacy_request_id,
+            },
+        )
+        self.assertEqual(legacy_first.get("status"), "sent")
+
+        # Alarm occurrence #1 with a per-occurrence dedupe_key that we
+        # will pair with an R3 run-scoped request_id — verifies the
+        # helper path is durable pre-replacement.
+        dedupe_first = "fleet:WIKI-ORCH:graph-health-blocking:no-reviewer:1"
+        first_request_id = fleet_monitor_request_id(first_run_id, dedupe_first)
+        first_result = await supervisor.dispatch(
+            "run/send_now",
+            {
+                "run_id": first_run_id,
+                "text": "alarm #1 on pre-replacement run",
+                "dedupe_key": dedupe_first,
+                "source": "fleet-monitor",
+                "request_id": first_request_id,
+            },
+        )
+        self.assertEqual(first_result.get("status"), "sent")
+
+        # Replace the orchestrator run.
+        replacement = await self.supervisor.replace(
+            orch.run_id, "replacement orchestrator prompt"
+        )
+        self.assertNotEqual(replacement.run_id, first_run_id)
+        self.assertEqual(
+            self.store.current_run_id("WIKI-ORCH"), replacement.run_id
+        )
+
+        # Legacy scheme now collides: same request_id, but the payload's
+        # run_id is the replacement run instead of the original. The
+        # command log rejects it as a conflicting payload — the exact
+        # failure that stops fleet-monitor from reaching the new run.
+        with self.assertRaises(CommandConflict):
+            await supervisor.dispatch(
+                "run/send_now",
+                {
+                    "run_id": replacement.run_id,
+                    "text": "stable-alarm on replacement run",
+                    "dedupe_key": stable_dedupe,
+                    "source": "fleet-monitor",
+                    "request_id": legacy_request_id,
+                },
+            )
+
+        # R3 scheme dodges the collision: the request_id namespace flips
+        # with the run_id, so the same alarm dedupe_key against the new
+        # run lands in its own slot.
+        dedupe_second = "fleet:WIKI-ORCH:graph-health-blocking:no-reviewer:2"
+        second_request_id = fleet_monitor_request_id(
+            replacement.run_id, dedupe_second
+        )
+        self.assertNotEqual(first_request_id, second_request_id)
+        second_result = await supervisor.dispatch(
+            "run/send_now",
+            {
+                "run_id": replacement.run_id,
+                "text": "alarm #2 on replacement run",
+                "dedupe_key": dedupe_second,
+                "source": "fleet-monitor",
+                "request_id": second_request_id,
+            },
+        )
+        self.assertEqual(second_result.get("status"), "sent")
+
+        second_receipt = self.store.command_log.receipt(
+            "run/send_now", second_request_id
+        )
+        self.assertIsNotNone(
+            second_receipt,
+            "monitor steer for replacement run must produce its own receipt",
+        )
+        assert second_receipt is not None
+        self.assertTrue(second_receipt.ok)
+
+        # The stable dedupe_key produces distinct request ids across the
+        # two runs — proof that the R3 scheme moves the collision surface
+        # out of the request-id namespace entirely.
+        self.assertNotEqual(
+            fleet_monitor_request_id(first_run_id, stable_dedupe),
+            fleet_monitor_request_id(replacement.run_id, stable_dedupe),
+        )
+
+        # Request id must stay within the supervisor's 200-char limit.
+        self.assertLessEqual(len(second_request_id), 200)
+        self.assertLessEqual(
+            len(fleet_monitor_request_id(replacement.run_id, stable_dedupe)),
+            200,
+        )
 
     async def test_no_change_between_ticks_emits_nothing(self) -> None:
         await self._spawn("WIKI-ORCH", role="orchestrator", orch=None)
