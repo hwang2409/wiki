@@ -12,12 +12,24 @@
     "over-cap-split-35.png",
     "over-cap-dialog-split-35.png",
     "over-cap-dialog-split-15.png",
-    "over-cap-dialog-log-split-15.png"
+    "over-cap-dialog-log-split-15.png",
+    "action-replace-split-35.png",
+    "action-review-split-35.png",
+    "action-graph-split-35.png",
+    "action-replay-split-35.png",
+    "action-close-split-35.png",
+    "action-replace-split-15.png",
+    "action-review-split-15.png",
+    "action-graph-split-15.png",
+    "action-replay-split-15.png",
+    "action-close-split-15.png"
   ],
   "audit": [
     "two clear header levels at normal width and in real 35% and 15% split panes",
     "current step remains readable without horizontal clipping",
     "Replace, Review, Graph, Replay, Close, and autopilot remain discoverable",
+    "Replace, Review, Graph, Replay, and Close receive input in isolated 35% and 15% split states",
+    "the visible composer and footer stay inside every split pane",
     "open loop history, findings, plateau state, and autopilot log stay inside narrow panes",
     "dense controls keep at least 32px height and visible focus",
     "cost and Run details remain absent"

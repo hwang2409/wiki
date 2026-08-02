@@ -79,13 +79,66 @@ async function resizeAgentPane(page, label, targetRatio) {
   }, { expected: targetRatio });
 }
 
+async function assertPromptDockFitsPane(page, label) {
+  const result = await page.locator(".pane-frame[data-pane-key='pane-1']").evaluate((pane) => {
+    const paneRect = pane.getBoundingClientRect();
+    const selectors = [".session-composer", ".session-footer"];
+    return selectors.map((selector) => {
+      const element = pane.querySelector(selector);
+      if (!(element instanceof HTMLElement)) return { selector, missing: true };
+      const rect = element.getBoundingClientRect();
+      const style = getComputedStyle(element);
+      return {
+        selector,
+        missing: false,
+        visible:
+          rect.width > 0
+          && rect.height > 0
+          && style.display !== "none"
+          && style.visibility !== "hidden"
+          && style.opacity !== "0",
+        inside:
+          rect.left >= paneRect.left
+          && rect.right <= paneRect.right
+          && rect.top >= paneRect.top
+          && rect.bottom <= paneRect.bottom,
+        overflow: element.scrollWidth > element.clientWidth + 1,
+        bounds: {
+          left: Math.round(rect.left),
+          right: Math.round(rect.right),
+          top: Math.round(rect.top),
+          bottom: Math.round(rect.bottom),
+        },
+        pane: {
+          left: Math.round(paneRect.left),
+          right: Math.round(paneRect.right),
+          top: Math.round(paneRect.top),
+          bottom: Math.round(paneRect.bottom),
+        },
+      };
+    });
+  });
+  const failures = result.filter((entry) =>
+    entry.missing || !entry.visible || !entry.inside || entry.overflow);
+  if (failures.length > 0) {
+    throw new Error(`${label}: prompt dock escaped its pane ${JSON.stringify(failures)}`);
+  }
+}
+
 async function assertLoopDetailFitsPane(detail, label) {
   const result = await detail.evaluate((dialog) => {
     const pane = dialog.closest(".pane-frame[data-pane-key='pane-1']");
     if (!(pane instanceof HTMLElement)) return { missingPane: true };
     const paneRect = pane.getBoundingClientRect();
     const dock = pane.querySelector(".session-composer");
+    const footer = pane.querySelector(".session-footer");
+    if (!(dock instanceof HTMLElement) || !(footer instanceof HTMLElement)) {
+      return { missingPane: false, missingPromptDock: true };
+    }
     const dockRect = dock instanceof HTMLElement ? dock.getBoundingClientRect() : null;
+    const footerRect = footer.getBoundingClientRect();
+    const dockStyle = getComputedStyle(dock);
+    const footerStyle = getComputedStyle(footer);
     const dialogRect = dialog.getBoundingClientRect();
     const elements = [dialog, ...dialog.querySelectorAll("*")]
       .filter((element) => element instanceof HTMLElement);
@@ -112,6 +165,7 @@ async function assertLoopDetailFitsPane(detail, label) {
       }));
     return {
       missingPane: false,
+      missingPromptDock: false,
       dialog: {
         left: Math.round(dialogRect.left),
         right: Math.round(dialogRect.right),
@@ -129,6 +183,17 @@ async function assertLoopDetailFitsPane(detail, label) {
         || dialogRect.top < paneRect.top
         || dialogRect.bottom > paneRect.bottom,
       dockTop: dockRect ? Math.round(dockRect.top) : null,
+      promptDockVisible:
+        dockRect.width > 0
+        && dockRect.height > 0
+        && footerRect.width > 0
+        && footerRect.height > 0
+        && dockStyle.display !== "none"
+        && dockStyle.visibility !== "hidden"
+        && dockStyle.opacity !== "0"
+        && footerStyle.display !== "none"
+        && footerStyle.visibility !== "hidden"
+        && footerStyle.opacity !== "0",
       escaped,
       horizontalOverflow,
       overlapsDock: dockRect ? dialogRect.bottom > dockRect.top + 1 : false,
@@ -136,6 +201,8 @@ async function assertLoopDetailFitsPane(detail, label) {
   });
   if (
     result.missingPane
+    || result.missingPromptDock
+    || !result.promptDockVisible
     || result.dialogEscaped
     || result.escaped?.length
     || result.horizontalOverflow?.length
@@ -354,6 +421,7 @@ async function main() {
         await header.waitFor({ state: "visible" });
         if (viewport.splitRatio !== null) {
           await resizeAgentPane(page, `${fixture.name}/${viewport.name}`, viewport.splitRatio);
+          await assertPromptDockFitsPane(page, `${fixture.name}/${viewport.name}`);
         }
         await header.locator('[data-testid="session-state-pill"]').filter({ hasText: fixture.status.state }).waitFor();
         const expectedRound = fixture.loop.round > fixture.loop.cap
@@ -492,6 +560,58 @@ async function main() {
       }
     }
 
+    currentStatus = states[0].status;
+    currentLoop = states[0].loop;
+    await writeStatus(fixtures, currentStatus);
+    const actionCases = ["Replace", "Review", "Graph", "Replay", "Close"];
+    for (const split of [
+      { name: "split-35", ratio: 0.35 },
+      { name: "split-15", ratio: 0.15 },
+    ]) {
+      for (const action of actionCases) {
+        const label = `action-${action.toLowerCase()}/${split.name}`;
+        await page.setViewportSize({ width: 1280, height: 900 });
+        await page.goto("about:blank");
+        await page.goto(`${backend.baseUrl}/#/agent/${TICKET}`, { waitUntil: "domcontentloaded" });
+        const header = page.locator(".agent-session-surface-head");
+        await header.waitFor({ state: "visible" });
+        await resizeAgentPane(page, label, split.ratio);
+        await assertPromptDockFitsPane(page, label);
+        await header.getByText("round 3 of 8", { exact: true }).waitFor();
+
+        if (action === "Close") {
+          await header.getByRole("button", { name: "Close pane" }).click();
+          await page.locator(".pane-frame[data-pane-key='pane-1']").waitFor({ state: "detached" });
+          if ((await page.locator(".pane-split.row").count()) !== 0
+            || (await page.locator(".pane-frame[data-pane-key='pane-2']").count()) !== 1) {
+            throw new Error(`${label}: close action did not leave the peer pane`);
+          }
+          await page.screenshot({
+            path: path.join(OUT_DIR, `action-${action.toLowerCase()}-${split.name}.png`),
+          });
+        } else {
+          await header.getByRole("button", { name: action, exact: true }).click();
+          if (action === "Replace") {
+            const dialog = page.getByRole("dialog", { name: `Replace ${TICKET}` });
+            await dialog.waitFor({ state: "visible" });
+            await page.screenshot({
+              path: path.join(OUT_DIR, `action-${action.toLowerCase()}-${split.name}.png`),
+            });
+            await dialog.getByRole("button", { name: "Close replace dialog" }).click();
+            await dialog.waitFor({ state: "detached" });
+          } else {
+            const panel = page.locator(`.session-side-panel-${action.toLowerCase()}`);
+            await panel.waitFor({ state: "visible" });
+            await page.screenshot({
+              path: path.join(OUT_DIR, `action-${action.toLowerCase()}-${split.name}.png`),
+            });
+            await panel.getByRole("button", { name: "Close" }).click();
+            await panel.waitFor({ state: "detached" });
+          }
+        }
+      }
+    }
+
     if ((await page.locator('[data-testid="session-run-details"]').count()) !== 0) {
       throw new Error("WIKI-240: Run details must stay removed");
     }
@@ -509,11 +629,16 @@ async function main() {
           "over-cap-dialog-split-35.png",
           "over-cap-dialog-split-15.png",
           "over-cap-dialog-log-split-15.png",
+          ...["split-35", "split-15"].flatMap((split) =>
+            ["replace", "review", "graph", "replay", "close"].map((action) =>
+              `action-${action}-${split}.png`)),
         ]),
         audit: [
           "two clear header levels at normal width and in real 35% and 15% split panes",
           "current step remains readable without horizontal clipping",
           "Replace, Review, Graph, Replay, Close, and autopilot remain discoverable",
+          "Replace, Review, Graph, Replay, and Close receive input in isolated 35% and 15% split states",
+          "the visible composer and footer stay inside every split pane",
           "open loop history, findings, plateau state, and autopilot log stay inside narrow panes",
           "dense controls keep at least 32px height and visible focus",
           "cost and Run details remain absent",
