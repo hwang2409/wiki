@@ -684,27 +684,93 @@ async function main() {
           await resizeAgentPane(page, `${fixture.name}/${viewport.name}`, viewport.splitRatio);
           await assertPromptDockFitsPane(page, `${fixture.name}/${viewport.name}`);
         }
-        await header.locator('[data-testid="session-state-pill"]').filter({ hasText: fixture.status.state }).waitFor();
         const expectedRound = fixture.loop.round > fixture.loop.cap
           ? `round ${fixture.loop.round} · cap ${fixture.loop.cap} exceeded`
           : `round ${fixture.loop.round} of ${fixture.loop.cap}`;
-        await header.getByText(expectedRound, { exact: true }).waitFor();
-
-        if ((await header.locator('[data-testid="session-header-primary"]').count()) !== 1
-          || (await header.locator('[data-testid="session-header-secondary"]').count()) !== 1) {
+        const primary = header.locator('[data-testid="session-header-primary"]');
+        const secondary = header.locator('[data-testid="session-header-secondary"]');
+        if ((await primary.count()) !== 1 || (await secondary.count()) !== 1) {
           throw new Error(`${fixture.name}/${viewport.name}: header must have two levels`);
         }
-        const actionLabels = await header.locator(".agent-surface-actions").innerText();
-        for (const action of ["Replace", "Review", "Graph", "Replay"]) {
-          if (!actionLabels.includes(action)) {
-            throw new Error(`${fixture.name}/${viewport.name}: missing ${action} action`);
+
+        const ticket = primary.locator(".session-ticket");
+        if ((await ticket.count()) !== 1 || (await ticket.textContent())?.trim() !== TICKET) {
+          throw new Error(`${fixture.name}/${viewport.name}: primary level must contain the ticket`);
+        }
+        const statePill = primary.locator(
+          `[data-testid="session-state-pill"][data-state="${fixture.status.state}"]`,
+        );
+        await statePill.waitFor();
+        if ((await statePill.count()) !== 1
+          || (await statePill.getAttribute("data-state")) !== fixture.status.state
+          || (await statePill.textContent())?.trim() !== fixture.status.state) {
+          throw new Error(`${fixture.name}/${viewport.name}: primary level must contain the run state`);
+        }
+        if (fixture.status.blocker) {
+          const blocker = primary.locator('[data-testid="session-blocker-row"] .session-blocker-text');
+          await primary.getByText(fixture.status.blocker, { exact: true }).waitFor();
+          if ((await blocker.count()) !== 1 || (await blocker.textContent())?.trim() !== fixture.status.blocker) {
+            throw new Error(`${fixture.name}/${viewport.name}: primary level must contain the current blocker`);
+          }
+          if ((await primary.locator('[data-testid="session-step-row"]').count()) !== 0) {
+            throw new Error(`${fixture.name}/${viewport.name}: blocked primary level must prefer the blocker`);
+          }
+        } else {
+          const step = primary.locator('[data-testid="session-step-row"] .session-step-text');
+          await primary.getByText(fixture.status.step, { exact: true }).waitFor();
+          if ((await step.count()) !== 1 || (await step.textContent())?.trim() !== fixture.status.step) {
+            throw new Error(`${fixture.name}/${viewport.name}: primary level must contain the current step`);
+          }
+          if ((await primary.locator('[data-testid="session-blocker-row"]').count()) !== 0) {
+            throw new Error(`${fixture.name}/${viewport.name}: primary level has an unexpected blocker`);
           }
         }
-        if ((await header.getByRole("button", { name: "Close pane" }).count()) !== 1) {
-          throw new Error(`${fixture.name}/${viewport.name}: close action is missing`);
+
+        const runtimeItems = (await secondary.locator(".agent-session-runtime-item").allTextContents())
+          .map((item) => item.trim());
+        if (JSON.stringify(runtimeItems) !== JSON.stringify(["cdx", "implement", "gpt-5.6-sol"])) {
+          throw new Error(
+            `${fixture.name}/${viewport.name}: secondary level has wrong runtime metadata ${JSON.stringify(runtimeItems)}`,
+          );
         }
-        if ((await header.getByRole("button", { name: /autopilot on/i }).count()) !== 1) {
-          throw new Error(`${fixture.name}/${viewport.name}: autopilot control is missing`);
+        const loopState = secondary.getByText(expectedRound, { exact: true });
+        await loopState.waitFor();
+        if ((await loopState.count()) !== 1) {
+          throw new Error(`${fixture.name}/${viewport.name}: secondary level must contain the loop state`);
+        }
+        if ((await secondary.getByRole("button", { name: /autopilot on/i }).count()) !== 1) {
+          throw new Error(`${fixture.name}/${viewport.name}: secondary level must contain autopilot`);
+        }
+        const actions = secondary.locator(".agent-surface-actions");
+        for (const action of ["Replace", "Review", "Graph", "Replay"]) {
+          if ((await actions.getByRole("button", { name: action, exact: true }).count()) !== 1) {
+            throw new Error(`${fixture.name}/${viewport.name}: secondary level must contain ${action}`);
+          }
+        }
+        if ((await actions.getByRole("button", { name: "Close pane" }).count()) !== 1) {
+          throw new Error(`${fixture.name}/${viewport.name}: secondary level must contain Close`);
+        }
+
+        const misplacedPrimaryContent = await primary.locator(
+          [
+            ".agent-session-runtime",
+            ".agent-session-runtime-item",
+            ".loop-chrome",
+            ".loop-chrome-trigger",
+            ".loop-autopilot-toggle",
+            ".agent-surface-actions",
+            ".agent-surface-action",
+            ".session-close",
+          ].join(", "),
+        ).count();
+        if (misplacedPrimaryContent !== 0) {
+          throw new Error(`${fixture.name}/${viewport.name}: primary level contains secondary content`);
+        }
+        const misplacedSecondaryContent = await secondary.locator(
+          '.session-ticket, [data-testid="session-state-pill"], [data-testid="session-step-row"], [data-testid="session-blocker-row"]',
+        ).count();
+        if (misplacedSecondaryContent !== 0) {
+          throw new Error(`${fixture.name}/${viewport.name}: secondary level contains primary content`);
         }
         const undersizedTargets = await header.locator("button").evaluateAll((buttons) =>
           buttons
