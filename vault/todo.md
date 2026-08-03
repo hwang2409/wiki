@@ -72,7 +72,6 @@ In Progress:
 - [P1] [PHO-14963](https://linear.app/phoebework/issue/PHO-14963): implement provider-neutral v3 tool discovery and Anthropic delivery — cdx:PHO-14963
 - [P1] [PHO-14975](https://linear.app/phoebework/issue/PHO-14975): implement v3 write registry and diff-first flow — cdx:PHO-14975
 - [P1] [PHO-14977](https://linear.app/phoebework/issue/PHO-14977): implement v3 read-only helpers and eval scaffolding — cdx:PHO-14977
-- [P1] WIKI-239 coalesced provider diagnostics with correct severity and full raw-warning retention — cc:WIKI-239
 - [P1] WIKI-241 clearer long tool-output controls with stable scroll and full raw-output access — cc:WIKI-241
 Backlog:
 
