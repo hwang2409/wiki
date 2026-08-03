@@ -23,8 +23,6 @@ Todo:
 - [P2] WIKI-229 archive transcript identity — split from WIKI-154 R8 (orch cap-decision 2026-07-31, /tmp/WIKI-154-REVIEW8-verdict.json findings 1-3): pre-existing platform bug exposed by per-archive history rows — /session route treats archived_at as non-authoritative (live run and ticket-only _session_paths cache win; older archive returns cached-newest), sidebar target prefers liveWorker over archivedWorker (history click opens live transcript, double selection), loadOlderEvents/getAgentOlderSession/older-session route drop archive identity. Fix: discriminated live-or-archive TranscriptTarget end to end (route resolves exact archive before current-run lookup, 404 stale ids; archived_at through the older-events path). Conflicts with PR #160 until it merges — slot after
 - [P2] WIKI-233 remaining 13 pre-existing frontend suite reds enumerated in PR #168 body (found during WIKI-230) — triage: fixture drift vs real regressions, restore full-suite green so worker gates can run unexcluded
 - LC-6: integrate practice runner into roadmap app (misc, in progress, owner: misc orch)
-- [P1] WIKI-239 coalesced provider diagnostics with correct severity and full raw-warning retention
-- [P1] WIKI-241 clearer long tool-output controls with stable scroll and full raw-output access
 - [P1] WIKI-242 final agent-surface focus, target-size, 320px reflow, and 400% zoom pass; start after WIKI-235/237-241
 
 Silky-smooth artifact rendering arc (Henry 2026-07-29):
@@ -56,7 +54,6 @@ Unknown provider-stream renderer arc (Henry 2026-07-29 — audit of `disposition
 
 In Progress:
 
-- [P1] WIKI-238 semantic model activity timeline and readable transcript hierarchy; retain thinking, tools, counts, and raw events — cdx:WIKI-238; merge requires Henry approval
 - [P2] WIKI-181 reviewer diversity harness — spawn N reviewers w/ distinct lenses (correctness / security / perf / test-strength) in parallel; synthesize verdicts. Codified adversarial verify — one lens catches what another misses. Wire into next_review (WIKI-171) as opt-in mode — cdx:WIKI-181
 
 - [PR #10475](https://github.com/phoebe-health/phoebe/pull/10475): subagent recommendation parity iteration (harness #10692) — cdx:PR-10475 worker; overfitting watch
@@ -75,6 +72,8 @@ In Progress:
 - [P1] [PHO-14963](https://linear.app/phoebework/issue/PHO-14963): implement provider-neutral v3 tool discovery and Anthropic delivery — cdx:PHO-14963
 - [P1] [PHO-14975](https://linear.app/phoebework/issue/PHO-14975): implement v3 write registry and diff-first flow — cdx:PHO-14975
 - [P1] [PHO-14977](https://linear.app/phoebework/issue/PHO-14977): implement v3 read-only helpers and eval scaffolding — cdx:PHO-14977
+- [P1] WIKI-239 coalesced provider diagnostics with correct severity and full raw-warning retention — cc:WIKI-239
+- [P1] WIKI-241 clearer long tool-output controls with stable scroll and full raw-output access — cc:WIKI-241
 Backlog:
 
 - [PHO-14974](https://linear.app/phoebework/issue/PHO-14974): implement the planned v3 describe catalog after retrieve and write registry interfaces land

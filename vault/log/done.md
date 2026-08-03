@@ -9,6 +9,7 @@ updated: 2026-08-03
 
 ## 2026-08-03
 
+- WIKI-238 semantic model activity + readable transcript hierarchy merged (#174 as 09b8b83) — semantic activity summary from fixed archetype allowlist, prominent state label with live-priority + explicit interrupted/dead terminals, rectangular expanded timeline in completion order, per-role contrast 4.5:1 across 13 themes × 5 states. 4 review rounds (6/8/1/0 findings)
 - WIKI-243 supervisor startup recovery memory streaming merged (#175 as 16a3b2a) — _reconcile_existing_runs + _normalize_orphan_raw_events now stream via _iter_json_lines instead of materializing full raw/normalized lists; WIKI-232 REVIEW9 F2 middle-gap + REVIEW12 H1 legacy-boundary invariants preserved
 
 ## 2026-08-02
