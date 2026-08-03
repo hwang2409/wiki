@@ -10436,9 +10436,9 @@ class UnixClientTests(unittest.IsolatedAsyncioTestCase):
             "run/archive",
             "run/respond",
         }:
-            self.assertEqual(client._timeout_for(method), 30.0)  # noqa: SLF001
+            self.assertEqual(client._timeout_for(method), 120.0)  # noqa: SLF001
         for method in {"ping", "run/list", "run/status", "run/queue", "events/read"}:
-            self.assertEqual(client._timeout_for(method), 1.0)  # noqa: SLF001
+            self.assertEqual(client._timeout_for(method), 3.0)  # noqa: SLF001
         connection = mock.Mock()
         connection.connect.side_effect = socket.timeout()
         with mock.patch(
@@ -10448,7 +10448,7 @@ class UnixClientTests(unittest.IsolatedAsyncioTestCase):
             with self.assertRaises(SupervisorUnavailable) as timed_out:
                 client.request("run/start", {"agent_id": "WIKI-TIMEOUT"})
 
-        self.assertEqual(connection.settimeout.call_args.args, (30.0,))
+        self.assertEqual(connection.settimeout.call_args.args, (120.0,))
         self.assertIn("may have succeeded", str(timed_out.exception))
         self.assertIn("Check GET /api/agents", str(timed_out.exception))
 
@@ -10460,7 +10460,7 @@ class UnixClientTests(unittest.IsolatedAsyncioTestCase):
         ):
             with self.assertRaises(SupervisorUnavailable):
                 client.request("run/status", {"agent_id": "WIKI-TIMEOUT"})
-        self.assertEqual(read_connection.settimeout.call_args.args, (1.0,))
+        self.assertEqual(read_connection.settimeout.call_args.args, (3.0,))
 
     async def test_server_accepts_existing_prompt_contract_above_default_reader_limit(
         self,

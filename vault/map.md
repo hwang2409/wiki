@@ -62,6 +62,7 @@ Topic → note index. **Agents: read this file first, before grepping.** Every n
 - [[admin-agent-tool-discovery]] — native tool_search + defer_loading decision, shipping chain PHO-14285..88, go/no-go = 14286 eval, watch items
 - [[admin-redesign]] — full /admin/* redesign decision (2026-07-27): Ramp×Linear×wiki direction, scrap 14461 primitives, signal-tier IA per laws-of-ux, one mega-PR after in-flight admin set lands
 - [[admin-agent-audit-2026-07-30]] — full admin-agent audit @main 7a3a01e1e2: 182 tools, 5H/11M/4L, remediation order
+- [[v3-harness-design]] — v3 harness design (2026-07-31): implicit sandbox, artifact spill, single retrieve/write/describe doors, per-conversation workspace; Linear project Phoebe Agent V3
 
 ## Phoebe/til
 

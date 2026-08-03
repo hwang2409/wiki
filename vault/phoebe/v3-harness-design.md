@@ -18,6 +18,16 @@ Agent V3** (one ticket per build step, all scoped to Henry).
 - 2026-07-31: PHO-14963 provider-neutral tool discovery passed final review at `c7dd622e70` on `henry/phoebe-v3-agent-tool-search`; no PR opened.
 - 2026-07-31: PHO-14977 helper bin and eval scaffolding passed final review at `66b3cd5da7` on `henry/phoebe-v3-agent-helpers`; no PR opened.
 
+Update 2026-07-31 (Henry): step work drifted onto independent
+`henry/phoebe-v3-agent-*` branches off `main` (describe, parity,
+tool-search, helpers, workspace, retrieve, write) with heavy file overlap.
+Henry re-confirmed `henry/phoebe-v3-agent` as the single experimental
+branch; PHO-V3-INTEGRATE worker is merging the settled step branches into
+it (describe -> parity -> tool-search -> helpers), and workspace/retrieve/
+write fold in as each clears review. Some tickets name a
+`henry/phoebe-v3-harness-proto` umbrella — that branch never existed; this
+note is canonical.
+
 ## Problem
 
 The v2 general agent grows by adding scoped, atomic tools for every

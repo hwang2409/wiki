@@ -13,7 +13,18 @@ During multi-worker phoebe sessions with the local-Bazel ban (pre-push hook exce
 - Worker status: "pre-push hook exhausted Ns Bazel slot waits; hook not bypassed"
 - `lsof /tmp/bazel-slots/slot-*` shows java PIDs at 0% CPU tagged `bazel(<ticket>)` of idle or archived workers
 
-## Fix (30 seconds, orchestrator)
+## Root-cause fix (landed 2026-07-31, phoebe orchestrator)
+
+The real leak was in `~/.local/bin/agent-shims/bazel`: it acquired the flock,
+marked the fd inheritable, and `execv`'d the real bazel. The bazel client
+forks the server daemon, which inherited the fd — so every finished build left
+a JVM squatting a slot for its lifetime. Patched: the shim now holds the lock
+itself and runs bazel as a `subprocess.Popen(..., close_fds=True)` child,
+releasing the slot the moment the client invocation exits. Verified: slot
+frees while the server daemon stays alive. Backup of the old shim at
+`~/.local/bin/agent-shims/bazel.bak-20260731`.
+
+## Legacy symptom cleanup (only needed for pre-fix squatters)
 1. `lsof /tmp/bazel-slots/slot-0 /tmp/bazel-slots/slot-1` — identify holder PIDs
 2. `ps` check they are 0% CPU idle (never kill an active >5% hook run)
 3. `kill <idle pids>` — waiting hooks acquire freed slots within seconds

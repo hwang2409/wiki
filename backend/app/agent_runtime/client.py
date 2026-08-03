@@ -19,8 +19,9 @@ from .version import RUNTIME_FINGERPRINT, RUNTIME_FROZEN
 
 
 DEFAULT_SWAP_DRAIN_SECONDS = 10.0
-DEFAULT_FAST_READ_TIMEOUT = 1.0
-DEFAULT_SLOW_OPERATION_TIMEOUT = 30.0
+DEFAULT_FAST_READ_TIMEOUT = 3.0
+DEFAULT_SLOW_OPERATION_TIMEOUT = 120.0
+DEFAULT_ENSURE_RUNNING_TIMEOUT = 15.0
 _HANDOVER_STATES = frozenset({"working", "waiting-approval", "idle"})
 
 _FAST_READ_METHODS = frozenset(
@@ -231,7 +232,9 @@ class SupervisorClient:
             writer.close()
             await writer.wait_closed()
 
-    def ensure_running(self, *, timeout: float = 5.0) -> dict[str, Any]:
+    def ensure_running(
+        self, *, timeout: float = DEFAULT_ENSURE_RUNNING_TIMEOUT
+    ) -> dict[str, Any]:
         active_runs: list[dict[str, Any]] = []
         autostart_enabled = os.environ.get(
             "WIKI_SUPERVISOR_AUTOSTART", "on"
