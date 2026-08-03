@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useState } from "react";
+import { useEffect, useMemo, useRef, useState } from "react";
 import { AlertTriangle, ChevronDown, ChevronRight, ListTodo, Terminal } from "lucide-react";
 import { DisclosureContent } from "./disclosure";
 import type { ProviderStreamEvent } from "./api";
@@ -215,20 +215,19 @@ function latestDiffSource(events: ProviderStreamEvent[]): string | null {
   return null;
 }
 
-function WarningRenderer({ event, moderation = false }: { event: ProviderStreamEvent; moderation?: boolean }) {
-  const params = eventParams(event);
-  const details: string[] = [];
+function collectModerationFlags(value: unknown): string[] {
+  const flags: string[] = [];
   const addFlag = (name: string) => {
-    if (name.toLowerCase() !== "safe" && !details.includes(name)) details.push(name);
+    if (name.toLowerCase() !== "safe" && !flags.includes(name)) flags.push(name);
   };
-  const visitFlags = (value: unknown, inFlagMap = false) => {
-    if (Array.isArray(value)) {
-      value.forEach((child) => visitFlags(child, inFlagMap));
+  const walk = (node: unknown, inFlagMap = false): void => {
+    if (Array.isArray(node)) {
+      node.forEach((child) => walk(child, inFlagMap));
       return;
     }
-    const record = recordValue(value);
+    const record = recordValue(node);
     if (!record) {
-      if (inFlagMap && typeof value === "string") addFlag(value);
+      if (inFlagMap && typeof node === "string") addFlag(node);
       return;
     }
     for (const [key, child] of Object.entries(record)) {
@@ -240,17 +239,248 @@ function WarningRenderer({ event, moderation = false }: { event: ProviderStreamE
       if (childIsFlagMap && child === true) addFlag(key);
       else if (childIsFlagMap && typeof child === "string") addFlag(child);
       else if (key === "is_blocked" && child === true) addFlag("blocked");
-      else if (child && typeof child === "object") visitFlags(child, childIsFlagMap);
+      else if (child && typeof child === "object") walk(child, childIsFlagMap);
     }
   };
-  visitFlags(params);
-  const message = stringValue(params.message) ?? "moderation flag raised";
+  walk(value);
+  return flags;
+}
+
+// Classification rules for provider diagnostics.
+//
+// A diagnostic's grouping key is `${source}|${kind}|${code}` — all three are
+// derived from structured event fields or from message-shape patterns, never
+// from the interpolated display text. Values like file paths, timeouts, and
+// thread ids do NOT influence the key; two clamp warnings for different
+// plugin files still coalesce.
+//
+// Severity is per-event; the group takes the max. `actionRequired` marks the
+// group for auto-open — reserved for cases where the user must intervene
+// (blocked moderation, failed provider call).
+export type DiagnosticSeverity = "advisory" | "warning" | "danger";
+
+export type DiagnosticClassification = {
+  source: string;
+  kind: string;
+  code: string;
+  severity: DiagnosticSeverity;
+  summary: string;
+  label: string;
+  actionRequired: boolean;
+  flags: string[];
+  message: string;
+};
+
+const CLAMP_MESSAGE_RE = /^\s*clamping\b/i;
+const HOOK_TIMEOUT_RE = /\bhook\s+timeout\b/i;
+
+function classifyCodexWarning(event: ProviderStreamEvent): DiagnosticClassification {
+  const message = stringValue(eventParams(event).message) ?? "runtime warning";
+  if (CLAMP_MESSAGE_RE.test(message)) {
+    const code = HOOK_TIMEOUT_RE.test(message) ? "hook-timeout" : "generic";
+    return {
+      source: "codex",
+      kind: "clamp",
+      code,
+      severity: "advisory",
+      summary: code === "hook-timeout" ? "hook timeout clamped" : "runtime setting clamped",
+      label: "advisory",
+      actionRequired: false,
+      flags: [],
+      message,
+    };
+  }
+  return {
+    source: "codex",
+    kind: "unknown",
+    code: "generic",
+    severity: "warning",
+    summary: "runtime warning",
+    label: "warning",
+    actionRequired: false,
+    flags: [],
+    message,
+  };
+}
+
+function classifyModerationWarning(event: ProviderStreamEvent): DiagnosticClassification {
+  const flags = collectModerationFlags(eventParams(event));
+  const blocked = flags.includes("blocked");
+  // Kind is intentionally a single bucket per categorical flag set so a
+  // blocked escalation coalesces with prior advisory flag events on the
+  // same category — the group promotes severity on the fly.
+  const categorical = flags.filter((flag) => flag !== "blocked");
+  const code = categorical.length ? categorical.slice().sort().join("+") : "generic";
+  const message = stringValue(eventParams(event).message) ?? (blocked ? "prompt blocked by moderation" : "moderation flag raised");
+  return {
+    source: "moderation",
+    kind: "moderation",
+    code,
+    severity: blocked ? "danger" : "warning",
+    summary: blocked ? "moderation blocked" : "moderation flag",
+    label: blocked ? "blocked" : "moderation",
+    actionRequired: blocked,
+    flags,
+    message,
+  };
+}
+
+export function classifyProviderDiagnostic(event: ProviderStreamEvent): DiagnosticClassification | null {
+  if (event.kind === "warning") return classifyCodexWarning(event);
+  if (event.kind === "turn_moderationMetadata_warning") return classifyModerationWarning(event);
+  return null;
+}
+
+const SEVERITY_RANK: Record<DiagnosticSeverity, number> = {
+  advisory: 0,
+  warning: 1,
+  danger: 2,
+};
+
+export type DiagnosticEntry = {
+  event: ProviderStreamEvent;
+  classification: DiagnosticClassification;
+};
+
+export type DiagnosticGroup = {
+  key: string;
+  source: string;
+  kind: string;
+  code: string;
+  severity: DiagnosticSeverity;
+  actionRequired: boolean;
+  summary: string;
+  label: string;
+  flags: string[];
+  entries: DiagnosticEntry[];
+  events: ProviderStreamEvent[];
+  firstSeq: number;
+};
+
+export function groupProviderDiagnostics(
+  events: readonly ProviderStreamEvent[],
+): DiagnosticGroup[] {
+  const groups = new Map<string, DiagnosticGroup>();
+  const order: string[] = [];
+  for (const event of events) {
+    const classification = classifyProviderDiagnostic(event);
+    if (!classification) continue;
+    const key = `${classification.source}|${classification.kind}|${classification.code}`;
+    const existing = groups.get(key);
+    const entry: DiagnosticEntry = { event, classification };
+    if (!existing) {
+      groups.set(key, {
+        key,
+        source: classification.source,
+        kind: classification.kind,
+        code: classification.code,
+        severity: classification.severity,
+        actionRequired: classification.actionRequired,
+        summary: classification.summary,
+        label: classification.label,
+        flags: [...classification.flags],
+        entries: [entry],
+        events: [event],
+        firstSeq: event.seq,
+      });
+      order.push(key);
+      continue;
+    }
+    existing.entries.push(entry);
+    existing.events.push(event);
+    if (SEVERITY_RANK[classification.severity] > SEVERITY_RANK[existing.severity]) {
+      existing.severity = classification.severity;
+      existing.summary = classification.summary;
+      existing.label = classification.label;
+    }
+    if (classification.actionRequired) existing.actionRequired = true;
+    for (const flag of classification.flags) {
+      if (!existing.flags.includes(flag)) existing.flags.push(flag);
+    }
+  }
+  return order.map((key) => groups.get(key)!);
+}
+
+function formatDiagnosticTime(iso: string): string {
+  const parsed = Date.parse(iso);
+  if (!Number.isFinite(parsed)) return iso.slice(11, 19);
+  return new Date(parsed).toLocaleTimeString(undefined, {
+    hour: "2-digit",
+    minute: "2-digit",
+    second: "2-digit",
+  });
+}
+
+function DiagnosticGroupRow({ group }: { group: DiagnosticGroup }) {
+  const [open, setOpen] = useState(group.actionRequired);
+  // Transition-only escalation: open the body on the false -> true edge of
+  // group.actionRequired, then never again for the life of the group. Once
+  // the row has been promoted the user's manual close is respected even if
+  // more actionRequired events arrive — repeated diagnostics must not
+  // overwrite an explicit dismissal.
+  const prevActionRequired = useRef(group.actionRequired);
+  useEffect(() => {
+    if (!prevActionRequired.current && group.actionRequired) {
+      setOpen(true);
+    }
+    prevActionRequired.current = group.actionRequired;
+  }, [group.actionRequired]);
+  const count = group.events.length;
+  const label = group.label;
+  const flagText = group.flags.length ? group.flags.join(", ") : null;
   return (
-    <div className={`codex-stream-warning${moderation ? " is-moderation" : ""}`} role="status">
-      <AlertTriangle aria-hidden="true" size={13} />
-      <span className="codex-stream-warning-label">{moderation ? "moderation" : "warning"}</span>
-      {details.length ? <span className="codex-stream-warning-flag">{details.join(", ")}</span> : null}
-      <span className="codex-stream-warning-message">{message}</span>
+    <div
+      className={`codex-stream-diagnostic is-${group.severity}`}
+      data-testid="codex-diagnostic-group"
+      data-source={group.source}
+      data-kind={group.kind}
+      data-code={group.code}
+      role="status"
+      aria-live="polite"
+    >
+      <button
+        type="button"
+        aria-expanded={open}
+        className="codex-stream-diagnostic-head"
+        onClick={() => setOpen((value) => !value)}
+      >
+        <ChevronDown
+          aria-hidden="true"
+          className={`disclosure-chevron${open ? "" : " is-collapsed"}`}
+          size={12}
+        />
+        <AlertTriangle aria-hidden="true" size={13} />
+        <span className="codex-stream-diagnostic-label">{label}</span>
+        {flagText ? <span className="codex-stream-diagnostic-flag">{flagText}</span> : null}
+        <span className="codex-stream-diagnostic-summary">{group.summary}</span>
+        {count > 1 ? (
+          <span className="codex-stream-diagnostic-count tabular-nums" aria-label={`${count} events`}>
+            {count}
+          </span>
+        ) : null}
+      </button>
+      <DisclosureContent open={open}>
+        <ul className="codex-stream-diagnostic-body" data-testid="codex-diagnostic-body">
+          {group.entries.map((entry) => (
+            <li key={entry.event.seq} className="codex-stream-diagnostic-item">
+              <time className="codex-stream-diagnostic-time tabular-nums" dateTime={entry.event.normalized_at}>
+                {formatDiagnosticTime(entry.event.normalized_at)}
+              </time>
+              <pre className="codex-stream-diagnostic-message">{entry.classification.message}</pre>
+            </li>
+          ))}
+        </ul>
+      </DisclosureContent>
+    </div>
+  );
+}
+
+function ProviderDiagnosticsRenderer({ events }: { events: readonly ProviderStreamEvent[] }) {
+  const groups = useMemo(() => groupProviderDiagnostics(events), [events]);
+  if (!groups.length) return null;
+  return (
+    <div className="codex-stream-diagnostics" data-testid="codex-diagnostics">
+      {groups.map((group) => <DiagnosticGroupRow group={group} key={group.key} />)}
     </div>
   );
 }
@@ -529,8 +759,9 @@ export function CodexStreamHighlights({
   currentTurnDiff?: string | null;
 }) {
   const rendered = events.filter((event) => event.disposition === "rendered");
-  const warningEvents = rendered.filter((event) => event.kind === "warning");
-  const moderationEvents = rendered.filter((event) => event.kind === "turn_moderationMetadata_warning");
+  const diagnosticEvents = rendered.filter((event) => (
+    event.kind === "warning" || event.kind === "turn_moderationMetadata_warning"
+  ));
   const skillEvents = rendered.filter((event) => event.kind === "skills_changed");
   const planEvents = rendered.filter((event) => event.kind === "turn_plan_updated");
   const hasHookEvents = events.some((event) => event.kind === "hook_started" || event.kind === "hook_completed");
@@ -538,8 +769,7 @@ export function CodexStreamHighlights({
   if (!rendered.length && !hasHookEvents && diffSource === null) return null;
   return (
     <div className="codex-stream-highlights">
-      {warningEvents.map((event) => <WarningRenderer event={event} key={event.seq} />)}
-      {moderationEvents.map((event) => <WarningRenderer event={event} key={event.seq} moderation />)}
+      <ProviderDiagnosticsRenderer events={diagnosticEvents} />
       <HookLifecycleRenderer events={events} />
       <TerminalInteractionRenderer events={events} />
       <DiffRenderer source={diffSource} />

@@ -6129,7 +6129,6 @@ body.is-resizing-panes .pane-cell {
   padding: 0 8px 7px;
 }
 
-.codex-stream-warning,
 .codex-stream-command-card,
 .codex-stream-chip {
   display: inline-flex;
@@ -6144,29 +6143,12 @@ body.is-resizing-panes .pane-cell {
   overflow-wrap: anywhere;
 }
 
-.codex-stream-warning {
-  border-color: color-mix(in srgb, var(--accent-warning) 60%, var(--background-modifier-border));
-  background-color: color-mix(in srgb, var(--accent-warning) 10%, var(--background-primary));
-  color: var(--text-normal);
-}
-
-.codex-stream-warning:not(.is-moderation) {
-  border-color: color-mix(in srgb, var(--accent-danger) 65%, var(--background-modifier-border));
-  background-color: color-mix(in srgb, var(--accent-danger) 11%, var(--background-primary));
-}
-
-.codex-stream-warning-label,
 .codex-stream-command-label {
   color: var(--accent-warning);
   font-weight: var(--fw-semibold);
   text-transform: lowercase;
 }
 
-.codex-stream-warning:not(.is-moderation) .codex-stream-warning-label {
-  color: var(--accent-danger);
-}
-
-.codex-stream-warning-flag,
 .codex-stream-command-id,
 .codex-stream-artifact-count,
 .codex-stream-diff-kind {
@@ -6174,10 +6156,145 @@ body.is-resizing-panes .pane-cell {
   font-size: var(--fs-2xs);
 }
 
-.codex-stream-warning-message {
+/* Coalesced provider diagnostics (WIKI-239). One row per stable
+   source/kind/code group, with the raw events tucked inside an expandable
+   body. Severity classes: advisory (muted hairline), warning (attention),
+   danger (blocked run / failed action — never a routine clamp). */
+.codex-stream-diagnostics {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+}
+
+.codex-stream-diagnostic {
+  overflow: hidden;
+  border: 1px solid var(--background-modifier-border);
+  border-radius: var(--radius-sm);
+  background-color: var(--background-primary);
+}
+
+.codex-stream-diagnostic.is-advisory {
+  border-color: color-mix(in srgb, var(--text-faint) 40%, var(--background-modifier-border));
+  background-color: color-mix(in srgb, var(--text-faint) 6%, var(--background-primary));
+}
+
+.codex-stream-diagnostic.is-warning {
+  border-color: color-mix(in srgb, var(--accent-warning) 55%, var(--background-modifier-border));
+  background-color: color-mix(in srgb, var(--accent-warning) 10%, var(--background-primary));
+}
+
+.codex-stream-diagnostic.is-danger {
+  border-color: color-mix(in srgb, var(--accent-danger) 60%, var(--background-modifier-border));
+  background-color: color-mix(in srgb, var(--accent-danger) 11%, var(--background-primary));
+}
+
+.codex-stream-diagnostic-head {
+  display: flex;
+  align-items: center;
+  min-width: 0;
+  width: 100%;
+  min-height: 40px;
+  gap: 7px;
+  padding: 6px 10px;
+  border: 0;
+  background: transparent;
+  color: var(--text-normal);
+  font: inherit;
+  text-align: left;
+  cursor: pointer;
+  transition-property: background-color;
+  transition-duration: 120ms;
+  transition-timing-function: cubic-bezier(0.2, 0, 0, 1);
+}
+
+.codex-stream-diagnostic-head:hover {
+  background-color: color-mix(in srgb, var(--text-normal) 5%, transparent);
+}
+
+.codex-stream-diagnostic-head:focus-visible {
+  outline: 2px solid var(--accent-primary);
+  outline-offset: -2px;
+}
+
+.codex-stream-diagnostic.is-advisory .codex-stream-diagnostic-label {
+  color: var(--text-subtle-readable, var(--text-muted));
+}
+
+.codex-stream-diagnostic.is-warning .codex-stream-diagnostic-label {
+  color: var(--accent-warning);
+}
+
+.codex-stream-diagnostic.is-danger .codex-stream-diagnostic-label {
+  color: var(--accent-danger);
+}
+
+.codex-stream-diagnostic-label {
+  flex-shrink: 0;
+  font-weight: var(--fw-semibold);
+  text-transform: lowercase;
+}
+
+.codex-stream-diagnostic-flag {
+  flex-shrink: 0;
+  color: var(--text-faint);
+  font-size: var(--fs-2xs);
+  text-transform: lowercase;
+}
+
+.codex-stream-diagnostic-summary {
+  flex: 1 1 auto;
   min-width: 0;
   color: var(--text-normal);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.codex-stream-diagnostic-count {
+  flex-shrink: 0;
+  min-width: 20px;
+  padding: 1px 6px;
+  border-radius: var(--radius-full);
+  background-color: color-mix(in srgb, var(--text-normal) 12%, transparent);
+  color: var(--text-normal);
+  font-size: var(--fs-2xs);
+  font-weight: var(--fw-semibold);
+  text-align: center;
+}
+
+.codex-stream-diagnostic-body {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  margin: 0;
+  padding: 4px 10px 8px 28px;
+  list-style: none;
+  border-top: 1px solid color-mix(in srgb, var(--text-normal) 8%, transparent);
+}
+
+.codex-stream-diagnostic-item {
+  display: flex;
+  gap: 8px;
+  align-items: flex-start;
+  min-width: 0;
+}
+
+.codex-stream-diagnostic-time {
+  flex-shrink: 0;
+  color: var(--text-faint);
+  font-size: var(--fs-2xs);
+  padding-top: 1px;
+}
+
+.codex-stream-diagnostic-message {
+  flex: 1 1 auto;
+  min-width: 0;
+  margin: 0;
+  color: var(--text-normal);
+  font-family: inherit;
+  font-size: var(--fs-xs);
   white-space: pre-wrap;
+  overflow-wrap: anywhere;
 }
 
 .codex-stream-chip-row {
