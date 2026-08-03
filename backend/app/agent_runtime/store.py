@@ -8,6 +8,7 @@ import stat
 import tempfile
 import threading
 import base64
+from collections.abc import Iterator
 from copy import deepcopy
 from dataclasses import dataclass
 from datetime import datetime, timedelta
@@ -1147,24 +1148,16 @@ class RunStore:
                 normalized_path = self.normalized_events_path(record.run_id)
                 _repair_jsonl_tail(raw_path)
                 _repair_jsonl_tail(normalized_path)
-                raw_events = self._read_json_lines(raw_path)
-                normalized_events = self._read_json_lines(normalized_path)
-                raw_count = max(
-                    (int(event.get("seq", 0)) for event in raw_events),
-                    default=0,
-                )
-                normalized_count = max(
-                    (int(event.get("seq", 0)) for event in normalized_events),
-                    default=0,
-                )
-                record_dirty = False
-                if (
-                    record.raw_event_count != raw_count
-                    or record.normalized_event_count != normalized_count
-                ):
-                    record.raw_event_count = raw_count
-                    record.normalized_event_count = normalized_count
-                    record_dirty = True
+                # WIKI-243: stream both logs instead of materializing full
+                # dict lists. Startup used to pull every run's raw +
+                # normalized JSONL into RAM just to compute max(seq)
+                # (and, for legacy runs, one legacy_boundary), which
+                # peaked backend RSS on repos with hundreds of runs.
+                raw_count = 0
+                for event in self._iter_json_lines(raw_path):
+                    seq = int(event.get("seq", 0))
+                    if seq > raw_count:
+                        raw_count = seq
                 # WIKI-232 REVIEW12 H1: legacy snapshots (schema_version < 2)
                 # were written before ``last_causal_raw_seq`` existed, so
                 # ``from_dict`` defaults it to 0. Left unseeded, the
@@ -1181,23 +1174,35 @@ class RunStore:
                 # the max raw_seq of any normalized event at or below
                 # that normalized checkpoint. Anything past the boundary
                 # is genuinely new and still applies.
-                if (
+                need_legacy_boundary = (
                     "last_causal_raw_seq" not in value
                     and record.last_lifecycle_event_seq > 0
                     and record.last_causal_raw_seq == 0
+                )
+                normalized_count = 0
+                legacy_boundary = 0
+                for event in self._iter_json_lines(normalized_path):
+                    seq = int(event.get("seq", 0))
+                    if seq > normalized_count:
+                        normalized_count = seq
+                    if (
+                        need_legacy_boundary
+                        and seq <= record.last_lifecycle_event_seq
+                    ):
+                        raw_seq = int(event.get("raw_seq", 0))
+                        if raw_seq > legacy_boundary:
+                            legacy_boundary = raw_seq
+                record_dirty = False
+                if (
+                    record.raw_event_count != raw_count
+                    or record.normalized_event_count != normalized_count
                 ):
-                    legacy_boundary = max(
-                        (
-                            int(event.get("raw_seq", 0))
-                            for event in normalized_events
-                            if int(event.get("seq", 0))
-                            <= record.last_lifecycle_event_seq
-                        ),
-                        default=0,
-                    )
-                    if legacy_boundary > 0:
-                        record.last_causal_raw_seq = legacy_boundary
-                        record_dirty = True
+                    record.raw_event_count = raw_count
+                    record.normalized_event_count = normalized_count
+                    record_dirty = True
+                if need_legacy_boundary and legacy_boundary > 0:
+                    record.last_causal_raw_seq = legacy_boundary
+                    record_dirty = True
                 if record_dirty:
                     self._write_record(record)
                 # Rebuild every event-derived projection from scratch in
@@ -2981,6 +2986,44 @@ class RunStore:
             if isinstance(value, dict):
                 events.append(value)
         return events
+
+    def _iter_json_lines(self, path: Path) -> Iterator[dict[str, Any]]:
+        """Stream one parsed record per JSONL line without materializing the file.
+
+        Recovery paths that only need a scalar per event (max seq, a set of
+        raw_seq values) use this instead of ``_read_json_lines`` so a
+        multi-hundred-run boot does not spike RSS holding every parsed
+        dict from every JSONL log at once (WIKI-243). Errors are swallowed
+        to match ``_read_json_lines``.
+        """
+
+        try:
+            handle = path.open("r", encoding="utf-8")
+        except FileNotFoundError as exc:
+            raise RunNotFound(str(path)) from exc
+        try:
+            for line in handle:
+                stripped = line.rstrip("\n")
+                if not stripped:
+                    continue
+                try:
+                    value = json.loads(stripped)
+                except ValueError:
+                    continue
+                if isinstance(value, dict):
+                    yield value
+        finally:
+            handle.close()
+
+    def iter_raw_events(self, run_id: str) -> Iterator[dict[str, Any]]:
+        """Stream raw-event records for ``run_id`` without materializing the log."""
+
+        return self._iter_json_lines(self.raw_events_path(run_id))
+
+    def iter_normalized_events(self, run_id: str) -> Iterator[dict[str, Any]]:
+        """Stream normalized-event records for ``run_id`` without materializing the log."""
+
+        return self._iter_json_lines(self.normalized_events_path(run_id))
 
     def _read_json_lines_tail(
         self,

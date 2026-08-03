@@ -1151,6 +1151,199 @@ class RunStoreTests(unittest.TestCase):
             self.assertEqual(recovered.last_causal_raw_seq, int(raw["seq"]))
             self.assertEqual(recovered.last_lifecycle_event_seq, 2)
 
+    def test_wiki_243_iter_json_lines_streams_records_without_full_load(
+        self,
+    ) -> None:
+        """WIKI-243: streaming helper yields parsed dicts one at a time
+        and swallows the same errors as ``_read_json_lines``."""
+
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            store = RunStore(_paths(root))
+            record = store.create(_record(root))
+            path = store.raw_events_path(record.run_id)
+            with path.open("w", encoding="utf-8") as handle:
+                handle.write('{"seq":1,"payload":{}}\n')
+                handle.write("\n")
+                handle.write("not-json\n")
+                handle.write('"scalar"\n')
+                handle.write('{"seq":2,"payload":{}}\n')
+            stream = store._iter_json_lines(path)  # noqa: SLF001
+            first = next(stream)
+            second = next(stream)
+            self.assertEqual(first["seq"], 1)
+            self.assertEqual(second["seq"], 2)
+            self.assertRaises(StopIteration, next, stream)
+
+    def test_wiki_243_reconcile_streams_recovery_logs_without_materializing_raw(
+        self,
+    ) -> None:
+        """WIKI-243: startup recovery must not pull the raw JSONL into RAM.
+
+        Previously ``_reconcile_existing_runs`` called ``_read_json_lines``
+        on both raw and normalized paths — a full list-of-parsed-dicts
+        allocation per run just to compute two ``max(seq)`` scalars (and
+        one legacy boundary). On multi-hundred-run stores this spiked
+        backend RSS. The refactor streams both. We patch both helpers to
+        record which paths they touch and assert the raw log is never
+        materialized via ``_read_json_lines`` during recovery. The
+        normalized log is still read once by
+        ``rebuild_projections_from_normalized`` — out of scope here.
+        """
+
+        rows = 1000
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            paths = _paths(root)
+            store = RunStore(paths)
+            record = store.create(_record(root))
+            raw_path = store.raw_events_path(record.run_id)
+            norm_path = store.normalized_events_path(record.run_id)
+            with (
+                raw_path.open("w", encoding="utf-8") as raw_handle,
+                norm_path.open("w", encoding="utf-8") as norm_handle,
+            ):
+                for seq in range(1, rows + 1):
+                    raw_handle.write(
+                        json.dumps(
+                            {
+                                "seq": seq,
+                                "received_at": "2026-01-01T00:00:00Z",
+                                "provider": "codex",
+                                "direction": "provider",
+                                "generation": 1,
+                                "payload": {"method": "fixture"},
+                            }
+                        )
+                        + "\n"
+                    )
+                    norm_handle.write(
+                        json.dumps(
+                            {
+                                "seq": seq,
+                                "raw_seq": seq,
+                                "normalized_at": "2026-01-01T00:00:00Z",
+                                "disposition": EventDisposition.IGNORED.value,
+                                "kind": "fixture",
+                                "payload": {},
+                                "lifecycle_state": None,
+                            }
+                        )
+                        + "\n"
+                    )
+            del store
+
+            original_read = store_module.RunStore._read_json_lines
+            original_iter = store_module.RunStore._iter_json_lines
+            read_paths: list[Path] = []
+            iter_paths: list[Path] = []
+
+            def spy_read(
+                self: store_module.RunStore, path: Path
+            ) -> list[dict[str, Any]]:
+                read_paths.append(path)
+                return original_read(self, path)
+
+            def spy_iter(self: store_module.RunStore, path: Path):
+                iter_paths.append(path)
+                yield from original_iter(self, path)
+
+            with (
+                mock.patch.object(
+                    store_module.RunStore, "_read_json_lines", spy_read
+                ),
+                mock.patch.object(
+                    store_module.RunStore, "_iter_json_lines", spy_iter
+                ),
+            ):
+                restarted = RunStore(paths)
+
+            self.assertNotIn(
+                raw_path,
+                read_paths,
+                "reconcile must stream the raw log, not materialize it",
+            )
+            self.assertIn(
+                raw_path,
+                iter_paths,
+                "reconcile must scan the raw log via the streaming helper",
+            )
+            self.assertIn(
+                norm_path,
+                iter_paths,
+                "reconcile must scan the normalized log via the streaming helper",
+            )
+            recovered = restarted.get(record.run_id)
+            self.assertEqual(recovered.raw_event_count, rows)
+            self.assertEqual(recovered.normalized_event_count, rows)
+
+    def test_wiki_243_reconcile_derives_legacy_last_causal_raw_seq_via_stream(
+        self,
+    ) -> None:
+        """WIKI-243 + WIKI-232 REVIEW12 H1: the legacy
+        ``last_causal_raw_seq`` derivation now runs inside the streaming
+        pass over normalized events. The raw log must not be materialized
+        via ``_read_json_lines`` on the recovery path."""
+
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            paths = _paths(root)
+            store = RunStore(paths)
+            record = store.create(_record(root))
+            started = store.append_raw(
+                record.run_id,
+                provider="codex",
+                direction="provider",
+                payload={"method": "turn/started"},
+            )
+            store.append_normalized(
+                record.run_id,
+                raw_seq=started["seq"],
+                disposition=EventDisposition.RENDERED,
+                kind="turn_started",
+                payload={"method": "turn/started"},
+                lifecycle_state=LifecycleState.WORKING,
+            )
+            completed = store.append_raw(
+                record.run_id,
+                provider="codex",
+                direction="provider",
+                payload={"method": "turn/completed"},
+            )
+            store.append_normalized(
+                record.run_id,
+                raw_seq=completed["seq"],
+                disposition=EventDisposition.RENDERED,
+                kind="turn_completed",
+                payload={"status": "completed"},
+                lifecycle_state=LifecycleState.IDLE,
+            )
+            run_path = store.run_path(record.run_id)
+            metadata = json.loads(run_path.read_text(encoding="utf-8"))
+            metadata.pop("last_causal_raw_seq", None)
+            run_path.write_text(json.dumps(metadata), encoding="utf-8")
+
+            raw_path = store.raw_events_path(record.run_id)
+            original_read = store_module.RunStore._read_json_lines
+
+            def blocking_read(
+                self: store_module.RunStore, path: Path
+            ) -> list[dict[str, Any]]:
+                if path == raw_path:
+                    raise AssertionError(
+                        "reconcile must not materialize the raw log"
+                    )
+                return original_read(self, path)
+
+            with mock.patch.object(
+                store_module.RunStore, "_read_json_lines", blocking_read
+            ):
+                restarted = RunStore(paths)
+            recovered = restarted.get(record.run_id)
+            self.assertEqual(
+                recovered.last_causal_raw_seq, int(completed["seq"])
+            )
+
     def test_clean_reopen_does_not_rewrite_rebuilt_run_projection(
         self,
     ) -> None:
