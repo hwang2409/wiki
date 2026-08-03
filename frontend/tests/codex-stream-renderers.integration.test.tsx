@@ -1,9 +1,10 @@
-import { cleanup, fireEvent, render, screen } from "@testing-library/react";
+import { cleanup, fireEvent, render, screen, within } from "@testing-library/react";
 import { afterEach, describe, expect, it } from "vitest";
 import {
   commandExecutionCards,
   CodexStreamHighlights,
   deriveHookChips,
+  groupProviderDiagnostics,
   matchedTerminalInteractions,
   parseDiffSnapshot,
 } from "../src/codex-stream-renderers";
@@ -120,7 +121,7 @@ describe("codex stream renderers", () => {
     expect(screen.getByText("list refreshed")).toBeTruthy();
   });
 
-  it("renders nested moderation category flags in the warning chip", () => {
+  it("renders nested moderation category flags on the diagnostic row", () => {
     render(
       <CodexStreamHighlights
         events={[event("turn_moderationMetadata_warning", 1, {
@@ -131,7 +132,7 @@ describe("codex stream renderers", () => {
         })]}
       />,
     );
-    expect(document.querySelector(".codex-stream-warning-flag")?.textContent).toBe("blocked, violence");
+    expect(document.querySelector(".codex-stream-diagnostic-flag")?.textContent).toBe("blocked, violence");
   });
 
   it("uses the newest complete diff snapshot and drops reverted files", () => {
@@ -216,6 +217,132 @@ describe("codex stream renderers", () => {
     expandDiffSection();
     expect(view.container.querySelectorAll(".codex-stream-diff-file").length).toBeLessThanOrEqual(100);
     expect(view.getByTestId("codex-diff-omitted")).toBeTruthy();
+  });
+
+  it("groups clamp warnings by stable source, kind, and code — never by display text", () => {
+    const first = event("warning", 1, {
+      message: "clamping SessionEnd hook timeout to 3s in /Users/henry/.codex/plugins/cache/openai-codex/codex/1.0.6/hooks/hooks.json",
+    });
+    const second = event("warning", 2, {
+      message: "clamping UserPromptSubmit hook timeout to 3s in /Users/henry/.codex/plugins/other/plugin.json",
+    });
+    const groups = groupProviderDiagnostics([first, second]);
+    expect(groups).toHaveLength(1);
+    expect(groups[0]?.source).toBe("codex");
+    expect(groups[0]?.kind).toBe("clamp");
+    expect(groups[0]?.code).toBe("hook-timeout");
+    expect(groups[0]?.severity).toBe("advisory");
+    expect(groups[0]?.actionRequired).toBe(false);
+    expect(groups[0]?.events.map((e) => e.seq)).toEqual([1, 2]);
+  });
+
+  it("keeps distinct diagnostic sources as separate rows", () => {
+    const clamp = event("warning", 1, {
+      message: "clamping SessionEnd hook timeout to 3s in /path/hooks.json",
+    });
+    const moderation = event("turn_moderationMetadata_warning", 2, {
+      metadata: { prompt: { omnimod: { outputs: [{
+        is_blocked: true,
+        results: [{ labels: ["violence"] }],
+      }] } } },
+    });
+    const groups = groupProviderDiagnostics([clamp, moderation]);
+    expect(groups).toHaveLength(2);
+    const sources = groups.map((g) => g.source).sort();
+    expect(sources).toEqual(["codex", "moderation"]);
+  });
+
+  it("promotes group severity to the highest per-event severity", () => {
+    const flagged = event("turn_moderationMetadata_warning", 1, {
+      metadata: { prompt: { omnimod: { outputs: [{
+        is_blocked: false,
+        results: [{ labels: ["hate"] }],
+      }] } } },
+    });
+    const blocked = event("turn_moderationMetadata_warning", 2, {
+      metadata: { prompt: { omnimod: { outputs: [{
+        is_blocked: true,
+        results: [{ labels: ["hate"] }],
+      }] } } },
+    });
+    const groups = groupProviderDiagnostics([flagged, blocked]);
+    expect(groups).toHaveLength(1);
+    expect(groups[0]?.severity).toBe("danger");
+    expect(groups[0]?.actionRequired).toBe(true);
+    expect(groups[0]?.events).toHaveLength(2);
+  });
+
+  it("preserves every raw warning message in the expanded diagnostics body", () => {
+    const first = event("warning", 1, {
+      message: "clamping SessionEnd hook timeout to 3s in /a/hooks.json",
+    });
+    const second = event("warning", 2, {
+      message: "clamping UserPromptSubmit hook timeout to 3s in /b/plugin.json",
+    });
+    render(<CodexStreamHighlights events={[first, second]} />);
+    const toggle = screen.getByRole("button", { name: /hook timeout clamped/i });
+    expect(toggle.getAttribute("aria-expanded")).toBe("false");
+    fireEvent.click(toggle);
+    const body = document.querySelector("[data-testid='codex-diagnostic-body']");
+    expect(body).toBeTruthy();
+    expect(body!.textContent).toContain("/a/hooks.json");
+    expect(body!.textContent).toContain("/b/plugin.json");
+  });
+
+  it("auto-opens groups when user action is required", () => {
+    const blocked = event("turn_moderationMetadata_warning", 1, {
+      metadata: { prompt: { omnimod: { outputs: [{
+        is_blocked: true,
+        results: [{ labels: ["hate"] }],
+      }] } } },
+    });
+    render(<CodexStreamHighlights events={[blocked]} />);
+    const toggle = screen.getByRole("button", { name: /moderation blocked/i });
+    expect(toggle.getAttribute("aria-expanded")).toBe("true");
+  });
+
+  it("keeps advisory clamp groups collapsed on first render", () => {
+    const clamp = event("warning", 1, {
+      message: "clamping SessionEnd hook timeout to 3s in /a/hooks.json",
+    });
+    render(<CodexStreamHighlights events={[clamp]} />);
+    const toggle = screen.getByRole("button", { name: /hook timeout clamped/i });
+    expect(toggle.getAttribute("aria-expanded")).toBe("false");
+  });
+
+  it("renders clamp notices with advisory styling — no danger class", () => {
+    const clamp = event("warning", 1, {
+      message: "clamping SessionEnd hook timeout to 3s in /a/hooks.json",
+    });
+    const { container } = render(<CodexStreamHighlights events={[clamp]} />);
+    const row = container.querySelector(".codex-stream-diagnostic");
+    expect(row).toBeTruthy();
+    expect(row!.className).toContain("is-advisory");
+    expect(row!.className).not.toContain("is-danger");
+  });
+
+  it("reserves danger styling for blocked runs", () => {
+    const blocked = event("turn_moderationMetadata_warning", 1, {
+      metadata: { prompt: { omnimod: { outputs: [{
+        is_blocked: true,
+        results: [{ labels: ["hate"] }],
+      }] } } },
+    });
+    const { container } = render(<CodexStreamHighlights events={[blocked]} />);
+    const row = container.querySelector(".codex-stream-diagnostic");
+    expect(row).toBeTruthy();
+    expect(row!.className).toContain("is-danger");
+  });
+
+  it("shows a coalesced count when a group has more than one event", () => {
+    const events = [
+      event("warning", 1, { message: "clamping SessionEnd hook timeout to 3s in /a/hooks.json" }),
+      event("warning", 2, { message: "clamping SessionEnd hook timeout to 3s in /b/hooks.json" }),
+      event("warning", 3, { message: "clamping SessionEnd hook timeout to 3s in /c/hooks.json" }),
+    ];
+    render(<CodexStreamHighlights events={events} />);
+    const toggle = screen.getByRole("button", { name: /hook timeout clamped/i });
+    expect(within(toggle).getByText("3")).toBeTruthy();
   });
 
   it("collapses the working diff section by default; toggle reveals the file list", () => {
