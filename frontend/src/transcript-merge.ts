@@ -175,7 +175,11 @@ function applyPatches(
     if (index === undefined) continue;
     const event = next[index];
     if (!event?.tool) continue;
-    if (event.tool.output === patch.output && event.tool.ok === patch.ok) continue;
+    if (
+      event.tool.output === patch.output
+      && event.tool.ok === patch.ok
+      && event.tool.completed_at === patch.completed_at
+    ) continue;
     if (next === events) next = events.slice();
     changedFrom = Math.min(changedFrom, index);
     next[index] = {
@@ -184,6 +188,7 @@ function applyPatches(
         ...event.tool,
         output: patch.output,
         ok: patch.ok,
+        completed_at: patch.completed_at,
       },
     };
   }

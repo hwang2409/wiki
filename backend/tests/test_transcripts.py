@@ -233,6 +233,104 @@ class ArtifactTranscriptTests(unittest.TestCase):
             "render_artifact completed without a parseable artifact",
         )
 
+    def test_codex_tool_retains_result_completion_time(self) -> None:
+        rows = [
+            {
+                "type": "response_item",
+                "timestamp": "2026-08-02T12:00:01Z",
+                "payload": {
+                    "type": "function_call",
+                    "call_id": "call-with-late-result",
+                    "name": "exec_command",
+                    "arguments": json.dumps({"cmd": "npm test"}),
+                },
+            },
+            {
+                "type": "response_item",
+                "timestamp": "2026-08-02T12:00:04Z",
+                "payload": {
+                    "type": "function_call_output",
+                    "call_id": "call-with-late-result",
+                    "output": "tests passed\nexited with code 0",
+                },
+            },
+        ]
+        with TemporaryDirectory() as tmp:
+            path = Path(tmp) / "codex-result-time.jsonl"
+            path.write_text("".join(json.dumps(row) + "\n" for row in rows))
+            parsed = transcripts.read_session_events("codex", path)
+
+        tool = parsed["events"][0]["tool"]
+        self.assertEqual(tool["completed_at"], "2026-08-02T12:00:04Z")
+
+    def test_codex_event_message_tool_retains_result_completion_time(self) -> None:
+        rows = [
+            {
+                "type": "response_item",
+                "timestamp": "2026-08-02T12:00:01Z",
+                "payload": {
+                    "type": "custom_tool_call",
+                    "call_id": "call-event-message-result",
+                    "name": "mcp__fixture__read",
+                    "input": "fixture input",
+                },
+            },
+            {
+                "type": "event_msg",
+                "timestamp": "2026-08-02T12:00:05Z",
+                "payload": {
+                    "type": "mcp_tool_call_end",
+                    "call_id": "call-event-message-result",
+                    "result": {
+                        "Err": {
+                            "content": [{"type": "text", "text": "fixture failed"}],
+                        },
+                    },
+                },
+            },
+        ]
+        with TemporaryDirectory() as tmp:
+            path = Path(tmp) / "codex-event-message-result-time.jsonl"
+            path.write_text("".join(json.dumps(row) + "\n" for row in rows))
+            parsed = transcripts.read_session_events("codex", path)
+
+        tool = parsed["events"][0]["tool"]
+        self.assertEqual(tool["completed_at"], "2026-08-02T12:00:05Z")
+
+    def test_claude_tool_retains_result_completion_time(self) -> None:
+        rows = [
+            {
+                "type": "assistant",
+                "timestamp": "2026-08-02T12:00:01Z",
+                "message": {
+                    "content": [{
+                        "type": "tool_use",
+                        "id": "toolu-result-time",
+                        "name": "Read",
+                        "input": {"file_path": "frontend/src/session.tsx"},
+                    }],
+                },
+            },
+            {
+                "type": "user",
+                "timestamp": "2026-08-02T12:00:06Z",
+                "message": {
+                    "content": [{
+                        "type": "tool_result",
+                        "tool_use_id": "toolu-result-time",
+                        "content": "fixture source",
+                    }],
+                },
+            },
+        ]
+        with TemporaryDirectory() as tmp:
+            path = Path(tmp) / "claude-result-time.jsonl"
+            path.write_text("".join(json.dumps(row) + "\n" for row in rows))
+            parsed = transcripts.read_session_events("claude", path)
+
+        tool = parsed["events"][0]["tool"]
+        self.assertEqual(tool["completed_at"], "2026-08-02T12:00:06Z")
+
     def test_claude_structured_content_result_reconstructs_artifact_event(self) -> None:
         path = FIXTURES_DIR / "claude_artifact_structured_content.jsonl"
 

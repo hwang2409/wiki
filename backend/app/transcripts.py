@@ -862,6 +862,7 @@ def _record_tool_patch(state: dict, event: dict) -> None:
             "index": int(event["id"]),
             "output": tool.get("output"),
             "ok": tool.get("ok"),
+            "completed_at": tool.get("completed_at"),
         },
     )
 
@@ -951,6 +952,7 @@ def _codex_apply(state: dict, row: dict) -> None:
             if event:
                 event["tool"]["output"] = _clip(str(out), MAX_TOOL_IO)
                 event["tool"]["ok"] = ok
+                event["tool"]["completed_at"] = ts
                 _record_tool_patch(state, event)
             _record_row_disposition(state, EVENT_DISPOSITION_RENDERED)
         else:
@@ -1029,6 +1031,7 @@ def _codex_apply(state: dict, row: dict) -> None:
             if event:
                 event["tool"]["output"] = _clip(output_text, MAX_TOOL_IO)
                 event["tool"]["ok"] = "exited with code 0" in output_text or None
+                event["tool"]["completed_at"] = ts
                 _record_tool_patch(state, event)
             _record_row_disposition(state, EVENT_DISPOSITION_RENDERED)
         else:
@@ -2109,6 +2112,7 @@ def _claude_apply(state: dict, row: dict) -> None:
             if event:
                 event["tool"]["output"] = _clip(result_text, MAX_TOOL_IO)
                 event["tool"]["ok"] = not block.get("is_error")
+                event["tool"]["completed_at"] = ts
                 _record_tool_patch(state, event)
                 rendered = True
             task_meta = state.get("task_inputs", {}).pop(tool_use_id, None) if tool_use_id else None
@@ -2373,6 +2377,7 @@ def read_session_delta(
                 "id": int(entry["id"]),
                 "output": entry.get("output"),
                 "ok": entry.get("ok"),
+                "completed_at": entry.get("completed_at"),
             }
             for entry in sorted(patch_map.values(), key=lambda item: int(item["cursor"]))
         ]
