@@ -73,7 +73,7 @@ export function StreamClamp({
       </div>
       {overflowing ? (
         <button className="stream-clamp-toggle" type="button" onClick={toggle}>
-          {clamped ? "show all" : "collapse"}
+          {clamped ? "show all" : "show less"}
         </button>
       ) : null}
     </div>

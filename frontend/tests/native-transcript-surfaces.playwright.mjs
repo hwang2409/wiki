@@ -205,13 +205,19 @@ async function main() {
     await ghActivityToggle.click();
     await page.locator(".session-activity-collapsible.is-open .session-tool").first().waitFor({ state: "visible" });
     const previewTool = page.locator(".session-activity-collapsible.is-open .session-tool").first();
+    const previewToolEventId = await previewTool.getAttribute("data-tool-event-id");
+    if (!previewToolEventId) throw new Error("preview tool missing data-tool-event-id");
     await previewTool.locator(".session-tool-head").click();
     await page.locator(".session-tool-collapsible.is-open").first().waitFor({ state: "visible" });
-    await previewTool.locator(".gh-preview-title", { hasText: "Add GitHub URL previews" }).waitFor();
+    // WIKI-238 split call and result into sibling rows; gh preview output
+    // lives in the result row for this tool event.
+    const previewResult = page.locator(`.session-activity-row.is-result[data-tool-event-id='${previewToolEventId}']`).first();
+    await previewResult.waitFor({ state: "visible" });
+    await previewResult.locator(".gh-preview-title", { hasText: "Add GitHub URL previews" }).waitFor();
     // WIKI-153 (#122) wrapped tool output in `.session-tool-output-text` so
     // preview cards render inline with ANSI text; the bare fallback anchor is
     // now a descendant of `.session-tool-output-blocks`, not a direct child.
-    await previewTool
+    await previewResult
       .locator(".session-tool-output-blocks a.external-link", {
         hasText: "https://github.com/hwang2409/wiki/issues/64",
       })

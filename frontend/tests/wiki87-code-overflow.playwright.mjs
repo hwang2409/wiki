@@ -132,8 +132,12 @@ async function main() {
     for (const tool of await tools.all()) {
       await tool.locator(".session-tool-head").click();
     }
+    // WIKI-238 split call and result rows; the output preview lives in
+    // .session-activity-row.is-result, keyed by data-tool-event-id.
+    // WIKI-241: output section labels reflect purpose — read = "file contents",
+    // bash = "command output", failed = "error output", generic = "tool output".
     const toolOutputs = page.locator(
-      ".session-tool .transcript-preview:has(.transcript-preview-label:text-is(\"output\")) .transcript-preview-body"
+      ".session-activity-row.is-result .transcript-preview:has(.transcript-preview-label:text-matches(\"^(tool output|command output|file contents|error output)$\")) .transcript-preview-body"
     );
     const longToolOutput = toolOutputs.nth(0);
     const shortToolOutput = toolOutputs.nth(1);

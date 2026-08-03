@@ -66,6 +66,7 @@ import type {
   SessionInit,
   SessionRateLimit,
   SessionPr,
+  SessionTool,
   SkillInfo,
   SubagentInfo,
 } from "./api";
@@ -1033,6 +1034,17 @@ function UserText({
   );
 }
 
+// WIKI-241: name the payload by its purpose, not by transport ("output" is
+// generic). Reads emit file contents; edits emit patched files; failed calls
+// carry an error message; everything else is a tool response.
+function outputLabelForTool(tool: SessionTool): string {
+  if (tool.ok === false) return "error output";
+  if (tool.archetype === "read") return "file contents";
+  if (tool.archetype === "edit") return "file contents";
+  if (tool.name === "Bash") return "command output";
+  return "tool output";
+}
+
 const ARCHETYPE_ICONS: Record<string, LucideIcon> = {
   monitor: Eye,
   steer: SendHorizontal,
@@ -1106,14 +1118,14 @@ function ToolCallRow({
               <div className="session-tool-body">
                 {tool.name === "Bash" && tool.input ? (
                   <BoundedPreview
-                    label="input"
+                    label="command input"
                     text={tool.input}
                     renderBody={({ text }) => (
                       <ShikiCode className="session-tool-input" code={text} lang="bash" transparent />
                     )}
                   />
                 ) : tool.input ? (
-                  <BoundedPreview label="input" text={tool.input} />
+                  <BoundedPreview label="tool input" text={tool.input} />
                 ) : null}
               </div>
             </div>
@@ -1148,7 +1160,7 @@ function ToolResultRow({ event, open }: { event: SessionEvent; open: boolean }) 
               {hasGitHubPreview ? (
                 <BoundedPreview
                   ansi
-                  label="output"
+                  label={outputLabelForTool(tool)}
                   text={tool.output ?? ""}
                   tone={tool.ok === false ? "error" : "normal"}
                   renderBody={({ text }) => (
@@ -1162,7 +1174,7 @@ function ToolResultRow({ event, open }: { event: SessionEvent; open: boolean }) 
               ) : tool.output ? (
                 <BoundedPreview
                   ansi
-                  label="output"
+                  label={outputLabelForTool(tool)}
                   text={tool.output}
                   tone={tool.ok === false ? "error" : "normal"}
                 />
@@ -1353,7 +1365,7 @@ function BashBlock({ event }: { event: SessionEvent }) {
     <div className="session-bash">
       {bash.input ? (
         <BoundedPreview
-          label="command"
+          label="command input"
           text={bash.input}
           renderBody={({ text }) => (
             <div className="session-bash-command">
@@ -1369,10 +1381,10 @@ function BashBlock({ event }: { event: SessionEvent }) {
         />
       ) : null}
       {bash.stdout ? (
-        <BoundedPreview ansi label="output" text={bash.stdout} />
+        <BoundedPreview ansi label="command output" text={bash.stdout} />
       ) : null}
       {bash.stderr ? (
-        <BoundedPreview ansi label="error" tone="error" text={bash.stderr} />
+        <BoundedPreview ansi label="command error" tone="error" text={bash.stderr} />
       ) : null}
     </div>
   );

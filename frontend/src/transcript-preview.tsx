@@ -33,16 +33,18 @@ export function summaryLabel(text: string): string {
 type ChipButtonProps = {
   active?: boolean;
   label: string;
+  ariaLabel?: string;
   title?: string;
   onClick: () => void;
 };
 
-function ChipButton({ active, label, title, onClick }: ChipButtonProps) {
+function ChipButton({ active, label, ariaLabel, title, onClick }: ChipButtonProps) {
   return (
     <button
       className={`transcript-chip${active ? " is-active" : ""}`}
       type="button"
-      title={title ?? label}
+      aria-label={ariaLabel ?? label}
+      title={title ?? ariaLabel ?? label}
       onClick={(event) => {
         event.stopPropagation();
         onClick();
@@ -77,6 +79,18 @@ type BoundedPreviewProps = {
   expandable?: boolean;
 };
 
+// Anchor scroll on the preview head so expand/collapse keeps the tool's start
+// row where the reader last saw it (WIKI-241). The preview lives inside the
+// virtualized `.session-scroll` container; the row's top is what stays fixed.
+function findScrollContainer(node: HTMLElement | null): HTMLElement | null {
+  let current: HTMLElement | null = node?.parentElement ?? null;
+  while (current) {
+    if (current.classList.contains("session-scroll")) return current;
+    current = current.parentElement;
+  }
+  return null;
+}
+
 export function BoundedPreview({
   text,
   label,
@@ -94,6 +108,7 @@ export function BoundedPreview({
   const [wrap, setWrap] = useState(true);
   const [copied, setCopied] = useState(false);
   const bodyRef = useRef<HTMLElement | null>(null);
+  const headRef = useRef<HTMLDivElement | null>(null);
   // Line clipping alone misses payloads with few newlines but long wrapped
   // lines; the shared rendered-height threshold catches those (WIKI-222 R1-01).
   const heightOverflow = useStreamHeightOverflow(bodyRef, expandable);
@@ -119,6 +134,44 @@ export function BoundedPreview({
     );
   }, [text]);
 
+  // WIKI-241: preserve the transcript scroll position across expand/collapse.
+  // Capture where the preview head sits before the toggle, then, once React
+  // re-lays out, adjust the session scroller by the delta so the head is at
+  // the same viewport y as before. The virtualized anchor system keeps the
+  // owning row anchored, but the reader's actual line-of-sight (the head, or
+  // some spot inside the long body) still shifts without this correction.
+  const toggleExpanded = useCallback(() => {
+    const head = headRef.current;
+    const container = findScrollContainer(head);
+    if (!head || !container) {
+      setExpanded((value) => !value);
+      return;
+    }
+    const containerTop = container.getBoundingClientRect().top;
+    const beforeHeadTop = head.getBoundingClientRect().top;
+    const beforeOffset = beforeHeadTop - containerTop;
+    setExpanded((value) => !value);
+    // Try to correct the drift once React has laid out. React commit runs
+    // synchronously before the next paint, but the virtualized transcript
+    // does one measurement pass in a useLayoutEffect that can bump row
+    // heights again. So: check the first frame; if it saw no drift yet,
+    // check the second frame. Never apply twice — one correction is enough
+    // and repeating it compounds the delta.
+    const tryCorrect = (): boolean => {
+      const nextContainerTop = container.getBoundingClientRect().top;
+      const nextHeadTop = head.getBoundingClientRect().top;
+      const nextOffset = nextHeadTop - nextContainerTop;
+      const delta = nextOffset - beforeOffset;
+      if (Math.abs(delta) <= 0.5) return false;
+      container.scrollTop += delta;
+      return true;
+    };
+    requestAnimationFrame(() => {
+      if (tryCorrect()) return;
+      requestAnimationFrame(() => { tryCorrect(); });
+    });
+  }, []);
+
   const bodyText = shownLines.join("\n");
   const custom = renderBody
     ? renderBody({
@@ -142,38 +195,46 @@ export function BoundedPreview({
     </span>
   ) : null;
 
+  const wrapChipLabel = wrap ? "keep lines" : "wrap lines";
+  const wrapChipTitle = wrap ? "Stop wrapping long lines" : "Wrap long lines to fit";
+  const expandChipLabel = expanded ? "show less" : "show all";
+  const expandChipTitle = expanded
+    ? "Show only the preview"
+    : totalLines > previewLines
+      ? `Show all ${totalLines} lines`
+      : "Show full output";
+
   return (
-    <div className={`transcript-preview${className ? ` ${className}` : ""} is-${tone}`}>
-      <div className="transcript-preview-head">
+    <div
+      className={`transcript-preview${className ? ` ${className}` : ""} is-${tone}${expanded ? " is-expanded" : ""}`}
+    >
+      <div className="transcript-preview-head" ref={headRef}>
         {label ? <span className="transcript-preview-label">{label}</span> : null}
         {summary ? <span className="transcript-preview-summary">{summary}</span> : null}
         <span className="transcript-preview-actions">
           {wrapAvailable ? (
             <ChipButton
               active={!wrap}
-              label={wrap ? "nowrap" : "wrap"}
-              title={wrap ? "Disable line wrap" : "Enable line wrap"}
+              label={wrapChipLabel}
+              ariaLabel={wrapChipLabel}
+              title={wrapChipTitle}
               onClick={() => setWrap((value) => !value)}
             />
           ) : null}
           {expandable && (totalLines > previewLines || heightOverflow) ? (
             <ChipButton
               active={expanded}
-              label={expanded ? "collapse" : "expand"}
-              title={
-                expanded
-                  ? "Collapse preview"
-                  : totalLines > previewLines
-                    ? `Show all ${totalLines} lines`
-                    : "Show full output"
-              }
-              onClick={() => setExpanded((value) => !value)}
+              label={expandChipLabel}
+              ariaLabel={expandChipLabel}
+              title={expandChipTitle}
+              onClick={toggleExpanded}
             />
           ) : null}
           {text.length > 0 ? (
             <ChipButton
-              label={copied ? "copied" : "copy"}
-              title="Copy full text"
+              label={copied ? "copied" : "copy output"}
+              ariaLabel="copy output"
+              title="Copy the full text to the clipboard"
               onClick={copy}
             />
           ) : null}
