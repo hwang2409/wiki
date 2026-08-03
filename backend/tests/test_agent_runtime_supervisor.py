@@ -3675,6 +3675,117 @@ class SupervisorTests(unittest.IsolatedAsyncioTestCase):
                 result.get("reason"), "supervisor_restart_dropped_send"
             )
 
+    async def test_wiki_243_orphan_scan_streams_middle_gap_without_full_lists(
+        self,
+    ) -> None:
+        """WIKI-243: the orphan sweep must not materialize every run's
+        raw + normalized JSONL just to diff the raw_seq sets.
+
+        The refactor streams both via ``iter_raw_events`` /
+        ``iter_normalized_events``. This test proves that after the
+        refactor, the middle-gap raw row is still detected and replayed
+        (preserving WIKI-232 REVIEW9 F2) even when
+        ``read_raw_events`` / ``read_normalized_events`` — the old
+        materializing entry points — are patched to raise.
+        """
+
+        record = await self.supervisor.start_run(
+            agent_id="WIKI-243-STREAM",
+            provider=ProviderKind.CODEX,
+            role="implement",
+            model="fixture-codex",
+            effort="high",
+            worktree=str(self.worktree),
+            prompt="wiki-243 stream",
+        )
+        pending_id = str(uuid4())
+        echoed_text = "wiki-243 stream echo"
+
+        self.store.command_log.steer_effect(
+            method="run/send_on_idle",
+            request_id="wiki-243-stream-effect",
+            agent_id=record.agent_id,
+            command_hash="",
+            run_id=record.run_id,
+            pending_id=pending_id,
+            message=echoed_text,
+            mode="on_idle",
+        )
+        self.store.command_log.mark_steer_sending_for_pending(
+            record.run_id, pending_id
+        )
+        self.store.track_pending_user_message(
+            record.run_id, pending_id, echoed_text
+        )
+
+        # Raw seq 1 is the middle-gap orphan; raw seq 2 normalizes.
+        self.store.append_raw(
+            record.run_id,
+            provider=ProviderKind.CODEX.value,
+            direction="provider",
+            payload={
+                "method": "item/completed",
+                "params": {
+                    "item": {
+                        "type": "userMessage",
+                        "content": [{"type": "text", "text": echoed_text}],
+                    }
+                },
+            },
+            generation=1,
+        )
+        self.store.append_raw(
+            record.run_id,
+            provider=ProviderKind.CODEX.value,
+            direction="provider",
+            payload={
+                "method": "item/started",
+                "params": {"item": {"type": "agentReasoning"}},
+            },
+            generation=1,
+        )
+        self.store.append_normalized(
+            record.run_id,
+            raw_seq=2,
+            disposition=EventDisposition.IGNORED,
+            kind="agent_reasoning",
+            payload={},
+        )
+
+        def blocked_read_raw(*_args: Any, **_kwargs: Any) -> Any:
+            raise AssertionError(
+                "orphan scan must stream raw events, not materialize them"
+            )
+
+        def blocked_read_norm(*_args: Any, **_kwargs: Any) -> Any:
+            raise AssertionError(
+                "orphan scan must stream normalized events, not materialize them"
+            )
+
+        with (
+            mock.patch.object(
+                self.store.__class__,
+                "read_raw_events",
+                blocked_read_raw,
+            ),
+            mock.patch.object(
+                self.store.__class__,
+                "read_normalized_events",
+                blocked_read_norm,
+            ),
+        ):
+            await self.supervisor._normalize_orphan_raw_events()  # noqa: SLF001
+
+        normalized_rows = self.store.read_normalized_events(record.run_id)
+        matching = [
+            row
+            for row in normalized_rows
+            if isinstance(row.get("payload"), dict)
+            and row["payload"].get("pending_id") == pending_id
+        ]
+        self.assertEqual(len(matching), 1)
+        self.assertEqual(int(matching[0]["raw_seq"]), 1)
+
     async def test_orphan_scan_serializes_with_live_event_pump(self) -> None:
         """WIKI-232 REVIEW9 F2: the orphan sweep runs before recovery
         attaches live event pumps, and holds the per-run

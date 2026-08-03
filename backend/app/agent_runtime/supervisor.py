@@ -2569,28 +2569,31 @@ Preserve the same identity, role, worktree, orchestrator grouping, PR gates, and
 
         for record in self.store.list_runs():
             run_id = record.run_id
-            try:
-                raw_events = self.store.read_raw_events(run_id)
-            except RunNotFound:
-                continue
-            if not raw_events:
-                continue
-            try:
-                normalized_events = self.store.read_normalized_events(run_id)
-            except RunNotFound:
-                normalized_events = []
+            # WIKI-243: stream both logs to detect orphans instead of
+            # materializing full raw + normalized dict lists per run.
+            # Startup used to hold every event of every run in RAM just
+            # to diff the raw_seq sets. Now we build only the small
+            # normalized_seqs set of ints, then stream raw once and
+            # keep only the (usually zero) orphan rows.
             # Walk the full set of normalized raw_seq values: a middle gap
             # (raw row N unnormalized, later raw row M > N normalized) sits
             # at or below the max and would be skipped forever by a
             # max-based cutoff (WIKI-232 REVIEW9 F2).
-            normalized_seqs = {
-                int(event.get("raw_seq", 0)) for event in normalized_events
-            }
-            orphans = [
-                event
-                for event in raw_events
-                if int(event.get("seq", 0)) not in normalized_seqs
-            ]
+            try:
+                normalized_seqs = {
+                    int(event.get("raw_seq", 0))
+                    for event in self.store.iter_normalized_events(run_id)
+                }
+            except RunNotFound:
+                normalized_seqs = set()
+            try:
+                orphans = [
+                    event
+                    for event in self.store.iter_raw_events(run_id)
+                    if int(event.get("seq", 0)) not in normalized_seqs
+                ]
+            except RunNotFound:
+                continue
             if not orphans:
                 continue
             # Recover in raw order so downstream normalizers see the same
@@ -2607,12 +2610,12 @@ Preserve the same identity, role, worktree, orchestrator grouping, PR gates, and
                 # Reload after acquiring the lock so a normalize that landed
                 # while we were waiting is not double-processed here.
                 try:
-                    normalized_events = self.store.read_normalized_events(run_id)
+                    normalized_seqs = {
+                        int(event.get("raw_seq", 0))
+                        for event in self.store.iter_normalized_events(run_id)
+                    }
                 except RunNotFound:
                     continue
-                normalized_seqs = {
-                    int(event.get("raw_seq", 0)) for event in normalized_events
-                }
                 for envelope in orphans:
                     orphan_seq = int(envelope.get("seq", 0))
                     if orphan_seq in normalized_seqs:
