@@ -21,8 +21,7 @@ Rolling ≤500-word session cache. Rewrite (don't append) at work-arc boundaries
 
 - Bazel slot starvation ROOT-FIXED: agent-shims/bazel leaked its flock fd into the server daemon; shim now holds the lock and releases on client exit ([[bazel-slot-shim-pathology]], backup .bak-20260731).
 - Fleet-monitor crash loop: worker ids must match `^[A-Z][A-Z0-9]+-[0-9]+(-[A-Z0-9]+)*$`; invalid id (PHO-V3-INTEGRATE) crash-looped graph-health every tick and degraded the supervisor until renamed (PHO-0-INTEGRATE).
-- Codex auth died (refresh unauthorized) ~21:30Z, Henry re-authed ~22:10Z; parked spawn queue drained. `codex login status` proves nothing — watch auth.json mtime.
-- Codex weekly quota was ~80% — may exhaust before reset; fall back to cc workers.
+- Codex CLEAR as of 08-03: Henry re-authed; quota concern void — spawn cdx (gpt) workers freely again. Old "quota ~80%, fall back to cc" note is obsolete. `codex login status` proves nothing — watch auth.json mtime.
 
 ## Watchouts
 
