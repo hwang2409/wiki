@@ -269,7 +269,6 @@ describe("codex stream renderers", () => {
     expect(groups).toHaveLength(1);
     expect(groups[0]?.severity).toBe("danger");
     expect(groups[0]?.actionRequired).toBe(true);
-    expect(groups[0]?.actionRequiredCount).toBe(1);
     expect(groups[0]?.summary).toBe("moderation blocked");
     expect(groups[0]?.label).toBe("blocked");
     expect(groups[0]?.events).toHaveLength(2);
@@ -342,7 +341,7 @@ describe("codex stream renderers", () => {
     expect(groups[0]?.actionRequired).toBe(false);
   });
 
-  it("auto-opens a group when a blocked event arrives after mount", () => {
+  it("auto-opens on the false->true escalation and then respects a manual close", () => {
     const advisory = event("turn_moderationMetadata_warning", 1, {
       metadata: { prompt: { omnimod: { outputs: [{
         is_blocked: false,
@@ -350,19 +349,44 @@ describe("codex stream renderers", () => {
       }] } } },
     });
     const view = render(<CodexStreamHighlights events={[advisory]} />);
-    const before = view.getByRole("button", { name: /moderation/i });
-    expect(before.getAttribute("aria-expanded")).toBe("false");
-    const blocked = event("turn_moderationMetadata_warning", 2, {
+    const beforeButton = () => view.container.querySelector("button.codex-stream-diagnostic-head")!;
+    expect(beforeButton().getAttribute("aria-expanded")).toBe("false");
+
+    const firstBlocked = event("turn_moderationMetadata_warning", 2, {
       metadata: { prompt: { omnimod: { outputs: [{
         is_blocked: true,
         results: [{ labels: ["hate"] }],
       }] } } },
     });
-    view.rerender(<CodexStreamHighlights events={[advisory, blocked]} />);
-    const after = view.getByRole("button", { name: /blocked/i });
-    expect(after.getAttribute("aria-expanded")).toBe("true");
-    const body = view.container.querySelector("[data-testid='codex-diagnostic-body']");
-    expect(body).toBeTruthy();
+    view.rerender(<CodexStreamHighlights events={[advisory, firstBlocked]} />);
+    expect(beforeButton().getAttribute("aria-expanded")).toBe("true");
+    expect(view.container.querySelector("[data-testid='codex-diagnostic-body']")).toBeTruthy();
+
+    // User manually collapses the row.
+    fireEvent.click(beforeButton());
+    expect(beforeButton().getAttribute("aria-expanded")).toBe("false");
+
+    // Another blocked event arrives — must NOT reopen. Repeated diagnostics
+    // cannot overwrite an explicit dismissal.
+    const secondBlocked = event("turn_moderationMetadata_warning", 3, {
+      metadata: { prompt: { omnimod: { outputs: [{
+        is_blocked: true,
+        results: [{ labels: ["hate"] }],
+      }] } } },
+    });
+    view.rerender(<CodexStreamHighlights events={[advisory, firstBlocked, secondBlocked]} />);
+    expect(beforeButton().getAttribute("aria-expanded")).toBe("false");
+
+    // Rerendering identical props also must not reopen (no effect loops).
+    view.rerender(<CodexStreamHighlights events={[advisory, firstBlocked, secondBlocked]} />);
+    expect(beforeButton().getAttribute("aria-expanded")).toBe("false");
+  });
+
+  it("returns an empty group list and renders nothing for zero diagnostic events", () => {
+    expect(groupProviderDiagnostics([])).toEqual([]);
+    const view = render(<CodexStreamHighlights events={[]} />);
+    expect(view.container.querySelector("[data-testid='codex-diagnostics']")).toBeNull();
+    expect(view.container.querySelector(".codex-stream-diagnostic")).toBeNull();
   });
 
   it("preserves every raw warning message in the expanded diagnostics body", () => {

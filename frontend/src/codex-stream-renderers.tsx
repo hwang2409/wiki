@@ -349,11 +349,6 @@ export type DiagnosticGroup = {
   code: string;
   severity: DiagnosticSeverity;
   actionRequired: boolean;
-  // Number of member events whose classifier reported actionRequired. Grows
-  // monotonically as new escalations arrive; the row uses the delta to
-  // decide whether a new escalation should re-open the body after the user
-  // has manually collapsed it.
-  actionRequiredCount: number;
   summary: string;
   label: string;
   flags: string[];
@@ -381,7 +376,6 @@ export function groupProviderDiagnostics(
         code: classification.code,
         severity: classification.severity,
         actionRequired: classification.actionRequired,
-        actionRequiredCount: classification.actionRequired ? 1 : 0,
         summary: classification.summary,
         label: classification.label,
         flags: [...classification.flags],
@@ -399,10 +393,7 @@ export function groupProviderDiagnostics(
       existing.summary = classification.summary;
       existing.label = classification.label;
     }
-    if (classification.actionRequired) {
-      existing.actionRequired = true;
-      existing.actionRequiredCount += 1;
-    }
+    if (classification.actionRequired) existing.actionRequired = true;
     for (const flag of classification.flags) {
       if (!existing.flags.includes(flag)) existing.flags.push(flag);
     }
@@ -422,17 +413,18 @@ function formatDiagnosticTime(iso: string): string {
 
 function DiagnosticGroupRow({ group }: { group: DiagnosticGroup }) {
   const [open, setOpen] = useState(group.actionRequired);
-  // Escalation tracking: open when actionRequiredCount rises. Covers both
-  // the initial promotion to actionRequired (0 -> 1) mid-stream and later
-  // escalations that arrive after the user manually closed a previously
-  // opened row. Steady state (count unchanged) leaves user intent alone.
-  const prevActionRequiredCount = useRef(group.actionRequiredCount);
+  // Transition-only escalation: open the body on the false -> true edge of
+  // group.actionRequired, then never again for the life of the group. Once
+  // the row has been promoted the user's manual close is respected even if
+  // more actionRequired events arrive — repeated diagnostics must not
+  // overwrite an explicit dismissal.
+  const prevActionRequired = useRef(group.actionRequired);
   useEffect(() => {
-    if (group.actionRequiredCount > prevActionRequiredCount.current) {
+    if (!prevActionRequired.current && group.actionRequired) {
       setOpen(true);
     }
-    prevActionRequiredCount.current = group.actionRequiredCount;
-  }, [group.actionRequiredCount]);
+    prevActionRequired.current = group.actionRequired;
+  }, [group.actionRequired]);
   const count = group.events.length;
   const label = group.label;
   const flagText = group.flags.length ? group.flags.join(", ") : null;
