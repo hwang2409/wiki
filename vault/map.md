@@ -107,6 +107,10 @@ Topic → note index. **Agents: read this file first, before grepping.** Every n
 
 - [[supervisor-fingerprint-swap-wedge]] — dev-code clients kill the prod agent supervisor via fingerprint swap; shutdown wedges holding the lock
 
+## Wiki/til
+
+- [[supervisor-recovery-memory]] — supervisor startup loads whole JSONL event logs, raising memory footprint
+
 ## Families (path patterns, not enumerated)
 
 - `log/YYYY-MM-DD.md` — daily end-of-day changelogs, cross-project.

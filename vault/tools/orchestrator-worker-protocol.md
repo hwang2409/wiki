@@ -97,6 +97,8 @@ Monitors = persistent background shell loops (Claude Code Monitor tool), one per
 5. **Silence backstop:** if a monitor produces no event for a long stretch while a PR is open, do a one-shot direct status read instead of trusting silence — GitHub ground truth (checks green + threads clear) overrides a stale/blind monitor per the signal-priority list above.
 6. **Watch `runtime_state`, not just the status file.** The worker-written status file says `working` while the provider run sits in `waiting-approval` (codex elicitation/approval prompts — e.g. the "install GitHub plugin?" tool suggestion stalled two workers 50-75 min on 2026-07-15). Monitors must print `state / runtime_state`; on `waiting-approval`, read the pending request from the run's raw.jsonl (`grep -i approval`/`elicitation`) and answer it via `POST /api/agents/<id>/respond` with `{"request_id": <id from the request payload>, "response": {"action": "decline"}}` (or accept when genuinely wanted). Plugin/tool-install suggestions: decline — workers use `gh` CLI. Kickoff prompts should pre-empt: workers decline install suggestions themselves.
 
+**`next_review` gate quirk (2026-08-02):** `expected_sha` must be the FULL 40-char SHA. A short SHA returns `{"status":"gate_failed","detail":"not-mergeable"}` even when GitHub reports MERGEABLE/CLEAN — misleading detail text. Reproduced twice (WIKI-234 R2, WIKI-232 R9); full-SHA retry with a fresh request_id spawned cleanly both times.
+
 ## Input channel (orchestrator → worker)
 
 `tmux send-keys -t <window_id> -l "<msg>"` then `sleep 0.5` then `send-keys Enter`, then VERIFY submitted (~2s later, capture pane; text still in composer ⇒ bare Enter again). The 0.5s is load-bearing: composers paste-detect rapid bursts and treat same-cycle Enter as a newline. Steer shape: observed → why wrong → do instead → constraint.
@@ -119,6 +121,7 @@ The wiki app exposes the same channel: session-view composer → `POST /api/agen
 ## Other state the orchestrator tracks (not files)
 
 - **Worktrees**: `~/me/fun/phoebe/.codex/worktrees/<slug>` / `.claude/worktrees/<slug>` — worker-owned; survive handoffs (same worktree across sessions); removed after merge.
+- **No stray dirs directly under `~/me/fun/`** (Henry, 2026-08-02): worktrees and worker output must NEVER land at `~/me/fun/<ticket-or-branch>/`. Observed failure mode: a worker in `.worktrees/<name>` mis-resolves a path and writes `~/me/fun/<name>/services/...`, leaving an orphan file tree Henry has to look at. Orchestrators sweep for these; delete a stray once no active agent's ticket relates to it, and if an active worker's ticket matches the dir name, wait until that worker wraps before deleting.
 - **PR handoff comments**: durable cross-session memory for multi-session tickets (done / remaining / file map) — better than compaction.
 - **Vault todo.md**: `In Progress` line names the owning window (`cdx:PHO-1234`); other sessions' ownership preflights grep tmux window names + worktrees + branches + open PRs.
 

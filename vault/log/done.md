@@ -2,13 +2,48 @@
 type: log
 tags: [log, done]
 created: 2026-07-06
-updated: 2026-08-01
+updated: 2026-08-03
 ---
 
 # Done
 
+## 2026-08-03
+
+- WIKI-243 supervisor startup recovery memory streaming merged (#175 as 16a3b2a) — _reconcile_existing_runs + _normalize_orphan_raw_events now stream via _iter_json_lines instead of materializing full raw/normalized lists; WIKI-232 REVIEW9 F2 middle-gap + REVIEW12 H1 legacy-boundary invariants preserved
+
+## 2026-08-02
+
+- LC-6 round 2 misc/lc: fold cross-tab storage listener + runner.js path/HEAD nits (LC-6-REVIEW1 findings)
+- LC-6 misc/lc: one-server integration merged (roadmap + practice unified, deep-links + shared progress)
+- bumped supervisor slow-lane timeout 30s->120s (client.py); rebuilt + restarted Wiki.app. run/replace cold-spawn of orphaned providers post-restart genuinely exceeds 30s under fleet load.
+- restarted Wiki.app + rebuilt from source with client.py timeout fix. gotcha: build/swap scripts (native_backend_fingerprint.py, native_swap_transaction.py) invoke bare python3 which is homebrew (no PIL); must prepend .venv/bin to PATH or scripts fail post-PyInstaller. also: hold_app_lock blocks swap while Wiki.app is live — kill Tauri first.
+- supervisor RPC: bumped fast-read/ping timeout 1s->3s and ensure_running default 5s->15s (backend/app/agent_runtime/client.py) — kills the '1s ping timed out' 503 spam under load
+- **wiki** — WIKI-232 command-log recovery hardening merged after 26 review rounds ([#167](https://github.com/hwang2409/wiki/pull/167), squash `bc31896a`)
+- **wiki** — WIKI-240 run-header hierarchy merged ([#173](https://github.com/hwang2409/wiki/pull/173), squash `8a261341`)
+- **wiki** — WIKI-225 strict VP8 keyframe-only WebM scrub merged ([#172](https://github.com/hwang2409/wiki/pull/172), squash `c8404590`)
+- **wiki** — WIKI-235 runs UI declutter merged ([#171](https://github.com/hwang2409/wiki/pull/171), squash `262795d0`)
+- **wiki** — WIKI-237 agent prompt dock merged ([#170](https://github.com/hwang2409/wiki/pull/170), squash `a672bc95`)
+- **wiki** — WIKI-236 UX diagnosis audited; WIKI-237–242 implementation split prepared
+- **misc** — LC-2 concept visuals merged after 3 review rounds (cdx luna implement + cdx sol review) — 32 canvas concept visuals with DPR-correct rendering, idempotent cleanup, dedupe-before-construct card opens, theme repaint, aria-valuetext sliders, narrow-width layouts; LC arc (LC-1..LC-5) complete
+- **misc** — LC-5 local leetcode practice runner merged after 3 review rounds (cdx luna implement + cc opus review after cdx sol cyberPolicy block) — 150-problem bank, python+js graders, per-slug outer/all unordered canonicalization, per-test SIGALRM timeouts, clone identity checks, submit/accepted tracking; verdicts in /tmp/LC-5-REVIEW*-verdict.json
+- wiki — WIKI-234 opencode-inspired terminal restyle merged as https://github.com/hwang2409/wiki/pull/169 (2 rounds, squash 0db025d)
+- lc roadmap app: LC-3 white default theme + 17-theme lab (themes.html, localStorage apply)
+- lc roadmap app: LC-4 cojudge import — 150/150 problems with statements, solutions, tests in app/problems/
+- lc roadmap app: LC-1 card dismissal rules (root-sweep + drag-to-pin) and article pane rail, fable-5 worker, orchestrator-gated
+- lc roadmap app: native rewritten wikipedia articles (32) with in-app article cards; 4 parallel writer agents
+- WIKI-230/231 merged as https://github.com/hwang2409/wiki/pull/168 (native-transcript suite fix + mp4 timing alias, 1 round, squash edddbdd)
+- lc roadmap app: built NeetCode-150 reader-style web app in ~/me/fun/misc/lc/app (concept cards, progress tracking)
+- WIKI-223 merged as https://github.com/hwang2409/wiki/pull/166 (ID3v2.4 footer strip + a/v copy action, 2 rounds, squash d0c3045)
+- WIKI-219 merged as https://github.com/hwang2409/wiki/pull/165 (event-sourced supervisor command log, 11 rounds + merge-integrity pass, squash b972a34; follow-ups WIKI-232)
+- WIKI-154 merged as https://github.com/hwang2409/wiki/pull/160 (runs-mgmt account-health notices, 27 rounds, squash a7354b5)
+- WIKI-190/191 merged as https://github.com/hwang2409/wiki/pull/150 (media artifact kinds, 46 rounds, squash 1236725)
+
 ## 2026-08-01
 
+- PHO-14969 merged: PR #13031 migrate direct admin tools into registry (squash, 4 review rounds)
+- v3 harness COMPLETE on henry/phoebe-v3-agent at 05d616e98d: all seven steps folded (describe, parity, tool-search, helpers, workspace, retrieve, write); bazel 74/74 + ty clean
+- PHO-14975 v3 write step clean after 10 review rounds at f5f0f31183; final fold queued
+- v3 harness: retrieve step (PHO-14973) folded into henry/phoebe-v3-agent at da184279d4 under the fenced-lease reconciliation; bazel 63/63 + ty clean; only write step remains
 - v3 harness: workspace step (PHO-14972) folded into henry/phoebe-v3-agent at 964d1027f3; bazel 59/59 + ty clean
 - v3 harness: retrieve step (PHO-14973) folded into henry/phoebe-v3-agent at da184279d456; bazel v3 12/12, sandbox 15/15, spill 2/2, llm 33/33, worker 1/1 + ty clean
 

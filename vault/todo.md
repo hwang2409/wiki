@@ -3,7 +3,7 @@ type: reference
 view: kanban
 tags: [todo]
 created: 2026-07-06
-updated: 2026-07-31
+updated: 2026-08-03
 ---
 
 Todo:
@@ -15,16 +15,17 @@ Todo:
 - [P3] WIKI-186 steer macros — reusable snippets in composer (reviewer prompt, mutation-verify contract, canonical-writer regression, iteration-cap check); one-click apply w/ ticket-name substitution. Cuts recurring prompt drafting
 - [P3] WIKI-187 hot.md dedicated editor UI — arc-boundary rewrite surface: split-pane w/ live preview, section templates (Active threads / Recent facts / Watchouts), word-count budget indicator (≤500 target). Currently hand-edited via Read/Edit tools
 - [P2] WIKI-177 blast radius view pre-spawn — PARKED 2026-07-30 by overnight orch after 7 review rounds: PR #147 open at 53ecaf7 + round-7 attestation refactor pushed; two structural false-clear blockers remain (blast_radius_cache.py:44 raw-tuple bypass; blast_radius_types.py:300 count-vs-identity fold — dropping an attestation passes all tests). Worktree .codex/worktrees/wiki-177-blast-radius + branch preserved. Resume = fresh implementer on those two items + REVIEW8, or Henry descope/close call
-- [P2] WIKI-223 media-scrub follow-ups split from WIKI-190 R9 (Henry 2026-07-30): [MEDIUM] mp3.py:36 ID3v2.4 footer-present flag — strip must include the 10-byte 3DI footer or valid footer-tagged MP3s fail 'frame stream broken at offset 0'; [MEDIUM] artifact-block.tsx:290 Copy for video/audio copies internal artifact:// UUID — hide Copy for a/v or route through bounded binary fetch; component tests for both kinds. Verdict archived at /tmp/WIKI-190-REVIEW9-verdict.json
 - backend: raise RLIMIT_NOFILE soft->hard at sidecar startup (GUI launch = 256 soft; wedge #7 defense-in-depth)
 - wiki-native: respawn sidecar after signal exits (currently gives up after SIGKILL; needed manual app relaunch in wedge #7)
 - check-aliveness: add daemon-mode sweep (registry tmux windows all NO-WINDOW for daemon-managed fleet; use /api/agents control_attached instead)
-- [P2] WIKI-225 strict WebM (EBML/Matroska) scrub + AAC-in-MP4 scrub + artifact kinds — split from WIKI-190 R16/R23 scope decisions (Henry 2026-07-30): AAC deferred after 3 failed review rounds (R21 unvalidated copy, R22 DSE/FIL bypass, R23 incomplete fix + bit-copy CPU hole) — needs a full raw_data_block syntax parser (one channel element + ID_END, strip DSE/FIL/PCE, byte-aligned copies); implement strict WebM scrubber (bounded EBML parse, element allowlist, VP8/VP9/Opus/Vorbis track types), add webm to VIDEO_MIMES, real mixed a/v fixtures, resource regression like mp4 box-count bound. WIKI-190 ships avc1+AAC MP4 and GIF only; PR #150 body amended to drop WebM claim
 - [P1] WIKI-227 backend /api/agents starvation under run-history growth (2026-07-31 07:35Z): HTTP API timing out (curl 000 at 8s, wiki agent status intermittent STATUS-ERROR) while MCP socket path stays fast; sidecar pid at 57% CPU after 15h; 2s sample = main thread dominated by __open/__open_nocancel/stat/__getdirentries64 + psynch GIL waits — costs.refresh() 5s runs-dir sweep scales with accumulated run history and starves the event loop (fd leak fixed in 8055e18 but the scan itself is O(history) every 5s). Also /api/agents payload bloated by full worker histories + composer messages (one archive record = 76KB). Fix: throttle/cache/incremental costs scan or move off the event loop (thread/process + mtime cache), and slim /api/agents default payload (histories behind a flag). Monitor degraded but functional; workers unaffected. No restart performed — app relaunch releases all provider processes
 - [P2] WIKI-228 durable provider-health notice lifecycle — split from WIKI-154 R3 (orch scope call 2026-07-31): headless supervisor must track per-ticket Claude limit state and publish claude_limit_cleared on confirmed resumed-turn recovery (current clear event lives only in the legacy tmux watchdog, skips headless entries — notices persist forever); replace/archive flows must emit ticket-scoped resolution events consumed by account notices; disk-backed notice store needs a durable cursor/replay so provider failures during backend-closed windows survive reconnect (R3 findings 2+4, /tmp/WIKI-154-REVIEW3-verdict.json). Slot after 224/226 land (supervisor.py conflict)
 - [P2] WIKI-229 archive transcript identity — split from WIKI-154 R8 (orch cap-decision 2026-07-31, /tmp/WIKI-154-REVIEW8-verdict.json findings 1-3): pre-existing platform bug exposed by per-archive history rows — /session route treats archived_at as non-authoritative (live run and ticket-only _session_paths cache win; older archive returns cached-newest), sidebar target prefers liveWorker over archivedWorker (history click opens live transcript, double selection), loadOlderEvents/getAgentOlderSession/older-session route drop archive identity. Fix: discriminated live-or-archive TranscriptTarget end to end (route resolves exact archive before current-run lookup, 404 stale ids; archived_at through the older-events path). Conflicts with PR #160 until it merges — slot after
-- [P2] WIKI-230 main frontend suite red: native-transcript-surfaces.playwright.mjs times out on issue-64 external-link locator (line 226) on main; pre-existing, blocks full-suite gates (found during WIKI-154 round-20)
-- [P3] WIKI-231 media_scrub/_mp4_timing.py:221 annotates _tkhd_dimensions_from_atom with undefined _Mp4TrackDimensions alias (F821; get_type_hints raises NameError) — define alias or import shared one + get_type_hints resolution test (deferred LOW from PR #150 round 46)
+- [P2] WIKI-233 remaining 13 pre-existing frontend suite reds enumerated in PR #168 body (found during WIKI-230) — triage: fixture drift vs real regressions, restore full-suite green so worker gates can run unexcluded
+- LC-6: integrate practice runner into roadmap app (misc, in progress, owner: misc orch)
+- [P1] WIKI-239 coalesced provider diagnostics with correct severity and full raw-warning retention
+- [P1] WIKI-241 clearer long tool-output controls with stable scroll and full raw-output access
+- [P1] WIKI-242 final agent-surface focus, target-size, 320px reflow, and 400% zoom pass; start after WIKI-235/237-241
 
 Silky-smooth artifact rendering arc (Henry 2026-07-29):
 
@@ -55,6 +56,7 @@ Unknown provider-stream renderer arc (Henry 2026-07-29 — audit of `disposition
 
 In Progress:
 
+- [P1] WIKI-238 semantic model activity timeline and readable transcript hierarchy; retain thinking, tools, counts, and raw events — cdx:WIKI-238; merge requires Henry approval
 - [P2] WIKI-181 reviewer diversity harness — spawn N reviewers w/ distinct lenses (correctness / security / perf / test-strength) in parallel; synthesize verdicts. Codified adversarial verify — one lens catches what another misses. Wire into next_review (WIKI-171) as opt-in mode — cdx:WIKI-181
 
 - [PR #10475](https://github.com/phoebe-health/phoebe/pull/10475): subagent recommendation parity iteration (harness #10692) — cdx:PR-10475 worker; overfitting watch
@@ -68,15 +70,11 @@ In Progress:
 - [P2] PHO-13826 ModalSandboxBackend + PHO-13827 sandbox ownership — workers live (Modal replaces exe.dev for v0; 13828 lifecycle + 13829 egress design queued)
 - mitmweb rebuild: scope and build a clearer live proxy-traffic inspector — owner (misc); merged through B6 (tooling PR #10, 2026-07-21); remaining: P1 packaging
 - WIKI-135 dashboard: implementation workers only (drop reviewers/one-shots) — owner cdx:WIKI-135 (luna)
-- [P1] WIKI-190 video/GIF artifact kind — new `kind: video` inline player (mp4/webm/gif). Controls: play/pause/scrubber/speed/mute; poster frame lazy-load; loop-by-default for GIFs. Useful for Playwright recordings, mitmproxy captures, animated diagrams
 - [P2] WIKI-191 audio artifact kind — new `kind: audio` inline w/ waveform preview + scrubber + speed control; transcript overlay if attached. For voice memos, TTS output, transcription evidence
 - [P1] PHO-14864 land agent-bash-recs-proto on main behind feature flag (owner: phoebe orch)
-- [P1] WIKI-154 runs management productization: Agents page/cards/banners/actions/session preview/spawn+replace dialogs — Active/History hierarchy, decision-relevant fields only, IDs/tmux/log-paths in Technical details, provider/auth notices state user impact + next action
-- [P1] WIKI-219 event-sourced supervisor command log — adopt t3code engine pattern: all fleet mutations become typed commands through a single-writer queue; pure decider -> events; append + project + durable request_id receipt in one sqlite txn; provider side effects in reactors consuming intent events. Structurally kills the wedge / mass-archive / split-brain / orphan-control-channel class; generalizes WIKI-163 workgraph idempotency backend-wide. Phase P1: agent-op surface (spawn/steer/archive/replace) with current registry as projection; P2 status/liveness; P3 retire snapshot mode. Coordinate with WIKI-217 (tactical fix may land first; must not fight this design). Spec /tmp/WIKI-219-spec.md + [[t3code]]. Slot after in-flight 190/168/157. ACCEPTANCE ADDITIONS from WIKI-226 R10 descope (orch 2026-07-31, /tmp/WIKI-226-REVIEW10-verdict.json): (a) pre-start snapshot + txn marker persisted with the run — restart between create() and commit_start() aborts the uncommitted start and restores prior registry/status; (b) run/start request IDs persisted with RunRecord/registry — restart or cache eviction still replays a durable successful start instead of 409
 - [P1] [PHO-14963](https://linear.app/phoebework/issue/PHO-14963): implement provider-neutral v3 tool discovery and Anthropic delivery — cdx:PHO-14963
 - [P1] [PHO-14975](https://linear.app/phoebework/issue/PHO-14975): implement v3 write registry and diff-first flow — cdx:PHO-14975
 - [P1] [PHO-14977](https://linear.app/phoebework/issue/PHO-14977): implement v3 read-only helpers and eval scaffolding — cdx:PHO-14977
-
 Backlog:
 
 - [PHO-14974](https://linear.app/phoebework/issue/PHO-14974): implement the planned v3 describe catalog after retrieve and write registry interfaces land
