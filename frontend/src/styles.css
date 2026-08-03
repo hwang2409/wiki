@@ -6189,13 +6189,13 @@ body.is-resizing-panes .pane-cell {
 }
 
 .codex-stream-diagnostic-head {
-  position: relative;
   display: flex;
   align-items: center;
   min-width: 0;
   width: 100%;
+  min-height: 40px;
   gap: 7px;
-  padding: 6px 8px;
+  padding: 6px 10px;
   border: 0;
   background: transparent;
   color: var(--text-normal);
@@ -6214,18 +6214,6 @@ body.is-resizing-panes .pane-cell {
 .codex-stream-diagnostic-head:focus-visible {
   outline: 2px solid var(--accent-primary);
   outline-offset: -2px;
-}
-
-/* Extend the hit area to WCAG-friendly 40px without visually growing the
-   row — the pseudo-element only captures pointer events. */
-.codex-stream-diagnostic-head::before {
-  content: "";
-  position: absolute;
-  inset: -8px 0;
-}
-
-.codex-stream-diagnostic-head > * {
-  position: relative;
 }
 
 .codex-stream-diagnostic.is-advisory .codex-stream-diagnostic-label {

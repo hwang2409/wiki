@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useState } from "react";
+import { useEffect, useMemo, useRef, useState } from "react";
 import { AlertTriangle, ChevronDown, ChevronRight, ListTodo, Terminal } from "lucide-react";
 import { DisclosureContent } from "./disclosure";
 import type { ProviderStreamEvent } from "./api";
@@ -349,6 +349,11 @@ export type DiagnosticGroup = {
   code: string;
   severity: DiagnosticSeverity;
   actionRequired: boolean;
+  // Number of member events whose classifier reported actionRequired. Grows
+  // monotonically as new escalations arrive; the row uses the delta to
+  // decide whether a new escalation should re-open the body after the user
+  // has manually collapsed it.
+  actionRequiredCount: number;
   summary: string;
   label: string;
   flags: string[];
@@ -376,6 +381,7 @@ export function groupProviderDiagnostics(
         code: classification.code,
         severity: classification.severity,
         actionRequired: classification.actionRequired,
+        actionRequiredCount: classification.actionRequired ? 1 : 0,
         summary: classification.summary,
         label: classification.label,
         flags: [...classification.flags],
@@ -393,7 +399,10 @@ export function groupProviderDiagnostics(
       existing.summary = classification.summary;
       existing.label = classification.label;
     }
-    if (classification.actionRequired) existing.actionRequired = true;
+    if (classification.actionRequired) {
+      existing.actionRequired = true;
+      existing.actionRequiredCount += 1;
+    }
     for (const flag of classification.flags) {
       if (!existing.flags.includes(flag)) existing.flags.push(flag);
     }
@@ -401,8 +410,29 @@ export function groupProviderDiagnostics(
   return order.map((key) => groups.get(key)!);
 }
 
+function formatDiagnosticTime(iso: string): string {
+  const parsed = Date.parse(iso);
+  if (!Number.isFinite(parsed)) return iso.slice(11, 19);
+  return new Date(parsed).toLocaleTimeString(undefined, {
+    hour: "2-digit",
+    minute: "2-digit",
+    second: "2-digit",
+  });
+}
+
 function DiagnosticGroupRow({ group }: { group: DiagnosticGroup }) {
   const [open, setOpen] = useState(group.actionRequired);
+  // Escalation tracking: open when actionRequiredCount rises. Covers both
+  // the initial promotion to actionRequired (0 -> 1) mid-stream and later
+  // escalations that arrive after the user manually closed a previously
+  // opened row. Steady state (count unchanged) leaves user intent alone.
+  const prevActionRequiredCount = useRef(group.actionRequiredCount);
+  useEffect(() => {
+    if (group.actionRequiredCount > prevActionRequiredCount.current) {
+      setOpen(true);
+    }
+    prevActionRequiredCount.current = group.actionRequiredCount;
+  }, [group.actionRequiredCount]);
   const count = group.events.length;
   const label = group.label;
   const flagText = group.flags.length ? group.flags.join(", ") : null;
@@ -413,6 +443,8 @@ function DiagnosticGroupRow({ group }: { group: DiagnosticGroup }) {
       data-source={group.source}
       data-kind={group.kind}
       data-code={group.code}
+      role="status"
+      aria-live="polite"
     >
       <button
         type="button"
@@ -421,6 +453,7 @@ function DiagnosticGroupRow({ group }: { group: DiagnosticGroup }) {
         onClick={() => setOpen((value) => !value)}
       >
         <ChevronDown
+          aria-hidden="true"
           className={`disclosure-chevron${open ? "" : " is-collapsed"}`}
           size={12}
         />
@@ -439,7 +472,7 @@ function DiagnosticGroupRow({ group }: { group: DiagnosticGroup }) {
           {group.entries.map((entry) => (
             <li key={entry.event.seq} className="codex-stream-diagnostic-item">
               <time className="codex-stream-diagnostic-time tabular-nums" dateTime={entry.event.normalized_at}>
-                {entry.event.normalized_at.slice(11, 19)}
+                {formatDiagnosticTime(entry.event.normalized_at)}
               </time>
               <pre className="codex-stream-diagnostic-message">{entry.classification.message}</pre>
             </li>

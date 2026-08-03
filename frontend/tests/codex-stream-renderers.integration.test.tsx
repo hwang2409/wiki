@@ -269,7 +269,100 @@ describe("codex stream renderers", () => {
     expect(groups).toHaveLength(1);
     expect(groups[0]?.severity).toBe("danger");
     expect(groups[0]?.actionRequired).toBe(true);
+    expect(groups[0]?.actionRequiredCount).toBe(1);
+    expect(groups[0]?.summary).toBe("moderation blocked");
+    expect(groups[0]?.label).toBe("blocked");
     expect(groups[0]?.events).toHaveLength(2);
+  });
+
+  it("keeps danger severity when a lower-severity event arrives after the escalation", () => {
+    const blocked = event("turn_moderationMetadata_warning", 1, {
+      metadata: { prompt: { omnimod: { outputs: [{
+        is_blocked: true,
+        results: [{ labels: ["hate"] }],
+      }] } } },
+    });
+    const flaggedAgain = event("turn_moderationMetadata_warning", 2, {
+      metadata: { prompt: { omnimod: { outputs: [{
+        is_blocked: false,
+        results: [{ labels: ["hate"] }],
+      }] } } },
+    });
+    const groups = groupProviderDiagnostics([blocked, flaggedAgain]);
+    expect(groups).toHaveLength(1);
+    expect(groups[0]?.severity).toBe("danger");
+    expect(groups[0]?.summary).toBe("moderation blocked");
+    expect(groups[0]?.label).toBe("blocked");
+    expect(groups[0]?.actionRequired).toBe(true);
+  });
+
+  it("splits same source/kind into separate rows when the code differs", () => {
+    const hookTimeout = event("warning", 1, {
+      message: "clamping SessionEnd hook timeout to 3s in /a/hooks.json",
+    });
+    const otherClamp = event("warning", 2, {
+      message: "clamping tool concurrency to 4",
+    });
+    const groups = groupProviderDiagnostics([hookTimeout, otherClamp]);
+    expect(groups).toHaveLength(2);
+    const codes = groups.map((group) => group.code).sort();
+    expect(codes).toEqual(["generic", "hook-timeout"]);
+    const kinds = groups.map((group) => group.kind);
+    expect(kinds.every((kind) => kind === "clamp")).toBe(true);
+  });
+
+  it("canonicalizes moderation flag order so equivalent flag sets share one row", () => {
+    const forwards = event("turn_moderationMetadata_warning", 1, {
+      metadata: { prompt: { omnimod: { outputs: [{
+        is_blocked: false,
+        results: [{ labels: ["hate", "violence"] }],
+      }] } } },
+    });
+    const reversed = event("turn_moderationMetadata_warning", 2, {
+      metadata: { prompt: { omnimod: { outputs: [{
+        is_blocked: false,
+        results: [{ labels: ["violence", "hate"] }],
+      }] } } },
+    });
+    const groups = groupProviderDiagnostics([forwards, reversed]);
+    expect(groups).toHaveLength(1);
+    expect(groups[0]?.events).toHaveLength(2);
+    expect(groups[0]?.code).toBe("hate+violence");
+  });
+
+  it("classifies non-clamp codex warnings as warning-severity runtime notices", () => {
+    const stray = event("warning", 1, { message: "provider disconnected: retrying" });
+    const groups = groupProviderDiagnostics([stray]);
+    expect(groups).toHaveLength(1);
+    expect(groups[0]?.source).toBe("codex");
+    expect(groups[0]?.kind).toBe("unknown");
+    expect(groups[0]?.severity).toBe("warning");
+    expect(groups[0]?.summary).toBe("runtime warning");
+    expect(groups[0]?.label).toBe("warning");
+    expect(groups[0]?.actionRequired).toBe(false);
+  });
+
+  it("auto-opens a group when a blocked event arrives after mount", () => {
+    const advisory = event("turn_moderationMetadata_warning", 1, {
+      metadata: { prompt: { omnimod: { outputs: [{
+        is_blocked: false,
+        results: [{ labels: ["hate"] }],
+      }] } } },
+    });
+    const view = render(<CodexStreamHighlights events={[advisory]} />);
+    const before = view.getByRole("button", { name: /moderation/i });
+    expect(before.getAttribute("aria-expanded")).toBe("false");
+    const blocked = event("turn_moderationMetadata_warning", 2, {
+      metadata: { prompt: { omnimod: { outputs: [{
+        is_blocked: true,
+        results: [{ labels: ["hate"] }],
+      }] } } },
+    });
+    view.rerender(<CodexStreamHighlights events={[advisory, blocked]} />);
+    const after = view.getByRole("button", { name: /blocked/i });
+    expect(after.getAttribute("aria-expanded")).toBe("true");
+    const body = view.container.querySelector("[data-testid='codex-diagnostic-body']");
+    expect(body).toBeTruthy();
   });
 
   it("preserves every raw warning message in the expanded diagnostics body", () => {
@@ -343,6 +436,14 @@ describe("codex stream renderers", () => {
     render(<CodexStreamHighlights events={events} />);
     const toggle = screen.getByRole("button", { name: /hook timeout clamped/i });
     expect(within(toggle).getByText("3")).toBeTruthy();
+  });
+
+  it("hides the count badge when a group has exactly one event", () => {
+    const clamp = event("warning", 1, {
+      message: "clamping SessionEnd hook timeout to 3s in /a/hooks.json",
+    });
+    const { container } = render(<CodexStreamHighlights events={[clamp]} />);
+    expect(container.querySelector(".codex-stream-diagnostic-count")).toBeNull();
   });
 
   it("collapses the working diff section by default; toggle reveals the file list", () => {
