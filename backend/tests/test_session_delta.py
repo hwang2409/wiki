@@ -116,7 +116,6 @@ class SessionDeltaTests(unittest.TestCase):
         # parent must map to the Nth child (ordered by start time); a parent
         # beyond the child count must stay unannotated instead of reusing a
         # sibling's child transcript.
-        transcripts._agent_child_assignments.clear()
         events = [
             {
                 "id": index,
@@ -131,7 +130,7 @@ class SessionDeltaTests(unittest.TestCase):
             {"id": "aaa11111", "prompt_head": "explore the code", "started_at": "2026-08-05T12:00:10Z"},
         ]
         with mock.patch.object(transcripts, "list_subagents", return_value=children):
-            annotated = transcripts.annotate_agent_events(Path("session-dup.jsonl"), events)
+            annotated = transcripts.annotate_agent_events(Path("session-dup.jsonl"), events, assignments={})
 
         self.assertEqual(annotated[0]["tool"]["agent_id"], "aaa11111")
         self.assertEqual(annotated[1]["tool"]["agent_id"], "bbb22222")
@@ -141,7 +140,7 @@ class SessionDeltaTests(unittest.TestCase):
         # WIKI-244 review round 2 (H1): a later delta window that carries only
         # the second duplicate parent must not restart the 1:1 counter and
         # re-map that parent onto the first parent's child.
-        transcripts._agent_child_assignments.clear()
+        store = {}
         children = [
             {"id": "aaa11111", "prompt_head": "explore the code", "started_at": "2026-08-05T12:00:10Z"},
             {"id": "bbb22222", "prompt_head": "explore the code", "started_at": "2026-08-05T12:05:10Z"},
@@ -159,11 +158,11 @@ class SessionDeltaTests(unittest.TestCase):
             "tool": {"name": "Task", "prompt_head": "explore the code"},
         }
         with mock.patch.object(transcripts, "list_subagents", return_value=children):
-            first = transcripts.annotate_agent_events(Path("session-split.jsonl"), [first_parent])
+            first = transcripts.annotate_agent_events(Path("session-split.jsonl"), [first_parent], assignments=store)
             # Second delta carries ONLY the later duplicate parent.
-            second = transcripts.annotate_agent_events(Path("session-split.jsonl"), [second_parent])
+            second = transcripts.annotate_agent_events(Path("session-split.jsonl"), [second_parent], assignments=store)
             # Re-annotating the first parent (older-page refetch) keeps its child.
-            refetched = transcripts.annotate_agent_events(Path("session-split.jsonl"), [first_parent])
+            refetched = transcripts.annotate_agent_events(Path("session-split.jsonl"), [first_parent], assignments=store)
 
         self.assertEqual(first[0]["tool"]["agent_id"], "aaa11111")
         self.assertEqual(second[0]["tool"]["agent_id"], "bbb22222")
@@ -174,7 +173,7 @@ class SessionDeltaTests(unittest.TestCase):
         # even when the LATER parent is annotated first, it claims the child
         # that started after its own timestamp, leaving the earlier child for
         # the earlier parent.
-        transcripts._agent_child_assignments.clear()
+        store = {}
         children = [
             {"id": "aaa11111", "prompt_head": "explore the code", "started_at": "2026-08-05T12:00:10Z"},
             {"id": "bbb22222", "prompt_head": "explore the code", "started_at": "2026-08-05T12:05:10Z"},
@@ -192,11 +191,119 @@ class SessionDeltaTests(unittest.TestCase):
             "tool": {"name": "Task", "prompt_head": "explore the code"},
         }
         with mock.patch.object(transcripts, "list_subagents", return_value=children):
-            late = transcripts.annotate_agent_events(Path("session-order.jsonl"), [late_parent])
-            early = transcripts.annotate_agent_events(Path("session-order.jsonl"), [early_parent])
+            late = transcripts.annotate_agent_events(Path("session-order.jsonl"), [late_parent], assignments=store)
+            early = transcripts.annotate_agent_events(Path("session-order.jsonl"), [early_parent], assignments=store)
 
         self.assertEqual(late[0]["tool"]["agent_id"], "bbb22222")
         self.assertEqual(early[0]["tool"]["agent_id"], "aaa11111")
+
+    def test_claude_annotation_drops_stale_assignment_on_prompt_change(self) -> None:
+        # WIKI-244 review round 4 (M2): a cached parent-id assignment must be
+        # re-validated against the current child list. If the parent at that
+        # id now carries a different prompt (id reuse after a rewrite), the
+        # stale child link is dropped and re-resolved by head.
+        store = {5: "old11111"}
+        children = [
+            {"id": "old11111", "prompt_head": "old work", "started_at": "2026-08-05T12:00:10Z"},
+            {"id": "new22222", "prompt_head": "different work", "started_at": "2026-08-05T12:05:10Z"},
+        ]
+        parent = {
+            "id": 5,
+            "kind": "tool",
+            "ts": "2026-08-05T12:05:00Z",
+            "tool": {"name": "Task", "prompt_head": "different work"},
+        }
+        with mock.patch.object(transcripts, "list_subagents", return_value=children):
+            annotated = transcripts.annotate_agent_events(Path("session-stale.jsonl"), [parent], assignments=store)
+
+        self.assertEqual(annotated[0]["tool"]["agent_id"], "new22222")
+        self.assertEqual(store, {5: "new22222"})
+
+    def test_claude_annotation_store_prunes_below_retained_base(self) -> None:
+        # Assignments for parents that fell below the retained event base can
+        # never be referenced again; they must not accumulate for the backend
+        # lifetime.
+        path = Path("session-prune.jsonl")
+        state = transcripts._new_parse_state("claude")
+        state["base"] = 10
+        state["agent_child_assignments"] = {3: "aaa11111", 12: "bbb22222"}
+        transcripts._cache[str(path)] = state
+
+        store = transcripts._agent_assignment_store(path)
+
+        self.assertEqual(store, {12: "bbb22222"})
+        self.assertIs(store, state["agent_child_assignments"])
+
+    def test_claude_annotation_resets_with_parse_state_on_transcript_shrink(self) -> None:
+        # WIKI-244 review round 4 (M2): a shrunk/rewritten transcript rebuilds
+        # the parse state; the assignment map must die with it so a reused
+        # path+event-id with a NEW prompt maps to the new child, never the old
+        # one.
+        long_prompt = "map the entire legacy billing pipeline and list every consumer of the invoice generator"
+        short_prompt = "check disk usage"
+        with TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            path = root / "session.jsonl"
+            subdir = root / "session" / "subagents"
+            subdir.mkdir(parents=True)
+            _write_rows(
+                subdir / "agent-aaaa1111.jsonl",
+                [{"type": "user", "timestamp": "2026-08-05T12:00:10Z", "message": {"content": long_prompt}}],
+                mode="w",
+            )
+            _write_rows(
+                path,
+                [
+                    {
+                        "type": "assistant",
+                        "timestamp": "2026-08-05T12:00:00Z",
+                        "message": {
+                            "role": "assistant",
+                            "content": [
+                                {"type": "tool_use", "id": "t1", "name": "Task", "input": {"prompt": long_prompt}},
+                            ],
+                        },
+                    },
+                ],
+                mode="w",
+            )
+            first = transcripts.read_session_delta("claude", path, 0, tail_window=False)
+            annotated = transcripts.annotate_agent_events(path, first["events"])
+            tool_events = [event for event in annotated if event.get("kind") == "tool"]
+            self.assertEqual(tool_events[0]["tool"]["agent_id"], "aaaa1111")
+            state = transcripts._cache[str(path)]
+            self.assertTrue(state["agent_child_assignments"], "assignment must live in the parse state")
+
+            # Rewrite the transcript SMALLER with a different prompt at the
+            # same event id, and add the matching new child transcript.
+            _write_rows(
+                subdir / "agent-bbbb2222.jsonl",
+                [{"type": "user", "timestamp": "2026-08-05T12:10:10Z", "message": {"content": short_prompt}}],
+                mode="w",
+            )
+            _write_rows(
+                path,
+                [
+                    {
+                        "type": "assistant",
+                        "timestamp": "2026-08-05T12:10:00Z",
+                        "message": {
+                            "role": "assistant",
+                            "content": [
+                                {"type": "tool_use", "id": "t2", "name": "Task", "input": {"prompt": short_prompt}},
+                            ],
+                        },
+                    },
+                ],
+                mode="w",
+            )
+            second = transcripts.read_session_delta("claude", path, 0, tail_window=False)
+            reannotated = transcripts.annotate_agent_events(path, second["events"])
+            new_tools = [event for event in reannotated if event.get("kind") == "tool"]
+            self.assertEqual(new_tools[0]["tool"]["agent_id"], "bbbb2222")
+            new_state = transcripts._cache[str(path)]
+            self.assertIsNot(new_state, state, "shrink must rebuild the parse state")
+            self.assertNotIn("aaaa1111", new_state["agent_child_assignments"].values())
 
     def test_models_endpoint_includes_new_codex_and_claude_options(self) -> None:
         payload = main.list_models()

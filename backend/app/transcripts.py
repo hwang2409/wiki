@@ -2193,6 +2193,9 @@ def _new_parse_state(fmt: str) -> dict:
         "artifact_ids": set(),
         "dedupe_credits": {},
         "dispositions": {"rendered": 0, "summarized": 0, "ignored": 0, "unknown": 0},
+        # parent event id → child agent id (claude only); dies with the state
+        # so stale links cannot outlive a transcript reset (WIKI-244).
+        "agent_child_assignments": {},
     }
 
 
@@ -2492,21 +2495,43 @@ def list_subagents(main_path: Path) -> list[dict]:
     return entries
 
 
-# main path → parent event id → assigned child id. Assignments persist across
-# delta windows so a duplicate-prompt parent arriving in a later response
-# never re-maps to a child that an earlier parent already claimed.
-_agent_child_assignments: dict[str, dict[int, str]] = {}
+def _agent_assignment_store(main_path: Path) -> dict:
+    """Parent-id → child-id map scoped to the transcript's parse state.
+
+    Living inside the parse-state dict means the map dies with the state:
+    a file shrink or reload rebuilds the state and drops every assignment,
+    so path+id reuse can never resurrect a stale child link. Entries below
+    the retained event base are pruned (those parents can no longer appear
+    in any response window). Direct callers without parse state get an
+    ephemeral map — correlation still works within that call.
+    """
+    key = str(main_path)
+    with _cache_lock_for(key):
+        state = _cache.get(key)
+        if state is None:
+            return {}
+        store = state.setdefault("agent_child_assignments", {})
+        base = int(state.get("base", 0))
+        if store and base:
+            for event_id in [event_id for event_id in store if event_id < base]:
+                del store[event_id]
+        return store
 
 
-def annotate_agent_events(main_path: Path, events: list) -> list:
+def annotate_agent_events(main_path: Path, events: list, assignments: dict | None = None) -> list:
     """Attach subagent ids without mutating parser-owned cached events.
 
     Parents and children correlate by prompt head. Duplicate heads (retries,
     repeated exploration prompts) resolve deterministically and independently
     of the delta window that carries the parent:
 
-    - assignments persist per parent event id (stable absolute index), so a
-      parent seen again in any later window keeps its child;
+    - assignments persist per parent event id (stable absolute index) inside
+      the transcript's parse state, so a parent seen again in a later window
+      keeps its child, while a parse-state reset (file shrink, reload) drops
+      the whole map;
+    - a cached assignment is re-validated against the current child list —
+      if the child vanished or its prompt head no longer matches the parent,
+      the stale link is dropped and re-resolved;
     - a new parent claims the first child (by start time) that no other
       parent holds AND that started at/after the parent's own timestamp —
       the timestamp anchor makes the choice identical whether duplicate
@@ -2515,7 +2540,9 @@ def annotate_agent_events(main_path: Path, events: list) -> list:
       another parent's child.
     """
     heads: dict[str, list[dict]] | None = None
-    assignments = _agent_child_assignments.setdefault(str(main_path), {})
+    children_by_id: dict[str, dict] = {}
+    if assignments is None:
+        assignments = _agent_assignment_store(main_path)
     annotated = events
     for index, event in enumerate(events):
         tool = event.get("tool")
@@ -2525,16 +2552,24 @@ def annotate_agent_events(main_path: Path, events: list) -> list:
         if not prompt_head:
             continue
         event_id = event.get("id")
+        if heads is None:
+            heads = {}
+            children = sorted(
+                (entry for entry in list_subagents(main_path) if entry["prompt_head"]),
+                key=lambda entry: (entry.get("started_at") or "", entry.get("mtime") or 0),
+            )
+            for child in children:
+                heads.setdefault(child["prompt_head"], []).append(child)
+                children_by_id[child["id"]] = child
         chosen = assignments.get(event_id) if isinstance(event_id, int) else None
+        if chosen is not None:
+            cached_child = children_by_id.get(chosen)
+            if cached_child is None or cached_child.get("prompt_head") != prompt_head:
+                # Stale link: the child vanished or the parent at this id now
+                # carries a different prompt (path or id reuse). Re-resolve.
+                del assignments[event_id]
+                chosen = None
         if chosen is None:
-            if heads is None:
-                heads = {}
-                children = sorted(
-                    (entry for entry in list_subagents(main_path) if entry["prompt_head"]),
-                    key=lambda entry: (entry.get("started_at") or "", entry.get("mtime") or 0),
-                )
-                for child in children:
-                    heads.setdefault(child["prompt_head"], []).append(child)
             candidates = heads.get(prompt_head) or []
             taken_ids = set(assignments.values())
             parent_ts = event.get("ts") or ""
