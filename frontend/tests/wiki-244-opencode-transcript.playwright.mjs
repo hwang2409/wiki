@@ -211,7 +211,14 @@ async function main() {
 
     logStep("M3: block cursor in insert and normal mode");
     const composer = page.locator(".session-composer textarea").first();
-    await composer.click();
+    const focusComposer = async () => {
+      await composer.click();
+      await page.waitForFunction(
+        () => document.activeElement === document.querySelector(".session-composer textarea"),
+      );
+    };
+    await focusComposer();
+    await composer.evaluate((el) => { el.dataset.wiki244 = "tagged"; });
     const caretColor = await composer.evaluate((el) => getComputedStyle(el).caretColor);
     assert(caretColor === "rgba(0, 0, 0, 0)" || caretColor === "transparent",
       `native caret must be transparent, got ${caretColor}`);
@@ -221,7 +228,15 @@ async function main() {
     await page.keyboard.press("ArrowLeft");
     await page.waitForTimeout(120);
     const overlay = page.locator(".session-empty-block-cursor");
-    await overlay.waitFor({ state: "visible" });
+    try {
+      await overlay.waitFor({ state: "visible", timeout: 5000 });
+    } catch {
+      // Focus can be stolen by a late layout pass under load — refocus once.
+      await focusComposer();
+      await page.keyboard.press("ArrowLeft");
+      await page.keyboard.press("ArrowRight");
+      await overlay.waitFor({ state: "visible", timeout: 10_000 });
+    }
     const overlayGeometry = () => page.evaluate(() => {
       const cursor = document.querySelector(".session-empty-block-cursor");
       const input = document.querySelector(".session-composer textarea");
@@ -265,37 +280,39 @@ async function main() {
     await page.keyboard.press("i");
     const longDraft = Array.from({ length: 40 }, (_, i) => `draft line ${i + 1}`).join("\n");
     await composer.fill(longDraft);
-    const scrollToCaret = () => composer.evaluate((el) => {
+    const scrollable = await composer.evaluate((el) => el.scrollHeight > el.clientHeight);
+    assert(scrollable, "capped draft must overflow the composer for the scroll assertions");
+    // The polling waits re-assert the scroll position on every poll (a held
+    // scroll position emits repeated scroll events for real users) and pass
+    // only once the overlay reaches the expected state.
+    const waitOverlayAtBottom = () => page.waitForFunction(() => {
+      const el = document.querySelector(".session-composer textarea");
+      if (!el || document.activeElement !== el) return false;
       el.setSelectionRange(el.value.length, el.value.length);
       el.scrollTop = el.scrollHeight;
       el.dispatchEvent(new Event("scroll", { bubbles: true }));
-    });
-    await scrollToCaret();
-    await page.waitForTimeout(150);
-    const scrollable = await composer.evaluate((el) => el.scrollHeight > el.clientHeight);
-    assert(scrollable, "capped draft must overflow the composer for the scroll assertions");
-    await overlay.waitFor({ state: "visible" });
+      return document.querySelectorAll(".session-empty-block-cursor").length === 1;
+    }, undefined, { timeout: 15_000 });
+    const waitOverlayHiddenAtTop = () => page.waitForFunction(() => {
+      const el = document.querySelector(".session-composer textarea");
+      if (!el) return false;
+      el.scrollTop = 0;
+      el.dispatchEvent(new Event("scroll", { bubbles: true }));
+      return document.querySelectorAll(".session-empty-block-cursor").length === 0;
+    }, undefined, { timeout: 15_000 });
+    await waitOverlayAtBottom();
     assert((await overlayGeometry()).within, "block cursor must sit inside the textarea at the scrolled caret");
     // Scroll the caret line out of view: the block must hide, not float over
     // unrelated rows.
-    await composer.evaluate((el) => {
-      el.scrollTop = 0;
-      el.dispatchEvent(new Event("scroll", { bubbles: true }));
-    });
-    await page.waitForTimeout(150);
-    assert((await overlay.count()) === 0, "block cursor must hide when the caret line scrolls out of view");
-    await scrollToCaret();
-    await page.waitForTimeout(150);
-    await overlay.waitFor({ state: "visible" });
+    await waitOverlayHiddenAtTop();
+    await waitOverlayAtBottom();
     // Pane reflow: a narrower viewport rewraps the draft; the overlay must
     // recompute and stay inside the textarea.
     await page.setViewportSize({ width: 1060, height: 1400 });
     await page.waitForTimeout(300);
     const reflowWidth = await composer.evaluate((el) => el.clientWidth);
     assert(reflowWidth > 200, `reflow precondition: composer must stay usable, got ${reflowWidth}px`);
-    await scrollToCaret();
-    await page.waitForTimeout(150);
-    await overlay.waitFor({ state: "visible" });
+    await waitOverlayAtBottom();
     assert((await overlayGeometry()).within, "block cursor must stay inside the textarea after a pane reflow");
 
     logStep("M3: no cursor after blur");

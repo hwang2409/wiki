@@ -3366,14 +3366,23 @@ function MessageComposer({
   // caret's viewport position, and layout reflow (pane resize) changes line
   // wrapping. Both bump a tick that re-runs the measurement effect.
   const [overlayTick, setOverlayTick] = useState(0);
-  const bumpOverlayTick = useCallback(() => setOverlayTick((tick) => tick + 1), []);
   useEffect(() => {
     const el = inputRef.current;
-    if (!el || typeof ResizeObserver === "undefined") return;
-    const observer = new ResizeObserver(() => setOverlayTick((tick) => tick + 1));
-    observer.observe(el);
-    return () => observer.disconnect();
-  }, []);
+    if (!el) return;
+    const bump = () => setOverlayTick((tick) => tick + 1);
+    // Native listener (not React-synthetic): programmatic scrollTop writes
+    // and browser-driven caret scrolling both fire here reliably. Re-bind on
+    // focus transitions so the listener always tracks the live node, and
+    // re-measure once on every (re)bind.
+    el.addEventListener("scroll", bump, { passive: true });
+    const observer = typeof ResizeObserver === "undefined" ? null : new ResizeObserver(bump);
+    observer?.observe(el);
+    bump();
+    return () => {
+      el.removeEventListener("scroll", bump);
+      observer?.disconnect();
+    };
+  }, [composerFocused]);
 
   // WIKI-244: the cursor is a block in every vim mode. Insert mode hides the
   // native line caret (CSS) and draws the same overlay block that normal mode
@@ -3386,7 +3395,12 @@ function MessageComposer({
       setOverlayPos(null);
       return;
     }
-    const at = Math.min(caretPos, text.length);
+    // Insert mode reads the live DOM selection: programmatic value/selection
+    // changes (paste, external fill) update the DOM without firing the
+    // select/keyup events that keep caretPos state in sync, and a stale
+    // caretPos would paint the block over the wrong character or hide it.
+    const domCaret = el.selectionStart ?? caretPos;
+    const at = Math.min(vimMode === "insert" ? domCaret : caretPos, text.length);
     if (vimMode !== "insert") {
       const needsOverlay = text.length === 0 || at >= text.length || text[at] === "\n";
       if (!needsOverlay) {
@@ -4234,7 +4248,6 @@ function MessageComposer({
                 }}
                 onClick={(event) => captureSelection(event.currentTarget)}
                 onKeyUp={(event) => captureSelection(event.currentTarget)}
-                onScroll={bumpOverlayTick}
                 onSelect={(event) => captureSelection(event.currentTarget)}
                 onDragOver={(event) => event.preventDefault()}
                 onDrop={(event) => {
