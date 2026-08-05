@@ -51,6 +51,7 @@ import {
   cancelQueuedMessage,
   getAgentModels,
   getSkills,
+  getSubagentSession,
   respondToAgentRequest,
   sendAgentMessage,
   setAgentModel,
@@ -66,6 +67,7 @@ import type {
   SessionInit,
   SessionRateLimit,
   SessionPr,
+  SessionTool,
   SkillInfo,
   SubagentInfo,
 } from "./api";
@@ -1053,123 +1055,225 @@ const ARCHETYPE_ICONS: Record<string, LucideIcon> = {
   tool: Wrench,
 };
 
+function toolSummaryLine(tool: SessionTool): string {
+  return tool.summary || tool.input.split("\n")[0].slice(0, 120);
+}
+
+// Multiline inputs (and Bash commands, whose summary is a description) render
+// as a body block. Single-line inputs are already carried by the row itself:
+// either the summary contains them, or they render as an inline dim detail
+// (OpenCode-style full argument after the tool name). Raw input evidence
+// therefore always stays reachable without a click (WIKI-238 contract).
+function toolInputIsBlock(tool: SessionTool): boolean {
+  if (!tool.input) return false;
+  if (tool.name === "Bash") return true;
+  return tool.input.split("\n")[0].length < tool.input.length;
+}
+
+function toolInlineDetail(tool: SessionTool): string | null {
+  if (!tool.input || toolInputIsBlock(tool)) return null;
+  const input = tool.input.trim();
+  if (!input || toolSummaryLine(tool).includes(input)) return null;
+  return input;
+}
+
+function ToolInputBody({ tool }: { tool: SessionTool }) {
+  if (!toolInputIsBlock(tool)) return null;
+  return (
+    <div className="session-tool-body">
+      {tool.name === "Bash" ? (
+        <BoundedPreview
+          label="input"
+          text={tool.input}
+          renderBody={({ text }) => (
+            <ShikiCode className="session-tool-input" code={text} lang="bash" transparent />
+          )}
+        />
+      ) : (
+        <BoundedPreview label="input" text={tool.input} />
+      )}
+    </div>
+  );
+}
+
+function ToolOutputBody({ tool }: { tool: SessionTool }) {
+  if (!tool.output) return null;
+  const hasGitHubPreview = containsGitHubPreviewUrl(tool.output);
+  return (
+    <div className="session-tool-body">
+      {hasGitHubPreview ? (
+        <BoundedPreview
+          ansi
+          label="output"
+          text={tool.output}
+          tone={tool.ok === false ? "error" : "normal"}
+          renderBody={({ text }) => (
+            <div className="session-tool-output-blocks">
+              <span className="session-tool-output-text">
+                {renderAnsiWithGitHubPreviews(text)}
+              </span>
+            </div>
+          )}
+        />
+      ) : (
+        <BoundedPreview
+          ansi
+          label="output"
+          text={tool.output}
+          tone={tool.ok === false ? "error" : "normal"}
+        />
+      )}
+    </div>
+  );
+}
+
+const SUBTRACE_MAX_ROWS = 60;
+// Virtualized rows unmount offscreen; the cache keeps the last fetched child
+// trace so scrolling back does not blank the rows or refetch from scratch.
+const subagentTraceCache = new Map<string, SessionEvent[]>();
+
+// OpenCode-style sub-agent grouping: an agent tool (Task/Explore) lists its
+// child tool calls as always-visible one-line rows indented under the parent.
+// The child transcript is a separate backend resource, so it loads lazily and
+// re-polls while the sub-agent is still running.
+function SubagentTrace({ active, agentId, ticket }: { active: boolean; agentId: string; ticket: string }) {
+  const cacheKey = `${ticket}:${agentId}`;
+  const [events, setEvents] = useState<SessionEvent[] | null>(
+    () => subagentTraceCache.get(cacheKey) ?? null
+  );
+  useEffect(() => {
+    let cancelled = false;
+    let timer: number | null = null;
+    const load = async () => {
+      try {
+        const data = await getSubagentSession(ticket, agentId);
+        if (cancelled) return;
+        subagentTraceCache.set(cacheKey, data.events);
+        setEvents(data.events);
+      } catch {
+        // Child transcript may not exist yet (or ever) — keep the parent row usable.
+      }
+      if (!cancelled && active) timer = window.setTimeout(load, POLL_MS);
+    };
+    void load();
+    return () => {
+      cancelled = true;
+      if (timer !== null) window.clearTimeout(timer);
+    };
+  }, [active, agentId, cacheKey, ticket]);
+  const toolEvents = (events ?? []).filter((event) => event.kind === "tool" && event.tool);
+  if (!toolEvents.length) return null;
+  const shown = toolEvents.slice(-SUBTRACE_MAX_ROWS);
+  const omitted = toolEvents.length - shown.length;
+  return (
+    <div className="session-subtrace">
+      {omitted > 0 ? (
+        <div className="session-subtrace-more">+{omitted} earlier calls</div>
+      ) : null}
+      {shown.map((child, index) => {
+        const tool = child.tool!;
+        const Icon = ARCHETYPE_ICONS[tool.archetype] ?? Terminal;
+        return (
+          <div className="session-subtrace-row" key={child.id}>
+            <span aria-hidden="true" className="session-trace-connector">
+              {index === shown.length - 1 ? "└" : "├"}
+            </span>
+            <Icon className="session-tool-icon" size={11} />
+            <span className="session-tool-summary" title={tool.name}>{toolSummaryLine(tool)}</span>
+            {tool.output === null && tool.ok === null ? (
+              <span className="session-tool-running" title="running" />
+            ) : null}
+            {tool.ok === false ? <span className="session-tool-err">failed</span> : null}
+          </div>
+        );
+      })}
+    </div>
+  );
+}
+
 function ToolCallRow({
+  connector,
   event,
   onInspect,
-  onToggle,
-  open,
+  ticket,
+  withResult,
 }: {
+  connector: string;
   event: SessionEvent;
   onInspect?: (agentId: string) => void;
-  onToggle: () => void;
-  open: boolean;
+  ticket: string;
+  withResult: boolean;
 }) {
   const tool = event.tool!;
   const Icon = ARCHETYPE_ICONS[tool.archetype] ?? Terminal;
-  const summary = tool.summary || tool.input.split("\n")[0].slice(0, 120);
   const running = tool.output === null && tool.ok === null;
+  const detail = toolInlineDetail(tool);
   return (
-    <div className={`session-tool${open ? " is-open" : ""}`} data-tool-event-id={event.id}>
-      <div className="session-activity-row is-tool">
-        <span className="session-activity-row-label">tool</span>
-        <div className="session-activity-row-content">
-          <button aria-expanded={open} className="session-tool-head" type="button" onClick={onToggle}>
-            <ChevronRight className={`collapse-icon${open ? "" : " is-collapsed"}`} size={12} />
-            <Icon className="session-tool-icon" size={12} />
-            <span className="session-tool-summary" title={tool.name}>
-              {summary}
-            </span>
-            {running ? <span className="session-tool-running" title="running" /> : null}
-            {tool.ok === false ? <span className="session-tool-err">failed</span> : null}
-            {tool.agent_id && onInspect ? (
-              <span
-                className="session-tool-inspect"
-                role="button"
-                tabIndex={0}
-                onClick={(e) => {
-                  e.stopPropagation();
-                  onInspect(tool.agent_id!);
-                }}
-                onKeyDown={(e) => {
-                  if (e.key === "Enter") {
-                    e.stopPropagation();
-                    onInspect(tool.agent_id!);
-                  }
-                }}
-              >
-                inspect
-              </span>
-            ) : null}
-          </button>
-          <div className={`session-collapsible session-tool-input-collapsible${open ? " is-open" : ""}`}>
-            <div className="session-collapsible-inner">
-              <div className="session-tool-body">
-                {tool.name === "Bash" && tool.input ? (
-                  <BoundedPreview
-                    label="input"
-                    text={tool.input}
-                    renderBody={({ text }) => (
-                      <ShikiCode className="session-tool-input" code={text} lang="bash" transparent />
-                    )}
-                  />
-                ) : tool.input ? (
-                  <BoundedPreview label="input" text={tool.input} />
-                ) : null}
-              </div>
-            </div>
-          </div>
-        </div>
+    <div
+      className={`session-tool session-activity-row is-tool${tool.ok === false ? " is-failed" : ""}`}
+      data-tool-event-id={event.id}
+    >
+      <div className="session-tool-head">
+        <span aria-hidden="true" className="session-trace-connector">{connector}</span>
+        <Icon className="session-tool-icon" size={12} />
+        <span className="session-tool-summary" title={tool.name}>
+          {toolSummaryLine(tool)}
+        </span>
+        {detail ? (
+          <span className="session-tool-detail" title={detail}>{detail}</span>
+        ) : null}
+        {running ? <span className="session-tool-running" title="running" /> : null}
+        {tool.ok === false ? <span className="session-tool-err">failed</span> : null}
+        {tool.agent_id && onInspect ? (
+          <span
+            className="session-tool-inspect"
+            role="button"
+            tabIndex={0}
+            onClick={(e) => {
+              e.stopPropagation();
+              onInspect(tool.agent_id!);
+            }}
+            onKeyDown={(e) => {
+              if (e.key === "Enter") {
+                e.stopPropagation();
+                onInspect(tool.agent_id!);
+              }
+            }}
+          >
+            inspect
+          </span>
+        ) : null}
+      </div>
+      <div className="session-trace-indent">
+        <ToolInputBody tool={tool} />
+        {withResult ? <ToolOutputBody tool={tool} /> : null}
+        {tool.agent_id ? (
+          <SubagentTrace active={running} agentId={tool.agent_id} ticket={ticket} />
+        ) : null}
       </div>
     </div>
   );
 }
 
-function ToolResultRow({ event, open }: { event: SessionEvent; open: boolean }) {
+// Standalone result row — used when the tool's completion is separated from
+// its call in the timeline (parallel tools completing out of order). The dim
+// identifying line says which call this output belongs to.
+function ToolResultRow({ connector, event }: { connector: string; event: SessionEvent }) {
   const tool = event.tool!;
-  const summary = tool.summary || tool.input.split("\n")[0].slice(0, 120);
-  const hasGitHubPreview = !!tool.output && containsGitHubPreviewUrl(tool.output);
   const resultLabel = tool.ok === false ? "failed" : tool.ok === true ? "done" : "completed";
-  const rawResult = tool.ok === false ? "error" : tool.ok === true ? "ok" : "unknown";
   return (
     <div
       className={`session-activity-row is-result${tool.ok === false ? " is-failed" : ""}`}
       data-tool-event-id={event.id}
     >
-      <span className="session-activity-row-label">result</span>
-      <div className="session-activity-row-content">
-        <div className="session-tool-result">
-          <span>{resultLabel}</span>
-          <span className="session-activity-row-meta">{rawResult}</span>
-          <span className="session-tool-result-summary" title={tool.name}>{summary}</span>
-        </div>
-        <div className={`session-collapsible session-tool-collapsible${open ? " is-open" : ""}`}>
-          <div className="session-collapsible-inner">
-            <div className="session-tool-body">
-              {hasGitHubPreview ? (
-                <BoundedPreview
-                  ansi
-                  label="output"
-                  text={tool.output ?? ""}
-                  tone={tool.ok === false ? "error" : "normal"}
-                  renderBody={({ text }) => (
-                    <div className="session-tool-output-blocks">
-                      <span className="session-tool-output-text">
-                        {renderAnsiWithGitHubPreviews(text)}
-                      </span>
-                    </div>
-                  )}
-                />
-              ) : tool.output ? (
-                <BoundedPreview
-                  ansi
-                  label="output"
-                  text={tool.output}
-                  tone={tool.ok === false ? "error" : "normal"}
-                />
-              ) : null}
-            </div>
-          </div>
-        </div>
+      <div className="session-tool-result">
+        <span aria-hidden="true" className="session-trace-connector">{connector}</span>
+        <span className="session-tool-result-state">{resultLabel}</span>
+        {tool.ok === null ? <span className="session-activity-row-meta">unknown</span> : null}
+        <span className="session-tool-result-summary" title={tool.name}>{toolSummaryLine(tool)}</span>
+      </div>
+      <div className="session-trace-indent">
+        <ToolOutputBody tool={tool} />
       </div>
     </div>
   );
@@ -1838,49 +1942,73 @@ const MessageBlock = memo(function MessageBlock({
   sameImageNums(prev.imageNums, next.imageNums)
 );
 
+type TraceRow =
+  | { kind: "tool"; event: SessionEvent; eventIndex: number; withResult: boolean }
+  | { kind: "result"; event: SessionEvent; eventIndex: number }
+  | { kind: "thinking"; event: SessionEvent; eventIndex: number };
+
+// Flatten the timeline into OpenCode-style rows. A call immediately followed
+// by its own result renders as one merged row (call line + output beneath) —
+// the common sequential case. Results separated by interleaved calls keep a
+// standalone row so parallel-tool completion order stays legible.
+function traceRows(timeline: ActivityTimelineItem[]): TraceRow[] {
+  const rows: TraceRow[] = [];
+  for (let index = 0; index < timeline.length; index += 1) {
+    const item = timeline[index];
+    if (item.kind === "result") {
+      rows.push({ kind: "result", event: item.event, eventIndex: item.eventIndex });
+      continue;
+    }
+    if (item.event.kind === "tool") {
+      const next = timeline[index + 1];
+      // Unknown-outcome completions (ok === null, e.g. interrupted sessions)
+      // keep a standalone result row so the neutral "completed/unknown"
+      // labelling survives (WIKI-238 contract).
+      const withResult =
+        !!next && next.kind === "result" && next.event === item.event && item.event.tool!.ok !== null;
+      if (withResult) index += 1;
+      rows.push({ kind: "tool", event: item.event, eventIndex: item.eventIndex, withResult });
+      continue;
+    }
+    if (!item.event.text) continue;
+    rows.push({ kind: "thinking", event: item.event, eventIndex: item.eventIndex });
+  }
+  return rows;
+}
+
+// Tree connector for a tool/result row: last row of a contiguous run of tool
+// rows closes with └, everything before it branches with ├.
+function traceConnector(rows: TraceRow[], index: number): string {
+  const next = rows[index + 1];
+  return next && next.kind !== "thinking" ? "├" : "└";
+}
+
 function ActivityGroupBase({
   events,
   groupKey,
   onInspect,
   runState,
+  ticket,
   uiState,
 }: {
   events: SessionEvent[];
   groupKey: number;
   onInspect?: (agentId: string) => void;
   runState: ActivityRunState;
+  ticket: string;
   uiState: SessionUiState;
 }) {
-  const [open, setOpen] = useStoredBooleanState(uiState, `activity:${groupKey}`, false);
-  const [openToolIndexes, setOpenToolIndexes] = useState<Set<number>>(() => {
-    const indexes = new Set<number>();
-    events.forEach((event, index) => {
-      if (event.kind === "tool" && uiState.booleans.get(`tool:${groupKey + index}`)) indexes.add(index);
-    });
-    return indexes;
-  });
+  // Open by default: the trace is meant to be read by scrolling (WIKI-244).
+  // Collapsing stays available as an explicit opt-out per group.
+  const [open, setOpen] = useStoredBooleanState(uiState, `activity:${groupKey}`, true);
   const counts = activityCountsLabel(events);
   const semanticSummary = activitySemanticSummary(events);
   const state = activityStateLabel(events, runState);
   const elapsed = activityElapsedLabel(events);
   const stateClass = state.replace(/\s+/g, "-");
-  const timeline = useMemo(() => activityTimeline(events), [events]);
-  const toggleTool = useCallback((eventIndex: number) => {
-    setOpenToolIndexes((current) => {
-      const next = new Set(current);
-      const stateKey = `tool:${groupKey + eventIndex}`;
-      if (next.has(eventIndex)) {
-        next.delete(eventIndex);
-        uiState.booleans.delete(stateKey);
-      } else {
-        next.add(eventIndex);
-        uiState.booleans.set(stateKey, true);
-      }
-      return next;
-    });
-  }, [groupKey, uiState]);
+  const rows = useMemo(() => traceRows(activityTimeline(events)), [events]);
   return (
-    <div className="session-activity">
+    <div className={`session-activity${open ? " is-open" : ""}`}>
       <button aria-expanded={open} className="session-activity-head" type="button" onClick={() => setOpen(!open)}>
         <ChevronRight className={`collapse-icon${open ? "" : " is-collapsed"}`} size={12} />
         <span className="session-activity-summary">
@@ -1900,34 +2028,36 @@ function ActivityGroupBase({
       <div className={`session-collapsible session-activity-collapsible${open ? " is-open" : ""}`}>
         <div className="session-collapsible-inner">
           <div className="session-activity-body">
-            {timeline.map(({ event, eventIndex, kind }) => {
-              const toolOpen = openToolIndexes.has(eventIndex);
-              if (kind === "result") {
-                return <ToolResultRow event={event} key={`result:${groupKey + eventIndex}`} open={toolOpen} />;
-              }
-              if (event.kind === "tool") {
+            {rows.map((row, index) => {
+              if (row.kind === "result") {
                 return (
-                  <ToolCallRow
-                    event={event}
-                    key={`tool:${groupKey + eventIndex}`}
-                    onInspect={onInspect}
-                    onToggle={() => toggleTool(eventIndex)}
-                    open={toolOpen}
+                  <ToolResultRow
+                    connector={traceConnector(rows, index)}
+                    event={row.event}
+                    key={`result:${groupKey + row.eventIndex}`}
                   />
                 );
               }
-              if (!event.text) return null;
+              if (row.kind === "tool") {
+                return (
+                  <ToolCallRow
+                    connector={traceConnector(rows, index)}
+                    event={row.event}
+                    key={`tool:${groupKey + row.eventIndex}`}
+                    onInspect={onInspect}
+                    ticket={ticket}
+                    withResult={row.withResult}
+                  />
+                );
+              }
               return (
-                <div className="session-activity-row is-reasoning" key={`event:${groupKey + eventIndex}`}>
-                  <span className="session-activity-row-label">reasoning</span>
-                  <div className="session-activity-row-content">
-                    <div className="session-activity-row-meta">thinking</div>
-                    <div className="session-thinking">
-                      <StreamClamp>
-                        {event.encrypted ? <span className="session-thinking-chip">encrypted</span> : null}
-                        {event.text}
-                      </StreamClamp>
-                    </div>
+                <div className="session-activity-row is-reasoning" key={`event:${groupKey + row.eventIndex}`}>
+                  <div className="session-activity-row-meta">thinking</div>
+                  <div className="session-thinking">
+                    <StreamClamp>
+                      {row.event.encrypted ? <span className="session-thinking-chip">encrypted</span> : null}
+                      {row.event.text}
+                    </StreamClamp>
                   </div>
                 </div>
               );
@@ -1943,6 +2073,7 @@ const ActivityGroup = memo(ActivityGroupBase, (prev, next) =>
   prev.groupKey === next.groupKey &&
   prev.onInspect === next.onInspect &&
   prev.runState === next.runState &&
+  prev.ticket === next.ticket &&
   prev.uiState === next.uiState &&
   prev.events.length === next.events.length &&
   prev.events.every((event, index) => event === next.events[index])
@@ -2070,6 +2201,7 @@ const VirtualSessionRow = memo(function VirtualSessionRow({
           groupKey={group.key}
           onInspect={onInspect}
           runState={activityRunState}
+          ticket={ticket}
           uiState={uiState}
         />
       ) : (
@@ -3014,6 +3146,7 @@ function MessageComposer({
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [vimMode, setVimMode] = useState<ComposerMode>(() => cachedComposer?.vimMode ?? "insert");
+  const [composerFocused, setComposerFocused] = useState(false);
   const pendingKeyRef = useRef<string | null>(null);
   const registerRef = useRef<string>("");
   const historyPosRef = useRef<number | null>(null);
@@ -3106,20 +3239,27 @@ function MessageComposer({
     restoreSelectionRef.current = false;
   }, [stateKey, text]);
 
+  // WIKI-244: the cursor is a block in every vim mode. Insert mode hides the
+  // native line caret (CSS) and draws the same overlay block that normal mode
+  // uses at end-of-line, so the cursor never changes shape across mode
+  // switches. Normal/visual mode keeps the one-char-selection block for
+  // positions that have a character under them.
   useLayoutEffect(() => {
     const el = inputRef.current;
-    if (!el || vimMode === "insert" || document.activeElement !== el) {
+    if (!el || document.activeElement !== el) {
       setOverlayPos(null);
       return;
     }
     const at = Math.min(caretPos, text.length);
-    const needsOverlay = text.length === 0 || at >= text.length || text[at] === "\n";
-    if (!needsOverlay) {
-      setOverlayPos(null);
-      return;
+    if (vimMode !== "insert") {
+      const needsOverlay = text.length === 0 || at >= text.length || text[at] === "\n";
+      if (!needsOverlay) {
+        setOverlayPos(null);
+        return;
+      }
     }
     setOverlayPos(measureCaret(el, at));
-  }, [text, caretPos, vimMode]);
+  }, [text, caretPos, vimMode, composerFocused]);
 
   const trigger = (() => {
     const el = inputRef.current;
@@ -3898,9 +4038,16 @@ function MessageComposer({
             <div className="session-input-wrap">
               {overlayPos ? (
                 <span
+                  aria-hidden="true"
                   className="session-empty-block-cursor"
                   style={{ top: overlayPos.top, left: overlayPos.left }}
-                />
+                >
+                  {(() => {
+                    const at = Math.min(caretPos, text.length);
+                    const under = text[at];
+                    return under && under !== "\n" ? under : "";
+                  })()}
+                </span>
               ) : null}
               <textarea
                 id={composerInputId}
@@ -3931,9 +4078,11 @@ function MessageComposer({
                 }
                 aria-autocomplete="list"
                 onFocus={(event) => {
+                  setComposerFocused(true);
                   if (vimMode !== "insert") enterInsert(event.currentTarget.selectionEnd ?? text.length);
                   else captureSelection(event.currentTarget);
                 }}
+                onBlur={() => setComposerFocused(false)}
                 onChange={(event) => {
                   setText(event.target.value);
                   setMenuDismissed(false);

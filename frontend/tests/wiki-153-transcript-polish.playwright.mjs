@@ -327,12 +327,10 @@ async function main() {
     await expectVisibleText(page, ".session-marker.is-info", "stop hook");
 
     logStep("tool call: expand activity, assert failed + bounded preview");
-    const activityToggle = page.locator(".session-activity-head").first();
-    await activityToggle.waitFor({ state: "visible" });
-    await activityToggle.click();
+    // WIKI-244: activity groups and tool bodies are open by default.
+    await page.locator(".session-activity-head").first().waitFor({ state: "visible" });
     const failedTool = page.locator(".session-tool", { has: page.locator(".session-tool-err", { hasText: "failed" }) }).first();
     await failedTool.waitFor({ state: "visible" });
-    await failedTool.locator(".session-tool-head").click();
 
     const outputPreview = failedTool.locator(".transcript-preview.is-error").first();
     await outputPreview.waitFor({ state: "visible" });
@@ -356,7 +354,6 @@ async function main() {
     logStep("bash tool call: input routed through BoundedPreview + shiki");
     const bashTool = page.locator(".session-tool", { has: page.locator(".session-tool-summary", { hasText: /wiki-153 tool step/ }) }).first();
     await bashTool.waitFor({ state: "visible" });
-    await bashTool.locator(".session-tool-head").click();
     const bashToolInput = bashTool.locator(".transcript-preview", { has: page.locator(".transcript-preview-label", { hasText: "input" }) }).first();
     await bashToolInput.waitFor({ state: "visible" });
     await bashToolInput.locator(".shiki-block[data-lang='bash']").waitFor({ state: "visible" });
@@ -368,7 +365,6 @@ async function main() {
     logStep("gh-preview mixed with long output: clip bounds output, expand reveals tail");
     const ghMixTool = page.locator(".session-tool", { has: page.locator(".session-tool-summary", { hasText: /gh pr view 122/ }) }).first();
     await ghMixTool.waitFor({ state: "visible" });
-    await ghMixTool.locator(".session-tool-head").click();
     const ghMixOutput = ghMixTool.locator(".transcript-preview", { has: page.locator(".transcript-preview-label", { hasText: "output" }) }).first();
     await ghMixOutput.waitFor({ state: "visible" });
     const ghMixBody = ghMixOutput.locator(".transcript-preview-body.is-custom").first();

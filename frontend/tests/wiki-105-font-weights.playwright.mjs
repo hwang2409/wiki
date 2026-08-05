@@ -56,15 +56,22 @@ try {
     throw new Error(`Settings modal overflowed: ${defaults.width} clientWidth vs ${defaults.scrollWidth} scrollWidth`);
   }
 
-  const monoPicker = page.locator(".font-picker").nth(2);
+  // WIKI-244: the agent chat font role sits between text and mono, and the
+  // weight control is a free numeric input plus detected-stop presets.
+  const monoRow = page.locator(".settings-row").filter({ hasText: "Monospace font" }).first();
+  const monoPicker = monoRow.locator(".font-picker");
   await monoPicker.getByRole("button").click();
   await monoPicker.getByRole("option", { name: /Consolas for Powerline/ }).click();
 
-  const monoWeight = page.getByLabel("Monospace font weight");
-  await page.waitForFunction(
-    () => document.querySelectorAll('select[aria-label="Monospace font weight"] option').length > 1
+  const monoWeight = monoRow.locator(".font-weight-input");
+  await page.waitForFunction(() => {
+    const row = [...document.querySelectorAll(".settings-row")]
+      .find((candidate) => candidate.textContent?.includes("Monospace font"));
+    return row ? row.querySelectorAll(".font-weight-stop").length > 1 : false;
+  });
+  const weights = await monoRow.locator(".font-weight-stop").evaluateAll(
+    (stops) => stops.map((stop) => stop.textContent?.trim() ?? "")
   );
-  const weights = await monoWeight.locator("option").evaluateAll((options) => options.map((option) => option.value));
   if (!weights.includes("400") || !weights.includes("700")) {
     throw new Error(`Expected bundled Consolas faces to expose Regular and Bold, saw ${weights.join(", ")}`);
   }
@@ -81,9 +88,9 @@ try {
   await monoPicker.getByRole("button").click();
   await page.screenshot({ path: screenshots.settings, fullPage: true });
   await page.keyboard.press("Escape");
-  await monoWeight.selectOption("400");
+  await monoRow.locator(".font-weight-stop", { hasText: "400" }).click();
   await page.screenshot({ path: screenshots.regular, fullPage: true });
-  await monoWeight.selectOption("700");
+  await monoRow.locator(".font-weight-stop", { hasText: "700" }).click();
   await page.screenshot({ path: screenshots.heavier, fullPage: true });
 
   const applied = await page.evaluate(() => {
@@ -127,26 +134,21 @@ try {
   }
   await mirrorContext.close();
 
-  const pickerAfterReload = page.locator(".font-picker").nth(2);
-  await pickerAfterReload.getByRole("button").click();
-  await pickerAfterReload.getByRole("option", { name: /JetBrains Mono/ }).click();
+  // WIKI-244: a saved weight is preserved as-is across family changes —
+  // arbitrary values are first-class (variable fonts); static faces render
+  // the nearest declared face.
+  const rowAfterReload = page.locator(".settings-row").filter({ hasText: "Monospace font" }).first();
+  await rowAfterReload.locator(".font-picker").getByRole("button").click();
+  await rowAfterReload.getByRole("option", { name: /JetBrains Mono/ }).click();
   await page.waitForFunction(() => {
-    const select = document.querySelector('select[aria-label="Monospace font weight"]');
-    return select instanceof HTMLSelectElement && [...select.options].some((option) => option.value === select.value);
+    const input = document.querySelector('input[aria-label^="Monospace font weight"]');
+    return input instanceof HTMLInputElement && input.value === "700";
   });
-  const selectedAfterChange = await page.getByLabel("Monospace font weight").inputValue();
-  const availableAfterChange = await page
-    .getByLabel("Monospace font weight")
-    .locator("option")
-    .evaluateAll((options) => options.map((option) => option.value));
-  if (!availableAfterChange.includes(selectedAfterChange)) {
-    throw new Error("Family change left an invalid selected weight");
-  }
   const appliedAfterChange = await page.evaluate(() =>
     document.documentElement.style.getPropertyValue("--font-monospace-weight")
   );
-  if (appliedAfterChange !== selectedAfterChange) {
-    throw new Error(`Family reset displayed ${selectedAfterChange} but applied ${appliedAfterChange || "nothing"}`);
+  if (appliedAfterChange !== "700") {
+    throw new Error(`Family change must preserve the saved weight, applied ${appliedAfterChange || "nothing"}`);
   }
 
   await page.evaluate(() => {
@@ -156,8 +158,13 @@ try {
   await page.reload({ waitUntil: "domcontentloaded" });
   await page.getByLabel("Settings").waitFor();
   await page.getByLabel("Settings").click();
-  if (await page.getByLabel("Monospace font weight").count()) {
-    throw new Error("Single detected weight should hide the selector");
+  // WIKI-244: the numeric weight input always renders; only the detected-stop
+  // presets hide when the face exposes a single weight.
+  const andaleRow = page.locator(".settings-row").filter({ hasText: "Monospace font" }).first();
+  await andaleRow.locator(".font-weight-input").waitFor({ state: "visible" });
+  await page.waitForTimeout(800);
+  if (await andaleRow.locator(".font-weight-stop").count()) {
+    throw new Error("Single detected weight should hide the stop presets");
   }
   if (errors.length) throw new Error(errors.join("\n"));
 
