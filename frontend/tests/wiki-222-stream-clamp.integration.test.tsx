@@ -79,30 +79,32 @@ test("StreamClamp clamps over-threshold content and expands on toggle", () => {
   fireEvent.click(toggle!);
   expect(container.querySelector(".stream-clamp")?.classList.contains("is-clamped")).toBe(false);
   expect(container.querySelector<HTMLElement>(".stream-clamp-body")?.style.maxHeight).toBe("");
-  expect(container.querySelector(".stream-clamp-toggle")?.textContent).toBe("collapse");
+  expect(container.querySelector(".stream-clamp-toggle")?.textContent).toBe("show less");
 });
 
 test("BoundedPreview shows threshold-sized text in full with no expand chip", () => {
   const text = Array.from({ length: STREAM_CLAMP_LINES }, (_, i) => `line ${i + 1}`).join("\n");
-  const { container, queryByText } = render(<BoundedPreview label="output" text={text} />);
+  const { container, queryByText } = render(<BoundedPreview label="tool output" text={text} />);
   const bodyText = container.querySelector(".transcript-preview-body")?.textContent ?? "";
   expect(bodyText).toContain(`line ${STREAM_CLAMP_LINES}`);
-  expect(queryByText("expand")).toBeNull();
+  expect(queryByText("show all")).toBeNull();
   expect(container.querySelector(".transcript-preview-more")).toBeNull();
 });
 
 test("BoundedPreview clips past the threshold and expands to full flow", () => {
   const total = STREAM_CLAMP_LINES + 25;
   const text = Array.from({ length: total }, (_, i) => `line ${i + 1}`).join("\n");
-  const { container, getByText } = render(<BoundedPreview label="output" text={text} />);
+  const { container, getByText } = render(<BoundedPreview label="tool output" text={text} />);
   let bodyText = container.querySelector(".transcript-preview-body")?.textContent ?? "";
   expect(bodyText).toContain(`line ${STREAM_CLAMP_LINES}`);
   expect(bodyText).not.toContain(`line ${total}`);
   expect(container.querySelector(".transcript-preview-more")?.textContent).toContain("+25 more lines");
 
-  fireEvent.click(getByText("expand"));
+  fireEvent.click(getByText("show all"));
   bodyText = container.querySelector(".transcript-preview-body")?.textContent ?? "";
   expect(bodyText).toContain(`line ${total}`);
+  expect(getByText("show less")).toBeTruthy();
+  expect(container.querySelector(".transcript-preview")?.classList.contains("is-expanded")).toBe(true);
 });
 
 test("BoundedPreview height-clamps a long single-line payload that wraps past the threshold", () => {
@@ -110,13 +112,13 @@ test("BoundedPreview height-clamps a long single-line payload that wraps past th
   // height than STREAM_CLAMP_PX (simulated via the mocked scrollHeight).
   mockScrollHeight(STREAM_CLAMP_PX + STREAM_CLAMP_SLACK_PX + 800);
   const text = "x".repeat(3000);
-  const { container, getByText } = render(<BoundedPreview label="output" text={text} />);
+  const { container, getByText } = render(<BoundedPreview label="tool output" text={text} />);
   const body = container.querySelector<HTMLElement>(".transcript-preview-body");
   expect(body?.classList.contains("is-height-clamped")).toBe(true);
   expect(body?.style.maxHeight).toBe(`${STREAM_CLAMP_PX}px`);
   expect(container.querySelector(".transcript-preview-more")).toBeNull();
 
-  fireEvent.click(getByText("expand"));
+  fireEvent.click(getByText("show all"));
   const expandedBody = container.querySelector<HTMLElement>(".transcript-preview-body");
   expect(expandedBody?.classList.contains("is-height-clamped")).toBe(false);
   expect(expandedBody?.style.maxHeight).toBe("");
@@ -124,10 +126,10 @@ test("BoundedPreview height-clamps a long single-line payload that wraps past th
 
 test("BoundedPreview does not height-clamp short single-line payloads", () => {
   mockScrollHeight(120);
-  const { container, queryByText } = render(<BoundedPreview label="output" text="one short line" />);
+  const { container, queryByText } = render(<BoundedPreview label="tool output" text="one short line" />);
   const body = container.querySelector<HTMLElement>(".transcript-preview-body");
   expect(body?.classList.contains("is-height-clamped")).toBe(false);
-  expect(queryByText("expand")).toBeNull();
+  expect(queryByText("show all")).toBeNull();
 });
 
 function tableArtifact(rowCount: number): SessionArtifact {

@@ -116,20 +116,87 @@ class SessionDeltaTests(unittest.TestCase):
         # parent must map to the Nth child (ordered by start time); a parent
         # beyond the child count must stay unannotated instead of reusing a
         # sibling's child transcript.
+        transcripts._agent_child_assignments.clear()
         events = [
-            {"id": index, "kind": "tool", "tool": {"name": "Task", "prompt_head": "explore the code"}}
+            {
+                "id": index,
+                "kind": "tool",
+                "ts": f"2026-08-05T12:0{index}:00Z",
+                "tool": {"name": "Task", "prompt_head": "explore the code"},
+            }
             for index in range(3)
         ]
         children = [
-            {"id": "bbb22222", "prompt_head": "explore the code", "started_at": "2026-08-05T12:01:00Z"},
-            {"id": "aaa11111", "prompt_head": "explore the code", "started_at": "2026-08-05T12:00:00Z"},
+            {"id": "bbb22222", "prompt_head": "explore the code", "started_at": "2026-08-05T12:01:10Z"},
+            {"id": "aaa11111", "prompt_head": "explore the code", "started_at": "2026-08-05T12:00:10Z"},
         ]
         with mock.patch.object(transcripts, "list_subagents", return_value=children):
-            annotated = transcripts.annotate_agent_events(Path("session.jsonl"), events)
+            annotated = transcripts.annotate_agent_events(Path("session-dup.jsonl"), events)
 
         self.assertEqual(annotated[0]["tool"]["agent_id"], "aaa11111")
         self.assertEqual(annotated[1]["tool"]["agent_id"], "bbb22222")
         self.assertNotIn("agent_id", annotated[2]["tool"])
+
+    def test_claude_annotation_survives_duplicate_parents_split_across_deltas(self) -> None:
+        # WIKI-244 review round 2 (H1): a later delta window that carries only
+        # the second duplicate parent must not restart the 1:1 counter and
+        # re-map that parent onto the first parent's child.
+        transcripts._agent_child_assignments.clear()
+        children = [
+            {"id": "aaa11111", "prompt_head": "explore the code", "started_at": "2026-08-05T12:00:10Z"},
+            {"id": "bbb22222", "prompt_head": "explore the code", "started_at": "2026-08-05T12:05:10Z"},
+        ]
+        first_parent = {
+            "id": 4,
+            "kind": "tool",
+            "ts": "2026-08-05T12:00:00Z",
+            "tool": {"name": "Task", "prompt_head": "explore the code"},
+        }
+        second_parent = {
+            "id": 9,
+            "kind": "tool",
+            "ts": "2026-08-05T12:05:00Z",
+            "tool": {"name": "Task", "prompt_head": "explore the code"},
+        }
+        with mock.patch.object(transcripts, "list_subagents", return_value=children):
+            first = transcripts.annotate_agent_events(Path("session-split.jsonl"), [first_parent])
+            # Second delta carries ONLY the later duplicate parent.
+            second = transcripts.annotate_agent_events(Path("session-split.jsonl"), [second_parent])
+            # Re-annotating the first parent (older-page refetch) keeps its child.
+            refetched = transcripts.annotate_agent_events(Path("session-split.jsonl"), [first_parent])
+
+        self.assertEqual(first[0]["tool"]["agent_id"], "aaa11111")
+        self.assertEqual(second[0]["tool"]["agent_id"], "bbb22222")
+        self.assertEqual(refetched[0]["tool"]["agent_id"], "aaa11111")
+
+    def test_claude_annotation_split_deltas_arriving_out_of_order(self) -> None:
+        # The timestamp anchor makes the mapping independent of arrival order:
+        # even when the LATER parent is annotated first, it claims the child
+        # that started after its own timestamp, leaving the earlier child for
+        # the earlier parent.
+        transcripts._agent_child_assignments.clear()
+        children = [
+            {"id": "aaa11111", "prompt_head": "explore the code", "started_at": "2026-08-05T12:00:10Z"},
+            {"id": "bbb22222", "prompt_head": "explore the code", "started_at": "2026-08-05T12:05:10Z"},
+        ]
+        early_parent = {
+            "id": 4,
+            "kind": "tool",
+            "ts": "2026-08-05T12:00:00Z",
+            "tool": {"name": "Task", "prompt_head": "explore the code"},
+        }
+        late_parent = {
+            "id": 9,
+            "kind": "tool",
+            "ts": "2026-08-05T12:05:00Z",
+            "tool": {"name": "Task", "prompt_head": "explore the code"},
+        }
+        with mock.patch.object(transcripts, "list_subagents", return_value=children):
+            late = transcripts.annotate_agent_events(Path("session-order.jsonl"), [late_parent])
+            early = transcripts.annotate_agent_events(Path("session-order.jsonl"), [early_parent])
+
+        self.assertEqual(late[0]["tool"]["agent_id"], "bbb22222")
+        self.assertEqual(early[0]["tool"]["agent_id"], "aaa11111")
 
     def test_models_endpoint_includes_new_codex_and_claude_options(self) -> None:
         payload = main.list_models()

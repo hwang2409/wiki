@@ -11949,23 +11949,41 @@ textarea.composer-command-input {
 
 .transcript-preview-head {
   display: flex;
-  align-items: baseline;
+  align-items: center;
   gap: 8px;
   min-width: 0;
+  padding: 2px 0;
   font-family: var(--font-monospace);
   font-weight: var(--font-monospace-weight);
   font-size: var(--fs-xs);
   letter-spacing: 0.03em;
-  color: var(--text-faint);
+  color: var(--text-muted);
+  z-index: 3;
+}
+
+/* WIKI-241: while the payload is expanded the head becomes a compact sticky
+   band so section purpose, summary counts, and the wrap/collapse/copy
+   controls stay one glance away no matter how far the reader scrolls. */
+.transcript-preview.is-expanded .transcript-preview-head {
+  position: sticky;
+  top: 0;
+  padding: 4px 6px;
+  border: 1px solid var(--background-modifier-border);
+  border-radius: var(--radius-xs);
+  background-color: color-mix(in srgb, var(--background-primary) 92%, transparent);
+  backdrop-filter: blur(6px);
+  -webkit-backdrop-filter: blur(6px);
 }
 
 .transcript-preview-label {
   text-transform: uppercase;
-  color: var(--text-faint);
+  color: var(--text-normal);
+  font-weight: var(--fw-semibold);
+  letter-spacing: 0.05em;
 }
 
 .transcript-preview.is-error .transcript-preview-label {
-  color: color-mix(in srgb, var(--accent-danger) 70%, var(--text-faint));
+  color: var(--text-normal);
 }
 
 .transcript-preview-summary {
@@ -11983,25 +12001,41 @@ textarea.composer-command-input {
 }
 
 .transcript-chip {
-  padding: 1px 7px;
+  position: relative;
+  padding: 3px 9px;
   border: 1px solid transparent;
   border-radius: var(--radius-xs);
   background: transparent;
-  color: var(--text-faint);
+  color: var(--text-muted);
   font-family: inherit;
   font-size: inherit;
   letter-spacing: inherit;
   text-transform: lowercase;
   cursor: pointer;
+  transition-property: color, border-color, background-color;
+  transition-duration: 120ms;
+}
+
+/* WIKI-241: widen the tap target without inflating the visible chip. */
+.transcript-chip::before {
+  content: "";
+  position: absolute;
+  inset: -8px -6px;
 }
 
 .transcript-chip:hover {
   border-color: var(--background-modifier-border);
-  color: var(--text-muted);
+  color: var(--text-normal);
+}
+
+.transcript-chip:focus-visible {
+  outline: 2px solid var(--interactive-accent);
+  outline-offset: 2px;
 }
 
 .transcript-chip.is-active {
   border-color: var(--background-modifier-border);
+  background-color: color-mix(in srgb, var(--background-modifier-border) 40%, transparent);
   color: var(--text-normal);
 }
 
@@ -12077,9 +12111,9 @@ textarea.composer-command-input {
 }
 
 .session-activity .transcript-preview-label,
+.session-activity .transcript-preview.is-error .transcript-preview-label,
 .session-activity .transcript-preview-summary,
 .session-activity .transcript-preview-body,
-.session-activity .transcript-preview.is-error .transcript-preview-label,
 .session-activity .transcript-preview.is-error .transcript-preview-body {
   color: var(--activity-metadata-color);
 }

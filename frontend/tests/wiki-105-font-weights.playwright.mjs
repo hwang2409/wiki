@@ -210,6 +210,57 @@ try {
   await weightEdge.fill("650");
   await weightEdge.blur();
 
+  // WIKI-244 review round 2 (M2): with no agent weight stored, the agent chat
+  // role must show an explicit inherited state (empty input + placeholder) and
+  // apply the note weight — never display 400 while 700 applies.
+  await page.evaluate(() => {
+    localStorage.setItem("wiki-text-font-weight", "700");
+    localStorage.removeItem("wiki-agent-font-weight");
+  });
+  await page.waitForTimeout(2200);
+  await page.reload({ waitUntil: "domcontentloaded" });
+  await page.getByLabel("Settings").waitFor();
+  await page.getByLabel("Settings").click();
+  const agentRow = page.locator(".settings-row").filter({ hasText: "Agent chat font" }).first();
+  const agentWeight = agentRow.locator(".font-weight-input");
+  await agentWeight.waitFor({ state: "visible" });
+  await page.waitForTimeout(600);
+  if ((await agentWeight.inputValue()) !== "") {
+    throw new Error(`Unset agent weight must show the inherited state, got "${await agentWeight.inputValue()}"`);
+  }
+  if ((await agentWeight.getAttribute("placeholder")) !== "inherit") {
+    throw new Error("Unset agent weight must carry the inherit placeholder");
+  }
+  if (await page.evaluate(() => document.documentElement.style.getPropertyValue("--font-agent-prose-weight")) !== "") {
+    throw new Error("Unset agent weight must not write --font-agent-prose-weight");
+  }
+  const agentPreviewWeight = () => page.evaluate(() => {
+    const previews = [...document.querySelectorAll(".settings-preview")];
+    const agentPreview = previews[1];
+    return getComputedStyle(agentPreview).fontWeight;
+  });
+  if ((await agentPreviewWeight()) !== "700") {
+    throw new Error(`Agent preview must inherit the note weight 700, got ${await agentPreviewWeight()}`);
+  }
+  await agentWeight.fill("300");
+  await agentWeight.blur();
+  await page.waitForFunction(() =>
+    document.documentElement.style.getPropertyValue("--font-agent-prose-weight") === "300");
+  if ((await agentPreviewWeight()) !== "300") {
+    throw new Error(`Explicit agent weight must override inheritance, got ${await agentPreviewWeight()}`);
+  }
+  await agentWeight.fill("");
+  await agentWeight.blur();
+  await page.waitForFunction(() =>
+    document.documentElement.style.getPropertyValue("--font-agent-prose-weight") === "");
+  if ((await agentPreviewWeight()) !== "700") {
+    throw new Error(`Clearing the agent weight must restore inheritance, got ${await agentPreviewWeight()}`);
+  }
+  await page.evaluate(() => {
+    localStorage.removeItem("wiki-text-font-weight");
+    localStorage.removeItem("wiki-agent-font-weight");
+  });
+
   await page.evaluate(() => {
     localStorage.setItem("wiki-mono-font", "Andale Mono");
     localStorage.removeItem("wiki-mono-font-weight");

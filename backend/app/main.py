@@ -3425,6 +3425,7 @@ def _session_delta_payload(
     kind: str | None = None,
     provider: str | None = None,
     tail_window: bool = True,
+    tail_events: int | None = None,
 ) -> dict[str, object]:
     effective_cursor = 0 if client_path is not None and client_path != str(path) else cursor
     result = transcripts.read_session_delta(
@@ -3432,6 +3433,7 @@ def _session_delta_payload(
         path,
         effective_cursor,
         tail_window=tail_window,
+        tail_events=tail_events,
     )
     raw_path: Path | None = None
     if (
@@ -3824,6 +3826,7 @@ def subagent_session(
     agent_id: str,
     cursor: int = Query(0, ge=0),
     client_path: str | None = Query(None, alias="path"),
+    limit: int | None = Query(None, ge=1, le=1000),
 ) -> dict[str, object]:
     if not valid_agent_id(ticket) or not SUBAGENT_ID_PATTERN.fullmatch(agent_id):
         raise HTTPException(status_code=400, detail="Bad id")
@@ -3833,14 +3836,20 @@ def subagent_session(
     path = transcripts.subagents_dir(main_path) / f"agent-{agent_id}.jsonl"
     if not path.is_file():
         raise HTTPException(status_code=404, detail="No such subagent")
-    # Subagent transcripts have no older-page route in the UI. Keep their
-    # initial response complete so tail-windowed events never become unreachable.
+    # Without a limit the response stays complete (the inspector has no
+    # older-page route, so tail-windowed events would become unreachable).
+    # The inline child trace passes an explicit limit so its first fetch is
+    # bounded server-side instead of transferring the full transcript
+    # (WIKI-244 review round 2, H2).
     return _session_delta_payload(
         "claude-sub",
         path,
         cursor=cursor,
         client_path=client_path,
         tail_window=False,
+        # Direct (non-HTTP) callers skip FastAPI resolution and pass the Query
+        # sentinel; normalize to "no limit" in that case.
+        tail_events=limit if isinstance(limit, int) else None,
     )
 
 

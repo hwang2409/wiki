@@ -285,6 +285,10 @@ type FontRole = {
   weightKey: string;
   weightCssVar: string;
   sample: string;
+  // When set and no weight is stored, the role inherits this role's weight
+  // (mirrors the CSS var fallback chain) and the control shows an explicit
+  // inherited state instead of a number that disagrees with what applies.
+  inheritsWeightFrom?: FontRoleId;
 };
 
 const FONT_ROLES: Record<FontRoleId, FontRole> = {
@@ -317,6 +321,7 @@ const FONT_ROLES: Record<FontRoleId, FontRole> = {
     weightKey: "wiki-agent-font-weight",
     weightCssVar: "--font-agent-prose-weight",
     sample: PROP_SAMPLE,
+    inheritsWeightFrom: "text",
   },
   mono: {
     name: "Monospace font",
@@ -668,8 +673,16 @@ function FontPicker({
 function FontRoleRow({ role }: { role: FontRole }) {
   const [label, setLabel] = useState(() => currentLabel(role));
   const [weights, setWeights] = useState<number[]>([]);
-  const [weight, setWeight] = useState(() => storedWeight(role) ?? 400);
-  const [weightText, setWeightText] = useState(() => String(storedWeight(role) ?? 400));
+  const inheritRole = role.inheritsWeightFrom ? FONT_ROLES[role.inheritsWeightFrom] : null;
+  const inheritedWeight = () => (inheritRole ? storedWeight(inheritRole) ?? 400 : 400);
+  const [weight, setWeight] = useState(() => storedWeight(role) ?? inheritedWeight());
+  const [weightText, setWeightText] = useState(() => {
+    const saved = storedWeight(role);
+    if (saved !== null) return String(saved);
+    // Inheriting roles display an explicit inherited state (empty input +
+    // placeholder) so the control never disagrees with the applied CSS.
+    return inheritRole ? "" : "400";
+  });
   const choice = useMemo(() => pickChoice(role.fonts, label), [role.fonts, label]);
 
   useEffect(() => {
@@ -681,6 +694,14 @@ function FontRoleRow({ role }: { role: FontRole }) {
       // arbitrary values are the point (variable fonts). Only the unset case
       // adopts the face's preferred default.
       const savedWeight = storedWeight(role);
+      if (savedWeight === null && inheritRole) {
+        // Stay in the inherited state — never auto-write a weight for a role
+        // whose CSS falls back to another role's weight.
+        setWeights(nextWeights);
+        setWeight(inheritedWeight());
+        setWeightText("");
+        return;
+      }
       const nextWeight = savedWeight ?? preferredWeight(nextWeights);
       if (savedWeight === null && nextWeight !== 400) {
         setFontWeight(role, nextWeight);
@@ -723,11 +744,21 @@ function FontRoleRow({ role }: { role: FontRole }) {
           inputMode="numeric"
           max={1000}
           min={1}
+          placeholder={inheritRole ? "inherit" : undefined}
           step={1}
-          title="Font weight, any value from 1 to 1000"
+          title={inheritRole
+            ? `Font weight 1–1000; empty inherits the ${inheritRole.name.toLowerCase()} weight`
+            : "Font weight, any value from 1 to 1000"}
           type="number"
           value={weightText}
           onBlur={() => {
+            if (weightText.trim() === "" && inheritRole) {
+              // Explicitly return to the inherited state.
+              setFontWeight(role, null);
+              setWeight(inheritedWeight());
+              setWeightText("");
+              return;
+            }
             const parsed = Number(weightText);
             const next = Number.isFinite(parsed) && weightText.trim() !== "" ? clampWeight(parsed) : weight;
             applyWeight(next);

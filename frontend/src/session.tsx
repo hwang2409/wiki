@@ -1148,12 +1148,33 @@ const SUBTRACE_MAX_ROWS = 60;
 // window (rows pair calls with results), far below a full long session.
 const CHILD_TRACE_MAX_EVENTS = 400;
 
-type ChildTraceState = { cursor: number; events: SessionEvent[] };
+type ChildTraceState = { cursor: number; events: SessionEvent[]; hasOlder: boolean };
 
 // Virtualized rows unmount offscreen; the cache keeps the merged, bounded
 // child state (with its poll cursor) so scrolling back neither blanks the
-// rows nor refetches the transcript from scratch.
+// rows nor refetches the transcript from scratch. LRU-capped: entries for
+// long-gone agent tools are evicted instead of accumulating per session.
+const SUBTRACE_CACHE_MAX = 12;
 const subagentTraceCache = new Map<string, ChildTraceState>();
+
+function readChildTraceCache(key: string): ChildTraceState | null {
+  const state = subagentTraceCache.get(key);
+  if (!state) return null;
+  // Refresh recency so the insertion-ordered Map behaves as an LRU.
+  subagentTraceCache.delete(key);
+  subagentTraceCache.set(key, state);
+  return state;
+}
+
+function writeChildTraceCache(key: string, state: ChildTraceState) {
+  subagentTraceCache.delete(key);
+  subagentTraceCache.set(key, state);
+  while (subagentTraceCache.size > SUBTRACE_CACHE_MAX) {
+    const oldest = subagentTraceCache.keys().next().value;
+    if (oldest === undefined) break;
+    subagentTraceCache.delete(oldest);
+  }
+}
 
 function applyChildPatches(events: SessionEvent[], patches: SessionPatch[]): SessionEvent[] {
   if (!patches.length) return events;
@@ -1182,16 +1203,19 @@ function applyChildPatches(events: SessionEvent[], patches: SessionPatch[]): Ses
 // trim to the retention bound (patches for trimmed events no-op by id-match).
 function mergeChildTraceDelta(state: ChildTraceState | null, data: AgentSessionData): ChildTraceState {
   let events: SessionEvent[];
+  let hasOlder = Boolean(data.has_older);
   if (!state || data.cursor < state.cursor) {
     events = data.events;
   } else {
     events = state.events.filter((event) => event.id < data.tail_from).concat(data.events);
+    hasOlder = state.hasOlder || hasOlder;
   }
   events = applyChildPatches(events, data.patches ?? []);
   if (events.length > CHILD_TRACE_MAX_EVENTS) {
     events = events.slice(events.length - CHILD_TRACE_MAX_EVENTS);
+    hasOlder = true;
   }
-  return { cursor: data.cursor, events };
+  return { cursor: data.cursor, events, hasOlder };
 }
 
 // OpenCode-style sub-agent grouping: an agent tool (Task/Explore) renders its
@@ -1212,19 +1236,25 @@ function SubagentTrace({
   ticket: string;
 }) {
   const cacheKey = `${ticket}:${agentId}`;
-  const [state, setState] = useState<ChildTraceState | null>(
-    () => subagentTraceCache.get(cacheKey) ?? null
-  );
+  const [state, setState] = useState<ChildTraceState | null>(() => readChildTraceCache(cacheKey));
   useEffect(() => {
     let cancelled = false;
     let timer: number | null = null;
     const load = async () => {
       try {
-        const cursor = subagentTraceCache.get(cacheKey)?.cursor ?? 0;
-        const data = await getSubagentSession(ticket, agentId, cursor);
+        const cached = readChildTraceCache(cacheKey);
+        // The first fetch is bounded server-side (limit) so a deep child
+        // transcript never transfers whole; repeat polls are cursor deltas.
+        const data = await getSubagentSession(
+          ticket,
+          agentId,
+          cached?.cursor ?? 0,
+          undefined,
+          CHILD_TRACE_MAX_EVENTS,
+        );
         if (cancelled) return;
-        const merged = mergeChildTraceDelta(subagentTraceCache.get(cacheKey) ?? null, data);
-        subagentTraceCache.set(cacheKey, merged);
+        const merged = mergeChildTraceDelta(readChildTraceCache(cacheKey), data);
+        writeChildTraceCache(cacheKey, merged);
         setState(merged);
       } catch {
         // Child transcript may not exist yet (or ever) — keep the parent row usable.
@@ -1247,12 +1277,15 @@ function SubagentTrace({
   if (!rows.length) return null;
   const shown = rows.slice(-SUBTRACE_MAX_ROWS);
   const omitted = rows.length - shown.length;
+  const historyNote = omitted > 0
+    ? `+${omitted} earlier rows — inspect opens the full transcript`
+    : state?.hasOlder
+      ? "earlier rows omitted — inspect opens the full transcript"
+      : null;
   return (
     <div className="session-subtrace">
-      {omitted > 0 ? (
-        <div className="session-subtrace-more">
-          +{omitted} earlier rows — inspect opens the full transcript
-        </div>
+      {historyNote ? (
+        <div className="session-subtrace-more">{historyNote}</div>
       ) : null}
       <TraceRowList keyBase={`sub:${agentId}`} nested onInspect={onInspect} rows={shown} ticket={ticket} />
     </div>
@@ -1590,7 +1623,7 @@ function BashBlock({ event }: { event: SessionEvent }) {
     <div className="session-bash">
       {bash.input ? (
         <BoundedPreview
-          label="command"
+          label="command input"
           text={bash.input}
           renderBody={({ text }) => (
             <div className="session-bash-command">
@@ -1606,10 +1639,10 @@ function BashBlock({ event }: { event: SessionEvent }) {
         />
       ) : null}
       {bash.stdout ? (
-        <BoundedPreview ansi label="output" text={bash.stdout} />
+        <BoundedPreview ansi label="command output" text={bash.stdout} />
       ) : null}
       {bash.stderr ? (
-        <BoundedPreview ansi label="error" tone="error" text={bash.stderr} />
+        <BoundedPreview ansi label="command error" tone="error" text={bash.stderr} />
       ) : null}
     </div>
   );
@@ -3329,6 +3362,19 @@ function MessageComposer({
     restoreSelectionRef.current = false;
   }, [stateKey, text]);
 
+  // Overlay invalidation beyond text/caret changes: textarea scroll moves the
+  // caret's viewport position, and layout reflow (pane resize) changes line
+  // wrapping. Both bump a tick that re-runs the measurement effect.
+  const [overlayTick, setOverlayTick] = useState(0);
+  const bumpOverlayTick = useCallback(() => setOverlayTick((tick) => tick + 1), []);
+  useEffect(() => {
+    const el = inputRef.current;
+    if (!el || typeof ResizeObserver === "undefined") return;
+    const observer = new ResizeObserver(() => setOverlayTick((tick) => tick + 1));
+    observer.observe(el);
+    return () => observer.disconnect();
+  }, []);
+
   // WIKI-244: the cursor is a block in every vim mode. Insert mode hides the
   // native line caret (CSS) and draws the same overlay block that normal mode
   // uses at end-of-line, so the cursor never changes shape across mode
@@ -3348,8 +3394,15 @@ function MessageComposer({
         return;
       }
     }
-    setOverlayPos(measureCaret(el, at));
-  }, [text, caretPos, vimMode, composerFocused]);
+    const pos = measureCaret(el, at);
+    // When the caret line is scrolled out of the textarea's visible box, hide
+    // the block — a cursor floating over unrelated rows is worse than none.
+    if (pos.top < -2 || pos.top > el.clientHeight - 4) {
+      setOverlayPos(null);
+      return;
+    }
+    setOverlayPos(pos);
+  }, [text, caretPos, vimMode, composerFocused, overlayTick]);
 
   const trigger = (() => {
     const el = inputRef.current;
@@ -4181,6 +4234,7 @@ function MessageComposer({
                 }}
                 onClick={(event) => captureSelection(event.currentTarget)}
                 onKeyUp={(event) => captureSelection(event.currentTarget)}
+                onScroll={bumpOverlayTick}
                 onSelect={(event) => captureSelection(event.currentTarget)}
                 onDragOver={(event) => event.preventDefault()}
                 onDrop={(event) => {

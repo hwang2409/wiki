@@ -2301,6 +2301,7 @@ def read_session_delta(
     cursor: int = 0,
     *,
     tail_window: bool = True,
+    tail_events: int | None = None,
 ) -> dict:
     key = str(path)
     with _cache_lock_for(key):
@@ -2323,7 +2324,12 @@ def read_session_delta(
                     full_reset = True
 
         if full_reset:
-            window_base = max(base, total - TAIL_WINDOW_EVENTS) if tail_window else base
+            # An explicit tail_events bound (e.g. the inline sub-agent trace)
+            # overrides the default policy in both directions.
+            if tail_events is not None:
+                window_base = max(base, total - tail_events)
+            else:
+                window_base = max(base, total - TAIL_WINDOW_EVENTS) if tail_window else base
             return {
                 # Snapshot only the event objects and mutable nested leaves;
                 # avoid a recursive clone of large immutable payloads.
@@ -2486,17 +2492,30 @@ def list_subagents(main_path: Path) -> list[dict]:
     return entries
 
 
+# main path → parent event id → assigned child id. Assignments persist across
+# delta windows so a duplicate-prompt parent arriving in a later response
+# never re-maps to a child that an earlier parent already claimed.
+_agent_child_assignments: dict[str, dict[int, str]] = {}
+
+
 def annotate_agent_events(main_path: Path, events: list) -> list:
     """Attach subagent ids without mutating parser-owned cached events.
 
     Parents and children correlate by prompt head. Duplicate heads (retries,
-    repeated exploration prompts) match one-to-one in order: the Nth parent
-    tool with head P gets the Nth child transcript with head P, children
-    ordered by first event timestamp (mtime fallback). A parent beyond the
-    child count stays unannotated rather than reusing another parent's child.
+    repeated exploration prompts) resolve deterministically and independently
+    of the delta window that carries the parent:
+
+    - assignments persist per parent event id (stable absolute index), so a
+      parent seen again in any later window keeps its child;
+    - a new parent claims the first child (by start time) that no other
+      parent holds AND that started at/after the parent's own timestamp —
+      the timestamp anchor makes the choice identical whether duplicate
+      parents arrive in one response or split across many;
+    - a parent with no claimable child stays unannotated rather than reusing
+      another parent's child.
     """
-    heads: dict[str, list[str]] | None = None
-    taken: dict[str, int] = {}
+    heads: dict[str, list[dict]] | None = None
+    assignments = _agent_child_assignments.setdefault(str(main_path), {})
     annotated = events
     for index, event in enumerate(events):
         tool = event.get("tool")
@@ -2505,25 +2524,44 @@ def annotate_agent_events(main_path: Path, events: list) -> list:
         prompt_head = tool.get("prompt_head")
         if not prompt_head:
             continue
-        if heads is None:
-            heads = {}
-            children = sorted(
-                (entry for entry in list_subagents(main_path) if entry["prompt_head"]),
-                key=lambda entry: (entry.get("started_at") or "", entry.get("mtime") or 0),
+        event_id = event.get("id")
+        chosen = assignments.get(event_id) if isinstance(event_id, int) else None
+        if chosen is None:
+            if heads is None:
+                heads = {}
+                children = sorted(
+                    (entry for entry in list_subagents(main_path) if entry["prompt_head"]),
+                    key=lambda entry: (entry.get("started_at") or "", entry.get("mtime") or 0),
+                )
+                for child in children:
+                    heads.setdefault(child["prompt_head"], []).append(child)
+            candidates = heads.get(prompt_head) or []
+            taken_ids = set(assignments.values())
+            parent_ts = event.get("ts") or ""
+            chosen = next(
+                (
+                    child["id"]
+                    for child in candidates
+                    if child["id"] not in taken_ids
+                    and (not parent_ts or not child.get("started_at") or child["started_at"] >= parent_ts)
+                ),
+                None,
             )
-            for child in children:
-                heads.setdefault(child["prompt_head"], []).append(child["id"])
-        candidates = heads.get(prompt_head)
-        if not candidates:
-            continue
-        position = taken.get(prompt_head, 0)
-        if position >= len(candidates):
-            continue
-        taken[prompt_head] = position + 1
+            if chosen is None:
+                # Clock skew fallback: no child started at/after the parent —
+                # take the first unclaimed child rather than dropping the link.
+                chosen = next(
+                    (child["id"] for child in candidates if child["id"] not in taken_ids),
+                    None,
+                )
+            if chosen is None:
+                continue
+            if isinstance(event_id, int):
+                assignments[event_id] = chosen
         if annotated is events:
             annotated = list(events)
         annotated[index] = {
             **event,
-            "tool": {**tool, "agent_id": candidates[position]},
+            "tool": {**tool, "agent_id": chosen},
         }
     return annotated
