@@ -12,8 +12,10 @@ import type { ProviderStreamEvent } from "../src/api";
 
 afterEach(cleanup);
 
+// WIKI-244: the working diff renders open — no section toggle exists. The
+// helper now asserts that no disclosure control gates the diff.
 function expandDiffSection() {
-  fireEvent.click(screen.getByRole("button", { name: /working diff/ }));
+  expect(screen.queryByRole("button", { name: /working diff/ })).toBeNull();
 }
 
 function event(
@@ -186,13 +188,13 @@ describe("codex stream renderers", () => {
     expect(parseDiffSnapshot(source)).toStrictEqual(parseDiffSnapshot(source));
   });
 
-  it("collapses large files and limits the expanded preview", () => {
+  it("renders large files open with a bounded preview", () => {
     const lines = Array.from({ length: 200 }, (_, index) => `+${"x".repeat(1_000)}-${index}`).join("\n");
     const source = `diff --git a/large.txt b/large.txt\n--- a/large.txt\n+++ b/large.txt\n@@ -0,0 +1,200 @@\n${lines}`;
     const view = render(<CodexStreamHighlights events={[event("turn_diff_updated", 1, { diff: source })]} />);
     expandDiffSection();
-    expect(view.container.querySelector(".codex-stream-diff-body")).toBeNull();
-    fireEvent.click(view.getByRole("button", { name: /large\.txt/ }));
+    // WIKI-244: large files render open and bounded — no per-file toggle.
+    expect(view.queryByRole("button", { name: /large\.txt/ })).toBeNull();
     const renderedLines = view.container.querySelectorAll(".codex-stream-diff-line");
     expect(renderedLines.length).toBeGreaterThan(0);
     expect(renderedLines.length).toBeLessThan(200);
@@ -203,7 +205,7 @@ describe("codex stream renderers", () => {
     const source = `diff --git a/headers.txt b/headers.txt\n--- a/headers.txt\n+++ b/headers.txt\n${hunks}`;
     const view = render(<CodexStreamHighlights events={[event("turn_diff_updated", 1, { diff: source })]} />);
     expandDiffSection();
-    fireEvent.click(view.getByRole("button", { name: /headers\.txt/ }));
+    expect(view.queryByRole("button", { name: /headers\.txt/ })).toBeNull();
     const renderedHeaders = view.container.querySelectorAll(".codex-stream-diff-hunk-head");
     expect(renderedHeaders.length).toBeLessThan(3_000);
     expect(renderedHeaders.length).toBeLessThanOrEqual(2_000);
@@ -470,16 +472,13 @@ describe("codex stream renderers", () => {
     expect(container.querySelector(".codex-stream-diagnostic-count")).toBeNull();
   });
 
-  it("collapses the working diff section by default; toggle reveals the file list", () => {
+  it("renders the working diff open with no disclosure control (WIKI-244)", () => {
     const source = "diff --git a/a.txt b/a.txt\n--- a/a.txt\n+++ b/a.txt\n@@ -1,1 +1,1 @@\n-old\n+new";
     const view = render(<CodexStreamHighlights events={[event("turn_diff_updated", 1, { diff: source })]} />);
-    const toggle = view.getByRole("button", { name: /working diff/ });
-    expect(toggle.getAttribute("aria-expanded")).toBe("false");
-    expect(view.queryByText("a.txt")).toBeNull();
-    expect(view.container.querySelector(".codex-stream-diff-file")).toBeNull();
-    expect(view.container.querySelector("[data-testid='codex-diff-omitted']")).toBeNull();
-    fireEvent.click(toggle);
-    expect(toggle.getAttribute("aria-expanded")).toBe("true");
+    expect(view.queryByRole("button", { name: /working diff/ })).toBeNull();
     expect(view.getByText("a.txt")).toBeTruthy();
+    expect(view.container.querySelector(".codex-stream-diff-body")?.textContent).toContain("+new");
+    expect(view.container.querySelector("[data-testid='codex-diff-omitted']")).toBeNull();
+    expect(view.getByRole("button", { name: /copy raw diff/ })).toBeTruthy();
   });
 });

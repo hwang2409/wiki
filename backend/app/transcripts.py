@@ -2419,19 +2419,22 @@ def read_older_session(
 
 # ---------------------------------------------------------------- claude subagents
 
-_subagent_heads: dict[str, str] = {}  # file path → first-user-prompt head (immutable once written)
+# file path → (first-user-prompt head, first-event timestamp); both immutable
+# once written, so the cache never needs invalidation.
+_subagent_intros: dict[str, tuple[str, str]] = {}
 
 
 def subagents_dir(main_path: Path) -> Path:
     return main_path.parent / main_path.stem / "subagents"
 
 
-def _subagent_prompt_head(path: Path) -> str:
+def _subagent_intro(path: Path) -> tuple[str, str]:
     key = str(path)
-    cached = _subagent_heads.get(key)
+    cached = _subagent_intros.get(key)
     if cached is not None:
         return cached
     head = ""
+    started_at = ""
     try:
         with path.open(encoding="utf-8", errors="replace") as f:
             for _ in range(20):
@@ -2442,6 +2445,8 @@ def _subagent_prompt_head(path: Path) -> str:
                     row = json.loads(line)
                 except ValueError:
                     continue
+                if not started_at and isinstance(row.get("timestamp"), str):
+                    started_at = row["timestamp"]
                 if row.get("type") == "user":
                     content = (row.get("message") or {}).get("content")
                     if isinstance(content, str):
@@ -2450,8 +2455,12 @@ def _subagent_prompt_head(path: Path) -> str:
     except OSError:
         pass
     if head:
-        _subagent_heads[key] = head
-    return head
+        _subagent_intros[key] = (head, started_at)
+    return head, started_at
+
+
+def _subagent_prompt_head(path: Path) -> str:
+    return _subagent_intro(path)[0]
 
 
 def list_subagents(main_path: Path) -> list[dict]:
@@ -2464,10 +2473,12 @@ def list_subagents(main_path: Path) -> list[dict]:
             stat = path.stat()
         except OSError:
             continue
+        head, started_at = _subagent_intro(path)
         entries.append(
             {
                 "id": path.stem.removeprefix("agent-"),
-                "prompt_head": _subagent_prompt_head(path),
+                "prompt_head": head,
+                "started_at": started_at,
                 "mtime": stat.st_mtime,
                 "size": stat.st_size,
             }
@@ -2476,8 +2487,16 @@ def list_subagents(main_path: Path) -> list[dict]:
 
 
 def annotate_agent_events(main_path: Path, events: list) -> list:
-    """Attach subagent ids without mutating parser-owned cached events."""
-    heads: dict[str, str] | None = None
+    """Attach subagent ids without mutating parser-owned cached events.
+
+    Parents and children correlate by prompt head. Duplicate heads (retries,
+    repeated exploration prompts) match one-to-one in order: the Nth parent
+    tool with head P gets the Nth child transcript with head P, children
+    ordered by first event timestamp (mtime fallback). A parent beyond the
+    child count stays unannotated rather than reusing another parent's child.
+    """
+    heads: dict[str, list[str]] | None = None
+    taken: dict[str, int] = {}
     annotated = events
     for index, event in enumerate(events):
         tool = event.get("tool")
@@ -2487,13 +2506,24 @@ def annotate_agent_events(main_path: Path, events: list) -> list:
         if not prompt_head:
             continue
         if heads is None:
-            heads = {e["prompt_head"]: e["id"] for e in list_subagents(main_path) if e["prompt_head"]}
-        agent_id = heads.get(prompt_head)
-        if agent_id:
-            if annotated is events:
-                annotated = list(events)
-            annotated[index] = {
-                **event,
-                "tool": {**tool, "agent_id": agent_id},
-            }
+            heads = {}
+            children = sorted(
+                (entry for entry in list_subagents(main_path) if entry["prompt_head"]),
+                key=lambda entry: (entry.get("started_at") or "", entry.get("mtime") or 0),
+            )
+            for child in children:
+                heads.setdefault(child["prompt_head"], []).append(child["id"])
+        candidates = heads.get(prompt_head)
+        if not candidates:
+            continue
+        position = taken.get(prompt_head, 0)
+        if position >= len(candidates):
+            continue
+        taken[prompt_head] = position + 1
+        if annotated is events:
+            annotated = list(events)
+        annotated[index] = {
+            **event,
+            "tool": {**tool, "agent_id": candidates[position]},
+        }
     return annotated

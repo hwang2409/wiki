@@ -195,8 +195,8 @@ async function main() {
     await expectVisibleText(page, ".gh-preview-badge.is-muted", "3 files");
     // WIKI-244: activity groups and tool bodies are open by default — no
     // clicks needed; the preview output is always visible in the tool row.
-    await page.locator(".session-activity-collapsible.is-open .session-tool").first().waitFor({ state: "visible" });
-    const previewTool = page.locator(".session-activity-collapsible.is-open .session-tool").first();
+    await page.locator(".session-activity-body .session-tool").first().waitFor({ state: "visible" });
+    const previewTool = page.locator(".session-activity-body .session-tool").first();
     const previewToolEventId = await previewTool.getAttribute("data-tool-event-id");
     if (!previewToolEventId) throw new Error("preview tool missing data-tool-event-id");
     // The gh preview output lives either merged in the tool row or in the

@@ -111,6 +111,26 @@ class SessionDeltaTests(unittest.TestCase):
         self.assertEqual(annotated[0]["tool"]["agent_id"], "abc12345")
         self.assertIsNot(annotated[0], event)
 
+    def test_claude_annotation_matches_duplicate_prompt_heads_in_order(self) -> None:
+        # WIKI-244 review: retried/repeated prompts share a head. The Nth
+        # parent must map to the Nth child (ordered by start time); a parent
+        # beyond the child count must stay unannotated instead of reusing a
+        # sibling's child transcript.
+        events = [
+            {"id": index, "kind": "tool", "tool": {"name": "Task", "prompt_head": "explore the code"}}
+            for index in range(3)
+        ]
+        children = [
+            {"id": "bbb22222", "prompt_head": "explore the code", "started_at": "2026-08-05T12:01:00Z"},
+            {"id": "aaa11111", "prompt_head": "explore the code", "started_at": "2026-08-05T12:00:00Z"},
+        ]
+        with mock.patch.object(transcripts, "list_subagents", return_value=children):
+            annotated = transcripts.annotate_agent_events(Path("session.jsonl"), events)
+
+        self.assertEqual(annotated[0]["tool"]["agent_id"], "aaa11111")
+        self.assertEqual(annotated[1]["tool"]["agent_id"], "bbb22222")
+        self.assertNotIn("agent_id", annotated[2]["tool"])
+
     def test_models_endpoint_includes_new_codex_and_claude_options(self) -> None:
         payload = main.list_models()
         models = {model["id"]: model for model in payload["models"]}

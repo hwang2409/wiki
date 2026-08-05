@@ -59,12 +59,14 @@ import {
 } from "./api";
 import type {
   AgentModelOption,
+  AgentSessionData,
   ComposerMessage,
   ProviderEventInspector,
   ProviderPendingRequest,
   QueuedMessage,
   SessionEvent,
   SessionInit,
+  SessionPatch,
   SessionRateLimit,
   SessionPr,
   SessionTool,
@@ -99,7 +101,6 @@ import { createStateKeyWriteBarrier, deletePaneStateEntries } from "./pane-state
 import { Timestamp } from "./timestamp";
 import { StatusBadge } from "./status-badge";
 import { BoundedPreview } from "./transcript-preview";
-import { StreamClamp } from "./stream-clamp";
 import { CodexStreamHighlights } from "./codex-stream-renderers";
 import { markerRule } from "./hook-message-registry";
 import type { MarkerSeverity } from "./hook-message-registry";
@@ -1077,20 +1078,35 @@ function toolInlineDetail(tool: SessionTool): string | null {
   return input;
 }
 
+// Purpose labels shared with PR #177 (WIKI-241): name the payload by what it
+// is, not by transport. Reads/edits emit file contents; failed calls carry an
+// error message; Bash carries command text.
+function inputLabelForTool(tool: SessionTool): string {
+  return tool.name === "Bash" ? "command input" : "tool input";
+}
+
+function outputLabelForTool(tool: SessionTool): string {
+  if (tool.ok === false) return "error output";
+  if (tool.archetype === "read") return "file contents";
+  if (tool.archetype === "edit") return "file contents";
+  if (tool.name === "Bash") return "command output";
+  return "tool output";
+}
+
 function ToolInputBody({ tool }: { tool: SessionTool }) {
   if (!toolInputIsBlock(tool)) return null;
   return (
     <div className="session-tool-body">
       {tool.name === "Bash" ? (
         <BoundedPreview
-          label="input"
+          label={inputLabelForTool(tool)}
           text={tool.input}
           renderBody={({ text }) => (
             <ShikiCode className="session-tool-input" code={text} lang="bash" transparent />
           )}
         />
       ) : (
-        <BoundedPreview label="input" text={tool.input} />
+        <BoundedPreview label={inputLabelForTool(tool)} text={tool.input} />
       )}
     </div>
   );
@@ -1104,7 +1120,7 @@ function ToolOutputBody({ tool }: { tool: SessionTool }) {
       {hasGitHubPreview ? (
         <BoundedPreview
           ansi
-          label="output"
+          label={outputLabelForTool(tool)}
           text={tool.output}
           tone={tool.ok === false ? "error" : "normal"}
           renderBody={({ text }) => (
@@ -1118,7 +1134,7 @@ function ToolOutputBody({ tool }: { tool: SessionTool }) {
       ) : (
         <BoundedPreview
           ansi
-          label="output"
+          label={outputLabelForTool(tool)}
           text={tool.output}
           tone={tool.ok === false ? "error" : "normal"}
         />
@@ -1128,17 +1144,75 @@ function ToolOutputBody({ tool }: { tool: SessionTool }) {
 }
 
 const SUBTRACE_MAX_ROWS = 60;
-// Virtualized rows unmount offscreen; the cache keeps the last fetched child
-// trace so scrolling back does not blank the rows or refetch from scratch.
-const subagentTraceCache = new Map<string, SessionEvent[]>();
+// Hard memory bound on retained child events — well above the rendered row
+// window (rows pair calls with results), far below a full long session.
+const CHILD_TRACE_MAX_EVENTS = 400;
 
-// OpenCode-style sub-agent grouping: an agent tool (Task/Explore) lists its
-// child tool calls as always-visible one-line rows indented under the parent.
-// The child transcript is a separate backend resource, so it loads lazily and
-// re-polls while the sub-agent is still running.
-function SubagentTrace({ active, agentId, ticket }: { active: boolean; agentId: string; ticket: string }) {
+type ChildTraceState = { cursor: number; events: SessionEvent[] };
+
+// Virtualized rows unmount offscreen; the cache keeps the merged, bounded
+// child state (with its poll cursor) so scrolling back neither blanks the
+// rows nor refetches the transcript from scratch.
+const subagentTraceCache = new Map<string, ChildTraceState>();
+
+function applyChildPatches(events: SessionEvent[], patches: SessionPatch[]): SessionEvent[] {
+  if (!patches.length) return events;
+  const byId = new Map(patches.map((patch) => [patch.id, patch]));
+  let changed = false;
+  const next = events.map((event) => {
+    const patch = byId.get(event.id);
+    if (!patch || !event.tool) return event;
+    if (event.tool.output === patch.output && event.tool.ok === patch.ok) return event;
+    changed = true;
+    return {
+      ...event,
+      tool: {
+        ...event.tool,
+        output: patch.output,
+        ok: patch.ok,
+        completed_at: patch.completed_at ?? event.tool.completed_at,
+      },
+    };
+  });
+  return changed ? next : events;
+}
+
+// Cursor-delta merge for the child transcript: keep events below the server's
+// tail window, append the delta, apply patches by absolute event id, then
+// trim to the retention bound (patches for trimmed events no-op by id-match).
+function mergeChildTraceDelta(state: ChildTraceState | null, data: AgentSessionData): ChildTraceState {
+  let events: SessionEvent[];
+  if (!state || data.cursor < state.cursor) {
+    events = data.events;
+  } else {
+    events = state.events.filter((event) => event.id < data.tail_from).concat(data.events);
+  }
+  events = applyChildPatches(events, data.patches ?? []);
+  if (events.length > CHILD_TRACE_MAX_EVENTS) {
+    events = events.slice(events.length - CHILD_TRACE_MAX_EVENTS);
+  }
+  return { cursor: data.cursor, events };
+}
+
+// OpenCode-style sub-agent grouping: an agent tool (Task/Explore) renders its
+// child trace — thinking and tool calls with their inputs/outputs — through
+// the same always-visible row model, indented under the parent. The child
+// transcript is a separate backend resource, so it loads lazily, re-polls
+// with cursor deltas while the sub-agent runs, and windows deep history
+// (the inspect action opens the full raw transcript).
+function SubagentTrace({
+  active,
+  agentId,
+  onInspect,
+  ticket,
+}: {
+  active: boolean;
+  agentId: string;
+  onInspect?: (agentId: string) => void;
+  ticket: string;
+}) {
   const cacheKey = `${ticket}:${agentId}`;
-  const [events, setEvents] = useState<SessionEvent[] | null>(
+  const [state, setState] = useState<ChildTraceState | null>(
     () => subagentTraceCache.get(cacheKey) ?? null
   );
   useEffect(() => {
@@ -1146,10 +1220,12 @@ function SubagentTrace({ active, agentId, ticket }: { active: boolean; agentId: 
     let timer: number | null = null;
     const load = async () => {
       try {
-        const data = await getSubagentSession(ticket, agentId);
+        const cursor = subagentTraceCache.get(cacheKey)?.cursor ?? 0;
+        const data = await getSubagentSession(ticket, agentId, cursor);
         if (cancelled) return;
-        subagentTraceCache.set(cacheKey, data.events);
-        setEvents(data.events);
+        const merged = mergeChildTraceDelta(subagentTraceCache.get(cacheKey) ?? null, data);
+        subagentTraceCache.set(cacheKey, merged);
+        setState(merged);
       } catch {
         // Child transcript may not exist yet (or ever) — keep the parent row usable.
       }
@@ -1161,32 +1237,38 @@ function SubagentTrace({ active, agentId, ticket }: { active: boolean; agentId: 
       if (timer !== null) window.clearTimeout(timer);
     };
   }, [active, agentId, cacheKey, ticket]);
-  const toolEvents = (events ?? []).filter((event) => event.kind === "tool" && event.tool);
-  if (!toolEvents.length) return null;
-  const shown = toolEvents.slice(-SUBTRACE_MAX_ROWS);
-  const omitted = toolEvents.length - shown.length;
+  const events = state?.events;
+  const rows = useMemo(() => {
+    const traceEvents = (events ?? []).filter(
+      (event) => (event.kind === "tool" && event.tool) || (event.kind === "thinking" && event.text)
+    );
+    return traceRows(activityTimeline(traceEvents));
+  }, [events]);
+  if (!rows.length) return null;
+  const shown = rows.slice(-SUBTRACE_MAX_ROWS);
+  const omitted = rows.length - shown.length;
   return (
     <div className="session-subtrace">
       {omitted > 0 ? (
-        <div className="session-subtrace-more">+{omitted} earlier calls</div>
+        <div className="session-subtrace-more">
+          +{omitted} earlier rows — inspect opens the full transcript
+        </div>
       ) : null}
-      {shown.map((child, index) => {
-        const tool = child.tool!;
-        const Icon = ARCHETYPE_ICONS[tool.archetype] ?? Terminal;
-        return (
-          <div className="session-subtrace-row" key={child.id}>
-            <span aria-hidden="true" className="session-trace-connector">
-              {index === shown.length - 1 ? "└" : "├"}
-            </span>
-            <Icon className="session-tool-icon" size={11} />
-            <span className="session-tool-summary" title={tool.name}>{toolSummaryLine(tool)}</span>
-            {tool.output === null && tool.ok === null ? (
-              <span className="session-tool-running" title="running" />
-            ) : null}
-            {tool.ok === false ? <span className="session-tool-err">failed</span> : null}
-          </div>
-        );
-      })}
+      <TraceRowList keyBase={`sub:${agentId}`} nested onInspect={onInspect} rows={shown} ticket={ticket} />
+    </div>
+  );
+}
+
+function ThinkingRow({ event }: { event: SessionEvent }) {
+  // WIKI-244: thinking renders in full — no clamp, no show-all gate. The
+  // backend already bounds thinking text at parse time.
+  return (
+    <div className="session-activity-row is-reasoning">
+      <div className="session-activity-row-meta">thinking</div>
+      <div className="session-thinking">
+        {event.encrypted ? <span className="session-thinking-chip">encrypted</span> : null}
+        {event.text}
+      </div>
     </div>
   );
 }
@@ -1194,12 +1276,14 @@ function SubagentTrace({ active, agentId, ticket }: { active: boolean; agentId: 
 function ToolCallRow({
   connector,
   event,
+  nested = false,
   onInspect,
   ticket,
   withResult,
 }: {
   connector: string;
   event: SessionEvent;
+  nested?: boolean;
   onInspect?: (agentId: string) => void;
   ticket: string;
   withResult: boolean;
@@ -1211,7 +1295,7 @@ function ToolCallRow({
   return (
     <div
       className={`session-tool session-activity-row is-tool${tool.ok === false ? " is-failed" : ""}`}
-      data-tool-event-id={event.id}
+      data-tool-event-id={nested ? undefined : event.id}
     >
       <div className="session-tool-head">
         <span aria-hidden="true" className="session-trace-connector">{connector}</span>
@@ -1247,24 +1331,73 @@ function ToolCallRow({
       <div className="session-trace-indent">
         <ToolInputBody tool={tool} />
         {withResult ? <ToolOutputBody tool={tool} /> : null}
-        {tool.agent_id ? (
-          <SubagentTrace active={running} agentId={tool.agent_id} ticket={ticket} />
+        {!nested && tool.agent_id ? (
+          <SubagentTrace active={running} agentId={tool.agent_id} onInspect={onInspect} ticket={ticket} />
         ) : null}
       </div>
     </div>
   );
 }
 
+// Shared renderer for a flat run of trace rows — used by the activity group
+// (top level) and by SubagentTrace (nested one level under an agent tool).
+function TraceRowList({
+  keyBase,
+  nested = false,
+  onInspect,
+  rows,
+  ticket,
+}: {
+  keyBase: string | number;
+  nested?: boolean;
+  onInspect?: (agentId: string) => void;
+  rows: TraceRow[];
+  ticket: string;
+}) {
+  return (
+    <>
+      {rows.map((row, index) => {
+        const key = `${keyBase}:${row.kind}:${row.eventIndex}`;
+        if (row.kind === "result") {
+          return <ToolResultRow connector={traceConnector(rows, index)} event={row.event} key={key} nested={nested} />;
+        }
+        if (row.kind === "tool") {
+          return (
+            <ToolCallRow
+              connector={traceConnector(rows, index)}
+              event={row.event}
+              key={key}
+              nested={nested}
+              onInspect={onInspect}
+              ticket={ticket}
+              withResult={row.withResult}
+            />
+          );
+        }
+        return <ThinkingRow event={row.event} key={key} />;
+      })}
+    </>
+  );
+}
+
 // Standalone result row — used when the tool's completion is separated from
 // its call in the timeline (parallel tools completing out of order). The dim
 // identifying line says which call this output belongs to.
-function ToolResultRow({ connector, event }: { connector: string; event: SessionEvent }) {
+function ToolResultRow({
+  connector,
+  event,
+  nested = false,
+}: {
+  connector: string;
+  event: SessionEvent;
+  nested?: boolean;
+}) {
   const tool = event.tool!;
   const resultLabel = tool.ok === false ? "failed" : tool.ok === true ? "done" : "completed";
   return (
     <div
       className={`session-activity-row is-result${tool.ok === false ? " is-failed" : ""}`}
-      data-tool-event-id={event.id}
+      data-tool-event-id={nested ? undefined : event.id}
     >
       <div className="session-tool-result">
         <span aria-hidden="true" className="session-trace-connector">{connector}</span>
@@ -1989,18 +2122,13 @@ function ActivityGroupBase({
   onInspect,
   runState,
   ticket,
-  uiState,
 }: {
   events: SessionEvent[];
   groupKey: number;
   onInspect?: (agentId: string) => void;
   runState: ActivityRunState;
   ticket: string;
-  uiState: SessionUiState;
 }) {
-  // Open by default: the trace is meant to be read by scrolling (WIKI-244).
-  // Collapsing stays available as an explicit opt-out per group.
-  const [open, setOpen] = useStoredBooleanState(uiState, `activity:${groupKey}`, true);
   const counts = activityCountsLabel(events);
   const semanticSummary = activitySemanticSummary(events);
   const state = activityStateLabel(events, runState);
@@ -2008,9 +2136,10 @@ function ActivityGroupBase({
   const stateClass = state.replace(/\s+/g, "-");
   const rows = useMemo(() => traceRows(activityTimeline(events)), [events]);
   return (
-    <div className={`session-activity${open ? " is-open" : ""}`}>
-      <button aria-expanded={open} className="session-activity-head" type="button" onClick={() => setOpen(!open)}>
-        <ChevronRight className={`collapse-icon${open ? "" : " is-collapsed"}`} size={12} />
+    <div className="session-activity">
+      {/* WIKI-244: the trace is always visible — the head is a noninteractive
+          status line, and no control can hide the rows below it. */}
+      <div className="session-activity-head">
         <span className="session-activity-summary">
           <span className="session-activity-primary">
             <span className={`session-activity-state is-${stateClass}`}>{state}</span>
@@ -2024,46 +2153,9 @@ function ActivityGroupBase({
             <span className="session-activity-meta tabular-nums">{elapsed}</span>
           ) : null}
         </span>
-      </button>
-      <div className={`session-collapsible session-activity-collapsible${open ? " is-open" : ""}`}>
-        <div className="session-collapsible-inner">
-          <div className="session-activity-body">
-            {rows.map((row, index) => {
-              if (row.kind === "result") {
-                return (
-                  <ToolResultRow
-                    connector={traceConnector(rows, index)}
-                    event={row.event}
-                    key={`result:${groupKey + row.eventIndex}`}
-                  />
-                );
-              }
-              if (row.kind === "tool") {
-                return (
-                  <ToolCallRow
-                    connector={traceConnector(rows, index)}
-                    event={row.event}
-                    key={`tool:${groupKey + row.eventIndex}`}
-                    onInspect={onInspect}
-                    ticket={ticket}
-                    withResult={row.withResult}
-                  />
-                );
-              }
-              return (
-                <div className="session-activity-row is-reasoning" key={`event:${groupKey + row.eventIndex}`}>
-                  <div className="session-activity-row-meta">thinking</div>
-                  <div className="session-thinking">
-                    <StreamClamp>
-                      {row.event.encrypted ? <span className="session-thinking-chip">encrypted</span> : null}
-                      {row.event.text}
-                    </StreamClamp>
-                  </div>
-                </div>
-              );
-            })}
-          </div>
-        </div>
+      </div>
+      <div className="session-activity-body">
+        <TraceRowList keyBase={groupKey} onInspect={onInspect} rows={rows} ticket={ticket} />
       </div>
     </div>
   );
@@ -2074,7 +2166,6 @@ const ActivityGroup = memo(ActivityGroupBase, (prev, next) =>
   prev.onInspect === next.onInspect &&
   prev.runState === next.runState &&
   prev.ticket === next.ticket &&
-  prev.uiState === next.uiState &&
   prev.events.length === next.events.length &&
   prev.events.every((event, index) => event === next.events[index])
 );
@@ -2202,7 +2293,6 @@ const VirtualSessionRow = memo(function VirtualSessionRow({
           onInspect={onInspect}
           runState={activityRunState}
           ticket={ticket}
-          uiState={uiState}
         />
       ) : (
         <>
@@ -4110,6 +4200,10 @@ function MessageComposer({
                   }
                 }}
                 onKeyDown={(event) => {
+                  // IME safety: during a composition session key events carry
+                  // intermediate composition state, not vim commands or menu
+                  // navigation — let the browser handle them untouched.
+                  if (event.nativeEvent.isComposing) return;
                   if (vimMode === "normal") {
                     handleNormalKey(event);
                     return;
