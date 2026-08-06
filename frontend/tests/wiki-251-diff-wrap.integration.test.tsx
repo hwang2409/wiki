@@ -11,7 +11,7 @@
 import { readFileSync } from "node:fs";
 import { dirname, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
-import { act, cleanup, fireEvent, render } from "@testing-library/react";
+import { cleanup, render } from "@testing-library/react";
 import { afterEach, beforeEach, describe, expect, test } from "vitest";
 
 import { SplitDiffView } from "../src/split-diff";
@@ -279,35 +279,18 @@ describe("WIKI-251 SplitDiffView Shiki wiring (HIGH-R3-2)", () => {
   });
 });
 
-describe("WIKI-251 raw/polished toggle for edits", () => {
-  test("polished branch (default) renders SplitDiffView; raw branch renders <pre> with the patch source", () => {
+describe("WIKI-257: edit tools render the split-diff with no raw toggle", () => {
+  test("SplitDiffView is the sole edit surface; no polished/raw toggle offered", () => {
     const { container } = render(<ToolCallRow event={editEvent()} ticket="WIKI-251" withResult />);
 
-    // Polished branch — split view is visible; the raw pane is NOT.
+    // Split view is visible.
     expect(container.querySelector(".session-tool-split-diff")).toBeTruthy();
+    // The redundant raw toggle + pane are gone (WIKI-257).
     expect(container.querySelector(".session-tool-raw")).toBeNull();
-
-    // Toggle the raw disclosure.
-    const rawButton = container.querySelector<HTMLButtonElement>(".session-tool-raw-toggle");
-    expect(rawButton).toBeTruthy();
-    act(() => {
-      fireEvent.click(rawButton!);
-    });
-
-    // Raw branch — the split view is hidden, and a <pre> with the actual
-    // patch source (not the "File updated." ack) is rendered.
-    expect(container.querySelector(".session-tool-split-diff")).toBeNull();
-    const rawBlock = container.querySelector(".session-tool-raw");
-    expect(rawBlock).toBeTruthy();
-    const pre = rawBlock!.querySelector("pre");
-    expect(pre).toBeTruthy();
-    const rawText = pre!.textContent ?? "";
-    // The patch's headers and the edited strings must appear verbatim.
-    expect(rawText).toContain("--- a/vault/hot.md");
-    expect(rawText).toContain("+++ b/vault/hot.md");
-    expect(rawText).toContain(LONG_NEW.slice(0, 40));
-    // The tool ack "File updated." must NOT be what raw shows.
-    expect(rawText).not.toBe("File updated.");
+    expect(container.querySelector(".session-tool-raw-toggle")).toBeNull();
+    // Diff tools also don't offer a structured-content polish toggle
+    // ("File updated." would be the parsed target — meaningless as polish).
+    expect(container.querySelector(".session-tool-polished-toggle")).toBeNull();
   });
 });
 

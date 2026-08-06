@@ -1654,19 +1654,15 @@ export function ToolCallRow({
   // collapse a known failure while scanning downstream rows.
   const [errorHidden, setErrorHidden] = useState(false);
   const errorShown = tool.ok === false && !errorHidden;
-  const [rawOpen, setRawOpen] = useState(false);
   const [polishedOpen, setPolishedOpen] = useState(false);
-  const rawId = useId();
   const polishedId = useId();
   // Polished view: recognizable content only (parse or filetype hint), never
   // heuristics. Offered for successful outputs; failures keep the error flow.
   // Read payloads with line-number gutters would mis-tokenize — no hint then.
   const numberedPayload = /^\s*\d+[\t→|]/.test(displayOutput);
   // For diff-presenting tools the split-diff view IS the polished form
-  // (WIKI-251 HIGH#1 fix): don't also offer a structured-content polished
-  // toggle over "File updated." (the ack), and route the raw toggle to the
-  // patch source instead of that ack so raw actually shows what the reviewer
-  // expects to inspect.
+  // (WIKI-251 HIGH#1 fix): don't offer a structured-content polished toggle
+  // over "File updated." (the ack).
   const isDiffPresentation = presentation === "diff" && !!diffSource;
   const polished = tool.ok !== false && displayOutput && !isDiffPresentation
     ? detectStructuredContent(
@@ -1674,8 +1670,6 @@ export function ToolCallRow({
         numberedPayload ? null : languageForPath(toolPathHint(tool) ?? ""),
       )
     : null;
-  const rawViewSource = isDiffPresentation ? diffSource! : rawOutput;
-  const hasRawView = rawViewSource.length > 0;
   const showOutputBlock = outputBlock && (tool.ok !== false || errorShown);
   const inlineOutput = presentation === "inline" && (tool.ok !== false || errorShown)
     ? tool.ok === false && errorShown
@@ -1752,6 +1746,7 @@ export function ToolCallRow({
             aria-controls={polishedId}
             aria-expanded={polishedOpen}
             aria-label={polishedOpen ? "hide polished output" : "show polished output"}
+            aria-pressed={polishedOpen}
             className="session-tool-polished-toggle"
             type="button"
             onClick={(event) => {
@@ -1759,22 +1754,7 @@ export function ToolCallRow({
               setPolishedOpen((value) => !value);
             }}
           >
-            {polishedOpen ? "hide polished" : "polished"}
-          </button>
-        ) : null}
-        {hasRawView ? (
-          <button
-            aria-controls={rawId}
-            aria-expanded={rawOpen}
-            aria-label={rawOpen ? "hide raw output" : "show raw output"}
-            className="session-tool-raw-toggle"
-            type="button"
-            onClick={(event) => {
-              event.stopPropagation();
-              setRawOpen((value) => !value);
-            }}
-          >
-            {rawOpen ? "hide raw" : "raw"}
+            polish
           </button>
         ) : null}
       </div>
@@ -1794,31 +1774,16 @@ export function ToolCallRow({
             />
           </div>
         ) : null}
-        {hasRawView && rawOpen ? (
-          <div className="session-tool-raw" id={rawId}>
-            <BoundedPreview
-              rawText={rawViewSource}
-              showSummary={false}
-              text={rawViewSource}
-              variant="block"
-            />
-          </div>
-        ) : null}
-        {/* For diff-presenting tools the split-diff view is the polished
-            branch of the raw/polished toggle: hide it while raw is open so
-            the reader sees exactly one representation at a time. */}
         {(withResult && showOutputBlock) || (isBashTool(tool) && running) ? (
-          isDiffPresentation && rawOpen ? null : (
-            <ToolOutputBody
-              displayOutput={displayOutput}
-              diffSource={diffSource}
-              eventId={event.id}
-              presentation={presentation}
-              rawOutput={rawOutput}
-              segments={outputSegments}
-              tool={tool}
-            />
-          )
+          <ToolOutputBody
+            displayOutput={displayOutput}
+            diffSource={diffSource}
+            eventId={event.id}
+            presentation={presentation}
+            rawOutput={rawOutput}
+            segments={outputSegments}
+            tool={tool}
+          />
         ) : null}
         {!nested && tool.agent_id ? (
           <SubagentTrace active={running} agentId={tool.agent_id} onInspect={onInspect} ticket={ticket} />

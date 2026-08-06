@@ -7683,35 +7683,32 @@ body.is-resizing-panes .pane-cell {
   text-decoration: underline;
 }
 
-.session-tool-raw {
-  box-sizing: border-box;
-  width: 100%;
-  min-width: 0;
-  max-width: 100%;
-  padding-left: 8px;
-  overflow-wrap: anywhere;
-}
-
-.session-tool-raw-toggle,
 .session-tool-polished-toggle {
   flex: 0 0 auto;
   opacity: 0.7;
+  border: 1px solid transparent;
+  border-radius: var(--radius-s, 3px);
+  background: transparent;
   color: inherit;
   font-family: var(--font-monospace);
   font-size: var(--fs-xs);
   cursor: pointer;
-  transition: opacity 120ms ease;
+  transition: opacity 120ms ease, background-color 120ms ease, border-color 120ms ease, color 120ms ease;
 }
 
-.session-tool-head:hover .session-tool-raw-toggle,
-.session-tool-head:focus-within .session-tool-raw-toggle,
-.session-tool-raw-toggle[aria-expanded="true"],
-.session-tool-raw-toggle:focus-visible,
 .session-tool-head:hover .session-tool-polished-toggle,
 .session-tool-head:focus-within .session-tool-polished-toggle,
-.session-tool-polished-toggle[aria-expanded="true"],
 .session-tool-polished-toggle:focus-visible {
   opacity: 1;
+}
+
+/* Pressed state: polish is engaged. Uses the gruvbox accent so the button
+   reads as an active affordance, not just hovered chrome. */
+.session-tool-polished-toggle[aria-pressed="true"] {
+  opacity: 1;
+  border-color: color-mix(in srgb, var(--accent-primary) 45%, var(--background-modifier-border));
+  background-color: color-mix(in srgb, var(--accent-primary) 12%, transparent);
+  color: var(--accent-primary);
 }
 
 .session-tool-failure-output {
@@ -7728,11 +7725,9 @@ body.is-resizing-panes .pane-cell {
   font-size: var(--font-ui-smaller);
 }
 
-.session-tool-raw-toggle:hover,
-.session-tool-raw-toggle:focus-visible,
 .session-tool-polished-toggle:hover,
 .session-tool-polished-toggle:focus-visible {
-  text-decoration: underline;
+  border-color: color-mix(in srgb, var(--accent-primary) 30%, var(--background-modifier-border));
 }
 
 .session-tool-result {
@@ -15901,7 +15896,7 @@ textarea.composer-command-input {
    Real box size (no negative insets) so adjacent head controls cannot steal
    each other's clicks across the 6px gaps. */
 .session-tool-error-toggle,
-.session-tool-raw-toggle,
+.session-tool-polished-toggle,
 .transcript-preview-more {
   min-height: 24px;
   min-width: 24px;

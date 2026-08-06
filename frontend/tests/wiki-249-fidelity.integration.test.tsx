@@ -227,7 +227,7 @@ test("compactJsonDetail collapses JSON inputs to key: value pairs", () => {
 
 // --- polished disclosure: sibling of raw, bounded, formatted ---
 
-test("polished toggle exposes a formatted view alongside raw", () => {
+test("polish toggle reveals a formatted view over the default raw peek", () => {
   const py = "def main():\n    print(\"hi\")\n\nif __name__ == \"__main__\":\n    main()";
   const readTool = tool({
     name: "Read",
@@ -236,20 +236,27 @@ test("polished toggle exposes a formatted view alongside raw", () => {
     summary: "read scripts/run.py",
     output: py,
   });
-  const { container, getByRole } = render(
+  const { container, getByRole, queryByRole } = render(
     <ToolCallRow event={event(5, { tool: readTool })} ticket="WIKI-249" withResult />,
   );
   const toggle = getByRole("button", { name: "show polished output" });
   expect(toggle.getAttribute("aria-expanded")).toBe("false");
+  expect(toggle.getAttribute("aria-pressed")).toBe("false");
   expect(container.querySelector(".session-tool-polished")).toBeNull();
   fireEvent.click(toggle);
   expect(toggle.getAttribute("aria-expanded")).toBe("true");
+  expect(toggle.getAttribute("aria-pressed")).toBe("true");
   const polishedView = container.querySelector(".session-tool-polished");
   expect(polishedView?.textContent).toContain("def main():");
   // Code-like content carries line-number gutters.
   expect(polishedView?.querySelector(".syntax-inline-gutter")?.textContent).toBe("1");
-  // Raw stays reachable as its own sibling disclosure.
-  expect(getByRole("button", { name: "show raw output" })).toBeTruthy();
+  // Toggling again returns to the default raw peek.
+  fireEvent.click(toggle);
+  expect(toggle.getAttribute("aria-pressed")).toBe("false");
+  expect(container.querySelector(".session-tool-polished")).toBeNull();
+  // The redundant separate "raw" toggle no longer exists — raw IS the default.
+  expect(queryByRole("button", { name: "show raw output" })).toBeNull();
+  expect(container.querySelector(".session-tool-raw-toggle")).toBeNull();
 });
 
 test("polished is not offered for unrecognizable output", () => {
