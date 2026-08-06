@@ -22,7 +22,14 @@ if [[ ! -d "$staged_bundle" && ! -f "$swap_intent" ]]; then
   exit 1
 fi
 
-python3 "$ROOT/scripts/native_swap_transaction.py" \
+# The swap transaction imports the agent runtime (pydantic, PIL, ...),
+# so it must run under the repo venv, not the system interpreter.
+python_bin="python3"
+if [[ -x "$ROOT/.venv/bin/python" ]]; then
+  python_bin="$ROOT/.venv/bin/python"
+fi
+
+"$python_bin" "$ROOT/scripts/native_swap_transaction.py" \
   "$stage_root" \
   --runtime-dir "$runtime_dir" \
   --repo-root "$ROOT" \
