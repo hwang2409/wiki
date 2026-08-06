@@ -82,8 +82,7 @@ In Progress:
 - PHO-14037 on-call transfer — investigate-then-fix worker spawned
 - PHO-15253 bash rewrite PRs A/B/C — night shift worker
 - PHO-15254 retrieve adoption tranche 1 — night shift worker
-- [P1] WIKI-248 transcript follow-ups from #183 round-1 verdict — kill ActivityGroup data-model aggregation (one virtual row per event), restore live/interrupted-state + wiki-238 coverage, composer focus + forced-colors treatment, wiki59 Shiki expectation, font-fallback root cause, working-diff collapsed by default (Henry: 'should not be a thing'); WIP seed branch wiki-248-transcript-followups @ aa0305ce
-- [P1] WIKI-249 OpenCode 1:1 run-view fidelity — Henry 2026-08-06: agent run UI 'almost exactly one to one' with OpenCode (reference vault/wiki-app/assets/opencode-ui-reference.png + /tmp/opencode-ref source): turn-header agent·model·duration meta rows, '+ Thought: Nms' duration rows, tinted user bars, packed tool runs, click-to-expand hints, zero extra chrome; systematic side-by-side gap audit -> close every gap; SPAWNED stacked on #185's branch (Henry: go now, REVIEW GATE WAIVED — orch merges directly on worker merge-ready)
+- [P1] WIKI-249 OpenCode 1:1 run-view fidelity — Henry 2026-08-06: agent run UI 'almost exactly one to one' with OpenCode (reference vault/wiki-app/assets/opencode-ui-reference.png + /tmp/opencode-ref source): turn-header agent·model·duration meta rows, '+ Thought: Nms' duration rows, tinted user bars, packed tool runs, click-to-expand hints, zero extra chrome; systematic side-by-side gap audit -> close every gap; SPAWNED (fable-5 per Henry); review loop APPLIES (Henry flipped the waiver to WIKI-248 instead); rebased onto main post-#185
 Backlog:
 
 - [PHO-14974](https://linear.app/phoebework/issue/PHO-14974): implement the planned v3 describe catalog after retrieve and write registry interfaces land

@@ -9,6 +9,7 @@ updated: 2026-08-06
 
 ## 2026-08-06
 
+- WIKI-248 merged via #185 (review gate waived by Henry at round 2): per-event spacing model, live-state anchor, data-level caps, exact assertions, working-diff summary
 - WIKI-250 merged via #184: Gruvbox dark retuned to gruvbox-dark-hard-contrast.terminal (21 keys decoded + verified twice; derived elevations; selection contrast fixed)
 - WIKI-247 merged via #183 (owner call mid-round-2): per-event units, quiet composer, native blocks, font+sidebar fixes; residual review findings split to WIKI-248
 - **wiki** — WIKI-247 fable-5 worker hit Anthropic credit wall mid-implementation (resets Aug 10 2am ET); WIP snapshotted at 97cb298, seat replaced with cdx luna + continuation contract
