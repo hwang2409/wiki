@@ -9,6 +9,7 @@ updated: 2026-08-06
 
 ## 2026-08-06
 
+- WIKI-249 merged via #186 (gate waived): OpenCode 1:1 run-view fidelity + polish wave — syntax highlighting everywhere (commands, file reads, diffs, thinking), json/python pretty rendering, polished toggle, fence-tag honoring, embedded-heredoc structuring, file-slice output inference, cursor=text — fable-5, 10-item gap table, 347 vitest + 5 playwright green
 - WIKI-248 merged via #185 (review gate waived by Henry at round 2): per-event spacing model, live-state anchor, data-level caps, exact assertions, working-diff summary
 - WIKI-250 merged via #184: Gruvbox dark retuned to gruvbox-dark-hard-contrast.terminal (21 keys decoded + verified twice; derived elevations; selection contrast fixed)
 - WIKI-247 merged via #183 (owner call mid-round-2): per-event units, quiet composer, native blocks, font+sidebar fixes; residual review findings split to WIKI-248
