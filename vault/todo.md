@@ -25,6 +25,7 @@ Todo:
 - [P1] phoebe: PHO-15149 refactor umbrella to ORGANIZATION.md layout — ticket filed under epic PHO-15148; blocked by PHO-15082 (last parity PR)
 - [P2] wiki backend: boot-sweep follow-ups from 2026-08-05 latency fix — skip terminal-state runs in orphan/costs sweeps + prune accumulated run-history store (multi-GB JSONL streaming still O(history) once per boot; related WIKI-227) + incremental/bounded checkpoint for costs state persistence (changed ticks serialize full history off-loop; deferred from WIKI-227 #180 R4 by orch ruling 2026-08-06)
 - [P3] wiki repo hygiene: ~95 stale worktrees under .claude/.codex worktrees (detached review checkouts + branches of long-merged tickets, e.g. 40+ wiki-168-review*) — bulk sweep worktrees+branches for merged/closed tickets, GBs of debris
+- [P1] WIKI-249 OpenCode 1:1 run-view fidelity — Henry 2026-08-06: agent run UI 'almost exactly one to one' with OpenCode (reference vault/wiki-app/assets/opencode-ui-reference.png + /tmp/opencode-ref source): turn-header agent·model·duration meta rows, '+ Thought: Nms' duration rows, tinted user bars, packed tool runs, click-to-expand hints, zero extra chrome; systematic side-by-side gap audit -> close every gap; START AFTER WIKI-248 merges (same surfaces)
 
 Silky-smooth artifact rendering arc (Henry 2026-07-29):
 
