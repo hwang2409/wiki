@@ -51,6 +51,7 @@ MAX_MESSAGE_DEDUPE_IDS = 4096
 CURSOR_TAIL_BYTES = 256
 REFRESH_INTERVAL_SECONDS = float(os.environ.get("WIKI_COST_REFRESH_INTERVAL_SECONDS", "5"))
 _REFRESH_LOCK = threading.Lock()
+_BACKGROUND_STATE: dict[str, Any] | None = None
 
 
 ACCOUNTING_FIELDS = ("input", "cache_read", "cache_write_5m", "cache_write_1h", "output")
@@ -108,7 +109,7 @@ def _load_state() -> dict[str, Any]:
     return value
 
 
-def _save_json(path: Path, value: dict[str, Any]) -> None:
+def _save_json(path: Path, value: dict[str, Any]) -> bool:
     try:
         path.parent.mkdir(parents=True, exist_ok=True)
         fd, raw_tmp = tempfile.mkstemp(prefix=f".{path.name}.", dir=path.parent)
@@ -122,23 +123,24 @@ def _save_json(path: Path, value: dict[str, Any]) -> None:
             try:
                 dir_fd = os.open(path.parent, os.O_RDONLY)
             except OSError:
-                return
+                return False
             try:
                 os.fsync(dir_fd)
             finally:
                 os.close(dir_fd)
+            return True
         finally:
             tmp.unlink(missing_ok=True)
     except OSError:
-        return
+        return False
 
 
-def _save_state(state: dict[str, Any]) -> None:
-    _save_json(cost_state_path(), state)
+def _save_state(state: dict[str, Any]) -> bool:
+    return _save_json(cost_state_path(), state)
 
 
-def _save_heartbeat(state: dict[str, Any]) -> None:
-    _save_json(cost_heartbeat_path(), {"updated_at": state.get("updated_at")})
+def _save_heartbeat(state: dict[str, Any]) -> bool:
+    return _save_json(cost_heartbeat_path(), {"updated_at": state.get("updated_at")})
 
 
 def _now_iso() -> str:
@@ -623,17 +625,27 @@ def refresh(state: dict[str, Any] | None = None) -> dict[str, Any]:
         ]
     state["runs_dir_signature"] = runs_dir_signature
     state["updated_at"] = _now_iso()
-    if state_changed:
-        _save_state(state)
-    _save_heartbeat(state)
+    state_saved = _save_state(state) if state_changed else True
+    if state_saved:
+        _save_heartbeat(state)
     return state
 
 
+def invalidate_background_state() -> None:
+    """Force the next background refresh to reload its durable state."""
+
+    global _BACKGROUND_STATE
+    _BACKGROUND_STATE = None
+
+
 async def refresh_in_background() -> bool:
+    global _BACKGROUND_STATE
     if not _REFRESH_LOCK.acquire(blocking=False):
         return False
     try:
-        await asyncio.to_thread(refresh)
+        if _BACKGROUND_STATE is None:
+            _BACKGROUND_STATE = _load_state()
+        _BACKGROUND_STATE = await asyncio.to_thread(refresh, _BACKGROUND_STATE)
     finally:
         _REFRESH_LOCK.release()
     return True

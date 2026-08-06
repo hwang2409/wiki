@@ -478,6 +478,20 @@ class KnowledgeIndexTests(unittest.TestCase):
         self.assertTrue(result["stale"])
         self.assertEqual(result["results"][0]["citation"], "durable.md")
 
+    def test_staging_runs_are_not_indexed_as_live_runs(self) -> None:
+        staging = self.runtime / "runs" / ".staging" / ".run-crashed"
+        _write_run(
+            staging,
+            run_id="00000000-0000-4000-8000-000000000107",
+            ticket="WIKI-107",
+            text="crash leftover must not be indexed",
+        )
+
+        stats = self.index.index_live_runs()
+
+        self.assertEqual(stats.runs_indexed, 0)
+        self.assertEqual(self.index.search("crash leftover")["results"], [])
+
     def test_locked_live_run_writer_returns_existing_results_as_stale(self) -> None:
         _write_note(self.vault / "locked.md", "Locked", "lockedsearchneedle")
         self.index.rebuild()

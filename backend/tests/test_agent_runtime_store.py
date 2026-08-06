@@ -619,6 +619,19 @@ class RunStoreTests(unittest.TestCase):
                 {"events.jsonl", "raw.jsonl", "run.json"},
             )
             self.assertEqual(list(root.joinpath("runtime", "runs").glob(".run-*")), [])
+            self.assertEqual(list(root.joinpath("runtime", "runs", ".staging").iterdir()), [])
+
+    def test_startup_cleans_crash_left_staging_runs(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            paths = _paths(root)
+            staging = paths.runs_dir / ".staging" / ".run-crashed"
+            staging.mkdir(parents=True)
+            (staging / "run.json").write_text("{}", encoding="utf-8")
+
+            RunStore(paths)
+
+            self.assertFalse(staging.exists())
 
     def test_raw_event_is_durable_before_normalization(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

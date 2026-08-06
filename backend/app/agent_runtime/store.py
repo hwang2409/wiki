@@ -593,6 +593,11 @@ class RunStore:
         self._start_registry_snapshots: dict[str, dict[str, Any]] = {}
         _ensure_private_dir(paths.runtime_dir)
         _ensure_private_dir(paths.runs_dir)
+        staging_dir = paths.runs_dir / ".staging"
+        _ensure_private_dir(staging_dir)
+        for temp_dir in staging_dir.iterdir():
+            if temp_dir.is_dir() and not temp_dir.is_symlink():
+                shutil.rmtree(temp_dir, ignore_errors=True)
         for temp_dir in paths.runs_dir.glob(".run-*"):
             if temp_dir.is_dir() and not temp_dir.is_symlink():
                 shutil.rmtree(temp_dir, ignore_errors=True)
@@ -1114,7 +1119,9 @@ class RunStore:
         directory = self.run_dir(record.run_id)
         if directory.exists():
             raise StoreConflict(f"run already exists: {record.run_id}")
-        temp_dir = Path(tempfile.mkdtemp(prefix=".run-", dir=self.paths.runs_dir))
+        staging_dir = self.paths.runs_dir / ".staging"
+        staging_dir.mkdir(mode=0o700, parents=True, exist_ok=True)
+        temp_dir = Path(tempfile.mkdtemp(prefix=".run-", dir=staging_dir))
         try:
             temp_dir.chmod(0o700)
             for name in ("raw.jsonl", "events.jsonl"):
