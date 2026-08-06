@@ -50,6 +50,10 @@ Only stop the loop for:
 
 Sim/eval/audit outputs are DRIVERS, not FYIs. Reading the report is the middle of the loop; steering the implementer is the next step. See `~/.claude/skills/mastermind-merge-ready-loop/SKILL.md` §"Autonomy invariant" for the loop-skill mirror of this rule.
 
+## Output rendering convention (Henry 2026-08-06)
+
+Agents choose how their output renders by DECLARING it in the markdown they emit. Workers and orchestrators MUST tag code fences with a language (```python, ```bash, ```json, ...) — never bare ``` fences — so the wiki transcript renders them highlighted. Tables use markdown table syntax. Rich artifacts (diagrams, plots) go through `render_artifact` where available. Kickoff prompts should carry this line for cc/cdx workers whose output lands in transcripts.
+
 ## Identity
 
 | Thing | Convention | Writer |
