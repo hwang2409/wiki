@@ -89,7 +89,6 @@ In Progress:
 - PHO-14037 on-call transfer — investigate-then-fix worker spawned
 - PHO-15253 bash rewrite PRs A/B/C — night shift worker
 - PHO-15254 retrieve adoption tranche 1 — night shift worker
-- [P1] wiki-app: WIKI-260 font picker enumerates real installed families; no variant grouping (owner: wiki-dev fleet)
 - [P1] wiki-app: WIKI-261 highlight numbered read-tool outputs (strip gutter, tokenize, gutter column) (owner: wiki-dev fleet)
 Backlog:
 
