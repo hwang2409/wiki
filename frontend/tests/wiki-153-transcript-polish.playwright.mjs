@@ -202,6 +202,39 @@ const CLAUDE_TRANSCRIPT_ROWS = [
       ],
     },
   },
+  {
+    type: "assistant",
+    timestamp: "2026-07-22T18:00:04.100Z",
+    message: {
+      role: "assistant",
+      content: [
+        {
+          type: "tool_use",
+          id: "toolu_edit_font_fixture",
+          name: "Edit",
+          input: {
+            file_path: "frontend/src/session.tsx",
+            old_string: "const before = true;",
+            new_string: "const after = true;",
+          },
+        },
+      ],
+    },
+  },
+  {
+    type: "user",
+    timestamp: "2026-07-22T18:00:04.200Z",
+    message: {
+      role: "user",
+      content: [
+        {
+          type: "tool_result",
+          tool_use_id: "toolu_edit_font_fixture",
+          content: "Applied edit",
+        },
+      ],
+    },
+  },
 ];
 
 const PROVIDER_PENDING_REQUEST = {
@@ -404,6 +437,20 @@ async function main() {
     await bashOutput.locator(".ansi-fg-2, .ansi-fg-6").first().waitFor({ state: "visible" });
     await bashOutput.locator(".transcript-preview-more").click();
     await bashOutput.locator(".ansi-fg-1").first().waitFor({ state: "visible" });
+
+    logStep("diff body keeps the monospace root font at runtime");
+    const diffLine = page.locator(".session-tool-diff-body .diff-line").first();
+    await diffLine.waitFor({ state: "visible" });
+    const diffFont = await diffLine.evaluate((element) => {
+      const root = getComputedStyle(document.documentElement);
+      return {
+        line: getComputedStyle(element).fontFamily,
+        root: root.getPropertyValue("--font-monospace").trim(),
+      };
+    });
+    if (diffFont.line !== diffFont.root) {
+      throw new Error(`rendered diff lines must use the monospace root, got ${diffFont.line} instead of ${diffFont.root}`);
+    }
 
     logStep("action-required card: question visible, kind hidden");
     // WIKI-152: Action required is promoted to the top-level chrome; there is

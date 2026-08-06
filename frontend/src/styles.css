@@ -6248,8 +6248,42 @@ body.is-resizing-panes .pane-cell {
   font-weight: var(--fw-normal);
 }
 
-/* WIKI-244: the working diff renders open — the section head is a status
-   line with a raw-diff copy control, not a toggle. */
+/* WIKI-247: the working diff is a quiet disclosure row. */
+.codex-stream-diff-toggle {
+  display: inline-flex;
+  flex: 1 1 auto;
+  align-items: center;
+  gap: 7px;
+  min-width: 0;
+  min-height: 24px;
+  padding: 1px 0;
+  border: 0;
+  background: transparent;
+  color: var(--text-normal);
+  font: inherit;
+  text-align: left;
+  text-transform: lowercase;
+  cursor: pointer;
+}
+
+.codex-stream-diff-toggle:hover {
+  color: var(--text-normal);
+}
+
+.codex-stream-diff-toggle:focus-visible {
+  outline: 2px solid var(--interactive-accent);
+  outline-offset: 1px;
+}
+
+.codex-stream-diff-chevron {
+  flex: 0 0 auto;
+  transition: transform 120ms ease;
+}
+
+.codex-stream-diff-toggle[aria-expanded="true"] .codex-stream-diff-chevron {
+  transform: rotate(180deg);
+}
+
 .codex-stream-diff-copy {
   display: inline-flex;
   align-items: center;
@@ -7272,12 +7306,12 @@ body.is-resizing-panes .pane-cell {
   display: inline-flex;
   align-items: baseline;
   gap: 8px;
-  margin-top: 6px;
-  padding: 7px 10px;
-  border: 1px solid var(--background-modifier-border);
-  background-color: var(--background-primary-alt);
+  margin-top: 4px;
+  padding: 0;
+  color: var(--activity-metadata-color);
   font-family: var(--font-monospace);
   font-weight: var(--font-monospace-weight);
+  font-size: var(--fs-xs);
 }
 
 .session-collapsible {
@@ -7313,20 +7347,6 @@ body.is-resizing-panes .pane-cell {
 
 .session-activity-row {
   min-width: 0;
-}
-
-/* WIKI-247 vertical rhythm: consecutive tier-1 inline rows pack at zero
-   margin; blocks and thinking traces stand alone with one unit of
-   whitespace on each side (doctrine: margin 1 when a neighbor is rich). */
-.session-activity > .session-activity-row.is-block,
-.session-activity > .session-activity-row.is-reasoning,
-.session-activity > .session-activity-row.is-block + .session-activity-row,
-.session-activity > .session-activity-row.is-reasoning + .session-activity-row {
-  margin-top: 8px;
-}
-
-.session-activity > .session-activity-row:first-child {
-  margin-top: 0;
 }
 
 .session-tool-head {
@@ -8493,6 +8513,14 @@ body.is-resizing-panes .pane-cell {
 .session-composer textarea:focus-visible {
   outline: none;
   box-shadow: none;
+}
+
+@media (forced-colors: active) {
+  .session-composer textarea:focus,
+  .session-composer textarea:focus-visible {
+    outline: auto;
+    outline-offset: 2px;
+  }
 }
 
 .session-composer textarea {
@@ -11710,6 +11738,7 @@ textarea.composer-command-input {
   border: 1px solid var(--background-modifier-border);
   border-radius: var(--radius-m);
   background-color: var(--code-background);
+  --diff-font-family: var(--font-monospace);
   font-family: var(--font-monospace);
   font-weight: var(--font-monospace-weight);
   font-size: var(--font-ui-smaller);
@@ -11838,16 +11867,6 @@ textarea.composer-command-input {
   flex: 1 1 auto;
   padding: 0 10px 0 6px;
   white-space: pre;
-}
-
-/* WIKI-247: diff interiors resolve to the mono stack on the leaves — an
-   ancestor prose font must never win for diff text or line numbers. */
-.diff-line,
-.diff-code,
-.diff-marker,
-.diff-gutter {
-  font-family: var(--font-monospace);
-  font-weight: var(--font-monospace-weight);
 }
 
 /* WIKI-153 — bounded transcript preview shared by tool + bash blocks */
@@ -15297,7 +15316,7 @@ textarea.composer-command-input {
 
 .session-composer-row:focus-within {
   border-left-color: var(--border-active);
-  background-color: var(--background-element);
+  background-color: color-mix(in srgb, var(--background-element) 94%, var(--text-normal));
 }
 
 .session-composer-target {

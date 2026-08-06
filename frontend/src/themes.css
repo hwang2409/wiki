@@ -524,8 +524,8 @@
   --text-on-accent: #fdf6e3;
   --text-selection: rgba(147, 161, 161, 0.38);
 
-  --activity-metadata-color: #435a61;
-  --activity-state-done-color: var(--text-muted);
+  --activity-metadata-color: #3d555c;
+  --activity-state-done-color: #3d555c;
   --activity-state-working-color: var(--text-normal);
   --activity-state-failed-color: var(--accent-danger);
   --activity-state-interrupted-color: #435a61;
@@ -733,6 +733,8 @@
   --text-on-accent: #282c34;
   --text-selection: rgba(62, 68, 81, 0.8);
 
+  --activity-state-done-color: #9aa1ad;
+
   --link-color: #61afef;
   --link-color-hover: #56b6c2;
 
@@ -801,6 +803,8 @@
   --text-faint: #737aa2;
   --text-on-accent: #1a1b26;
   --text-selection: rgba(81, 92, 126, 0.48);
+
+  --activity-state-done-color: #9ca5c8;
 
   --link-color: #7aa2f7;
   --link-color-hover: #7dcfff;

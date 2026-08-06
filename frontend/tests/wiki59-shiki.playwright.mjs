@@ -148,7 +148,7 @@ async function main() {
 
     // Give shiki a moment to load themes+langs and re-render.
     await page.waitForFunction(
-      () => document.querySelectorAll(".shiki-block .shiki").length >= 3,
+      () => document.querySelectorAll(".shiki-block .shiki").length === 2,
       null,
       { timeout: 5000 }
     );
@@ -179,8 +179,12 @@ async function main() {
     });
 
     const shikiCount = await page.locator(".shiki-block .shiki").count();
-    if (shikiCount < 3) {
-      throw new Error(`Expected >=3 shiki blocks (2 fences + 1 bash), found ${shikiCount}`);
+    if (shikiCount !== 2) {
+      throw new Error(`Expected 2 shiki blocks (the fenced Python and JSON blocks), found ${shikiCount}`);
+    }
+    const bashCommand = page.locator(".session-bash .session-tool-block-title.is-command");
+    if ((await bashCommand.count()) !== 1 || !(await bashCommand.innerText()).includes("grep -R 'shiki'")) {
+      throw new Error("Bash should render as the native command line, outside Shiki");
     }
     logStep(`shiki blocks rendered: ${shikiCount}`);
   } finally {

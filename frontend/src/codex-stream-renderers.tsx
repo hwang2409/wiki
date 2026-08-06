@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useRef, useState } from "react";
+import { useEffect, useId, useMemo, useRef, useState } from "react";
 import { AlertTriangle, ChevronDown, ListTodo, Terminal } from "lucide-react";
 import { DisclosureContent } from "./disclosure";
 import type { ProviderStreamEvent } from "./api";
@@ -567,9 +567,9 @@ function boundDiffFiles(files: ReadonlyMap<string, DiffFilePatch>): Map<string, 
   return bounded;
 }
 
-// WIKI-244: the working diff renders open — no section toggle, no per-file
-// disclosure. Byte/line bounds stay for performance; truncated data keeps raw
-// access through a copy control that carries the full unparsed diff source.
+// WIKI-247: transcript rows stay always open, but the working diff is a
+// separate disclosure. Byte/line bounds stay for performance; truncated data
+// keeps raw access through a copy control that carries the full source.
 function DiffRenderer({ source }: { source: string | null }) {
   const snapshot = useMemo(
     () => (source === null
@@ -579,8 +579,11 @@ function DiffRenderer({ source }: { source: string | null }) {
   );
   const boundedFiles = useMemo(() => boundDiffFiles(snapshot.files), [snapshot]);
   const [copied, setCopied] = useState(false);
+  const [expanded, setExpanded] = useState(false);
+  const bodyId = useId();
   useEffect(() => {
     setCopied(false);
+    setExpanded(false);
   }, [source]);
   if (!boundedFiles.size && !snapshot.omittedFiles) return null;
   const copyRawDiff = () => {
@@ -593,8 +596,16 @@ function DiffRenderer({ source }: { source: string | null }) {
   return (
     <div className="codex-stream-artifact codex-stream-diff" data-testid="codex-diff-renderer">
       <div className="codex-stream-artifact-head">
-        <span>working diff</span>
-        <span className="codex-stream-artifact-count tabular-nums">{boundedFiles.size} file{boundedFiles.size === 1 ? "" : "s"}</span>
+        <button
+          aria-controls={bodyId}
+          aria-expanded={expanded}
+          className="codex-stream-diff-toggle"
+          type="button"
+          onClick={() => setExpanded((value) => !value)}
+        >
+          <ChevronDown aria-hidden="true" className="codex-stream-diff-chevron" size={13} />
+          <span>working diff · {boundedFiles.size} file{boundedFiles.size === 1 ? "" : "s"}</span>
+        </button>
         {source ? (
           <button
             className="codex-stream-diff-copy"
@@ -606,41 +617,45 @@ function DiffRenderer({ source }: { source: string | null }) {
           </button>
         ) : null}
       </div>
-      {snapshot.omittedFiles ? (
-        <div className="codex-stream-diff-omitted" data-testid="codex-diff-omitted" role="status">
-          additional diff files omitted from preview — copy raw diff for the complete data
-        </div>
-      ) : null}
-      {[...boundedFiles.entries()].map(([path, bounded]) => {
-        const { file } = bounded;
-        const kind = fileKind(file);
-        return (
-          <div className="codex-stream-diff-file" key={path}>
-            <div className="codex-stream-diff-file-head">
-              <span>{path}</span>
-              {kind ? <span className="codex-stream-diff-kind">{fileKindLabel(kind)}</span> : null}
+      {expanded ? (
+        <div id={bodyId}>
+          {snapshot.omittedFiles ? (
+            <div className="codex-stream-diff-omitted" data-testid="codex-diff-omitted" role="status">
+              additional diff files omitted from preview — copy raw diff for the complete data
             </div>
-            <div className="codex-stream-diff-body">
-              {file.hunks.map((hunk) => (
-                <div className="codex-stream-diff-hunk" key={`${path}:${hunk.header}`}>
-                  <div className="codex-stream-diff-hunk-head">{hunk.header}</div>
-                  {hunk.lines.map((line, index) => (
-                    <div className={`codex-stream-diff-line is-${line.kind}`} key={`${hunk.header}:${index}`}>
-                      <span className="codex-stream-diff-marker">{line.kind === "add" ? "+" : line.kind === "remove" ? "-" : " "}</span>
-                      <code>{line.text}</code>
+          ) : null}
+          {[...boundedFiles.entries()].map(([path, bounded]) => {
+            const { file } = bounded;
+            const kind = fileKind(file);
+            return (
+              <div className="codex-stream-diff-file" key={path}>
+                <div className="codex-stream-diff-file-head">
+                  <span>{path}</span>
+                  {kind ? <span className="codex-stream-diff-kind">{fileKindLabel(kind)}</span> : null}
+                </div>
+                <div className="codex-stream-diff-body">
+                  {file.hunks.map((hunk) => (
+                    <div className="codex-stream-diff-hunk" key={`${path}:${hunk.header}`}>
+                      <div className="codex-stream-diff-hunk-head">{hunk.header}</div>
+                      {hunk.lines.map((line, index) => (
+                        <div className={`codex-stream-diff-line is-${line.kind}`} key={`${hunk.header}:${index}`}>
+                          <span className="codex-stream-diff-marker">{line.kind === "add" ? "+" : line.kind === "remove" ? "-" : " "}</span>
+                          <code>{line.text}</code>
+                        </div>
+                      ))}
                     </div>
                   ))}
+                  {bounded.truncated ? (
+                    <div className="codex-stream-diff-truncated">
+                      diff preview truncated — copy raw diff for the complete data
+                    </div>
+                  ) : null}
                 </div>
-              ))}
-              {bounded.truncated ? (
-                <div className="codex-stream-diff-truncated">
-                  diff preview truncated — copy raw diff for the complete data
-                </div>
-              ) : null}
-            </div>
-          </div>
-        );
-      })}
+              </div>
+            );
+          })}
+        </div>
+      ) : null}
     </div>
   );
 }
