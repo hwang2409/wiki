@@ -337,6 +337,20 @@ export function CommandPalette({ onClose, onOpen }: CommandPaletteProps) {
             </div>
           )}
         </div>
+        <div aria-label="Keyboard shortcuts" className="quick-switcher-footer">
+          <span className="quick-switcher-hint">
+            <span className="quick-switcher-hint-key">up/down</span>
+            <span className="quick-switcher-hint-label">navigate</span>
+          </span>
+          <span className="quick-switcher-hint">
+            <span className="quick-switcher-hint-key">enter</span>
+            <span className="quick-switcher-hint-label">open</span>
+          </span>
+          <span className="quick-switcher-hint">
+            <span className="quick-switcher-hint-key">esc</span>
+            <span className="quick-switcher-hint-label">close</span>
+          </span>
+        </div>
       </div>
     </div>,
     document.body

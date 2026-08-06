@@ -77,6 +77,17 @@ describe("WIKI-246 OpenCode chrome states", () => {
     expect(cssDeclarations(".dialog-title")).toContain("font-weight: var(--fw-semibold);");
     expect(cssDeclarations(".dialog-title-esc")).toContain("color: var(--text-muted);");
     expect(cssDeclarations(".dialog-title-esc")).toContain("cursor: pointer;");
+    expect(within(switcherDialog).getByLabelText("Keyboard shortcuts").textContent).toContain(
+      "up/downnavigateenteropenescclose",
+    );
+    expect(within(paletteDialog).getByLabelText("Keyboard shortcuts").textContent).toContain(
+      "up/downnavigateenteropenescclose",
+    );
+    expect(cssDeclarations(".quick-switcher-footer")).toContain("gap: 8px;");
+    expect(cssDeclarations(".quick-switcher-hint-key")).toContain("color: var(--text);");
+    expect(cssDeclarations(".quick-switcher-hint-label")).toContain(
+      "color: var(--text-muted);",
+    );
   });
 
   test("real switcher selection and fleet rows use the chrome declarations", () => {
@@ -163,7 +174,7 @@ describe("WIKI-246 OpenCode chrome states", () => {
     );
     expect(cssDeclarations(".session-composer-row")).not.toContain("transition");
     expect(CSS_SOURCE).not.toContain(".agent-spawn-static");
-    expect(CHROME_CSS).toContain("animation: chrome-fade-in var(--chrome-motion-duration)");
+    expect(CHROME_CSS).not.toContain("animation: chrome-fade-in");
   });
 
   test("current navigation items expose one dot and no left rail", () => {

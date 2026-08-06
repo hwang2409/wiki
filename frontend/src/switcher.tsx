@@ -492,6 +492,20 @@ export function QuickSwitcher({
             <div className="quick-switcher-empty">No matches</div>
           )}
         </div>
+        <div aria-label="Keyboard shortcuts" className="quick-switcher-footer">
+          <span className="quick-switcher-hint">
+            <span className="quick-switcher-hint-key">up/down</span>
+            <span className="quick-switcher-hint-label">navigate</span>
+          </span>
+          <span className="quick-switcher-hint">
+            <span className="quick-switcher-hint-key">enter</span>
+            <span className="quick-switcher-hint-label">open</span>
+          </span>
+          <span className="quick-switcher-hint">
+            <span className="quick-switcher-hint-key">esc</span>
+            <span className="quick-switcher-hint-label">close</span>
+          </span>
+        </div>
       </div>
     </div>
   );
@@ -610,6 +624,20 @@ export function FleetSwitcher({
           ) : (
             <div className="quick-switcher-empty">No agents</div>
           )}
+        </div>
+        <div aria-label="Keyboard shortcuts" className="quick-switcher-footer">
+          <span className="quick-switcher-hint">
+            <span className="quick-switcher-hint-key">up/down</span>
+            <span className="quick-switcher-hint-label">navigate</span>
+          </span>
+          <span className="quick-switcher-hint">
+            <span className="quick-switcher-hint-key">enter</span>
+            <span className="quick-switcher-hint-label">select</span>
+          </span>
+          <span className="quick-switcher-hint">
+            <span className="quick-switcher-hint-key">esc</span>
+            <span className="quick-switcher-hint-label">close</span>
+          </span>
         </div>
       </div>
     </div>

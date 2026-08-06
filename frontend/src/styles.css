@@ -219,7 +219,6 @@ button:disabled {
   gap: 8px;
   width: min(100%, 420px);
   opacity: 0;
-  animation: loading-reveal 120ms ease-out 150ms forwards;
 }
 
 .loading-line {
@@ -247,32 +246,6 @@ button:disabled {
     background-position: 100% 50%;
     opacity: 1;
   }
-}
-
-@keyframes loading-reveal {
-  from {
-    opacity: 0;
-  }
-
-  to {
-    opacity: 1;
-  }
-}
-
-:where(
-  .activity-commit-row,
-  .activity-file,
-  .health-row,
-  .agent-log-toggle,
-  .view-action,
-  .settings-reset,
-  .session-activity-head,
-  .session-tool-head,
-  .session-expand
-) {
-  transition-property: background-color, border-color, color, transform, opacity, box-shadow;
-  transition-duration: 120ms;
-  transition-timing-function: ease-out;
 }
 
 :where(
@@ -367,7 +340,6 @@ button:disabled {
   font-family: var(--font-chrome);
   font-size: var(--fs-sm);
   text-align: left;
-  transition: background-color 120ms ease-out, color 120ms ease-out;
 }
 
 .ribbon-more-item svg {
@@ -431,9 +403,6 @@ button:disabled {
   opacity: 0;
   scale: 0.25;
   filter: blur(4px);
-  transition-property: opacity, scale, filter;
-  transition-duration: 200ms;
-  transition-timing-function: cubic-bezier(0.2, 0, 0, 1);
 }
 
 .theme-icon.is-active {
@@ -512,7 +481,6 @@ button:disabled {
   color: var(--text-normal);
   font-family: var(--font-chrome);
   font-size: var(--font-ui-smaller);
-  transition: background-color 120ms ease-out, border-color 120ms ease-out;
 }
 
 .nav-inline-retry:hover {
@@ -661,7 +629,6 @@ button:disabled {
   flex-shrink: 0;
   color: var(--text-faint);
   transform: rotate(90deg);
-  transition: transform 100ms ease-in-out;
 }
 
 .collapse-icon.is-collapsed {
@@ -802,9 +769,6 @@ button:disabled {
   height: 26px;
   border-radius: var(--radius-s);
   color: var(--text-muted);
-  transition-property: background-color, color, scale;
-  transition-duration: 100ms;
-  transition-timing-function: ease-out;
 }
 
 .view-action:hover:not(:disabled) {
@@ -860,7 +824,6 @@ button:disabled {
   min-width: 0;
   outline: none;
   box-shadow: inset 0 0 0 1px transparent;
-  transition: box-shadow 120ms ease-out;
 }
 
 .pane-frame.is-focused {
@@ -914,9 +877,6 @@ button:disabled {
   content: "";
   position: absolute;
   background-color: var(--background-modifier-border);
-  transition-property: background-color, width, height;
-  transition-duration: 100ms;
-  transition-timing-function: ease-out;
 }
 
 .pane-divider.row::before {
@@ -1303,7 +1263,6 @@ body.is-resizing-panes .pane-cell {
   background-color: var(--terminal-surface-alt);
   box-shadow: var(--shadow-floating);
   transform-origin: top right;
-  animation: switcher-in 100ms cubic-bezier(0.2, 0, 0, 1) both;
 }
 
 .terminal-pane-details-row {
@@ -1515,9 +1474,6 @@ body.is-resizing-panes .pane-cell {
   position: absolute;
   border: 2px dashed transparent;
   border-radius: var(--radius-md);
-  transition-property: background-color, border-color;
-  transition-duration: 100ms;
-  transition-timing-function: ease-out;
 }
 
 .pane-drop-zone.is-active {
@@ -1586,9 +1542,6 @@ body.is-resizing-panes .pane-cell {
 .empty-state-actions button {
   color: var(--link-color);
   font-size: var(--font-ui-small);
-  transition-property: color;
-  transition-duration: 100ms;
-  transition-timing-function: ease-out;
 }
 
 .empty-state-actions button:hover {
@@ -1630,7 +1583,6 @@ body.is-resizing-panes .pane-cell {
   border-radius: var(--radius-md);
   background-color: var(--background-primary);
   box-shadow: var(--shadow-floating);
-  animation: switcher-in 100ms cubic-bezier(0.2, 0, 0, 1) both;
 }
 
 .context-menu button {
@@ -1639,9 +1591,6 @@ body.is-resizing-panes .pane-cell {
   color: var(--text-normal);
   font-size: var(--font-ui-small);
   text-align: left;
-  transition-property: background-color;
-  transition-duration: 100ms;
-  transition-timing-function: ease-out;
 }
 
 .context-menu button:hover {
@@ -1874,8 +1823,6 @@ body.is-resizing-panes .pane-cell {
   font-size: var(--fs-xs);
   font-variant-numeric: tabular-nums;
   cursor: pointer;
-  transition-property: color, border-color, background-color;
-  transition-duration: 120ms;
 }
 
 .font-weight-stop:hover {
@@ -2002,9 +1949,6 @@ body.is-resizing-panes .pane-cell {
   background-color: var(--background-secondary);
   color: var(--text-muted);
   text-align: left;
-  transition-property: border-color, background-color, color;
-  transition-duration: 100ms;
-  transition-timing-function: ease-out;
 }
 
 .theme-choice:hover {
@@ -2070,7 +2014,6 @@ body.is-resizing-panes .pane-cell {
   background-color: var(--background-primary);
   box-shadow: var(--shadow-modal);
   translate: -50% 0;
-  animation: switcher-in 140ms cubic-bezier(0.2, 0, 0, 1) both;
 }
 
 .dialog-title {
@@ -2090,9 +2033,6 @@ body.is-resizing-panes .pane-cell {
   font-family: var(--font-monospace);
   font-weight: var(--font-monospace-weight);
   font-size: var(--font-ui-small);
-  transition-property: border-color, box-shadow;
-  transition-duration: 120ms;
-  transition-timing-function: ease-out;
   outline: none;
 }
 
@@ -2252,9 +2192,6 @@ body.is-resizing-panes .pane-cell {
   font-family: var(--font-monospace);
   font-weight: var(--font-monospace-weight);
   font-size: var(--font-ui-small);
-  transition-property: border-color, box-shadow;
-  transition-duration: 120ms;
-  transition-timing-function: ease-out;
 }
 
 .agent-spawn-select {
@@ -2365,16 +2302,6 @@ body.is-resizing-panes .pane-cell {
   inset: 0;
   z-index: 100;
   background-color: var(--background-overlay-strong);
-  animation: backdrop-in 120ms ease-out both;
-}
-
-@keyframes backdrop-in {
-  from {
-    opacity: 0;
-  }
-  to {
-    opacity: 1;
-  }
 }
 
 .quick-switcher {
@@ -2392,18 +2319,6 @@ body.is-resizing-panes .pane-cell {
   background-color: var(--background-primary);
   box-shadow: var(--shadow-modal);
   translate: -50% 0;
-  animation: switcher-in 140ms cubic-bezier(0.2, 0, 0, 1) both;
-}
-
-@keyframes switcher-in {
-  from {
-    opacity: 0;
-    scale: 0.98;
-  }
-  to {
-    opacity: 1;
-    scale: 1;
-  }
 }
 
 .quick-switcher input {
@@ -2803,25 +2718,6 @@ body.is-resizing-panes .pane-cell {
   letter-spacing: -0.005em;
 }
 
-.markdown-reading-view .inline-title {
-  animation: fade-slide-in 200ms cubic-bezier(0.2, 0, 0, 1) both;
-}
-
-.markdown-reading-view .markdown-preview-view {
-  animation: fade-slide-in 250ms cubic-bezier(0.2, 0, 0, 1) 60ms both;
-}
-
-@keyframes fade-slide-in {
-  from {
-    opacity: 0;
-    translate: 0 4px;
-  }
-  to {
-    opacity: 1;
-    translate: 0 0;
-  }
-}
-
 /* Properties (frontmatter) */
 
 .metadata-container {
@@ -2833,7 +2729,6 @@ body.is-resizing-panes .pane-cell {
   border: 1px solid var(--background-modifier-border);
   border-radius: var(--radius-s);
   background-color: var(--background-secondary);
-  animation: fade-slide-in 220ms cubic-bezier(0.2, 0, 0, 1) 30ms both;
 }
 
 .metadata-property {
@@ -2908,7 +2803,6 @@ body.is-resizing-panes .pane-cell {
   border: 1px solid var(--background-modifier-border);
   border-radius: var(--radius-md);
   background-color: var(--kanban-lane);
-  animation: fade-slide-in 200ms cubic-bezier(0.2, 0, 0, 1) both;
 }
 
 .kanban-column:nth-child(2) {
@@ -3004,7 +2898,6 @@ body.is-resizing-panes .pane-cell {
   color: var(--text-muted);
   font-size: var(--font-ui-small);
   translate: -50% 0;
-  animation: fade-slide-in 160ms cubic-bezier(0.2, 0, 0, 1) both;
 }
 
 .kanban-done-zone code {
@@ -3033,9 +2926,6 @@ body.is-resizing-panes .pane-cell {
   border-radius: var(--radius-sm);
   color: var(--text-faint);
   font-size: var(--font-ui-small);
-  transition-property: background-color, color, scale;
-  transition-duration: 100ms;
-  transition-timing-function: ease-out;
 }
 
 .kanban-add-button:active {
@@ -3625,9 +3515,6 @@ body.is-resizing-panes .pane-cell {
   font-weight: var(--fw-semibold);
   font-size: inherit;
   line-height: 1.3;
-  transition-property: color, transform;
-  transition-duration: 120ms;
-  transition-timing-function: ease-out;
 }
 
 .callout.is-collapsible .callout-title {
@@ -3655,7 +3542,6 @@ body.is-resizing-panes .pane-cell {
   align-items: center;
   flex-shrink: 0;
   padding-top: 1px;
-  transition: transform 100ms ease-in-out;
 }
 
 .callout.is-collapsed .callout-fold {
@@ -3667,17 +3553,12 @@ body.is-resizing-panes .pane-cell {
   grid-template-rows: 0fr;
   opacity: 0;
   visibility: hidden;
-  transition-property: grid-template-rows, opacity, margin-top, visibility;
-  transition-duration: 160ms;
-  transition-timing-function: ease-out;
-  transition-delay: 0ms, 0ms, 0ms, 160ms;
 }
 
 .callout-content-wrap.is-open {
   grid-template-rows: 1fr;
   opacity: 1;
   visibility: visible;
-  transition-delay: 0ms;
 }
 
 .callout-content {
@@ -3703,17 +3584,12 @@ body.is-resizing-panes .pane-cell {
   grid-template-rows: 0fr;
   opacity: 0;
   visibility: hidden;
-  transition-property: grid-template-rows, opacity, visibility;
-  transition-duration: 160ms;
-  transition-timing-function: ease-out;
-  transition-delay: 0ms, 0ms, 160ms;
 }
 
 .disclosure-wrap.is-open {
   grid-template-rows: 1fr;
   opacity: 1;
   visibility: visible;
-  transition-delay: 0ms;
 }
 
 .disclosure-inner {
@@ -3723,7 +3599,6 @@ body.is-resizing-panes .pane-cell {
 
 .disclosure-chevron {
   flex-shrink: 0;
-  transition: transform 100ms ease-in-out;
 }
 
 .disclosure-chevron.is-collapsed {
@@ -3779,12 +3654,6 @@ body.is-resizing-panes .pane-cell {
 
 .markdown-preview-view tbody tr:last-child td {
   border-bottom: none;
-}
-
-.markdown-preview-view tbody tr {
-  transition-property: background-color;
-  transition-duration: 100ms;
-  transition-timing-function: ease-out;
 }
 
 .markdown-preview-view tbody tr:hover {
@@ -4053,7 +3922,6 @@ body.is-resizing-panes .pane-cell {
   cursor: pointer;
   font-size: var(--font-ui-smaller);
   font-weight: var(--fw-medium);
-  transition: background-color 100ms ease-out, border-color 100ms ease-out;
 }
 
 .utility-state-retry:hover {
@@ -4197,9 +4065,6 @@ body.is-resizing-panes .pane-cell {
   padding: 5px 8px;
   border-radius: var(--radius-s);
   text-align: left;
-  transition-property: background-color;
-  transition-duration: 100ms;
-  transition-timing-function: ease-out;
 }
 
 .activity-commit-row:hover {
@@ -4238,9 +4103,6 @@ body.is-resizing-panes .pane-cell {
   border-radius: 2em;
   color: var(--text-muted);
   font-size: var(--font-ui-smaller);
-  transition-property: border-color, color;
-  transition-duration: 100ms;
-  transition-timing-function: ease-out;
 }
 
 .activity-file:not(:disabled):hover {
@@ -4391,7 +4253,6 @@ body.is-resizing-panes .pane-cell {
   font-size: var(--font-ui-smaller);
   opacity: 0;
   transform: translateY(4px);
-  transition: opacity 160ms ease, transform 160ms ease;
   pointer-events: none;
 }
 
@@ -4476,7 +4337,6 @@ body.is-resizing-panes .pane-cell {
   cursor: pointer;
   font-size: var(--font-ui-small);
   list-style: none;
-  transition: background-color 100ms ease-out;
 }
 
 .graph-list-row::-webkit-details-marker {
@@ -4924,9 +4784,6 @@ body.is-resizing-panes .pane-cell {
   border-radius: var(--radius-s);
   font-size: var(--font-ui-small);
   text-align: left;
-  transition-property: background-color;
-  transition-duration: 100ms;
-  transition-timing-function: ease-out;
 }
 
 .health-row:hover {
@@ -5041,9 +4898,6 @@ body.is-resizing-panes .pane-cell {
   font-family: var(--font-monospace);
   font-weight: var(--font-monospace-weight);
   font-size: var(--font-ui-small);
-  transition-property: background-color, color, border-color, scale;
-  transition-duration: 100ms;
-  transition-timing-function: ease-out;
 }
 
 .agents-spawn-button:hover {
@@ -5161,9 +5015,6 @@ body.is-resizing-panes .pane-cell {
   font-size: var(--font-ui-smaller);
   min-height: 28px;
   padding: 3px 4px;
-  transition-property: color;
-  transition-duration: 100ms;
-  transition-timing-function: ease-out;
 }
 
 .agents-account-banner-details-toggle:hover {
@@ -5353,9 +5204,6 @@ body.is-resizing-panes .pane-cell {
   font-size: var(--font-ui-smaller);
   min-height: 28px;
   padding: 4px 6px;
-  transition-property: color;
-  transition-duration: 100ms;
-  transition-timing-function: ease-out;
 }
 
 .agent-actions .agent-log-toggle,
@@ -5383,9 +5231,6 @@ body.is-resizing-panes .pane-cell {
   font-family: var(--font-monospace);
   font-weight: var(--font-monospace-weight);
   font-size: var(--font-ui-smaller);
-  transition-property: color;
-  transition-duration: 100ms;
-  transition-timing-function: ease-out;
 }
 
 .agent-replace-button:hover {
@@ -5413,9 +5258,6 @@ body.is-resizing-panes .pane-cell {
   font-family: var(--font-monospace);
   font-weight: var(--fw-semibold);
   font-size: var(--font-ui-smaller);
-  transition-property: background-color, border-color, color;
-  transition-duration: 100ms;
-  transition-timing-function: ease-out;
 }
 
 .agent-primary-action:hover {
@@ -5518,9 +5360,6 @@ body.is-resizing-panes .pane-cell {
   font-family: var(--font-monospace);
   font-size: var(--font-ui-smaller);
   font-weight: var(--fw-semibold);
-  transition-property: background-color, border-color, color, scale;
-  transition-duration: 100ms;
-  transition-timing-function: ease-out;
 }
 
 .agent-archive-button:hover {
@@ -6253,9 +6092,6 @@ body.is-resizing-panes .pane-cell {
   font: inherit;
   text-align: left;
   cursor: pointer;
-  transition-property: background-color;
-  transition-duration: 120ms;
-  transition-timing-function: cubic-bezier(0.2, 0, 0, 1);
 }
 
 .codex-stream-diagnostic-head:hover {
@@ -6446,8 +6282,6 @@ body.is-resizing-panes .pane-cell {
   font-size: var(--fs-xs);
   text-transform: lowercase;
   cursor: pointer;
-  transition-property: color, border-color;
-  transition-duration: 120ms;
 }
 
 .codex-stream-diff-copy:hover {
@@ -6766,9 +6600,6 @@ body.is-resizing-panes .pane-cell {
   font-family: var(--font-monospace);
   font-weight: var(--font-monospace-weight);
   font-size: var(--font-ui-smaller);
-  transition-property: background-color, color;
-  transition-duration: 100ms;
-  transition-timing-function: ease-out;
 }
 
 .agent-surface-action:hover {
@@ -7510,17 +7341,12 @@ body.is-resizing-panes .pane-cell {
   grid-template-rows: 0fr;
   opacity: 0;
   visibility: hidden;
-  transition-property: grid-template-rows, opacity, margin-top, visibility;
-  transition-duration: 160ms;
-  transition-timing-function: ease-out;
-  transition-delay: 0ms, 0ms, 0ms, 160ms;
 }
 
 .session-collapsible.is-open {
   grid-template-rows: 1fr;
   opacity: 1;
   visibility: visible;
-  transition-delay: 0ms;
 }
 
 .session-collapsible-inner {
@@ -7799,7 +7625,6 @@ body.is-resizing-panes .pane-cell {
 
 .session-question-option.is-clickable {
   cursor: pointer;
-  transition: border-color 120ms ease, background-color 120ms ease, color 120ms ease;
 }
 
 .session-question-option.is-clickable:hover {
@@ -8058,9 +7883,6 @@ body.is-resizing-panes .pane-cell {
   border-radius: var(--radius-s);
   font-size: var(--font-ui-small);
   text-align: left;
-  transition-property: background-color;
-  transition-duration: 100ms;
-  transition-timing-function: ease-out;
 }
 
 .backlink:hover {
@@ -8478,7 +8300,6 @@ body.is-resizing-panes .pane-cell {
   font-family: var(--font-chrome);
   font-size: var(--font-ui-small);
   font-weight: var(--fw-semibold);
-  transition: opacity 120ms ease-out, transform 120ms ease-out;
 }
 
 .nav-empty-primary:hover {
@@ -8497,7 +8318,6 @@ body.is-resizing-panes .pane-cell {
   text-decoration: underline;
   text-decoration-color: var(--background-modifier-border);
   text-underline-offset: 3px;
-  transition: color 120ms ease-out, text-decoration-color 120ms ease-out;
 }
 
 .nav-empty-secondary:hover {
@@ -8715,7 +8535,6 @@ body.is-resizing-panes .pane-cell {
   box-shadow: 0 4px 14px rgb(0 0 0 / 18%);
   opacity: 0;
   pointer-events: none;
-  transition: opacity 100ms ease-out;
   white-space: normal;
 }
 
@@ -9028,7 +8847,6 @@ body.is-resizing-panes .pane-cell {
   padding: 6px 10px;
   border-radius: var(--radius-sm);
   text-align: left;
-  transition: background-color 90ms ease;
 }
 
 .composer-slash-item.is-active,
@@ -9143,7 +8961,6 @@ body.is-resizing-panes .pane-cell {
   color: var(--text-normal);
   font-family: inherit;
   font-size: var(--font-ui-small);
-  transition: border-color 90ms ease, box-shadow 90ms ease;
 }
 
 .composer-command-input:focus,
@@ -9229,7 +9046,6 @@ textarea.composer-command-input {
   font-family: var(--font-monospace);
   font-size: var(--font-ui-smaller);
   font-weight: var(--fw-semibold);
-  transition: opacity 90ms ease, background-color 90ms ease;
 }
 
 .composer-command-submit:hover:not(:disabled) {
@@ -9452,7 +9268,6 @@ textarea.composer-command-input {
   font-size: var(--fs-sm);
   cursor: pointer;
   font-family: inherit;
-  transition: color 120ms ease;
 }
 
 .tokens-chip:hover {
@@ -9729,7 +9544,6 @@ textarea.composer-command-input {
   flex: 0 0 auto;
   gap: 2px;
   opacity: 0;
-  transition: opacity 120ms ease;
 }
 
 .artifact-block-shell:hover .artifact-actions,
@@ -9883,7 +9697,6 @@ textarea.composer-command-input {
   border: 1px solid var(--background-modifier-border);
   background: var(--background-primary);
   cursor: zoom-in;
-  transition: border-color 120ms ease, box-shadow 120ms ease;
 }
 
 .artifact-compact-diagram:hover {
@@ -10414,7 +10227,6 @@ textarea.composer-command-input {
   min-width: 0;
   max-width: 220px;
   color: var(--text-faint);
-  transition: color 120ms ease;
 }
 
 .artifact-panel-tab:hover {
@@ -10458,7 +10270,6 @@ textarea.composer-command-input {
   place-items: center;
   color: var(--text-faint);
   opacity: 0;
-  transition: opacity 120ms ease;
 }
 
 .artifact-panel-tab:hover .artifact-panel-tab-action,
@@ -10494,7 +10305,6 @@ textarea.composer-command-input {
   position: static;
   height: 26px;
   opacity: 0;
-  transition: opacity 120ms ease;
 }
 
 .artifact-panel:hover .artifact-panel-overflow-toggle,
@@ -10876,11 +10686,6 @@ textarea.composer-command-input {
   border: 0;
 }
 
-@keyframes artifact-slideover-in {
-  from { transform: translateX(24px); opacity: 0; }
-  to { transform: translateX(0); opacity: 1; }
-}
-
 @media (max-width: 899px) {
   .artifact-panel.session-side-panel,
   .agent-pane .artifact-panel.session-side-panel {
@@ -10892,7 +10697,6 @@ textarea.composer-command-input {
     min-width: 0;
     height: 100vh;
     border: 0;
-    animation: artifact-slideover-in 150ms ease-out;
   }
 
   .artifact-panel > .session-resize {
@@ -11332,10 +11136,6 @@ textarea.composer-command-input {
   font-variant-numeric: tabular-nums;
   white-space: nowrap;
   vertical-align: baseline;
-  transition:
-    background-color 120ms ease,
-    border-color 120ms ease,
-    color 120ms ease;
 }
 
 .status-badge.is-compact {
@@ -11468,9 +11268,6 @@ textarea.composer-command-input {
 
 .branch-pill.is-clickable {
   cursor: pointer;
-  transition:
-    background-color 120ms ease,
-    border-color 120ms ease;
 }
 
 .branch-pill.is-clickable:hover {
@@ -11659,7 +11456,6 @@ textarea.composer-command-input {
 
 .artifact-file-list-button {
   cursor: pointer;
-  transition: background-color 120ms ease;
 }
 
 .artifact-file-list-button:hover,
@@ -11726,7 +11522,6 @@ textarea.composer-command-input {
   letter-spacing: 0.02em;
   cursor: pointer;
   backdrop-filter: blur(4px);
-  transition: color 120ms ease, background-color 120ms ease, border-color 120ms ease;
 }
 
 .copy-pill:hover {
@@ -11752,7 +11547,6 @@ textarea.composer-command-input {
   right: 6px;
   opacity: 0;
   transform: translateY(-1px);
-  transition: opacity 120ms ease, transform 120ms ease;
   pointer-events: none;
 }
 
@@ -12027,8 +11821,6 @@ textarea.composer-command-input {
   letter-spacing: inherit;
   text-transform: lowercase;
   cursor: pointer;
-  transition-property: color, border-color, background-color;
-  transition-duration: 120ms;
 }
 
 /* WIKI-241: widen the tap target without inflating the visible chip. */
@@ -12163,8 +11955,6 @@ textarea.composer-command-input {
   letter-spacing: 0.02em;
   text-transform: lowercase;
   cursor: pointer;
-  transition-property: color, border-color, background-color, transform;
-  transition-duration: 120ms;
 }
 
 .stream-clamp-toggle:active {
@@ -12796,9 +12586,6 @@ textarea.composer-command-input {
   background-color: transparent;
   color: var(--text-normal);
   overflow: hidden;
-  transition-property: border-color, background-color;
-  transition-duration: 120ms;
-  transition-timing-function: ease-out;
   min-height: 32px;
 }
 
@@ -12870,9 +12657,6 @@ textarea.composer-command-input {
   align-self: center;
   padding: 0 6px;
   color: var(--text-faint);
-  transition-property: transform, color;
-  transition-duration: 120ms;
-  transition-timing-function: ease-out;
 }
 
 .loop-chrome-caret.is-open {
@@ -12964,9 +12748,6 @@ textarea.composer-command-input {
   padding: 6px 8px;
   border-radius: var(--radius-xs);
   background-color: transparent;
-  transition-property: background-color;
-  transition-duration: 100ms;
-  transition-timing-function: ease-out;
 }
 
 .loop-history-row:hover {
@@ -13341,7 +13122,7 @@ textarea.composer-command-input {
   overflow-wrap: anywhere;
 }
 
-/* PDF artifact — solid framing, dense chrome, silky page transitions. */
+/* PDF artifact — solid framing, dense chrome, clear page rendering. */
 
 .artifact-pdf-compact {
   display: flex;
@@ -13357,7 +13138,6 @@ textarea.composer-command-input {
   border-radius: var(--radius-xs);
   background: var(--background-secondary);
   box-shadow: 0 1px 0 color-mix(in srgb, var(--background-primary) 60%, transparent) inset;
-  transition: border-color 150ms cubic-bezier(0.2, 0, 0, 1);
 }
 
 .artifact-pdf-compact-frame:hover {
@@ -13368,7 +13148,6 @@ textarea.composer-command-input {
   display: block;
   width: 100%;
   height: 100%;
-  transition: opacity 150ms cubic-bezier(0.2, 0, 0, 1);
 }
 
 .artifact-pdf-compact-meta {
@@ -13479,8 +13258,6 @@ textarea.composer-command-input {
   background: transparent;
   color: var(--text-muted);
   cursor: pointer;
-  transition: border-color 150ms cubic-bezier(0.2, 0, 0, 1),
-    background 150ms cubic-bezier(0.2, 0, 0, 1);
   /* Fixed slot geometry: the sidebar's DOM windowing math (see
      THUMB_SLOT_HEIGHT in pdf.tsx) picks the visible range from
      scrollTop / height, so every button MUST occupy exactly the
@@ -13551,8 +13328,6 @@ textarea.composer-command-input {
   background: white;
   box-shadow: 0 10px 30px color-mix(in srgb, var(--background-primary) 30%, transparent),
     0 2px 6px color-mix(in srgb, var(--background-primary) 50%, transparent);
-  transition: width 150ms cubic-bezier(0.2, 0, 0, 1),
-    height 150ms cubic-bezier(0.2, 0, 0, 1);
 }
 
 .artifact-pdf-page-canvas {
@@ -13593,7 +13368,6 @@ textarea.composer-command-input {
 
 .artifact-image {
   display: block;
-  transition: filter 320ms cubic-bezier(0.2, 0, 0, 1);
 }
 
 .artifact-image:not(.is-loaded) {
@@ -13643,7 +13417,6 @@ textarea.composer-command-input {
   filter: blur(20px) saturate(1.05);
   transform: scale(1.08);
   opacity: 1;
-  transition: opacity 360ms cubic-bezier(0.2, 0, 0, 1);
   pointer-events: none;
 }
 
@@ -13669,10 +13442,9 @@ textarea.composer-command-input {
   filter: blur(16px) saturate(1.05);
   transform: scale(1.08);
   opacity: 1;
-  transition: opacity 360ms cubic-bezier(0.2, 0, 0, 1);
   pointer-events: none;
   /* Above the sharp image so the fade actually reveals the load; the tile's
-     retention timer then unmounts the preview once the transition finishes. */
+     retention timer then unmounts the preview once the fade ends. */
   z-index: 2;
 }
 
@@ -13698,9 +13470,6 @@ textarea.composer-command-input {
   border: 0;
   background: transparent;
   cursor: zoom-in;
-  transition-property: transform, box-shadow;
-  transition-duration: 160ms;
-  transition-timing-function: cubic-bezier(0.2, 0, 0, 1);
   will-change: transform;
 }
 
@@ -13734,9 +13503,6 @@ textarea.composer-command-input {
   color: var(--text-normal);
   opacity: 0;
   transform: translate(-2px, 6px);
-  transition:
-    opacity 160ms cubic-bezier(0.2, 0, 0, 1),
-    transform 160ms cubic-bezier(0.2, 0, 0, 1);
   pointer-events: none;
   backdrop-filter: blur(6px);
 }
@@ -13782,9 +13548,6 @@ textarea.composer-command-input {
   background: var(--background-secondary);
   cursor: zoom-in;
   overflow: hidden;
-  transition:
-    transform 180ms cubic-bezier(0.2, 0, 0, 1),
-    box-shadow 180ms cubic-bezier(0.2, 0, 0, 1);
 }
 
 .artifact-gallery-tile::after {
@@ -13793,7 +13556,6 @@ textarea.composer-command-input {
   inset: 0;
   background: linear-gradient(180deg, transparent 60%, rgba(0, 0, 0, 0.28) 100%);
   opacity: 0;
-  transition: opacity 160ms cubic-bezier(0.2, 0, 0, 1);
   pointer-events: none;
 }
 
@@ -13863,7 +13625,7 @@ textarea.composer-command-input {
 }
 
 /* Scope the fade-in to the REAL image so it doesn't fight the preview's
-   own opacity transitions. The previous `.markdown-image-frame img`
+   own opacity changes. The previous `.markdown-image-frame img`
    selector matched the preview img too and beat the preview's own
    `.is-fading` rule on specificity. */
 .markdown-image-frame img:not(.markdown-image-preview) {
@@ -13874,7 +13636,6 @@ textarea.composer-command-input {
   border: 1px solid var(--image-outline);
   border-radius: var(--radius-xs);
   opacity: 0;
-  transition: opacity 260ms cubic-bezier(0.2, 0, 0, 1);
 }
 
 .markdown-image-frame.is-loaded img:not(.markdown-image-preview) {
@@ -13893,7 +13654,6 @@ textarea.composer-command-input {
   filter: blur(18px) saturate(1.05);
   transform: scale(1.08);
   opacity: 1;
-  transition: opacity 360ms cubic-bezier(0.2, 0, 0, 1);
 }
 
 .markdown-image-frame .markdown-image-preview.is-fading {
@@ -13955,7 +13715,6 @@ textarea.composer-command-input {
   grid-template-rows: auto 1fr;
   background: color-mix(in srgb, #05070c 92%, transparent);
   backdrop-filter: blur(12px);
-  animation: artifact-lightbox-enter 180ms cubic-bezier(0.2, 0, 0, 1);
   outline: 0;
 }
 
@@ -14027,11 +13786,6 @@ textarea.composer-command-input {
   font-family: inherit;
   font-size: 12px;
   cursor: pointer;
-  transition:
-    background-color 140ms cubic-bezier(0.2, 0, 0, 1),
-    border-color 140ms cubic-bezier(0.2, 0, 0, 1),
-    color 140ms cubic-bezier(0.2, 0, 0, 1),
-    transform 120ms cubic-bezier(0.2, 0, 0, 1);
 }
 
 .artifact-lightbox-action:hover {
@@ -14104,7 +13858,6 @@ textarea.composer-command-input {
   border-radius: 4px;
   opacity: 0;
   transform-origin: center;
-  transition: opacity 200ms cubic-bezier(0.2, 0, 0, 1);
   will-change: transform;
   -webkit-user-drag: element;
   user-select: none;
@@ -14129,10 +13882,6 @@ textarea.composer-command-input {
   color: rgba(255, 255, 255, 0.9);
   cursor: pointer;
   transform: translateY(-50%);
-  transition:
-    background-color 140ms cubic-bezier(0.2, 0, 0, 1),
-    border-color 140ms cubic-bezier(0.2, 0, 0, 1),
-    transform 140ms cubic-bezier(0.2, 0, 0, 1);
 }
 
 .artifact-lightbox-nav:hover {
@@ -14170,17 +13919,6 @@ textarea.composer-command-input {
   pointer-events: none;
 }
 
-@keyframes artifact-lightbox-enter {
-  from {
-    opacity: 0;
-    backdrop-filter: blur(0);
-  }
-  to {
-    opacity: 1;
-    backdrop-filter: blur(12px);
-  }
-}
-
 /* WIKI-195: universal fullscreen artifact inspector. A solid, anchored
    sheet (not a translucent lightbox) so themed detail renderers — code,
    tables, diffs — sit on their designed surfaces. */
@@ -14199,7 +13937,6 @@ textarea.composer-command-input {
   grid-template-rows: auto 1fr;
   background: var(--background-primary);
   outline: 0;
-  animation: artifact-inspector-enter 160ms cubic-bezier(0.2, 0, 0, 1);
 }
 
 .artifact-inspector-topbar {
@@ -14287,11 +14024,6 @@ textarea.composer-command-input {
   font-family: inherit;
   font-size: 12px;
   cursor: pointer;
-  transition:
-    background-color 140ms cubic-bezier(0.2, 0, 0, 1),
-    border-color 140ms cubic-bezier(0.2, 0, 0, 1),
-    color 140ms cubic-bezier(0.2, 0, 0, 1),
-    transform 120ms cubic-bezier(0.2, 0, 0, 1);
 }
 
 .artifact-inspector-action:hover {
@@ -14348,11 +14080,6 @@ textarea.composer-command-input {
   font-size: 11px;
   transform: translateX(-50%);
   pointer-events: none;
-}
-
-@keyframes artifact-inspector-enter {
-  from { opacity: 0; }
-  to { opacity: 1; }
 }
 
 @media (prefers-reduced-motion: reduce) {
@@ -14834,7 +14561,6 @@ textarea.composer-command-input {
   justify-content: center;
   cursor: pointer;
   z-index: 1;
-  transition: transform 120ms ease, background-color 120ms ease;
 }
 
 .artifact-gif-play:hover,
@@ -15060,10 +14786,6 @@ textarea.composer-command-input {
   font-size: var(--fs-2xs);
   font-weight: 500;
   cursor: pointer;
-  transition:
-    border-color 120ms cubic-bezier(0.2, 0, 0, 1),
-    color 120ms cubic-bezier(0.2, 0, 0, 1),
-    background 120ms cubic-bezier(0.2, 0, 0, 1);
 }
 
 .visual-diff-toggle:hover:not(:disabled) {
@@ -15260,7 +14982,6 @@ textarea.composer-command-input {
 .kanban-card:hover,
 .quick-switcher-result:hover:not(.is-selected):not(.is-disabled) {
   background-color: var(--background-element);
-  color: var(--text);
 }
 
 /* Current items are marked by text and a gutter dot. Cursor selection uses
@@ -15437,7 +15158,6 @@ textarea.composer-command-input {
   border-radius: 0;
   background-color: var(--background-panel);
   box-shadow: none;
-  animation: chrome-fade-in var(--chrome-motion-duration) ease-out both;
 }
 
 .dialog {
@@ -15483,7 +15203,6 @@ textarea.composer-command-input {
   cursor: pointer;
 }
 
-.dialog-title-esc:hover,
 .dialog-title-esc:focus-visible {
   color: var(--text);
 }
@@ -15521,7 +15240,6 @@ textarea.composer-command-input {
 .dialog-button:hover {
   border: 0;
   background-color: var(--background-element);
-  color: var(--text);
 }
 
 .dialog-confirm,
@@ -15583,7 +15301,10 @@ textarea.composer-command-input {
   border-radius: 0;
 }
 
-.tmux-status-item:hover,
+.tmux-status-item:hover {
+  background-color: transparent;
+}
+
 .tmux-status-item.is-active {
   background-color: transparent;
   color: var(--text);
@@ -15636,9 +15357,32 @@ textarea.composer-command-input {
   font-weight: var(--fw-medium);
 }
 
-@keyframes chrome-fade-in {
-  from { opacity: 0; }
-  to { opacity: 1; }
+.quick-switcher > .dialog-title {
+  padding: 4px 16px 0;
+}
+
+.quick-switcher-footer {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+  padding: 4px 16px 8px;
+  color: var(--text-muted);
+  font-size: var(--font-ui-smaller);
+}
+
+.quick-switcher-hint {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+}
+
+.quick-switcher-hint-key {
+  color: var(--text);
+  font-family: var(--font-monospace);
+}
+
+.quick-switcher-hint-label {
+  color: var(--text-muted);
 }
 
 @media (prefers-reduced-motion: reduce) {
