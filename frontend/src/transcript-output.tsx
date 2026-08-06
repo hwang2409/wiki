@@ -320,31 +320,38 @@ export function hasHarnessError(raw: string): boolean {
   return parseHarnessOutput(raw).some((segment) => segment.kind === "error");
 }
 
-// Inline rows clip per segment with whitespace compression applied first,
-// so length budgeting matches what actually renders; ellipsis marks overflow.
+// Inline rows clip per compressed segment against a budget that always
+// reserves room for the trailing ellipsis, so rendered length never exceeds
+// the budget — including exact-fill and tiny-budget boundaries.
 export function clipSegmentsInline(
   segments: HarnessOutputSegment[],
   budget = 120,
 ): HarnessOutputSegment[] {
+  const compressed = segments
+    .map((segment) => ({ ...segment, text: segment.text.replace(/\s+/g, " ").trim() }))
+    .filter((segment) => segment.text);
+  const total = compressed.reduce(
+    (length, segment, index) => length + segment.text.length + (index > 0 ? 1 : 0),
+    0,
+  );
+  if (total <= budget) return compressed;
+  const body = Math.max(0, budget - 3);
   const out: HarnessOutputSegment[] = [];
   let used = 0;
-  for (const segment of segments) {
-    const text = segment.text.replace(/\s+/g, " ").trim();
-    if (!text) continue;
+  for (const segment of compressed) {
     const separator = out.length > 0 ? 1 : 0;
-    if (used + separator + text.length <= budget) {
-      out.push({ ...segment, text });
-      used += separator + text.length;
-      continue;
-    }
-    const room = budget - used - separator - 3;
-    if (room > 0) out.push({ ...segment, text: `${text.slice(0, room)}...` });
-    else if (out.length > 0) {
-      const last = out[out.length - 1];
-      out[out.length - 1] = { ...last, text: `${last.text.slice(0, Math.max(0, last.text.length - 3))}...` };
-    }
-    break;
+    if (used + separator >= body) break;
+    const room = body - used - separator;
+    const text = segment.text.slice(0, room);
+    out.push({ ...segment, text });
+    used += separator + text.length;
+    if (text.length < segment.text.length) break;
   }
+  if (out.length === 0) {
+    return [{ kind: compressed[0]?.kind ?? "text", text: "...".slice(0, Math.max(1, budget)) }];
+  }
+  const last = out[out.length - 1];
+  out[out.length - 1] = { ...last, text: `${last.text}...` };
   return out;
 }
 

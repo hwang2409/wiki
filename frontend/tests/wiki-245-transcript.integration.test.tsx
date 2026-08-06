@@ -14,7 +14,7 @@ import {
   toolSummaryParts,
 } from "../src/transcript-event-utils";
 import { BoundedPreview } from "../src/transcript-preview";
-import {
+import { clipSegmentsInline,
   cleanHarnessOutput,
   editDiffFromInput,
   HarnessOutput,
@@ -402,6 +402,33 @@ test("apply_patch with a garbage preamble falls back instead of diffing", () => 
     output: "Done",
   });
   expect(container.querySelector(".diff-view, .diff-line")).toBeNull();
+});
+
+test("clipSegmentsInline holds the budget at exact-fill and tiny boundaries", () => {
+  const seg = (text: string) => ({ kind: "text" as const, text });
+  const rendered = (out: Array<{ text: string }>) =>
+    out.reduce((n, s, i) => n + s.text.length + (i > 0 ? 1 : 0), 0);
+
+  // 118 + 1 + 1 with separators exceeds 120 -> clipped output stays <= 120.
+  const exactFill = clipSegmentsInline([seg("x".repeat(118)), seg("y"), seg("z")], 120);
+  expect(rendered(exactFill)).toBeLessThanOrEqual(120);
+  expect(exactFill[exactFill.length - 1].text).toMatch(/\.\.\.$/);
+
+  // totals equal to the budget pass through unchanged, no ellipsis.
+  const fits = clipSegmentsInline([seg("a".repeat(59)), seg("b".repeat(60))], 120);
+  expect(rendered(fits)).toBe(120);
+  expect(fits[fits.length - 1].text).not.toMatch(/\.\.\.$/);
+
+  // a first segment that cannot fit a tiny budget still yields an ellipsis.
+  const tiny = clipSegmentsInline([seg("overflowing")], 3);
+  expect(tiny).toHaveLength(1);
+  expect(tiny[0].text).toBe("...");
+  expect(rendered(tiny)).toBeLessThanOrEqual(3);
+
+  // clipped segments keep their kind.
+  const kinds = clipSegmentsInline([{ kind: "error" as const, text: "e".repeat(200) }], 120);
+  expect(kinds[0].kind).toBe("error");
+  expect(rendered(kinds)).toBeLessThanOrEqual(120);
 });
 
 test("small transcript controls keep the 24px target baseline", () => {
