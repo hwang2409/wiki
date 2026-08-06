@@ -4811,14 +4811,19 @@ export function InspectableSessionTab(props: ComponentProps<typeof SessionTab>) 
 const WIDTH_KEY = "wiki-session-sidebar-width";
 const WIDTH_CUSTOM_KEY = "wiki-session-sidebar-width-custom";
 const MIN_WIDTH = 320;
-// WIKI-251 HIGH#4: while the reader hasn't customized the width, the pane
-// tracks the viewport at ~47% (clamped to a floor so it stays usable on small
-// windows, and to 70% so it never crowds the primary pane) so a window resize
-// keeps the ratio. Once the user drags the handle we persist a px value and
-// stop re-flowing on resize — the drag intent locks the pixel width.
+// WIKI-251 HIGH#4: while the reader hasn't customized the width the pane
+// width is a pure CSS expression — max(47vw, 560px floor), capped at 70vw,
+// never below 320px. The browser recomputes on resize with no JS listener,
+// so the default tracks the viewport at every screen size (not just at
+// mount). Once the user drags we persist a px value and lock to it.
 const DEFAULT_WIDTH_RATIO = 0.47;
 const DEFAULT_WIDTH_FLOOR = 560;
 const MAX_WIDTH_RATIO = 0.7;
+
+// The CSS-side default. Keep the numerics in sync with the constants above.
+// Used by the JSX below and asserted by the wiki-251 playwright fixture at
+// 1280/1440/1920/2560 without a JS resize listener.
+export const DEFAULT_WIDTH_CSS = `max(${MIN_WIDTH}px, min(${MAX_WIDTH_RATIO * 100}vw, max(${DEFAULT_WIDTH_RATIO * 100}vw, ${DEFAULT_WIDTH_FLOOR}px)))`;
 
 export function computeDefaultWidth(viewport: number): number {
   const preferred = Math.round(viewport * DEFAULT_WIDTH_RATIO);
@@ -4872,19 +4877,23 @@ export function SessionSidebar({
     const stored = Number(localStorage.getItem(WIDTH_KEY));
     return stored > 0 ? stored : 0;
   });
+  // Resize listener only re-clamps the CUSTOM px width against the current
+  // viewport (so the persisted px stays within the 70vw cap when the window
+  // shrinks). The default path is pure CSS — no state, no listener.
   const [viewportWidth, setViewportWidth] = useState<number>(
     () => (typeof window !== "undefined" ? window.innerWidth : 1440),
   );
   useEffect(() => {
     if (typeof window === "undefined") return;
+    if (!isCustom) return;
     const onResize = () => setViewportWidth(window.innerWidth);
     window.addEventListener("resize", onResize);
     return () => window.removeEventListener("resize", onResize);
-  }, []);
+  }, [isCustom]);
 
-  const width = isCustom
+  const width: string | number = isCustom
     ? clampWidth(customWidth || computeDefaultWidth(viewportWidth), viewportWidth)
-    : computeDefaultWidth(viewportWidth);
+    : DEFAULT_WIDTH_CSS;
 
   const startResize = (event: React.PointerEvent<HTMLDivElement>) => {
     event.preventDefault();

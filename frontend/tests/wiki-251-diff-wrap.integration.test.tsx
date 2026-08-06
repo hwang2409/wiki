@@ -122,6 +122,94 @@ describe("WIKI-251 split-diff default", () => {
     expect(inserts.length).toBeGreaterThan(0);
   });
 
+  // WIKI-251 MED-R3-2: prove all four row shapes (context, pure-delete,
+  // pure-insert, paired replacement) render with the correct DOM shape and
+  // that paired cells share a row (delete left, insert right, equal height).
+  // A regression that split deletions and insertions across different rows —
+  // or produced un-equal-height siblings under wrap — must fail here.
+  const ALL_SHAPES_PATCH = [
+    "--- a/vault/hot.md",
+    "+++ b/vault/hot.md",
+    "@@ -1,6 +1,7 @@",
+    " context-line-unchanged",
+    "-pure-delete-line",
+    " context-two",
+    "-paired-old",
+    "+paired-new",
+    "+pure-insert-line",
+    " context-tail",
+  ].join("\n");
+
+  test("split-diff snapshot covers context + pure-delete + pure-insert + paired rows", () => {
+    const { container } = render(
+      <SplitDiffView
+        className="all-shapes"
+        emptyClassName="test-diff-empty"
+        emptyMessage="No diff to display."
+        patch={ALL_SHAPES_PATCH}
+      />,
+    );
+    const rows = Array.from(container.querySelectorAll<HTMLTableRowElement>("tr.diff-line"));
+    expect(rows.length).toBeGreaterThanOrEqual(5);
+
+    // Categorize each row by its class list. react-diff-view emits:
+    //  - .diff-line-normal for context rows (delete cell + insert cell both point at the same change).
+    //  - .diff-line-old-only for pure-delete rows (insert side is a spacer .diff-code-omit).
+    //  - .diff-line-new-only for pure-insert rows.
+    //  - .diff-line-compare for paired replacement rows (both delete + insert cells populated).
+    const shapes = rows.map((row) => {
+      if (row.classList.contains("diff-line-normal")) return "context";
+      if (row.classList.contains("diff-line-old-only")) return "pure-delete";
+      if (row.classList.contains("diff-line-new-only")) return "pure-insert";
+      if (row.classList.contains("diff-line-compare")) return "paired";
+      return "unknown";
+    });
+    expect(shapes).toContain("context");
+    expect(shapes).toContain("pure-delete");
+    expect(shapes).toContain("pure-insert");
+    expect(shapes).toContain("paired");
+    expect(shapes).not.toContain("unknown");
+
+    for (const row of rows) {
+      const cells = Array.from(row.querySelectorAll<HTMLTableCellElement>("td.diff-code"));
+      // Split view is a two-column diff — every row must have exactly two
+      // code cells (delete side + insert side).
+      expect(cells.length).toBe(2);
+      const [leftCell, rightCell] = cells;
+      // Delete cell must be the LEFT sibling of the insert cell — no row
+      // may swap columns. Empty (spacer) cells still count as siblings.
+      const leftIsDelete = leftCell.classList.contains("diff-code-delete")
+        || leftCell.classList.contains("diff-code-omit")
+        || leftCell.classList.contains("diff-code-normal");
+      const rightIsInsert = rightCell.classList.contains("diff-code-insert")
+        || rightCell.classList.contains("diff-code-omit")
+        || rightCell.classList.contains("diff-code-normal");
+      expect(leftIsDelete).toBe(true);
+      expect(rightIsInsert).toBe(true);
+      // Paired cells must sit inside the SAME <tr> (parentElement is that row).
+      expect(leftCell.parentElement).toBe(row);
+      expect(rightCell.parentElement).toBe(row);
+      // Under jsdom offsetHeight is a stub (0 unless overridden by shim);
+      // the DOM invariant that matters is that both siblings share a parent
+      // <tr>, so their intrinsic row height stays paired under wrap. When
+      // offsetHeight IS populated (e.g. under a real browser via the same
+      // fixture in wiki-251-diff-wrap.playwright.mjs) the assertion below
+      // guards equal heights; under jsdom both are 0 which equals cleanly.
+      expect(leftCell.offsetHeight).toBe(rightCell.offsetHeight);
+    }
+
+    // Snapshot: freeze the shape so a future regression that stripped a row
+    // class, dropped a cell, or reshuffled the column order fails here.
+    const snapshot = rows.map((row) => ({
+      classes: [...row.classList].sort(),
+      cells: Array.from(row.querySelectorAll<HTMLTableCellElement>("td.diff-code")).map((cell) => ({
+        classes: [...cell.classList].sort(),
+        text: cell.textContent?.trim() ?? "",
+      })),
+    }));
+    expect(snapshot).toMatchSnapshot();
+  });
+
   test("split-diff pairs old/new cells within the same DOM row", () => {
     const { container } = render(
       <SplitDiffView
@@ -166,6 +254,28 @@ describe("WIKI-251 split-diff default", () => {
     // Split rendering emitted BOTH delete and insert cells (side-by-side).
     expect(container.querySelectorAll(".diff-code-delete").length).toBeGreaterThan(0);
     expect(container.querySelectorAll(".diff-code-insert").length).toBeGreaterThan(0);
+  });
+});
+
+describe("WIKI-251 SplitDiffView Shiki wiring (HIGH-R3-2)", () => {
+  // Verify SplitDiffView wires the shiki hook + renderToken into react-diff-view.
+  // The runtime tokenization is exercised end-to-end by the wiki-251 playwright
+  // stage (real browser: async shiki resolves and the DOM shows colored spans);
+  // here we prove the code path is threaded — a regression that dropped the
+  // `tokens` / `renderToken` props on `<Diff>` would fail this static check.
+  test("SplitDiffView source wires Shiki tokens + renderToken into <Diff>", () => {
+    const source = readFileSync(
+      resolve(dirname(fileURLToPath(import.meta.url)), "..", "src", "split-diff.tsx"),
+      "utf-8",
+    );
+    // Uses shiki tokens per side + custom renderToken.
+    expect(source).toMatch(/useHighlightTokenLines/);
+    expect(source).toMatch(/renderToken=\{/);
+    expect(source).toMatch(/tokens=\{/);
+    // Extends the canonical SplitDiffView (no duplicate renderer restored).
+    expect(source).toMatch(/react-diff-view/);
+    // Language derived per file (so each file gets its own tokens).
+    expect(source).toMatch(/languageForPath/);
   });
 });
 

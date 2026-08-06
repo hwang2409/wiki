@@ -1,19 +1,21 @@
-// WIKI-251 field verification (round 2):
+// WIKI-251 field verification (round 3):
 //  1) A file-edit tool renders as a side-by-side split diff (deletions LEFT,
 //     insertions RIGHT), matching Henry's screenshot.
 //  2) No descendant of the transcript, its markdown surfaces, or its artifact
 //     archetypes (table, code, diff, JSON) horizontally overflows the
 //     container at 1280 / 1440 / 1920 viewport widths. Tolerance: 1px for
 //     sub-pixel rendering noise — anything above is a real overflow.
-//  3) The `.is-nowrap` escape hatch is dead: no DOM node exposes it as a
+//  3) All four artifact archetypes (table, code, diff, JSON) render; a
+//     missing kind fails LOUDLY (no silent skips).
+//  4) The `.is-nowrap` escape hatch is dead: no DOM node exposes it as a
 //     surviving tool-output consumer. If a future change wires the class
 //     back in, this stage fails.
-//  4) Chat pane default width tracks the viewport (~47%) and re-flows on
-//     window resize until the user drags the handle — covered by the vitest
-//     unit in wiki-251-sidebar-width.unit.test.ts (SessionSidebar directly
-//     rendering it in playwright requires a live worker registry, which is
-//     out of scope for this stage; the unit test verifies the same contract
-//     on the exact code path).
+//  5) Chat pane default width tracks the viewport (~45-50%) at
+//     1280/1440/1920/2560 via pure CSS (no JS resize listener needed for
+//     the default path); persists user drag; re-hydrates the persisted px
+//     on reload. Sidebar mounts via `#/agents/<TICKET>` — a live orchestrator
+//     entry in the fixture registry pops it open, and the sidebar-visible
+//     guard asserts the pane is on-screen before we measure.
 import fs from "node:fs/promises";
 import path from "node:path";
 import { chromium } from "playwright";
@@ -86,15 +88,16 @@ const LONG_OLD =
 const LONG_NEW =
   "PR #186 landed the 1:1 fidelity + polish wave (fable-5, 10-item gap table), superseding the #185 regressions Henry flagged; transcript now honors fence tags, structures embedded heredocs, and infers file-slice output — see vault/hot.md for the eight-merge close-out.";
 
-// Artifact archetypes shipped inline in an assistant message via the
-// wiki:artifact code-fence protocol (renderer parses them into artifact
-// blocks). Each one exercises a specific wrap surface.
-const ARTIFACT_LONG_JSON = JSON.stringify({
+// Artifact archetypes emitted through the render_artifact MCP tool. Each
+// tool_use registers a pending artifact; the matching tool_result closes it
+// with `{"ok": true, "artifact_id": "..."}` — the transcript parser rebuilds
+// the artifact from the tool input and emits a `kind: "artifact"` event.
+const LONG_JSON_DATA = {
   url: LONG_URL,
   description:
     "Long JSON value with a very-very-long-token-that-would-otherwise-push-the-container-off-screen-until-the-wrap-sweep-lands ".repeat(2),
   ids: Array.from({ length: 6 }, (_, i) => `token-${i}-` + "x".repeat(80)),
-});
+};
 
 const ARTIFACT_DIFF = [
   "diff --git a/vault/hot.md b/vault/hot.md",
@@ -116,40 +119,82 @@ const ARTIFACT_TABLE_ROWS = [
 
 const ARTIFACT_CODE_LINE = `curl -sSL "${LONG_URL}" | jq -r '.items[] | select(.state == "open")'`;
 
-function artifactFenceBlock(payload) {
-  const source = JSON.stringify(payload);
-  return ["```wiki:artifact", source, "```"].join("\n");
+// artifact_from_text validates the `id` as a canonical UUID; supply
+// deterministic UUIDs so the fixture is reproducible.
+const ARTIFACT_IDS = {
+  table: "11111111-1111-4111-8111-111111111111",
+  json: "22222222-2222-4222-8222-222222222222",
+  diff: "33333333-3333-4333-8333-333333333333",
+  code: "44444444-4444-4444-8444-444444444444",
+};
+
+function renderArtifactPair(callId, artifactId, second, kind, title, payload) {
+  return [
+    {
+      type: "assistant",
+      timestamp: ts(second),
+      message: {
+        role: "assistant",
+        content: [
+          {
+            type: "tool_use",
+            id: callId,
+            name: "mcp__wiki-artifacts__render_artifact",
+            input: { kind, payload, title },
+          },
+        ],
+      },
+    },
+    toolResult(
+      second + 1,
+      callId,
+      JSON.stringify({ ok: true, artifact_id: artifactId }),
+    ),
+  ];
 }
 
-const ARTIFACT_TABLE_ARTIFACT = artifactFenceBlock({
-  kind: "table",
-  title: "packages",
-  columns: [
-    { key: "pkg", label: "Package" },
-    { key: "version", label: "Version" },
-    { key: "note", label: "Notes" },
-  ],
-  rows: ARTIFACT_TABLE_ROWS,
-});
+const ARTIFACT_TABLE_CALLS = renderArtifactPair(
+  "art_table",
+  ARTIFACT_IDS.table,
+  5,
+  "table",
+  "packages",
+  {
+    columns: [
+      { key: "pkg", label: "Package", type: "string" },
+      { key: "version", label: "Version", type: "string" },
+      { key: "note", label: "Notes", type: "string" },
+    ],
+    rows: ARTIFACT_TABLE_ROWS.map((row) => [row.pkg, row.version, row.note]),
+  },
+);
 
-const ARTIFACT_JSON_ARTIFACT = artifactFenceBlock({
-  kind: "json",
-  title: "trace",
-  source: ARTIFACT_LONG_JSON,
-});
+const ARTIFACT_JSON_CALLS = renderArtifactPair(
+  "art_json",
+  ARTIFACT_IDS.json,
+  7,
+  "json",
+  "trace",
+  { json_data: LONG_JSON_DATA },
+);
 
-const ARTIFACT_DIFF_ARTIFACT = artifactFenceBlock({
-  kind: "diff",
-  title: "hot.md.diff",
-  source: ARTIFACT_DIFF,
-});
+const ARTIFACT_DIFF_CALLS = renderArtifactPair(
+  "art_diff",
+  ARTIFACT_IDS.diff,
+  9,
+  "diff",
+  "hot.md.diff",
+  { source: ARTIFACT_DIFF },
+);
 
-const ARTIFACT_CODE_ARTIFACT = artifactFenceBlock({
-  kind: "code",
-  title: "curl-command.sh",
-  lang: "bash",
-  source: ARTIFACT_CODE_LINE,
-});
+const ARTIFACT_CODE_CALLS = renderArtifactPair(
+  "art_code",
+  ARTIFACT_IDS.code,
+  11,
+  "code",
+  "curl-command.sh",
+  { language: "bash", source: ARTIFACT_CODE_LINE, filename: "curl-command.sh" },
+);
 
 const TRANSCRIPT = [
   { type: "mode", mode: "normal", sessionId: `fixture-${TICKET}` },
@@ -179,9 +224,13 @@ const TRANSCRIPT = [
   assistant(3, [
     {
       type: "text",
-      text: `Extra surfaces to sanity-check wrap on:\n\n${CODE_FENCE}\n\n${MD_TABLE}\n\n${ARTIFACT_TABLE_ARTIFACT}\n\n${ARTIFACT_JSON_ARTIFACT}\n\n${ARTIFACT_DIFF_ARTIFACT}\n\n${ARTIFACT_CODE_ARTIFACT}`,
+      text: `Extra surfaces to sanity-check wrap on:\n\n${CODE_FENCE}\n\n${MD_TABLE}`,
     },
   ]),
+  ...ARTIFACT_TABLE_CALLS,
+  ...ARTIFACT_JSON_CALLS,
+  ...ARTIFACT_DIFF_CALLS,
+  ...ARTIFACT_CODE_CALLS,
 ];
 
 async function writeJsonl(target, rows) {
@@ -218,6 +267,18 @@ async function overflowingDescendants(page, rootSelector) {
       // that's what actually reveals reader-facing overflow.
       const tag = node.tagName;
       if (tag === "TR" || tag === "TBODY" || tag === "THEAD" || tag === "COLGROUP" || tag === "COL") continue;
+      // Elements that intentionally clip with text-overflow: ellipsis (tool
+      // titles, inline result summaries) report scrollWidth > clientWidth by
+      // design — the DOM keeps the full text for accessibility, the box shows
+      // an ellipsis. That is NOT a horizontal-scroll defect.
+      const style = getComputedStyle(node);
+      if (
+        style.textOverflow === "ellipsis"
+        || style.overflowX === "hidden"
+        || style.overflow === "hidden"
+      ) {
+        continue;
+      }
       const overflow = node.scrollWidth - node.clientWidth;
       if (overflow > tolerance) {
         offenders.push({
@@ -285,6 +346,29 @@ async function main() {
       assert(deleteCells > 0, "split view must expose delete-side cells (react-diff-view .diff-code-delete)");
       assert(insertCells > 0, "split view must expose insert-side cells (react-diff-view .diff-code-insert)");
 
+      // HIGH-R3-2 field verification: Shiki tokens must render inside BOTH
+      // delete and insert cells so the split-diff view keeps WIKI-249 syntax
+      // highlighting parity with the unified diff. A regression that dropped
+      // token wiring surfaces as zero token spans on either side.
+      // Give the async Shiki highlighter time to resolve and re-render tokens
+      // inside the split-diff cells (bundle load can take several seconds).
+      await page.waitForFunction(() => {
+        const del = document.querySelectorAll(".session-tool-split-diff .diff-code-delete span").length;
+        const ins = document.querySelectorAll(".session-tool-split-diff .diff-code-insert span").length;
+        return del > 0 && ins > 0;
+      }, null, { timeout: 20_000 });
+      const tokenCounts = await page.evaluate(() => ({
+        del: document.querySelectorAll(".session-tool-split-diff .diff-code-delete span").length,
+        ins: document.querySelectorAll(".session-tool-split-diff .diff-code-insert span").length,
+        delColored: document.querySelectorAll(".session-tool-split-diff .diff-code-delete span[style*='color']").length,
+        insColored: document.querySelectorAll(".session-tool-split-diff .diff-code-insert span[style*='color']").length,
+      }));
+      assert(
+        tokenCounts.del > 0 && tokenCounts.ins > 0,
+        `Shiki tokens must appear in both split-diff sides; saw delete=${tokenCounts.del} insert=${tokenCounts.ins}`,
+      );
+      logStep(`viewport ${viewport.width}: Shiki tokens present in split-diff (delete=${tokenCounts.del}, insert=${tokenCounts.ins}, coloredDel=${tokenCounts.delColored}, coloredIns=${tokenCounts.insColored})`);
+
       logStep(`viewport ${viewport.width}: sweep transcript for horizontal overflow (tolerance ${OVERFLOW_TOLERANCE_PX}px)`);
       const scrollCheck = await overflowingDescendants(page, ".session-scroll-inner");
       assert(!scrollCheck.rootMissing, "session-scroll-inner missing");
@@ -293,39 +377,46 @@ async function main() {
         `expected no horizontal overflow inside the transcript, saw: ${JSON.stringify(scrollCheck.offenders, null, 2)}`,
       );
 
-      // Wait for artifact archetypes to have rendered (or been surfaced as
-      // fallbacks). The renderer emits `.artifact-block` for every parsed
-      // fence — assert we have all four archetypes before checking overflow.
-      // The renderer may downgrade to a fallback under load — that's fine so
-      // long as the fallback doesn't itself overflow.
-      const artifactCount = await page.locator(".artifact-block").count();
-      logStep(`viewport ${viewport.width}: ${artifactCount} artifact blocks rendered`);
-      if (artifactCount > 0) {
-        const artifactOverflow = await page.evaluate(({ tolerance }) => {
-          const nodes = document.querySelectorAll(".artifact-block *");
-          const offenders = [];
-          for (const node of nodes) {
-            if (node.matches(".diff-marker, .diff-gutter, .diff-gutter-col")) continue;
-            if (node.matches(".artifact-panzoom-viewport, .artifact-panzoom-content")) continue;
-            const tag = node.tagName;
-            if (tag === "TR" || tag === "TBODY" || tag === "THEAD" || tag === "COLGROUP" || tag === "COL") continue;
-            const overflow = node.scrollWidth - node.clientWidth;
-            if (overflow > tolerance) {
-              offenders.push({
-                selector: [node.tagName.toLowerCase(), ...node.classList].join("."),
-                scrollWidth: node.scrollWidth,
-                clientWidth: node.clientWidth,
-                overflow,
-              });
-            }
+      // Require ALL FOUR artifact archetypes to render. A missing kind is a
+      // regression in the renderer, not something to silently skip past.
+      await page.waitForSelector(".artifact-block", { timeout: 15_000 });
+      const artifactKinds = await page.evaluate(() => {
+        const nodes = Array.from(document.querySelectorAll(".artifact-block"));
+        return nodes.map((node) => node.getAttribute("data-artifact-kind") ?? node.className ?? "");
+      });
+      const REQUIRED_KINDS = ["table", "code", "diff", "json"];
+      const missingKinds = REQUIRED_KINDS.filter(
+        (kind) => !artifactKinds.some((entry) => entry.includes(kind)),
+      );
+      assert(
+        missingKinds.length === 0,
+        `artifact kinds must all render; missing: ${missingKinds.join(", ")}, saw: ${JSON.stringify(artifactKinds)}`,
+      );
+      logStep(`viewport ${viewport.width}: ${artifactKinds.length} artifact blocks rendered (${REQUIRED_KINDS.join(", ")} all present)`);
+      const artifactOverflow = await page.evaluate(({ tolerance }) => {
+        const nodes = document.querySelectorAll(".artifact-block *");
+        const offenders = [];
+        for (const node of nodes) {
+          if (node.matches(".diff-marker, .diff-gutter, .diff-gutter-col")) continue;
+          if (node.matches(".artifact-panzoom-viewport, .artifact-panzoom-content")) continue;
+          const tag = node.tagName;
+          if (tag === "TR" || tag === "TBODY" || tag === "THEAD" || tag === "COLGROUP" || tag === "COL") continue;
+          const overflow = node.scrollWidth - node.clientWidth;
+          if (overflow > tolerance) {
+            offenders.push({
+              selector: [node.tagName.toLowerCase(), ...node.classList].join("."),
+              scrollWidth: node.scrollWidth,
+              clientWidth: node.clientWidth,
+              overflow,
+            });
           }
-          return offenders.slice(0, 16);
-        }, { tolerance: OVERFLOW_TOLERANCE_PX });
-        assert(
-          artifactOverflow.length === 0,
-          `expected no horizontal overflow inside artifact blocks, saw: ${JSON.stringify(artifactOverflow, null, 2)}`,
-        );
-      }
+        }
+        return offenders.slice(0, 16);
+      }, { tolerance: OVERFLOW_TOLERANCE_PX });
+      assert(
+        artifactOverflow.length === 0,
+        `expected no horizontal overflow inside artifact blocks, saw: ${JSON.stringify(artifactOverflow, null, 2)}`,
+      );
 
       logStep(`viewport ${viewport.width}: .is-nowrap has zero surviving consumers on tool output`);
       const nowrapCount = await page.evaluate(() => document.querySelectorAll(".is-nowrap").length);
@@ -334,6 +425,150 @@ async function main() {
         `.is-nowrap escape hatch must be gone; found ${nowrapCount} nodes still wearing it`,
       );
 
+      await context.close();
+    }
+
+    // HIGH-R3-4: chat-pane default width tracks the viewport at ~45-50% via
+    // pure CSS at 1280/1440/1920/2560, plus resize / drag / reload survival.
+    const widthChecks = [
+      { width: 1280, height: 900 },
+      { width: 1440, height: 900 },
+      { width: 1920, height: 1080 },
+      { width: 2560, height: 1440 },
+    ];
+    for (const viewport of widthChecks) {
+      logStep(`sidebar width @ ${viewport.width}x${viewport.height}: fresh session, no persisted width`);
+      const context = await browser.newContext({ viewport });
+      const page = await context.newPage();
+      await page.addInitScript(() => {
+        localStorage.setItem("wiki-sidebar-visible", "false");
+        localStorage.removeItem("wiki-session-sidebar-width");
+        localStorage.removeItem("wiki-session-sidebar-width-custom");
+      });
+      await page.goto(`${backend.baseUrl}/#/agents`, { waitUntil: "domcontentloaded" });
+      const sessionButton = page
+        .locator(".agents-orch-actions .agent-log-toggle", { hasText: "session" })
+        .first();
+      await sessionButton.waitFor({ timeout: 30_000 });
+      await sessionButton.click();
+      const sidebar = page.locator(".session-sidebar").first();
+      await sidebar.waitFor({ timeout: 15_000 });
+      // Sidebar-visible guard: fail loudly if the pane never mounted.
+      const sidebarVisible = await sidebar.isVisible();
+      assert(sidebarVisible, `.session-sidebar must be visible before we measure at ${viewport.width}`);
+      const measured = await sidebar.evaluate((node) => node.getBoundingClientRect().width);
+      const ratio = measured / viewport.width;
+      assert(
+        ratio >= 0.44 && ratio <= 0.5,
+        `default sidebar width at ${viewport.width} must sit at 45-50% of viewport; measured ${measured}px (${(ratio * 100).toFixed(1)}%)`,
+      );
+      const widthMode = await sidebar.getAttribute("data-width-mode");
+      assert(widthMode === "responsive", `expected responsive width mode; saw ${widthMode}`);
+
+      await context.close();
+    }
+
+    // Resize survival: fresh session at 1280, then resize to 1920 and confirm
+    // the pane re-flowed via CSS (no JS resize listener needed in this branch).
+    logStep(`sidebar width: resize survival (1280 -> 1920)`);
+    {
+      const context = await browser.newContext({ viewport: { width: 1280, height: 900 } });
+      const page = await context.newPage();
+      await page.addInitScript(() => {
+        localStorage.setItem("wiki-sidebar-visible", "false");
+        localStorage.removeItem("wiki-session-sidebar-width");
+        localStorage.removeItem("wiki-session-sidebar-width-custom");
+      });
+      await page.goto(`${backend.baseUrl}/#/agents`, { waitUntil: "domcontentloaded" });
+      const sessionButton = page.locator(".agents-orch-actions .agent-log-toggle", { hasText: "session" }).first();
+      await sessionButton.waitFor({ timeout: 30_000 });
+      await sessionButton.click();
+      const sidebar = page.locator(".session-sidebar").first();
+      await sidebar.waitFor({ timeout: 15_000 });
+      const before = await sidebar.evaluate((node) => node.getBoundingClientRect().width);
+      assert(before / 1280 >= 0.44 && before / 1280 <= 0.5, `1280 pre-resize ratio out of band: ${before}`);
+      await page.setViewportSize({ width: 1920, height: 1080 });
+      // Give the browser a beat to re-layout.
+      await page.evaluate(() => new Promise((r) => requestAnimationFrame(() => requestAnimationFrame(r))));
+      const after = await sidebar.evaluate((node) => node.getBoundingClientRect().width);
+      const afterRatio = after / 1920;
+      assert(
+        afterRatio >= 0.44 && afterRatio <= 0.5,
+        `after resize to 1920, sidebar must still sit at 45-50% (proving CSS-relative default); measured ${after}px (${(afterRatio * 100).toFixed(1)}%)`,
+      );
+      assert(after > before, `wider viewport must yield wider pane; before=${before} after=${after}`);
+      await context.close();
+    }
+
+    // Drag survival: drag the resize handle to a custom px, verify localStorage
+    // captures the custom flag + width, then reload and verify the persisted
+    // px is restored (data-width-mode="custom") instead of the CSS default.
+    logStep(`sidebar width: drag -> persist -> reload -> restore`);
+    {
+      const context = await browser.newContext({ viewport: { width: 1440, height: 900 } });
+      const page = await context.newPage();
+      // Init script runs on every navigation (including reload) — gate it on
+      // a marker key so the reset only wipes the sidebar width on FIRST boot.
+      // After a drag persists the custom width, a reload preserves both.
+      await page.addInitScript(() => {
+        if (!localStorage.getItem("wiki-251-fixture-inited")) {
+          localStorage.setItem("wiki-sidebar-visible", "false");
+          localStorage.removeItem("wiki-session-sidebar-width");
+          localStorage.removeItem("wiki-session-sidebar-width-custom");
+          localStorage.setItem("wiki-251-fixture-inited", "1");
+        }
+      });
+      await page.goto(`${backend.baseUrl}/#/agents`, { waitUntil: "domcontentloaded" });
+      const sessionButton = page.locator(".agents-orch-actions .agent-log-toggle", { hasText: "session" }).first();
+      await sessionButton.waitFor({ timeout: 30_000 });
+      await sessionButton.click();
+      const sidebar = page.locator(".session-sidebar").first();
+      await sidebar.waitFor({ timeout: 15_000 });
+      const handle = sidebar.locator(".session-resize").first();
+      await handle.waitFor({ timeout: 5_000 });
+      const handleBox = await handle.boundingBox();
+      assert(handleBox, ".session-resize handle box must be measurable");
+      // Drag the handle toward the left — the pane grows to the RIGHT edge of
+      // the viewport, so a left-drag widens it. Target 900px width at 1440.
+      const targetWidth = 900;
+      const targetX = 1440 - targetWidth;
+      const startX = handleBox.x + handleBox.width / 2;
+      const startY = handleBox.y + handleBox.height / 2;
+      await page.mouse.move(startX, startY);
+      await page.mouse.down();
+      await page.mouse.move(targetX, startY, { steps: 8 });
+      await page.mouse.up();
+      // Give React a frame to commit the drag-end state.
+      await page.evaluate(() => new Promise((r) => requestAnimationFrame(() => requestAnimationFrame(r))));
+      const stored = await page.evaluate(() => ({
+        width: localStorage.getItem("wiki-session-sidebar-width"),
+        custom: localStorage.getItem("wiki-session-sidebar-width-custom"),
+      }));
+      assert(stored.custom === "1", `drag must set the custom flag; saw ${stored.custom}`);
+      const storedPx = Number(stored.width);
+      assert(storedPx > 0, `drag must persist a positive px width; saw ${stored.width}`);
+      const afterMode = await sidebar.getAttribute("data-width-mode");
+      assert(afterMode === "custom", `after drag data-width-mode must be "custom"; saw ${afterMode}`);
+      const afterWidth = await sidebar.evaluate((node) => node.getBoundingClientRect().width);
+      assert(
+        Math.abs(afterWidth - storedPx) <= 3,
+        `sidebar width after drag must match persisted px (${storedPx}); measured ${afterWidth}`,
+      );
+
+      // Reload and verify persisted custom width is honored (no CSS default).
+      await page.reload({ waitUntil: "domcontentloaded" });
+      const reopen = page.locator(".agents-orch-actions .agent-log-toggle", { hasText: "session" }).first();
+      await reopen.waitFor({ timeout: 30_000 });
+      await reopen.click();
+      const sidebarAfterReload = page.locator(".session-sidebar").first();
+      await sidebarAfterReload.waitFor({ timeout: 15_000 });
+      const restoredMode = await sidebarAfterReload.getAttribute("data-width-mode");
+      assert(restoredMode === "custom", `after reload the persisted custom flag must survive; saw ${restoredMode}`);
+      const restoredWidth = await sidebarAfterReload.evaluate((node) => node.getBoundingClientRect().width);
+      assert(
+        Math.abs(restoredWidth - storedPx) <= 3,
+        `after reload sidebar width must equal persisted ${storedPx}; measured ${restoredWidth}`,
+      );
       await context.close();
     }
   } finally {

@@ -118,6 +118,7 @@ export function replacementDiff(filePath: string, oldText: string, newText: stri
   const oldCount = contextBefore.length + removed.length + contextAfter.length;
   const newCount = contextBefore.length + added.length + contextAfter.length;
   const result = [
+    `diff --git a/${filePath} b/${filePath}`,
     `--- a/${filePath}`,
     `+++ b/${filePath}`,
     `@@ -${oldStart},${oldCount} +${newStart},${newCount} @@`,
