@@ -2201,6 +2201,18 @@ _APPLY = {
 #      paths trims back to the bound as soon as holders drain, and the
 #      just-released key itself is evictable. Entries with holders or
 #      waiters (refs > 0) are never evicted.
+#
+# Endpoint transaction rule (R9):
+#   An endpoint's parse + agent annotation is ONE path-lock span.
+#   read_session_delta / read_older_session annotate their response window
+#   in-span (annotate_agents=True) — annotation never runs on a snapshot
+#   after the lock was released, so no eviction or same-path replacement
+#   can interleave between read and annotate. When annotation finds a
+#   fresh state (empty assignment map — new, rebuilt, or evicted-and-
+#   rebuilt), it first reconstructs assignments from the state's FULL
+#   retained parent sequence, bounded by the event-retention window, so
+#   duplicate-prompt parents keep stable one-to-one children across
+#   eviction and replacement.
 # ---------------------------------------------------------------------------
 _PARSE_CACHE_MAX = max(8, int(os.environ.get("WIKI_PARSE_CACHE_MAX", "64")))
 _cache: dict[str, dict] = {}  # path → parse state (insertion order = LRU order)
@@ -2366,6 +2378,27 @@ def _read_cached_state(fmt: str, path: Path, key: str) -> dict:
     return state
 
 
+def _annotate_window_locked(main_path: Path, state: dict, window_events: list) -> list:
+    """Annotate a response window inside the caller's path-lock span.
+
+    Endpoint transaction rule: the caller holds _path_lock(main path) and
+    `state` is the CURRENT parse state — no eviction or replacement can
+    interleave. If the assignment map is empty (fresh, rebuilt, or
+    evicted-and-rebuilt state), reconstruct it from the state's full
+    retained parent sequence first, so windowed responses keep stable
+    one-to-one children even for duplicate prompts without timestamps.
+    """
+    store = _agent_assignment_store(main_path)
+    if not store and any(
+        event.get("kind") == "tool"
+        and (event.get("tool") or {}).get("name") in ("Agent", "Task")
+        for event in state["events"]
+    ):
+        # Bounded reconstruction: the retained event window (<= 2000 events).
+        _annotate_agent_events_locked(main_path, state["events"], store)
+    return _annotate_agent_events_locked(main_path, window_events, store)
+
+
 def read_session_events(fmt: str, path: Path) -> dict:
     """Returns {events, base, tokens, dirty_from}.
 
@@ -2418,6 +2451,7 @@ def read_session_delta(
     *,
     tail_window: bool = True,
     tail_events: int | None = None,
+    annotate_agents: bool = False,
 ) -> dict:
     key = str(path)
     with _path_lock(key):
@@ -2446,10 +2480,13 @@ def read_session_delta(
                 window_base = max(base, total - tail_events)
             else:
                 window_base = max(base, total - TAIL_WINDOW_EVENTS) if tail_window else base
+            # Snapshot only the event objects and mutable nested leaves;
+            # avoid a recursive clone of large immutable payloads.
+            reset_events = _snapshot_events(events[window_base - base :])
+            if annotate_agents:
+                reset_events = _annotate_window_locked(path, state, reset_events)
             return {
-                # Snapshot only the event objects and mutable nested leaves;
-                # avoid a recursive clone of large immutable payloads.
-                "events": _snapshot_events(events[window_base - base :]),
+                "events": reset_events,
                 "base": window_base,
                 "tokens": state["tokens"],
                 "tasks": tasks,
@@ -2472,8 +2509,11 @@ def read_session_delta(
                 patch_map[int(entry["id"])] = entry
 
         if tail_from < base:
+            rewind_events = _snapshot_events(events)
+            if annotate_agents:
+                rewind_events = _annotate_window_locked(path, state, rewind_events)
             return {
-                "events": _snapshot_events(events),
+                "events": rewind_events,
                 "base": base,
                 "tokens": state["tokens"],
                 "tasks": tasks,
@@ -2519,6 +2559,8 @@ def read_session_delta(
             }
             for entry in sorted(patch_map.values(), key=lambda item: int(item["cursor"]))
         ]
+        if annotate_agents and tail_slice:
+            tail_slice = _annotate_window_locked(path, state, tail_slice)
         payload = {
             "events": tail_slice,
             "base": base,
@@ -2541,6 +2583,8 @@ def read_older_session(
     path: Path,
     before: int,
     count: int,
+    *,
+    annotate_agents: bool = False,
 ) -> dict:
     """Return the retained events immediately before an absolute event index."""
     key = str(path)
@@ -2551,8 +2595,11 @@ def read_older_session(
         total = base + len(events)
         end = min(max(before, base), total)
         start = max(base, end - max(1, count))
+        page_events = _snapshot_events(events[start - base : end - base])
+        if annotate_agents:
+            page_events = _annotate_window_locked(path, state, page_events)
         return {
-            "events": _snapshot_events(events[start - base : end - base]),
+            "events": page_events,
             "base": start,
             "has_older": start > base,
         }

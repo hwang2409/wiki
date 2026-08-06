@@ -651,6 +651,124 @@ class SessionDeltaTests(unittest.TestCase):
                 self.assertEqual(child_a, "aaa11111")
                 self.assertEqual(child_b, "bbb22222")
 
+    def _task_row(self, prompt: str, tool_id: str) -> dict:
+        # No timestamp: duplicate-prompt parents without a timestamp anchor
+        # depend entirely on the persistent/reconstructed assignment map.
+        return {
+            "type": "assistant",
+            "message": {
+                "role": "assistant",
+                "content": [
+                    {"type": "tool_use", "id": tool_id, "name": "Task", "input": {"prompt": prompt}},
+                ],
+            },
+        }
+
+    def _child_file(self, subdir: Path, name: str, prompt: str, started_at: str) -> None:
+        _write_rows(
+            subdir / name,
+            [{"type": "user", "timestamp": started_at, "message": {"content": prompt}}],
+            mode="w",
+        )
+
+    def test_in_span_annotation_survives_eviction_between_polls(self) -> None:
+        # WIKI-244 review round 9 (repro A): parse + annotate is one path-lock
+        # span, and a fresh state reconstructs assignments from its full
+        # retained parent sequence. Duplicate-prompt parents WITHOUT
+        # timestamps, split across polls with a full eviction in between,
+        # must keep unique stable children.
+        with TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            path = root / "session.jsonl"
+            subdir = root / "session" / "subagents"
+            subdir.mkdir(parents=True)
+            self._child_file(subdir, "agent-aaa11111.jsonl", "explore the code", "2026-08-05T12:00:10Z")
+            self._child_file(subdir, "agent-bbb22222.jsonl", "explore the code", "2026-08-05T12:05:10Z")
+            _write_rows(path, [self._task_row("explore the code", "t1")], mode="w")
+
+            first = transcripts.read_session_delta(
+                "claude", path, 0, tail_window=False, annotate_agents=True
+            )
+            first_tools = [event for event in first["events"] if event.get("kind") == "tool"]
+            self.assertEqual(first_tools[0]["tool"]["agent_id"], "aaa11111")
+            cursor = first["cursor"]
+
+            # Evict everything between the two polls.
+            transcripts._cache.clear()
+            transcripts._cache_locks.clear()
+
+            _write_rows(path, [self._task_row("explore the code", "t2")])
+            second = transcripts.read_session_delta(
+                "claude", path, cursor, tail_window=False, annotate_agents=True
+            )
+            second_tools = [event for event in second["events"] if event.get("kind") == "tool"]
+            by_id = {event["id"]: event["tool"]["agent_id"] for event in second_tools}
+            self.assertEqual(by_id.get(1), "bbb22222", f"second parent must get the second child: {by_id}")
+
+            # A cold full read confirms both mappings are stable one-to-one.
+            transcripts._cache.clear()
+            transcripts._cache_locks.clear()
+            full = transcripts.read_session_delta(
+                "claude", path, 0, tail_window=False, annotate_agents=True
+            )
+            ids = [event["tool"]["agent_id"] for event in full["events"] if event.get("kind") == "tool"]
+            self.assertEqual(ids, ["aaa11111", "bbb22222"])
+
+    def test_in_span_annotation_keeps_new_generation_unpolluted_after_replacement(self) -> None:
+        # WIKI-244 review round 9 (repro B): annotation never runs on a
+        # released snapshot, so a same-path replacement can never see stale
+        # ids written into the new generation's store; fresh polls map the
+        # reused event id to the NEW child.
+        with TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            path = root / "session.jsonl"
+            subdir = root / "session" / "subagents"
+            subdir.mkdir(parents=True)
+            self._child_file(subdir, "agent-old11111.jsonl", "old work", "2026-08-05T12:00:10Z")
+            _write_rows(path, [self._task_row("old work", "t1")], mode="w")
+
+            first = transcripts.read_session_delta(
+                "claude", path, 0, tail_window=False, annotate_agents=True
+            )
+            stale_snapshot = first["events"]
+            first_tools = [event for event in stale_snapshot if event.get("kind") == "tool"]
+            self.assertEqual(first_tools[0]["tool"]["agent_id"], "old11111")
+
+            # Same-path replacement: LARGER file, new prompt at the SAME
+            # (reused) event id, and its own child transcript.
+            self._child_file(subdir, "agent-new22222.jsonl", "new work", "2026-08-05T12:10:10Z")
+            replacement = root / "session.jsonl.next"
+            _write_rows(
+                replacement,
+                [
+                    self._task_row("new work", "t2"),
+                    {
+                        "type": "assistant",
+                        "message": {"role": "assistant", "content": [{"type": "text", "text": "padding " * 30}]},
+                    },
+                ],
+                mode="w",
+            )
+            self.assertGreater(replacement.stat().st_size, path.stat().st_size)
+            os.replace(replacement, path)
+
+            for _ in range(3):
+                poll = transcripts.read_session_delta(
+                    "claude", path, 0, tail_window=False, annotate_agents=True
+                )
+                tools = [event for event in poll["events"] if event.get("kind") == "tool"]
+                self.assertEqual(tools[0]["tool"]["agent_id"], "new22222")
+
+            state = transcripts._cache[str(path)]
+            self.assertNotIn(
+                "old11111",
+                set(state["agent_child_assignments"].values()),
+                "the new generation's store must never carry the old child id",
+            )
+            # The stale snapshot kept its own values but never leaked into
+            # the current generation.
+            self.assertEqual(first_tools[0]["tool"]["agent_id"], "old11111")
+
     def test_models_endpoint_includes_new_codex_and_claude_options(self) -> None:
         payload = main.list_models()
         models = {model["id"]: model for model in payload["models"]}

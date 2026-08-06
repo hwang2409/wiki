@@ -3434,6 +3434,9 @@ def _session_delta_payload(
         effective_cursor,
         tail_window=tail_window,
         tail_events=tail_events,
+        # Endpoint transaction rule: parse + agent annotation happen inside
+        # one path-lock span, never on a released snapshot.
+        annotate_agents=fmt == "claude",
     )
     raw_path: Path | None = None
     if (
@@ -3450,8 +3453,6 @@ def _session_delta_payload(
             client_cursor=effective_cursor,
         )
     events = result["events"]
-    if fmt == "claude":
-        events = transcripts.annotate_agent_events(path, events)
     payload: dict[str, object] = {
         "version": 2,
         "format": fmt,
@@ -3743,12 +3744,14 @@ def agent_session_older(
             count,
         )
     elif fmt in {"codex", "claude"}:
-        result = transcripts.read_older_session(fmt, path, before, count)
+        # Endpoint transaction rule: annotation runs inside the read's
+        # path-lock span, never on a released snapshot.
+        result = transcripts.read_older_session(
+            fmt, path, before, count, annotate_agents=fmt == "claude"
+        )
     else:
         raise HTTPException(status_code=409, detail="Older transcript events are unavailable")
     events = result["events"]
-    if fmt == "claude":
-        events = transcripts.annotate_agent_events(path, events)
     return {
         "version": 2,
         "format": fmt,
