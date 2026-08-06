@@ -9,6 +9,8 @@ updated: 2026-08-06
 
 ## 2026-08-06
 
+- WIKI-258 merged (#195) — split-diff columns no longer collapse to 1ch; wrap preserved without width collapse
+- WIKI-259 merged (#194) — empty events no longer reserve virtual row height; transcript row gaps deterministic
 - **wiki** — rebuilt and relaunched Wiki.app at origin/main c84dfe4
 - WIKI-257 merged (#193) — single polish toggle, raw is default (removed redundant raw button + section, aria-pressed on active polish)
 - WIKI-256 merged (#192) — dropped 13 @fontsource/* deps; Wiki.app now renders from OS-installed fonts (JetBrains OTF quality vs Google Fonts subset)
