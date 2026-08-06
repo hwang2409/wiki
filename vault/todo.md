@@ -83,6 +83,7 @@ In Progress:
 - PHO-15254 retrieve adoption tranche 1 — night shift worker
 - [P1] WIKI-242 final agent-surface focus, target-size, 320px reflow, and 400% zoom pass; start after WIKI-235/237-241
 - [P1] WIKI-227 backend /api/agents starvation under run-history growth (2026-07-31 07:35Z): HTTP API timing out (curl 000 at 8s, wiki agent status intermittent STATUS-ERROR) while MCP socket path stays fast; sidecar pid at 57% CPU after 15h; 2s sample = main thread dominated by __open/__open_nocancel/stat/__getdirentries64 + psynch GIL waits — costs.refresh() 5s runs-dir sweep scales with accumulated run history and starves the event loop (fd leak fixed in 8055e18 but the scan itself is O(history) every 5s). Also /api/agents payload bloated by full worker histories + composer messages (one archive record = 76KB). Fix: throttle/cache/incremental costs scan or move off the event loop (thread/process + mtime cache), and slim /api/agents default payload (histories behind a flag). Monitor degraded but functional; workers unaffected. No restart performed — app relaunch releases all provider processes
+- [P1] WIKI-245 transcript readability redesign — one visual unit per tool call, chrome diet on small results, semantic result labels, harness-wrapper stripping at render time, scan hierarchy, quiet thinking traces (Henry 2026-08-06: top priority; screenshots /tmp/WIKI-245-example-{1,2}.png)
 Backlog:
 
 - [PHO-14974](https://linear.app/phoebework/issue/PHO-14974): implement the planned v3 describe catalog after retrieve and write registry interfaces land
