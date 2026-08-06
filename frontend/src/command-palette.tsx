@@ -235,6 +235,17 @@ export function CommandPalette({ onClose, onOpen }: CommandPaletteProps) {
         onClick={(event) => event.stopPropagation()}
         onKeyDown={handleDialogKeyDown}
       >
+        <div className="dialog-title">
+          <span>Command palette</span>
+          <button
+            aria-label="Close command palette"
+            className="dialog-title-esc"
+            type="button"
+            onClick={onClose}
+          >
+            esc
+          </button>
+        </div>
         <div className="command-palette-mode" role="group" aria-label="Search mode">
           <span className="command-palette-mode-label">search</span>
           {(["lexical", "semantic"] as PaletteSearchMode[]).map((option) => (
@@ -325,6 +336,20 @@ export function CommandPalette({ onClose, onOpen }: CommandPaletteProps) {
               {query.trim() ? "No matches" : "Recent items will appear here"}
             </div>
           )}
+        </div>
+        <div aria-label="Keyboard shortcuts" className="quick-switcher-footer">
+          <span className="quick-switcher-hint">
+            <span className="quick-switcher-hint-key">up/down</span>
+            <span className="quick-switcher-hint-label">navigate</span>
+          </span>
+          <span className="quick-switcher-hint">
+            <span className="quick-switcher-hint-key">enter</span>
+            <span className="quick-switcher-hint-label">open</span>
+          </span>
+          <span className="quick-switcher-hint">
+            <span className="quick-switcher-hint-key">esc</span>
+            <span className="quick-switcher-hint-label">close</span>
+          </span>
         </div>
       </div>
     </div>,

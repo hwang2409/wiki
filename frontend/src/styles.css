@@ -109,6 +109,19 @@
   --font-ui-small: 13.5px;
   --font-text-size: 16.5px;
   --font-monospace-size: 13.5px;
+
+  /* WIKI-246: semantic chrome roles. These names keep the shell on four
+     elevation steps while each theme keeps its existing palette values. */
+  --background-canvas: var(--background-primary);
+  --background-panel: var(--background-primary-alt);
+  --background-element: var(--background-secondary);
+  --background-menu: var(--background-secondary);
+  --border-subtle: color-mix(in srgb, var(--background-modifier-border) 72%, var(--background-primary));
+  --border-default: var(--background-modifier-border);
+  --border-active: color-mix(in srgb, var(--background-modifier-border) 68%, var(--text-normal));
+  --primary: var(--accent-primary);
+  --text: var(--text-normal);
+  --selected-list-item-text: var(--text-on-accent);
 }
 
 * {
@@ -142,7 +155,7 @@ body {
   margin: 0;
   min-width: 320px;
   overflow: hidden;
-  background-color: var(--background-primary);
+  background-color: var(--background-canvas);
   color: var(--text-normal);
   font-family: var(--font-chrome);
   font-weight: var(--font-interface-weight);
@@ -205,7 +218,6 @@ button:disabled {
   gap: 8px;
   width: min(100%, 420px);
   opacity: 0;
-  animation: loading-reveal 120ms ease-out 150ms forwards;
 }
 
 .loading-line {
@@ -235,52 +247,11 @@ button:disabled {
   }
 }
 
-@keyframes loading-reveal {
-  from {
-    opacity: 0;
-  }
-
-  to {
-    opacity: 1;
-  }
-}
-
 :where(
-  .search-result,
-  .activity-commit-row,
-  .activity-file,
-  .health-row,
-  .nav-agent,
-  .agent-log-toggle,
-  .view-action,
-  .settings-reset,
-  .session-close,
-  .session-activity-head,
-  .session-tool-head,
-  .session-send,
-  .session-subagent-chip,
-  .session-skill-item,
-  .session-queued button,
-  .session-attachment button,
-  .session-expand
-) {
-  transition-property: background-color, border-color, color, transform, opacity, box-shadow;
-  transition-duration: 120ms;
-  transition-timing-function: ease-out;
-}
-
-:where(
-  .search-result,
   .activity-file,
   .agent-log-toggle,
   .view-action,
   .settings-reset,
-  .session-close,
-  .session-send,
-  .session-subagent-chip,
-  .session-skill-item,
-  .session-queued button,
-  .session-attachment button,
   .session-expand
 ):active:not(:disabled) {
   transform: scale(0.96);
@@ -368,7 +339,6 @@ button:disabled {
   font-family: var(--font-chrome);
   font-size: var(--fs-sm);
   text-align: left;
-  transition: background-color 120ms ease-out, color 120ms ease-out;
 }
 
 .ribbon-more-item svg {
@@ -397,9 +367,6 @@ button:disabled {
   height: 30px;
   border-radius: var(--radius-s);
   color: var(--text-muted);
-  transition-property: background-color, color, scale;
-  transition-duration: 100ms;
-  transition-timing-function: ease-out;
 }
 
 .ribbon-action::after {
@@ -410,11 +377,6 @@ button:disabled {
 
 .ribbon-action:hover {
   background-color: var(--background-modifier-hover);
-  color: var(--text-normal);
-}
-
-.ribbon-action:active {
-  scale: 0.96;
 }
 
 .ribbon-action.is-active {
@@ -439,9 +401,6 @@ button:disabled {
   opacity: 0;
   scale: 0.25;
   filter: blur(4px);
-  transition-property: opacity, scale, filter;
-  transition-duration: 200ms;
-  transition-timing-function: cubic-bezier(0.2, 0, 0, 1);
 }
 
 .theme-icon.is-active {
@@ -520,12 +479,10 @@ button:disabled {
   color: var(--text-normal);
   font-family: var(--font-chrome);
   font-size: var(--font-ui-smaller);
-  transition: background-color 120ms ease-out, border-color 120ms ease-out;
 }
 
 .nav-inline-retry:hover {
   background-color: var(--background-modifier-hover);
-  border-color: var(--text-faint);
 }
 
 .nav-inline-retry svg {
@@ -603,23 +560,15 @@ button:disabled {
   height: 26px;
   border-radius: var(--radius-s);
   color: var(--text-muted);
-  transition-property: background-color, color, scale;
-  transition-duration: 100ms;
-  transition-timing-function: ease-out;
 }
 
 .nav-action-button:hover {
   background-color: var(--background-modifier-hover);
-  color: var(--text-normal);
 }
 
 .nav-action-button.is-active {
   color: var(--text-normal);
   box-shadow: inset 0 -1px 0 var(--text-normal);
-}
-
-.nav-action-button:active {
-  scale: 0.96;
 }
 
 .nav-files-container {
@@ -639,14 +588,10 @@ button:disabled {
   font-size: var(--font-ui-small);
   line-height: 1.3;
   text-align: left;
-  transition-property: background-color, color;
-  transition-duration: 100ms;
-  transition-timing-function: ease-out;
 }
 
 .tree-item-self:hover {
   background-color: var(--background-modifier-hover);
-  color: var(--text-normal);
 }
 
 .tree-item-self.is-active {
@@ -679,7 +624,6 @@ button:disabled {
   flex-shrink: 0;
   color: var(--text-faint);
   transform: rotate(90deg);
-  transition: transform 100ms ease-in-out;
 }
 
 .collapse-icon.is-collapsed {
@@ -739,9 +683,6 @@ button:disabled {
   padding: 6px 8px;
   border-radius: var(--radius-s);
   text-align: left;
-  transition-property: background-color;
-  transition-duration: 100ms;
-  transition-timing-function: ease-out;
 }
 
 .search-result:hover {
@@ -823,9 +764,6 @@ button:disabled {
   height: 26px;
   border-radius: var(--radius-s);
   color: var(--text-muted);
-  transition-property: background-color, color, scale;
-  transition-duration: 100ms;
-  transition-timing-function: ease-out;
 }
 
 .view-action:hover:not(:disabled) {
@@ -881,7 +819,6 @@ button:disabled {
   min-width: 0;
   outline: none;
   box-shadow: inset 0 0 0 1px transparent;
-  transition: box-shadow 120ms ease-out;
 }
 
 .pane-frame.is-focused {
@@ -935,9 +872,6 @@ button:disabled {
   content: "";
   position: absolute;
   background-color: var(--background-modifier-border);
-  transition-property: background-color, width, height;
-  transition-duration: 100ms;
-  transition-timing-function: ease-out;
 }
 
 .pane-divider.row::before {
@@ -1324,7 +1258,6 @@ body.is-resizing-panes .pane-cell {
   background-color: var(--terminal-surface-alt);
   box-shadow: var(--shadow-floating);
   transform-origin: top right;
-  animation: switcher-in 100ms cubic-bezier(0.2, 0, 0, 1) both;
 }
 
 .terminal-pane-details-row {
@@ -1536,9 +1469,6 @@ body.is-resizing-panes .pane-cell {
   position: absolute;
   border: 2px dashed transparent;
   border-radius: var(--radius-md);
-  transition-property: background-color, border-color;
-  transition-duration: 100ms;
-  transition-timing-function: ease-out;
 }
 
 .pane-drop-zone.is-active {
@@ -1607,9 +1537,6 @@ body.is-resizing-panes .pane-cell {
 .empty-state-actions button {
   color: var(--link-color);
   font-size: var(--font-ui-small);
-  transition-property: color;
-  transition-duration: 100ms;
-  transition-timing-function: ease-out;
 }
 
 .empty-state-actions button:hover {
@@ -1651,7 +1578,6 @@ body.is-resizing-panes .pane-cell {
   border-radius: var(--radius-md);
   background-color: var(--background-primary);
   box-shadow: var(--shadow-floating);
-  animation: switcher-in 100ms cubic-bezier(0.2, 0, 0, 1) both;
 }
 
 .context-menu button {
@@ -1660,9 +1586,6 @@ body.is-resizing-panes .pane-cell {
   color: var(--text-normal);
   font-size: var(--font-ui-small);
   text-align: left;
-  transition-property: background-color;
-  transition-duration: 100ms;
-  transition-timing-function: ease-out;
 }
 
 .context-menu button:hover {
@@ -1769,7 +1692,7 @@ body.is-resizing-panes .pane-cell {
 }
 
 .settings-row select:hover {
-  border-color: var(--text-muted);
+  background-color: var(--background-modifier-hover);
 }
 
 .settings-row select:focus {
@@ -1850,7 +1773,10 @@ body.is-resizing-panes .pane-cell {
   cursor: pointer;
 }
 
-.font-weight-picker:hover,
+.font-weight-picker:hover {
+  background-color: var(--background-modifier-hover);
+}
+
 .font-weight-picker:focus {
   border-color: var(--text-muted);
   outline: none;
@@ -1871,7 +1797,10 @@ body.is-resizing-panes .pane-cell {
   font-variant-numeric: tabular-nums;
 }
 
-.settings-row .font-weight-input:hover,
+.settings-row .font-weight-input:hover {
+  background-color: var(--background-modifier-hover);
+}
+
 .settings-row .font-weight-input:focus {
   border-color: var(--text-muted);
   outline: none;
@@ -1895,8 +1824,6 @@ body.is-resizing-panes .pane-cell {
   font-size: var(--fs-xs);
   font-variant-numeric: tabular-nums;
   cursor: pointer;
-  transition-property: color, border-color, background-color;
-  transition-duration: 120ms;
 }
 
 .font-weight-stop:hover {
@@ -1937,7 +1864,7 @@ body.is-resizing-panes .pane-cell {
 }
 
 .font-picker-trigger:hover {
-  border-color: var(--text-muted);
+  background-color: var(--background-modifier-hover);
 }
 
 .font-picker.is-open .font-picker-trigger {
@@ -2023,14 +1950,11 @@ body.is-resizing-panes .pane-cell {
   background-color: var(--background-secondary);
   color: var(--text-muted);
   text-align: left;
-  transition-property: border-color, background-color, color;
-  transition-duration: 100ms;
-  transition-timing-function: ease-out;
 }
 
 .theme-choice:hover {
-  border-color: var(--text-muted);
   color: var(--text-normal);
+  background-color: var(--background-modifier-hover);
 }
 
 .theme-choice.is-active {
@@ -2091,7 +2015,6 @@ body.is-resizing-panes .pane-cell {
   background-color: var(--background-primary);
   box-shadow: var(--shadow-modal);
   translate: -50% 0;
-  animation: switcher-in 140ms cubic-bezier(0.2, 0, 0, 1) both;
 }
 
 .dialog-title {
@@ -2111,13 +2034,11 @@ body.is-resizing-panes .pane-cell {
   font-family: var(--font-monospace);
   font-weight: var(--font-monospace-weight);
   font-size: var(--font-ui-small);
-  transition-property: border-color, box-shadow;
-  transition-duration: 120ms;
-  transition-timing-function: ease-out;
+  outline: none;
 }
 
 .dialog-input:hover {
-  border-color: var(--text-faint);
+  background-color: var(--background-modifier-hover);
 }
 
 .dialog-input:focus,
@@ -2142,19 +2063,10 @@ body.is-resizing-panes .pane-cell {
   border-radius: var(--radius-md);
   color: var(--text-muted);
   font-size: var(--font-ui-small);
-  transition-property: background-color, color, border-color, scale;
-  transition-duration: 100ms;
-  transition-timing-function: ease-out;
 }
 
 .dialog-button:hover {
-  border-color: var(--text-faint);
   background-color: var(--background-modifier-hover);
-  color: var(--text-normal);
-}
-
-.dialog-button:active:not(:disabled) {
-  scale: 0.97;
 }
 
 .dialog-confirm {
@@ -2164,7 +2076,6 @@ body.is-resizing-panes .pane-cell {
 }
 
 .dialog-confirm:hover {
-  border-color: var(--text-normal);
   background-color: var(--text-muted);
   color: var(--background-primary);
 }
@@ -2268,8 +2179,7 @@ body.is-resizing-panes .pane-cell {
   letter-spacing: 0.01em;
 }
 
-.agent-spawn-select,
-.agent-spawn-static {
+.agent-spawn-select {
   width: 100%;
   min-height: 36px;
   padding: 9px 12px;
@@ -2280,9 +2190,6 @@ body.is-resizing-panes .pane-cell {
   font-family: var(--font-monospace);
   font-weight: var(--font-monospace-weight);
   font-size: var(--font-ui-small);
-  transition-property: border-color, box-shadow;
-  transition-duration: 120ms;
-  transition-timing-function: ease-out;
 }
 
 .agent-spawn-select {
@@ -2295,7 +2202,7 @@ body.is-resizing-panes .pane-cell {
 }
 
 .agent-spawn-select:hover {
-  border-color: var(--text-faint);
+  background-color: var(--background-modifier-hover);
 }
 
 .agent-spawn-select:focus,
@@ -2304,12 +2211,6 @@ body.is-resizing-panes .pane-cell {
   box-shadow: 0 0 0 3px color-mix(in srgb, var(--text-normal) 8%, transparent);
   outline: 2px solid var(--accent-primary, var(--text-normal));
   outline-offset: 2px;
-}
-
-.agent-spawn-static {
-  color: var(--text-faint);
-  background-color: var(--background-secondary);
-  border-style: dashed;
 }
 
 .agent-spawn-textarea {
@@ -2399,16 +2300,6 @@ body.is-resizing-panes .pane-cell {
   inset: 0;
   z-index: 100;
   background-color: var(--background-overlay-strong);
-  animation: backdrop-in 120ms ease-out both;
-}
-
-@keyframes backdrop-in {
-  from {
-    opacity: 0;
-  }
-  to {
-    opacity: 1;
-  }
 }
 
 .quick-switcher {
@@ -2426,18 +2317,6 @@ body.is-resizing-panes .pane-cell {
   background-color: var(--background-primary);
   box-shadow: var(--shadow-modal);
   translate: -50% 0;
-  animation: switcher-in 140ms cubic-bezier(0.2, 0, 0, 1) both;
-}
-
-@keyframes switcher-in {
-  from {
-    opacity: 0;
-    scale: 0.98;
-  }
-  to {
-    opacity: 1;
-    scale: 1;
-  }
 }
 
 .quick-switcher input {
@@ -2567,8 +2446,8 @@ body.is-resizing-panes .pane-cell {
 }
 
 .command-palette-mode-button {
-  border: 1px solid var(--background-modifier-border);
-  border-radius: 4px;
+  border: 0;
+  border-radius: 0;
   padding: 3px 8px;
   color: var(--text-faint);
   background: transparent;
@@ -2578,7 +2457,6 @@ body.is-resizing-panes .pane-cell {
 
 .command-palette-mode-button:hover,
 .command-palette-mode-button.is-selected {
-  border-color: var(--interactive-accent);
   color: var(--text-normal);
 }
 
@@ -2640,6 +2518,12 @@ body.is-resizing-panes .pane-cell {
   font-family: var(--font-monospace);
   font-size: var(--font-ui-small);
   font-weight: var(--fw-semibold);
+}
+
+.fleet-switcher-head-actions {
+  display: inline-flex;
+  align-items: baseline;
+  gap: 12px;
 }
 
 .fleet-switcher-count {
@@ -2727,12 +2611,10 @@ body.is-resizing-panes .pane-cell {
   font-weight: var(--font-monospace-weight);
   font-size: var(--font-ui-smaller);
   white-space: nowrap;
-  transition: background-color 100ms ease-out, color 100ms ease-out;
 }
 
 .tmux-status-item:hover {
   background-color: var(--background-modifier-hover);
-  color: var(--text-normal);
 }
 
 .tmux-status-item.is-active {
@@ -2833,25 +2715,6 @@ body.is-resizing-panes .pane-cell {
   letter-spacing: -0.005em;
 }
 
-.markdown-reading-view .inline-title {
-  animation: fade-slide-in 200ms cubic-bezier(0.2, 0, 0, 1) both;
-}
-
-.markdown-reading-view .markdown-preview-view {
-  animation: fade-slide-in 250ms cubic-bezier(0.2, 0, 0, 1) 60ms both;
-}
-
-@keyframes fade-slide-in {
-  from {
-    opacity: 0;
-    translate: 0 4px;
-  }
-  to {
-    opacity: 1;
-    translate: 0 0;
-  }
-}
-
 /* Properties (frontmatter) */
 
 .metadata-container {
@@ -2863,7 +2726,6 @@ body.is-resizing-panes .pane-cell {
   border: 1px solid var(--background-modifier-border);
   border-radius: var(--radius-s);
   background-color: var(--background-secondary);
-  animation: fade-slide-in 220ms cubic-bezier(0.2, 0, 0, 1) 30ms both;
 }
 
 .metadata-property {
@@ -2938,15 +2800,6 @@ body.is-resizing-panes .pane-cell {
   border: 1px solid var(--background-modifier-border);
   border-radius: var(--radius-md);
   background-color: var(--kanban-lane);
-  animation: fade-slide-in 200ms cubic-bezier(0.2, 0, 0, 1) both;
-}
-
-.kanban-column:nth-child(2) {
-  animation-delay: 50ms;
-}
-
-.kanban-column:nth-child(n + 3) {
-  animation-delay: 100ms;
 }
 
 .kanban-column-header {
@@ -2988,18 +2841,11 @@ body.is-resizing-panes .pane-cell {
   height: 96px;
   overflow: hidden;
   padding: 8px 10px;
-  border: 1px solid var(--background-modifier-border);
-  border-radius: var(--radius-sm);
+  border: 0;
+  border-radius: 0;
   background-color: var(--kanban-card);
   box-shadow: var(--kanban-card-shadow);
   cursor: grab;
-  transition-property: border-color, opacity;
-  transition-duration: 100ms;
-  transition-timing-function: ease-out;
-}
-
-.kanban-card:hover {
-  border-color: var(--text-faint);
 }
 
 .kanban-card {
@@ -3037,7 +2883,6 @@ body.is-resizing-panes .pane-cell {
   color: var(--text-muted);
   font-size: var(--font-ui-small);
   translate: -50% 0;
-  animation: fade-slide-in 160ms cubic-bezier(0.2, 0, 0, 1) both;
 }
 
 .kanban-done-zone code {
@@ -3066,9 +2911,6 @@ body.is-resizing-panes .pane-cell {
   border-radius: var(--radius-sm);
   color: var(--text-faint);
   font-size: var(--font-ui-small);
-  transition-property: background-color, color, scale;
-  transition-duration: 100ms;
-  transition-timing-function: ease-out;
 }
 
 .kanban-add-button:active {
@@ -3404,8 +3246,8 @@ body.is-resizing-panes .pane-cell {
 }
 
 .markdown-preview-view a.tag:hover {
-  border-color: var(--text-faint);
   color: var(--text-normal);
+  background-color: var(--background-modifier-hover);
 }
 
 /* Priority badges */
@@ -3658,9 +3500,6 @@ body.is-resizing-panes .pane-cell {
   font-weight: var(--fw-semibold);
   font-size: inherit;
   line-height: 1.3;
-  transition-property: color, transform;
-  transition-duration: 120ms;
-  transition-timing-function: ease-out;
 }
 
 .callout.is-collapsible .callout-title {
@@ -3688,7 +3527,6 @@ body.is-resizing-panes .pane-cell {
   align-items: center;
   flex-shrink: 0;
   padding-top: 1px;
-  transition: transform 100ms ease-in-out;
 }
 
 .callout.is-collapsed .callout-fold {
@@ -3700,17 +3538,12 @@ body.is-resizing-panes .pane-cell {
   grid-template-rows: 0fr;
   opacity: 0;
   visibility: hidden;
-  transition-property: grid-template-rows, opacity, margin-top, visibility;
-  transition-duration: 160ms;
-  transition-timing-function: ease-out;
-  transition-delay: 0ms, 0ms, 0ms, 160ms;
 }
 
 .callout-content-wrap.is-open {
   grid-template-rows: 1fr;
   opacity: 1;
   visibility: visible;
-  transition-delay: 0ms;
 }
 
 .callout-content {
@@ -3736,17 +3569,12 @@ body.is-resizing-panes .pane-cell {
   grid-template-rows: 0fr;
   opacity: 0;
   visibility: hidden;
-  transition-property: grid-template-rows, opacity, visibility;
-  transition-duration: 160ms;
-  transition-timing-function: ease-out;
-  transition-delay: 0ms, 0ms, 160ms;
 }
 
 .disclosure-wrap.is-open {
   grid-template-rows: 1fr;
   opacity: 1;
   visibility: visible;
-  transition-delay: 0ms;
 }
 
 .disclosure-inner {
@@ -3756,7 +3584,6 @@ body.is-resizing-panes .pane-cell {
 
 .disclosure-chevron {
   flex-shrink: 0;
-  transition: transform 100ms ease-in-out;
 }
 
 .disclosure-chevron.is-collapsed {
@@ -3812,12 +3639,6 @@ body.is-resizing-panes .pane-cell {
 
 .markdown-preview-view tbody tr:last-child td {
   border-bottom: none;
-}
-
-.markdown-preview-view tbody tr {
-  transition-property: background-color;
-  transition-duration: 100ms;
-  transition-timing-function: ease-out;
 }
 
 .markdown-preview-view tbody tr:hover {
@@ -4086,12 +3907,10 @@ body.is-resizing-panes .pane-cell {
   cursor: pointer;
   font-size: var(--font-ui-smaller);
   font-weight: var(--fw-medium);
-  transition: background-color 100ms ease-out, border-color 100ms ease-out;
 }
 
 .utility-state-retry:hover {
   background: var(--background-modifier-hover);
-  border-color: var(--text-faint);
 }
 
 .utility-state-retry:focus-visible {
@@ -4167,7 +3986,6 @@ body.is-resizing-panes .pane-cell {
 
 .activity-refresh-retry:hover {
   background: var(--background-modifier-hover);
-  border-color: var(--text-faint);
 }
 
 .tokens-refresh-banner {
@@ -4207,7 +4025,6 @@ body.is-resizing-panes .pane-cell {
 
 .tokens-refresh-retry:hover {
   background: var(--background-modifier-hover);
-  border-color: var(--text-faint);
 }
 
 .activity-day-heading {
@@ -4230,9 +4047,6 @@ body.is-resizing-panes .pane-cell {
   padding: 5px 8px;
   border-radius: var(--radius-s);
   text-align: left;
-  transition-property: background-color;
-  transition-duration: 100ms;
-  transition-timing-function: ease-out;
 }
 
 .activity-commit-row:hover {
@@ -4271,14 +4085,11 @@ body.is-resizing-panes .pane-cell {
   border-radius: 2em;
   color: var(--text-muted);
   font-size: var(--font-ui-smaller);
-  transition-property: border-color, color;
-  transition-duration: 100ms;
-  transition-timing-function: ease-out;
 }
 
 .activity-file:not(:disabled):hover {
-  border-color: var(--text-faint);
   color: var(--text-normal);
+  background-color: var(--background-modifier-hover);
 }
 
 .activity-file:disabled {
@@ -4424,7 +4235,6 @@ body.is-resizing-panes .pane-cell {
   font-size: var(--font-ui-smaller);
   opacity: 0;
   transform: translateY(4px);
-  transition: opacity 160ms ease, transform 160ms ease;
   pointer-events: none;
 }
 
@@ -4509,7 +4319,6 @@ body.is-resizing-panes .pane-cell {
   cursor: pointer;
   font-size: var(--font-ui-small);
   list-style: none;
-  transition: background-color 100ms ease-out;
 }
 
 .graph-list-row::-webkit-details-marker {
@@ -4718,7 +4527,10 @@ body.is-resizing-panes .pane-cell {
   cursor: pointer;
 }
 
-.fleet-graph-chip:hover,
+.fleet-graph-chip:hover {
+  background-color: var(--background-modifier-hover);
+}
+
 .fleet-graph-chip.is-active {
   border-color: var(--text-normal);
   background-color: var(--text-normal);
@@ -4957,9 +4769,6 @@ body.is-resizing-panes .pane-cell {
   border-radius: var(--radius-s);
   font-size: var(--font-ui-small);
   text-align: left;
-  transition-property: background-color;
-  transition-duration: 100ms;
-  transition-timing-function: ease-out;
 }
 
 .health-row:hover {
@@ -5074,13 +4883,9 @@ body.is-resizing-panes .pane-cell {
   font-family: var(--font-monospace);
   font-weight: var(--font-monospace-weight);
   font-size: var(--font-ui-small);
-  transition-property: background-color, color, border-color, scale;
-  transition-duration: 100ms;
-  transition-timing-function: ease-out;
 }
 
 .agents-spawn-button:hover {
-  border-color: var(--text-faint);
   background-color: var(--background-modifier-hover);
   color: var(--text-normal);
 }
@@ -5194,9 +4999,6 @@ body.is-resizing-panes .pane-cell {
   font-size: var(--font-ui-smaller);
   min-height: 28px;
   padding: 3px 4px;
-  transition-property: color;
-  transition-duration: 100ms;
-  transition-timing-function: ease-out;
 }
 
 .agents-account-banner-details-toggle:hover {
@@ -5216,8 +5018,8 @@ body.is-resizing-panes .pane-cell {
 
 .agent-card {
   padding: 12px 14px;
-  border: 1px solid var(--background-modifier-border);
-  border-radius: var(--radius-m);
+  border: 0;
+  border-radius: 0;
   background-color: var(--background-secondary);
 }
 
@@ -5386,9 +5188,6 @@ body.is-resizing-panes .pane-cell {
   font-size: var(--font-ui-smaller);
   min-height: 28px;
   padding: 4px 6px;
-  transition-property: color;
-  transition-duration: 100ms;
-  transition-timing-function: ease-out;
 }
 
 .agent-actions .agent-log-toggle,
@@ -5416,9 +5215,6 @@ body.is-resizing-panes .pane-cell {
   font-family: var(--font-monospace);
   font-weight: var(--font-monospace-weight);
   font-size: var(--font-ui-smaller);
-  transition-property: color;
-  transition-duration: 100ms;
-  transition-timing-function: ease-out;
 }
 
 .agent-replace-button:hover {
@@ -5446,9 +5242,6 @@ body.is-resizing-panes .pane-cell {
   font-family: var(--font-monospace);
   font-weight: var(--fw-semibold);
   font-size: var(--font-ui-smaller);
-  transition-property: background-color, border-color, color;
-  transition-duration: 100ms;
-  transition-timing-function: ease-out;
 }
 
 .agent-primary-action:hover {
@@ -5551,9 +5344,6 @@ body.is-resizing-panes .pane-cell {
   font-family: var(--font-monospace);
   font-size: var(--font-ui-smaller);
   font-weight: var(--fw-semibold);
-  transition-property: background-color, border-color, color, scale;
-  transition-duration: 100ms;
-  transition-timing-function: ease-out;
 }
 
 .agent-archive-button:hover {
@@ -5569,15 +5359,8 @@ body.is-resizing-panes .pane-cell {
   opacity: 0.55;
 }
 
-.agent-card.is-selected {
-  border-color: var(--text-muted);
-}
-
 .agents-layout .agent-card {
   cursor: default;
-  transition-property: border-color, background-color;
-  transition-duration: 100ms;
-  transition-timing-function: ease-out;
 }
 
 .agents-layout .agent-card:not(.is-selected):hover {
@@ -6293,9 +6076,6 @@ body.is-resizing-panes .pane-cell {
   font: inherit;
   text-align: left;
   cursor: pointer;
-  transition-property: background-color;
-  transition-duration: 120ms;
-  transition-timing-function: cubic-bezier(0.2, 0, 0, 1);
 }
 
 .codex-stream-diagnostic-head:hover {
@@ -6486,8 +6266,6 @@ body.is-resizing-panes .pane-cell {
   font-size: var(--fs-xs);
   text-transform: lowercase;
   cursor: pointer;
-  transition-property: color, border-color;
-  transition-duration: 120ms;
 }
 
 .codex-stream-diff-copy:hover {
@@ -6806,9 +6584,6 @@ body.is-resizing-panes .pane-cell {
   font-family: var(--font-monospace);
   font-weight: var(--font-monospace-weight);
   font-size: var(--font-ui-smaller);
-  transition-property: background-color, color;
-  transition-duration: 100ms;
-  transition-timing-function: ease-out;
 }
 
 .agent-surface-action:hover {
@@ -7550,17 +7325,12 @@ body.is-resizing-panes .pane-cell {
   grid-template-rows: 0fr;
   opacity: 0;
   visibility: hidden;
-  transition-property: grid-template-rows, opacity, margin-top, visibility;
-  transition-duration: 160ms;
-  transition-timing-function: ease-out;
-  transition-delay: 0ms, 0ms, 0ms, 160ms;
 }
 
 .session-collapsible.is-open {
   grid-template-rows: 1fr;
   opacity: 1;
   visibility: visible;
-  transition-delay: 0ms;
 }
 
 .session-collapsible-inner {
@@ -7839,7 +7609,6 @@ body.is-resizing-panes .pane-cell {
 
 .session-question-option.is-clickable {
   cursor: pointer;
-  transition: border-color 120ms ease, background-color 120ms ease, color 120ms ease;
 }
 
 .session-question-option.is-clickable:hover {
@@ -8098,9 +7867,6 @@ body.is-resizing-panes .pane-cell {
   border-radius: var(--radius-s);
   font-size: var(--font-ui-small);
   text-align: left;
-  transition-property: background-color;
-  transition-duration: 100ms;
-  transition-timing-function: ease-out;
 }
 
 .backlink:hover {
@@ -8270,7 +8036,6 @@ body.is-resizing-panes .pane-cell {
 
 .nav-agent:hover {
   background-color: var(--background-modifier-hover);
-  color: var(--text-normal);
 }
 
 .nav-agent.is-active {
@@ -8362,12 +8127,6 @@ body.is-resizing-panes .pane-cell {
 .nav-orch-toggle:focus-visible {
   background-color: var(--background-modifier-hover);
   color: var(--text-normal);
-}
-
-.nav-orch-toggle .nav-orch-chevron {
-  transition-property: transform;
-  transition-duration: 140ms;
-  transition-timing-function: ease-out;
 }
 
 .nav-orch-toggle[aria-expanded="true"] .nav-orch-chevron {
@@ -8524,7 +8283,6 @@ body.is-resizing-panes .pane-cell {
   font-family: var(--font-chrome);
   font-size: var(--font-ui-small);
   font-weight: var(--fw-semibold);
-  transition: opacity 120ms ease-out, transform 120ms ease-out;
 }
 
 .nav-empty-primary:hover {
@@ -8543,7 +8301,6 @@ body.is-resizing-panes .pane-cell {
   text-decoration: underline;
   text-decoration-color: var(--background-modifier-border);
   text-underline-offset: 3px;
-  transition: color 120ms ease-out, text-decoration-color 120ms ease-out;
 }
 
 .nav-empty-secondary:hover {
@@ -8599,9 +8356,6 @@ body.is-resizing-panes .pane-cell {
   border-left: 3px solid color-mix(in srgb, var(--accent-primary) 55%, transparent);
   border-radius: var(--radius-xs);
   background-color: var(--background-secondary);
-  transition-property: border-color, background-color;
-  transition-duration: 120ms;
-  transition-timing-function: ease-out;
 }
 
 .session-composer-row:focus-within {
@@ -8764,7 +8518,6 @@ body.is-resizing-panes .pane-cell {
   box-shadow: 0 4px 14px rgb(0 0 0 / 18%);
   opacity: 0;
   pointer-events: none;
-  transition: opacity 100ms ease-out;
   white-space: normal;
 }
 
@@ -9077,7 +8830,6 @@ body.is-resizing-panes .pane-cell {
   padding: 6px 10px;
   border-radius: var(--radius-sm);
   text-align: left;
-  transition: background-color 90ms ease;
 }
 
 .composer-slash-item.is-active,
@@ -9192,7 +8944,6 @@ body.is-resizing-panes .pane-cell {
   color: var(--text-normal);
   font-family: inherit;
   font-size: var(--font-ui-small);
-  transition: border-color 90ms ease, box-shadow 90ms ease;
 }
 
 .composer-command-input:focus,
@@ -9278,7 +9029,6 @@ textarea.composer-command-input {
   font-family: var(--font-monospace);
   font-size: var(--font-ui-smaller);
   font-weight: var(--fw-semibold);
-  transition: opacity 90ms ease, background-color 90ms ease;
 }
 
 .composer-command-submit:hover:not(:disabled) {
@@ -9501,7 +9251,6 @@ textarea.composer-command-input {
   font-size: var(--fs-sm);
   cursor: pointer;
   font-family: inherit;
-  transition: color 120ms ease;
 }
 
 .tokens-chip:hover {
@@ -9778,7 +9527,6 @@ textarea.composer-command-input {
   flex: 0 0 auto;
   gap: 2px;
   opacity: 0;
-  transition: opacity 120ms ease;
 }
 
 .artifact-block-shell:hover .artifact-actions,
@@ -9932,7 +9680,6 @@ textarea.composer-command-input {
   border: 1px solid var(--background-modifier-border);
   background: var(--background-primary);
   cursor: zoom-in;
-  transition: border-color 120ms ease, box-shadow 120ms ease;
 }
 
 .artifact-compact-diagram:hover {
@@ -10463,7 +10210,6 @@ textarea.composer-command-input {
   min-width: 0;
   max-width: 220px;
   color: var(--text-faint);
-  transition: color 120ms ease;
 }
 
 .artifact-panel-tab:hover {
@@ -10507,7 +10253,6 @@ textarea.composer-command-input {
   place-items: center;
   color: var(--text-faint);
   opacity: 0;
-  transition: opacity 120ms ease;
 }
 
 .artifact-panel-tab:hover .artifact-panel-tab-action,
@@ -10543,7 +10288,6 @@ textarea.composer-command-input {
   position: static;
   height: 26px;
   opacity: 0;
-  transition: opacity 120ms ease;
 }
 
 .artifact-panel:hover .artifact-panel-overflow-toggle,
@@ -10925,11 +10669,6 @@ textarea.composer-command-input {
   border: 0;
 }
 
-@keyframes artifact-slideover-in {
-  from { transform: translateX(24px); opacity: 0; }
-  to { transform: translateX(0); opacity: 1; }
-}
-
 @media (max-width: 899px) {
   .artifact-panel.session-side-panel,
   .agent-pane .artifact-panel.session-side-panel {
@@ -10941,7 +10680,6 @@ textarea.composer-command-input {
     min-width: 0;
     height: 100vh;
     border: 0;
-    animation: artifact-slideover-in 150ms ease-out;
   }
 
   .artifact-panel > .session-resize {
@@ -11381,10 +11119,6 @@ textarea.composer-command-input {
   font-variant-numeric: tabular-nums;
   white-space: nowrap;
   vertical-align: baseline;
-  transition:
-    background-color 120ms ease,
-    border-color 120ms ease,
-    color 120ms ease;
 }
 
 .status-badge.is-compact {
@@ -11517,9 +11251,6 @@ textarea.composer-command-input {
 
 .branch-pill.is-clickable {
   cursor: pointer;
-  transition:
-    background-color 120ms ease,
-    border-color 120ms ease;
 }
 
 .branch-pill.is-clickable:hover {
@@ -11708,7 +11439,6 @@ textarea.composer-command-input {
 
 .artifact-file-list-button {
   cursor: pointer;
-  transition: background-color 120ms ease;
 }
 
 .artifact-file-list-button:hover,
@@ -11775,12 +11505,10 @@ textarea.composer-command-input {
   letter-spacing: 0.02em;
   cursor: pointer;
   backdrop-filter: blur(4px);
-  transition: color 120ms ease, background-color 120ms ease, border-color 120ms ease;
 }
 
 .copy-pill:hover {
   color: var(--text-normal);
-  border-color: var(--text-faint);
   background-color: var(--background-primary);
 }
 
@@ -11801,7 +11529,6 @@ textarea.composer-command-input {
   right: 6px;
   opacity: 0;
   transform: translateY(-1px);
-  transition: opacity 120ms ease, transform 120ms ease;
   pointer-events: none;
 }
 
@@ -12076,8 +11803,6 @@ textarea.composer-command-input {
   letter-spacing: inherit;
   text-transform: lowercase;
   cursor: pointer;
-  transition-property: color, border-color, background-color;
-  transition-duration: 120ms;
 }
 
 /* WIKI-241: widen the tap target without inflating the visible chip. */
@@ -12212,8 +11937,6 @@ textarea.composer-command-input {
   letter-spacing: 0.02em;
   text-transform: lowercase;
   cursor: pointer;
-  transition-property: color, border-color, background-color, transform;
-  transition-duration: 120ms;
 }
 
 .stream-clamp-toggle:active {
@@ -12522,7 +12245,7 @@ textarea.composer-command-input {
 
 .workgraph-step:not(:disabled):hover {
   color: var(--text-normal);
-  border-color: var(--text-muted);
+  background-color: var(--background-modifier-hover);
 }
 
 .workgraph-play {
@@ -12539,7 +12262,7 @@ textarea.composer-command-input {
 
 .workgraph-play:hover {
   color: var(--text-normal);
-  border-color: var(--text-muted);
+  background-color: var(--background-modifier-hover);
 }
 
 .workgraph-play:focus-visible,
@@ -12845,9 +12568,6 @@ textarea.composer-command-input {
   background-color: transparent;
   color: var(--text-normal);
   overflow: hidden;
-  transition-property: border-color, background-color;
-  transition-duration: 120ms;
-  transition-timing-function: ease-out;
   min-height: 32px;
 }
 
@@ -12919,9 +12639,6 @@ textarea.composer-command-input {
   align-self: center;
   padding: 0 6px;
   color: var(--text-faint);
-  transition-property: transform, color;
-  transition-duration: 120ms;
-  transition-timing-function: ease-out;
 }
 
 .loop-chrome-caret.is-open {
@@ -13013,9 +12730,6 @@ textarea.composer-command-input {
   padding: 6px 8px;
   border-radius: var(--radius-xs);
   background-color: transparent;
-  transition-property: background-color;
-  transition-duration: 100ms;
-  transition-timing-function: ease-out;
 }
 
 .loop-history-row:hover {
@@ -13215,7 +12929,7 @@ textarea.composer-command-input {
 .replay-step:not(:disabled):hover,
 .replay-play:not([disabled]):hover {
   color: var(--text-normal);
-  border-color: var(--text-muted);
+  background-color: var(--background-modifier-hover);
 }
 
 .replay-play[aria-pressed="true"] {
@@ -13390,7 +13104,7 @@ textarea.composer-command-input {
   overflow-wrap: anywhere;
 }
 
-/* PDF artifact — solid framing, dense chrome, silky page transitions. */
+/* PDF artifact — solid framing, dense chrome, clear page rendering. */
 
 .artifact-pdf-compact {
   display: flex;
@@ -13406,7 +13120,6 @@ textarea.composer-command-input {
   border-radius: var(--radius-xs);
   background: var(--background-secondary);
   box-shadow: 0 1px 0 color-mix(in srgb, var(--background-primary) 60%, transparent) inset;
-  transition: border-color 150ms cubic-bezier(0.2, 0, 0, 1);
 }
 
 .artifact-pdf-compact-frame:hover {
@@ -13417,7 +13130,6 @@ textarea.composer-command-input {
   display: block;
   width: 100%;
   height: 100%;
-  transition: opacity 150ms cubic-bezier(0.2, 0, 0, 1);
 }
 
 .artifact-pdf-compact-meta {
@@ -13528,8 +13240,6 @@ textarea.composer-command-input {
   background: transparent;
   color: var(--text-muted);
   cursor: pointer;
-  transition: border-color 150ms cubic-bezier(0.2, 0, 0, 1),
-    background 150ms cubic-bezier(0.2, 0, 0, 1);
   /* Fixed slot geometry: the sidebar's DOM windowing math (see
      THUMB_SLOT_HEIGHT in pdf.tsx) picks the visible range from
      scrollTop / height, so every button MUST occupy exactly the
@@ -13600,8 +13310,6 @@ textarea.composer-command-input {
   background: white;
   box-shadow: 0 10px 30px color-mix(in srgb, var(--background-primary) 30%, transparent),
     0 2px 6px color-mix(in srgb, var(--background-primary) 50%, transparent);
-  transition: width 150ms cubic-bezier(0.2, 0, 0, 1),
-    height 150ms cubic-bezier(0.2, 0, 0, 1);
 }
 
 .artifact-pdf-page-canvas {
@@ -13642,7 +13350,6 @@ textarea.composer-command-input {
 
 .artifact-image {
   display: block;
-  transition: filter 320ms cubic-bezier(0.2, 0, 0, 1);
 }
 
 .artifact-image:not(.is-loaded) {
@@ -13692,7 +13399,6 @@ textarea.composer-command-input {
   filter: blur(20px) saturate(1.05);
   transform: scale(1.08);
   opacity: 1;
-  transition: opacity 360ms cubic-bezier(0.2, 0, 0, 1);
   pointer-events: none;
 }
 
@@ -13718,10 +13424,9 @@ textarea.composer-command-input {
   filter: blur(16px) saturate(1.05);
   transform: scale(1.08);
   opacity: 1;
-  transition: opacity 360ms cubic-bezier(0.2, 0, 0, 1);
   pointer-events: none;
   /* Above the sharp image so the fade actually reveals the load; the tile's
-     retention timer then unmounts the preview once the transition finishes. */
+     retention timer then unmounts the preview once the fade ends. */
   z-index: 2;
 }
 
@@ -13747,9 +13452,6 @@ textarea.composer-command-input {
   border: 0;
   background: transparent;
   cursor: zoom-in;
-  transition-property: transform, box-shadow;
-  transition-duration: 160ms;
-  transition-timing-function: cubic-bezier(0.2, 0, 0, 1);
   will-change: transform;
 }
 
@@ -13783,9 +13485,6 @@ textarea.composer-command-input {
   color: var(--text-normal);
   opacity: 0;
   transform: translate(-2px, 6px);
-  transition:
-    opacity 160ms cubic-bezier(0.2, 0, 0, 1),
-    transform 160ms cubic-bezier(0.2, 0, 0, 1);
   pointer-events: none;
   backdrop-filter: blur(6px);
 }
@@ -13831,9 +13530,6 @@ textarea.composer-command-input {
   background: var(--background-secondary);
   cursor: zoom-in;
   overflow: hidden;
-  transition:
-    transform 180ms cubic-bezier(0.2, 0, 0, 1),
-    box-shadow 180ms cubic-bezier(0.2, 0, 0, 1);
 }
 
 .artifact-gallery-tile::after {
@@ -13842,7 +13538,6 @@ textarea.composer-command-input {
   inset: 0;
   background: linear-gradient(180deg, transparent 60%, rgba(0, 0, 0, 0.28) 100%);
   opacity: 0;
-  transition: opacity 160ms cubic-bezier(0.2, 0, 0, 1);
   pointer-events: none;
 }
 
@@ -13912,7 +13607,7 @@ textarea.composer-command-input {
 }
 
 /* Scope the fade-in to the REAL image so it doesn't fight the preview's
-   own opacity transitions. The previous `.markdown-image-frame img`
+   own opacity changes. The previous `.markdown-image-frame img`
    selector matched the preview img too and beat the preview's own
    `.is-fading` rule on specificity. */
 .markdown-image-frame img:not(.markdown-image-preview) {
@@ -13923,7 +13618,6 @@ textarea.composer-command-input {
   border: 1px solid var(--image-outline);
   border-radius: var(--radius-xs);
   opacity: 0;
-  transition: opacity 260ms cubic-bezier(0.2, 0, 0, 1);
 }
 
 .markdown-image-frame.is-loaded img:not(.markdown-image-preview) {
@@ -13942,7 +13636,6 @@ textarea.composer-command-input {
   filter: blur(18px) saturate(1.05);
   transform: scale(1.08);
   opacity: 1;
-  transition: opacity 360ms cubic-bezier(0.2, 0, 0, 1);
 }
 
 .markdown-image-frame .markdown-image-preview.is-fading {
@@ -14004,7 +13697,6 @@ textarea.composer-command-input {
   grid-template-rows: auto 1fr;
   background: color-mix(in srgb, #05070c 92%, transparent);
   backdrop-filter: blur(12px);
-  animation: artifact-lightbox-enter 180ms cubic-bezier(0.2, 0, 0, 1);
   outline: 0;
 }
 
@@ -14076,11 +13768,6 @@ textarea.composer-command-input {
   font-family: inherit;
   font-size: 12px;
   cursor: pointer;
-  transition:
-    background-color 140ms cubic-bezier(0.2, 0, 0, 1),
-    border-color 140ms cubic-bezier(0.2, 0, 0, 1),
-    color 140ms cubic-bezier(0.2, 0, 0, 1),
-    transform 120ms cubic-bezier(0.2, 0, 0, 1);
 }
 
 .artifact-lightbox-action:hover {
@@ -14153,7 +13840,6 @@ textarea.composer-command-input {
   border-radius: 4px;
   opacity: 0;
   transform-origin: center;
-  transition: opacity 200ms cubic-bezier(0.2, 0, 0, 1);
   will-change: transform;
   -webkit-user-drag: element;
   user-select: none;
@@ -14178,10 +13864,6 @@ textarea.composer-command-input {
   color: rgba(255, 255, 255, 0.9);
   cursor: pointer;
   transform: translateY(-50%);
-  transition:
-    background-color 140ms cubic-bezier(0.2, 0, 0, 1),
-    border-color 140ms cubic-bezier(0.2, 0, 0, 1),
-    transform 140ms cubic-bezier(0.2, 0, 0, 1);
 }
 
 .artifact-lightbox-nav:hover {
@@ -14219,17 +13901,6 @@ textarea.composer-command-input {
   pointer-events: none;
 }
 
-@keyframes artifact-lightbox-enter {
-  from {
-    opacity: 0;
-    backdrop-filter: blur(0);
-  }
-  to {
-    opacity: 1;
-    backdrop-filter: blur(12px);
-  }
-}
-
 /* WIKI-195: universal fullscreen artifact inspector. A solid, anchored
    sheet (not a translucent lightbox) so themed detail renderers — code,
    tables, diffs — sit on their designed surfaces. */
@@ -14248,7 +13919,6 @@ textarea.composer-command-input {
   grid-template-rows: auto 1fr;
   background: var(--background-primary);
   outline: 0;
-  animation: artifact-inspector-enter 160ms cubic-bezier(0.2, 0, 0, 1);
 }
 
 .artifact-inspector-topbar {
@@ -14336,11 +14006,6 @@ textarea.composer-command-input {
   font-family: inherit;
   font-size: 12px;
   cursor: pointer;
-  transition:
-    background-color 140ms cubic-bezier(0.2, 0, 0, 1),
-    border-color 140ms cubic-bezier(0.2, 0, 0, 1),
-    color 140ms cubic-bezier(0.2, 0, 0, 1),
-    transform 120ms cubic-bezier(0.2, 0, 0, 1);
 }
 
 .artifact-inspector-action:hover {
@@ -14397,11 +14062,6 @@ textarea.composer-command-input {
   font-size: 11px;
   transform: translateX(-50%);
   pointer-events: none;
-}
-
-@keyframes artifact-inspector-enter {
-  from { opacity: 0; }
-  to { opacity: 1; }
 }
 
 @media (prefers-reduced-motion: reduce) {
@@ -14624,13 +14284,6 @@ textarea.composer-command-input {
 .agent-session-head-secondary .session-close {
   min-height: 32px;
   color: var(--text-muted);
-  transition-property: background-color, color, scale;
-}
-
-.agent-session-head-secondary .agent-surface-action:active,
-.agent-session-head-secondary .session-close:active,
-.loop-chrome button:active {
-  scale: 0.96;
 }
 
 .agent-session-head-secondary :where(button):focus-visible {
@@ -14890,7 +14543,6 @@ textarea.composer-command-input {
   justify-content: center;
   cursor: pointer;
   z-index: 1;
-  transition: transform 120ms ease, background-color 120ms ease;
 }
 
 .artifact-gif-play:hover,
@@ -15116,10 +14768,6 @@ textarea.composer-command-input {
   font-size: var(--fs-2xs);
   font-weight: 500;
   cursor: pointer;
-  transition:
-    border-color 120ms cubic-bezier(0.2, 0, 0, 1),
-    color 120ms cubic-bezier(0.2, 0, 0, 1),
-    background 120ms cubic-bezier(0.2, 0, 0, 1);
 }
 
 .visual-diff-toggle:hover:not(:disabled) {
@@ -15265,4 +14913,496 @@ textarea.composer-command-input {
     grid-template-columns: minmax(0, 1fr);
     overflow-y: visible;
   }
+}
+
+/* ------------------------------------------------------------------ */
+/* WIKI-246: OpenCode chrome language                                 */
+/* ------------------------------------------------------------------ */
+
+/* Surfaces use elevation. Borders stay for focus and separators only. */
+.workspace-ribbon,
+.workspace-sidebar,
+.session-sidebar,
+.session-side-panel {
+  background-color: var(--background-panel);
+  border-color: var(--border-subtle);
+}
+
+.workspace-ribbon {
+  background-color: var(--background-element);
+}
+
+.workspace-sidebar {
+  border-right-width: 1px;
+}
+
+.ribbon-zone + .ribbon-zone,
+.sidebar-mode-title,
+.session-footer,
+.agent-session-surface-head,
+.agent-session-head-secondary {
+  border-color: var(--border-subtle);
+}
+
+.ribbon-action,
+.nav-action-button,
+.tree-item-self,
+.nav-agent,
+.search-result,
+.quick-switcher-result,
+.session-skill-item,
+.kanban-card {
+  border-radius: 0;
+}
+
+.nav-action-button:hover,
+.tree-item-self:hover,
+.nav-agent:hover,
+.search-result:hover,
+.session-skill-item:hover,
+.kanban-card:hover,
+.quick-switcher-result:hover:not(.is-selected):not(.is-disabled) {
+  background-color: var(--background-element);
+}
+
+/* ribbon rests on element bg; hover needs the modifier token to stay visible */
+.ribbon-action:hover {
+  background-color: var(--background-modifier-hover);
+}
+
+/* Current items are marked by text and a gutter dot. Cursor selection uses
+   a solid fill and contrast text. */
+.tree-item-self.is-active,
+.nav-agent.is-active,
+.fleet-switcher-result.is-current:not(.is-selected) {
+  position: relative;
+  background-color: transparent;
+  color: var(--primary, var(--accent-primary));
+  box-shadow: none;
+  font-weight: var(--fw-semibold);
+}
+
+.tree-item-self.is-active::before,
+.nav-agent.is-active::before,
+.fleet-switcher-result.is-current:not(.is-selected)::before {
+  position: absolute;
+  left: 4px;
+  color: var(--accent-primary);
+  content: "●";
+  font-size: 0.58em;
+  line-height: 1;
+}
+
+.tree-item-self.is-active {
+  padding-left: 8px;
+  border-left: 0;
+}
+
+.nav-agent.is-active {
+  padding-left: 8px;
+  border-left: 0;
+}
+
+.quick-switcher-result.is-selected,
+.command-palette-mode-button.is-selected,
+.session-skill-item.is-active {
+  background-color: var(--accent-primary);
+  color: var(--selected-list-item-text);
+  font-weight: var(--fw-semibold);
+}
+
+.quick-switcher-result.is-selected svg,
+.quick-switcher-result.is-selected .quick-switcher-name,
+.quick-switcher-result.is-selected .quick-switcher-path,
+.quick-switcher-result.is-selected .quick-switcher-session-badge,
+.quick-switcher-result.is-selected .fleet-switcher-current,
+.session-skill-item.is-active .session-skill-name,
+.session-skill-item.is-active .session-skill-desc {
+  color: inherit;
+}
+
+.quick-switcher-result.is-selected .quick-switcher-path,
+.quick-switcher-result.is-selected .quick-switcher-session-badge,
+.session-skill-item.is-active .session-skill-desc {
+  opacity: 0.78;
+}
+
+.agent-card.is-selected {
+  border: 0;
+  border-left: 0;
+  border-radius: 0;
+  background-color: var(--accent-primary);
+  color: var(--selected-list-item-text);
+}
+
+.agent-card.is-selected :where(.agent-ticket, .agent-age, .agent-step, .agent-blocker,
+  .agent-flag, .agent-meta, .agent-window, .agent-chain, .agent-worktree,
+  .agent-pr, .agent-log-toggle, .agent-replace-button) {
+  color: inherit;
+}
+
+.kanban-card:hover {
+  box-shadow: none;
+}
+
+/* Semantic left rails replace framed chrome. */
+.nav-inline-error,
+.nav-files-retry,
+.agent-inline-error,
+.agent-spawn-preview,
+.agent-tech,
+.session-composer-row,
+.session-pending-user {
+  border-top: 0;
+  border-right: 0;
+  border-bottom: 0;
+  border-radius: 0;
+}
+
+.nav-inline-error,
+.nav-files-retry {
+  border-left: 3px solid var(--accent-warning);
+  background-color: var(--background-panel);
+}
+
+.agent-inline-error {
+  border-left-width: 3px;
+}
+
+.agent-spawn-preview {
+  border-left-width: 3px;
+  background-color: var(--background-panel);
+}
+
+.agent-tech {
+  background-color: var(--background-panel);
+}
+
+.session-composer {
+  gap: 6px;
+  padding-top: 10px;
+  border-top: 0;
+}
+
+.session-composer-row {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto;
+  grid-template-rows: auto minmax(40px, auto);
+  min-height: 64px;
+  padding: 8px 10px;
+  border-left: 3px solid color-mix(in srgb, var(--accent-primary) 62%, transparent);
+  background-color: var(--background-element);
+}
+
+.session-composer-row:focus-within {
+  border-left-color: var(--border-active);
+  background-color: var(--background-element);
+}
+
+.session-composer-target {
+  grid-column: 1 / -1;
+  grid-row: 1;
+  width: auto;
+  min-height: 18px;
+  padding: 0;
+  color: var(--text-muted);
+}
+
+.session-composer-row .session-input-wrap {
+  grid-column: 1;
+  grid-row: 2;
+}
+
+.session-composer-row .session-send {
+  grid-column: 2;
+  grid-row: 2;
+}
+
+.session-composer-target strong {
+  color: var(--accent-primary);
+  font-weight: var(--fw-semibold);
+}
+
+.session-composer-status {
+  min-height: 20px;
+  color: var(--text-muted);
+}
+
+/* Dialogs are panels on a scrim. They have no frame or movement. */
+.modal-backdrop,
+.settings-backdrop {
+  background-color: var(--background-overlay-strong);
+  animation: none;
+}
+
+.dialog,
+.quick-switcher,
+.settings-modal {
+  top: 25vh;
+  width: min(480px, calc(100vw - 32px));
+  border: 0;
+  border-radius: 0;
+  background-color: var(--background-panel);
+  box-shadow: none;
+}
+
+.dialog {
+  gap: 12px;
+  padding: 12px 16px 14px;
+}
+
+.settings-modal {
+  width: min(680px, calc(100vw - 32px));
+  max-height: 70vh;
+  translate: -50% 0;
+}
+
+.agent-spawn-modal {
+  top: 25vh;
+  width: min(620px, calc(100vw - 32px));
+}
+
+.agent-replace-modal {
+  top: 25vh;
+  width: min(500px, calc(100vw - 32px));
+}
+
+@media (max-width: 640px) {
+  .dialog,
+  .quick-switcher,
+  .settings-modal,
+  .agent-spawn-modal {
+    top: 12px;
+    max-height: calc(100vh - 24px);
+    overflow-y: auto;
+  }
+}
+
+.dialog-title {
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: 12px;
+  color: var(--text);
+  font-size: var(--font-ui-small);
+  font-weight: var(--fw-semibold);
+  letter-spacing: 0;
+}
+
+.dialog-title-esc {
+  border: 0;
+  padding: 0;
+  background: transparent;
+  color: var(--text-muted);
+  font: inherit;
+  font-size: var(--font-ui-smaller);
+  font-weight: var(--fw-regular);
+  cursor: pointer;
+}
+
+.dialog-title-esc:focus-visible {
+  color: var(--text);
+}
+
+.dialog-input,
+.agent-spawn-select {
+  border: 0;
+  border-bottom: 1px solid var(--border-default);
+  border-radius: 0;
+  background-color: var(--background-element);
+}
+
+.dialog-input:focus,
+.dialog-input:focus-visible,
+.agent-spawn-select:focus,
+.agent-spawn-select:focus-visible {
+  border-bottom-color: var(--border-active);
+  box-shadow: none;
+}
+
+.dialog-actions {
+  gap: 8px;
+}
+
+.dialog-button {
+  min-height: 30px;
+  padding: 5px 12px;
+  border: 0;
+  border-radius: 0;
+  background-color: var(--background-menu);
+  color: var(--text-muted);
+  font-weight: var(--fw-medium);
+}
+
+.dialog-button:hover {
+  border: 0;
+  background-color: var(--background-modifier-hover);
+}
+
+.dialog-confirm,
+.dialog-confirm:hover {
+  border: 0;
+  background-color: var(--accent-primary);
+  color: var(--selected-list-item-text);
+}
+
+.quick-switcher {
+  max-height: 60vh;
+  overflow: hidden;
+}
+
+@media (max-width: 640px) {
+  .quick-switcher {
+    max-height: calc(100vh - 24px);
+    overflow-y: auto;
+  }
+}
+
+.quick-switcher input {
+  padding: 10px 16px;
+  border-bottom: 1px solid var(--border-subtle);
+  background-color: transparent;
+}
+
+.quick-switcher-results {
+  padding: 6px 8px 8px;
+}
+
+.quick-switcher-group + .quick-switcher-group {
+  border-top: 0;
+}
+
+.quick-switcher-group-label {
+  padding: 5px 10px 3px;
+  color: var(--accent-primary);
+  font-weight: var(--fw-semibold);
+}
+
+.quick-switcher-result {
+  padding: 7px 10px;
+  color: var(--text-muted);
+}
+
+.quick-switcher-empty,
+.nav-empty,
+.session-empty,
+.empty-state-title {
+  color: var(--text-muted);
+}
+
+/* Transparent, single-line status rows. */
+.status-bar {
+  min-height: var(--status-bar-height);
+  padding: 0 12px;
+  border-top: 0;
+  background-color: transparent;
+  color: var(--text-muted);
+}
+
+.tmux-status-item {
+  height: auto;
+  padding: 0;
+  border-radius: 0;
+}
+
+.tmux-status-item:hover {
+  background-color: var(--background-modifier-hover);
+}
+
+.tmux-status-item.is-active {
+  background-color: transparent;
+  color: var(--text);
+}
+
+.tmux-status-item.is-active::before {
+  margin-right: 5px;
+  color: var(--accent-primary);
+  content: "●";
+  font-size: 0.55em;
+  vertical-align: middle;
+}
+
+.status-bar-metrics {
+  gap: 16px;
+}
+
+.status-bar-metrics > span {
+  display: inline-flex;
+  align-items: baseline;
+  gap: 4px;
+  color: var(--text);
+}
+
+.status-bar-metrics > span::before {
+  color: var(--accent-primary);
+  content: "·";
+}
+
+.status-bar-metrics > span:first-child::before { content: "∑"; }
+.status-bar-metrics > span:nth-child(2)::before { content: "#"; }
+
+.session-footer {
+  flex-wrap: wrap;
+  min-height: 26px;
+  padding: 2px 14px 8px;
+  border-top: 0;
+  background-color: transparent;
+  color: var(--text-muted);
+}
+
+.session-footer-sep,
+.session-model-queued,
+.session-hint {
+  color: var(--text-muted);
+}
+
+.session-hint-key {
+  color: var(--text);
+  font-weight: var(--fw-medium);
+}
+
+.quick-switcher > .dialog-title {
+  padding: 4px 16px 0;
+}
+
+.quick-switcher-footer {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+  padding: 4px 16px 8px;
+  color: var(--text-muted);
+  font-size: var(--font-ui-smaller);
+}
+
+.quick-switcher-hint {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+}
+
+.quick-switcher-hint-key {
+  color: var(--text);
+  font-family: var(--font-monospace);
+}
+
+.quick-switcher-hint-label {
+  color: var(--text-muted);
+}
+
+@media (prefers-reduced-motion: reduce) {
+  *,
+  *::before,
+  *::after {
+    animation-duration: 0.01ms !important;
+    animation-iteration-count: 1 !important;
+    scroll-behavior: auto !important;
+    transition-duration: 0.01ms !important;
+  }
+}
+
+/* transcript scope (WIKI-245/#182): keep main's transition on the tool head until that PR restyles it */
+.session-tool-head {
+  transition-property: background-color, border-color, color, transform, opacity, box-shadow;
+  transition-duration: 120ms;
+  transition-timing-function: ease-out;
 }
