@@ -321,6 +321,29 @@ class CostAggregatorTests(unittest.TestCase):
         self.assertFalse(save_heartbeat.called)
         self.assertEqual(costs.cost_heartbeat_path().read_text(encoding="utf-8"), heartbeat_before)
 
+    def test_background_failed_state_write_retries_until_success(self) -> None:
+        raw = self._run("run-background-write-failure")
+        raw.write_text(json.dumps(_envelope("2026-07-30T10:00:00Z", _usage(10, 2))) + "\n", encoding="utf-8")
+        costs.invalidate_background_state()
+        self.assertTrue(asyncio.run(costs.refresh_in_background()))
+        heartbeat_before = costs.cost_heartbeat_path().read_text(encoding="utf-8")
+
+        raw.write_text(json.dumps(_envelope("2026-07-30T10:01:00Z", _usage(20, 4))) + "\n", encoding="utf-8")
+        with mock.patch.object(costs, "_save_state", side_effect=[False, False, True]) as save_state, mock.patch.object(
+            costs, "_save_heartbeat", wraps=costs._save_heartbeat
+        ) as save_heartbeat:
+            self.assertTrue(asyncio.run(costs.refresh_in_background()))
+            self.assertEqual(costs.cost_heartbeat_path().read_text(encoding="utf-8"), heartbeat_before)
+
+            self.assertTrue(asyncio.run(costs.refresh_in_background()))
+            self.assertEqual(costs.cost_heartbeat_path().read_text(encoding="utf-8"), heartbeat_before)
+
+            self.assertTrue(asyncio.run(costs.refresh_in_background()))
+
+        self.assertEqual(save_state.call_count, 3)
+        self.assertEqual(save_heartbeat.call_count, 1)
+        self.assertNotEqual(costs.cost_heartbeat_path().read_text(encoding="utf-8"), heartbeat_before)
+
     def test_atomic_run_publication_appears_on_the_next_refresh(self) -> None:
         costs.refresh()
 

@@ -57,6 +57,12 @@ _BACKGROUND_STATE: dict[str, Any] | None = None
 ACCOUNTING_FIELDS = ("input", "cache_read", "cache_write_5m", "cache_write_1h", "output")
 
 
+class _CostState(dict[str, Any]):
+    """In-memory state with a save-pending marker outside the JSON payload."""
+
+    dirty: bool
+
+
 def runtime_runs_dir() -> Path:
     runtime = Path(os.environ.get("WIKI_AGENT_RUNTIME_DIR") or Path.home() / ".wiki" / "agent-runtime")
     return Path(os.environ.get("WIKI_AGENT_RUNS_DIR") or runtime / "runs").expanduser()
@@ -71,15 +77,19 @@ def cost_heartbeat_path() -> Path:
     return Path(f"{cost_state_path()}.heartbeat")
 
 
-def _empty_state() -> dict[str, Any]:
-    return {
-        "version": STATE_VERSION,
-        "updated_at": None,
-        "runs_dir_signature": None,
-        "active_runs": [],
-        "runs": {},
-        "records": {},
-    }
+def _empty_state() -> _CostState:
+    state = _CostState(
+        {
+            "version": STATE_VERSION,
+            "updated_at": None,
+            "runs_dir_signature": None,
+            "active_runs": [],
+            "runs": {},
+            "records": {},
+        }
+    )
+    state.dirty = False
+    return state
 
 
 def _load_state() -> dict[str, Any]:
@@ -106,7 +116,9 @@ def _load_state() -> dict[str, Any]:
         heartbeat = None
     if isinstance(heartbeat, dict) and isinstance(heartbeat.get("updated_at"), str):
         value["updated_at"] = heartbeat["updated_at"]
-    return value
+    state = _CostState(value)
+    state.dirty = False
+    return state
 
 
 def _save_json(path: Path, value: dict[str, Any]) -> bool:
@@ -570,6 +582,10 @@ def _scan_run(state: dict[str, Any], run_id: str, root_fd: int) -> bool:
 def refresh(state: dict[str, Any] | None = None) -> dict[str, Any]:
     if state is None:
         state = _load_state()
+    elif not isinstance(state, _CostState):
+        cached_state = _CostState(state)
+        cached_state.dirty = False
+        state = cached_state
     root_fd = _open_root()
     seen_runs: set[str] = set()
     runs_dir_signature: list[int] | None = None
@@ -625,7 +641,10 @@ def refresh(state: dict[str, Any] | None = None) -> dict[str, Any]:
         ]
     state["runs_dir_signature"] = runs_dir_signature
     state["updated_at"] = _now_iso()
-    state_saved = _save_state(state) if state_changed else True
+    state.dirty = bool(state.dirty or state_changed)
+    state_saved = _save_state(state) if state.dirty else True
+    if state_saved:
+        state.dirty = False
     if state_saved:
         _save_heartbeat(state)
     return state
