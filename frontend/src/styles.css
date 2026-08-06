@@ -6472,7 +6472,10 @@ body.is-resizing-panes .pane-cell {
 /* WIKI-244: the working diff renders open — the section head is a status
    line with a raw-diff copy control, not a toggle. */
 .codex-stream-diff-copy {
+  display: inline-flex;
+  align-items: center;
   margin-left: 8px;
+  min-height: 24px;
   padding: 1px 7px;
   border: 1px solid transparent;
   border-radius: var(--radius-xs);
@@ -7098,6 +7101,17 @@ body.is-resizing-panes .pane-cell {
   padding: 4px 8px;
   border-radius: var(--radius-xs);
   cursor: pointer;
+}
+
+@media (max-width: 480px) {
+  .session-model-confirm {
+    position: fixed;
+    right: 12px;
+    bottom: 58px;
+    left: calc(44px + 12px);
+    width: auto;
+    max-width: none;
+  }
 }
 
 .pr-review {

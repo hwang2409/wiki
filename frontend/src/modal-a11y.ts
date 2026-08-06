@@ -1,5 +1,7 @@
 import { useEffect, useRef } from "react";
 
+type ElementRef = { current: HTMLElement | null };
+
 const FOCUSABLE_SELECTOR = [
   "a[href]",
   "button:not([disabled])",
@@ -17,9 +19,15 @@ function focusableWithin(root: HTMLElement): HTMLElement[] {
   );
 }
 
-export function useModalA11y<T extends HTMLElement>(open: boolean) {
+export function useModalA11y<T extends HTMLElement>(
+  open: boolean,
+  onEscape?: () => void,
+  fallbackRef?: ElementRef,
+) {
   const dialogRef = useRef<T | null>(null);
   const invokerRef = useRef<HTMLElement | null>(null);
+  const onEscapeRef = useRef(onEscape);
+  onEscapeRef.current = onEscape;
 
   useEffect(() => {
     if (!open) return;
@@ -66,6 +74,12 @@ export function useModalA11y<T extends HTMLElement>(open: boolean) {
     };
     const frame = window.requestAnimationFrame(focusFirst);
     const onKeyDown = (event: KeyboardEvent) => {
+      if (event.key === "Escape") {
+        event.preventDefault();
+        event.stopPropagation();
+        onEscapeRef.current?.();
+        return;
+      }
       if (event.key !== "Tab") return;
       const focusables = focusableWithin(dialog);
       if (focusables.length === 0) {
@@ -97,10 +111,18 @@ export function useModalA11y<T extends HTMLElement>(open: boolean) {
         if (root.ariaHidden === null) root.element.removeAttribute("aria-hidden");
         else root.element.setAttribute("aria-hidden", root.ariaHidden);
       }
-      const invoker = invokerRef.current;
-      if (invoker && document.contains(invoker)) invoker.focus();
+      window.requestAnimationFrame(() => {
+        const invoker = invokerRef.current;
+        const fallback = fallbackRef?.current;
+        const target = invoker && document.contains(invoker)
+          ? invoker
+          : fallback && document.contains(fallback)
+            ? fallback
+            : null;
+        target?.focus();
+      });
     };
-  }, [open]);
+  }, [fallbackRef, open]);
 
   return dialogRef;
 }

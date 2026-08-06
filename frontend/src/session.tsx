@@ -823,7 +823,7 @@ function mergeComposerEvents(events: SessionEvent[], composerEvents: SessionEven
   return merged;
 }
 
-function SessionModelFooter({
+export function SessionModelFooter({
   session,
   ticket,
 }: {
@@ -834,7 +834,14 @@ function SessionModelFooter({
   const [models, setModels] = useState<AgentModelOption[]>([]);
   const [loading, setLoading] = useState(false);
   const [confirmModel, setConfirmModel] = useState<string | null>(null);
-  const modelConfirmRef = useModalA11y<HTMLDivElement>(Boolean(confirmModel));
+  const modelTriggerRef = useRef<HTMLButtonElement | null>(null);
+  const modelConfirmRef = useModalA11y<HTMLDivElement>(
+    Boolean(confirmModel),
+    () => setConfirmModel(null),
+    modelTriggerRef,
+  );
+  const modelMenuRef = useRef<HTMLDivElement | null>(null);
+  const modelOptionRefs = useRef<Array<HTMLButtonElement | null>>([]);
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const currentModel = session.model ?? "";
@@ -847,6 +854,34 @@ function SessionModelFooter({
       ),
     [currentModel, kind, models],
   );
+
+  useEffect(() => {
+    if (!open || loading || allowedModels.length === 0) return;
+    const frame = window.requestAnimationFrame(() => modelOptionRefs.current[0]?.focus());
+    return () => window.cancelAnimationFrame(frame);
+  }, [allowedModels.length, loading, open]);
+
+  function handleModelMenuKeyDown(event: React.KeyboardEvent<HTMLDivElement>) {
+    const options = modelOptionRefs.current.filter(
+      (option): option is HTMLButtonElement => option !== null,
+    );
+    if (options.length === 0) return;
+    const activeIndex = options.indexOf(document.activeElement as HTMLButtonElement);
+    let nextIndex: number | null = null;
+    if (event.key === "ArrowDown") nextIndex = activeIndex < 0 ? 0 : (activeIndex + 1) % options.length;
+    else if (event.key === "ArrowUp") nextIndex = activeIndex < 0 ? options.length - 1 : (activeIndex - 1 + options.length) % options.length;
+    else if (event.key === "Home") nextIndex = 0;
+    else if (event.key === "End") nextIndex = options.length - 1;
+    else if (event.key === "Escape") {
+      event.preventDefault();
+      setOpen(false);
+      modelTriggerRef.current?.focus();
+      return;
+    }
+    if (nextIndex === null) return;
+    event.preventDefault();
+    options[nextIndex]?.focus();
+  }
 
   useEffect(() => {
     if (!open || models.length > 0 || loading) return;
@@ -903,10 +938,12 @@ function SessionModelFooter({
       <span className={`session-model-badge${desiredModel ? " has-queued" : ""}`}>
         <button
           aria-expanded={open}
-          aria-haspopup="listbox"
+          aria-controls="session-model-menu"
+          aria-haspopup="menu"
           aria-label="Change model"
           className="session-model-current"
           disabled={busy}
+          ref={modelTriggerRef}
           type="button"
           onClick={() => setOpen((value) => !value)}
         >
@@ -928,17 +965,24 @@ function SessionModelFooter({
         ) : null}
       </span>
       {open ? (
-        <div aria-label="Available models" className="session-model-menu" role="listbox">
+        <div
+          aria-label="Available models"
+          className="session-model-menu"
+          id="session-model-menu"
+          ref={modelMenuRef}
+          role="menu"
+          onKeyDown={handleModelMenuKeyDown}
+        >
           {loading ? <div className="session-model-empty">Loading models</div> : null}
           {!loading && allowedModels.length === 0 ? (
             <div className="session-model-empty">No alternate models</div>
           ) : null}
-          {allowedModels.map((option) => (
+          {allowedModels.map((option, index) => (
             <button
-              aria-selected={option.id === currentModel}
               className="session-model-option"
               key={option.id}
-              role="option"
+              ref={(element) => { modelOptionRefs.current[index] = element; }}
+              role="menuitem"
               type="button"
               onClick={() => setConfirmModel(option.id)}
             >

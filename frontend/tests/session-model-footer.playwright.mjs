@@ -177,9 +177,21 @@ async function main() {
     // and the diagnostics JSON dump.
     await page.getByText("model changed to gpt-5.5", { exact: true }).waitFor();
 
-    await page.getByRole("button", { name: "Change model" }).click();
-    await page.getByRole("button", { name: /GPT 5\.5/ }).click();
+    const modelTrigger = page.getByRole("button", { name: "Change model" });
+    await modelTrigger.click();
+    await expectFocused(page, page.getByRole("menuitem").first());
+    const modelOption = page.getByRole("menuitem", { name: /GPT 5\.5/ });
+    await modelOption.click();
     await page.getByText("Switch to gpt-5.5 after current turn finishes? Currently on gpt-5.4.").waitFor();
+    await page.keyboard.press("Escape");
+    await page.locator(".session-model-confirm").waitFor({ state: "detached" });
+    await expectFocused(page, modelOption);
+
+    await modelOption.click();
+    await page.getByRole("button", { name: "Cancel" }).click();
+    await expectFocused(page, modelOption);
+
+    await modelOption.click();
     await page.getByRole("button", { name: "Switch model" }).click();
     await page.waitForFunction(async (ticket) => {
       const response = await fetch(`/api/agents/${ticket}/session`);
@@ -187,6 +199,7 @@ async function main() {
       return payload.desired_model === "gpt-5.5";
     }, TICKET);
     await page.getByText("queued: gpt-5.5").waitFor();
+    await expectFocused(page, modelTrigger);
 
     await page.getByRole("button", { name: "Cancel queued model change" }).click();
     await page.waitForFunction(async (ticket) => {
@@ -195,12 +208,36 @@ async function main() {
       return payload.desired_model === null;
     }, TICKET);
     await page.getByText("queued: gpt-5.5").waitFor({ state: "detached" });
+
+    await modelTrigger.click();
+    await modelOption.click();
+    const confirmation = page.locator(".session-model-confirm");
+    await confirmation.waitFor();
+    await page.setViewportSize({ width: 320, height: 900 });
+    const bounds = await confirmation.boundingBox();
+    if (!bounds || bounds.x < 12 || bounds.x + bounds.width > 308) {
+      throw new Error(`model confirmation clips at 320px: ${JSON.stringify(bounds)}`);
+    }
     await page.screenshot({ path: path.join(OUT_DIR, "session-model-footer.png"), fullPage: true });
   } finally {
     await page.close();
     await browser.close();
     await backend.stop();
     await supervisor.stop();
+  }
+}
+
+async function expectFocused(page, locator) {
+  const handle = await locator.elementHandle();
+  if (!handle) throw new Error("expected focus target to be mounted");
+  try {
+    await page.waitForFunction((element) => document.activeElement === element, handle, { timeout: 5_000 });
+  } catch (error) {
+    const state = await page.evaluate(() => ({
+      active: document.activeElement?.outerHTML,
+      menu: document.querySelector(".session-model-menu")?.outerHTML,
+    }));
+    throw new Error(`expected focus target to have focus: ${JSON.stringify(state)}`, { cause: error });
   }
 }
 
