@@ -21,6 +21,7 @@ Normalized event:
 
 from __future__ import annotations
 
+import ast
 import base64
 import binascii
 import json
@@ -556,6 +557,162 @@ def _codex_tool_input(name: str, arguments: object) -> str:
     return _clip(str(arguments), MAX_TOOL_IO)
 
 
+_CODEX_HARNESS_CALL = re.compile(r"\btools\.([A-Za-z_$][\w$]*)\s*\(")
+
+
+def _balanced_js_call_end(source: str, opening: int) -> int | None:
+    depth = 1
+    quote: str | None = None
+    escaped = False
+    for index in range(opening + 1, len(source)):
+        char = source[index]
+        if quote:
+            if escaped:
+                escaped = False
+            elif char == "\\":
+                escaped = True
+            elif char == quote:
+                quote = None
+            continue
+        if char in ("'", '"', "`"):
+            quote = char
+        elif char == "(":
+            depth += 1
+        elif char == ")":
+            depth -= 1
+            if depth == 0:
+                return index
+    return None
+
+
+def _codex_harness_calls(source: str) -> list[tuple[str, str]]:
+    calls: list[tuple[str, str]] = []
+    for match in _CODEX_HARNESS_CALL.finditer(source):
+        end = _balanced_js_call_end(source, match.end() - 1)
+        if end is not None:
+            calls.append((match.group(1), source[match.end():end].strip()))
+    return calls
+
+
+def _codex_js_arguments(source: str) -> dict | None:
+    value = source.strip()
+    if not value.startswith("{"):
+        return None
+    for candidate in (value, re.sub(r"([,{]\s*)([A-Za-z_$][\w$]*)\s*:", r'\1"\2":', value)):
+        candidate = re.sub(r",\s*([}\]])", r"\1", candidate)
+        try:
+            parsed = json.loads(candidate)
+        except ValueError:
+            try:
+                parsed = ast.literal_eval(candidate)
+            except (SyntaxError, ValueError):
+                continue
+        if isinstance(parsed, dict):
+            return parsed
+    return None
+
+
+def _codex_harness_tool(name: object, raw_input: object) -> dict | None:
+    """Unwrap the new Codex runtime's ``const r = await tools.*(...)`` input."""
+    if name != "exec" or not isinstance(raw_input, str):
+        return None
+    calls = _codex_harness_calls(raw_input)
+    if not calls:
+        return None
+    function_name, argument_source = calls[0]
+    arguments = _codex_js_arguments(argument_source)
+    classified_input = _codex_tool_input(function_name, arguments or argument_source)
+    if function_name == "exec_command" and arguments:
+        command = arguments.get("cmd", arguments.get("command"))
+        if isinstance(command, str):
+            classified_input = _clip(command, MAX_TOOL_IO)
+    if len(calls) == 1:
+        display_input = classified_input
+    else:
+        display_input = _clip(f"```js\n{raw_input.strip()}\n```", MAX_TOOL_IO)
+    return {
+        "name": function_name,
+        "input": display_input,
+        "classify_input": classified_input,
+        "arguments": arguments,
+        "calls": len(calls),
+    }
+
+
+def _codex_output_status(value: dict) -> bool | None:
+    for key in ("is_error", "isError", "failed"):
+        if isinstance(value.get(key), bool):
+            return not value[key]
+    if "exit_code" in value:
+        exit_code = value.get("exit_code")
+        if isinstance(exit_code, (int, float)):
+            return exit_code == 0
+    return None
+
+
+def _codex_tool_output(value: object) -> tuple[str, bool | None]:
+    """Extract command text from Codex output envelopes and infer success."""
+    if value is None:
+        return "", None
+    if isinstance(value, str):
+        stripped = value.strip()
+        for parser in (json.loads, ast.literal_eval):
+            if not stripped.startswith(("{", "[")):
+                break
+            try:
+                parsed = parser(stripped)
+            except (ValueError, SyntaxError):
+                continue
+            if isinstance(parsed, (dict, list)):
+                extracted, status = _codex_tool_output(parsed)
+                if status is not None or extracted != stripped:
+                    return extracted, status
+        if re.search(r"\bexited with code 0\b", value):
+            return value, True
+        match = re.search(r"\b(?:exit(?:ed)?|exit_code)\D+(\d+)\b", value)
+        return value, int(match.group(1)) == 0 if match else None
+    if isinstance(value, list):
+        text_parts = [
+            item.get("text")
+            for item in value
+            if isinstance(item, dict) and isinstance(item.get("text"), str)
+        ]
+        if not text_parts and value and all(isinstance(item, dict) for item in value):
+            nested_outputs: list[str] = []
+            nested_statuses: list[bool] = []
+            for item in value:
+                extracted, nested_status = _codex_tool_output(item)
+                nested_outputs.append(extracted)
+                if nested_status is not None:
+                    nested_statuses.append(nested_status)
+            if nested_outputs:
+                return "\n".join(output for output in nested_outputs if output), (
+                    all(nested_statuses) if nested_statuses else None
+                )
+        for text in text_parts:
+            extracted, status = _codex_tool_output(text)
+            if status is not None and extracted != text:
+                return extracted, status
+        return "\n".join(text_parts), None
+    if isinstance(value, dict):
+        status = _codex_output_status(value)
+        if "output" in value:
+            output = value.get("output")
+            if isinstance(output, str):
+                return output, status
+            extracted, nested_status = _codex_tool_output(output)
+            return extracted, status if status is not None else nested_status
+        content = value.get("content")
+        if content is not None:
+            extracted, nested_status = _codex_tool_output(content)
+            return extracted, status if status is not None else nested_status
+        error = value.get("error")
+        if error is not None:
+            return str(error), False if status is None else status
+        return json.dumps(value), status
+    return str(value), None
+
+
 def _structured_edit_payload(name: object, raw_input: object) -> dict | None:
     """Keep bounded edit data needed by the transcript diff renderer."""
     tool_name = str(name or "").strip().lower()
@@ -1035,15 +1192,26 @@ def _codex_apply(state: dict, row: dict) -> None:
             name = payload.get("name") or ptype.replace("_call", "")
             raw_input = payload.get("arguments", payload.get("input", payload.get("action", "")))
             call_id = payload.get("call_id")
+            harness = _codex_harness_tool(name, raw_input)
+            if harness:
+                name = harness["name"]
+                tool_input = harness["input"]
+                classify_input = harness["classify_input"]
+            else:
+                tool_input = _codex_tool_input(name, raw_input)
+                classify_input = tool_input
             if _is_artifact_tool(name) and call_id:
                 state.setdefault("pending_artifacts", {})[call_id] = {
                     "name": name,
-                    "input": _tool_arguments(raw_input) or {},
+                    "input": (
+                        harness.get("arguments")
+                        if harness and isinstance(harness.get("arguments"), dict)
+                        else _tool_arguments(raw_input)
+                    ) or {},
                 }
                 _record_row_disposition(state, EVENT_DISPOSITION_RENDERED)
                 return
-            tool_input = _codex_tool_input(name, raw_input)
-            archetype, summary = classify_tool(name, tool_input)
+            archetype, summary = classify_tool(name, classify_input)
             event = {
                 "kind": "tool",
                 "ts": ts,
@@ -1066,17 +1234,14 @@ def _codex_apply(state: dict, row: dict) -> None:
             _record_row_disposition(state, EVENT_DISPOSITION_RENDERED)
         elif ptype in ("function_call_output", "custom_tool_call_output", "tool_search_output"):
             call_id = payload.get("call_id")
-            output = payload.get("output")
-            if isinstance(output, dict):
-                output = output.get("content") or json.dumps(output)
-            output_text = str(output or "")
+            output_text, output_ok = _codex_tool_output(payload.get("output"))
             if _complete_artifact(state, call_id, output_text, ts):
                 _record_row_disposition(state, EVENT_DISPOSITION_RENDERED)
                 return
             event = pending.pop(call_id, None)
             if event:
                 event["tool"]["output"] = _clip(output_text, MAX_TOOL_IO)
-                event["tool"]["ok"] = "exited with code 0" in output_text or None
+                event["tool"]["ok"] = output_ok
                 event["tool"]["completed_at"] = ts
                 _record_tool_patch(state, event)
             _record_row_disposition(state, EVENT_DISPOSITION_RENDERED)

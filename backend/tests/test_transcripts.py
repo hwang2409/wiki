@@ -660,6 +660,44 @@ class ArtifactTranscriptTests(unittest.TestCase):
                 )
 
 
+class CodexNewRuntimeTranscriptTests(unittest.TestCase):
+    def setUp(self) -> None:
+        transcripts._cache.clear()
+
+    def test_new_runtime_harness_calls_and_outputs_are_normalized(self) -> None:
+        path = FIXTURES_DIR / "codex_new_runtime_rendering.jsonl"
+
+        parsed = transcripts.read_session_events("codex", path)
+
+        tools = [event["tool"] for event in parsed["events"] if event["kind"] == "tool"]
+        self.assertEqual(len(tools), 4)
+
+        read_tool = tools[0]
+        self.assertEqual(read_tool["name"], "exec_command")
+        self.assertEqual(read_tool["archetype"], "read")
+        self.assertEqual(read_tool["summary"], "read transcripts.py:1-40")
+        self.assertEqual(read_tool["output"], "1\tfrom __future__ import annotations\n2\t\n")
+        self.assertTrue(read_tool["ok"])
+
+        github_tool = tools[1]
+        self.assertEqual(github_tool["archetype"], "github")
+        self.assertEqual(github_tool["summary"], "gh pr checks 13606 --repo hwang2409/wiki")
+        self.assertEqual(github_tool["output"], "all checks passed\n")
+
+        multi_tool = tools[2]
+        self.assertTrue(multi_tool["input"].startswith("```js\nconst results"))
+        self.assertTrue(multi_tool["input"].endswith("\n```"))
+        self.assertEqual(multi_tool["archetype"], "git")
+        self.assertEqual(multi_tool["summary"], "git status")
+        self.assertEqual(multi_tool["output"], "## git\n## wiki-main\n## rg\n1034: custom_tool_call\n")
+        self.assertTrue(multi_tool["ok"])
+
+        failed_tool = tools[3]
+        self.assertEqual(failed_tool["archetype"], "validate")
+        self.assertFalse(failed_tool["ok"])
+        self.assertEqual(failed_tool["output"], "test command failed\n")
+
+
 def _write_rollout(day_dir: Path, name: str, cwd: str, session_id: str,
                    kickoff_ticket: str | None = None, mtime: float | None = None) -> Path:
     day_dir.mkdir(parents=True, exist_ok=True)
