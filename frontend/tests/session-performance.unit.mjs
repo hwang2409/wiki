@@ -4,8 +4,8 @@ import test from "node:test";
 import {
   buildVirtualLayout,
   buildVirtualLayoutIncremental,
-  groupEvents,
-  groupEventsIncremental,
+  eventRows,
+  eventRowsIncremental,
 } from "../src/session-layout.ts";
 import {
   buildSession,
@@ -244,58 +244,60 @@ test("prependOlderEvents rejects a non-contiguous page", () => {
   assert.equal(prependOlderEvents(current, result, 3), null);
 });
 
-test("groupEventsIncremental matches full grouping for append, patch, and base drift", () => {
+test("eventRowsIncremental keeps one virtual row per event", () => {
   let events = [event(0), event(1, "tool"), event(2, "thinking"), event(3)];
-  let result = groupEventsIncremental(events, 0, null);
-  assert.deepEqual(result.groups, groupEvents(events, 0));
+  let result = eventRowsIncremental(events, 0, null);
+  assert.deepEqual(result.rows, eventRows(events, 0));
+  assert.equal(result.rows.length, events.length);
+  assert.deepEqual(result.rows.map((row) => row.key), [0, 1, 2, 3]);
 
   events = [...events, event(4, "tool"), event(5, "thinking"), event(6)];
-  result = groupEventsIncremental(events, 0, result.cache);
-  assert.deepEqual(result.groups, groupEvents(events, 0));
+  result = eventRowsIncremental(events, 0, result.cache);
+  assert.deepEqual(result.rows, eventRows(events, 0));
+  assert.equal(result.rows.length, events.length);
 
   events = events.map((entry, index) => index === 1
     ? { ...entry, tool: { ...entry.tool, output: "patched", ok: true } }
     : entry);
-  result = groupEventsIncremental(events, 0, result.cache);
-  assert.deepEqual(result.groups, groupEvents(events, 0));
+  result = eventRowsIncremental(events, 0, result.cache);
+  assert.deepEqual(result.rows, eventRows(events, 0));
 
   events = events.slice(2);
-  result = groupEventsIncremental(events, 2, result.cache);
-  assert.deepEqual(result.groups, groupEvents(events, 2));
+  result = eventRowsIncremental(events, 2, result.cache);
+  assert.deepEqual(result.rows, eventRows(events, 2));
   assert.equal(result.changedFrom, 0);
 });
 
-test("buildVirtualLayoutIncremental matches full layout across group and height deltas", () => {
+test("buildVirtualLayoutIncremental matches full layout across row and height deltas", () => {
   let events = [event(0), event(1, "tool"), event(2), event(3)];
-  let grouped = groupEventsIncremental(events, 0, null);
+  let grouped = eventRowsIncremental(events, 0, null);
   const heights = new Map();
-  let incremental = buildVirtualLayoutIncremental(grouped.groups, heights, 0, null, grouped.changedFrom);
-  assert.deepEqual(incremental.layout, buildVirtualLayout(grouped.groups, heights));
+  let incremental = buildVirtualLayoutIncremental(grouped.rows, heights, 0, null, grouped.changedFrom);
+  assert.deepEqual(incremental.layout, buildVirtualLayout(grouped.rows, heights));
 
   events = [...events, event(4), event(5, "tool")];
-  grouped = groupEventsIncremental(events, 0, grouped.cache);
+  grouped = eventRowsIncremental(events, 0, grouped.cache);
   incremental = buildVirtualLayoutIncremental(
-    grouped.groups,
+    grouped.rows,
     heights,
     0,
     incremental.cache,
     grouped.changedFrom,
   );
-  assert.deepEqual(incremental.layout, buildVirtualLayout(grouped.groups, heights));
+  assert.deepEqual(incremental.layout, buildVirtualLayout(grouped.rows, heights));
 
-  const measuredGroup = grouped.groups[1];
-  const refs = measuredGroup.kind === "activity" ? measuredGroup.events : [measuredGroup.event];
-  heights.set(measuredGroup.key, { refs, height: 321 });
-  incremental = buildVirtualLayoutIncremental(grouped.groups, heights, 1, incremental.cache, 1);
-  assert.deepEqual(incremental.layout, buildVirtualLayout(grouped.groups, heights));
+  const measuredRow = grouped.rows[1];
+  heights.set(measuredRow.key, { refs: [measuredRow.event], height: 321 });
+  incremental = buildVirtualLayoutIncremental(grouped.rows, heights, 1, incremental.cache, 1);
+  assert.deepEqual(incremental.layout, buildVirtualLayout(grouped.rows, heights));
 
   events = events.slice(0, -1);
-  grouped = groupEventsIncremental(events, 0, grouped.cache);
-  incremental = buildVirtualLayoutIncremental(grouped.groups, heights, 1, incremental.cache, grouped.changedFrom);
-  assert.deepEqual(incremental.layout, buildVirtualLayout(grouped.groups, heights));
+  grouped = eventRowsIncremental(events, 0, grouped.cache);
+  incremental = buildVirtualLayoutIncremental(grouped.rows, heights, 1, incremental.cache, grouped.changedFrom);
+  assert.deepEqual(incremental.layout, buildVirtualLayout(grouped.rows, heights));
 
   events = events.slice(2);
-  grouped = groupEventsIncremental(events, 2, grouped.cache);
-  incremental = buildVirtualLayoutIncremental(grouped.groups, heights, 1, incremental.cache, grouped.changedFrom);
-  assert.deepEqual(incremental.layout, buildVirtualLayout(grouped.groups, heights));
+  grouped = eventRowsIncremental(events, 2, grouped.cache);
+  incremental = buildVirtualLayoutIncremental(grouped.rows, heights, 1, incremental.cache, grouped.changedFrom);
+  assert.deepEqual(incremental.layout, buildVirtualLayout(grouped.rows, heights));
 });

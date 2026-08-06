@@ -148,10 +148,10 @@ import {
 } from "./transcript-store";
 import {
   buildVirtualLayoutIncremental,
-  groupEventsIncremental,
+  eventRowsIncremental,
   sameEventRefs,
-  type EventGroup,
-  type GroupEventsCache,
+  type EventRow,
+  type EventRowsCache,
   type RowMeasurement,
   type VirtualLayout,
   type VirtualLayoutCache,
@@ -2265,42 +2265,33 @@ const MessageBlock = memo(function MessageBlock({
   sameImageNums(prev.imageNums, next.imageNums)
 );
 
-// WIKI-247: no turn aggregation. The activity group exists only as a
-// virtualization container — every tool call and thinking trace renders as
-// its own visual unit in the flow, with no header, counts, or collapse.
-export function ActivityGroupBase({
-  events,
-  groupKey,
+// WIKI-247: one virtual row owns one activity event. Tool output stays paired
+// with its call inside ToolCallRow, but adjacent events never share a row.
+export function ActivityEventRow({
+  event,
+  rowKey,
   onInspect,
   ticket,
 }: {
-  events: SessionEvent[];
-  groupKey: number;
+  event: SessionEvent;
+  rowKey: number;
   onInspect?: (agentId: string) => void;
   ticket: string;
 }) {
-  const rows = useMemo(() => traceRows(activityTimeline(events)), [events]);
+  const rows = useMemo(() => traceRows(activityTimeline([event])), [event]);
   return (
     <div className="session-activity">
-      <TraceRowList keyBase={groupKey} onInspect={onInspect} rows={rows} ticket={ticket} />
+      <TraceRowList keyBase={rowKey} onInspect={onInspect} rows={rows} ticket={ticket} />
     </div>
   );
 }
 
-const ActivityGroup = memo(ActivityGroupBase, (prev, next) =>
-  prev.groupKey === next.groupKey &&
-  prev.onInspect === next.onInspect &&
-  prev.ticket === next.ticket &&
-  prev.events.length === next.events.length &&
-  prev.events.every((event, index) => event === next.events[index])
-);
-
-function useMeasuredRow(group: EventGroup, onHeightChange: (group: EventGroup, height: number) => void) {
+function useMeasuredRow(row: EventRow, onHeightChange: (row: EventRow, height: number) => void) {
   const ref = useRef<HTMLDivElement | null>(null);
   useLayoutEffect(() => {
     const el = ref.current;
     if (!el) return;
-    const report = (height: number) => onHeightChange(group, Math.max(MIN_ROW_HEIGHT, Math.round(height)));
+    const report = (height: number) => onHeightChange(row, Math.max(MIN_ROW_HEIGHT, Math.round(height)));
     report(el.getBoundingClientRect().height);
     const observer = new ResizeObserver((entries) => {
       const entry = entries[0];
@@ -2308,46 +2299,39 @@ function useMeasuredRow(group: EventGroup, onHeightChange: (group: EventGroup, h
     });
     observer.observe(el);
     return () => observer.disconnect();
-  }, [group, onHeightChange]);
+  }, [row, onHeightChange]);
   return ref;
 }
 
-function groupTimestamp(group: EventGroup): string | null {
-  if (group.kind === "message") return group.event.ts;
-  for (const event of group.events) {
-    if (event.ts) return event.ts;
-  }
-  return null;
+function rowTimestamp(row: EventRow): string | null {
+  return row.event.ts;
 }
 
-function groupAlign(group: EventGroup): "end" | "start" {
-  if (group.kind !== "message" || group.event.kind !== "user") return "start";
-  return group.event.source ? "start" : "end";
+function rowAlign(row: EventRow): "end" | "start" {
+  if (row.event.kind !== "user") return "start";
+  return row.event.source ? "start" : "end";
 }
 
-function computeTimestampKeys(groups: EventGroup[]): Set<number> {
+function computeTimestampKeys(rows: EventRow[]): Set<number> {
   const keys = new Set<number>();
-  for (let i = 0; i < groups.length; i += 1) {
-    const g = groups[i];
-    if (g.kind !== "message") continue;
-    const kind = g.event.kind;
+  for (let i = 0; i < rows.length; i += 1) {
+    const row = rows[i];
+    const kind = row.event.kind;
     if (kind === "user") {
-      keys.add(g.key);
+      keys.add(row.key);
       continue;
     }
     if (kind !== "assistant") continue;
     let isLast = true;
-    for (let j = i + 1; j < groups.length; j += 1) {
-      const later = groups[j];
-      if (later.kind !== "message") continue;
-      const laterKind = later.event.kind;
+    for (let j = i + 1; j < rows.length; j += 1) {
+      const laterKind = rows[j].event.kind;
       if (laterKind === "assistant") {
         isLast = false;
         break;
       }
       if (laterKind === "user") break;
     }
-    if (isLast) keys.add(g.key);
+    if (isLast) keys.add(row.key);
   }
   return keys;
 }
@@ -2374,7 +2358,7 @@ function CurrentTurnState({ runState }: { runState: Exclude<ActivityRunState, "i
 
 const VirtualSessionRow = memo(function VirtualSessionRow({
   activityRunState,
-  group,
+  row,
   imageNums,
   onHeightChange,
   onInspect,
@@ -2387,9 +2371,9 @@ const VirtualSessionRow = memo(function VirtualSessionRow({
   uiState,
 }: {
   activityRunState: ActivityRunState;
-  group: EventGroup;
+  row: EventRow;
   imageNums?: number[];
-  onHeightChange: (group: EventGroup, height: number) => void;
+  onHeightChange: (row: EventRow, height: number) => void;
   onInspect?: (agentId: string) => void;
   onInspectArtifact?: (event: SessionEvent) => void;
   onOpenArtifact?: (event: SessionEvent) => void;
@@ -2399,42 +2383,42 @@ const VirtualSessionRow = memo(function VirtualSessionRow({
   ticket: string;
   uiState: SessionUiState;
 }) {
-  const rowRef = useMeasuredRow(group, onHeightChange);
+  const rowRef = useMeasuredRow(row, onHeightChange);
   const style: CSSProperties = { transform: `translateY(${top}px)` };
-  const ts = showTimestamp ? groupTimestamp(group) : null;
+  const ts = showTimestamp ? rowTimestamp(row) : null;
+  const isActivity = row.event.kind === "tool" || row.event.kind === "thinking";
   return (
     <div
       className="session-virtual-row"
-      data-align={groupAlign(group)}
-      data-group-key={group.key}
+      data-align={rowAlign(row)}
+      data-row-key={row.key}
+      data-row-kind={isActivity ? "activity" : "message"}
       data-row-top={top}
       ref={rowRef}
       style={style}
     >
-      {group.kind === "activity" ? (
-        <ActivityGroup
-          events={group.events}
-          groupKey={group.key}
+      {isActivity ? (
+        <ActivityEventRow
+          event={row.event}
+          rowKey={row.key}
           onInspect={onInspect}
           ticket={ticket}
         />
       ) : (
         <>
           <MessageBlock
-            event={group.event}
+            event={row.event}
             imageNums={imageNums}
             onInspectArtifact={onInspectArtifact}
             onOpenArtifact={onOpenArtifact}
-            rowKey={group.key}
+            rowKey={row.key}
             sessionKey={sessionKey}
             ticket={ticket}
             uiState={uiState}
           />
-          {group.event.kind === "user" && activityRunState !== "idle" ? (
-            <CurrentTurnState runState={activityRunState} />
-          ) : null}
         </>
       )}
+      {activityRunState !== "idle" ? <CurrentTurnState runState={activityRunState} /> : null}
       {ts ? <Timestamp value={ts} /> : null}
     </div>
   );
@@ -2452,17 +2436,9 @@ const VirtualSessionRow = memo(function VirtualSessionRow({
   ) {
     return false;
   }
-  const prevGroup = prev.group;
-  const nextGroup = next.group;
-  if (prevGroup.kind !== nextGroup.kind || prevGroup.key !== nextGroup.key) return false;
-  if (prevGroup.kind === "activity" && nextGroup.kind === "activity") {
-    return (
-      prevGroup.events.length === nextGroup.events.length &&
-      prevGroup.events.every((event, index) => event === nextGroup.events[index])
-    );
-  }
-  if (prevGroup.kind !== "message" || nextGroup.kind !== "message") return false;
-  return prevGroup.event === nextGroup.event && sameImageNums(prev.imageNums, next.imageNums);
+  return prev.row.key === next.row.key &&
+    prev.row.event === next.row.event &&
+    sameImageNums(prev.imageNums, next.imageNums);
 });
 
 type SessionAcc = TranscriptSession;
@@ -2575,7 +2551,7 @@ export function SessionTab({
   const sessionStateKey = `${stateKey ?? resetKey}:${resetKey}`;
   const rowHeightsKeyRef = useRef(resetKey);
   const rowHeightsRef = useRef<Map<number, RowMeasurement>>(new Map());
-  const groupCacheRef = useRef<GroupEventsCache | null>(null);
+  const eventRowsCacheRef = useRef<EventRowsCache | null>(null);
   const layoutCacheRef = useRef<VirtualLayoutCache | null>(null);
   const layoutDirtyFromRef = useRef(Number.POSITIVE_INFINITY);
   const layoutRef = useRef<VirtualLayout | null>(null);
@@ -2596,7 +2572,7 @@ export function SessionTab({
   if (rowHeightsKeyRef.current !== resetKey) {
     rowHeightsKeyRef.current = resetKey;
     rowHeightsRef.current = new Map();
-    groupCacheRef.current = null;
+    eventRowsCacheRef.current = null;
     layoutCacheRef.current = null;
     layoutDirtyFromRef.current = 0;
   }
@@ -2849,21 +2825,21 @@ export function SessionTab({
     [session?.events, session?.providerInspector, session?.composerMessages],
   );
 
-  const grouped = useMemo(() => {
-    const result = groupEventsIncremental(
+  const rowResult = useMemo(() => {
+    const result = eventRowsIncremental(
       displayEvents,
       session?.base ?? 0,
-      groupCacheRef.current,
+      eventRowsCacheRef.current,
       session?.eventsChangedFrom,
     );
-    groupCacheRef.current = result.cache;
+    eventRowsCacheRef.current = result.cache;
     return result;
   }, [displayEvents, session?.base, session?.eventsChangedFrom]);
-  const groups = grouped.groups;
+  const rows = rowResult.rows;
   const layout = useMemo(() => {
-    const changedFrom = Math.min(grouped.changedFrom, layoutDirtyFromRef.current);
+    const changedFrom = Math.min(rowResult.changedFrom, layoutDirtyFromRef.current);
     const result = buildVirtualLayoutIncremental(
-      groups,
+      rows,
       rowHeightsRef.current,
       rowHeightVersion,
       layoutCacheRef.current,
@@ -2872,7 +2848,7 @@ export function SessionTab({
     layoutCacheRef.current = result.cache;
     layoutDirtyFromRef.current = Number.POSITIVE_INFINITY;
     return result.layout;
-  }, [grouped.changedFrom, groups, resetKey, rowHeightVersion]);
+  }, [rowResult.changedFrom, rows, resetKey, rowHeightVersion]);
   const [visibleRange, setVisibleRange] = useState<{ start: number; end: number }>({ start: 0, end: -1 });
   const visibleRangeViewportRef = useRef<{ top: number; height: number } | null>(null);
   const syncVisibleRange = useCallback((viewport: { top: number; height: number }, force = false) => {
@@ -2922,17 +2898,17 @@ export function SessionTab({
     }
   }, [sessionStateKey]);
 
-  const reportRowHeight = useCallback((group: EventGroup, height: number) => {
+  const reportRowHeight = useCallback((row: EventRow, height: number) => {
     const measurement: RowMeasurement = {
       height,
-      refs: group.kind === "activity" ? group.events.slice() : [group.event],
+      refs: [row.event],
     };
-    const current = rowHeightsRef.current.get(group.key);
+    const current = rowHeightsRef.current.get(row.key);
     if (current && current.height === measurement.height && sameEventRefs(current.refs, measurement.refs)) {
       return;
     }
-    rowHeightsRef.current.set(group.key, measurement);
-    const index = layoutCacheRef.current?.layout.keyToIndex.get(group.key);
+    rowHeightsRef.current.set(row.key, measurement);
+    const index = layoutCacheRef.current?.layout.keyToIndex.get(row.key);
     if (index !== undefined) {
       layoutDirtyFromRef.current = Math.min(layoutDirtyFromRef.current, index);
     }
@@ -3078,30 +3054,27 @@ export function SessionTab({
       sessionScrollCache.set(sessionStateKey, saved);
     };
   }, [pinnedRef, ref, sessionStateKey]);
-  const visibleGroups = useMemo(() => {
-    const end = Math.min(visibleRange.end, groups.length - 1);
+  const visibleRows = useMemo(() => {
+    const end = Math.min(visibleRange.end, rows.length - 1);
     if (end < visibleRange.start) return [];
-    const rows: { group: EventGroup; top: number }[] = [];
+    const visible: { row: EventRow; top: number }[] = [];
     for (let index = visibleRange.start; index <= end; index += 1) {
-      const group = groups[index];
-      if (!group) continue;
-      rows.push({ group, top: layout.tops[index] ?? 0 });
+      const row = rows[index];
+      if (!row) continue;
+      visible.push({ row, top: layout.tops[index] ?? 0 });
     }
-    return rows;
-  }, [groups, layout.tops, visibleRange.end, visibleRange.start]);
-  const timestampKeys = useMemo(() => computeTimestampKeys(groups), [groups]);
+    return visible;
+  }, [layout.tops, rows, visibleRange.end, visibleRange.start]);
+  const timestampKeys = useMemo(() => computeTimestampKeys(rows), [rows]);
   const activityRunState = currentActivityRunState(session);
   const currentTurnUserKey = activityRunState === "idle"
     ? null
-    : [...groups].reverse().find(
-        (group) => group.kind === "message" && group.event.kind === "user",
-      )?.key ?? null;
+    : [...rows].reverse().find((row) => row.event.kind === "user")?.key ?? null;
   const currentActivityKey = activityRunState === "idle"
     ? null
-    : [...groups].reverse().find(
-        (group) => group.kind === "activity" && (
-          currentTurnUserKey === null || group.key > currentTurnUserKey
-        ),
+    : [...rows].reverse().find(
+        (row) => (row.event.kind === "tool" || row.event.kind === "thinking") &&
+          (currentTurnUserKey === null || row.key > currentTurnUserKey),
       )?.key ?? null;
   const currentTurnStateKey = activityRunState !== "idle" && currentActivityKey === null
     ? currentTurnUserKey
@@ -3236,23 +3209,23 @@ export function SessionTab({
             </div>
           ) : null}
           <div className="session-virtual-list" style={{ height: layout.totalHeight }}>
-            {visibleGroups.map(({ group, top }) => (
+            {visibleRows.map(({ row, top }) => (
               <VirtualSessionRow
                 activityRunState={
-                  (group.kind === "activity" && group.key === currentActivityKey)
-                    || (group.kind === "message" && group.key === currentTurnStateKey)
+                  ((row.event.kind === "tool" || row.event.kind === "thinking") && row.key === currentActivityKey)
+                    || (row.event.kind === "user" && row.key === currentTurnStateKey)
                     ? activityRunState
                     : "idle"
                 }
-                group={group}
-                imageNums={group.kind === "message" ? imageNumbers.get(group.event) : undefined}
-                key={group.key}
+                row={row}
+                imageNums={row.event.kind === "user" ? imageNumbers.get(row.event) : undefined}
+                key={row.key}
                 onHeightChange={reportRowHeight}
                 onInspect={onInspect}
                 onInspectArtifact={onInspectArtifact}
                 onOpenArtifact={onOpenArtifact}
                 sessionKey={inlineArtifactKey}
-                showTimestamp={timestampKeys.has(group.key)}
+                showTimestamp={timestampKeys.has(row.key)}
                 ticket={ticket}
                 top={top}
                 uiState={uiState}

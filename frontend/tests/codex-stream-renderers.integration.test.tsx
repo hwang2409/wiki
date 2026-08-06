@@ -21,10 +21,13 @@ const CSS_SOURCE = readFileSync(
   "utf-8",
 );
 
-// WIKI-244: the working diff renders open — no section toggle exists. The
-// helper now asserts that no disclosure control gates the diff.
+// WIKI-247: the working diff has its own disclosure. Transcript rows remain
+// always open, so this helper only opens the diff panel.
 function expandDiffSection() {
-  expect(screen.queryByRole("button", { name: /working diff/ })).toBeNull();
+  const toggle = screen.getByRole("button", { name: /working diff/ });
+  expect(toggle.getAttribute("aria-expanded")).toBe("false");
+  fireEvent.click(toggle);
+  expect(toggle.getAttribute("aria-expanded")).toBe("true");
 }
 
 function event(
@@ -202,7 +205,7 @@ describe("codex stream renderers", () => {
     const source = `diff --git a/large.txt b/large.txt\n--- a/large.txt\n+++ b/large.txt\n@@ -0,0 +1,200 @@\n${lines}`;
     const view = render(<CodexStreamHighlights events={[event("turn_diff_updated", 1, { diff: source })]} />);
     expandDiffSection();
-    // WIKI-244: large files render open and bounded — no per-file toggle.
+    // WIKI-247: large files render after the working-diff toggle and stay bounded.
     expect(view.queryByRole("button", { name: /large\.txt/ })).toBeNull();
     const renderedLines = view.container.querySelectorAll(".codex-stream-diff-line");
     expect(renderedLines.length).toBeGreaterThan(0);
@@ -481,10 +484,15 @@ describe("codex stream renderers", () => {
     expect(container.querySelector(".codex-stream-diagnostic-count")).toBeNull();
   });
 
-  it("renders the working diff open with no disclosure control (WIKI-244)", () => {
+  it("keeps the working diff collapsed until explicit toggle", () => {
     const source = "diff --git a/a.txt b/a.txt\n--- a/a.txt\n+++ b/a.txt\n@@ -1,1 +1,1 @@\n-old\n+new";
     const view = render(<CodexStreamHighlights events={[event("turn_diff_updated", 1, { diff: source })]} />);
-    expect(view.queryByRole("button", { name: /working diff/ })).toBeNull();
+    const toggle = view.getByRole("button", { name: /working diff/ });
+    expect(toggle.getAttribute("aria-expanded")).toBe("false");
+    expect(view.queryByText("a.txt")).toBeNull();
+    expect(view.container.querySelector(".codex-stream-diff-body")).toBeNull();
+    fireEvent.click(toggle);
+    expect(toggle.getAttribute("aria-expanded")).toBe("true");
     expect(view.getByText("a.txt")).toBeTruthy();
     expect(view.container.querySelector(".codex-stream-diff-body")?.textContent).toContain("+new");
     expect(view.container.querySelector("[data-testid='codex-diff-omitted']")).toBeNull();

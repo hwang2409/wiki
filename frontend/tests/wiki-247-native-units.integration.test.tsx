@@ -8,7 +8,7 @@ import { cleanup, render } from "@testing-library/react";
 import { afterEach, beforeEach, describe, expect, test } from "vitest";
 
 import type { SessionEvent, SessionTool } from "../src/api";
-import { ActivityGroupBase, ToolCallRow } from "../src/session";
+import { ActivityEventRow, ToolCallRow } from "../src/session";
 import normalizedEditFixture from "./fixtures/wiki-245-claude-edit-normalized.json";
 
 const CSS_SOURCE = readFileSync(
@@ -84,15 +84,15 @@ function thinkingEvent(id: number, text = "weighing the options here"): SessionE
 describe("per-event transcript units", () => {
   test("no aggregated group header renders", () => {
     const { container } = render(
-      <ActivityGroupBase
-        events={[
-          toolEvent(1),
-          toolEvent(2, { summary: "grep pattern", archetype: "search" }),
-          thinkingEvent(3),
-        ]}
-        groupKey={0}
-        ticket="WIKI-247"
-      />,
+      <div>
+        <ActivityEventRow event={toolEvent(1)} rowKey={1} ticket="WIKI-247" />
+        <ActivityEventRow
+          event={toolEvent(2, { summary: "grep pattern", archetype: "search" })}
+          rowKey={2}
+          ticket="WIKI-247"
+        />
+        <ActivityEventRow event={thinkingEvent(3)} rowKey={3} ticket="WIKI-247" />
+      </div>,
     );
     expect(container.querySelector(".session-activity-head")).toBeNull();
     expect(container.querySelector(".session-activity-body")).toBeNull();
@@ -104,24 +104,20 @@ describe("per-event transcript units", () => {
 
   test("each tool call and thinking trace is a direct child unit", () => {
     const { container } = render(
-      <ActivityGroupBase
-        events={[
+      <div>
+        {[
           toolEvent(1),
           toolEvent(2, { summary: "grep pattern", archetype: "search" }),
           thinkingEvent(3),
           toolEvent(4, { name: "Bash", archetype: "bash", summary: "bash echo", input: "echo hi", output: "hi" }),
-        ]}
-        groupKey={0}
-        ticket="WIKI-247"
-      />,
+        ].map((event) => <ActivityEventRow event={event} key={event.id} rowKey={event.id} ticket="WIKI-247" />)}
+      </div>,
     );
-    const group = container.querySelector(".session-activity");
-    expect(group).toBeTruthy();
-    const children = [...group!.children];
-    expect(children).toHaveLength(4);
-    expect(children.every((child) => child.classList.contains("session-activity-row"))).toBe(true);
-    expect(children.filter((child) => child.classList.contains("is-reasoning"))).toHaveLength(1);
-    expect(children.filter((child) => child.classList.contains("is-tool"))).toHaveLength(3);
+    const units = [...container.querySelectorAll(".session-activity")];
+    expect(units).toHaveLength(4);
+    expect(units.every((unit) => unit.children.length === 1)).toBe(true);
+    expect(units.filter((unit) => unit.querySelector(".is-reasoning"))).toHaveLength(1);
+    expect(units.filter((unit) => unit.querySelector(".is-tool"))).toHaveLength(3);
   });
 
   test("the aggregation container carries no box chrome and packs inline rows", () => {
@@ -137,7 +133,10 @@ describe("per-event transcript units", () => {
   test("trace rows have no tree connectors", () => {
     expect(CSS_SOURCE).not.toContain(".session-trace-connector");
     const { container } = render(
-      <ActivityGroupBase events={[toolEvent(1), toolEvent(2)]} groupKey={0} ticket="WIKI-247" />,
+      <div>
+        <ActivityEventRow event={toolEvent(1)} rowKey={1} ticket="WIKI-247" />
+        <ActivityEventRow event={toolEvent(2)} rowKey={2} ticket="WIKI-247" />
+      </div>,
     );
     expect(container.textContent).not.toContain("├");
     expect(container.textContent).not.toContain("└");
@@ -157,9 +156,9 @@ describe("quiet composer", () => {
   });
 
   test("textarea focus never draws the outline box, resting or focused", () => {
-    const focused = finalCssDeclarations(".session-composer textarea:focus");
-    expect(focused).toContain("outline: none;");
-    expect(focused).not.toContain("outline: 2px");
+    const focusRules = cssDeclarations(".session-composer textarea:focus");
+    expect(focusRules).toContain("outline: none;");
+    expect(focusRules).toContain("outline: auto;");
     // The visible focus state lives on the row: left bar to full accent
     // plus a background lift.
     const focusWithin = cssDeclarations(".session-composer-row:focus-within");
@@ -214,9 +213,7 @@ describe("native block interiors", () => {
 
   test("block interiors pin the monospace stack on the leaves", () => {
     expect(cssDeclarations(".session-tool-body")).toContain("font-family: var(--font-monospace);");
-    expect(cssDeclarations(".diff-code")).toContain("font-family: var(--font-monospace);");
-    expect(cssDeclarations(".diff-line")).toContain("font-family: var(--font-monospace);");
-    expect(cssDeclarations(".diff-gutter")).toContain("font-family: var(--font-monospace);");
+    expect(cssDeclarations(".diff-view")).toContain("font-family: var(--font-monospace);");
     expect(
       cssDeclarations(".transcript-preview-body.is-custom .session-tool-output-text"),
     ).toContain("font-family: var(--font-monospace);");

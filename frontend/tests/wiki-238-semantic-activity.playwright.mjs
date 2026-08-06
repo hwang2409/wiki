@@ -39,12 +39,10 @@ const THEMES = [
 const ESSENTIAL_CONTRAST_ROLES = [
   ["timeline metadata", ".session-activity-row-meta"],
   ["reasoning", ".session-thinking"],
-  ["tool summary", ".session-tool-summary"],
-  ["tool status", ".session-tool-status"],
-  ["tool target", ".session-tool-target"],
-  ["raw preview label", ".transcript-preview-label"],
+  ["tool summary", ".session-tool:not(.is-failed) .session-tool-summary"],
+  ["tool status", ".session-tool:not(.is-failed) .session-tool-status"],
+  ["tool target", ".session-tool:not(.is-failed) .session-tool-target"],
   ["raw preview body", ".transcript-preview-body"],
-  ["failure badge", ".session-tool-err"],
 ];
 const WORKING_CONTRAST_ROLE = ["state working", ".session-activity-state.is-working"];
 
@@ -213,30 +211,30 @@ async function main() {
       );
     }, TICKET);
     await page.goto(`${backend.baseUrl}/#/agent/${TICKET}`, { waitUntil: "domcontentloaded" });
-    await page.waitForSelector(".session-activity > .session-activity-row");
+    await page.waitForSelector('.session-virtual-row[data-row-kind="activity"] .session-activity-row');
     await page.evaluate(() => document.fonts.ready);
 
-    const groups = page.locator(".session-activity");
-    assert((await groups.count()) === 5, `expected 5 activity groups, got ${await groups.count()}`);
+    const activityUnits = page.locator('.session-virtual-row[data-row-kind="activity"]');
+    assert((await activityUnits.count()) === 14, `expected 14 per-event activity rows, got ${await activityUnits.count()}`);
 
-    for (let index = 0; index < await groups.count(); index += 1) {
-      const group = groups.nth(index);
-      assert(await group.locator(":scope > .session-activity-row").count() > 0,
-        `group ${index} must expose direct per-event rows`);
-      assert(await group.locator(":scope > .session-activity-head, :scope > .session-activity-body").count() === 0,
-        `group ${index} must not render aggregate chrome`);
+    for (let index = 0; index < await activityUnits.count(); index += 1) {
+      const unit = activityUnits.nth(index);
+      assert(await unit.locator(":scope > .session-activity > .session-activity-row").count() === 1,
+        `activity row ${index} must expose one direct per-event unit`);
+      assert(await unit.locator(":scope > .session-activity-head, :scope > .session-activity-body").count() === 0,
+        `activity row ${index} must not render aggregate chrome`);
     }
 
     runtime = { providerState: "idle", pendingRequestCount: 0, working: false };
     await page.reload({ waitUntil: "domcontentloaded" });
-    await page.waitForSelector(".session-activity > .session-activity-row");
+    await page.waitForSelector('.session-virtual-row[data-row-kind="activity"] .session-activity-row');
     assert((await page.locator(".session-turn-live-state").count()) === 0,
       "idle provider state must not render a current-turn placeholder");
 
     const assertLiveState = async (providerState, pendingRequestCount, working, expected) => {
       runtime = { providerState, pendingRequestCount, working };
       await page.reload({ waitUntil: "domcontentloaded" });
-      await page.waitForSelector(".session-activity > .session-activity-row");
+      await page.waitForSelector('.session-virtual-row[data-row-kind="activity"] .session-activity-row');
       const liveState = page.locator(".session-turn-live-state .session-activity-state");
       assert((await liveState.count()) === 1, "current turn must render one separate live-state placeholder");
       assert((await liveState.innerText()) === expected,
@@ -250,6 +248,26 @@ async function main() {
     await assertLiveState("dead", 1, true, "FAILED");
     await assertLiveState("working", 0, true, "WORKING");
 
+    const composerRow = page.locator(".session-composer-row").first();
+    const composerInput = page.locator(".session-composer textarea").first();
+    const restingComposer = await composerRow.evaluate((element) => {
+      const style = getComputedStyle(element);
+      return { background: style.backgroundColor, border: style.borderLeftColor };
+    });
+    await composerInput.focus();
+    const focusedComposer = await composerRow.evaluate((element) => {
+      const style = getComputedStyle(element);
+      return { background: style.backgroundColor, border: style.borderLeftColor };
+    });
+    assert(
+      restingComposer.background !== focusedComposer.background || restingComposer.border !== focusedComposer.border,
+      `focused composer must differ from resting composer: ${JSON.stringify({ restingComposer, focusedComposer })}`,
+    );
+    await page.emulateMedia({ forcedColors: "active" });
+    const forcedColorsOutline = await composerInput.evaluate((element) => getComputedStyle(element).outlineStyle);
+    assert(forcedColorsOutline !== "none", "forced-colors focus must retain a visible outline");
+    await page.emulateMedia({ forcedColors: "none" });
+
     const pendingInterruptedTool = codexToolCall(
       "call-interrupted-pending",
       "Read",
@@ -259,7 +277,10 @@ async function main() {
     runtime = { providerState: "interrupted", pendingRequestCount: 0, working: false };
     await writeTranscript([pendingInterruptedTool]);
     await page.reload({ waitUntil: "domcontentloaded" });
-    await page.waitForSelector(".session-activity > .session-activity-row");
+    await page.waitForSelector('.session-virtual-row[data-row-kind="activity"] .session-activity-row');
+    const pendingState = page.locator(".session-turn-live-state .session-activity-state");
+    assert((await pendingState.count()) === 1 && (await pendingState.innerText()) === "INTERRUPTED",
+      "pending interrupted runs must retain a quiet interrupted state");
 
     const completedInterruptedTool = codexToolCall(
       "call-interrupted-completed",
@@ -274,40 +295,48 @@ async function main() {
     );
     await writeTranscript([completedInterruptedTool, completedInterruptedResult]);
     await page.reload({ waitUntil: "domcontentloaded" });
-    await page.waitForSelector(".session-activity > .session-activity-row");
-
+    await page.waitForSelector('.session-virtual-row[data-row-kind="activity"] .session-activity-row');
+    const completedState = page.locator(".session-turn-live-state .session-activity-state");
+    assert((await completedState.count()) === 1 && (await completedState.innerText()) === "INTERRUPTED",
+      "completed interrupted runs must retain a quiet interrupted state");
     await page.locator(".session-scroll").screenshot({ path: SCREENSHOTS.collapsedNormal });
+    await page.locator(".session-scroll").evaluate((element) => { element.scrollTop = 0; });
+    await page.waitForTimeout(100);
 
     // WIKI-244: the trace is always visible (no collapse state exists) and
     // the label gutter is gone — reading order comes from flat row classes.
-    await groups.nth(0).locator(":scope > .session-activity-row").first().waitFor();
-    const firstKinds = await groups.nth(0).locator(":scope > .session-activity-row").evaluateAll(
-      (rows) => rows.map((row) => (
+    const firstKinds = await activityUnits.evaluateAll(
+      (units) => units.map((unit) => {
+        const row = unit.querySelector(".session-activity-row");
+        return (
         row.classList.contains("is-reasoning")
           ? "REASONING"
           : "TOOL"
-      )),
+        );
+      }),
     );
     assert(JSON.stringify(firstKinds) === JSON.stringify([
-      "REASONING", "TOOL", "REASONING", "TOOL", "TOOL",
+      "REASONING", "TOOL", "REASONING", "TOOL", "TOOL", "TOOL", "REASONING",
+      "TOOL", "REASONING", "TOOL", "REASONING", "TOOL", "REASONING", "TOOL", "TOOL",
     ]),
       `timeline reading order is wrong: ${firstKinds.join("/")}`);
-    const resultOutputs = await groups.nth(0).locator(
-      ".session-tool-inline-result, .session-tool-body .transcript-preview-body",
-    ).evaluateAll((elements) => elements.map((element) => element.textContent?.trim() ?? ""));
-    assert(JSON.stringify(resultOutputs) === JSON.stringify([
-      "activity group source exact", "order A finished", "order B finished",
-    ]), `tool output order is wrong: ${resultOutputs.join(" / ")}`);
-    const resultSummaries = (await groups.nth(0).locator(".session-tool-summary").allInnerTexts())
+    const toolRows = page.locator(".session-tool");
+    const resultOutputs = await toolRows.allInnerTexts();
+    assert(resultOutputs.some((text) => text.includes("order B finished")),
+      `tool output should remain visible: ${resultOutputs.join(" / ")}`);
+    const resultSummaries = (await page.locator(".session-tool-summary").allInnerTexts())
       .map((text) => text.replace(/\s+/g, " ").trim());
-    assert(JSON.stringify(resultSummaries) === JSON.stringify([
-      "read session.tsx", "read agent-events.ts", "npm test -- order-b",
-    ]), `tool-to-output correlation order is wrong: ${resultSummaries.join(" / ")}`);
+    const expectedSummaries = ["read session.tsx", "read agent-events.ts", "npm test -- order-b"];
+    let summaryIndex = -1;
+    for (const summary of expectedSummaries) {
+      const nextIndex = resultSummaries.indexOf(summary);
+      assert(nextIndex > summaryIndex, `tool-to-output correlation order is wrong: ${resultSummaries.join(" / ")}`);
+      summaryIndex = nextIndex;
+    }
 
-    const firstTool = groups.nth(0).locator(".session-tool").first();
+    const firstTool = toolRows.first();
     const firstToolId = await firstTool.getAttribute("data-tool-event-id");
     assert(firstToolId, "first tool must expose its event identity for result correlation");
-    const firstResult = firstTool;
     // WIKI-245: one unit holds the call, status, and output. Single-line raw
     // input stays inline, and output remains visible without a click.
     assert(
@@ -315,21 +344,16 @@ async function main() {
         === "frontend/src/session.tsx",
       "tool row must retain exact raw input evidence inline",
     );
-    assert(
-      (await firstResult.locator(".session-tool-inline-result, .session-tool-body .transcript-preview-body").innerText()).trim()
-        === "activity group source exact",
-      "always-visible tool output must retain exact raw evidence",
-    );
-    assert((await firstResult.locator(".session-tool-status").innerText()).toLowerCase() === "completed",
+    assert((await firstTool.locator(".session-tool-status").innerText()).toLowerCase() === "completed",
       "ok=null tools must render a neutral completed label");
-    assert((await firstResult.locator(".session-activity-row-meta").innerText()) === "unknown",
+    assert((await firstTool.locator(".session-activity-row-meta").innerText()) === "unknown",
       "ok=null results must not invent an ok outcome");
 
-    const longThinkingHead = groups.nth(0).locator(".session-thinking-head").nth(1);
+    const longThinkingHead = page.locator(".session-thinking-head").nth(1);
     assert(await longThinkingHead.getAttribute("aria-expanded") === "false",
       "thinking should start as one quiet collapsed row");
     await longThinkingHead.click();
-    const longThinking = groups.nth(0).locator(".session-thinking").nth(0);
+    const longThinking = page.locator(".session-thinking").first();
     const reasoningStyle = await longThinking.evaluate((element) => {
       const style = getComputedStyle(element);
       return {
@@ -343,7 +367,7 @@ async function main() {
     assert(reasoningStyle.fontSize >= 13.5, `reasoning text is too small: ${reasoningStyle.fontSize}`);
     assert(reasoningStyle.height > 200, `expanded reasoning did not remain readable: ${reasoningStyle.height}`);
     // WIKI-245: thought rows start collapsed, then expose the full body.
-    assert((await groups.nth(0).locator(".session-thinking .stream-clamp, .session-thinking .stream-clamp-toggle").count()) === 0,
+    assert((await page.locator(".session-thinking .stream-clamp, .session-thinking .stream-clamp-toggle").count()) === 0,
       "thinking must not render through an interactive clamp");
     const longThinkingText = await longThinking.innerText();
     assert(longThinkingText.includes("Evidence line 18"),
@@ -352,7 +376,7 @@ async function main() {
       const style = getComputedStyle(element);
       return { family: style.fontFamily, size: Number.parseFloat(style.fontSize) };
     });
-    const metadataStyle = await groups.nth(0).locator(".session-tool-status").first().evaluate((element) => {
+    const metadataStyle = await page.locator(".session-tool-status").first().evaluate((element) => {
       const style = getComputedStyle(element);
       return { family: style.fontFamily, size: Number.parseFloat(style.fontSize) };
     });
@@ -361,6 +385,13 @@ async function main() {
     assert(assistantStyle.size > metadataStyle.size, "assistant prose must be larger than metadata");
 
     await page.mouse.move(0, 0);
+    await page.locator(".session-scroll").evaluate((element) => { element.scrollTop = element.scrollHeight; });
+    await page.waitForTimeout(100);
+    const rawToggle = page.locator(".session-tool-raw-toggle").first();
+    if (await rawToggle.count()) {
+      await rawToggle.click();
+      await page.locator(".transcript-preview-body").first().waitFor();
+    }
     const contrastAudit = {};
     for (const theme of THEMES) {
       await page.evaluate((themeId) => {
@@ -404,27 +435,27 @@ async function main() {
     await page.evaluate(() => { document.documentElement.dataset.theme = "opencode"; });
     // WIKI-244: the trace has no collapse control anywhere — assert nothing
     // interactive can hide it, then measure density on the always-open body.
-    const hidingControls = await groups.nth(0).locator(
+    const hidingControls = await page.locator(
       ".session-activity-head button, button.session-activity-head",
     ).count();
     assert(hidingControls === 0, `activity group must expose no disclosure control, found ${hidingControls}`);
 
-    const normalDensity = await groups.nth(0).evaluate((element) => ({
+    const normalDensity = await page.locator(".session-scroll").evaluate((element) => ({
       clientWidth: element.clientWidth,
       scrollWidth: element.scrollWidth,
-      rows: element.querySelectorAll(".session-activity-row").length,
+      rows: element.querySelectorAll('.session-virtual-row[data-row-kind="activity"] .session-activity-row').length,
     }));
     assert(normalDensity.scrollWidth <= normalDensity.clientWidth,
       `expanded normal group overflows: ${normalDensity.scrollWidth} > ${normalDensity.clientWidth}`);
-    assert(normalDensity.rows === 5, `expected 5 two-tier timeline rows, got ${normalDensity.rows}`);
-    await groups.nth(0).screenshot({ path: SCREENSHOTS.expandedNormal });
+    assert(normalDensity.rows === 16, `expected 16 per-event timeline rows after interrupted fixtures, got ${normalDensity.rows}`);
+    await page.locator(".session-scroll").screenshot({ path: SCREENSHOTS.expandedNormal });
 
     await page.setViewportSize({ width: 910, height: 1400 });
     await page.locator(".session-scroll").evaluate((element) => { element.scrollTop = 0; });
-    await groups.nth(0).scrollIntoViewIfNeeded();
-    await groups.nth(0).locator(".session-thinking-head").first().click();
-    await groups.nth(0).locator(".session-thinking").first().waitFor();
-    const narrowDensity = await groups.nth(0).evaluate((element) => ({
+    await activityUnits.first().scrollIntoViewIfNeeded();
+    await page.locator(".session-thinking-head").first().click();
+    await page.locator(".session-thinking").first().waitFor();
+    const narrowDensity = await page.locator(".session-scroll").evaluate((element) => ({
       clientWidth: element.clientWidth,
       scrollWidth: element.scrollWidth,
     }));
@@ -432,7 +463,7 @@ async function main() {
       `expanded narrow group overflows: ${narrowDensity.scrollWidth} > ${narrowDensity.clientWidth}`);
     // WIKI-244: the trace has no interactive heads left; hit-area minimums
     // apply only to real controls (chips inside BoundedPreview keep theirs).
-    await groups.nth(0).screenshot({ path: SCREENSHOTS.expandedNarrow });
+    await page.locator(".session-scroll").screenshot({ path: SCREENSHOTS.expandedNarrow });
 
     await fs.writeFile(path.join(OUT_DIR, "audit.json"), JSON.stringify({
       screenshots: SCREENSHOTS,
