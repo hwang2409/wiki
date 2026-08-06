@@ -273,6 +273,21 @@ class CostAggregatorTests(unittest.TestCase):
             costs.refresh(costs._load_state())
         self.assertEqual(len(os.listdir("/dev/fd")), baseline)
 
+    def test_unchanged_runs_skip_full_directory_sweep(self) -> None:
+        raw = self._run("run-cache")
+        raw.write_text(json.dumps(_envelope("2026-07-30T10:00:00Z", _usage(10, 2))) + "\n", encoding="utf-8")
+        costs.refresh()
+
+        with (
+            mock.patch.object(costs.os, "scandir", wraps=costs.os.scandir) as scandir,
+            mock.patch.object(costs, "_scan_run", wraps=costs._scan_run) as scan_run,
+        ):
+            refreshed = costs.refresh(costs._load_state())
+
+        self.assertEqual(scan_run.call_count, 0)
+        self.assertEqual(scandir.call_count, 0)
+        self.assertEqual(refreshed["runs"]["run-cache"]["offset"], raw.stat().st_size)
+
     def test_state_is_atomic_and_does_not_touch_live_paths(self) -> None:
         raw = self._run("run-atomic")
         raw.write_text(json.dumps(_envelope("2026-07-30T10:00:00Z", _usage(10, 2))) + "\n", encoding="utf-8")

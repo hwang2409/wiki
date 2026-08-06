@@ -67,7 +67,13 @@ def cost_state_path() -> Path:
 
 
 def _empty_state() -> dict[str, Any]:
-    return {"version": STATE_VERSION, "updated_at": None, "runs": {}, "records": {}}
+    return {
+        "version": STATE_VERSION,
+        "updated_at": None,
+        "runs_dir_signature": None,
+        "runs": {},
+        "records": {},
+    }
 
 
 def _load_state() -> dict[str, Any]:
@@ -361,8 +367,49 @@ def _discard_run(state: dict[str, Any], run_id: str) -> None:
         _remove_run_contributions(state, old_run)
 
 
+def _stat_signature(value: os.stat_result) -> list[int]:
+    return [value.st_dev, value.st_ino, value.st_size, value.st_mtime_ns]
+
+
+def _run_signature(root_fd: int, run_id: str) -> dict[str, list[int] | None] | None:
+    """Return cheap file signatures without reading a run's event stream."""
+
+    try:
+        run_fd = open_relative_directory(root_fd, (run_id,))
+    except OSError:
+        return None
+    raw_fd: int | None = None
+    metadata_fd: int | None = None
+    try:
+        if not stat.S_ISDIR(os.fstat(run_fd).st_mode):
+            return None
+        try:
+            raw_fd = open_relative_file(run_fd, ("raw.jsonl",), extra_final_flags=getattr(os, "O_NONBLOCK", 0))
+            raw_stat = os.fstat(raw_fd)
+            if not stat.S_ISREG(raw_stat.st_mode):
+                return None
+        except OSError:
+            return None
+        try:
+            metadata_fd = open_relative_file(run_fd, ("run.json",), extra_final_flags=getattr(os, "O_NONBLOCK", 0))
+            metadata_stat = os.fstat(metadata_fd)
+            metadata_signature = _stat_signature(metadata_stat) if stat.S_ISREG(metadata_stat.st_mode) else None
+        except FileNotFoundError:
+            metadata_signature = None
+        except OSError:
+            return None
+        return {"raw": _stat_signature(raw_stat), "metadata": metadata_signature}
+    finally:
+        if metadata_fd is not None:
+            os.close(metadata_fd)
+        if raw_fd is not None:
+            os.close(raw_fd)
+        os.close(run_fd)
+
+
 def _scan_run(state: dict[str, Any], run_id: str, root_fd: int) -> None:
     raw_fd: int | None = None
+    metadata_signature: list[int] | None = None
     try:
         run_fd = open_relative_directory(root_fd, (run_id,))
     except OSError:
@@ -394,11 +441,13 @@ def _scan_run(state: dict[str, Any], run_id: str, root_fd: int) -> None:
             return
         else:
             try:
-                if not stat.S_ISREG(os.fstat(metadata_fd).st_mode):
+                metadata_stat = os.fstat(metadata_fd)
+                if not stat.S_ISREG(metadata_stat.st_mode):
                     os.close(raw_fd)
                     raw_fd = None
                     _discard_run(state, run_id)
                     return
+                metadata_signature = _stat_signature(metadata_stat)
                 metadata = _read_json_fd(metadata_fd)
             finally:
                 os.close(metadata_fd)
@@ -462,6 +511,11 @@ def _scan_run(state: dict[str, Any], run_id: str, root_fd: int) -> None:
             "ticket": base_ticket(str(metadata.get("agent_id") or run_id)),
             "orchestrator": str(metadata.get("orchestrator_id") or ""),
             "created_at": metadata.get("created_at"),
+            "active": metadata.get("state") not in {"dead", "completed"} and not metadata.get("ended_at"),
+            "scan_signature": {
+                "raw": _stat_signature(final_stat),
+                "metadata": metadata_signature,
+            },
         }
     )
     os.close(raw_fd)
@@ -472,23 +526,43 @@ def refresh(state: dict[str, Any] | None = None) -> dict[str, Any]:
         state = _load_state()
     root_fd = _open_root()
     seen_runs: set[str] = set()
+    runs_dir_signature: list[int] | None = None
     if root_fd is not None:
         try:
-            # os.scandir(fd) dups the fd internally and closes only its own
-            # dup — an explicit os.dup() here is owned by nobody and leaks
-            # one runs-dir fd per refresh (wedged the backend at the GUI
-            # 256-fd rlimit; wedge #7, 2026-07-30).
-            with os.scandir(root_fd) as entries:
-                run_ids = [entry.name for entry in entries if not entry.is_symlink() and entry.is_dir(follow_symlinks=False)]
-            for run_id in run_ids:
-                seen_runs.add(run_id)
-                _scan_run(state, run_id, root_fd)
+            runs_dir_signature = _stat_signature(os.fstat(root_fd))
+            root_changed = state.get("runs_dir_signature") != runs_dir_signature
+            if root_changed:
+                # os.scandir(fd) dups the fd internally and closes only its own
+                # dup — an explicit os.dup() here is owned by nobody and leaks
+                # one runs-dir fd per refresh (wedged the backend at the GUI
+                # 256-fd rlimit; wedge #7, 2026-07-30).
+                with os.scandir(root_fd) as entries:
+                    run_ids = [
+                        entry.name
+                        for entry in entries
+                        if not entry.is_symlink() and entry.is_dir(follow_symlinks=False)
+                    ]
+                for run_id in run_ids:
+                    seen_runs.add(run_id)
+                    _scan_run(state, run_id, root_fd)
+            else:
+                # A run directory's mtime does not change when raw.jsonl grows.
+                # Check only active runs for cheap signatures, then parse new
+                # bytes only when a signature changed. Completed history stays
+                # out of the five-second refresh path.
+                seen_runs.update(state["runs"])
+                for run_id, run_state in list(state["runs"].items()):
+                    if not isinstance(run_state, dict) or not run_state.get("active", True):
+                        continue
+                    if _run_signature(root_fd, run_id) != run_state.get("scan_signature"):
+                        _scan_run(state, run_id, root_fd)
         finally:
             os.close(root_fd)
     for run_id in list(state["runs"]):
         if run_id not in seen_runs:
             _remove_run_contributions(state, state["runs"][run_id])
             state["runs"].pop(run_id, None)
+    state["runs_dir_signature"] = runs_dir_signature
     state["updated_at"] = _now_iso()
     _save_state(state)
     return state
