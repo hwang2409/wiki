@@ -204,6 +204,9 @@ describe("native block interiors", () => {
   });
 
   test("edit diffs render line-number gutters with red/green line backgrounds", () => {
+    // WIKI-251: SplitDiffView (react-diff-view) is the transcript edit
+    // renderer. The library's insert/delete gutters are the landmarks; the
+    // wiki-diff CSS variables still wire the red/green tokens through.
     const { container } = render(
       <ToolCallRow
         event={normalizedEditFixture as unknown as SessionEvent}
@@ -211,18 +214,25 @@ describe("native block interiors", () => {
         withResult
       />,
     );
-    expect(container.querySelector(".diff-view.has-line-numbers")).toBeTruthy();
-    expect(container.querySelector(".diff-line.is-add .diff-gutter-new")?.textContent).not.toBe("");
-    expect(cssDeclarations(".diff-line.is-add")).toContain("background-color: var(--diff-add-background);");
-    expect(cssDeclarations(".diff-line.is-remove")).toContain("background-color: var(--diff-remove-background);");
+    expect(container.querySelector(".session-tool-split-diff")).toBeTruthy();
+    expect(container.querySelector(".diff-gutter-insert")).toBeTruthy();
+    expect(container.querySelector(".diff-gutter-delete")).toBeTruthy();
+    // The shared wiki-diff tokens still translate the library's gutter/code
+    // classes to the wiki palette (styles.css:11585 — one rule body shared
+    // between .split-diff-file .wiki-diff and .wiki-diff).
+    expect(cssDeclarations(".wiki-diff"))
+      .toContain("--diff-gutter-insert-background-color");
+    expect(cssDeclarations(".wiki-diff"))
+      .toContain("--diff-gutter-delete-background-color");
   });
 
-  test("transcript diffs drop the box, duplicate file header, and hunk chrome", () => {
-    expect(finalCssDeclarations(".session-tool-diff-body .diff-view")).toContain("border: 0;");
-    expect(cssDeclarations(".session-tool-diff-body .diff-file:only-child > .diff-file-header"))
-      .toContain("display: none;");
-    expect(cssDeclarations(".session-tool-diff-body .diff-hunk-header")).toContain("display: none;");
-  });
+  // WIKI-251: the "transcript diffs drop the box, duplicate file header,
+  // and hunk chrome" test was removed. That inline-diff chrome policy
+  // applied to the old DiffPatchView (unified) in the transcript — the
+  // transcript now uses SplitDiffView (react-diff-view), which has its own
+  // DOM/CSS surface (see .wiki-diff tokens in styles.css:11569). The
+  // unified renderer still lives in artifact-detail, where the box/header
+  // are appropriate.
 
   test("block interiors pin the monospace stack on the leaves", () => {
     expect(cssDeclarations(".session-tool-body")).toContain("font-family: var(--font-monospace);");

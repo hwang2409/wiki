@@ -2,14 +2,19 @@
 //  1) file-edit tools default to side-by-side (deletions LEFT, insertions RIGHT).
 //  2) transcript surfaces wrap — no horizontal-scroll min-widths, cells break
 //     long tokens with overflow-wrap: anywhere.
-//  3) chat pane default sits at ~45% of viewport, not a fixed 480px.
+//  3) chat pane default sits at ~45-50% of viewport, not a fixed 480px.
+//  4) split-diff rows pair the old cell (left) with the new cell (right) in
+//     the DOM — a regression that unpaired them (removes in one column,
+//     adds in another) must fail here.
+//  5) the raw/polished toggle for edits: polished branch = SplitDiffView,
+//     raw branch = <pre> with the actual patch source (not the tool ack).
 import { readFileSync } from "node:fs";
 import { dirname, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
-import { cleanup, render } from "@testing-library/react";
+import { act, cleanup, fireEvent, render } from "@testing-library/react";
 import { afterEach, beforeEach, describe, expect, test } from "vitest";
 
-import { DiffPatchView } from "../src/diff-view";
+import { SplitDiffView } from "../src/split-diff";
 import { ToolCallRow } from "../src/session";
 import type { SessionEvent, SessionTool } from "../src/api";
 
@@ -65,6 +70,11 @@ const HOT_MD_PATCH = [
   " ",
 ].join("\n");
 
+const LONG_OLD =
+  'PR #185 landed transcript follow-ups (spacing model, live-state anchor, data-level caps) but has known regressions in hunk chrome and the "polished" toggle that need triage before we merge #186.';
+const LONG_NEW =
+  "PR #186 landed the 1:1 fidelity + polish wave (fable-5, 10-item gap table), superseding the #185 regressions Henry flagged; transcript now honors fence tags, structures embedded heredocs, and infers file-slice output.";
+
 function editEvent(): SessionEvent {
   return {
     id: 42,
@@ -76,10 +86,8 @@ function editEvent(): SessionEvent {
       name: "Edit",
       input: JSON.stringify({
         file_path: "vault/hot.md",
-        old_string:
-          'PR #185 landed transcript follow-ups (spacing model, live-state anchor, data-level caps) but has known regressions in hunk chrome and the "polished" toggle that need triage before we merge #186.',
-        new_string:
-          "PR #186 landed the 1:1 fidelity + polish wave (fable-5, 10-item gap table), superseding the #185 regressions Henry flagged; transcript now honors fence tags, structures embedded heredocs, and infers file-slice output.",
+        old_string: LONG_OLD,
+        new_string: LONG_NEW,
         replace_all: false,
       }),
       output: "File updated.",
@@ -91,35 +99,105 @@ function editEvent(): SessionEvent {
 }
 
 describe("WIKI-251 split-diff default", () => {
-  test("DiffPatchView with viewType=split emits paired rows (removes left, adds right)", () => {
-    const { container } = render(<DiffPatchView source={HOT_MD_PATCH} viewType="split" />);
-    // The container is marked so callers/tests can distinguish modes.
-    expect(container.querySelector(".diff-view.is-split")).toBeTruthy();
-    expect(container.querySelector(".diff-hunk-body.is-split")).toBeTruthy();
-    // A remove sits on the left cell, an add on the right cell — exactly the
-    // "before | after" ordering Henry called out.
-    const removes = container.querySelectorAll(".diff-split-cell.is-side-left.is-remove");
-    const adds = container.querySelectorAll(".diff-split-cell.is-side-right.is-add");
-    expect(removes.length).toBeGreaterThan(0);
-    expect(adds.length).toBeGreaterThan(0);
-    // Every context row shows on BOTH sides (one row = two cells in the grid).
-    const contextLeft = container.querySelectorAll(".diff-split-cell.is-side-left.is-context").length;
-    const contextRight = container.querySelectorAll(".diff-split-cell.is-side-right.is-context").length;
-    expect(contextLeft).toBe(contextRight);
-    expect(contextLeft).toBeGreaterThan(0);
+  test("SplitDiffView (react-diff-view) renders a two-column split for a modified line", () => {
+    const { container } = render(
+      <SplitDiffView
+        className="test-diff"
+        emptyClassName="test-diff-empty"
+        emptyMessage="No diff to display."
+        patch={HOT_MD_PATCH}
+      />,
+    );
+    // Every rendered file wears the shared container class.
+    const diffs = container.querySelectorAll(".test-diff");
+    expect(diffs.length).toBe(1);
+
+    // react-diff-view emits a <table> per file with a split-view <tbody>.
+    // The class marker on inserted/deleted cells is diff-code-insert /
+    // diff-code-delete; the paired gutters are diff-gutter-delete /
+    // diff-gutter-insert. Presence of BOTH proves side-by-side rendering.
+    const deletes = container.querySelectorAll(".diff-code-delete");
+    const inserts = container.querySelectorAll(".diff-code-insert");
+    expect(deletes.length).toBeGreaterThan(0);
+    expect(inserts.length).toBeGreaterThan(0);
   });
 
-  test("DiffPatchView defaults to unified when viewType is omitted (back-compat)", () => {
-    const { container } = render(<DiffPatchView source={HOT_MD_PATCH} />);
-    expect(container.querySelector(".diff-view.is-unified")).toBeTruthy();
-    expect(container.querySelector(".diff-hunk-body.is-split")).toBeNull();
+  test("split-diff pairs old/new cells within the same DOM row", () => {
+    const { container } = render(
+      <SplitDiffView
+        className="test-diff"
+        emptyClassName="test-diff-empty"
+        emptyMessage="No diff to display."
+        patch={HOT_MD_PATCH}
+      />,
+    );
+
+    // Every row that mentions a delete cell must ALSO contain an insert or an
+    // empty-side cell — the two are DOM siblings inside the same <tr>. A
+    // regression that emitted deletes in one column and inserts in another
+    // would violate this pairing.
+    const rows = container.querySelectorAll("tr.diff-line");
+    expect(rows.length).toBeGreaterThan(0);
+
+    let sawPairedChange = false;
+    for (const row of Array.from(rows)) {
+      const deleteCell = row.querySelector(".diff-code-delete");
+      const insertCell = row.querySelector(".diff-code-insert");
+      if (deleteCell && insertCell) {
+        // Both sides present in one row — the change row Henry called out.
+        // Their DOM order must be delete-first (left column) then insert
+        // (right column).
+        const cells = Array.from(row.querySelectorAll("td.diff-code"));
+        const deleteIndex = cells.indexOf(deleteCell);
+        const insertIndex = cells.indexOf(insertCell);
+        expect(deleteIndex).toBeGreaterThanOrEqual(0);
+        expect(insertIndex).toBeGreaterThanOrEqual(0);
+        expect(deleteIndex).toBeLessThan(insertIndex);
+        sawPairedChange = true;
+      }
+    }
+    expect(sawPairedChange).toBe(true);
   });
 
   test("edit tool in the transcript routes through split view by default", () => {
     const { container } = render(<ToolCallRow event={editEvent()} ticket="WIKI-251" withResult />);
-    expect(container.querySelector(".diff-view.is-split")).toBeTruthy();
-    expect(container.querySelector(".diff-split-cell.is-side-left")).toBeTruthy();
-    expect(container.querySelector(".diff-split-cell.is-side-right")).toBeTruthy();
+    // The tool renders via SplitDiffView (session-tool-split-diff wraps it).
+    expect(container.querySelector(".session-tool-split-diff")).toBeTruthy();
+    // Split rendering emitted BOTH delete and insert cells (side-by-side).
+    expect(container.querySelectorAll(".diff-code-delete").length).toBeGreaterThan(0);
+    expect(container.querySelectorAll(".diff-code-insert").length).toBeGreaterThan(0);
+  });
+});
+
+describe("WIKI-251 raw/polished toggle for edits", () => {
+  test("polished branch (default) renders SplitDiffView; raw branch renders <pre> with the patch source", () => {
+    const { container } = render(<ToolCallRow event={editEvent()} ticket="WIKI-251" withResult />);
+
+    // Polished branch — split view is visible; the raw pane is NOT.
+    expect(container.querySelector(".session-tool-split-diff")).toBeTruthy();
+    expect(container.querySelector(".session-tool-raw")).toBeNull();
+
+    // Toggle the raw disclosure.
+    const rawButton = container.querySelector<HTMLButtonElement>(".session-tool-raw-toggle");
+    expect(rawButton).toBeTruthy();
+    act(() => {
+      fireEvent.click(rawButton!);
+    });
+
+    // Raw branch — the split view is hidden, and a <pre> with the actual
+    // patch source (not the "File updated." ack) is rendered.
+    expect(container.querySelector(".session-tool-split-diff")).toBeNull();
+    const rawBlock = container.querySelector(".session-tool-raw");
+    expect(rawBlock).toBeTruthy();
+    const pre = rawBlock!.querySelector("pre");
+    expect(pre).toBeTruthy();
+    const rawText = pre!.textContent ?? "";
+    // The patch's headers and the edited strings must appear verbatim.
+    expect(rawText).toContain("--- a/vault/hot.md");
+    expect(rawText).toContain("+++ b/vault/hot.md");
+    expect(rawText).toContain(LONG_NEW.slice(0, 40));
+    // The tool ack "File updated." must NOT be what raw shows.
+    expect(rawText).not.toBe("File updated.");
   });
 });
 
@@ -139,11 +217,13 @@ describe("WIKI-251 wrap sweep", () => {
     expect(CSS_WITHOUT_COMMENTS).not.toMatch(/\.diff-hunk-body\s*\{[^}]*min-width:\s*max-content/);
   });
 
-  test("split cells sit in a two-column grid with minmax(0, 1fr) — long code wraps in place", () => {
-    const grid = cssDeclarations(".diff-hunk-body.is-split");
-    expect(grid).toContain("display: grid;");
-    expect(grid).toContain("grid-template-columns: minmax(0, 1fr) minmax(0, 1fr);");
-    expect(grid).toContain("min-width: 0;");
+  test("react-diff-view cells wrap in place — long code stays in-container", () => {
+    const code = cssDeclarations(".wiki-diff .diff-code");
+    expect(code).toContain("white-space: pre-wrap;");
+    expect(code).toContain("overflow-wrap: anywhere;");
+    const table = cssDeclarations(".wiki-diff");
+    expect(table).toContain("table-layout: fixed;");
+    expect(table).toContain("width: 100%;");
   });
 
   test("markdown pre/code fences wrap by default (no per-block horizontal scroll)", () => {
@@ -176,10 +256,48 @@ describe("WIKI-251 wrap sweep", () => {
     expect(body).not.toContain("overflow-x: auto;");
   });
 
-  test("codex-stream diff lines wrap like the transcript diff", () => {
-    const line = cssDeclarations(".codex-stream-diff-line");
-    expect(line).toContain("white-space: pre-wrap;");
-    expect(line).toContain("overflow-wrap: anywhere;");
-    expect(line).not.toContain("min-width: max-content;");
+  test("artifact table cells wrap in place at container width", () => {
+    const shell = cssDeclarations(".artifact-table-scroll");
+    // The scroll shell drops horizontal scroll — only vertical remains for
+    // very tall tables with sticky headers.
+    expect(shell).not.toContain("overflow: auto;");
+    expect(shell).not.toContain("overflow-x: auto;");
+
+    const table = cssDeclarations(".artifact-table");
+    expect(table).toContain("table-layout: fixed;");
+
+    // The shared td/th selector emits ONE rule body under the multi-selector
+    // form (".artifact-table th, .artifact-table td"). Locate it by scanning
+    // for the joined selector — cssRuleBodies matches an exact single
+    // selector, which won't hit the comma-joined form.
+    const source = readFileSync(
+      resolve(dirname(fileURLToPath(import.meta.url)), "..", "src", "styles.css"),
+      "utf-8",
+    );
+    const cellRule = source
+      .split(/\/\*[\s\S]*?\*\//g).join("")
+      .match(/\.artifact-table\s+th\s*,\s*\.artifact-table\s+td\s*\{([^{}]+)\}/);
+    expect(cellRule).toBeTruthy();
+    expect(cellRule![1]).toContain("overflow-wrap: anywhere;");
+    expect(cellRule![1]).not.toMatch(/white-space:\s*nowrap;/);
+  });
+
+  test("artifact JSON wraps rather than scrolling horizontally", () => {
+    const body = cssDeclarations(".artifact-json");
+    expect(body).toContain("white-space: pre-wrap;");
+    expect(body).toContain("overflow-wrap: anywhere;");
+    expect(body).not.toContain("overflow: auto;");
+  });
+
+  test("no .is-nowrap escape hatch remains in the CSS (WIKI-251 HIGH#3)", () => {
+    // The class name and every consumer are removed — nothing in the app can
+    // fall back to horizontal-scroll on tool output.
+    expect(CSS_WITHOUT_COMMENTS).not.toMatch(/\.is-nowrap\b/);
+    // And the JSX components no longer emit the class.
+    const preview = readFileSync(
+      resolve(dirname(fileURLToPath(import.meta.url)), "..", "src", "transcript-preview.tsx"),
+      "utf-8",
+    );
+    expect(preview).not.toMatch(/is-nowrap/);
   });
 });

@@ -10334,8 +10334,13 @@ textarea.composer-command-input {
   object-fit: contain;
 }
 
+/* WIKI-251 HIGH#2: artifact tables wrap inside their container. The scroll
+   shell only owns vertical scroll now (sticky-thead + tall rows still need
+   overflow-y); table-layout: fixed distributes column widths so long cells
+   wrap in place instead of pushing the table wider than the pane. */
 .artifact-table-scroll {
-  overflow: auto;
+  overflow-x: hidden;
+  overflow-y: auto;
   border: 1px solid var(--table-border-color);
 }
 
@@ -10343,6 +10348,7 @@ textarea.composer-command-input {
   width: 100%;
   border-collapse: separate;
   border-spacing: 0;
+  table-layout: fixed;
   color: var(--text-normal);
   font-family: var(--font-monospace);
   font-weight: var(--font-monospace-weight);
@@ -10357,13 +10363,16 @@ textarea.composer-command-input {
 
 .artifact-table th,
 .artifact-table td {
-  height: 32px;
+  min-height: 32px;
   padding: 5px 9px;
   border-right: 1px solid var(--table-border-color);
   border-bottom: 1px solid var(--table-border-color);
   background: var(--background-primary);
   text-align: left;
-  white-space: nowrap;
+  white-space: normal;
+  overflow-wrap: anywhere;
+  word-break: break-word;
+  vertical-align: top;
 }
 
 .artifact-table th {
@@ -10397,9 +10406,8 @@ textarea.composer-command-input {
 }
 
 .artifact-table td.is-link {
-  max-width: 320px;
   overflow: hidden;
-  text-overflow: ellipsis;
+  overflow-wrap: anywhere;
 }
 
 .artifact-table td.is-link a {
@@ -10485,7 +10493,8 @@ textarea.composer-command-input {
   max-height: 500px;
   margin: 0;
   padding: 10px;
-  overflow: auto;
+  overflow-x: hidden;
+  overflow-y: auto;
   background: transparent;
   color: var(--text-muted);
   font-family: var(--font-monospace);
@@ -10494,6 +10503,7 @@ textarea.composer-command-input {
   line-height: 1.5;
   white-space: pre-wrap;
   overflow-wrap: anywhere;
+  word-break: break-word;
 }
 
 /* Artifact split-pane */
@@ -10682,16 +10692,18 @@ textarea.composer-command-input {
   font-size: var(--font-ui-smaller);
 }
 
+/* WIKI-251 HIGH#2: toolbar chip row wraps when the pane is narrow instead of
+   introducing a horizontal scroll strip that hides controls behind an edge. */
 .artifact-detail-toolbar {
   display: flex;
   flex: 0 0 auto;
+  flex-wrap: wrap;
   align-items: center;
   gap: 5px;
   min-height: 38px;
   padding: 5px 8px;
   border-bottom: 1px solid var(--background-modifier-border);
   background: var(--background-secondary);
-  overflow-x: auto;
 }
 
 .artifact-detail-toolbar button,
@@ -10846,15 +10858,19 @@ textarea.composer-command-input {
   font-size: var(--fs-2xs);
 }
 
+/* WIKI-251 HIGH#2: artifact-detail table (the full inspector view) wraps
+   cells too — vertical scroll only, horizontal wrap in place. */
 .artifact-table-detail-scroll {
   flex: 1;
   min-height: 0;
-  overflow: auto;
+  overflow-x: hidden;
+  overflow-y: auto;
 }
 
 .artifact-table-detail .artifact-table {
-  width: max-content;
-  min-width: 100%;
+  width: 100%;
+  min-width: 0;
+  table-layout: fixed;
 }
 
 .artifact-table-detail-heading {
@@ -11702,13 +11718,32 @@ textarea.composer-command-input {
   font-family: var(--font-monospace);
 }
 
-/* WIKI-143: artifact renderers */
+/* WIKI-143 / WIKI-251 HIGH#2: artifact renderers */
 
 .artifact-diff {
-  overflow-x: auto;
+  overflow-x: hidden;
   padding: 6px 0;
   font-family: var(--font-monospace);
   font-size: var(--fs-sm);
+}
+
+/* WIKI-251 HIGH#2: react-diff-view's table shell wraps in place — cells break
+   long tokens, gutters stay narrow. Applies to every SplitDiffView surface
+   (activity, PR review, transcript edit tools). */
+.wiki-diff {
+  width: 100%;
+  table-layout: fixed;
+}
+
+.wiki-diff .diff-code {
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+  word-break: break-word;
+}
+
+.wiki-diff .diff-gutter {
+  white-space: nowrap;
+  width: 3ch;
 }
 
 .artifact-diff-empty {
@@ -11783,10 +11818,15 @@ textarea.composer-command-input {
   font-size: var(--fs-sm);
 }
 
+/* WIKI-251 HIGH#2: JSON artifact wraps long tokens instead of scrolling. */
 .artifact-json {
   margin: 0;
   padding: 8px 12px;
-  overflow: auto;
+  overflow-x: hidden;
+  overflow-y: auto;
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+  word-break: break-word;
   font-family: var(--font-monospace);
   font-size: var(--fs-sm);
   line-height: 1.5;
@@ -11875,7 +11915,8 @@ textarea.composer-command-input {
   flex: 1;
   min-height: 0;
   padding: 12px;
-  overflow: auto;
+  overflow-x: hidden;
+  overflow-y: auto;
 }
 
 .diff-file-kind {
@@ -12307,11 +12348,6 @@ textarea.composer-command-input {
   overflow-wrap: anywhere;
 }
 
-.transcript-preview-body.is-nowrap {
-  white-space: pre;
-  overflow-wrap: normal;
-}
-
 .transcript-preview.is-error .transcript-preview-body {
   border-color: color-mix(in srgb, var(--accent-danger) 30%, var(--background-modifier-border));
   color: color-mix(in srgb, var(--accent-danger) 20%, var(--text-muted));
@@ -12351,17 +12387,6 @@ textarea.composer-command-input {
   white-space: pre-wrap;
   overflow-wrap: anywhere;
   font-family: var(--font-monospace);
-}
-
-.transcript-preview-body.is-custom.is-nowrap {
-  overflow-x: auto;
-}
-
-.transcript-preview-body.is-custom.is-nowrap .session-tool-output-text,
-.transcript-preview-body.is-custom.is-nowrap pre,
-.transcript-preview-body.is-custom.is-nowrap .shiki-block code {
-  white-space: pre;
-  overflow-wrap: normal;
 }
 
 /* WIKI-222: rendered-height clamp for payloads with long wrapped lines —

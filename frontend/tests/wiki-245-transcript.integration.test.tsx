@@ -195,7 +195,11 @@ test("tier is chosen by tool kind, not multiline output shape", () => {
   expect(write.container.querySelector(".session-tool-output-text")?.textContent).toContain("four");
 });
 
-test("apply_patch input renders its patch body as a diff", () => {
+test("apply_patch input renders its patch body as a split diff", () => {
+  // WIKI-251: transcript edit tools now render through SplitDiffView
+  // (react-diff-view), so the DOM landmarks are the library's class names
+  // (.diff-code-delete / .diff-code-insert) — not the unified .diff-line
+  // classes DiffPatchView emits for artifact-detail views.
   const { container } = renderTool({
     name: "apply_patch",
     archetype: "edit",
@@ -204,9 +208,11 @@ test("apply_patch input renders its patch body as a diff", () => {
     output: "Done",
   });
   expect(container.querySelector(".session-tool-diff-body")).toBeTruthy();
-  expect(container.querySelector(".diff-file-path")?.textContent).toBe("hot.md");
-  expect(container.querySelector(".diff-line.is-remove")?.textContent).toContain("old");
-  expect(container.querySelector(".diff-line.is-add")?.textContent).toContain("new");
+  expect(container.querySelector(".session-tool-split-diff")).toBeTruthy();
+  const deleted = container.querySelector(".diff-code-delete");
+  const inserted = container.querySelector(".diff-code-insert");
+  expect(deleted?.textContent).toContain("old");
+  expect(inserted?.textContent).toContain("new");
 });
 
 test("edit rows without diff material stay inline", () => {
@@ -229,8 +235,17 @@ test("a normalized raw Claude edit fixture renders through the real tool row", (
       withResult
     />,
   );
-  expect(container.querySelector(".diff-line.is-remove")?.textContent).toContain("function classNamesFor");
-  expect(container.querySelector(".diff-line.is-add")?.textContent).toContain("export function classNamesFor");
+  // WIKI-251: SplitDiffView (react-diff-view) is now the transcript edit
+  // renderer. The delete/insert cells expose their content on the same class
+  // names react-diff-view emits, not the unified .diff-line classes.
+  const deleteCells = Array.from(container.querySelectorAll(".diff-code-delete"))
+    .map((cell) => cell.textContent ?? "")
+    .join("\n");
+  const insertCells = Array.from(container.querySelectorAll(".diff-code-insert"))
+    .map((cell) => cell.textContent ?? "")
+    .join("\n");
+  expect(deleteCells).toContain("function classNamesFor");
+  expect(insertCells).toContain("export function classNamesFor");
 });
 
 test("replacement diffs keep full common ranges but cap visible context", () => {
