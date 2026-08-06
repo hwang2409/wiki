@@ -2153,15 +2153,55 @@ _APPLY = {
     "codex-normalized": _codex_normalized_apply,
     "claude-normalized": _claude_normalized_apply,
 }
-# Parse-state cache lifecycle (WIKI-244 R7 — the whole class, closed out):
-#   identity   — every state carries the transcript's device+inode; a replaced
-#                file at the same path (larger OR smaller) rebuilds the state,
-#                which also drops the child-assignment map living inside it.
-#   reset      — shrink (size < parsed offset) rebuilds, as before.
-#   bound      — the cache is an LRU capped at _PARSE_CACHE_MAX states; the
-#                matching lock entry is evicted with the state, but only when
-#                its refcount is zero (no holder or waiter), so an in-flight
-#                read can never share a critical section with a new lock.
+# ---------------------------------------------------------------------------
+# Cache-layer concurrency model (WIKI-244 R8 — one design, all rules here).
+#
+# Locks:
+#   _cache_locks_guard  — ONE short-hold registry mutex. Protects the
+#                         STRUCTURE and entries of all three registries:
+#                         _cache (path → parse state), _cache_locks
+#                         (path → _PathLockEntry incl. refcounts), and
+#                         _subagent_intros (child path → intro tuple).
+#   _PathLockEntry.lock — one per-path critical section, entered via
+#                         _path_lock(key). Covers the FULL read-modify-write
+#                         span for that transcript: the parse state dict,
+#                         its agent_child_assignments map, and any intro
+#                         data consulted while annotating that path.
+#
+# Lock ordering:
+#   A thread MAY take the guard while holding a path lock (guard is a leaf).
+#   A thread MUST NEVER acquire a path lock while holding the guard —
+#   _path_lock releases the guard before blocking on the path lock.
+#   The guard is never held across file I/O or any blocking call.
+#
+# Escape rule:
+#   No mutable registry object may be mutated after its lock is released.
+#   Parse states and their agent_child_assignments are only mutated inside
+#   _path_lock(main path) — including by annotate_agent_events, which holds
+#   the path lock for its whole read-modify-write span. _subagent_intros
+#   entries are immutable tuples; every compound operation on the map
+#   (lookup+validate+delete, evict+insert) happens inside the guard, with
+#   file reads OUTSIDE the guard and a re-stat validation before publish.
+#
+# Identity / reset / bound (per registry):
+#   _cache            — states carry device+inode; identity change or shrink
+#                       rebuilds (dropping the assignment map inside);
+#                       LRU-bounded at _PARSE_CACHE_MAX.
+#   _cache_locks      — refcounted; an entry is only evicted at refcount 0
+#                       (refcounts increment under the guard BEFORE lock
+#                       acquisition, so eviction can never split one path
+#                       across two lock objects); orphan entries swept.
+#   _subagent_intros  — entries carry device+inode+size; replacement or
+#                       shrink reloads; insertion-order bounded.
+#
+# Eviction points:
+#   1. On state creation (under the guard, inside _read_cached_state).
+#   2. On path-lock RELEASE when the refcount falls to zero (under the
+#      guard, inside _path_lock's finally) — so a concurrent burst of many
+#      paths trims back to the bound as soon as holders drain, and the
+#      just-released key itself is evictable. Entries with holders or
+#      waiters (refs > 0) are never evicted.
+# ---------------------------------------------------------------------------
 _PARSE_CACHE_MAX = max(8, int(os.environ.get("WIKI_PARSE_CACHE_MAX", "64")))
 _cache: dict[str, dict] = {}  # path → parse state (insertion order = LRU order)
 _cache_locks: dict[str, "_PathLockEntry"] = {}
@@ -2194,9 +2234,14 @@ def _path_lock(key: str):
         entry.lock.release()
         with _cache_locks_guard:
             entry.refs -= 1
+            if entry.refs == 0:
+                # Eviction point 2: trim on release so concurrent bursts of
+                # many distinct paths return to the bound once holders
+                # drain; the just-released key itself is fair game.
+                _evict_parse_states_locked(None)
 
 
-def _evict_parse_states_locked(current_key: str) -> None:
+def _evict_parse_states_locked(current_key: str | None) -> None:
     # Caller holds _cache_locks_guard. Evict least-recently-used states past
     # the cap, skipping the active key and any path whose lock is in use.
     for key in list(_cache):
@@ -2529,21 +2574,7 @@ def subagents_dir(main_path: Path) -> Path:
     return main_path.parent / main_path.stem / "subagents"
 
 
-def _subagent_intro(path: Path, stat: os.stat_result | None = None) -> tuple[str, str]:
-    key = str(path)
-    if stat is None:
-        try:
-            stat = path.stat()
-        except OSError:
-            return "", ""
-    cached = _subagent_intros.get(key)
-    if cached is not None:
-        head, started_at, ino, dev, size = cached
-        # Same inode growing (or unchanged) in place → the first rows cannot
-        # have changed. A new inode or a shrink means replacement/truncation.
-        if ino == stat.st_ino and dev == stat.st_dev and stat.st_size >= size:
-            return head, started_at
-        del _subagent_intros[key]
+def _read_intro_rows(path: Path) -> tuple[str, str]:
     head = ""
     started_at = ""
     try:
@@ -2565,10 +2596,44 @@ def _subagent_intro(path: Path, stat: os.stat_result | None = None) -> tuple[str
                     break
     except OSError:
         pass
+    return head, started_at
+
+
+def _subagent_intro(path: Path, stat: os.stat_result | None = None) -> tuple[str, str]:
+    key = str(path)
+    if stat is None:
+        try:
+            stat = path.stat()
+        except OSError:
+            return "", ""
+    # Compound lookup+validate+delete under the guard (concurrency model):
+    # two readers racing a replacement both take this section in turn; the
+    # loser sees the entry already gone and simply falls through to re-read.
+    with _cache_locks_guard:
+        cached = _subagent_intros.get(key)
+        if cached is not None:
+            head, started_at, ino, dev, size = cached
+            # Same inode growing (or unchanged) in place → the first rows
+            # cannot have changed. New inode or shrink = replacement.
+            if ino == stat.st_ino and dev == stat.st_dev and stat.st_size >= size:
+                return head, started_at
+            _subagent_intros.pop(key, None)
+    # File I/O outside the guard.
+    head, started_at = _read_intro_rows(path)
     if head:
-        while len(_subagent_intros) >= _SUBAGENT_INTRO_CACHE_MAX:
-            _subagent_intros.pop(next(iter(_subagent_intros)))
-        _subagent_intros[key] = (head, started_at, stat.st_ino, stat.st_dev, stat.st_size)
+        # Revalidate before publish: if the file changed identity while we
+        # read it, our rows may belong to neither generation — return them
+        # to this caller but do not publish to the cache.
+        try:
+            fresh = path.stat()
+        except OSError:
+            return head, started_at
+        if fresh.st_ino != stat.st_ino or fresh.st_dev != stat.st_dev or fresh.st_size < stat.st_size:
+            return head, started_at
+        with _cache_locks_guard:
+            while len(_subagent_intros) >= _SUBAGENT_INTRO_CACHE_MAX:
+                _subagent_intros.pop(next(iter(_subagent_intros)))
+            _subagent_intros[key] = (head, started_at, stat.st_ino, stat.st_dev, stat.st_size)
     return head, started_at
 
 
@@ -2603,14 +2668,17 @@ def _agent_assignment_store(main_path: Path) -> dict:
     """Parent-id → child-id map scoped to the transcript's parse state.
 
     Living inside the parse-state dict means the map dies with the state:
-    a file shrink or reload rebuilds the state and drops every assignment,
-    so path+id reuse can never resurrect a stale child link. Entries below
-    the retained event base are pruned (those parents can no longer appear
-    in any response window). Direct callers without parse state get an
-    ephemeral map — correlation still works within that call.
+    a file shrink, reload, or same-path replacement rebuilds the state and
+    drops every assignment. Entries below the retained event base are
+    pruned. Callers without parse state get an ephemeral map.
+
+    Concurrency model: the returned dict belongs to the parse state — the
+    CALLER must hold _path_lock(main path) for the whole span in which it
+    reads or mutates the map (annotate_agent_events does). This helper only
+    takes the registry guard for the structural lookup/prune.
     """
     key = str(main_path)
-    with _path_lock(key):
+    with _cache_locks_guard:
         state = _cache.get(key)
         if state is None:
             return {}
@@ -2643,10 +2711,21 @@ def annotate_agent_events(main_path: Path, events: list, assignments: dict | Non
     - a parent with no claimable child stays unannotated rather than reusing
       another parent's child.
     """
+    if assignments is None:
+        # Concurrency model: the state-backed assignment map may only be
+        # read or mutated inside the path's critical section — hold it for
+        # the WHOLE read-modify-write span so two concurrent annotations
+        # cannot hand the same child to two different parents.
+        with _path_lock(str(main_path)):
+            return _annotate_agent_events_locked(
+                main_path, events, _agent_assignment_store(main_path)
+            )
+    return _annotate_agent_events_locked(main_path, events, assignments)
+
+
+def _annotate_agent_events_locked(main_path: Path, events: list, assignments: dict) -> list:
     heads: dict[str, list[dict]] | None = None
     children_by_id: dict[str, dict] = {}
-    if assignments is None:
-        assignments = _agent_assignment_store(main_path)
     annotated = events
     for index, event in enumerate(events):
         tool = event.get("tool")

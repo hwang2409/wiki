@@ -497,6 +497,160 @@ class SessionDeltaTests(unittest.TestCase):
             self.assertEqual(len(reread["events"]), 1)
             self.assertIn("note 0", reread["events"][0]["text"])
 
+    def test_parse_cache_bound_recovers_after_concurrent_path_burst(self) -> None:
+        # WIKI-244 review round 8 (finding 1): eviction also runs on path-lock
+        # release, so a concurrent burst across many distinct paths trims both
+        # maps back to the bound once the holders drain.
+        def note_row(index: int) -> dict:
+            return {
+                "type": "assistant",
+                "timestamp": "2026-08-05T12:00:00Z",
+                "message": {"role": "assistant", "content": [{"type": "text", "text": f"burst {index}"}]},
+            }
+
+        with TemporaryDirectory() as tmp, mock.patch.object(transcripts, "_PARSE_CACHE_MAX", 8):
+            root = Path(tmp)
+            paths = []
+            for index in range(250):
+                path = root / f"burst-{index:03d}.jsonl"
+                _write_rows(path, [note_row(index)], mode="w")
+                paths.append(path)
+
+            errors: list[BaseException] = []
+            barrier = threading.Barrier(10)
+
+            def worker(chunk: list[Path]) -> None:
+                try:
+                    barrier.wait(timeout=30)
+                    for path in chunk:
+                        result = transcripts.read_session_delta("claude-sub", path, 0, tail_window=False)
+                        assert len(result["events"]) == 1
+                except BaseException as error:  # noqa: BLE001 — surfaced below
+                    errors.append(error)
+
+            threads = [
+                threading.Thread(target=worker, args=(paths[index::10],))
+                for index in range(10)
+            ]
+            for thread in threads:
+                thread.start()
+            for thread in threads:
+                thread.join(timeout=60)
+            self.assertEqual(errors, [])
+            self.assertLessEqual(len(transcripts._cache), 8, "state map must return to the bound after the burst")
+            self.assertLessEqual(len(transcripts._cache_locks), 9, "lock map must return to the bound after the burst")
+
+            evicted = paths[0]
+            reread = transcripts.read_session_delta("claude-sub", evicted, 0, tail_window=False)
+            self.assertIn("burst 0", reread["events"][0]["text"])
+
+    def test_subagent_intro_concurrent_replacement_is_safe(self) -> None:
+        # WIKI-244 review round 8 (finding 2): two readers racing a child-file
+        # replacement must never raise (the old code could KeyError on a
+        # double delete) and must converge on the newest intro.
+        def child_payload(prompt: str) -> str:
+            return json.dumps({
+                "type": "user",
+                "timestamp": "2026-08-05T12:00:10Z",
+                "message": {"content": prompt},
+            }) + "\n"
+
+        with TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            main_path = root / "session.jsonl"
+            main_path.touch()
+            subdir = root / "session" / "subagents"
+            subdir.mkdir(parents=True)
+            child = subdir / "agent-cafe9999.jsonl"
+            child.write_text(child_payload("generation 0 prompt padded for shrink coverage"))
+
+            errors: list[BaseException] = []
+            stop = threading.Event()
+
+            def reader() -> None:
+                try:
+                    while not stop.is_set():
+                        transcripts.list_subagents(main_path)
+                except BaseException as error:  # noqa: BLE001 — surfaced below
+                    errors.append(error)
+
+            threads = [threading.Thread(target=reader) for _ in range(2)]
+            for thread in threads:
+                thread.start()
+            try:
+                for generation in range(1, 30):
+                    replacement = subdir / "agent-cafe9999.jsonl.next"
+                    replacement.write_text(child_payload(f"gen {generation}"))
+                    os.replace(replacement, child)
+            finally:
+                stop.set()
+                for thread in threads:
+                    thread.join(timeout=30)
+
+            self.assertEqual(errors, [], "concurrent replacement must never raise in readers")
+            final = transcripts.list_subagents(main_path)
+            self.assertEqual(final[0]["prompt_head"], "gen 29")
+            self.assertLessEqual(len(transcripts._subagent_intros), transcripts._SUBAGENT_INTRO_CACHE_MAX)
+
+    def test_concurrent_duplicate_parent_annotation_stays_one_to_one(self) -> None:
+        # WIKI-244 review round 8 (finding 3): the annotation read-modify-
+        # write span holds the path lock, so two threads annotating duplicate
+        # -prompt parents concurrently can never hand the same child to both.
+        children = [
+            {"id": "aaa11111", "prompt_head": "explore the code", "started_at": "2026-08-05T12:00:10Z"},
+            {"id": "bbb22222", "prompt_head": "explore the code", "started_at": "2026-08-05T12:05:10Z"},
+        ]
+        parent_a = {
+            "id": 4,
+            "kind": "tool",
+            "ts": "2026-08-05T12:00:00Z",
+            "tool": {"name": "Task", "prompt_head": "explore the code"},
+        }
+        parent_b = {
+            "id": 9,
+            "kind": "tool",
+            "ts": "2026-08-05T12:05:00Z",
+            "tool": {"name": "Task", "prompt_head": "explore the code"},
+        }
+
+        with TemporaryDirectory() as tmp, mock.patch.object(transcripts, "list_subagents", return_value=children):
+            for iteration in range(50):
+                transcripts._cache.clear()
+                transcripts._cache_locks.clear()
+                path = Path(tmp) / f"dup-{iteration:02d}.jsonl"
+                path.touch()
+                # Build real parse state so annotation uses the state-backed,
+                # path-locked store.
+                transcripts.read_session_delta("claude", path, 0, tail_window=False)
+
+                results: dict[str, list] = {}
+                errors: list[BaseException] = []
+                barrier = threading.Barrier(2)
+
+                def annotate(name: str, parent: dict) -> None:
+                    try:
+                        barrier.wait(timeout=30)
+                        results[name] = transcripts.annotate_agent_events(path, [parent])
+                    except BaseException as error:  # noqa: BLE001 — surfaced below
+                        errors.append(error)
+
+                threads = [
+                    threading.Thread(target=annotate, args=("a", parent_a)),
+                    threading.Thread(target=annotate, args=("b", parent_b)),
+                ]
+                for thread in threads:
+                    thread.start()
+                for thread in threads:
+                    thread.join(timeout=30)
+                self.assertEqual(errors, [])
+                child_a = results["a"][0]["tool"].get("agent_id")
+                child_b = results["b"][0]["tool"].get("agent_id")
+                self.assertIsNotNone(child_a)
+                self.assertIsNotNone(child_b)
+                self.assertNotEqual(child_a, child_b, f"iteration {iteration}: both parents got {child_a}")
+                self.assertEqual(child_a, "aaa11111")
+                self.assertEqual(child_b, "bbb22222")
+
     def test_models_endpoint_includes_new_codex_and_claude_options(self) -> None:
         payload = main.list_models()
         models = {model["id"]: model for model in payload["models"]}
