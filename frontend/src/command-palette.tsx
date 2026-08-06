@@ -235,6 +235,17 @@ export function CommandPalette({ onClose, onOpen }: CommandPaletteProps) {
         onClick={(event) => event.stopPropagation()}
         onKeyDown={handleDialogKeyDown}
       >
+        <div className="dialog-title">
+          <span>Command palette</span>
+          <button
+            aria-label="Close command palette"
+            className="dialog-title-esc"
+            type="button"
+            onClick={onClose}
+          >
+            esc
+          </button>
+        </div>
         <div className="command-palette-mode" role="group" aria-label="Search mode">
           <span className="command-palette-mode-label">search</span>
           {(["lexical", "semantic"] as PaletteSearchMode[]).map((option) => (

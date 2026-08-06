@@ -3,8 +3,16 @@ import { readFileSync } from "node:fs";
 import { dirname, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 
-import { cleanup, render } from "@testing-library/react";
-import { afterEach, describe, expect, test } from "vitest";
+import { cleanup, render, within } from "@testing-library/react";
+import { afterEach, describe, expect, test, vi } from "vitest";
+import { CommandPalette } from "../src/command-palette";
+import { KanbanBoard } from "../src/kanban";
+import { searchPalette } from "../src/api";
+import { FleetSwitcher, QuickSwitcher } from "../src/switcher";
+
+vi.mock("../src/api", () => ({
+  searchPalette: vi.fn(),
+}));
 
 const CSS_SOURCE = readFileSync(
   resolve(dirname(fileURLToPath(import.meta.url)), "..", "src", "styles.css"),
@@ -12,94 +20,158 @@ const CSS_SOURCE = readFileSync(
 );
 const CHROME_CSS = CSS_SOURCE.slice(CSS_SOURCE.lastIndexOf("WIKI-246: OpenCode chrome language"));
 
-function cssRule(selector: string): string {
-  const start = CSS_SOURCE.lastIndexOf(`${selector} {`);
-  expect(start).toBeGreaterThanOrEqual(0);
-  const end = CSS_SOURCE.indexOf("}", start);
-  expect(end).toBeGreaterThan(start);
-  return CSS_SOURCE.slice(start, end);
+function cssDeclarations(selector: string): string {
+  const declarations = [...CSS_SOURCE.matchAll(/([^{}]+)\{([^{}]*)\}/g)]
+    .filter((match) => match[1].split(",").some((entry) => entry.trim() === selector))
+    .map((match) => match[2]);
+  expect(declarations.length).toBeGreaterThan(0);
+  return declarations.join("\n");
 }
 
-afterEach(() => cleanup());
+const noOp = () => {};
+
+afterEach(() => {
+  cleanup();
+  vi.clearAllMocks();
+});
 
 describe("WIKI-246 OpenCode chrome states", () => {
-  test("selected controls use fill selection without a border", () => {
-    const { container } = render(
-      <div>
-        <button className="command-palette-mode-button is-selected">semantic</button>
-        <button className="quick-switcher-result is-selected">selected result</button>
-        <article className="agent-card is-selected">selected agent</article>
-      </div>,
+  test("real switcher dialogs mount title rows and clickable esc hints", () => {
+    const switcher = render(
+      <QuickSwitcher
+        notes={[
+          {
+            id: "note-1",
+            path: "notes/one.md",
+            title: "one",
+            excerpt: "",
+            updated_at: "2026-08-06T00:00:00Z",
+          },
+        ]}
+        files={[]}
+        filesLoading={false}
+        recent={[]}
+        sessions={[]}
+        onClose={noOp}
+        onOpen={noOp}
+        onOpenFile={noOp}
+        onOpenRecent={noOp}
+        onOpenSession={noOp}
+        onOpenPage={noOp}
+      />,
     );
 
-    expect(container.querySelectorAll(".is-selected")).toHaveLength(3);
-    expect(cssRule(".command-palette-mode-button")).toContain("border: 0;");
-    expect(CSS_SOURCE).toContain(".command-palette-mode-button.is-selected");
-    expect(CSS_SOURCE).toContain("background-color: var(--accent-primary);");
-    expect(cssRule(".agent-card.is-selected")).toContain("border-left: 0;");
-    expect(cssRule(".agent-card.is-selected")).toContain(
-      "background-color: var(--accent-primary);",
-    );
+    const switcherDialog = switcher.getByRole("dialog", { name: "Quick switcher" });
+    expect(within(switcherDialog).getByText("Quick switcher")).toBeTruthy();
+    expect(
+      within(switcherDialog).getByRole("button", { name: "Close quick switcher" }),
+    ).toBeTruthy();
+
+    vi.mocked(searchPalette).mockResolvedValue({ results: [] });
+    const commandPalette = render(<CommandPalette onClose={noOp} onOpen={noOp} />);
+    const paletteDialog = commandPalette.getByRole("dialog", { name: "Command palette" });
+    expect(within(paletteDialog).getByText("Command palette")).toBeTruthy();
+    expect(
+      within(paletteDialog).getByRole("button", { name: "Close command palette" }),
+    ).toBeTruthy();
+    expect(cssDeclarations(".dialog-title")).toContain("font-weight: var(--fw-semibold);");
+    expect(cssDeclarations(".dialog-title-esc")).toContain("color: var(--text-muted);");
+    expect(cssDeclarations(".dialog-title-esc")).toContain("cursor: pointer;");
   });
 
-  test("disabled switcher entries do not receive hover elevation", () => {
-    const { container } = render(
-      <button className="quick-switcher-result fleet-switcher-result is-disabled">
-        unavailable
-      </button>,
+  test("real switcher selection and fleet rows use the chrome declarations", () => {
+    const switcher = render(
+      <QuickSwitcher
+        notes={[]}
+        files={[]}
+        filesLoading={false}
+        recent={[]}
+        sessions={[
+          {
+            id: "session-1",
+            model: "model",
+            orchestratorId: null,
+            provider: "provider",
+            role: "worker",
+            sessionKind: "worker",
+          },
+        ]}
+        onClose={noOp}
+        onOpen={noOp}
+        onOpenFile={noOp}
+        onOpenRecent={noOp}
+        onOpenSession={noOp}
+        onOpenPage={noOp}
+      />,
     );
 
-    const entry = container.querySelector(".fleet-switcher-result");
-    expect(entry?.classList.contains("is-disabled")).toBe(true);
+    const selected = switcher.container.querySelector(".quick-switcher-result.is-selected");
+    expect(selected).toBeTruthy();
+    expect(cssDeclarations(".quick-switcher-result")).toContain("border-radius: 0;");
+    expect(cssDeclarations(".quick-switcher-result.is-selected")).toContain(
+      "background-color: var(--accent-primary);",
+    );
+
+    const fleet = render(
+      <FleetSwitcher
+        title="Agents"
+        items={[
+          { key: "current", value: "current", label: "current", meta: "working", active: true },
+          { key: "disabled", value: "disabled", label: "disabled", meta: "offline", disabled: true },
+        ]}
+        onClose={noOp}
+        onPick={noOp}
+      />,
+    );
+
+    expect(fleet.container.querySelector(".fleet-switcher-result.is-current")).toBeTruthy();
+    expect(
+      within(fleet.getByRole("dialog", { name: "Agents" })).getByRole("button", {
+        name: "Close Agents",
+      }),
+    ).toBeTruthy();
+    expect(cssDeclarations(".fleet-switcher-result.is-current:not(.is-selected)")).toContain(
+      "background-color: transparent;",
+    );
     expect(CSS_SOURCE).toContain(
       ".quick-switcher-result:hover:not(.is-selected):not(.is-disabled)",
     );
   });
 
-  test("current navigation items expose one dot and no left rail", () => {
-    const { container } = render(
-      <div>
-        <button className="tree-item-self is-active">current note</button>
-        <button className="nav-agent is-active">current agent</button>
-      </div>,
+  test("real kanban cards keep flat chrome", () => {
+    const view = render(
+      <KanbanBoard
+        content={"Todo:\n- ship chrome"}
+        notes={[]}
+        onChange={noOp}
+        onComplete={noOp}
+        onOpenNote={noOp}
+      />,
     );
 
-    expect(container.querySelectorAll(".is-active")).toHaveLength(2);
-    expect(cssRule(".tree-item-self.is-active")).toContain("border-left: 0;");
-    expect(cssRule(".nav-agent.is-active")).toContain("border-left: 0;");
+    const card = view.getByText("ship chrome").closest(".kanban-card");
+    expect(card).toBeTruthy();
+    expect(cssDeclarations(".kanban-card")).toContain("border-radius: 0;");
+    expect(cssDeclarations(".kanban-card")).toContain("border: 0;");
+    expect(cssDeclarations(".kanban-card:hover")).toContain("box-shadow: none;");
+  });
+
+  test("converted chrome has no transition sites", () => {
+    expect(cssDeclarations(".tmux-status-item")).not.toContain("transition");
+    expect(CSS_SOURCE).not.toContain(
+      "transition-property: transform;\n  transition-duration: 140ms;",
+    );
+    expect(cssDeclarations(".session-composer-row")).not.toContain("transition");
+    expect(CSS_SOURCE).not.toContain(".agent-spawn-static");
+    expect(CHROME_CSS).toContain("animation: chrome-fade-in var(--chrome-motion-duration)");
+  });
+
+  test("current navigation items expose one dot and no left rail", () => {
+    expect(cssDeclarations(".tree-item-self.is-active")).toContain("border-left: 0;");
+    expect(cssDeclarations(".nav-agent.is-active")).toContain("border-left: 0;");
     expect(CSS_SOURCE).toContain(".tree-item-self.is-active::before");
     expect(CSS_SOURCE).toContain(".nav-agent.is-active::before");
     expect(CSS_SOURCE).toContain('content: "●";');
-  });
-
-  test("dialogs and composer expose the intended chrome structure", () => {
-    const { container } = render(
-      <div className="modal-backdrop">
-        <section aria-modal="true" className="dialog" role="dialog">
-          <div className="dialog-title">commands</div>
-          <div className="dialog-actions">
-            <button className="dialog-button dialog-confirm">confirm</button>
-          </div>
-        </section>
-        <section className="session-composer">
-          <div className="session-composer-row">
-            <label className="session-composer-target" htmlFor="prompt">ask</label>
-            <div className="session-input-wrap"><textarea id="prompt" /></div>
-            <button className="session-send">send</button>
-          </div>
-        </section>
-      </div>,
-    );
-
-    expect(container.querySelector('[role="dialog"]')?.classList.contains("dialog")).toBe(true);
-    expect(CSS_SOURCE).toContain('.dialog-title::after');
-    expect(CSS_SOURCE).toContain('content: "esc";');
-    expect(CHROME_CSS).toContain(".dialog,");
-    expect(CHROME_CSS).toContain("  border: 0;");
-    expect(container.querySelector(".session-composer-row")?.classList.contains("session-composer-row")).toBe(true);
-    expect(container.querySelector(".session-composer-target")?.getAttribute("for")).toBe("prompt");
-    expect(container.querySelector(".session-input-wrap")).toBeTruthy();
-    expect(container.querySelector(".session-send")).toBeTruthy();
   });
 
   test("pending-user styling stays outside transcript messages", () => {

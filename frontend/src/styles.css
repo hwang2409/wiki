@@ -2241,8 +2241,7 @@ body.is-resizing-panes .pane-cell {
   letter-spacing: 0.01em;
 }
 
-.agent-spawn-select,
-.agent-spawn-static {
+.agent-spawn-select {
   width: 100%;
   min-height: 36px;
   padding: 9px 12px;
@@ -2277,12 +2276,6 @@ body.is-resizing-panes .pane-cell {
   box-shadow: 0 0 0 3px color-mix(in srgb, var(--text-normal) 8%, transparent);
   outline: 2px solid var(--accent-primary, var(--text-normal));
   outline-offset: 2px;
-}
-
-.agent-spawn-static {
-  color: var(--text-faint);
-  background-color: var(--background-secondary);
-  border-style: dashed;
 }
 
 .agent-spawn-textarea {
@@ -2614,6 +2607,12 @@ body.is-resizing-panes .pane-cell {
   font-weight: var(--fw-semibold);
 }
 
+.fleet-switcher-head-actions {
+  display: inline-flex;
+  align-items: baseline;
+  gap: 12px;
+}
+
 .fleet-switcher-count {
   color: var(--text-faint);
   font-size: var(--font-ui-smaller);
@@ -2699,7 +2698,6 @@ body.is-resizing-panes .pane-cell {
   font-weight: var(--font-monospace-weight);
   font-size: var(--font-ui-smaller);
   white-space: nowrap;
-  transition: background-color 100ms ease-out, color 100ms ease-out;
 }
 
 .tmux-status-item:hover {
@@ -8326,12 +8324,6 @@ body.is-resizing-panes .pane-cell {
   color: var(--text-normal);
 }
 
-.nav-orch-toggle .nav-orch-chevron {
-  transition-property: transform;
-  transition-duration: 140ms;
-  transition-timing-function: ease-out;
-}
-
 .nav-orch-toggle[aria-expanded="true"] .nav-orch-chevron {
   transform: rotate(90deg);
 }
@@ -8561,9 +8553,6 @@ body.is-resizing-panes .pane-cell {
   border-left: 3px solid color-mix(in srgb, var(--accent-primary) 55%, transparent);
   border-radius: var(--radius-xs);
   background-color: var(--background-secondary);
-  transition-property: border-color, background-color;
-  transition-duration: 120ms;
-  transition-timing-function: ease-out;
 }
 
 .session-composer-row:focus-within {
@@ -15483,16 +15472,24 @@ textarea.composer-command-input {
   letter-spacing: 0;
 }
 
-.dialog-title::after {
+.dialog-title-esc {
+  border: 0;
+  padding: 0;
+  background: transparent;
   color: var(--text-muted);
-  content: "esc";
+  font: inherit;
   font-size: var(--font-ui-smaller);
   font-weight: var(--fw-regular);
+  cursor: pointer;
+}
+
+.dialog-title-esc:hover,
+.dialog-title-esc:focus-visible {
+  color: var(--text);
 }
 
 .dialog-input,
-.agent-spawn-select,
-.agent-spawn-static {
+.agent-spawn-select {
   border: 0;
   border-bottom: 1px solid var(--border-default);
   border-radius: 0;

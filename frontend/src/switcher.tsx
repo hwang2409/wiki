@@ -403,6 +403,17 @@ export function QuickSwitcher({
         role="dialog"
         onClick={(event) => event.stopPropagation()}
       >
+        <div className="dialog-title">
+          <span>Quick switcher</span>
+          <button
+            aria-label="Close quick switcher"
+            className="dialog-title-esc"
+            type="button"
+            onClick={onClose}
+          >
+            esc
+          </button>
+        </div>
         <input
           autoFocus
           placeholder="Find a note, file, or session..."
@@ -558,9 +569,19 @@ export function FleetSwitcher({
         onClick={(event) => event.stopPropagation()}
         onKeyDown={handleKeyDown}
       >
-        <div className="fleet-switcher-head">
+        <div className="dialog-title fleet-switcher-head">
           <span>{title}</span>
-          <span className="fleet-switcher-count">{items.length} items</span>
+          <span className="fleet-switcher-head-actions">
+            <span className="fleet-switcher-count">{items.length} items</span>
+            <button
+              aria-label={`Close ${title}`}
+              className="dialog-title-esc"
+              type="button"
+              onClick={onClose}
+            >
+              esc
+            </button>
+          </span>
         </div>
         <div className="quick-switcher-results">
           {items.length > 0 ? (
