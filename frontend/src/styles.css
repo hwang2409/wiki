@@ -156,7 +156,7 @@ body {
   margin: 0;
   min-width: 320px;
   overflow: hidden;
-  background-color: var(--background-primary);
+  background-color: var(--background-canvas);
   color: var(--text-normal);
   font-family: var(--font-chrome);
   font-weight: var(--font-interface-weight);
@@ -260,22 +260,14 @@ button:disabled {
 }
 
 :where(
-  .search-result,
   .activity-commit-row,
   .activity-file,
   .health-row,
-  .nav-agent,
   .agent-log-toggle,
   .view-action,
   .settings-reset,
-  .session-close,
   .session-activity-head,
   .session-tool-head,
-  .session-send,
-  .session-subagent-chip,
-  .session-skill-item,
-  .session-queued button,
-  .session-attachment button,
   .session-expand
 ) {
   transition-property: background-color, border-color, color, transform, opacity, box-shadow;
@@ -284,17 +276,10 @@ button:disabled {
 }
 
 :where(
-  .search-result,
   .activity-file,
   .agent-log-toggle,
   .view-action,
   .settings-reset,
-  .session-close,
-  .session-send,
-  .session-subagent-chip,
-  .session-skill-item,
-  .session-queued button,
-  .session-attachment button,
   .session-expand
 ):active:not(:disabled) {
   transform: scale(0.96);
@@ -411,9 +396,6 @@ button:disabled {
   height: 30px;
   border-radius: var(--radius-s);
   color: var(--text-muted);
-  transition-property: background-color, color, scale;
-  transition-duration: 100ms;
-  transition-timing-function: ease-out;
 }
 
 .ribbon-action::after {
@@ -425,10 +407,6 @@ button:disabled {
 .ribbon-action:hover {
   background-color: var(--background-modifier-hover);
   color: var(--text-normal);
-}
-
-.ribbon-action:active {
-  scale: 0.96;
 }
 
 .ribbon-action.is-active {
@@ -617,9 +595,6 @@ button:disabled {
   height: 26px;
   border-radius: var(--radius-s);
   color: var(--text-muted);
-  transition-property: background-color, color, scale;
-  transition-duration: 100ms;
-  transition-timing-function: ease-out;
 }
 
 .nav-action-button:hover {
@@ -630,10 +605,6 @@ button:disabled {
 .nav-action-button.is-active {
   color: var(--text-normal);
   box-shadow: inset 0 -1px 0 var(--text-normal);
-}
-
-.nav-action-button:active {
-  scale: 0.96;
 }
 
 .nav-files-container {
@@ -653,9 +624,6 @@ button:disabled {
   font-size: var(--font-ui-small);
   line-height: 1.3;
   text-align: left;
-  transition-property: background-color, color;
-  transition-duration: 100ms;
-  transition-timing-function: ease-out;
 }
 
 .tree-item-self:hover {
@@ -753,9 +721,6 @@ button:disabled {
   padding: 6px 8px;
   border-radius: var(--radius-s);
   text-align: left;
-  transition-property: background-color;
-  transition-duration: 100ms;
-  transition-timing-function: ease-out;
 }
 
 .search-result:hover {
@@ -2128,6 +2093,7 @@ body.is-resizing-panes .pane-cell {
   transition-property: border-color, box-shadow;
   transition-duration: 120ms;
   transition-timing-function: ease-out;
+  outline: none;
 }
 
 .dialog-input:hover {
@@ -2156,19 +2122,12 @@ body.is-resizing-panes .pane-cell {
   border-radius: var(--radius-md);
   color: var(--text-muted);
   font-size: var(--font-ui-small);
-  transition-property: background-color, color, border-color, scale;
-  transition-duration: 100ms;
-  transition-timing-function: ease-out;
 }
 
 .dialog-button:hover {
   border-color: var(--text-faint);
   background-color: var(--background-modifier-hover);
   color: var(--text-normal);
-}
-
-.dialog-button:active:not(:disabled) {
-  scale: 0.97;
 }
 
 .dialog-confirm {
@@ -2581,8 +2540,8 @@ body.is-resizing-panes .pane-cell {
 }
 
 .command-palette-mode-button {
-  border: 1px solid var(--background-modifier-border);
-  border-radius: 4px;
+  border: 0;
+  border-radius: 0;
   padding: 3px 8px;
   color: var(--text-faint);
   background: transparent;
@@ -2592,7 +2551,6 @@ body.is-resizing-panes .pane-cell {
 
 .command-palette-mode-button:hover,
 .command-palette-mode-button.is-selected {
-  border-color: var(--interactive-accent);
   color: var(--text-normal);
 }
 
@@ -3002,14 +2960,11 @@ body.is-resizing-panes .pane-cell {
   height: 96px;
   overflow: hidden;
   padding: 8px 10px;
-  border: 1px solid var(--background-modifier-border);
-  border-radius: var(--radius-sm);
+  border: 0;
+  border-radius: 0;
   background-color: var(--kanban-card);
   box-shadow: var(--kanban-card-shadow);
   cursor: grab;
-  transition-property: border-color, opacity;
-  transition-duration: 100ms;
-  transition-timing-function: ease-out;
 }
 
 .kanban-card:hover {
@@ -5230,8 +5185,8 @@ body.is-resizing-panes .pane-cell {
 
 .agent-card {
   padding: 12px 14px;
-  border: 1px solid var(--background-modifier-border);
-  border-radius: var(--radius-m);
+  border: 0;
+  border-radius: 0;
   background-color: var(--background-secondary);
 }
 
@@ -5583,15 +5538,8 @@ body.is-resizing-panes .pane-cell {
   opacity: 0.55;
 }
 
-.agent-card.is-selected {
-  border-color: var(--text-muted);
-}
-
 .agents-layout .agent-card {
   cursor: default;
-  transition-property: border-color, background-color;
-  transition-duration: 100ms;
-  transition-timing-function: ease-out;
 }
 
 .agents-layout .agent-card:not(.is-selected):hover {
@@ -14638,13 +14586,6 @@ textarea.composer-command-input {
 .agent-session-head-secondary .session-close {
   min-height: 32px;
   color: var(--text-muted);
-  transition-property: background-color, color, scale;
-}
-
-.agent-session-head-secondary .agent-surface-action:active,
-.agent-session-head-secondary .session-close:active,
-.loop-chrome button:active {
-  scale: 0.96;
 }
 
 .agent-session-head-secondary :where(button):focus-visible {
@@ -15328,7 +15269,7 @@ textarea.composer-command-input {
 .search-result:hover,
 .session-skill-item:hover,
 .kanban-card:hover,
-.quick-switcher-result:hover:not(.is-selected) {
+.quick-switcher-result:hover:not(.is-selected):not(.is-disabled) {
   background-color: var(--background-element);
   color: var(--text);
 }
@@ -15357,13 +15298,13 @@ textarea.composer-command-input {
 }
 
 .tree-item-self.is-active {
-  padding-left: 18px;
-  border-left: 3px solid var(--accent-primary);
+  padding-left: 8px;
+  border-left: 0;
 }
 
 .nav-agent.is-active {
-  padding-left: 18px;
-  border-left: 3px solid var(--accent-primary);
+  padding-left: 8px;
+  border-left: 0;
 }
 
 .quick-switcher-result.is-selected,
@@ -15392,7 +15333,7 @@ textarea.composer-command-input {
 
 .agent-card.is-selected {
   border: 0;
-  border-left: 3px solid var(--accent-primary);
+  border-left: 0;
   border-radius: 0;
   background-color: var(--accent-primary);
   color: var(--selected-list-item-text);
@@ -15405,7 +15346,6 @@ textarea.composer-command-input {
 }
 
 .kanban-card:hover {
-  border-color: transparent;
   box-shadow: none;
 }
 
@@ -15416,7 +15356,7 @@ textarea.composer-command-input {
 .agent-spawn-preview,
 .agent-tech,
 .session-composer-row,
-.session-user {
+.session-pending-user {
   border-top: 0;
   border-right: 0;
   border-bottom: 0;
@@ -15456,13 +15396,10 @@ textarea.composer-command-input {
   padding: 8px 10px;
   border-left: 3px solid color-mix(in srgb, var(--accent-primary) 62%, transparent);
   background-color: var(--background-element);
-  transition-property: border-color, background-color;
-  transition-duration: var(--chrome-motion-duration);
-  transition-timing-function: ease-out;
 }
 
 .session-composer-row:focus-within {
-  border-left-color: var(--accent-primary);
+  border-left-color: var(--border-active);
   background-color: var(--background-element);
 }
 
@@ -15566,7 +15503,7 @@ textarea.composer-command-input {
 .dialog-input:focus-visible,
 .agent-spawn-select:focus,
 .agent-spawn-select:focus-visible {
-  border-color: var(--accent-primary);
+  border-bottom-color: var(--border-active);
   box-shadow: none;
 }
 
@@ -15701,39 +15638,6 @@ textarea.composer-command-input {
   color: var(--text);
   font-weight: var(--fw-medium);
 }
-
-/* Toast contract for current and future callers: one stack, one panel. */
-.toast-stack {
-  position: fixed;
-  top: 16px;
-  right: 16px;
-  z-index: 200;
-  display: flex;
-  flex-direction: column;
-  gap: 8px;
-  width: min(360px, calc(100vw - 32px));
-  pointer-events: none;
-}
-
-.toast-stack > :not(:last-child) {
-  display: none;
-}
-
-.toast {
-  padding: 10px 12px;
-  border: 0;
-  border-left: 3px solid var(--accent-primary);
-  border-radius: 0;
-  background-color: var(--background-panel);
-  color: var(--text);
-  box-shadow: none;
-  pointer-events: auto;
-}
-
-.toast.is-success { border-left-color: var(--accent-success); }
-.toast.is-warning { border-left-color: var(--accent-warning); }
-.toast.is-error { border-left-color: var(--accent-danger); }
-.toast.is-info { border-left-color: var(--accent-primary); }
 
 @keyframes chrome-fade-in {
   from { opacity: 0; }
