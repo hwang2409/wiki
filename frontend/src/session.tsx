@@ -90,6 +90,7 @@ import {
   slashMenuOptionId,
 } from "./composer-slash-menu";
 import { externalLinkProps } from "./external-links";
+import { useModalA11y } from "./modal-a11y";
 import {
   GhPreviewCard,
   containsGitHubPreviewUrl,
@@ -822,7 +823,7 @@ function mergeComposerEvents(events: SessionEvent[], composerEvents: SessionEven
   return merged;
 }
 
-function SessionModelFooter({
+export function SessionModelFooter({
   session,
   ticket,
 }: {
@@ -833,6 +834,18 @@ function SessionModelFooter({
   const [models, setModels] = useState<AgentModelOption[]>([]);
   const [loading, setLoading] = useState(false);
   const [confirmModel, setConfirmModel] = useState<string | null>(null);
+  const modelTriggerRef = useRef<HTMLButtonElement | null>(null);
+  const modelA11yId = useId();
+  const modelMenuId = `session-model-menu-${modelA11yId}`;
+  const modelConfirmTitleId = `session-model-confirm-title-${modelA11yId}`;
+  const modelConfirmRef = useModalA11y<HTMLDivElement>(
+    Boolean(confirmModel),
+    () => setConfirmModel(null),
+    modelTriggerRef,
+  );
+  const modelMenuRef = useRef<HTMLDivElement | null>(null);
+  const modelOptionRefs = useRef<Array<HTMLButtonElement | null>>([]);
+  const [menuActiveIndex, setMenuActiveIndex] = useState(0);
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const currentModel = session.model ?? "";
@@ -845,6 +858,42 @@ function SessionModelFooter({
       ),
     [currentModel, kind, models],
   );
+
+  useEffect(() => {
+    if (!open || loading || allowedModels.length === 0) return;
+    const frame = window.requestAnimationFrame(() => {
+      setMenuActiveIndex(0);
+      modelOptionRefs.current[0]?.focus();
+    });
+    return () => window.cancelAnimationFrame(frame);
+  }, [allowedModels.length, loading, open]);
+
+  function handleModelMenuKeyDown(event: React.KeyboardEvent<HTMLDivElement>) {
+    if (event.key === "Tab") {
+      setOpen(false);
+      return;
+    }
+    if (event.key === "Escape") {
+      event.preventDefault();
+      setOpen(false);
+      modelTriggerRef.current?.focus();
+      return;
+    }
+    const options = modelOptionRefs.current.filter(
+      (option): option is HTMLButtonElement => option !== null,
+    );
+    if (options.length === 0) return;
+    const activeIndex = options.indexOf(document.activeElement as HTMLButtonElement);
+    let nextIndex: number | null = null;
+    if (event.key === "ArrowDown") nextIndex = activeIndex < 0 ? 0 : (activeIndex + 1) % options.length;
+    else if (event.key === "ArrowUp") nextIndex = activeIndex < 0 ? options.length - 1 : (activeIndex - 1 + options.length) % options.length;
+    else if (event.key === "Home") nextIndex = 0;
+    else if (event.key === "End") nextIndex = options.length - 1;
+    if (nextIndex === null) return;
+    event.preventDefault();
+    setMenuActiveIndex(nextIndex);
+    options[nextIndex]?.focus();
+  }
 
   useEffect(() => {
     if (!open || models.length > 0 || loading) return;
@@ -901,9 +950,12 @@ function SessionModelFooter({
       <span className={`session-model-badge${desiredModel ? " has-queued" : ""}`}>
         <button
           aria-expanded={open}
+          aria-controls={modelMenuId}
+          aria-haspopup="menu"
           aria-label="Change model"
           className="session-model-current"
           disabled={busy}
+          ref={modelTriggerRef}
           type="button"
           onClick={() => setOpen((value) => !value)}
         >
@@ -925,15 +977,25 @@ function SessionModelFooter({
         ) : null}
       </span>
       {open ? (
-        <div className="session-model-menu">
+        <div
+          aria-label="Available models"
+          className="session-model-menu"
+          id={modelMenuId}
+          ref={modelMenuRef}
+          role="menu"
+          onKeyDown={handleModelMenuKeyDown}
+        >
           {loading ? <div className="session-model-empty">Loading models</div> : null}
           {!loading && allowedModels.length === 0 ? (
             <div className="session-model-empty">No alternate models</div>
           ) : null}
-          {allowedModels.map((option) => (
+          {allowedModels.map((option, index) => (
             <button
               className="session-model-option"
               key={option.id}
+              ref={(element) => { modelOptionRefs.current[index] = element; }}
+              role="menuitem"
+              tabIndex={index === menuActiveIndex ? 0 : -1}
               type="button"
               onClick={() => setConfirmModel(option.id)}
             >
@@ -944,8 +1006,16 @@ function SessionModelFooter({
         </div>
       ) : null}
       {confirmModel ? (
-        <div className="session-model-confirm" role="dialog" aria-modal="true">
+        <div
+          aria-labelledby={modelConfirmTitleId}
+          className="session-model-confirm"
+          ref={modelConfirmRef}
+          role="dialog"
+          aria-modal="true"
+          tabIndex={-1}
+        >
           <div className="session-model-confirm-text">
+            <strong id={modelConfirmTitleId} className="sr-only">Confirm model switch</strong>
             Switch to {confirmModel} after current turn finishes? Currently on {currentModel}.
           </div>
           <div className="session-model-confirm-actions">

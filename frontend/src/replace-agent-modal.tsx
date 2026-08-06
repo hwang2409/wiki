@@ -2,6 +2,7 @@ import { useEffect, useState, type FormEvent } from "react";
 import { ChevronDown, RefreshCw, X } from "lucide-react";
 import { getAgentModels, replaceAgent } from "./api";
 import { DisclosureContent } from "./disclosure";
+import { useModalA11y } from "./modal-a11y";
 import { isWorkerRole, presetWorkerModel } from "./role-pipeline";
 import type {
   AgentModelOption,
@@ -55,6 +56,9 @@ export function ReplaceAgentModal({
   const [submitting, setSubmitting] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [advancedOpen, setAdvancedOpen] = useState(false);
+  const dialogRef = useModalA11y<HTMLFormElement>(true, () => {
+    if (!submitting) onClose();
+  });
 
   useEffect(() => {
     if (models) {
@@ -73,14 +77,6 @@ export function ReplaceAgentModal({
       ignore = true;
     };
   }, [models]);
-
-  useEffect(() => {
-    function onKeyDown(event: globalThis.KeyboardEvent) {
-      if (event.key === "Escape" && !submitting) onClose();
-    }
-    window.addEventListener("keydown", onKeyDown);
-    return () => window.removeEventListener("keydown", onKeyDown);
-  }, [onClose, submitting]);
 
   const filteredModels = availableModels.filter((option) => option.kind === kind);
 
@@ -119,17 +115,20 @@ export function ReplaceAgentModal({
 
   return (
     <>
-      <div className="settings-backdrop" onClick={() => !submitting && onClose()} />
+      <div aria-hidden="true" className="settings-backdrop" onClick={() => !submitting && onClose()} />
       <form
         aria-label={`Replace ${target.id}`}
-        aria-modal
+        aria-modal="true"
+        aria-labelledby="replace-agent-dialog-title"
         className="dialog agent-replace-modal"
         role="dialog"
+        ref={dialogRef}
+        tabIndex={-1}
         onSubmit={submit}
       >
         <div className="settings-header">
           <div>
-            <div className="dialog-title">Replace {target.id}</div>
+            <div className="dialog-title" id="replace-agent-dialog-title">Replace {target.id}</div>
             <div className="agent-replace-summary">
               Stop the current run and continue from its durable context.
             </div>

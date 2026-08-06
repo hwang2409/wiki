@@ -46,6 +46,7 @@ import { SessionSidebar } from "./session";
 import type { SidebarTarget } from "./session";
 import { BranchPill } from "./branch-pill";
 import { StatusBadge } from "./status-badge";
+import { useModalA11y } from "./modal-a11y";
 
 declare global {
   interface Window {
@@ -269,6 +270,7 @@ export function SpawnWorkerModal({
   const [confirming, setConfirming] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [advancedOpen, setAdvancedOpen] = useState(false);
+  const dialogRef = useModalA11y<HTMLFormElement>(true, requestClose);
 
   function requestClose() {
     if (submitting) return;
@@ -286,14 +288,6 @@ export function SpawnWorkerModal({
     setPreludeLoading(true);
     setPreludeError(null);
   }
-
-  useEffect(() => {
-    function onKeyDown(event: globalThis.KeyboardEvent) {
-      if (event.key === "Escape") requestClose();
-    }
-    window.addEventListener("keydown", onKeyDown);
-    return () => window.removeEventListener("keydown", onKeyDown);
-  }, [onClose, submitting]);
 
   useEffect(() => {
     const allowed = modelsForKind(models, kind);
@@ -438,12 +432,14 @@ export function SpawnWorkerModal({
 
   return (
     <>
-      <div className="settings-backdrop" onClick={requestClose} />
+      <div aria-hidden="true" className="settings-backdrop" onClick={requestClose} />
       <form
-        aria-modal
+        aria-modal="true"
         aria-labelledby="spawn-worker-dialog-title"
         className="dialog agent-spawn-modal"
         role="dialog"
+        ref={dialogRef}
+        tabIndex={-1}
         onSubmit={submit}
       >
         <div className="settings-header">
@@ -772,6 +768,7 @@ export function SpawnOrchestratorModal({
   const [confirming, setConfirming] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [advancedOpen, setAdvancedOpen] = useState(false);
+  const dialogRef = useModalA11y<HTMLFormElement>(true, requestClose);
   const projectDirTouched = useRef(false);
   const workspaceRootProvided = workspaceRootReady && Boolean(workspaceRoot?.trim());
 
@@ -789,14 +786,6 @@ export function SpawnOrchestratorModal({
     setConfirming(false);
     setError(null);
   }
-
-  useEffect(() => {
-    function onKeyDown(event: globalThis.KeyboardEvent) {
-      if (event.key === "Escape") requestClose();
-    }
-    window.addEventListener("keydown", onKeyDown);
-    return () => window.removeEventListener("keydown", onKeyDown);
-  }, [onClose, submitting]);
 
   useEffect(() => {
     const nextDefault = defaultOrchestratorModel(models, kind);
@@ -869,12 +858,14 @@ export function SpawnOrchestratorModal({
 
   return (
     <>
-      <div className="settings-backdrop" onClick={requestClose} />
+      <div aria-hidden="true" className="settings-backdrop" onClick={requestClose} />
       <form
-        aria-modal
+        aria-modal="true"
         aria-labelledby="spawn-orchestrator-dialog-title"
         className="dialog agent-spawn-modal"
         role="dialog"
+        ref={dialogRef}
+        tabIndex={-1}
         onSubmit={submit}
       >
         <div className="settings-header">
@@ -1275,6 +1266,9 @@ export function AgentsView({
   );
   const [expandedDetails, setExpandedDetails] = useState<Set<string>>(new Set());
   const [openMenuTicket, setOpenMenuTicket] = useState<string | null>(null);
+  const menuButtonRefs = useRef(new Map<string, HTMLButtonElement>());
+  const previousOpenMenuRef = useRef<string | null>(null);
+  const closeReasonRef = useRef<"escape" | "pointer" | null>(null);
   // Per-archive selection is WIKI-229: the backend session route currently
   // prefers a live run for the same ticket and consults a ticket-only
   // transcript-path cache before the archived_at hint, so promising a
@@ -1285,14 +1279,32 @@ export function AgentsView({
   // open the ticket's transcript view (as they did pre-WIKI-154).
 
   useEffect(() => {
+    if (
+      openMenuTicket === null &&
+      previousOpenMenuRef.current !== null &&
+      closeReasonRef.current === "escape"
+    ) {
+      const button = menuButtonRefs.current.get(previousOpenMenuRef.current);
+      window.requestAnimationFrame(() => button?.focus());
+    }
+    if (openMenuTicket === null) closeReasonRef.current = null;
+    previousOpenMenuRef.current = openMenuTicket;
+  }, [openMenuTicket]);
+
+  function closeMenu(reason: "escape" | "pointer") {
+    closeReasonRef.current = reason;
+    setOpenMenuTicket(null);
+  }
+
+  useEffect(() => {
     if (openMenuTicket === null) return;
     function onDown(event: MouseEvent) {
       const target = event.target as HTMLElement | null;
       if (target && target.closest(`[data-agent-menu-for="${openMenuTicket}"]`)) return;
-      setOpenMenuTicket(null);
+      closeMenu("pointer");
     }
     function onKey(event: KeyboardEvent) {
-      if (event.key === "Escape") setOpenMenuTicket(null);
+      if (event.key === "Escape") closeMenu("escape");
     }
     window.addEventListener("mousedown", onDown);
     window.addEventListener("keydown", onKey);
@@ -1837,6 +1849,10 @@ export function AgentsView({
                   aria-label={`More actions for ${orch.id}`}
                   className="agent-log-toggle agent-card-menu-toggle"
                   type="button"
+                  ref={(button) => {
+                    if (button) menuButtonRefs.current.set(orch.id, button);
+                    else menuButtonRefs.current.delete(orch.id);
+                  }}
                   onClick={() => setOpenMenuTicket(menuOpen ? null : orch.id)}
                 >
                   <MoreHorizontal size={13} />
@@ -1862,7 +1878,7 @@ export function AgentsView({
                             type="button"
                             onClick={() => {
                               if (item.disabled) return;
-                              setOpenMenuTicket(null);
+                              closeMenu("pointer");
                               item.run();
                             }}
                           >
@@ -2157,6 +2173,10 @@ export function AgentsView({
                   aria-label={`More actions for ${worker.ticket}`}
                   className="agent-log-toggle agent-card-menu-toggle"
                   type="button"
+                  ref={(button) => {
+                    if (button) menuButtonRefs.current.set(worker.ticket, button);
+                    else menuButtonRefs.current.delete(worker.ticket);
+                  }}
                   onClick={() =>
                     setOpenMenuTicket(menuOpen ? null : worker.ticket)
                   }

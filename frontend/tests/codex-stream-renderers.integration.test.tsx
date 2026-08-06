@@ -1,3 +1,7 @@
+import { readFileSync } from "node:fs";
+import { fileURLToPath } from "node:url";
+import { dirname, resolve } from "node:path";
+
 import { cleanup, fireEvent, render, screen, within } from "@testing-library/react";
 import { afterEach, describe, expect, it } from "vitest";
 import {
@@ -11,6 +15,11 @@ import {
 import type { ProviderStreamEvent } from "../src/api";
 
 afterEach(cleanup);
+
+const CSS_SOURCE = readFileSync(
+  resolve(dirname(fileURLToPath(import.meta.url)), "..", "src", "styles.css"),
+  "utf-8",
+);
 
 // WIKI-244: the working diff renders open — no section toggle exists. The
 // helper now asserts that no disclosure control gates the diff.
@@ -479,6 +488,11 @@ describe("codex stream renderers", () => {
     expect(view.getByText("a.txt")).toBeTruthy();
     expect(view.container.querySelector(".codex-stream-diff-body")?.textContent).toContain("+new");
     expect(view.container.querySelector("[data-testid='codex-diff-omitted']")).toBeNull();
-    expect(view.getByRole("button", { name: /copy raw diff/ })).toBeTruthy();
+    const copyButton = view.getByRole("button", { name: /copy raw diff/ });
+    expect(copyButton).toBeTruthy();
+    const copyRule = CSS_SOURCE.match(/\.codex-stream-diff-copy\s*\{([\s\S]*?)\}/)?.[1];
+    expect(copyRule).toBeDefined();
+    const minHeight = Number(copyRule?.match(/\bmin-height:\s*(\d+)px/)?.[1] ?? 0);
+    expect(minHeight).toBeGreaterThanOrEqual(24);
   });
 });

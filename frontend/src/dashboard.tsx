@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useRef, useState } from "react";
+import { useEffect, useId, useMemo, useRef, useState } from "react";
 import { ArrowDown, ArrowUp, ChevronDown, X } from "lucide-react";
 import {
   getAutopilotFleetStatus,
@@ -420,17 +420,34 @@ type MultiSelectDropdownProps = {
 function MultiSelectDropdown({ label, options, selected, onToggle }: MultiSelectDropdownProps) {
   const [open, setOpen] = useState(false);
   const rootRef = useRef<HTMLDivElement | null>(null);
+  const triggerRef = useRef<HTMLButtonElement | null>(null);
+  const wasOpenRef = useRef(false);
+  const closeReasonRef = useRef<"escape" | "pointer" | null>(null);
+  const optionsId = `dashboard-filter-${useId()}-options`;
+
+  function close(reason: "escape" | "pointer") {
+    closeReasonRef.current = reason;
+    setOpen(false);
+  }
+
+  useEffect(() => {
+    if (wasOpenRef.current && !open && closeReasonRef.current === "escape") {
+      window.requestAnimationFrame(() => triggerRef.current?.focus());
+    }
+    if (!open) closeReasonRef.current = null;
+    wasOpenRef.current = open;
+  }, [open]);
 
   useEffect(() => {
     if (!open) return;
     function onDown(event: MouseEvent) {
       if (!rootRef.current) return;
       if (event.target instanceof Node && !rootRef.current.contains(event.target)) {
-        setOpen(false);
+        close("pointer");
       }
     }
     function onEsc(event: KeyboardEvent) {
-      if (event.key === "Escape") setOpen(false);
+      if (event.key === "Escape") close("escape");
     }
     document.addEventListener("mousedown", onDown);
     document.addEventListener("keydown", onEsc);
@@ -452,18 +469,28 @@ function MultiSelectDropdown({ label, options, selected, onToggle }: MultiSelect
   return (
     <div className="dashboard-filter-multi" ref={rootRef}>
       <button
+        ref={triggerRef}
         type="button"
         className={`dashboard-filter-trigger${selected.length > 0 ? " is-active" : ""}`}
-        onClick={() => setOpen((v) => !v)}
+        onClick={() => {
+          if (open) close("pointer");
+          else setOpen(true);
+        }}
         aria-haspopup="listbox"
         aria-expanded={open}
+        aria-controls={optionsId}
         disabled={disabled}
       >
         <span>{summary}</span>
         <ChevronDown size={12} />
       </button>
       {open ? (
-        <div className="dashboard-filter-popover" role="listbox" aria-label={`${label} filter`}>
+        <div
+          id={optionsId}
+          className="dashboard-filter-popover"
+          role="listbox"
+          aria-label={`${label} filter`}
+        >
           {options.map((option) => {
             const checked = selected.includes(option);
             return (
