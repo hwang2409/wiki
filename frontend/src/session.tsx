@@ -14,28 +14,19 @@ import type { ComponentProps, CSSProperties } from "react";
 import {
   AlertTriangle,
   Bell,
-  Bot,
   ChevronRight,
   Circle,
   CircleCheck,
   CircleDashed,
   CircleSlash,
-  Eye,
-  FileText,
-  GitCommit,
   GitPullRequest,
   Hourglass,
   ListTodo,
   MessageCircleQuestion,
-  Pencil,
   Radio,
   ScrollText,
-  Search,
   SendHorizontal,
-  Server,
   SlashSquare,
-  Tag,
-  Terminal,
   Wrench,
   X,
 } from "lucide-react";
@@ -72,7 +63,7 @@ import type {
   SkillInfo,
   SubagentInfo,
 } from "./api";
-import { renderAnsi } from "./ansi";
+import { hasAnsi, renderAnsi } from "./ansi";
 import { ArtifactBlock } from "./artifact-block";
 import { useArtifactInspector } from "./artifact-inspector";
 import { DiffPatchView } from "./diff-view";
@@ -103,18 +94,28 @@ import { Timestamp } from "./timestamp";
 import { StatusBadge } from "./status-badge";
 import { BoundedPreview } from "./transcript-preview";
 import {
+  bashReadTargetPath,
+  compactJsonDetail,
+  detectStructuredContent,
+  formatEventDuration,
   isBashTool,
   isReadOrSearchTool,
+  parseEmbeddedScripts,
+  thoughtDurations,
   toolDiffIsTruncated,
+  toolGlyph,
   toolInlineResult,
   toolDiffSource,
+  toolPathHint,
   toolPresentation,
   toolStatus,
   toolSummaryLine,
   toolSummaryParts,
   traceRows,
+  turnMetaDurations,
   type TraceRow,
 } from "./transcript-event-utils";
+import { HighlightedCode, ShikiCode, languageForPath } from "./shiki";
 import {
   HarnessOutput,
   clipSegmentsInline,
@@ -1123,31 +1124,37 @@ function UserText({
   );
 }
 
-const ARCHETYPE_ICONS: Record<string, LucideIcon> = {
-  monitor: Eye,
-  steer: SendHorizontal,
-  agent: Bot,
-  ask: MessageCircleQuestion,
-  read: FileText,
-  search: Search,
-  edit: Pencil,
-  git: GitCommit,
-  github: GitPullRequest,
-  validate: CircleCheck,
-  wait: Hourglass,
-  status: Radio,
-  ticket: Tag,
-  infra: Server,
-  plan: ListTodo,
-  run: Terminal,
-  tool: Wrench,
-};
+// Bash command titles render structured when the command embeds scripts
+// (heredocs, -c/-e bodies): bash stays bash, embedded bodies highlight in
+// their own language with a quiet indent. Ambiguous commands parse to null
+// and keep the flat bash render; the raw toggle always has exact bytes.
+function CommandHighlight({ command }: { command: string }) {
+  const segments = useMemo(() => parseEmbeddedScripts(command), [command]);
+  if (!segments) return <HighlightedCode code={command} lang="bash" />;
+  return (
+    <>
+      {segments.map((segment, index) => (
+        segment.kind === "bash"
+          ? <HighlightedCode code={segment.text} key={index} lang="bash" />
+          : (
+            <span
+              className={`session-command-embed${segment.kind === "embed-inline" ? " is-inline" : ""}`}
+              data-lang={segment.lang}
+              key={index}
+            >
+              <HighlightedCode code={segment.text} lang={segment.lang} />
+            </span>
+          )
+      ))}
+    </>
+  );
+}
 
 function toolInlineDetail(tool: SessionTool): string | null {
   if (!tool.input || toolPresentation(tool) !== "inline") return null;
   const input = tool.input.trim();
   if (!input || toolSummaryLine(tool).includes(input)) return null;
-  return input;
+  return compactJsonDetail(input) ?? input;
 }
 
 function renderOutputSegments(
@@ -1213,12 +1220,26 @@ function ToolOutputBody({
   const outputTone = tool.ok === false || segments.some((segment) => segment.kind === "error")
     ? "error"
     : "normal";
+  // Structured non-bash outputs (JSON and friends) read pretty-printed in the
+  // block view; the clipped budget applies to the PRETTY text, raw stays exact.
+  const structured = !bash && outputTone === "normal" && !hasGitHubPreview
+    ? detectStructuredContent(displayOutput)
+    : null;
+  // File-slice bash reads (sed -n over one .py file etc.) highlight their
+  // OUTPUT in the target file's language; ANSI-decorated output keeps the
+  // ansi path, everything ambiguous stays plain.
+  const bashReadTarget = bash && outputTone === "normal" && !hasGitHubPreview && !hasAnsi(displayOutput)
+    ? bashReadTargetPath(tool.input)
+    : null;
+  const bashOutputLang = bashReadTarget ? languageForPath(bashReadTarget) : null;
   return (
     <div className="session-tool-body session-tool-block-body">
       {/* Bash blocks: the command line reads in text color, output recedes to
           muted — two tones, no same-color wall (WIKI-247). */}
       {bash ? (
-        <div className="session-tool-block-title is-command">$ {tool.input || toolSummaryLine(tool)}</div>
+        <div className="session-tool-block-title is-command">
+          $ <CommandHighlight command={tool.input || toolSummaryLine(tool)} />
+        </div>
       ) : (
         <div className="session-tool-block-title">{toolBlockTitle(tool)}</div>
       )}
@@ -1228,13 +1249,17 @@ function ToolOutputBody({
         previewLines={bash ? 10 : 3}
         rawText={rawOutput}
         showSummary={false}
-        text={displayOutput}
+        text={structured?.text ?? displayOutput}
         tone={outputTone}
         variant="block"
         renderBody={({ text }) => (
           <div className="session-tool-output-blocks">
             <span className="session-tool-output-text">
-              {renderOutputSegments(segments, text, hasGitHubPreview)}
+              {structured
+                ? <HighlightedCode code={text} lang={structured.lang} />
+                : bashOutputLang
+                ? <HighlightedCode code={text} lang={bashOutputLang} />
+                : renderOutputSegments(segments, text, hasGitHubPreview)}
             </span>
           </div>
         )}
@@ -1392,9 +1417,14 @@ function SubagentTrace({
   );
 }
 
-function ThinkingRow({ event }: { event: SessionEvent }) {
+// OpenCode reasoning anatomy (session/index.tsx:1635-1677): one warning-hued
+// line `+ Thought: <title> · <duration>`, `-` when open, body as muted
+// markdown at reduced strength. Duration comes from the normalized event
+// timing; omitted silently when unavailable.
+function ThinkingRow({ event, durationMs = null }: { event: SessionEvent; durationMs?: number | null }) {
   const [expanded, setExpanded] = useState(false);
   const title = event.text.split("\n")[0].trim().slice(0, 120);
+  const duration = durationMs !== null ? formatEventDuration(durationMs) : null;
   return (
     <div className="session-activity-row is-reasoning">
       <button
@@ -1403,13 +1433,25 @@ function ThinkingRow({ event }: { event: SessionEvent }) {
         aria-expanded={expanded}
         onClick={() => setExpanded((value) => !value)}
       >
-        <span className="session-activity-row-meta">thought</span>
-        <span className="session-thinking-title">{title || "thinking"}</span>
+        <span aria-hidden="true" className="session-thinking-prefix">{expanded ? "-" : "+"}</span>
+        <span className="session-thinking-line">
+          Thought
+          {title || duration ? ": " : ""}
+          {title ? <span className="session-thinking-title">{title}</span> : null}
+          {duration ? (
+            <span className="session-thinking-duration tabular-nums">
+              {title ? " · " : ""}
+              {duration}
+            </span>
+          ) : null}
+        </span>
         {event.encrypted ? <span className="session-thinking-chip">encrypted</span> : null}
       </button>
       {expanded ? (
         <div className="session-thinking">
-          {event.text}
+          {/* Subtle scheme: markdown tokens damped by the container (OpenCode
+              renders reasoning syntax at thinkingOpacity, theme/index.ts:292). */}
+          <ShikiCode className="session-thinking-code" code={event.text} lang="markdown" transparent />
         </div>
       ) : null}
     </div>
@@ -1430,7 +1472,6 @@ export function ToolCallRow({
   withResult: boolean;
 }) {
   const tool = event.tool!;
-  const Icon = ARCHETYPE_ICONS[tool.archetype] ?? Terminal;
   const status = toolStatus(tool);
   const running = status === "working";
   const detail = toolInlineDetail(tool);
@@ -1449,7 +1490,19 @@ export function ToolCallRow({
   const outputBlock = presentation !== "inline";
   const [errorExpanded, setErrorExpanded] = useState(false);
   const [rawOpen, setRawOpen] = useState(false);
+  const [polishedOpen, setPolishedOpen] = useState(false);
   const rawId = useId();
+  const polishedId = useId();
+  // Polished view: recognizable content only (parse or filetype hint), never
+  // heuristics. Offered for successful outputs; failures keep the error flow.
+  // Read payloads with line-number gutters would mis-tokenize — no hint then.
+  const numberedPayload = /^\s*\d+[\t→|]/.test(displayOutput);
+  const polished = tool.ok !== false && displayOutput
+    ? detectStructuredContent(
+        displayOutput,
+        numberedPayload ? null : languageForPath(toolPathHint(tool) ?? ""),
+      )
+    : null;
   const showOutputBlock = outputBlock && (tool.ok !== false || errorExpanded);
   const inlineOutput = presentation === "inline" && (tool.ok !== false || errorExpanded)
     ? tool.ok === false && errorExpanded
@@ -1462,11 +1515,11 @@ export function ToolCallRow({
       data-tool-event-id={nested ? undefined : event.id}
     >
       <div className="session-tool-head">
-        {isBashTool(tool) ? (
-          <span aria-hidden="true" className="session-tool-icon session-tool-icon-text">$</span>
-        ) : (
-          <Icon className="session-tool-icon" size={12} />
-        )}
+        {/* OpenCode's glyph micro-vocabulary in a fixed 2-char column; state
+            is the row's COLOR (muted done, error failed), never a word. */}
+        <span aria-hidden="true" className="session-tool-icon session-tool-icon-text">
+          {toolGlyph(tool, status)}
+        </span>
         <span className="session-tool-summary" title={toolSummaryLine(tool)}>
           <span className="session-tool-verb">{verb}</span>
           {target ? <><span aria-hidden="true">{" "}</span><span className="session-tool-target">{target}</span></> : null}
@@ -1475,10 +1528,9 @@ export function ToolCallRow({
           <span className="session-tool-detail" title={detail}>{detail}</span>
         ) : null}
         {running ? <span className="session-tool-running" title="running" /> : null}
-        <span className={`session-tool-status${status === "failed" ? " session-tool-err" : ""} is-${status}`}>
-          {status}
-        </span>
-        {tool.ok === null && !running ? <span className="session-activity-row-meta">unknown</span> : null}
+        {/* Status words left the visual row (state = color, OpenCode
+            index.tsx:1867-1874) but stay for screen readers. */}
+        <span className="sr-only">{status}</span>
         {inlineOutput ? (
           <span className="session-tool-inline-result">
             {nested
@@ -1522,6 +1574,21 @@ export function ToolCallRow({
             inspect
           </span>
         ) : null}
+        {polished ? (
+          <button
+            aria-controls={polishedId}
+            aria-expanded={polishedOpen}
+            aria-label={polishedOpen ? "hide polished output" : "show polished output"}
+            className="session-tool-polished-toggle"
+            type="button"
+            onClick={(event) => {
+              event.stopPropagation();
+              setPolishedOpen((value) => !value);
+            }}
+          >
+            {polishedOpen ? "hide polished" : "polished"}
+          </button>
+        ) : null}
         {rawOutput ? (
           <button
             aria-controls={rawId}
@@ -1539,6 +1606,21 @@ export function ToolCallRow({
         ) : null}
       </div>
       <div className="session-trace-indent">
+        {polished && polishedOpen ? (
+          <div className="session-tool-polished" id={polishedId}>
+            <BoundedPreview
+              className="session-tool-polished-preview"
+              previewLines={30}
+              rawText={rawOutput || polished.text}
+              showSummary={false}
+              text={polished.text}
+              variant="block"
+              renderBody={({ text }) => (
+                <HighlightedCode code={text} lang={polished.lang} lineNumbers={polished.code} />
+              )}
+            />
+          </div>
+        ) : null}
         {rawOutput && rawOpen ? (
           <div className="session-tool-raw" id={rawId}>
             <BoundedPreview rawText={rawOutput} showSummary={false} text={rawOutput} variant="block" />
@@ -1773,9 +1855,13 @@ function SessionMarkdownLink({ href, ...props }: ComponentProps<"a">) {
   return <a href={href} {...props} {...externalLinkProps(href)} />;
 }
 
+function SessionMarkdownPre(props: ComponentProps<"pre">) {
+  return <MarkdownPre detectLang {...props} />;
+}
+
 const sessionMarkdownComponents = {
   a: SessionMarkdownLink,
-  pre: MarkdownPre,
+  pre: SessionMarkdownPre,
   table: MarkdownTable,
 };
 
@@ -1788,7 +1874,9 @@ function BashBlock({ event }: { event: SessionEvent }) {
   const output = segments.map((segment) => segment.text).join("\n");
   return (
     <div className="session-bash session-tool-body session-tool-block-body">
-      <div className="session-tool-block-title is-command">$ {bash.input || "bash"}</div>
+      <div className="session-tool-block-title is-command">
+        $ <CommandHighlight command={bash.input || "bash"} />
+      </div>
       {output ? (
         <BoundedPreview
           ansi
@@ -2275,14 +2363,23 @@ export function ActivityEventRow({
   event,
   rowKey,
   onInspect,
+  thoughtDurationMs = null,
   ticket,
 }: {
   event: SessionEvent;
   rowKey: number;
   onInspect?: (agentId: string) => void;
+  thoughtDurationMs?: number | null;
   ticket: string;
 }) {
   const rows = useMemo(() => traceRows(activityTimeline([event])), [event]);
+  if (event.kind === "thinking" && event.text) {
+    return (
+      <div className="session-activity">
+        <ThinkingRow durationMs={thoughtDurationMs} event={event} />
+      </div>
+    );
+  }
   return (
     <div className="session-activity">
       <TraceRowList keyBase={rowKey} onInspect={onInspect} rows={rows} ticket={ticket} />
@@ -2349,6 +2446,28 @@ function currentActivityRunState(session: TranscriptSession | null): ActivityRun
   );
 }
 
+export type TurnMeta = {
+  agent: string;
+  model: string | null;
+  durationMs: number | null;
+};
+
+// OpenCode's turn boundary (session/index.tsx:1534-1559): `▣ Build · model ·
+// duration` after the final part of each completed turn — glyph in the agent
+// color, name in text, the rest muted.
+export function TurnMetaRow({ meta }: { meta: TurnMeta }) {
+  return (
+    <div className="session-turn-meta" data-testid="session-turn-meta">
+      <span aria-hidden="true" className="session-turn-meta-glyph">▣</span>
+      <span className="session-turn-meta-agent">{meta.agent}</span>
+      {meta.model ? <span className="session-turn-meta-detail"> · {meta.model}</span> : null}
+      {meta.durationMs !== null ? (
+        <span className="session-turn-meta-detail tabular-nums"> · {formatEventDuration(meta.durationMs)}</span>
+      ) : null}
+    </div>
+  );
+}
+
 function CurrentTurnState({ runState }: { runState: Exclude<ActivityRunState, "idle"> }) {
   const state = activityStateLabel([], runState);
   const stateClass = state.replace(/\s+/g, "-");
@@ -2370,8 +2489,10 @@ const VirtualSessionRow = memo(function VirtualSessionRow({
   onOpenArtifact,
   sessionKey,
   showTimestamp,
+  thoughtDurationMs = null,
   top,
   ticket,
+  turnMeta = null,
   uiState,
 }: {
   activityRunState: ActivityRunState;
@@ -2383,8 +2504,10 @@ const VirtualSessionRow = memo(function VirtualSessionRow({
   onOpenArtifact?: (event: SessionEvent) => void;
   sessionKey: string;
   showTimestamp: boolean;
+  thoughtDurationMs?: number | null;
   top: number;
   ticket: string;
+  turnMeta?: TurnMeta | null;
   uiState: SessionUiState;
 }) {
   const rowRef = useMeasuredRow(row, onHeightChange);
@@ -2406,6 +2529,7 @@ const VirtualSessionRow = memo(function VirtualSessionRow({
           event={row.event}
           rowKey={row.key}
           onInspect={onInspect}
+          thoughtDurationMs={thoughtDurationMs}
           ticket={ticket}
         />
       ) : (
@@ -2422,6 +2546,7 @@ const VirtualSessionRow = memo(function VirtualSessionRow({
           />
         </>
       )}
+      {turnMeta && activityRunState === "idle" ? <TurnMetaRow meta={turnMeta} /> : null}
       {activityRunState !== "idle" ? <CurrentTurnState runState={activityRunState} /> : null}
       {ts ? <Timestamp value={ts} /> : null}
     </div>
@@ -2435,7 +2560,9 @@ const VirtualSessionRow = memo(function VirtualSessionRow({
     prev.onInspectArtifact !== next.onInspectArtifact ||
     prev.onOpenArtifact !== next.onOpenArtifact ||
     prev.showTimestamp !== next.showTimestamp ||
+    prev.thoughtDurationMs !== next.thoughtDurationMs ||
     prev.ticket !== next.ticket ||
+    prev.turnMeta !== next.turnMeta ||
     prev.uiState !== next.uiState
   ) {
     return false;
@@ -3072,6 +3199,19 @@ export function SessionTab({
   const timestampKeys = useMemo(() => computeTimestampKeys(rows), [rows]);
   const activityRunState = currentActivityRunState(session);
   const currentTurnStateKey = activityRunState === "idle" ? null : rows.at(-1)?.key ?? null;
+  const sessionWorking = session?.working ?? false;
+  const sessionModel = session?.model ?? null;
+  const sessionAgentName = session?.sessionMeta.agent_name ?? session?.kind ?? null;
+  const thoughtDurationByKey = useMemo(() => thoughtDurations(rows), [rows]);
+  // Stable per-key TurnMeta objects so row memoization holds between renders.
+  const turnMetaByKey = useMemo(() => {
+    const metas = new Map<number, TurnMeta>();
+    if (!sessionAgentName && !sessionModel) return metas;
+    for (const [key, durationMs] of turnMetaDurations(rows, sessionWorking)) {
+      metas.set(key, { agent: sessionAgentName ?? "agent", model: sessionModel, durationMs });
+    }
+    return metas;
+  }, [rows, sessionAgentName, sessionModel, sessionWorking]);
 
   const imageNumbers = useMemo(() => {
     const map = new Map<SessionEvent, number[]>();
@@ -3218,8 +3358,10 @@ export function SessionTab({
                 onOpenArtifact={onOpenArtifact}
                 sessionKey={inlineArtifactKey}
                 showTimestamp={timestampKeys.has(row.key)}
+                thoughtDurationMs={thoughtDurationByKey.get(row.key) ?? null}
                 ticket={ticket}
                 top={top}
+                turnMeta={turnMetaByKey.get(row.key) ?? null}
                 uiState={uiState}
               />
             ))}

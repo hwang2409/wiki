@@ -194,6 +194,9 @@ export function BoundedPreview({
       ? renderAnsi(bodyText)
       : bodyText;
 
+  // OpenCode clipped blocks end in one muted "Click to expand" line
+  // (session/index.tsx:2083-2085); the default variant keeps the count hint
+  // for the raw/preview disclosures.
   const moreHint = shouldClip && hiddenCount > 0 ? (
     <button
       aria-expanded={expanded}
@@ -201,7 +204,9 @@ export function BoundedPreview({
       type="button"
       onClick={toggleExpanded}
     >
-      +{hiddenCount} more line{hiddenCount === 1 ? "" : "s"}
+      {variant === "block"
+        ? "Click to expand"
+        : `+${hiddenCount} more line${hiddenCount === 1 ? "" : "s"}`}
     </button>
   ) : null;
 
@@ -278,7 +283,7 @@ export function BoundedPreview({
           type="button"
           onClick={toggleExpanded}
         >
-          {expandChipLabel}
+          {expanded ? "Click to collapse" : "Click to expand"}
         </button>
       ) : null}
     </div>

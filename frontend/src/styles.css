@@ -7199,12 +7199,13 @@ body.is-resizing-panes .pane-cell {
 }
 
 /* WIKI-234: opencode-style accent-bar block — user turns read as flat
-   full-width panels marked by a left accent bar, not floating bubbles. */
+   full-width panels marked by a left accent bar, not floating bubbles.
+   Square corners: panels are background rectangles, never rounded boxes
+   (opencode ui/border.ts:15-21). */
 .session-user {
   align-self: stretch;
   padding: 8px 12px;
   border-left: 3px solid var(--accent-primary);
-  border-radius: var(--radius-xs);
   background-color: var(--background-secondary);
   color: var(--text-normal);
   font-family: var(--font-monospace);
@@ -7314,6 +7315,75 @@ body.is-resizing-panes .pane-cell {
   font-size: var(--fs-xs);
 }
 
+/* OpenCode turn boundary `▣ Build · Big Pickle · 2.5s` — glyph in the agent
+   accent, name in text, model/duration muted (session/index.tsx:1536-1557). */
+.session-turn-meta {
+  display: block;
+  margin-top: 8px;
+  color: var(--activity-metadata-color);
+  font-family: var(--font-monospace);
+  font-weight: var(--font-monospace-weight);
+  font-size: var(--font-ui-smaller);
+}
+
+.session-turn-meta-glyph {
+  margin-right: 1ch;
+  color: var(--accent-primary);
+}
+
+.session-turn-meta-agent {
+  color: var(--text-normal);
+}
+
+.session-turn-meta-detail {
+  color: var(--activity-metadata-color);
+}
+
+/* Polished disclosure: the formatted sibling of the raw view. */
+.session-tool-polished {
+  box-sizing: border-box;
+  width: 100%;
+  min-width: 0;
+  max-width: 100%;
+  padding-left: 8px;
+  overflow-wrap: anywhere;
+}
+
+/* Token-level highlight runs (command titles, polished output, diff lines):
+   inline spans only, no block chrome — backgrounds stay with the container. */
+.syntax-inline {
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+}
+
+/* Embedded script bodies inside bash command titles: quiet indent + hairline,
+   no heavy chrome. The surrounding bash text owns all newlines, so the block
+   form slots between the opener and closing-tag lines. */
+.session-command-embed {
+  display: inline-block;
+  width: 100%;
+  box-sizing: border-box;
+  padding-left: 2ch;
+  border-left: 1px solid var(--background-modifier-border);
+  vertical-align: top;
+}
+
+.session-command-embed.is-inline {
+  display: inline;
+  width: auto;
+  padding-left: 0;
+  border-left: 0;
+}
+
+.syntax-inline-gutter {
+  display: inline-block;
+  min-width: 3ch;
+  margin-right: 1ch;
+  color: var(--text-faint);
+  text-align: right;
+  user-select: none;
+}
+
 .session-collapsible {
   display: grid;
   grid-template-rows: 0fr;
@@ -7332,13 +7402,15 @@ body.is-resizing-panes .pane-cell {
   overflow: hidden;
 }
 
+/* OpenCode tool-row state machine, color only: running = normal text,
+   completed = muted recede, failed = error (session/index.tsx:1867-1874). */
 .session-tool {
   min-width: 0;
   color: var(--activity-state-done-color);
 }
 
 .session-tool.is-working {
-  color: var(--activity-state-working-color);
+  color: var(--text-normal);
 }
 
 .session-tool.is-failed {
@@ -7379,6 +7451,17 @@ body.is-resizing-panes .pane-cell {
   color: inherit;
 }
 
+/* OpenCode's 2-char glyph column ($ → ← ✱ % ◈ ⚙ ✓ │) — text glyphs, not
+   SVGs (session/index.tsx:1570, :2090-2291). */
+.session-tool-icon-text {
+  display: inline-flex;
+  align-items: baseline;
+  height: auto;
+  font-family: var(--font-monospace);
+  font-weight: var(--font-monospace-weight);
+  line-height: inherit;
+}
+
 .session-tool-summary {
   display: inline-flex;
   align-items: baseline;
@@ -7414,36 +7497,6 @@ body.is-resizing-panes .pane-cell {
   opacity: 0.78;
   text-overflow: ellipsis;
   white-space: nowrap;
-}
-
-.session-tool-err {
-  flex-shrink: 0;
-  color: inherit;
-  font-size: var(--fs-xs);
-  font-weight: var(--fw-semibold);
-  letter-spacing: 0.02em;
-  text-transform: uppercase;
-}
-
-.session-tool-status {
-  flex-shrink: 0;
-  color: inherit;
-  font-size: var(--fs-xs);
-  font-weight: var(--fw-semibold);
-  letter-spacing: 0.04em;
-  text-transform: uppercase;
-}
-
-.session-tool-status.is-working {
-  color: inherit;
-}
-
-.session-tool-status.is-failed {
-  color: inherit;
-}
-
-.session-tool-status.is-completed {
-  color: inherit;
 }
 
 .session-tool-inline-result {
@@ -7544,7 +7597,8 @@ body.is-resizing-panes .pane-cell {
   overflow-wrap: anywhere;
 }
 
-.session-tool-raw-toggle {
+.session-tool-raw-toggle,
+.session-tool-polished-toggle {
   flex: 0 0 auto;
   opacity: 0.7;
   color: inherit;
@@ -7557,7 +7611,11 @@ body.is-resizing-panes .pane-cell {
 .session-tool-head:hover .session-tool-raw-toggle,
 .session-tool-head:focus-within .session-tool-raw-toggle,
 .session-tool-raw-toggle[aria-expanded="true"],
-.session-tool-raw-toggle:focus-visible {
+.session-tool-raw-toggle:focus-visible,
+.session-tool-head:hover .session-tool-polished-toggle,
+.session-tool-head:focus-within .session-tool-polished-toggle,
+.session-tool-polished-toggle[aria-expanded="true"],
+.session-tool-polished-toggle:focus-visible {
   opacity: 1;
 }
 
@@ -7576,15 +7634,10 @@ body.is-resizing-panes .pane-cell {
 }
 
 .session-tool-raw-toggle:hover,
-.session-tool-raw-toggle:focus-visible {
+.session-tool-raw-toggle:focus-visible,
+.session-tool-polished-toggle:hover,
+.session-tool-polished-toggle:focus-visible {
   text-decoration: underline;
-}
-
-.session-activity-row-meta {
-  color: var(--activity-metadata-color);
-  font-family: var(--font-monospace);
-  font-weight: var(--font-monospace-weight);
-  font-size: var(--fs-xs);
 }
 
 .session-tool-result {
@@ -7685,10 +7738,12 @@ body.is-resizing-panes .pane-cell {
   align-self: flex-start;
 }
 
+/* OpenCode reasoning body: muted markdown indented under the toggle, no
+   border chrome (session/index.tsx:1617-1628); rendered at reduced strength —
+   the web analog of thinkingOpacity 0.6. */
 .session-thinking {
   margin: 3px 0 8px;
   padding: 3px 0 3px 2ch;
-  border-left: 1px solid var(--background-modifier-border);
   color: var(--activity-metadata-color);
   font-family: var(--font-agent-prose);
   font-weight: var(--font-agent-prose-weight, var(--font-text-weight));
@@ -7699,23 +7754,31 @@ body.is-resizing-panes .pane-cell {
   overflow-wrap: break-word;
 }
 
-.session-activity-row.is-reasoning .session-activity-row-meta {
-  padding-top: 6px;
-  color: var(--activity-metadata-color);
-  font-size: var(--fs-xs);
-  letter-spacing: 0.04em;
-  text-transform: uppercase;
+/* Damp the markdown token colors, not the muted base text — the audit-visible
+   body color stays as approved; only the syntax accents render subtle. */
+.session-thinking .shiki-block {
+  opacity: 0.7;
 }
 
-.session-activity-row.is-reasoning {
-  padding-left: 10px;
-  border-left: 1px solid var(--background-modifier-border);
+.session-thinking .shiki-block pre {
+  margin: 0;
+  padding: 0;
+  background: transparent;
+  font-family: var(--font-agent-prose);
+  font-weight: var(--font-agent-prose-weight, var(--font-text-weight));
+  font-size: var(--font-ui-small);
+  line-height: 1.6;
+  white-space: pre-wrap;
+  overflow-wrap: break-word;
 }
 
+/* OpenCode reasoning header: one warning-hued line `+ Thought: title · 463ms`
+   (session/index.tsx:1655-1673); the open state drops to thinkingOpacity
+   (:1643-1646). Hover/focus restores full strength for the affordance. */
 .session-thinking-head {
   display: flex;
   align-items: baseline;
-  gap: 8px;
+  gap: 1ch;
   width: 100%;
   min-width: 0;
   padding: 2px 0;
@@ -7724,21 +7787,36 @@ body.is-resizing-panes .pane-cell {
   color: var(--activity-state-working-color);
   font: inherit;
   font-family: var(--font-monospace);
+  font-size: var(--font-ui-smaller);
   text-align: left;
   cursor: pointer;
+}
+
+.session-thinking-head[aria-expanded="true"] {
+  opacity: 0.6;
 }
 
 .session-thinking-head:hover,
 .session-thinking-head:focus-visible {
   color: var(--text-normal);
+  opacity: 1;
 }
 
-.session-thinking-title {
+.session-thinking-prefix {
+  flex-shrink: 0;
+  width: 1ch;
+}
+
+.session-thinking-line {
   min-width: 0;
   overflow: hidden;
-  color: var(--text-muted);
   text-overflow: ellipsis;
   white-space: nowrap;
+}
+
+.session-thinking-title,
+.session-thinking-duration {
+  color: inherit;
 }
 
 .session-thinking-chip {

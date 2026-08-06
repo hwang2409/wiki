@@ -134,6 +134,96 @@ export async function highlightToHtml(
   }
 }
 
+export type TokenLine = Array<{ content: string; color?: string }>;
+
+const MAX_TOKENIZE_BYTES = 64 * 1024;
+const MAX_TOKENIZE_LINES = 400;
+
+// Token-level highlighting for transcript surfaces (command titles, diff
+// lines, polished output). Returns per-line token runs instead of Shiki's
+// pre/code HTML so callers control the DOM — and the wiki59 `.shiki-block`
+// census stays scoped to fenced markdown blocks.
+export async function highlightToTokenLines(
+  code: string,
+  lang: string | null | undefined,
+  appTheme: ThemeId,
+): Promise<TokenLine[] | null> {
+  const normalized = normalizeLang(lang);
+  if (!normalized) return null;
+  if (code.length > MAX_TOKENIZE_BYTES || code.split("\n").length > MAX_TOKENIZE_LINES) return null;
+  const theme = resolveShikiTheme(appTheme);
+  try {
+    const h = await getHighlighter();
+    await Promise.all([ensureTheme(h, theme), ensureLang(h, normalized)]);
+    const { tokens } = h.codeToTokens(code, { lang: normalized, theme });
+    return tokens.map((line) => line.map((token) => ({ content: token.content, color: token.color })));
+  } catch {
+    return null;
+  }
+}
+
+export function useHighlightTokenLines(code: string, lang: string | null | undefined): TokenLine[] | null {
+  const theme = useCurrentTheme();
+  const normalized = normalizeLang(lang);
+  const [lines, setLines] = useState<TokenLine[] | null>(null);
+  useEffect(() => {
+    if (!normalized) {
+      setLines(null);
+      return;
+    }
+    let cancelled = false;
+    highlightToTokenLines(code, normalized, theme).then((result) => {
+      if (!cancelled) setLines(result);
+    });
+    return () => {
+      cancelled = true;
+    };
+  }, [code, normalized, theme]);
+  return normalized ? lines : null;
+}
+
+export function TokenizedLine({ tokens, fallback }: { tokens: TokenLine | null | undefined; fallback: string }) {
+  if (!tokens) return <>{fallback}</>;
+  return (
+    <>
+      {tokens.map((token, index) => (
+        <span key={index} style={token.color ? { color: token.color } : undefined}>{token.content}</span>
+      ))}
+    </>
+  );
+}
+
+// One-line-or-few inline highlight (no block chrome, no backgrounds): the
+// bash `$ command` title, polished output bodies. Falls back to plain text
+// until tokens resolve — content identical either way.
+export function HighlightedCode({
+  code,
+  lang,
+  lineNumbers = false,
+  className,
+}: {
+  code: string;
+  lang: string | null | undefined;
+  lineNumbers?: boolean;
+  className?: string;
+}) {
+  const tokenLines = useHighlightTokenLines(code, lang);
+  const plainLines = code.split("\n");
+  return (
+    <span className={`syntax-inline${className ? ` ${className}` : ""}`} data-lang={normalizeLang(lang) ?? undefined}>
+      {plainLines.map((line, index) => (
+        <span className="syntax-inline-line" key={index}>
+          {index > 0 ? "\n" : null}
+          {lineNumbers ? (
+            <span aria-hidden="true" className="syntax-inline-gutter tabular-nums">{index + 1}</span>
+          ) : null}
+          <TokenizedLine fallback={line} tokens={tokenLines?.[index]} />
+        </span>
+      ))}
+    </span>
+  );
+}
+
 export function useCurrentTheme(): ThemeId {
   const [theme, setTheme] = useState<ThemeId>(() => {
     if (typeof document === "undefined") return DEFAULT_THEME;

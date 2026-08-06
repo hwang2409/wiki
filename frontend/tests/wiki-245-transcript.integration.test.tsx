@@ -185,7 +185,9 @@ test("tier is chosen by tool kind, not multiline output shape", () => {
     output: "one\ntwo\nthree\nfour",
   });
   expect(write.container.querySelector(".session-tool")?.classList.contains("is-block")).toBe(true);
-  const expand = write.getByRole("button", { name: /more line/ });
+  // WIKI-249: clipped blocks end in OpenCode's muted "Click to expand" line
+  // (session/index.tsx:2083-2085), not a line-count hint.
+  const expand = write.getByRole("button", { name: /Click to expand/ });
   expect(expand).toBeTruthy();
   expect(expand.getAttribute("aria-expanded")).toBe("false");
   expect(write.container.querySelector(".session-tool-output-text")?.textContent).toContain("three");

@@ -70,7 +70,7 @@
   --diff-remove-foreground: #8a3038;
   --diff-hatch-color: rgba(200, 40, 50, 0.12);
 
-  --selection-inverse-background: var(--text-faint);
+  --selection-inverse-background: var(--text-normal);
   --selection-inverse-color: var(--background-primary);
 
   --syntax-text: var(--text-normal);
@@ -223,7 +223,7 @@
   --diff-remove-foreground: #d98781;
   --diff-hatch-color: rgba(230, 100, 95, 0.14);
 
-  --selection-inverse-background: var(--text-faint);
+  --selection-inverse-background: var(--text-normal);
   --selection-inverse-color: var(--background-primary);
 
   --syntax-text: var(--text-normal);
@@ -292,7 +292,7 @@
   --diff-remove-foreground: #fb4934;
   --diff-hatch-color: color-mix(in srgb, var(--accent-danger) 20%, var(--background-primary));
 
-  --selection-inverse-background: #d65d0e;
+  --selection-inverse-background: var(--text-normal);
   --selection-inverse-color: var(--background-primary);
 
   --syntax-text: #ebdbb2;
@@ -356,7 +356,7 @@
   --diff-remove-foreground: #9d0006;
   --diff-hatch-color: color-mix(in srgb, var(--accent-danger) 18%, var(--background-primary));
 
-  --selection-inverse-background: #928374;
+  --selection-inverse-background: var(--text-normal);
   --selection-inverse-color: var(--background-primary);
 
   --syntax-text: #3c3836;
@@ -425,8 +425,8 @@
   --diff-remove-foreground: #f85149;
   --diff-hatch-color: color-mix(in srgb, var(--accent-danger) 20%, var(--background-primary));
 
-  --selection-inverse-background: #0078d4;
-  --selection-inverse-color: #ffffff;
+  --selection-inverse-background: var(--text-normal);
+  --selection-inverse-color: var(--background-primary);
 
   --syntax-text: #d4d4d4;
   --syntax-comment: #6a9955;
@@ -494,8 +494,8 @@
   --diff-remove-foreground: #dc322f;
   --diff-hatch-color: color-mix(in srgb, var(--accent-danger) 20%, var(--background-primary));
 
-  --selection-inverse-background: #586e75;
-  --selection-inverse-color: #fdf6e3;
+  --selection-inverse-background: var(--text-normal);
+  --selection-inverse-color: var(--background-primary);
 
   --syntax-text: #93a1a1;
   --syntax-comment: #586e75;
@@ -565,8 +565,8 @@
   --diff-remove-foreground: #dc322f;
   --diff-hatch-color: color-mix(in srgb, var(--accent-danger) 18%, var(--background-primary));
 
-  --selection-inverse-background: #657b83;
-  --selection-inverse-color: #fdf6e3;
+  --selection-inverse-background: var(--text-normal);
+  --selection-inverse-color: var(--background-primary);
 
   --syntax-text: #586e75;
   --syntax-comment: #93a1a1;
@@ -634,8 +634,8 @@
   --diff-remove-foreground: #ff5555;
   --diff-hatch-color: color-mix(in srgb, var(--accent-danger) 22%, var(--background-primary));
 
-  --selection-inverse-background: #bd93f9;
-  --selection-inverse-color: #282a36;
+  --selection-inverse-background: var(--text-normal);
+  --selection-inverse-color: var(--background-primary);
 
   --syntax-text: #f8f8f2;
   --syntax-comment: #6272a4;
@@ -703,8 +703,8 @@
   --diff-remove-foreground: #bf616a;
   --diff-hatch-color: color-mix(in srgb, var(--accent-danger) 20%, var(--background-primary));
 
-  --selection-inverse-background: #81a1c1;
-  --selection-inverse-color: #2e3440;
+  --selection-inverse-background: var(--text-normal);
+  --selection-inverse-color: var(--background-primary);
 
   --syntax-text: #eceff4;
   --syntax-comment: #81a1c1;
@@ -845,8 +845,8 @@
   --diff-remove-foreground: #f7768e;
   --diff-hatch-color: color-mix(in srgb, var(--accent-danger) 22%, var(--background-primary));
 
-  --selection-inverse-background: #7aa2f7;
-  --selection-inverse-color: #1a1b26;
+  --selection-inverse-background: var(--text-normal);
+  --selection-inverse-color: var(--background-primary);
 
   --syntax-text: #c0caf5;
   --syntax-comment: #565f89;
@@ -914,8 +914,8 @@
   --diff-remove-foreground: #f38ba8;
   --diff-hatch-color: color-mix(in srgb, var(--accent-danger) 22%, var(--background-primary));
 
-  --selection-inverse-background: #cba6f7;
-  --selection-inverse-color: #11111b;
+  --selection-inverse-background: var(--text-normal);
+  --selection-inverse-color: var(--background-primary);
 
   --syntax-text: #cdd6f4;
   --syntax-comment: #6c7086;
