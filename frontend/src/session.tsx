@@ -119,6 +119,7 @@ import {
 } from "./transcript-event-utils";
 import {
   HarnessOutput,
+  clipSegmentsInline,
   parseHarnessOutput,
   segmentsForDisplayText,
 } from "./transcript-output";
@@ -1451,8 +1452,7 @@ export function ToolCallRow({
   const [errorExpanded, setErrorExpanded] = useState(false);
   const [rawOpen, setRawOpen] = useState(false);
   const rawId = useId();
-  const hasSemanticFailure = outputSegments.some((segment) => segment.kind === "error");
-  const showOutputBlock = outputBlock && (tool.ok !== false || errorExpanded || hasSemanticFailure);
+  const showOutputBlock = outputBlock && (tool.ok !== false || errorExpanded);
   const inlineOutput = presentation === "inline" && (tool.ok !== false || errorExpanded)
     ? tool.ok === false && errorExpanded
       ? displayOutput
@@ -1486,7 +1486,12 @@ export function ToolCallRow({
           <span className="session-tool-inline-result">
             {isReadOrSearchTool(tool)
               ? renderAnsi(inlineOutput)
-              : renderOutputSegments(outputSegments, inlineOutput)}
+              : (
+                <HarnessOutput
+                  ansi
+                  segments={tool.ok === false && errorExpanded ? outputSegments : clipSegmentsInline(outputSegments)}
+                />
+              )}
           </span>
         ) : null}
         {tool.ok === false && tool.output ? (

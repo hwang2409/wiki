@@ -144,9 +144,7 @@ test("real inline rows keep raw output keyboard reachable", () => {
   const row = container.querySelector(".session-tool");
   expect(row?.classList.contains("is-inline")).toBe(true);
   expect(row?.querySelector(".session-output-segment.is-error")?.textContent).toBe("failed status");
-  // the 120-char inline cap may clip inside the final segment; the semantic
-  // class and prefix are the contract here (full text lives in the raw body).
-  expect(row?.querySelector(".session-output-segment.is-note")?.textContent).toMatch(/^quiet no/);
+  expect(row?.querySelector(".session-output-segment.is-note")?.textContent).toBe("quiet note");
   const raw = getByRole("button", { name: "show raw output" });
   raw.focus();
   expect(document.activeElement).toBe(raw);
@@ -307,6 +305,10 @@ test("failed edits show semantic errors before the intended diff", () => {
     output: "<tool_use_error>old text was not found</tool_use_error>",
     ok: false,
   });
+  // failure details sit behind the error toggle; the row itself carries the
+  // failed state color.
+  expect(container.querySelector(".session-tool-body")).toBeNull();
+  fireEvent.click(container.querySelector(".session-tool-error-toggle")!);
   expect(container.querySelector(".session-output-segment.is-error")?.textContent)
     .toContain("old text was not found");
   expect(container.querySelector(".diff-view")).toBeNull();
@@ -363,7 +365,23 @@ test("generic inline tools render the capped inline output", () => {
   });
   const inline = container.querySelector(".session-tool-inline-result");
   expect(inline).toBeTruthy();
-  expect((inline?.textContent ?? "").length).toBeLessThan(200);
+  expect((inline?.textContent ?? "").length).toBeLessThanOrEqual(120);
+  expect(inline?.textContent ?? "").toMatch(/\.\.\.$/);
+});
+
+test("failed block output stays hidden until the error toggle expands it", () => {
+  const { container, getByRole } = renderTool({
+    name: "Bash",
+    archetype: "bash",
+    input: "false",
+    output: "boom",
+    ok: false,
+  });
+  expect(container.querySelector(".session-tool-body")).toBeNull();
+  fireEvent.click(getByRole("button", { name: "show error" }));
+  expect(container.querySelector(".session-tool-body")).toBeTruthy();
+  fireEvent.click(getByRole("button", { name: "hide error" }));
+  expect(container.querySelector(".session-tool-body")).toBeNull();
 });
 
 test("apply_patch with a garbage preamble falls back instead of diffing", () => {
