@@ -351,14 +351,23 @@ async function main() {
         === "frontend/src/session.tsx",
       "tool row must retain exact raw input evidence inline",
     );
-    const firstRawToggle = firstTool.locator(".session-tool-raw-toggle");
-    assert(await firstRawToggle.count() === 1, "first per-event tool row must expose raw disclosure");
-    await firstRawToggle.click();
+    // WIKI-257: the redundant "raw" toggle is gone (raw IS the default view).
+    // For inline rows a path-hinted output stays reachable through the single
+    // polish toggle, which now doubles as the sole disclosure control.
     assert(
-      (await firstTool.locator(".session-tool-raw .transcript-preview-body").innerText()).trim()
-        === "activity group source exact",
-      "raw disclosure must retain exact tool output on its owning per-event row",
+      await firstTool.locator(".session-tool-raw-toggle").count() === 0,
+      "per-event tool row must not carry a redundant raw toggle after WIKI-257",
     );
+    const firstPolishToggle = firstTool.locator(".session-tool-polished-toggle");
+    assert(await firstPolishToggle.count() === 1,
+      "per-event tool row must expose the polish disclosure for structured output");
+    await firstPolishToggle.click();
+    assert(
+      (await firstTool.locator(".session-tool-polished").innerText()).includes("activity group source exact"),
+      "polish disclosure must retain exact tool output on its owning per-event row",
+    );
+    assert(await firstPolishToggle.getAttribute("aria-pressed") === "true",
+      "polish button must expose an active/pressed state when engaged");
     const orderB = toolRows.nth(2);
     assert(
       (await orderB.locator(".session-tool-inline-result, .session-tool-body .transcript-preview-body").innerText()).trim()
@@ -412,11 +421,12 @@ async function main() {
     await page.mouse.move(0, 0);
     await page.locator(".session-scroll").evaluate((element) => { element.scrollTop = element.scrollHeight; });
     await page.waitForTimeout(100);
-    const rawToggle = page.locator(".session-tool-raw-toggle").last();
-    if (await rawToggle.count()) {
-      await rawToggle.click();
-      await page.locator(".transcript-preview-body").last().waitFor();
-    }
+    // WIKI-257: no raw toggle any more — the collapsed peek row from WIKI-253
+    // already exposes the output for contrast auditing.
+    assert(
+      await page.locator(".session-tool-raw-toggle").count() === 0,
+      "raw toggle must be gone after WIKI-257",
+    );
     const contrastAudit = {};
     for (const theme of THEMES) {
       await page.evaluate((themeId) => {

@@ -133,8 +133,11 @@ function renderTool(toolOverrides: Partial<SessionTool> = {}) {
   );
 }
 
-test("real inline rows keep raw output keyboard reachable", () => {
-  const { container, getByRole } = renderTool({
+test("real inline rows keep the parsed output visible with no redundant raw toggle", () => {
+  // WIKI-257: raw is the default view, so the separate "raw" toggle is gone.
+  // The parsed segments render inline; the raw source is already what the
+  // reader sees without any click.
+  const { container, queryByRole } = renderTool({
     name: "Status",
     archetype: "status",
     summary: "status",
@@ -144,13 +147,8 @@ test("real inline rows keep raw output keyboard reachable", () => {
   expect(row?.classList.contains("is-inline")).toBe(true);
   expect(row?.querySelector(".session-output-segment.is-error")?.textContent).toBe("failed status");
   expect(row?.querySelector(".session-output-segment.is-note")?.textContent).toBe("quiet note");
-  const raw = getByRole("button", { name: "show raw output" });
-  raw.focus();
-  expect(document.activeElement).toBe(raw);
-  expect(raw.getAttribute("aria-expanded")).toBe("false");
-  fireEvent.click(raw);
-  expect(raw.getAttribute("aria-expanded")).toBe("true");
-  expect(container.querySelector(".session-tool-raw")?.textContent).toContain("<tool_use_error>");
+  expect(queryByRole("button", { name: "show raw output" })).toBeNull();
+  expect(container.querySelector(".session-tool-raw-toggle")).toBeNull();
 });
 
 test("tier is chosen by tool kind, not multiline output shape", () => {
@@ -342,20 +340,16 @@ test("failed edits keep plain failure output primary", () => {
   expect(container.querySelector(".diff-view")).toBeNull();
 });
 
-test("raw toggle lives in the head and opens a body below it", () => {
-  const { container, getByRole } = renderTool({
+test("no separate raw toggle — raw output is the default view (WIKI-257)", () => {
+  const { container, queryByRole } = renderTool({
     name: "Bash",
     archetype: "bash",
     input: "echo ok",
     output: "ok",
   });
-  const toggle = getByRole("button", { name: "show raw output" });
-  expect(toggle.closest(".session-tool-head")).toBeTruthy();
+  expect(queryByRole("button", { name: "show raw output" })).toBeNull();
+  expect(container.querySelector(".session-tool-raw-toggle")).toBeNull();
   expect(container.querySelector(".session-tool-raw")).toBeNull();
-  fireEvent.click(toggle);
-  const body = container.querySelector(".session-trace-indent .session-tool-raw");
-  expect(body).toBeTruthy();
-  expect(toggle.getAttribute("aria-expanded")).toBe("true");
 });
 
 test("plain failed output renders as error segments", () => {
@@ -458,13 +452,13 @@ test("small transcript controls keep the 24px target baseline", () => {
   const block = css.slice(css.indexOf("small transcript controls keep a 24px minimum target"));
   for (const selector of [
     ".session-tool-error-toggle",
-    ".session-tool-raw-toggle",
+    ".session-tool-polished-toggle",
     ".transcript-preview-more",
     ".session-thinking-head",
   ]) {
     expect(block).toContain(selector);
   }
   expect(block).toContain("min-height: 24px;");
-  expect(css).toContain('.session-tool-head:hover .session-tool-raw-toggle');
-  expect(css).toContain('.session-tool-raw-toggle[aria-expanded="true"]');
+  expect(css).toContain('.session-tool-head:hover .session-tool-polished-toggle');
+  expect(css).toContain('.session-tool-polished-toggle[aria-pressed="true"]');
 });
