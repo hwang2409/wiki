@@ -1339,7 +1339,7 @@ export function AgentsView({
   useEffect(() => {
     if (data) return;
     let ignore = false;
-    getAgents()
+    getAgents(true)
       .then((result) => {
         if (!ignore) {
           setFetchedWorkers(result.workers);
@@ -1489,7 +1489,7 @@ export function AgentsView({
     setControlError(null);
     try {
       await archiveAgent(id);
-      const result = await getAgents();
+      const result = await getAgents(true);
       setOverrideData({
         workers: result.workers,
         orchestrators: result.orchestrators ?? [],
@@ -2245,8 +2245,8 @@ export function AgentsView({
               worker.session !== null
                 ? [
                     "session",
-                    worker.history.length > 0
-                      ? `${worker.session} · prev: ${worker.history
+                    (worker.history ?? []).length > 0
+                      ? `${worker.session} · prev: ${(worker.history ?? [])
                           .map((s) => `${s.role ?? "?"} (${s.kind ?? "?"}, ${s.outcome ?? "?"})`)
                           .join(" → ")}`
                       : `${worker.session}`,

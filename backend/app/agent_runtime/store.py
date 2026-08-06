@@ -593,6 +593,14 @@ class RunStore:
         self._start_registry_snapshots: dict[str, dict[str, Any]] = {}
         _ensure_private_dir(paths.runtime_dir)
         _ensure_private_dir(paths.runs_dir)
+        staging_dir = paths.runs_dir / ".staging"
+        _ensure_private_dir(staging_dir)
+        for temp_dir in staging_dir.iterdir():
+            if temp_dir.is_dir() and not temp_dir.is_symlink():
+                shutil.rmtree(temp_dir, ignore_errors=True)
+        for temp_dir in paths.runs_dir.glob(".run-*"):
+            if temp_dir.is_dir() and not temp_dir.is_symlink():
+                shutil.rmtree(temp_dir, ignore_errors=True)
         self.command_log = CommandLog(paths.command_log_path)
         self._abort_uncommitted_starts()
         self._reconcile_existing_runs()
@@ -1111,15 +1119,22 @@ class RunStore:
         directory = self.run_dir(record.run_id)
         if directory.exists():
             raise StoreConflict(f"run already exists: {record.run_id}")
-        directory.mkdir(mode=0o700, parents=False)
-        directory.chmod(0o700)
-        for path in (
-            self.raw_events_path(record.run_id),
-            self.normalized_events_path(record.run_id),
-        ):
-            fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
-            os.close(fd)
-        self._write_record(record)
+        staging_dir = self.paths.runs_dir / ".staging"
+        staging_dir.mkdir(mode=0o700, parents=True, exist_ok=True)
+        temp_dir = Path(tempfile.mkdtemp(prefix=".run-", dir=staging_dir))
+        try:
+            temp_dir.chmod(0o700)
+            for name in ("raw.jsonl", "events.jsonl"):
+                fd = os.open(temp_dir / name, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+                os.close(fd)
+            record.updated_at = utc_now()
+            _atomic_write_json(temp_dir / "run.json", record.to_dict())
+            # Publish only after every run file is complete and durable.
+            os.replace(temp_dir, directory)
+            _fsync_directory(self.paths.runs_dir)
+        except BaseException:
+            shutil.rmtree(temp_dir, ignore_errors=True)
+            raise
 
     def _reconcile_existing_runs(self) -> None:
         """Repair event counters after a crash between JSONL fsync and run.json.

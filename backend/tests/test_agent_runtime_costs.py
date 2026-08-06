@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import json
 import os
 import shutil
@@ -54,6 +55,7 @@ class CostAggregatorTests(unittest.TestCase):
         self.env.start()
 
     def tearDown(self) -> None:
+        costs.invalidate_background_state()
         self.env.stop()
         self.tmp.cleanup()
 
@@ -272,6 +274,105 @@ class CostAggregatorTests(unittest.TestCase):
         for _ in range(5):
             costs.refresh(costs._load_state())
         self.assertEqual(len(os.listdir("/dev/fd")), baseline)
+
+    def test_unchanged_runs_skip_full_directory_sweep(self) -> None:
+        raw = self._run("run-cache")
+        raw.write_text(json.dumps(_envelope("2026-07-30T10:00:00Z", _usage(10, 2))) + "\n", encoding="utf-8")
+        costs.refresh()
+
+        with (
+            mock.patch.object(costs.os, "scandir", wraps=costs.os.scandir) as scandir,
+            mock.patch.object(costs, "_scan_run", wraps=costs._scan_run) as scan_run,
+            mock.patch.object(costs, "_save_state", wraps=costs._save_state) as save_state,
+            mock.patch.object(costs, "_save_heartbeat", wraps=costs._save_heartbeat) as save_heartbeat,
+        ):
+            refreshed = costs.refresh(costs._load_state())
+
+        self.assertEqual(scan_run.call_count, 0)
+        self.assertEqual(scandir.call_count, 0)
+        self.assertEqual(save_state.call_count, 0)
+        self.assertEqual(save_heartbeat.call_count, 1)
+        self.assertEqual(refreshed["runs"]["run-cache"]["offset"], raw.stat().st_size)
+
+    def test_background_refresh_loads_state_once_across_ticks(self) -> None:
+        costs.invalidate_background_state()
+        with mock.patch.object(costs, "_load_state", wraps=costs._load_state) as load_state:
+            self.assertTrue(asyncio.run(costs.refresh_in_background()))
+            self.assertTrue(asyncio.run(costs.refresh_in_background()))
+
+        self.assertEqual(load_state.call_count, 1)
+
+    def test_failed_state_write_does_not_advance_heartbeat(self) -> None:
+        raw = self._run("run-write-failure")
+        raw.write_text(json.dumps(_envelope("2026-07-30T10:00:00Z", _usage(10, 2))) + "\n", encoding="utf-8")
+        costs.refresh()
+        heartbeat_before = costs.cost_heartbeat_path().read_text(encoding="utf-8")
+
+        with mock.patch.object(costs, "_save_state", return_value=False) as save_state, mock.patch.object(
+            costs, "_save_heartbeat", wraps=costs._save_heartbeat
+        ) as save_heartbeat:
+            raw.write_text(
+                json.dumps(_envelope("2026-07-30T10:01:00Z", _usage(20, 4))) + "\n",
+                encoding="utf-8",
+            )
+            costs.refresh(costs._load_state())
+
+        self.assertTrue(save_state.called)
+        self.assertFalse(save_heartbeat.called)
+        self.assertEqual(costs.cost_heartbeat_path().read_text(encoding="utf-8"), heartbeat_before)
+
+    def test_background_failed_state_write_retries_until_success(self) -> None:
+        raw = self._run("run-background-write-failure")
+        raw.write_text(json.dumps(_envelope("2026-07-30T10:00:00Z", _usage(10, 2))) + "\n", encoding="utf-8")
+        costs.invalidate_background_state()
+        self.assertTrue(asyncio.run(costs.refresh_in_background()))
+        heartbeat_before = costs.cost_heartbeat_path().read_text(encoding="utf-8")
+
+        raw.write_text(json.dumps(_envelope("2026-07-30T10:01:00Z", _usage(20, 4))) + "\n", encoding="utf-8")
+        with mock.patch.object(costs, "_save_state", side_effect=[False, False, True]) as save_state, mock.patch.object(
+            costs, "_save_heartbeat", wraps=costs._save_heartbeat
+        ) as save_heartbeat:
+            self.assertTrue(asyncio.run(costs.refresh_in_background()))
+            self.assertEqual(costs.cost_heartbeat_path().read_text(encoding="utf-8"), heartbeat_before)
+
+            self.assertTrue(asyncio.run(costs.refresh_in_background()))
+            self.assertEqual(costs.cost_heartbeat_path().read_text(encoding="utf-8"), heartbeat_before)
+
+            self.assertTrue(asyncio.run(costs.refresh_in_background()))
+
+        self.assertEqual(save_state.call_count, 3)
+        self.assertEqual(save_heartbeat.call_count, 1)
+        self.assertNotEqual(costs.cost_heartbeat_path().read_text(encoding="utf-8"), heartbeat_before)
+
+    def test_atomic_run_publication_appears_on_the_next_refresh(self) -> None:
+        costs.refresh()
+
+        staging = self.runs / ".run-pending"
+        staging.mkdir()
+        (staging / "run.json").write_text(
+            json.dumps(
+                {
+                    "run_id": "run-pending",
+                    "agent_id": "WIKI-178",
+                    "provider": "codex",
+                    "model": "gpt-5.4",
+                    "created_at": "2026-07-30T12:00:00Z",
+                }
+            ),
+            encoding="utf-8",
+        )
+        raw = staging / "raw.jsonl"
+        raw.write_text(json.dumps(_envelope("2026-07-30T10:00:00Z", _usage(10, 2))) + "\n", encoding="utf-8")
+        costs.refresh(costs._load_state())
+        self.assertNotIn("run-pending", costs._load_state()["runs"])
+
+        os.replace(staging, self.runs / "run-pending")
+        raw = self.runs / "run-pending" / "raw.jsonl"
+        refreshed = costs.refresh(costs._load_state())
+
+        self.assertEqual(refreshed["runs"]["run-pending"]["offset"], raw.stat().st_size)
+        self.assertEqual(sum(record["input"] for record in refreshed["records"].values()), 10)
+        self.assertNotIn("pending_runs", refreshed)
 
     def test_state_is_atomic_and_does_not_touch_live_paths(self) -> None:
         raw = self._run("run-atomic")

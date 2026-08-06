@@ -172,7 +172,7 @@ export type AgentWorker = AgentSession & {
   worktree: string | null;
   log: string | null;
   orch: string | null;
-  history: AgentSession[];
+  history?: AgentSession[];
   state: string | null;
   pr: string | null;
   step: string | null;
@@ -262,13 +262,14 @@ export type AccountEvent =
       run_id?: string;
     };
 
-export function getAgents() {
+export function getAgents(includeHistory = false) {
+  const query = includeHistory ? "?include_history=true" : "";
   return request<{
     workers: AgentWorker[];
     orchestrators: Orchestrator[];
     archived: ArchivedWorker[];
     account_notices?: AccountEvent[];
-  }>("/api/agents");
+  }>(`/api/agents${query}`);
 }
 
 export type MarkViewedResult = {

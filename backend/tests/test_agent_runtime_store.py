@@ -595,6 +595,44 @@ class RunStoreTests(unittest.TestCase):
             with self.assertRaisesRegex(StoreError, "invalid run id"):
                 store.get("../../outside")
 
+    def test_run_directory_publishes_only_after_all_files_are_complete(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            store = RunStore(_paths(root))
+            record = _record(root)
+            final_dir = store.run_dir(record.run_id)
+            observations: list[tuple[bool, set[str]]] = []
+            real_replace = store_module.os.replace
+
+            def observe_replace(source: str | os.PathLike[str], destination: str | os.PathLike[str]) -> None:
+                if Path(destination) == final_dir:
+                    observations.append((final_dir.exists(), {path.name for path in Path(source).iterdir()}))
+                real_replace(source, destination)
+
+            with mock.patch.object(store_module.os, "replace", side_effect=observe_replace):
+                store.create(record)
+
+            self.assertEqual(observations, [(False, {"events.jsonl", "raw.jsonl", "run.json"})])
+            self.assertTrue(final_dir.is_dir())
+            self.assertEqual(
+                {path.name for path in final_dir.iterdir()},
+                {"events.jsonl", "raw.jsonl", "run.json"},
+            )
+            self.assertEqual(list(root.joinpath("runtime", "runs").glob(".run-*")), [])
+            self.assertEqual(list(root.joinpath("runtime", "runs", ".staging").iterdir()), [])
+
+    def test_startup_cleans_crash_left_staging_runs(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            paths = _paths(root)
+            staging = paths.runs_dir / ".staging" / ".run-crashed"
+            staging.mkdir(parents=True)
+            (staging / "run.json").write_text("{}", encoding="utf-8")
+
+            RunStore(paths)
+
+            self.assertFalse(staging.exists())
+
     def test_raw_event_is_durable_before_normalization(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
