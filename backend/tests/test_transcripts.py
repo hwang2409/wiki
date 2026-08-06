@@ -1144,45 +1144,40 @@ class TranscriptEditPayloadTests(unittest.TestCase):
         transcripts._cache_locks.clear()
 
     def test_raw_claude_edit_survives_normalization_for_renderer(self) -> None:
-        raw = {
-            "type": "assistant",
-            "timestamp": "2026-08-06T00:00:00Z",
-            "message": {
-                "content": [{
-                    "type": "tool_use",
-                    "id": "toolu-edit",
-                    "name": "Edit",
-                    "input": {
-                        "file_path": "hot.md",
-                        "old_string": "before\nold\nafter",
-                        "new_string": "before\nnew\nafter",
-                        "replace_all": False,
-                    },
-                }],
-            },
-        }
-        normalized = normalize_provider_event("claude", raw)
-        envelope = {
-            "kind": normalized.kind,
-            "disposition": normalized.disposition.value,
-            "normalized_at": raw["timestamp"],
-            "payload": normalized.payload,
-        }
+        raw_rows = [
+            json.loads(line)
+            for line in (FIXTURES_DIR / "claude_edit_raw.jsonl")
+            .read_text(encoding="utf-8")
+            .splitlines()
+        ]
+        envelopes = []
+        for raw in raw_rows:
+            normalized = normalize_provider_event("claude", raw)
+            envelopes.append({
+                "kind": normalized.kind,
+                "disposition": normalized.disposition.value,
+                "normalized_at": raw["timestamp"],
+                "payload": normalized.payload,
+            })
         with TemporaryDirectory() as tmp:
             path = Path(tmp) / "events.jsonl"
-            path.write_text(json.dumps(envelope) + "\n", encoding="utf-8")
+            path.write_text(
+                "\n".join(json.dumps(envelope) for envelope in envelopes) + "\n",
+                encoding="utf-8",
+            )
             result = transcripts.read_session_events("claude-normalized", path)
 
         tool = result["events"][0]["tool"]
         self.assertEqual(
             tool["edit"],
             {
-                "file_path": "hot.md",
-                "old_string": "before\nold\nafter",
-                "new_string": "before\nnew\nafter",
+                "file_path": "/Users/henry/me/fun/wiki/.claude/worktrees/wiki-153/frontend/src/ansi.tsx",
+                "old_string": "function classNamesFor(style: AnsiStyle): string {",
+                "new_string": "export function classNamesFor(style: AnsiStyle): string {",
                 "replace_all": False,
             },
         )
+        self.assertIn("updated successfully", tool["output"])
 
     def test_edit_payload_strings_are_bounded(self) -> None:
         long_text = "x" * (transcripts.MAX_EDIT_PAYLOAD + 500)
@@ -1206,7 +1201,10 @@ class TranscriptEditPayloadTests(unittest.TestCase):
 
         edit = result["events"][0]["tool"]["edit"]
         self.assertLessEqual(len(edit["old_string"]), transcripts.MAX_EDIT_PAYLOAD + 64)
-        self.assertIn("truncated", edit["old_string"])
+        self.assertEqual(len(edit["old_string"]), transcripts.MAX_EDIT_PAYLOAD)
+        self.assertNotIn("truncated", edit["old_string"])
+        self.assertTrue(edit["old_string_truncated"])
+        self.assertTrue(edit["new_string_truncated"])
 
     def test_cache_version_rebuilds_old_normalized_events(self) -> None:
         payload = {

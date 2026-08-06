@@ -7562,6 +7562,15 @@ body.is-resizing-panes .pane-cell {
   overflow-wrap: anywhere;
 }
 
+.session-tool-degraded-diff {
+  padding: 10px 12px;
+  border: 1px dashed var(--background-modifier-border);
+  border-radius: var(--radius-m);
+  color: var(--text-muted);
+  font-family: var(--font-monospace);
+  font-size: var(--font-ui-smaller);
+}
+
 .session-tool-raw-toggle:hover,
 .session-tool-raw-toggle:focus-visible {
   text-decoration: underline;
@@ -15659,11 +15668,4 @@ textarea.composer-command-input {
     scroll-behavior: auto !important;
     transition-duration: 0.01ms !important;
   }
-}
-
-/* transcript scope (WIKI-245/#182): keep main's transition on the tool head until that PR restyles it */
-.session-tool-head {
-  transition-property: background-color, border-color, color, transform, opacity, box-shadow;
-  transition-duration: 120ms;
-  transition-timing-function: ease-out;
 }

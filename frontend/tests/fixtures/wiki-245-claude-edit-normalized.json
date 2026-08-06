@@ -1,0 +1,22 @@
+{
+  "id": 0,
+  "kind": "tool",
+  "ts": "2026-07-22T17:04:49.425Z",
+  "text": "",
+  "disposition": "rendered",
+  "tool": {
+    "name": "Edit",
+    "input": "/Users/henry/me/fun/wiki/.claude/worktrees/wiki-153/frontend/src/ansi.tsx",
+    "output": "The file /Users/henry/me/fun/wiki/.claude/worktrees/wiki-153/frontend/src/ansi.tsx has been updated successfully. (file state is current in your context — no need to Read it back)",
+    "ok": true,
+    "archetype": "edit",
+    "summary": "edit ansi.tsx",
+    "completed_at": "2026-07-22T17:04:49.868Z",
+    "edit": {
+      "file_path": "/Users/henry/me/fun/wiki/.claude/worktrees/wiki-153/frontend/src/ansi.tsx",
+      "old_string": "function classNamesFor(style: AnsiStyle): string {",
+      "new_string": "export function classNamesFor(style: AnsiStyle): string {",
+      "replace_all": false
+    }
+  }
+}

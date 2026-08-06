@@ -105,6 +105,8 @@ import { StatusBadge } from "./status-badge";
 import { BoundedPreview } from "./transcript-preview";
 import {
   isBashTool,
+  isReadOrSearchTool,
+  toolDiffIsTruncated,
   toolInlineResult,
   toolDiffSource,
   toolPresentation,
@@ -1190,16 +1192,19 @@ function ToolOutputBody({
 }) {
   const presentation = toolPresentation(tool, displayOutput);
   if (presentation === "inline" || (!displayOutput && !isBashTool(tool))) return null;
-  const failureSegments = tool.ok === false
-    ? segments.filter((segment) => segment.kind === "error")
-    : [];
+  const failed = tool.ok === false;
+  const diffDegraded = toolDiffIsTruncated(tool);
   if (presentation === "diff") {
     return (
       <div className="session-tool-body session-tool-diff-body">
         <div className="session-tool-block-title">{toolBlockTitle(tool)}</div>
-        {failureSegments.length > 0 ? (
+        {failed ? (
           <div className="session-tool-failure-output">
-            {renderOutputSegments(failureSegments, failureSegments.map((segment) => segment.text).join("\n"))}
+            {renderOutputSegments(segments, displayOutput || rawOutput)}
+          </div>
+        ) : diffDegraded ? (
+          <div className="session-tool-degraded-diff">
+            edit too large to diff — view raw
           </div>
         ) : (
           <DiffPatchView source={diffSource ?? displayOutput} />
@@ -1503,7 +1508,9 @@ export function ToolCallRow({
         {tool.ok === null && !running ? <span className="session-activity-row-meta">unknown</span> : null}
         {inlineOutput ? (
           <span className="session-tool-inline-result">
-            {renderOutputSegments(outputSegments, displayOutput)}
+            {isReadOrSearchTool(tool)
+              ? renderAnsi(inlineOutput)
+              : renderOutputSegments(outputSegments, displayOutput)}
           </span>
         ) : null}
         {tool.ok === false && tool.output ? (

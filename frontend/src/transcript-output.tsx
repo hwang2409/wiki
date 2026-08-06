@@ -15,12 +15,17 @@ export type StructuredEditPayload = {
   new_string?: string;
   replace_all?: boolean;
   patch?: string;
+  old_string_truncated?: boolean;
+  new_string_truncated?: boolean;
+  patch_truncated?: boolean;
 };
 
 const DIFF_CONTEXT_LINES = 3;
 const MAX_DIFF_LINES = 200;
 const MAX_DIFF_CHARS = 60_000;
 const MAX_DIFF_LINE_CHARS = 256;
+const MAX_PATCH_LINES = 200;
+const MAX_PATCH_HUNK_CONTEXT_LINES = 40;
 
 function structuredToolInput(input: unknown): StructuredToolInput | null {
   if (input && typeof input === "object" && !Array.isArray(input)) {
@@ -45,6 +50,20 @@ function stringField(input: StructuredToolInput | null, ...keys: string[]): stri
     if (typeof input[key] === "string") return input[key] as string;
   }
   return null;
+}
+
+export function editDiffIsTruncated(
+  input: unknown,
+  editPayload?: StructuredEditPayload,
+): boolean {
+  const structured = editPayload ?? structuredToolInput(input);
+  return Boolean(
+    structured && (
+      structured.old_string_truncated === true
+      || structured.new_string_truncated === true
+      || structured.patch_truncated === true
+    ),
+  );
 }
 
 function diffLine(text: string): string {
@@ -144,10 +163,11 @@ function validateUnifiedPatch(source: string): boolean {
   if (source.length > MAX_DIFF_CHARS) return false;
   const lines = source.split("\n");
   if (lines.at(-1) === "") lines.pop();
+  if (lines.length > MAX_PATCH_LINES) return false;
   const fileIndexes = lines
     .map((line, index) => /^---\s+\S/.test(line) ? index : -1)
     .filter((index) => index >= 0);
-  if (fileIndexes.length === 0) return false;
+  if (fileIndexes.length !== 1) return false;
   for (let fileIndex = 0; fileIndex < fileIndexes.length; fileIndex += 1) {
     const start = fileIndexes[fileIndex];
     const end = fileIndexes[fileIndex + 1] ?? lines.length;
@@ -162,6 +182,8 @@ function validateUnifiedPatch(source: string): boolean {
       const hunkEnd = hunkIndexes[hunkIndex + 1] ?? body.length;
       const hunkHeader = body[hunkStart];
       const hunkBody = body.slice(hunkStart + 1, hunkEnd);
+      const contextLines = hunkBody.filter((line) => line.startsWith(" ")).length;
+      if (contextLines > MAX_PATCH_HUNK_CONTEXT_LINES) return false;
       if (!validHunk(hunkHeader, hunkBody) || !validHunkBody(hunkBody)) return false;
     }
   }
@@ -217,7 +239,7 @@ function normalizeApplyPatch(source: string): string | null {
     if (current) current.lines.push(line);
   }
   finish();
-  if (sections.length === 0) return null;
+  if (sections.length !== 1) return null;
   if (sections.some((section) => {
     if (!section.path || !validHunkBody(section.lines.filter((line) => !line.startsWith("@@")))) return true;
     const hunkIndexes = section.lines
@@ -238,6 +260,7 @@ export function editDiffFromInput(
   input: unknown,
   editPayload?: StructuredEditPayload,
 ): string | null {
+  if (editDiffIsTruncated(input, editPayload)) return null;
   const structured = editPayload ?? structuredToolInput(input);
   const nestedPatch = stringField(structured, "patch", "diff");
   const source = nestedPatch ?? (typeof input === "string" ? input : "");

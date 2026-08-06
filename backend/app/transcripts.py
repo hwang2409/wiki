@@ -562,9 +562,17 @@ def _structured_edit_payload(name: object, raw_input: object) -> dict | None:
     edit_names = {"edit", "multiedit", "notebookedit", "apply_patch"}
     if tool_name not in edit_names:
         return None
+
+    def bounded_value(key: str, value: str) -> None:
+        payload[key] = value[:MAX_EDIT_PAYLOAD]
+        if len(value) > MAX_EDIT_PAYLOAD:
+            payload[f"{key}_truncated"] = True
+
     if isinstance(raw_input, str):
         if tool_name == "apply_patch" and "*** Begin Patch" in raw_input:
-            return {"patch": _clip(raw_input, MAX_EDIT_PAYLOAD)}
+            payload: dict = {}
+            bounded_value("patch", raw_input)
+            return payload
         return None
     if not isinstance(raw_input, dict):
         return None
@@ -577,14 +585,14 @@ def _structured_edit_payload(name: object, raw_input: object) -> dict | None:
     for output_key, *keys in aliases:
         value = next((raw_input[key] for key in keys if key in raw_input), None)
         if isinstance(value, str):
-            payload[output_key] = _clip(value, MAX_EDIT_PAYLOAD)
+            bounded_value(output_key, value)
     replace_all = raw_input.get("replace_all", raw_input.get("replaceAll"))
     if isinstance(replace_all, bool):
         payload["replace_all"] = replace_all
     if tool_name == "apply_patch":
         patch = raw_input.get("patch", raw_input.get("diff"))
         if isinstance(patch, str):
-            payload["patch"] = _clip(patch, MAX_EDIT_PAYLOAD)
+            bounded_value("patch", patch)
     return payload or None
 
 

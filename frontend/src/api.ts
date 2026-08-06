@@ -533,6 +533,9 @@ export type SessionTool = {
     new_string?: string;
     replace_all?: boolean;
     patch?: string;
+    old_string_truncated?: boolean;
+    new_string_truncated?: boolean;
+    patch_truncated?: boolean;
   };
 };
 

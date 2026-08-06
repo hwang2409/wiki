@@ -18,6 +18,7 @@ import {
   parseHarnessOutput,
 } from "../src/transcript-output";
 import { ToolCallRow } from "../src/session";
+import normalizedEditFixture from "./fixtures/wiki-245-claude-edit-normalized.json";
 
 class NoopObserver {
   observe() {}
@@ -158,8 +159,7 @@ test("tier is chosen by tool kind, not multiline output shape", () => {
     output: "one\ntwo\nthree\nfour",
   });
   expect(read.container.querySelector(".session-tool")?.classList.contains("is-inline")).toBe(true);
-  expect(read.container.querySelector(".session-tool-inline-result")?.textContent).toContain("one");
-  expect(read.container.querySelector(".session-output-segment.is-text")?.textContent).toContain("one");
+  expect(read.container.querySelector(".session-tool-inline-result")?.textContent).toBe("(4 lines)");
   expect(read.container.querySelector(".session-tool-body")).toBeNull();
   cleanup();
 
@@ -190,25 +190,6 @@ test("tier is chosen by tool kind, not multiline output shape", () => {
   expect(write.container.querySelector(".session-tool-output-text")?.textContent).not.toContain("four");
 });
 
-test("edit rows render an actual stored unified diff", () => {
-  const { container } = renderTool({
-    name: "Edit",
-    archetype: "edit",
-    summary: "edit hot.md",
-    input: JSON.stringify({
-      file_path: "hot.md",
-      old_string: "before\nold\nafter",
-      new_string: "before\nnew\nafter",
-    }),
-    output: "updated",
-  });
-  expect(container.querySelector(".session-tool-diff-body")).toBeTruthy();
-  expect(container.querySelector(".diff-view")).toBeTruthy();
-  expect(container.querySelector(".diff-line.is-remove")?.textContent).toContain("old");
-  expect(container.querySelector(".diff-line.is-add")?.textContent).toContain("new");
-  expect(container.querySelector(".diff-line.is-context")?.textContent).toContain("before");
-});
-
 test("apply_patch input renders its patch body as a diff", () => {
   const { container } = renderTool({
     name: "apply_patch",
@@ -235,18 +216,17 @@ test("edit rows without diff material stay inline", () => {
   expect(container.querySelector(".session-tool-diff-body")).toBeNull();
 });
 
-test("normalized edit payloads render through the real tool row", () => {
-  const { container } = renderTool({
-    input: "hot.md",
-    edit: {
-      file_path: "hot.md",
-      old_string: "before\nold\nafter",
-      new_string: "before\nnew\nafter",
-      replace_all: false,
-    },
-  });
-  expect(container.querySelector(".diff-line.is-remove")?.textContent).toContain("old");
-  expect(container.querySelector(".diff-line.is-add")?.textContent).toContain("new");
+test("a normalized raw Claude edit fixture renders through the real tool row", () => {
+  const { container } = render(
+    <ToolCallRow
+      connector="└"
+      event={normalizedEditFixture as unknown as SessionEvent}
+      ticket="WIKI-245"
+      withResult
+    />,
+  );
+  expect(container.querySelector(".diff-line.is-remove")?.textContent).toContain("function classNamesFor");
+  expect(container.querySelector(".diff-line.is-add")?.textContent).toContain("export function classNamesFor");
 });
 
 test("replacement diffs keep full common ranges but cap visible context", () => {
@@ -288,8 +268,31 @@ test("malformed and multi-file patches are handled safely", () => {
     "*** End Patch",
   ].join("\n");
   const diff = editDiffFromInput("apply_patch", patch);
-  expect(diff).toContain("--- a/one.md");
-  expect(diff).toContain("--- a/two.md");
+  expect(diff).toBeNull();
+  const manyLines = [
+    "*** Begin Patch",
+    "*** Update File: many.md",
+    "@@",
+    ...Array.from({ length: 5_000 }, (_, index) => `+line-${index}`),
+    "*** End Patch",
+  ].join("\n");
+  expect(editDiffFromInput("apply_patch", manyLines)).toBeNull();
+});
+
+test("truncated edit payloads use a degraded view instead of a false diff", () => {
+  const { container } = renderTool({
+    input: "hot.md",
+    edit: {
+      file_path: "hot.md",
+      old_string: "old content",
+      new_string: "new content",
+      old_string_truncated: true,
+    },
+    output: "updated",
+  });
+  expect(container.querySelector(".session-tool-degraded-diff")?.textContent)
+    .toContain("edit too large to diff");
+  expect(container.querySelector(".diff-line")).toBeNull();
 });
 
 test("failed edits show semantic errors before the intended diff", () => {
@@ -300,6 +303,19 @@ test("failed edits show semantic errors before the intended diff", () => {
     ok: false,
   });
   expect(container.querySelector(".session-output-segment.is-error")?.textContent)
+    .toContain("old text was not found");
+  expect(container.querySelector(".diff-view")).toBeNull();
+});
+
+test("failed edits keep plain failure output primary", () => {
+  const { container } = renderTool({
+    input: "hot.md",
+    edit: { file_path: "hot.md", old_string: "old", new_string: "new" },
+    output: "old text was not found",
+    ok: false,
+  });
+  fireEvent.click(container.querySelector(".session-tool-error-toggle")!);
+  expect(container.querySelector(".session-tool-failure-output")?.textContent)
     .toContain("old text was not found");
   expect(container.querySelector(".diff-view")).toBeNull();
 });
