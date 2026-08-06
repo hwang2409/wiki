@@ -6,89 +6,6 @@ export type FontChoice = {
   label: string;
   family: string;
   stack: string;
-  load?: () => Promise<unknown>;
-};
-
-const monoLoaders = {
-  jetbrainsMono: () =>
-    Promise.all([
-      import("@fontsource/jetbrains-mono/latin-400.css"),
-      import("@fontsource/jetbrains-mono/latin-500.css"),
-      import("@fontsource/jetbrains-mono/latin-600.css"),
-    ]),
-  geistMono: () =>
-    Promise.all([
-      import("@fontsource/geist-mono/latin-400.css"),
-      import("@fontsource/geist-mono/latin-500.css"),
-      import("@fontsource/geist-mono/latin-600.css"),
-    ]),
-  firaCode: () =>
-    Promise.all([
-      import("@fontsource/fira-code/latin-400.css"),
-      import("@fontsource/fira-code/latin-500.css"),
-      import("@fontsource/fira-code/latin-600.css"),
-    ]),
-  ibmPlexMono: () =>
-    Promise.all([
-      import("@fontsource/ibm-plex-mono/latin-400.css"),
-      import("@fontsource/ibm-plex-mono/latin-500.css"),
-      import("@fontsource/ibm-plex-mono/latin-600.css"),
-    ]),
-  sourceCodePro: () =>
-    Promise.all([
-      import("@fontsource/source-code-pro/latin-400.css"),
-      import("@fontsource/source-code-pro/latin-500.css"),
-      import("@fontsource/source-code-pro/latin-600.css"),
-    ]),
-  robotoMono: () =>
-    Promise.all([
-      import("@fontsource/roboto-mono/latin-400.css"),
-      import("@fontsource/roboto-mono/latin-500.css"),
-      import("@fontsource/roboto-mono/latin-600.css"),
-    ]),
-  inconsolata: () =>
-    Promise.all([
-      import("@fontsource/inconsolata/latin-400.css"),
-      import("@fontsource/inconsolata/latin-500.css"),
-      import("@fontsource/inconsolata/latin-600.css"),
-    ]),
-  spaceMono: () =>
-    Promise.all([
-      import("@fontsource/space-mono/latin-400.css"),
-      import("@fontsource/space-mono/latin-700.css"),
-    ]),
-  victorMono: () =>
-    Promise.all([
-      import("@fontsource/victor-mono/latin-400.css"),
-      import("@fontsource/victor-mono/latin-500.css"),
-      import("@fontsource/victor-mono/latin-600.css"),
-    ]),
-  redHatMono: () =>
-    Promise.all([
-      import("@fontsource/red-hat-mono/latin-400.css"),
-      import("@fontsource/red-hat-mono/latin-500.css"),
-      import("@fontsource/red-hat-mono/latin-600.css"),
-    ]),
-  martianMono: () =>
-    Promise.all([
-      import("@fontsource/martian-mono/latin-400.css"),
-      import("@fontsource/martian-mono/latin-500.css"),
-      import("@fontsource/martian-mono/latin-600.css"),
-    ]),
-};
-
-const proportionalLoaders = {
-  inter: () =>
-    Promise.all([
-      import("@fontsource/inter/latin-400.css"),
-      import("@fontsource/inter/latin-500.css"),
-      import("@fontsource/inter/latin-600.css"),
-    ]),
-  sourceSerif4: () =>
-    Promise.all([
-      import("@fontsource/source-serif-4/latin-400.css"),
-      import("@fontsource/source-serif-4/latin-600.css"),
-    ]),
 };
 
 const MONO_TAIL =
@@ -99,72 +16,17 @@ const SERIF_TAIL =
   'Georgia, Charter, "Iowan Old Style", "Times New Roman", serif';
 
 export const MONO_FONTS: FontChoice[] = [
-  {
-    label: "JetBrains Mono",
-    family: "JetBrains Mono",
-    stack: `"JetBrains Mono", ${MONO_TAIL}`,
-    load: monoLoaders.jetbrainsMono,
-  },
-  {
-    label: "Geist Mono",
-    family: "Geist Mono",
-    stack: `"Geist Mono", ${MONO_TAIL}`,
-    load: monoLoaders.geistMono,
-  },
-  {
-    label: "Fira Code",
-    family: "Fira Code",
-    stack: `"Fira Code", ${MONO_TAIL}`,
-    load: monoLoaders.firaCode,
-  },
-  {
-    label: "IBM Plex Mono",
-    family: "IBM Plex Mono",
-    stack: `"IBM Plex Mono", ${MONO_TAIL}`,
-    load: monoLoaders.ibmPlexMono,
-  },
-  {
-    label: "Source Code Pro",
-    family: "Source Code Pro",
-    stack: `"Source Code Pro", ${MONO_TAIL}`,
-    load: monoLoaders.sourceCodePro,
-  },
-  {
-    label: "Roboto Mono",
-    family: "Roboto Mono",
-    stack: `"Roboto Mono", ${MONO_TAIL}`,
-    load: monoLoaders.robotoMono,
-  },
-  {
-    label: "Inconsolata",
-    family: "Inconsolata",
-    stack: `"Inconsolata", ${MONO_TAIL}`,
-    load: monoLoaders.inconsolata,
-  },
-  {
-    label: "Space Mono",
-    family: "Space Mono",
-    stack: `"Space Mono", ${MONO_TAIL}`,
-    load: monoLoaders.spaceMono,
-  },
-  {
-    label: "Victor Mono",
-    family: "Victor Mono",
-    stack: `"Victor Mono", ${MONO_TAIL}`,
-    load: monoLoaders.victorMono,
-  },
-  {
-    label: "Red Hat Mono",
-    family: "Red Hat Mono",
-    stack: `"Red Hat Mono", ${MONO_TAIL}`,
-    load: monoLoaders.redHatMono,
-  },
-  {
-    label: "Martian Mono",
-    family: "Martian Mono",
-    stack: `"Martian Mono", ${MONO_TAIL}`,
-    load: monoLoaders.martianMono,
-  },
+  { label: "JetBrains Mono", family: "JetBrains Mono", stack: `"JetBrains Mono", ${MONO_TAIL}` },
+  { label: "Geist Mono", family: "Geist Mono", stack: `"Geist Mono", ${MONO_TAIL}` },
+  { label: "Fira Code", family: "Fira Code", stack: `"Fira Code", ${MONO_TAIL}` },
+  { label: "IBM Plex Mono", family: "IBM Plex Mono", stack: `"IBM Plex Mono", ${MONO_TAIL}` },
+  { label: "Source Code Pro", family: "Source Code Pro", stack: `"Source Code Pro", ${MONO_TAIL}` },
+  { label: "Roboto Mono", family: "Roboto Mono", stack: `"Roboto Mono", ${MONO_TAIL}` },
+  { label: "Inconsolata", family: "Inconsolata", stack: `"Inconsolata", ${MONO_TAIL}` },
+  { label: "Space Mono", family: "Space Mono", stack: `"Space Mono", ${MONO_TAIL}` },
+  { label: "Victor Mono", family: "Victor Mono", stack: `"Victor Mono", ${MONO_TAIL}` },
+  { label: "Red Hat Mono", family: "Red Hat Mono", stack: `"Red Hat Mono", ${MONO_TAIL}` },
+  { label: "Martian Mono", family: "Martian Mono", stack: `"Martian Mono", ${MONO_TAIL}` },
   { label: "Monaco", family: "Monaco", stack: `Monaco, ${MONO_TAIL}` },
   { label: "Menlo", family: "Menlo", stack: `Menlo, ${MONO_TAIL}` },
   { label: "Consolas", family: "Consolas", stack: `Consolas, ${MONO_TAIL}` },
@@ -199,12 +61,7 @@ export const UI_FONTS: FontChoice[] = [
     family: "-apple-system",
     stack: SANS_TAIL,
   },
-  {
-    label: "Inter",
-    family: "Inter",
-    stack: `"Inter", ${SANS_TAIL}`,
-    load: proportionalLoaders.inter,
-  },
+  { label: "Inter", family: "Inter", stack: `"Inter", ${SANS_TAIL}` },
   { label: "Helvetica Neue", family: "Helvetica Neue", stack: `"Helvetica Neue", ${SANS_TAIL}` },
   { label: "Helvetica", family: "Helvetica", stack: `Helvetica, ${SANS_TAIL}` },
   { label: "Arial", family: "Arial", stack: `Arial, ${SANS_TAIL}` },
@@ -224,18 +81,8 @@ export const TEXT_FONTS: FontChoice[] = [
     family: "-apple-system",
     stack: SANS_TAIL,
   },
-  {
-    label: "Inter",
-    family: "Inter",
-    stack: `"Inter", ${SANS_TAIL}`,
-    load: proportionalLoaders.inter,
-  },
-  {
-    label: "Source Serif",
-    family: "Source Serif 4",
-    stack: `"Source Serif 4", ${SERIF_TAIL}`,
-    load: proportionalLoaders.sourceSerif4,
-  },
+  { label: "Inter", family: "Inter", stack: `"Inter", ${SANS_TAIL}` },
+  { label: "Source Serif", family: "Source Serif 4", stack: `"Source Serif 4", ${SERIF_TAIL}` },
   { label: "Georgia", family: "Georgia", stack: `Georgia, ${SERIF_TAIL}` },
   { label: "Charter", family: "Charter", stack: `Charter, ${SERIF_TAIL}` },
   { label: "Iowan Old Style", family: "Iowan Old Style", stack: `"Iowan Old Style", ${SERIF_TAIL}` },
@@ -335,18 +182,7 @@ const FONT_ROLES: Record<FontRoleId, FontRole> = {
   },
 };
 
-const loadedFonts = new Set<string>();
-function loadFont(choice: FontChoice): Promise<void> {
-  if (!choice.load) return Promise.resolve();
-  if (loadedFonts.has(choice.label)) return Promise.resolve();
-  loadedFonts.add(choice.label);
-  return choice.load().catch(() => {
-    loadedFonts.delete(choice.label);
-  }) as Promise<void>;
-}
-
 async function loadFontFaces(choice: FontChoice): Promise<void> {
-  await loadFont(choice);
   if (!document.fonts) return;
   await Promise.all(
     WEIGHT_STOPS.map((weight) =>
@@ -405,7 +241,6 @@ const ALWAYS_AVAILABLE_FAMILIES = new Set([
 ]);
 
 function isAvailable(choice: FontChoice): boolean {
-  if (choice.load) return true;
   if (ALWAYS_AVAILABLE_FAMILIES.has(choice.family)) return true;
   return isFontInstalled(choice.family);
 }
@@ -514,7 +349,6 @@ function pickChoice(fonts: FontChoice[], stored: string | null): FontChoice {
 
 function applyFontVar(cssVar: string, choice: FontChoice) {
   document.documentElement.style.setProperty(cssVar, choice.stack);
-  void loadFont(choice);
 }
 
 // Any CSS font-weight is legal (1–1000): variable fonts render arbitrary
@@ -586,7 +420,7 @@ function FontPicker({
 
   useEffect(() => {
     if (!open) return;
-    void Promise.all(fonts.map(loadFont)).then(() => setAvailTick((t) => t + 1));
+    setAvailTick((t) => t + 1);
   }, [open, fonts]);
 
   useEffect(() => {
