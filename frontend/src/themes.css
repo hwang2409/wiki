@@ -239,37 +239,37 @@
 [data-theme="gruvbox-dark"] {
   color-scheme: dark;
 
-  --background-primary: #282828;
-  --background-primary-alt: #32302f;
-  --background-secondary: #3c3836;
-  --background-modifier-border: #504945;
-  --background-modifier-hover: rgba(251, 241, 199, 0.06);
-  --background-modifier-active: rgba(251, 241, 199, 0.12);
+  --background-primary: #1d2021;
+  --background-primary-alt: #272828;
+  --background-secondary: #31302f;
+  --background-modifier-border: #45413e;
+  --background-modifier-hover: rgba(235, 219, 178, 0.06);
+  --background-modifier-active: rgba(235, 219, 178, 0.12);
 
   --text-normal: #ebdbb2;
-  --text-muted: #bdae93;
-  --text-subtle-readable: #bdae93;
+  --text-muted: #a89984;
+  --text-subtle-readable: #a89984;
   --text-faint: #928374;
   --text-on-accent: #1d2021;
-  --text-selection: rgba(80, 73, 69, 0.55);
+  --text-selection: rgba(235, 219, 178, 0.55);
 
-  --link-color: #83a598;
+  --link-color: #458588;
   --link-color-hover: #8ec07c;
 
-  --code-background: #32302f;
-  --image-outline: rgba(251, 241, 199, 0.12);
+  --code-background: #272828;
+  --image-outline: rgba(235, 219, 178, 0.12);
   --kanban-backdrop: #1d2021;
-  --kanban-lane: #32302f;
-  --kanban-card: #3c3836;
+  --kanban-lane: #272828;
+  --kanban-card: #31302f;
   --kanban-card-shadow: 0 1px 2px rgba(0, 0, 0, 0.4);
-  --blockquote-border-color: #665c54;
-  --scrollbar-thumb: #665c54;
-  --scrollbar-thumb-hover: #7c6f64;
+  --blockquote-border-color: #5d544d;
+  --scrollbar-thumb: #928374;
+  --scrollbar-thumb-hover: #a89984;
 
-  --accent-primary: #83a598;
-  --accent-success: #b8bb26;
-  --accent-warning: #fabd2f;
-  --accent-danger: #fb4934;
+  --accent-primary: #458588;
+  --accent-success: #98971a;
+  --accent-warning: #d79921;
+  --accent-danger: #cc241d;
 
   --shadow-floating: 0 2px 8px rgba(0, 0, 0, 0.28), 0 8px 28px rgba(0, 0, 0, 0.38);
   --shadow-modal: 0 2px 8px rgba(0, 0, 0, 0.28), 0 12px 40px rgba(0, 0, 0, 0.46);
@@ -292,16 +292,16 @@
   --diff-remove-foreground: #fb4934;
   --diff-hatch-color: color-mix(in srgb, var(--accent-danger) 20%, var(--background-primary));
 
-  --selection-inverse-background: #928374;
+  --selection-inverse-background: #d65d0e;
   --selection-inverse-color: var(--background-primary);
 
   --syntax-text: #ebdbb2;
   --syntax-comment: #928374;
-  --syntax-keyword: #d3869b;
+  --syntax-keyword: #b16286;
   --syntax-function: #b8bb26;
   --syntax-string: #8ec07c;
-  --syntax-number: #fe8019;
-  --syntax-type: #83a598;
+  --syntax-number: #d65d0e;
+  --syntax-type: #689d6a;
   --syntax-variable: #fabd2f;
 }
 
