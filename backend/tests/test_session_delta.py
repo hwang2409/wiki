@@ -32,11 +32,15 @@ def _legacy_delta(fmt: str, path: Path, after: int) -> dict:
 class SessionDeltaTests(unittest.TestCase):
     def setUp(self) -> None:
         transcripts._cache.clear()
+        transcripts._cache_locks.clear()
 
     def _cached_events(self, root: Path, count: int) -> tuple[Path, dict]:
         path = root / "large.jsonl"
         path.touch()
         state = transcripts._new_parse_state("codex")
+        stat = path.stat()
+        state["ino"] = stat.st_ino
+        state["dev"] = stat.st_dev
         state["events"] = [
             {
                 "id": index,
@@ -401,6 +405,97 @@ class SessionDeltaTests(unittest.TestCase):
             }
             stale = transcripts.annotate_agent_events(main_path, [stale_parent], assignments={})
             self.assertNotIn("agent_id", stale[0]["tool"], "old prompt must not match the replaced child")
+
+    def test_parse_state_rebuilds_on_same_path_larger_replacement(self) -> None:
+        # WIKI-244 review round 7 (M1): parse state carries the transcript's
+        # device+inode. Replacing the path with a DIFFERENT, LARGER file must
+        # rebuild the state — main events come from the new file and the
+        # child-assignment map dies with the old state.
+        def task_row(prompt: str, pad: str = "") -> dict:
+            return {
+                "type": "assistant",
+                "timestamp": "2026-08-05T12:00:00Z",
+                "message": {
+                    "role": "assistant",
+                    "content": [
+                        {"type": "tool_use", "id": "t1", "name": "Task", "input": {"prompt": prompt}},
+                        *([{"type": "text", "text": pad}] if pad else []),
+                    ],
+                },
+            }
+
+        def child_row(prompt: str) -> dict:
+            return {"type": "user", "timestamp": "2026-08-05T12:00:10Z", "message": {"content": prompt}}
+
+        with TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            path = root / "session.jsonl"
+            subdir = root / "session" / "subagents"
+            subdir.mkdir(parents=True)
+            _write_rows(subdir / "agent-aaaa1111.jsonl", [child_row("old work")], mode="w")
+            _write_rows(path, [task_row("old work")], mode="w")
+
+            first = transcripts.read_session_delta("claude", path, 0, tail_window=False)
+            annotated = transcripts.annotate_agent_events(path, first["events"])
+            first_tools = [event for event in annotated if event.get("kind") == "tool"]
+            self.assertEqual(first_tools[0]["tool"]["agent_id"], "aaaa1111")
+            old_state = transcripts._cache[str(path)]
+
+            # Replace with a DIFFERENT, LARGER transcript at the same path.
+            _write_rows(subdir / "agent-bbbb2222.jsonl", [child_row("new work")], mode="w")
+            replacement = root / "session.jsonl.next"
+            _write_rows(
+                replacement,
+                [task_row("new work", pad="padding " * 40)],
+                mode="w",
+            )
+            self.assertGreater(replacement.stat().st_size, path.stat().st_size)
+            os.replace(replacement, path)
+
+            second = transcripts.read_session_delta("claude", path, 0, tail_window=False)
+            reannotated = transcripts.annotate_agent_events(path, second["events"])
+            texts = [event["tool"]["prompt_head"] for event in reannotated if event.get("kind") == "tool"]
+            self.assertEqual(texts, ["new work"], "main events must come from the replacement file")
+            new_tools = [event for event in reannotated if event.get("kind") == "tool"]
+            self.assertEqual(new_tools[0]["tool"]["agent_id"], "bbbb2222")
+            new_state = transcripts._cache[str(path)]
+            self.assertIsNot(new_state, old_state, "replacement must rebuild the parse state")
+            self.assertNotIn(
+                "aaaa1111",
+                set(new_state["agent_child_assignments"].values()),
+                "old child assignments must die with the replaced state",
+            )
+
+    def test_parse_cache_stays_bounded_under_path_churn(self) -> None:
+        # WIKI-244 review round 7 (M2): distinct transcript paths (panes,
+        # inline child traces) must not grow the parse-state or lock maps
+        # without bound, and evicted paths must reload safely from disk.
+        def note_row(index: int) -> dict:
+            return {
+                "type": "assistant",
+                "timestamp": f"2026-08-05T12:00:{index % 60:02d}Z",
+                "message": {"role": "assistant", "content": [{"type": "text", "text": f"note {index}"}]},
+            }
+
+        with TemporaryDirectory() as tmp, mock.patch.object(transcripts, "_PARSE_CACHE_MAX", 8):
+            root = Path(tmp)
+            paths = []
+            for index in range(40):
+                path = root / f"session-{index:03d}.jsonl"
+                _write_rows(path, [note_row(index)], mode="w")
+                paths.append(path)
+                result = transcripts.read_session_delta("claude-sub", path, 0, tail_window=False)
+                self.assertEqual(len(result["events"]), 1)
+
+            self.assertLessEqual(len(transcripts._cache), 8, "parse states must stay bounded")
+            self.assertLessEqual(len(transcripts._cache_locks), 9, "lock entries must be evicted with states")
+
+            # An evicted path must reload correctly from disk on demand.
+            evicted = paths[0]
+            self.assertNotIn(str(evicted), transcripts._cache)
+            reread = transcripts.read_session_delta("claude-sub", evicted, 0, tail_window=False)
+            self.assertEqual(len(reread["events"]), 1)
+            self.assertIn("note 0", reread["events"][0]["text"])
 
     def test_models_endpoint_includes_new_codex_and_claude_options(self) -> None:
         payload = main.list_models()

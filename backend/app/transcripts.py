@@ -28,6 +28,7 @@ import os
 import re
 import threading
 from collections.abc import Callable
+from contextlib import contextmanager
 from copy import deepcopy
 from datetime import datetime, timedelta, timezone
 from pathlib import Path, PurePosixPath
@@ -2152,18 +2153,72 @@ _APPLY = {
     "codex-normalized": _codex_normalized_apply,
     "claude-normalized": _claude_normalized_apply,
 }
-_cache: dict[str, dict] = {}  # path → parse state; wiped on reload, rebuilt lazily
-_cache_locks: dict[str, threading.Lock] = {}
-_cache_locks_guard = threading.Lock()
+# Parse-state cache lifecycle (WIKI-244 R7 — the whole class, closed out):
+#   identity   — every state carries the transcript's device+inode; a replaced
+#                file at the same path (larger OR smaller) rebuilds the state,
+#                which also drops the child-assignment map living inside it.
+#   reset      — shrink (size < parsed offset) rebuilds, as before.
+#   bound      — the cache is an LRU capped at _PARSE_CACHE_MAX states; the
+#                matching lock entry is evicted with the state, but only when
+#                its refcount is zero (no holder or waiter), so an in-flight
+#                read can never share a critical section with a new lock.
+_PARSE_CACHE_MAX = max(8, int(os.environ.get("WIKI_PARSE_CACHE_MAX", "64")))
+_cache: dict[str, dict] = {}  # path → parse state (insertion order = LRU order)
+_cache_locks: dict[str, "_PathLockEntry"] = {}
+_cache_locks_guard = threading.Lock()  # guards _cache/_cache_locks STRUCTURE
 
 
-def _cache_lock_for(key: str) -> threading.Lock:
+class _PathLockEntry:
+    __slots__ = ("lock", "refs")
+
+    def __init__(self) -> None:
+        self.lock = threading.Lock()
+        self.refs = 0
+
+
+@contextmanager
+def _path_lock(key: str):
+    # Refcount under the guard BEFORE acquiring, so eviction (which only
+    # removes entries with refs == 0) can never race a thread that is about
+    # to acquire the lock it just looked up.
     with _cache_locks_guard:
-        lock = _cache_locks.get(key)
-        if lock is None:
-            lock = threading.Lock()
-            _cache_locks[key] = lock
-        return lock
+        entry = _cache_locks.get(key)
+        if entry is None:
+            entry = _PathLockEntry()
+            _cache_locks[key] = entry
+        entry.refs += 1
+    entry.lock.acquire()
+    try:
+        yield
+    finally:
+        entry.lock.release()
+        with _cache_locks_guard:
+            entry.refs -= 1
+
+
+def _evict_parse_states_locked(current_key: str) -> None:
+    # Caller holds _cache_locks_guard. Evict least-recently-used states past
+    # the cap, skipping the active key and any path whose lock is in use.
+    for key in list(_cache):
+        if len(_cache) <= _PARSE_CACHE_MAX:
+            break
+        if key == current_key:
+            continue
+        entry = _cache_locks.get(key)
+        if entry is not None and entry.refs > 0:
+            continue
+        _cache.pop(key, None)
+        _cache_locks.pop(key, None)
+    # Prune orphaned lock entries whose state is gone (evicted while the lock
+    # was held, or cleared externally) once nobody references them, so the
+    # lock map is bounded by the state map plus in-flight readers.
+    for key in list(_cache_locks):
+        if key == current_key or key in _cache:
+            continue
+        entry = _cache_locks[key]
+        if entry.refs > 0:
+            continue
+        del _cache_locks[key]
 
 
 def _new_parse_state(fmt: str) -> dict:
@@ -2217,10 +2272,23 @@ def _prune_change_log(state: dict) -> None:
 
 def _read_cached_state(fmt: str, path: Path, key: str) -> dict:
     stat = path.stat()
-    state = _cache.get(key)
-    if state is None or stat.st_size < state["offset"]:
-        state = _new_parse_state(fmt)
-        _cache[key] = state
+    with _cache_locks_guard:
+        state = _cache.get(key)
+        if (
+            state is None
+            or stat.st_size < state["offset"]
+            or state.get("ino") != stat.st_ino
+            or state.get("dev") != stat.st_dev
+        ):
+            state = _new_parse_state(fmt)
+            state["ino"] = stat.st_ino
+            state["dev"] = stat.st_dev
+            _cache.pop(key, None)
+            _cache[key] = state
+            _evict_parse_states_locked(key)
+        else:
+            # LRU touch: re-insertion moves the key to the end.
+            _cache[key] = _cache.pop(key)
     if stat.st_size > state["offset"]:
         apply = _APPLY[fmt]
         with path.open(encoding="utf-8", errors="replace") as f:
@@ -2262,7 +2330,7 @@ def read_session_events(fmt: str, path: Path) -> dict:
     consumers must re-fetch from min(cursor, dirty_from).
     """
     key = str(path)
-    with _cache_lock_for(key):
+    with _path_lock(key):
         state = _read_cached_state(fmt, path, key)
         total = state["base"] + len(state["events"])
         dirty_from = total
@@ -2307,7 +2375,7 @@ def read_session_delta(
     tail_events: int | None = None,
 ) -> dict:
     key = str(path)
-    with _cache_lock_for(key):
+    with _path_lock(key):
         state = _read_cached_state(fmt, path, key)
         base = int(state["base"])
         events = state["events"]
@@ -2431,7 +2499,7 @@ def read_older_session(
 ) -> dict:
     """Return the retained events immediately before an absolute event index."""
     key = str(path)
-    with _cache_lock_for(key):
+    with _path_lock(key):
         state = _read_cached_state(fmt, path, key)
         base = int(state["base"])
         events = state["events"]
@@ -2542,7 +2610,7 @@ def _agent_assignment_store(main_path: Path) -> dict:
     ephemeral map — correlation still works within that call.
     """
     key = str(main_path)
-    with _cache_lock_for(key):
+    with _path_lock(key):
         state = _cache.get(key)
         if state is None:
             return {}
