@@ -66,6 +66,7 @@ export type BoundedPreviewRenderProps = {
 
 type BoundedPreviewProps = {
   text: string;
+  rawText?: string;
   label?: string;
   language?: "bash" | "plain";
   previewLines?: number;
@@ -93,6 +94,7 @@ function findScrollContainer(node: HTMLElement | null): HTMLElement | null {
 
 export function BoundedPreview({
   text,
+  rawText = text,
   label,
   previewLines = STREAM_CLAMP_LINES,
   ansi = false,
@@ -115,6 +117,7 @@ export function BoundedPreview({
 
   const lines = useMemo(() => (text.length === 0 ? [] : text.split("\n")), [text]);
   const totalLines = lines.length;
+  const compact = totalLines <= 1 && text.length <= 240;
   const shouldClip = expandable && !expanded && totalLines > previewLines;
   const heightClamped = expandable && !expanded && heightOverflow;
   const shownLines = shouldClip ? lines.slice(0, previewLines) : lines;
@@ -125,14 +128,14 @@ export function BoundedPreview({
     ?? (shownLines.some((line) => line.length > 120) || totalLines > 30);
 
   const copy = useCallback(() => {
-    void navigator.clipboard?.writeText(text).then(
+    void navigator.clipboard?.writeText(rawText).then(
       () => {
         setCopied(true);
         window.setTimeout(() => setCopied(false), 1200);
       },
       () => setCopied(false),
     );
-  }, [text]);
+  }, [rawText]);
 
   // WIKI-241: preserve the transcript scroll position across expand/collapse.
   // Capture where the preview head sits before the toggle, then, once React
@@ -206,7 +209,7 @@ export function BoundedPreview({
 
   return (
     <div
-      className={`transcript-preview${className ? ` ${className}` : ""} is-${tone}${expanded ? " is-expanded" : ""}`}
+      className={`transcript-preview${className ? ` ${className}` : ""} is-${tone}${compact ? " is-compact" : ""}${expanded ? " is-expanded" : ""}`}
     >
       <div className="transcript-preview-head" ref={headRef}>
         {label ? <span className="transcript-preview-label">{label}</span> : null}

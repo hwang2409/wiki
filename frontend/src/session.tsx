@@ -102,6 +102,20 @@ import { createStateKeyWriteBarrier, deletePaneStateEntries } from "./pane-state
 import { Timestamp } from "./timestamp";
 import { StatusBadge } from "./status-badge";
 import { BoundedPreview } from "./transcript-preview";
+import {
+  outputLabelForTool,
+  toolStatus,
+  toolSummaryLine,
+  toolSummaryParts,
+  traceConnector,
+  traceRows,
+  type TraceRow,
+} from "./transcript-event-utils";
+import {
+  cleanHarnessOutput,
+  HarnessOutput,
+  hasHarnessError,
+} from "./transcript-output";
 import { CodexStreamHighlights } from "./codex-stream-renderers";
 import { markerRule } from "./hook-message-registry";
 import type { MarkerSeverity } from "./hook-message-registry";
@@ -1126,10 +1140,6 @@ const ARCHETYPE_ICONS: Record<string, LucideIcon> = {
   tool: Wrench,
 };
 
-function toolSummaryLine(tool: SessionTool): string {
-  return tool.summary || tool.input.split("\n")[0].slice(0, 120);
-}
-
 // Multiline inputs (and Bash commands, whose summary is a description) render
 // as a body block. Single-line inputs are already carried by the row itself:
 // either the summary contains them, or they render as an inline dim detail
@@ -1148,19 +1158,22 @@ function toolInlineDetail(tool: SessionTool): string | null {
   return input;
 }
 
-// Purpose labels shared with PR #177 (WIKI-241): name the payload by what it
-// is, not by transport. Reads/edits emit file contents; failed calls carry an
-// error message; Bash carries command text.
+// Purpose labels shared with PR #177 (WIKI-241): name each payload by what it
+// is, not by transport. Reads expose contents; edits acknowledge a change;
+// rich command output is a log.
 function inputLabelForTool(tool: SessionTool): string {
   return tool.name === "Bash" ? "command input" : "tool input";
 }
 
-function outputLabelForTool(tool: SessionTool): string {
-  if (tool.ok === false) return "error output";
-  if (tool.archetype === "read") return "file contents";
-  if (tool.archetype === "edit") return "file contents";
-  if (tool.name === "Bash") return "command output";
-  return "tool output";
+function toolOutputIsBlock(tool: SessionTool, displayOutput: string): boolean {
+  return Boolean(displayOutput) && (
+    tool.name === "Bash" ||
+    tool.archetype === "bash" ||
+    tool.archetype === "terminal" ||
+    tool.archetype === "diff" ||
+    displayOutput.includes("\n") ||
+    displayOutput.length > 120
+  );
 }
 
 function ToolInputBody({ tool }: { tool: SessionTool }) {
@@ -1184,15 +1197,21 @@ function ToolInputBody({ tool }: { tool: SessionTool }) {
 
 function ToolOutputBody({ tool }: { tool: SessionTool }) {
   if (!tool.output) return null;
-  const hasGitHubPreview = containsGitHubPreviewUrl(tool.output);
+  const rawOutput = tool.output;
+  const displayOutput = cleanHarnessOutput(rawOutput);
+  if (!toolOutputIsBlock(tool, displayOutput)) return null;
+  const harnessOutput = displayOutput !== rawOutput;
+  const hasGitHubPreview = !harnessOutput && containsGitHubPreviewUrl(displayOutput);
+  const outputTone = tool.ok === false || hasHarnessError(rawOutput) ? "error" : "normal";
   return (
     <div className="session-tool-body">
       {hasGitHubPreview ? (
         <BoundedPreview
           ansi
           label={outputLabelForTool(tool)}
-          text={tool.output}
-          tone={tool.ok === false ? "error" : "normal"}
+          rawText={rawOutput}
+          text={displayOutput}
+          tone={outputTone}
           renderBody={({ text }) => (
             <div className="session-tool-output-blocks">
               <span className="session-tool-output-text">
@@ -1205,8 +1224,14 @@ function ToolOutputBody({ tool }: { tool: SessionTool }) {
         <BoundedPreview
           ansi
           label={outputLabelForTool(tool)}
-          text={tool.output}
-          tone={tool.ok === false ? "error" : "normal"}
+          rawText={rawOutput}
+          text={displayOutput}
+          tone={outputTone}
+          renderBody={harnessOutput ? ({ text }) => (
+            <span className="session-tool-output-text">
+              <HarnessOutput text={text} ansi />
+            </span>
+          ) : undefined}
         />
       )}
     </div>
@@ -1363,15 +1388,25 @@ function SubagentTrace({
 }
 
 function ThinkingRow({ event }: { event: SessionEvent }) {
-  // WIKI-244: thinking renders in full — no clamp, no show-all gate. The
-  // backend already bounds thinking text at parse time.
+  const [expanded, setExpanded] = useState(false);
+  const title = event.text.split("\n")[0].trim().slice(0, 120);
   return (
     <div className="session-activity-row is-reasoning">
-      <div className="session-activity-row-meta">thinking</div>
-      <div className="session-thinking">
+      <button
+        className="session-thinking-head"
+        type="button"
+        aria-expanded={expanded}
+        onClick={() => setExpanded((value) => !value)}
+      >
+        <span className="session-activity-row-meta">thought</span>
+        <span className="session-thinking-title">{title || "thinking"}</span>
         {event.encrypted ? <span className="session-thinking-chip">encrypted</span> : null}
-        {event.text}
-      </div>
+      </button>
+      {expanded ? (
+        <div className="session-thinking">
+          {event.text}
+        </div>
+      ) : null}
     </div>
   );
 }
@@ -1393,24 +1428,52 @@ function ToolCallRow({
 }) {
   const tool = event.tool!;
   const Icon = ARCHETYPE_ICONS[tool.archetype] ?? Terminal;
-  const running = tool.output === null && tool.ok === null;
+  const status = toolStatus(tool);
+  const running = status === "working";
   const detail = toolInlineDetail(tool);
+  const { verb, target } = toolSummaryParts(tool);
+  const displayOutput = tool.output ? cleanHarnessOutput(tool.output) : "";
+  const outputBlock = toolOutputIsBlock(tool, displayOutput);
+  const [errorExpanded, setErrorExpanded] = useState(false);
+  const showOutputBlock = outputBlock && (tool.ok !== false || errorExpanded);
+  const inlineOutput = displayOutput && !outputBlock && (tool.ok !== false || errorExpanded)
+    ? displayOutput
+    : null;
   return (
     <div
-      className={`session-tool session-activity-row is-tool${tool.ok === false ? " is-failed" : ""}`}
+      className={`session-tool session-activity-row is-tool is-${status}${outputBlock ? " is-block" : " is-inline"}${tool.ok === false ? " is-failed" : ""}`}
       data-tool-event-id={nested ? undefined : event.id}
     >
       <div className="session-tool-head">
         <span aria-hidden="true" className="session-trace-connector">{connector}</span>
         <Icon className="session-tool-icon" size={12} />
-        <span className="session-tool-summary" title={tool.name}>
-          {toolSummaryLine(tool)}
+        <span className="session-tool-summary" title={toolSummaryLine(tool)}>
+          <span className="session-tool-verb">{verb}</span>
+          {target ? <><span aria-hidden="true">{" "}</span><span className="session-tool-target">{target}</span></> : null}
         </span>
         {detail ? (
           <span className="session-tool-detail" title={detail}>{detail}</span>
         ) : null}
         {running ? <span className="session-tool-running" title="running" /> : null}
-        {tool.ok === false ? <span className="session-tool-err">failed</span> : null}
+        <span className={`session-tool-status${status === "failed" ? " session-tool-err" : ""} is-${status}`}>
+          {status}
+        </span>
+        {tool.ok === null && !running ? <span className="session-activity-row-meta">unknown</span> : null}
+        {inlineOutput ? (
+          <span className="session-tool-inline-result" title={tool.output ?? undefined}>
+            <HarnessOutput text={inlineOutput} ansi />
+          </span>
+        ) : null}
+        {tool.ok === false && tool.output ? (
+          <button
+            className="session-tool-error-toggle"
+            type="button"
+            aria-expanded={errorExpanded}
+            onClick={() => setErrorExpanded((value) => !value)}
+          >
+            {errorExpanded ? "hide error" : "show error"}
+          </button>
+        ) : null}
         {tool.agent_id && onInspect ? (
           <span
             className="session-tool-inspect"
@@ -1433,7 +1496,7 @@ function ToolCallRow({
       </div>
       <div className="session-trace-indent">
         <ToolInputBody tool={tool} />
-        {withResult ? <ToolOutputBody tool={tool} /> : null}
+        {withResult && showOutputBlock ? <ToolOutputBody tool={tool} /> : null}
         {!nested && tool.agent_id ? (
           <SubagentTrace active={running} agentId={tool.agent_id} onInspect={onInspect} ticket={ticket} />
         ) : null}
@@ -1461,9 +1524,6 @@ function TraceRowList({
     <>
       {rows.map((row, index) => {
         const key = `${keyBase}:${row.kind}:${row.eventIndex}`;
-        if (row.kind === "result") {
-          return <ToolResultRow connector={traceConnector(rows, index)} event={row.event} key={key} nested={nested} />;
-        }
         if (row.kind === "tool") {
           return (
             <ToolCallRow
@@ -1483,37 +1543,6 @@ function TraceRowList({
   );
 }
 
-// Standalone result row — used when the tool's completion is separated from
-// its call in the timeline (parallel tools completing out of order). The dim
-// identifying line says which call this output belongs to.
-function ToolResultRow({
-  connector,
-  event,
-  nested = false,
-}: {
-  connector: string;
-  event: SessionEvent;
-  nested?: boolean;
-}) {
-  const tool = event.tool!;
-  const resultLabel = tool.ok === false ? "failed" : tool.ok === true ? "done" : "completed";
-  return (
-    <div
-      className={`session-activity-row is-result${tool.ok === false ? " is-failed" : ""}`}
-      data-tool-event-id={nested ? undefined : event.id}
-    >
-      <div className="session-tool-result">
-        <span aria-hidden="true" className="session-trace-connector">{connector}</span>
-        <span className="session-tool-result-state">{resultLabel}</span>
-        {tool.ok === null ? <span className="session-activity-row-meta">unknown</span> : null}
-        <span className="session-tool-result-summary" title={tool.name}>{toolSummaryLine(tool)}</span>
-      </div>
-      <div className="session-trace-indent">
-        <ToolOutputBody tool={tool} />
-      </div>
-    </div>
-  );
-}
 
 type ActivityTimelineItem = {
   event: SessionEvent;
@@ -2177,47 +2206,6 @@ const MessageBlock = memo(function MessageBlock({
   prev.uiState === next.uiState &&
   sameImageNums(prev.imageNums, next.imageNums)
 );
-
-type TraceRow =
-  | { kind: "tool"; event: SessionEvent; eventIndex: number; withResult: boolean }
-  | { kind: "result"; event: SessionEvent; eventIndex: number }
-  | { kind: "thinking"; event: SessionEvent; eventIndex: number };
-
-// Flatten the timeline into OpenCode-style rows. A call immediately followed
-// by its own result renders as one merged row (call line + output beneath) —
-// the common sequential case. Results separated by interleaved calls keep a
-// standalone row so parallel-tool completion order stays legible.
-function traceRows(timeline: ActivityTimelineItem[]): TraceRow[] {
-  const rows: TraceRow[] = [];
-  for (let index = 0; index < timeline.length; index += 1) {
-    const item = timeline[index];
-    if (item.kind === "result") {
-      rows.push({ kind: "result", event: item.event, eventIndex: item.eventIndex });
-      continue;
-    }
-    if (item.event.kind === "tool") {
-      const next = timeline[index + 1];
-      // Unknown-outcome completions (ok === null, e.g. interrupted sessions)
-      // keep a standalone result row so the neutral "completed/unknown"
-      // labelling survives (WIKI-238 contract).
-      const withResult =
-        !!next && next.kind === "result" && next.event === item.event && item.event.tool!.ok !== null;
-      if (withResult) index += 1;
-      rows.push({ kind: "tool", event: item.event, eventIndex: item.eventIndex, withResult });
-      continue;
-    }
-    if (!item.event.text) continue;
-    rows.push({ kind: "thinking", event: item.event, eventIndex: item.eventIndex });
-  }
-  return rows;
-}
-
-// Tree connector for a tool/result row: last row of a contiguous run of tool
-// rows closes with └, everything before it branches with ├.
-function traceConnector(rows: TraceRow[], index: number): string {
-  const next = rows[index + 1];
-  return next && next.kind !== "thinking" ? "├" : "└";
-}
 
 function ActivityGroupBase({
   events,

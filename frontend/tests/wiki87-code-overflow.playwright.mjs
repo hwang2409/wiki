@@ -130,13 +130,10 @@ async function main() {
     await page.locator(".session-activity-head").first().waitFor({ state: "visible" });
     const tools = page.locator(".session-tool");
     assert((await tools.count()) === 2, `Expected 2 tool calls, found ${await tools.count()}`);
-    // WIKI-241/#177 purpose labels: read = "file contents", bash = "command
-    // output", failed = "error output", generic = "tool output".
-    const toolOutputs = page.locator(
-      ".session-activity-row .transcript-preview:has(.transcript-preview-label:text-matches(\"^(tool output|command output|file contents|error output)$\")) .transcript-preview-body"
-    );
-    const longToolOutput = toolOutputs.nth(0);
-    const shortToolOutput = toolOutputs.nth(1);
+    // WIKI-245: rich output uses a left-border block; short output stays in
+    // the inline tool row with no preview chrome.
+    const longToolOutput = page.locator(".session-tool-body .transcript-preview-body").first();
+    const shortToolOutput = page.locator(".session-tool-inline-result").last();
     await shortToolOutput.waitFor({ state: "visible" });
     await page.waitForTimeout(250);
 

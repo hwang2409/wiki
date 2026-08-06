@@ -331,6 +331,8 @@ async function main() {
     await page.locator(".session-activity-head").first().waitFor({ state: "visible" });
     const failedTool = page.locator(".session-tool", { has: page.locator(".session-tool-err", { hasText: "failed" }) }).first();
     await failedTool.waitFor({ state: "visible" });
+    // WIKI-245: failures stay inline until the reader asks for the detail.
+    await failedTool.locator(".session-tool-error-toggle").click();
 
     const outputPreview = failedTool.locator(".transcript-preview.is-error").first();
     await outputPreview.waitFor({ state: "visible" });
@@ -366,7 +368,7 @@ async function main() {
     logStep("gh-preview mixed with long output: clip bounds output, expand reveals tail");
     const ghMixTool = page.locator(".session-tool", { has: page.locator(".session-tool-summary", { hasText: /gh pr view 122/ }) }).first();
     await ghMixTool.waitFor({ state: "visible" });
-    const ghMixOutput = ghMixTool.locator(".transcript-preview", { has: page.locator(".transcript-preview-label", { hasText: /^(tool output|command output|file contents)$/ }) }).first();
+    const ghMixOutput = ghMixTool.locator(".transcript-preview", { has: page.locator(".transcript-preview-label", { hasText: /^(tool output|command output|file contents|log)$/ }) }).first();
     await ghMixOutput.waitFor({ state: "visible" });
     const ghMixBody = ghMixOutput.locator(".transcript-preview-body.is-custom").first();
     await ghMixBody.waitFor({ state: "visible" });

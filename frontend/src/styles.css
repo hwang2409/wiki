@@ -7361,7 +7361,7 @@ body.is-resizing-panes .pane-cell {
   align-items: center;
   gap: 6px;
   width: 100%;
-  min-height: 24px;
+  min-height: 20px;
   min-width: 0;
   color: var(--text-muted);
   font-family: var(--font-monospace);
@@ -7390,10 +7390,15 @@ body.is-resizing-panes .pane-cell {
 
 .session-tool-icon {
   flex-shrink: 0;
+  width: 2ch;
+  height: 1em;
   color: var(--text-muted);
 }
 
 .session-tool-summary {
+  display: inline-flex;
+  align-items: baseline;
+  gap: 6px;
   flex-shrink: 0;
   max-width: min(60ch, 70%);
   overflow: hidden;
@@ -7402,10 +7407,61 @@ body.is-resizing-panes .pane-cell {
   white-space: nowrap;
 }
 
+.session-tool-verb {
+  flex-shrink: 0;
+  color: var(--text-normal);
+  font-weight: var(--fw-semibold);
+}
+
+.session-tool-target {
+  min-width: 0;
+  overflow: hidden;
+  color: var(--activity-metadata-color);
+  text-overflow: ellipsis;
+}
+
 /* Inline raw argument (full path, pattern) after the summary — dim, one line,
    full text preserved in the DOM and title for exact evidence. */
 .session-tool-detail {
   flex: 1 1 auto;
+  min-width: 0;
+  overflow: hidden;
+  color: var(--text-faint);
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.session-tool-err {
+  flex-shrink: 0;
+  color: var(--activity-state-failed-color);
+  font-size: var(--fs-xs);
+  font-weight: var(--fw-semibold);
+  letter-spacing: 0.02em;
+  text-transform: uppercase;
+}
+
+.session-tool-status {
+  flex-shrink: 0;
+  color: var(--activity-state-done-color);
+  font-size: var(--fs-xs);
+  font-weight: var(--fw-semibold);
+  letter-spacing: 0.04em;
+  text-transform: uppercase;
+}
+
+.session-tool-status.is-working {
+  color: var(--activity-state-working-color);
+}
+
+.session-tool-status.is-failed {
+  color: var(--activity-state-failed-color);
+}
+
+.session-tool-status.is-completed {
+  color: var(--activity-state-done-color);
+}
+
+.session-tool-inline-result {
   min-width: 0;
   overflow: hidden;
   color: var(--activity-metadata-color);
@@ -7413,22 +7469,35 @@ body.is-resizing-panes .pane-cell {
   white-space: nowrap;
 }
 
-.session-tool-err {
+.session-tool-error-toggle {
   flex-shrink: 0;
-  padding: 1px 7px;
-  border: 1px solid var(--text-muted);
-  border-radius: var(--radius-xs);
-  color: var(--activity-state-failed-color);
+  padding: 0;
+  border: 0;
+  background: transparent;
+  color: var(--text-muted);
+  font: inherit;
   font-size: var(--fs-xs);
-  letter-spacing: 0.02em;
-  text-transform: uppercase;
+  cursor: pointer;
+}
+
+.session-tool-error-toggle:hover,
+.session-tool-error-toggle:focus-visible {
+  color: var(--activity-state-failed-color);
+  text-decoration: underline;
 }
 
 .session-tool-body {
   display: flex;
   flex-direction: column;
   gap: 4px;
-  margin: 2px 0 6px;
+  margin: 4px 0 6px;
+  padding: 4px 8px;
+  border-left: 1px solid var(--background-modifier-border);
+  background-color: var(--background-primary-alt);
+}
+
+.session-tool-body:has(.transcript-preview.is-error) {
+  border-left-color: var(--activity-state-failed-color);
 }
 
 .session-activity-row-meta {
@@ -7529,7 +7598,9 @@ body.is-resizing-panes .pane-cell {
 }
 
 .session-thinking {
-  padding: 3px 0 10px;
+  margin: 3px 0 8px;
+  padding: 3px 0 3px 2ch;
+  border-left: 1px solid var(--background-modifier-border);
   color: var(--activity-metadata-color);
   font-family: var(--font-agent-prose);
   font-weight: var(--font-agent-prose-weight, var(--font-text-weight));
@@ -7541,7 +7612,46 @@ body.is-resizing-panes .pane-cell {
 }
 
 .session-activity-row.is-reasoning .session-activity-row-meta {
-  padding-top: 8px;
+  padding-top: 6px;
+  color: var(--activity-metadata-color);
+  font-size: var(--fs-xs);
+  letter-spacing: 0.04em;
+  text-transform: uppercase;
+}
+
+.session-activity-row.is-reasoning {
+  margin-left: calc(1ch + 6px);
+  padding-left: 10px;
+  border-left: 1px solid var(--background-modifier-border);
+}
+
+.session-thinking-head {
+  display: flex;
+  align-items: baseline;
+  gap: 8px;
+  width: 100%;
+  min-width: 0;
+  padding: 2px 0;
+  border: 0;
+  background: transparent;
+  color: var(--activity-state-working-color);
+  font: inherit;
+  font-family: var(--font-monospace);
+  text-align: left;
+  cursor: pointer;
+}
+
+.session-thinking-head:hover,
+.session-thinking-head:focus-visible {
+  color: var(--text-normal);
+}
+
+.session-thinking-title {
+  min-width: 0;
+  overflow: hidden;
+  color: var(--text-muted);
+  text-overflow: ellipsis;
+  white-space: nowrap;
 }
 
 .session-thinking-chip {
@@ -11840,6 +11950,62 @@ textarea.composer-command-input {
   font-size: var(--font-ui-smaller);
   line-height: 1.5;
   overflow-x: auto;
+}
+
+/* Short outputs are evidence, not cards. Keep the full action set in the
+   tab order, but let hover and focus reveal it when the reader needs it. */
+.transcript-preview.is-compact .transcript-preview-head {
+  gap: 6px;
+  padding: 0;
+}
+
+.transcript-preview.is-compact .transcript-preview-actions {
+  opacity: 0;
+  transition-property: opacity;
+  transition-duration: 120ms;
+}
+
+.transcript-preview.is-compact:hover .transcript-preview-actions,
+.transcript-preview.is-compact:focus-within .transcript-preview-actions {
+  opacity: 1;
+}
+
+.transcript-preview.is-compact .transcript-preview-body {
+  padding: 1px 0 3px;
+  border: none;
+  border-radius: 0;
+  background: transparent;
+  color: var(--activity-metadata-color);
+}
+
+.transcript-preview.is-compact .transcript-preview-summary {
+  color: var(--text-faint);
+  font-size: var(--fs-2xs);
+}
+
+.session-tool-body > .transcript-preview {
+  gap: 2px;
+}
+
+.session-tool-body > .transcript-preview .transcript-preview-head {
+  padding: 0;
+  color: var(--text-muted);
+}
+
+.session-tool-body > .transcript-preview .transcript-preview-body {
+  padding: 2px 0;
+  border: 0;
+  border-radius: 0;
+  background: transparent;
+}
+
+.session-output-segment.is-error {
+  color: var(--activity-state-failed-color);
+}
+
+.session-output-segment.is-note {
+  color: var(--text-faint);
+  font-style: italic;
 }
 
 .transcript-preview-body.is-wrap {
