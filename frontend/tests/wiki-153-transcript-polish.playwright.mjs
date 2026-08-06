@@ -399,7 +399,12 @@ async function main() {
     if (ghMixBodyBefore.includes(GH_MIX_OUTPUT_TAIL_MARKER)) {
       throw new Error("gh-preview mixed output should hide tail marker before expand — renderBody must clip via BoundedPreview text");
     }
-    await ghMixOutput.locator(`a.external-link[href='${GH_PREVIEW_URL}'], a.gh-preview-card[href='${GH_PREVIEW_URL}']`).first().waitFor({ state: "visible" });
+    // WIKI-252: tool output renders GitHub URLs as plain external-link anchors,
+    // never as a metadata card unfurl (that stays on the prose surface).
+    await ghMixOutput.locator(`a.external-link[href='${GH_PREVIEW_URL}']`).first().waitFor({ state: "visible" });
+    if ((await ghMixOutput.locator(`a.gh-preview-card[href='${GH_PREVIEW_URL}']`).count()) !== 0) {
+      throw new Error("WIKI-252: tool output must not render a gh-preview-card unfurl");
+    }
     if (ghMixBodyBefore.includes("\x1b[")) {
       throw new Error("gh-preview text segments must strip ANSI escapes via renderAnsi, not render them raw");
     }

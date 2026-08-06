@@ -86,7 +86,7 @@ import {
   GhPreviewCard,
   containsGitHubPreviewUrl,
   isGitHubPreviewUrl,
-  renderAnsiWithGitHubPreviews,
+  renderAnsiWithGitHubLinks,
 } from "./github-preview";
 import { LoadingPlaceholder } from "./loading";
 import { createStateKeyWriteBarrier, deletePaneStateEntries } from "./pane-state-cache";
@@ -1160,15 +1160,15 @@ function toolInlineDetail(tool: SessionTool): string | null {
 function renderOutputSegments(
   segments: HarnessOutputSegment[],
   text: string,
-  withGitHubPreviews = false,
+  withGitHubLinks = false,
 ) {
   const visible = segmentsForDisplayText(segments, text);
-  if (!withGitHubPreviews) return <HarnessOutput segments={visible} ansi />;
+  if (!withGitHubLinks) return <HarnessOutput segments={visible} ansi />;
   return visible.map((segment, index) => (
     <span key={`${segment.kind}:${index}`}>
       {index > 0 ? "\n" : null}
       <span className={`session-output-segment is-${segment.kind}`}>
-        {renderAnsiWithGitHubPreviews(segment.text)}
+        {renderAnsiWithGitHubLinks(segment.text)}
       </span>
     </span>
   ));
@@ -1216,19 +1216,23 @@ function ToolOutputBody({
     );
   }
   const bash = isBashTool(tool);
-  const hasGitHubPreview = containsGitHubPreviewUrl(displayOutput);
+  // WIKI-252: GitHub URLs inside tool output render as plain external-link
+  // anchors (no PR-metadata card unfurl); highlighter branches yield to the
+  // text path so those anchors stay clickable instead of getting swallowed
+  // into a Shiki code block.
+  const hasGitHubLink = containsGitHubPreviewUrl(displayOutput);
   const outputTone = tool.ok === false || segments.some((segment) => segment.kind === "error")
     ? "error"
     : "normal";
   // Structured non-bash outputs (JSON and friends) read pretty-printed in the
   // block view; the clipped budget applies to the PRETTY text, raw stays exact.
-  const structured = !bash && outputTone === "normal" && !hasGitHubPreview
+  const structured = !bash && outputTone === "normal" && !hasGitHubLink
     ? detectStructuredContent(displayOutput)
     : null;
   // File-slice bash reads (sed -n over one .py file etc.) highlight their
   // OUTPUT in the target file's language; ANSI-decorated output keeps the
   // ansi path, everything ambiguous stays plain.
-  const bashReadTarget = bash && outputTone === "normal" && !hasGitHubPreview && !hasAnsi(displayOutput)
+  const bashReadTarget = bash && outputTone === "normal" && !hasGitHubLink && !hasAnsi(displayOutput)
     ? bashReadTargetPath(tool.input)
     : null;
   const bashOutputLang = bashReadTarget ? languageForPath(bashReadTarget) : null;
@@ -1259,7 +1263,7 @@ function ToolOutputBody({
                 ? <HighlightedCode code={text} lang={structured.lang} />
                 : bashOutputLang
                 ? <HighlightedCode code={text} lang={bashOutputLang} />
-                : renderOutputSegments(segments, text, hasGitHubPreview)}
+                : renderOutputSegments(segments, text, hasGitHubLink)}
             </span>
           </div>
         )}

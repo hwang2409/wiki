@@ -51,7 +51,9 @@ export function splitGitHubPreviewSegments(text: string): GitHubPreviewSegment[]
 // Parse ANSI FIRST so SGR state and OSC escapes stay intact, then split each
 // styled visible-text run on GitHub URLs. Splitting raw bytes before ANSI parse
 // would sever SGR state across the URL boundary and could bisect OSC escapes.
-export function renderAnsiWithGitHubPreviews(text: string): ReactNode[] {
+// Tool-output path: GitHub URLs render as plain external-link anchors, no card
+// unfurl — the fetched-metadata preview only lives in prose (WIKI-252).
+export function renderAnsiWithGitHubLinks(text: string): ReactNode[] {
   const ansiSegments = parseAnsi(text);
   const nodes: ReactNode[] = [];
   let key = 0;
@@ -61,7 +63,17 @@ export function renderAnsiWithGitHubPreviews(text: string): ReactNode[] {
     for (const part of splitGitHubPreviewSegments(seg.text)) {
       if (!part.value) continue;
       if (part.type === "url") {
-        nodes.push(<GhPreviewCard key={`url:${key++}:${part.value}`} url={part.value} />);
+        nodes.push(
+          <a
+            key={`url:${key++}:${part.value}`}
+            className="external-link"
+            href={part.value}
+            title={part.value}
+            {...externalLinkProps(part.value)}
+          >
+            {part.value}
+          </a>
+        );
       } else if (ansiClass) {
         nodes.push(
           <span key={`text:${key++}`} className={ansiClass}>
