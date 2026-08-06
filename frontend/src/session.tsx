@@ -2341,7 +2341,7 @@ const MessageBlock = memo(function MessageBlock({
       <ReactMarkdown
         components={sessionMarkdownComponents}
         rehypePlugins={[rehypeKatex, rehypeEscapeRawHtml]}
-        remarkPlugins={[remarkGfm, remarkMath]}
+        remarkPlugins={[remarkGfm, [remarkMath, { singleDollarTextMath: false }]]}
       >
         {prepareTranscriptMarkdown(event.text)}
       </ReactMarkdown>

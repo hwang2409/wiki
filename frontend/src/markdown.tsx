@@ -119,7 +119,56 @@ function stripBlockComments(content: string) {
 }
 
 export function prepareMarkdown(content: string) {
-  return stripBlockComments(content.replace(wikiStylesPattern, ""));
+  return normalizeInlineMathDelimiters(stripBlockComments(content.replace(wikiStylesPattern, "")));
+}
+
+function normalizeInlineMathDelimiters(content: string) {
+  let fence: "`" | "~" | null = null;
+  let fenceLength = 0;
+
+  return content
+    .split("\n")
+    .map((line) => {
+      const fenceMatch = fence ? isFenceLine(line, fence) : isFenceLine(line, null);
+      if (fenceMatch && (!fence || fenceMatch.length >= fenceLength)) {
+        if (fence) {
+          fence = null;
+          fenceLength = 0;
+        } else {
+          fence = fenceMatch.marker;
+          fenceLength = fenceMatch.length;
+        }
+        return line;
+      }
+      if (fence) return line;
+
+      let result = "";
+      let index = 0;
+      while (index < line.length) {
+        const codeStart = line.indexOf("`", index);
+        if (codeStart === -1) {
+          result += normalizeInlineMathSegment(line.slice(index));
+          break;
+        }
+        result += normalizeInlineMathSegment(line.slice(index, codeStart));
+        let codeEnd = codeStart;
+        while (line[codeEnd] === "`") codeEnd += 1;
+        const marker = line.slice(codeStart, codeEnd);
+        const close = line.indexOf(marker, codeEnd);
+        if (close === -1) {
+          result += line.slice(codeStart);
+          break;
+        }
+        result += line.slice(codeStart, close + marker.length);
+        index = close + marker.length;
+      }
+      return result;
+    })
+    .join("\n");
+}
+
+function normalizeInlineMathSegment(segment: string) {
+  return segment.replace(/\\\(([\s\S]*?)\\\)/g, (_match, expression: string) => `$$${expression}$$`);
 }
 
 export function rehypeEscapeRawHtml() {
@@ -202,7 +251,7 @@ function isTranscriptTextLine(line: string) {
 }
 
 export function prepareTranscriptMarkdown(content: string) {
-  const lines = content.split(/\r?\n/);
+  const lines = normalizeInlineMathDelimiters(content).split(/\r?\n/);
   const output: string[] = [];
   let fence: "`" | "~" | null = null;
   let fenceLength = 0;
@@ -737,7 +786,7 @@ export function ObsidianMarkdown({
     <ReactMarkdown
       components={components}
       rehypePlugins={[rehypeKatex]}
-      remarkPlugins={[remarkGfm, remarkMath, remarkObsidianInline, remarkBreaks]}
+      remarkPlugins={[remarkGfm, [remarkMath, { singleDollarTextMath: false }], remarkObsidianInline, remarkBreaks]}
     >
       {prepared}
     </ReactMarkdown>
