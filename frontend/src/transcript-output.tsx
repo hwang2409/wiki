@@ -9,6 +9,19 @@ export type HarnessOutputSegment = {
 
 type StructuredToolInput = Record<string, unknown>;
 
+export type StructuredEditPayload = {
+  file_path?: string;
+  old_string?: string;
+  new_string?: string;
+  replace_all?: boolean;
+  patch?: string;
+};
+
+const DIFF_CONTEXT_LINES = 3;
+const MAX_DIFF_LINES = 200;
+const MAX_DIFF_CHARS = 60_000;
+const MAX_DIFF_LINE_CHARS = 256;
+
 function structuredToolInput(input: unknown): StructuredToolInput | null {
   if (input && typeof input === "object" && !Array.isArray(input)) {
     return input as StructuredToolInput;
@@ -34,11 +47,13 @@ function stringField(input: StructuredToolInput | null, ...keys: string[]): stri
   return null;
 }
 
-function diffLineCount(text: string): number {
-  return text ? text.split("\n").length : 0;
+function diffLine(text: string): string {
+  return text.length > MAX_DIFF_LINE_CHARS
+    ? `${text.slice(0, MAX_DIFF_LINE_CHARS)}… [line truncated]`
+    : text;
 }
 
-function replacementDiff(filePath: string, oldText: string, newText: string): string {
+export function replacementDiff(filePath: string, oldText: string, newText: string): string | null {
   const oldLines = oldText ? oldText.split("\n") : [];
   const newLines = newText ? newText.split("\n") : [];
   let prefix = 0;
@@ -46,7 +61,6 @@ function replacementDiff(filePath: string, oldText: string, newText: string): st
     prefix < oldLines.length
     && prefix < newLines.length
     && oldLines[prefix] === newLines[prefix]
-    && prefix < 3
   ) {
     prefix += 1;
   }
@@ -55,21 +69,36 @@ function replacementDiff(filePath: string, oldText: string, newText: string): st
     suffix < oldLines.length - prefix
     && suffix < newLines.length - prefix
     && oldLines[oldLines.length - 1 - suffix] === newLines[newLines.length - 1 - suffix]
-    && suffix < 3
   ) {
     suffix += 1;
   }
-  const contextBefore = oldLines.slice(0, prefix).map((line) => ` ${line}`);
-  const removed = oldLines.slice(prefix, oldLines.length - suffix).map((line) => `-${line}`);
-  const added = newLines.slice(prefix, newLines.length - suffix).map((line) => `+${line}`);
-  const contextAfter = suffix > 0
-    ? oldLines.slice(oldLines.length - suffix).map((line) => ` ${line}`)
-    : [];
-  const oldStart = oldLines.length > 0 ? 1 : 0;
-  const newStart = newLines.length > 0 ? 1 : 0;
-  const oldCount = diffLineCount(oldText);
-  const newCount = diffLineCount(newText);
-  return [
+  if (prefix === oldLines.length && prefix === newLines.length) return null;
+  const contextBefore = oldLines
+    .slice(Math.max(0, prefix - DIFF_CONTEXT_LINES), prefix)
+    .map((line) => ` ${diffLine(line)}`);
+  const contextAfter = oldLines
+    .slice(oldLines.length - suffix, oldLines.length - suffix + DIFF_CONTEXT_LINES)
+    .map((line) => ` ${diffLine(line)}`);
+  let removed = oldLines
+    .slice(prefix, oldLines.length - suffix)
+    .map((line) => `-${diffLine(line)}`);
+  let added = newLines
+    .slice(prefix, newLines.length - suffix)
+    .map((line) => `+${diffLine(line)}`);
+  const available = Math.max(2, MAX_DIFF_LINES - contextBefore.length - contextAfter.length);
+  if (removed.length + added.length > available) {
+    const removedLimit = Math.max(1, Math.floor(available / 2));
+    const addedLimit = Math.max(1, available - removedLimit);
+    removed = removed.slice(0, removedLimit);
+    added = added.slice(0, addedLimit);
+    if (removed.length < oldLines.length - prefix - suffix) removed.push("-… [diff truncated]");
+    if (added.length < newLines.length - prefix - suffix) added.push("+… [diff truncated]");
+  }
+  const oldStart = oldLines.length > 0 ? Math.max(1, prefix - contextBefore.length + 1) : 0;
+  const newStart = newLines.length > 0 ? Math.max(1, prefix - contextBefore.length + 1) : 0;
+  const oldCount = contextBefore.length + removed.length + contextAfter.length;
+  const newCount = contextBefore.length + added.length + contextAfter.length;
+  const result = [
     `--- a/${filePath}`,
     `+++ b/${filePath}`,
     `@@ -${oldStart},${oldCount} +${newStart},${newCount} @@`,
@@ -78,6 +107,7 @@ function replacementDiff(filePath: string, oldText: string, newText: string): st
     ...added,
     ...contextAfter,
   ].join("\n");
+  return result.length <= MAX_DIFF_CHARS ? result : null;
 }
 
 type PatchSection = {
@@ -87,12 +117,55 @@ type PatchSection = {
 };
 
 function normalizedHunkHeader(header: string, body: string[], kind: PatchSection["kind"]): string {
-  if (/^@@\s+-\d+(?:,\d+)?\s+\+\d+(?:,\d+)?\s+@@/.test(header)) return header;
+  if (/^@@\s+-\d+(?:,\d+)?\s+\+\d+(?:,\d+)?\s+@@(?:.*)$/.test(header)) return header;
   const oldCount = body.filter((line) => !line.startsWith("+")).length;
   const newCount = body.filter((line) => !line.startsWith("-")).length;
   const oldStart = kind === "add" ? 0 : 1;
   const newStart = kind === "delete" ? 0 : 1;
   return `@@ -${oldStart},${oldCount} +${newStart},${newCount} @@`;
+}
+
+function validHunk(header: string, body: string[]): boolean {
+  const match = /^@@\s+-(\d+)(?:,(\d+))?\s+\+(\d+)(?:,(\d+))?\s+@@(?:.*)$/.exec(header);
+  if (!match) return header.trim() === "@@";
+  if (!body.some((line) => line.startsWith("+") || line.startsWith("-"))) return false;
+  const oldCount = body.filter((line) => line.startsWith(" ") || line.startsWith("-")).length;
+  const newCount = body.filter((line) => line.startsWith(" ") || line.startsWith("+")).length;
+  return oldCount === Number(match[2] ?? 1) && newCount === Number(match[4] ?? 1);
+}
+
+function validHunkBody(body: string[]): boolean {
+  return body.length > 0
+    && body.every((line) => line.startsWith(" ") || line.startsWith("+") || line.startsWith("-") || line.startsWith("\\"))
+    && body.some((line) => line.startsWith("+") || line.startsWith("-"));
+}
+
+function validateUnifiedPatch(source: string): boolean {
+  if (source.length > MAX_DIFF_CHARS) return false;
+  const lines = source.split("\n");
+  if (lines.at(-1) === "") lines.pop();
+  const fileIndexes = lines
+    .map((line, index) => /^---\s+\S/.test(line) ? index : -1)
+    .filter((index) => index >= 0);
+  if (fileIndexes.length === 0) return false;
+  for (let fileIndex = 0; fileIndex < fileIndexes.length; fileIndex += 1) {
+    const start = fileIndexes[fileIndex];
+    const end = fileIndexes[fileIndex + 1] ?? lines.length;
+    if (!/^\+\+\+\s+\S/.test(lines[start + 1] ?? "")) return false;
+    const body = lines.slice(start + 2, end);
+    const hunkIndexes = body
+      .map((line, index) => line.startsWith("@@") ? index : -1)
+      .filter((index) => index >= 0);
+    if (hunkIndexes.length === 0) return false;
+    for (let hunkIndex = 0; hunkIndex < hunkIndexes.length; hunkIndex += 1) {
+      const hunkStart = hunkIndexes[hunkIndex];
+      const hunkEnd = hunkIndexes[hunkIndex + 1] ?? body.length;
+      const hunkHeader = body[hunkStart];
+      const hunkBody = body.slice(hunkStart + 1, hunkEnd);
+      if (!validHunk(hunkHeader, hunkBody) || !validHunkBody(hunkBody)) return false;
+    }
+  }
+  return true;
 }
 
 function normalizedPatchSection(section: PatchSection): string[] {
@@ -122,6 +195,8 @@ function normalizedPatchSection(section: PatchSection): string[] {
 
 function normalizeApplyPatch(source: string): string | null {
   const lines = source.split("\n");
+  if (lines.at(-1) === "") lines.pop();
+  if (lines.shift() !== "*** Begin Patch" || lines.pop() !== "*** End Patch") return null;
   const sections: PatchSection[] = [];
   let current: PatchSection | null = null;
   const finish = () => {
@@ -139,21 +214,38 @@ function normalizeApplyPatch(source: string): string | null {
       };
       continue;
     }
-    if (line === "*** Begin Patch" || line === "*** End Patch") continue;
     if (current) current.lines.push(line);
   }
   finish();
   if (sections.length === 0) return null;
-  return sections.flatMap(normalizedPatchSection).join("\n");
+  if (sections.some((section) => {
+    if (!section.path || !validHunkBody(section.lines.filter((line) => !line.startsWith("@@")))) return true;
+    const hunkIndexes = section.lines
+      .map((line, index) => line.startsWith("@@") ? index : -1)
+      .filter((index) => index >= 0);
+    return hunkIndexes.some((start, index) => {
+      const end = hunkIndexes[index + 1] ?? section.lines.length;
+      return !validHunk(section.lines[start], section.lines.slice(start + 1, end))
+        || !validHunkBody(section.lines.slice(start + 1, end));
+    });
+  })) return null;
+  const normalized = sections.flatMap(normalizedPatchSection).join("\n");
+  return validateUnifiedPatch(normalized) ? normalized : null;
 }
 
-export function editDiffFromInput(name: string, input: unknown): string | null {
-  const structured = structuredToolInput(input);
+export function editDiffFromInput(
+  name: string,
+  input: unknown,
+  editPayload?: StructuredEditPayload,
+): string | null {
+  const structured = editPayload ?? structuredToolInput(input);
   const nestedPatch = stringField(structured, "patch", "diff");
   const source = nestedPatch ?? (typeof input === "string" ? input : "");
   const lowerName = name.trim().toLowerCase();
   if (lowerName === "apply_patch" || source.includes("*** Begin Patch")) {
-    if (source.startsWith("diff --git ") || source.startsWith("--- ")) return source;
+    if (source.startsWith("diff --git ") || source.startsWith("--- ")) {
+      return validateUnifiedPatch(source) ? source : null;
+    }
     return normalizeApplyPatch(source);
   }
   const oldText = stringField(structured, "old_string", "oldString");

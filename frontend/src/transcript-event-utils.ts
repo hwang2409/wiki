@@ -50,7 +50,7 @@ export function looksLikeUnifiedDiff(text: string | null | undefined): boolean {
 
 export function toolDiffSource(tool: SessionTool, displayOutput = ""): string | null {
   if (isEditTool(tool)) {
-    return editDiffFromInput(tool.name, tool.input)
+    return editDiffFromInput(tool.name, tool.input, tool.edit)
       ?? (looksLikeUnifiedDiff(displayOutput) ? displayOutput : null);
   }
   return tool.archetype === "diff" && looksLikeUnifiedDiff(displayOutput)

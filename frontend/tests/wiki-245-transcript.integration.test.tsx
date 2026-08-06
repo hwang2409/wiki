@@ -13,6 +13,7 @@ import {
 import { BoundedPreview } from "../src/transcript-preview";
 import {
   cleanHarnessOutput,
+  editDiffFromInput,
   HarnessOutput,
   parseHarnessOutput,
 } from "../src/transcript-output";
@@ -157,7 +158,8 @@ test("tier is chosen by tool kind, not multiline output shape", () => {
     output: "one\ntwo\nthree\nfour",
   });
   expect(read.container.querySelector(".session-tool")?.classList.contains("is-inline")).toBe(true);
-  expect(read.container.querySelector(".session-tool-inline-result")?.textContent).toBe("(4 lines)");
+  expect(read.container.querySelector(".session-tool-inline-result")?.textContent).toContain("one");
+  expect(read.container.querySelector(".session-output-segment.is-text")?.textContent).toContain("one");
   expect(read.container.querySelector(".session-tool-body")).toBeNull();
   cleanup();
 
@@ -231,4 +233,85 @@ test("edit rows without diff material stay inline", () => {
   });
   expect(container.querySelector(".session-tool.is-inline")).toBeTruthy();
   expect(container.querySelector(".session-tool-diff-body")).toBeNull();
+});
+
+test("normalized edit payloads render through the real tool row", () => {
+  const { container } = renderTool({
+    input: "hot.md",
+    edit: {
+      file_path: "hot.md",
+      old_string: "before\nold\nafter",
+      new_string: "before\nnew\nafter",
+      replace_all: false,
+    },
+  });
+  expect(container.querySelector(".diff-line.is-remove")?.textContent).toContain("old");
+  expect(container.querySelector(".diff-line.is-add")?.textContent).toContain("new");
+});
+
+test("replacement diffs keep full common ranges but cap visible context", () => {
+  const common = Array.from({ length: 10 }, (_, index) => `common-${index}`);
+  const diff = editDiffFromInput("hot.md", {
+    file_path: "hot.md",
+    old_string: [...common, "old", ...common].join("\n"),
+    new_string: [...common, "new", ...common].join("\n"),
+  });
+  expect(diff).toContain("-old");
+  expect(diff).toContain("+new");
+  expect(diff).not.toContain("-common-");
+});
+
+test("long replacement diffs stay within the renderer cap", () => {
+  const oldText = Array.from({ length: 500 }, (_, index) => `old-${index}`).join("\n");
+  const newText = Array.from({ length: 500 }, (_, index) => `new-${index}`).join("\n");
+  const diff = editDiffFromInput("hot.md", { file_path: "hot.md", old_string: oldText, new_string: newText });
+  expect(diff).not.toBeNull();
+  expect(diff!.length).toBeLessThanOrEqual(60_000);
+  expect(diff).toContain("diff truncated");
+});
+
+test("malformed and multi-file patches are handled safely", () => {
+  expect(editDiffFromInput(
+    "apply_patch",
+    "*** Begin Patch\n*** Update File: hot.md\n@@\n context only\n*** End Patch",
+  )).toBeNull();
+  const patch = [
+    "*** Begin Patch",
+    "*** Update File: one.md",
+    "@@",
+    "-one",
+    "+ONE",
+    "*** Update File: two.md",
+    "@@",
+    "-two",
+    "+TWO",
+    "*** End Patch",
+  ].join("\n");
+  const diff = editDiffFromInput("apply_patch", patch);
+  expect(diff).toContain("--- a/one.md");
+  expect(diff).toContain("--- a/two.md");
+});
+
+test("failed edits show semantic errors before the intended diff", () => {
+  const { container } = renderTool({
+    input: "hot.md",
+    edit: { file_path: "hot.md", old_string: "old", new_string: "new" },
+    output: "<tool_use_error>old text was not found</tool_use_error>",
+    ok: false,
+  });
+  expect(container.querySelector(".session-output-segment.is-error")?.textContent)
+    .toContain("old text was not found");
+  expect(container.querySelector(".diff-view")).toBeNull();
+});
+
+test("block outputs also expose raw output below the head", () => {
+  const { container, getByRole } = renderTool({
+    name: "Bash",
+    archetype: "bash",
+    input: "echo ok",
+    output: "ok",
+  });
+  expect(container.querySelector(".session-tool-head + .session-trace-indent .session-tool-raw-disclosure"))
+    .toBeTruthy();
+  expect(getByRole("button", { name: "show raw output" })).toBeTruthy();
 });

@@ -105,7 +105,6 @@ import { StatusBadge } from "./status-badge";
 import { BoundedPreview } from "./transcript-preview";
 import {
   isBashTool,
-  isReadOrSearchTool,
   toolInlineResult,
   toolDiffSource,
   toolPresentation,
@@ -1191,11 +1190,20 @@ function ToolOutputBody({
 }) {
   const presentation = toolPresentation(tool, displayOutput);
   if (presentation === "inline" || (!displayOutput && !isBashTool(tool))) return null;
+  const failureSegments = tool.ok === false
+    ? segments.filter((segment) => segment.kind === "error")
+    : [];
   if (presentation === "diff") {
     return (
       <div className="session-tool-body session-tool-diff-body">
         <div className="session-tool-block-title">{toolBlockTitle(tool)}</div>
-        <DiffPatchView source={diffSource ?? displayOutput} />
+        {failureSegments.length > 0 ? (
+          <div className="session-tool-failure-output">
+            {renderOutputSegments(failureSegments, failureSegments.map((segment) => segment.text).join("\n"))}
+          </div>
+        ) : (
+          <DiffPatchView source={diffSource ?? displayOutput} />
+        )}
       </div>
     );
   }
@@ -1233,7 +1241,7 @@ function RawOutputDisclosure({ rawText }: { rawText: string }) {
   const [open, setOpen] = useState(false);
   const id = useId();
   return (
-    <>
+    <div className="session-tool-raw-disclosure">
       <button
         aria-controls={id}
         aria-expanded={open}
@@ -1257,7 +1265,7 @@ function RawOutputDisclosure({ rawText }: { rawText: string }) {
           />
         </div>
       ) : null}
-    </>
+    </div>
   );
 }
 
@@ -1462,7 +1470,8 @@ export function ToolCallRow({
   const presentation = toolPresentation(tool, diffSource ?? displayOutput);
   const outputBlock = presentation !== "inline";
   const [errorExpanded, setErrorExpanded] = useState(false);
-  const showOutputBlock = outputBlock && (tool.ok !== false || errorExpanded);
+  const hasSemanticFailure = outputSegments.some((segment) => segment.kind === "error");
+  const showOutputBlock = outputBlock && (tool.ok !== false || errorExpanded || hasSemanticFailure);
   const inlineOutput = presentation === "inline" && (tool.ok !== false || errorExpanded)
     ? tool.ok === false && errorExpanded
       ? displayOutput
@@ -1494,12 +1503,9 @@ export function ToolCallRow({
         {tool.ok === null && !running ? <span className="session-activity-row-meta">unknown</span> : null}
         {inlineOutput ? (
           <span className="session-tool-inline-result">
-            {isReadOrSearchTool(tool)
-              ? inlineOutput
-              : renderOutputSegments(outputSegments, displayOutput)}
+            {renderOutputSegments(outputSegments, displayOutput)}
           </span>
         ) : null}
-        {presentation === "inline" && rawOutput ? <RawOutputDisclosure rawText={rawOutput} /> : null}
         {tool.ok === false && tool.output ? (
           <button
             className="session-tool-error-toggle"
@@ -1531,6 +1537,7 @@ export function ToolCallRow({
         ) : null}
       </div>
       <div className="session-trace-indent">
+        {rawOutput ? <RawOutputDisclosure rawText={rawOutput} /> : null}
         {withResult && showOutputBlock ? (
           <ToolOutputBody
             displayOutput={displayOutput}

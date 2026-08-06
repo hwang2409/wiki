@@ -54,6 +54,8 @@ KICKOFF_TICKET_PATTERN = re.compile(r"(?:Linear )?ticket ([A-Z]+-\d+)\b")
 MAX_TEXT = 80_000
 MAX_TOOL_IO = 3_000
 MAX_CHANGE_LOG = 4_096
+TRANSCRIPT_CACHE_VERSION = 2
+MAX_EDIT_PAYLOAD = 10_000
 
 try:
     TAIL_WINDOW_EVENTS = max(1, int(os.environ.get("WIKI_TRANSCRIPT_TAIL_WINDOW", "500")))
@@ -554,6 +556,38 @@ def _codex_tool_input(name: str, arguments: object) -> str:
     return _clip(str(arguments), MAX_TOOL_IO)
 
 
+def _structured_edit_payload(name: object, raw_input: object) -> dict | None:
+    """Keep bounded edit data needed by the transcript diff renderer."""
+    tool_name = str(name or "").strip().lower()
+    edit_names = {"edit", "multiedit", "notebookedit", "apply_patch"}
+    if tool_name not in edit_names:
+        return None
+    if isinstance(raw_input, str):
+        if tool_name == "apply_patch" and "*** Begin Patch" in raw_input:
+            return {"patch": _clip(raw_input, MAX_EDIT_PAYLOAD)}
+        return None
+    if not isinstance(raw_input, dict):
+        return None
+    payload: dict = {}
+    aliases = (
+        ("file_path", "file_path", "filePath", "path"),
+        ("old_string", "old_string", "oldString"),
+        ("new_string", "new_string", "newString"),
+    )
+    for output_key, *keys in aliases:
+        value = next((raw_input[key] for key in keys if key in raw_input), None)
+        if isinstance(value, str):
+            payload[output_key] = _clip(value, MAX_EDIT_PAYLOAD)
+    replace_all = raw_input.get("replace_all", raw_input.get("replaceAll"))
+    if isinstance(replace_all, bool):
+        payload["replace_all"] = replace_all
+    if tool_name == "apply_patch":
+        patch = raw_input.get("patch", raw_input.get("diff"))
+        if isinstance(patch, str):
+            payload["patch"] = _clip(patch, MAX_EDIT_PAYLOAD)
+    return payload or None
+
+
 def _is_artifact_tool(name: object) -> bool:
     return isinstance(name, str) and name in {
         "render_artifact",
@@ -1015,6 +1049,9 @@ def _codex_apply(state: dict, row: dict) -> None:
                     "summary": summary,
                 },
             }
+            edit_payload = _structured_edit_payload(name, raw_input)
+            if edit_payload is not None:
+                event["tool"]["edit"] = edit_payload
             _append_event(state, event)
             if call_id:
                 pending[call_id] = event
@@ -2061,6 +2098,9 @@ def _claude_apply(state: dict, row: dict) -> None:
                         "summary": summary,
                     },
                 }
+                edit_payload = _structured_edit_payload(name, raw_input)
+                if edit_payload is not None:
+                    event["tool"]["edit"] = edit_payload
                 if name in ("Agent", "Task") and isinstance(raw_input, dict):
                     prompt = raw_input.get("prompt")
                     if isinstance(prompt, str):
@@ -2308,6 +2348,7 @@ def _new_parse_state(fmt: str) -> dict:
         # parent event id → child agent id (claude only); dies with the state
         # so stale links cannot outlive a transcript reset (WIKI-244).
         "agent_child_assignments": {},
+        "cache_version": TRANSCRIPT_CACHE_VERSION,
     }
 
 
@@ -2333,6 +2374,7 @@ def _read_cached_state(fmt: str, path: Path, key: str) -> dict:
         state = _cache.get(key)
         if (
             state is None
+            or state.get("cache_version") != TRANSCRIPT_CACHE_VERSION
             or stat.st_size < state["offset"]
             or state.get("ino") != stat.st_ino
             or state.get("dev") != stat.st_dev
