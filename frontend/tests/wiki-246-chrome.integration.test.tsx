@@ -20,12 +20,27 @@ const CSS_SOURCE = readFileSync(
 );
 const CHROME_CSS = CSS_SOURCE.slice(CSS_SOURCE.lastIndexOf("WIKI-246: OpenCode chrome language"));
 
-function cssDeclarations(selector: string): string {
-  const declarations = [...CSS_SOURCE.matchAll(/([^{}]+)\{([^{}]*)\}/g)]
+// Comments would otherwise hide a rule from selector matching, and joined
+// duplicates would let a reverted late override pass on the earlier rule.
+const CSS_WITHOUT_COMMENTS = CSS_SOURCE.replace(/\/\*[\s\S]*?\*\//g, "");
+
+function cssRuleBodies(selector: string): string[] {
+  const bodies = [...CSS_WITHOUT_COMMENTS.matchAll(/([^{}]+)\{([^{}]*)\}/g)]
     .filter((match) => match[1].split(",").some((entry) => entry.trim() === selector))
     .map((match) => match[2]);
-  expect(declarations.length).toBeGreaterThan(0);
-  return declarations.join("\n");
+  expect(bodies.length).toBeGreaterThan(0);
+  return bodies;
+}
+
+function cssDeclarations(selector: string): string {
+  return cssRuleBodies(selector).join("\n");
+}
+
+// The declarations that actually win the cascade for equal-specificity
+// duplicates: the last rule body in source order.
+function finalCssDeclarations(selector: string): string {
+  const bodies = cssRuleBodies(selector);
+  return bodies[bodies.length - 1];
 }
 
 const noOp = () => {};
@@ -212,13 +227,16 @@ describe("WIKI-246 OpenCode chrome states", () => {
     expect(lateCss).toContain("overflow-y: auto;");
   });
 
-  test("muted chrome controls have visible hover elevation", () => {
-    // element-on-element or transparent hover backgrounds are invisible.
-    expect(cssDeclarations(".ribbon-action:hover")).toContain("var(--background-modifier-hover)");
-    expect(cssDeclarations(".dialog-button:hover")).toContain("var(--background-modifier-hover)");
-    const tmuxHover = cssDeclarations(".tmux-status-item:hover");
-    expect(tmuxHover).toContain("var(--background-modifier-hover)");
-    expect(tmuxHover).not.toContain("transparent");
+  test("muted chrome controls have visible hover elevation in the final cascade", () => {
+    // element-on-element or transparent hover backgrounds are invisible; the
+    // FINAL rule in source order must carry the modifier token so a reverted
+    // late override cannot hide behind an earlier legacy rule.
+    for (const selector of [".ribbon-action:hover", ".dialog-button:hover", ".tmux-status-item:hover"]) {
+      const finalBody = finalCssDeclarations(selector);
+      expect(finalBody).toContain("var(--background-modifier-hover)");
+      expect(finalBody).not.toContain("var(--background-element)");
+      expect(finalBody).not.toContain("transparent");
+    }
   });
 
   test("hover rules never promote border color", () => {
