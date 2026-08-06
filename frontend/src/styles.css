@@ -12030,15 +12030,24 @@ textarea.composer-command-input {
   min-width: 0;
 }
 
+/* Wrap contract shared by both diff renderers: the legacy div lines
+   (DiffPatchView) and react-diff-view's tr.diff-line table rows. */
 .diff-line {
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+  word-break: break-word;
+}
+
+/* WIKI-258: flex line layout is for the legacy div renderer ONLY (.diff-view
+   root). react-diff-view rows are <tr class="diff-line">; display: flex on a
+   <tr> detaches its cells from the table columns, so under overflow-wrap:
+   anywhere the split view collapsed to ~1ch-wide code columns. */
+.diff-view .diff-line {
   display: flex;
   align-items: flex-start;
   gap: 0;
   padding: 0;
   min-width: 0;
-  white-space: pre-wrap;
-  overflow-wrap: anywhere;
-  word-break: break-word;
 }
 
 .diff-line.is-add {
