@@ -7413,6 +7413,38 @@ body.is-resizing-panes .pane-cell {
   user-select: none;
 }
 
+/* WIKI-261: numbered read outputs (cat -n / arrow-gutter) render as a
+   two-column table — muted, non-selectable gutter next to the tokenized
+   code. Wrapped continuation lines indent under the code column via
+   `padding-inline-start` on the row body, so long lines line up cleanly
+   instead of returning to the left margin (WIKI-251 wrap conventions). */
+.numbered-read {
+  display: table;
+  width: 100%;
+  border-collapse: collapse;
+  --numbered-read-gutter-width: 3ch;
+}
+.numbered-read-row {
+  display: table-row;
+}
+.numbered-read-gutter {
+  display: table-cell;
+  width: var(--numbered-read-gutter-width);
+  padding-inline-end: 1ch;
+  color: var(--text-faint);
+  text-align: right;
+  user-select: none;
+  white-space: nowrap;
+  vertical-align: top;
+}
+.numbered-read-code {
+  display: table-cell;
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+  word-break: break-word;
+  vertical-align: top;
+}
+
 .session-collapsible {
   display: grid;
   grid-template-rows: 0fr;

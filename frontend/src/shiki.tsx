@@ -1,6 +1,10 @@
-import { useEffect, useState } from "react";
+import { useEffect, useMemo, useState } from "react";
 import type { BundledLanguage, BundledTheme, Highlighter } from "shiki";
 import { createHighlighter } from "shiki";
+import {
+  numberedGutterWidth,
+  type NumberedPayload,
+} from "./read-gutter";
 import { DEFAULT_THEME, normalizeTheme, type ThemeId } from "./themes";
 
 const APP_THEME_TO_SHIKI: Record<ThemeId, BundledTheme> = {
@@ -218,6 +222,49 @@ export function HighlightedCode({
             <span aria-hidden="true" className="syntax-inline-gutter tabular-nums">{index + 1}</span>
           ) : null}
           <TokenizedLine fallback={line} tokens={tokenLines?.[index]} />
+        </span>
+      ))}
+    </span>
+  );
+}
+
+// WIKI-261: highlighted rendering for a numbered read payload. The line
+// numbers come from the file (not synthetic 1..N), tokenization runs on the
+// gutter-stripped code, and the two columns render as a table row so wrapped
+// continuation lines stay aligned under the code column instead of the
+// number. Selecting/copying the block yields code only — the gutter is
+// aria-hidden and user-select: none.
+export function NumberedReadHighlight({
+  payload,
+  lang,
+  className,
+}: {
+  payload: NumberedPayload;
+  lang: string | null | undefined;
+  className?: string;
+}) {
+  const tokenLines = useHighlightTokenLines(payload.code, lang);
+  const gutterCh = useMemo(() => numberedGutterWidth(payload), [payload]);
+  const normalizedLang = normalizeLang(lang);
+  return (
+    <span
+      className={`numbered-read${className ? ` ${className}` : ""}`}
+      data-lang={normalizedLang ?? undefined}
+      style={{ ["--numbered-read-gutter-width" as string]: `${gutterCh}ch` }}
+    >
+      {payload.lines.map((line, index) => (
+        <span className="numbered-read-row" key={index}>
+          <span
+            aria-hidden="true"
+            className="numbered-read-gutter tabular-nums"
+          >
+            {line.num > 0 ? line.num : ""}
+          </span>
+          <span className="numbered-read-code">
+            {line.text === ""
+              ? " "
+              : <TokenizedLine fallback={line.text} tokens={tokenLines?.[index]} />}
+          </span>
         </span>
       ))}
     </span>
