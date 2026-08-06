@@ -166,7 +166,6 @@ const POLL_MS = 2500;
 const VIRTUAL_MIN_OVERSCAN = 3600;
 const VIRTUAL_OVERSCAN_MULTIPLIER = 5;
 const VIRTUAL_DEFAULT_VIEWPORT = 720;
-const MIN_ROW_HEIGHT = 24;
 const COMPOSER_MIN_HEIGHT = 44;
 const COMPOSER_NARROW_WIDTH = 480;
 
@@ -2541,12 +2540,18 @@ function useMeasuredRow(row: EventRow, onHeightChange: (row: EventRow, height: n
   useLayoutEffect(() => {
     const el = ref.current;
     if (!el) return;
-    const report = (height: number) => onHeightChange(row, Math.max(MIN_ROW_HEIGHT, Math.round(height)));
-    report(el.getBoundingClientRect().height);
-    const observer = new ResizeObserver((entries) => {
-      const entry = entries[0];
-      if (entry) report(entry.contentRect.height);
-    });
+    // WIKI-259: border-box for the resize callback too — the old
+    // contentRect/getBoundingClientRect mix meant two box models could feed
+    // the same cache. No minimum clamp: rounding a short row up to a floor
+    // widens its gap beyond VIRTUAL_ROW_GAP. Zero height means a hidden
+    // ancestor (display:none), not real content size — keep the last honest
+    // measurement instead of stomping the cache.
+    const report = () => {
+      const height = el.getBoundingClientRect().height;
+      if (height > 0) onHeightChange(row, Math.round(height));
+    };
+    report();
+    const observer = new ResizeObserver(report);
     observer.observe(el);
     return () => observer.disconnect();
   }, [row, onHeightChange]);

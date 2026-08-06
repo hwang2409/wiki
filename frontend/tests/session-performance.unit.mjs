@@ -276,6 +276,52 @@ test("eventRowsIncremental keeps one virtual row per event", () => {
   assert.equal(result.changedFrom, 0);
 });
 
+// WIKI-259: an event that renders no visible content must not reserve row
+// height + gap in the virtual layout — that painted as a random blank band.
+test("events that render nothing produce no virtual rows", () => {
+  const events = [
+    toolEvent(0, "read", "Read"),
+    event(1, "thinking", ""),
+    toolEvent(2, "read", "Read"),
+    { ...event(3, "tool"), tool: undefined },
+    event(4, "assistant", "   "),
+    event(5, "assistant", "prose"),
+  ];
+  const rows = eventRows(events, 0);
+  assert.deepEqual(rows.map((row) => row.key), [0, 2, 5], "hidden events are skipped, keys stay event-indexed");
+
+  const heights = new Map(rows.map((row) => [row.key, { refs: [row.event], height: 20 }]));
+  const layout = buildVirtualLayout(rows, heights);
+  assert.equal(layout.tops[1] - layout.tops[0], 20, "hidden thought adds no height or gap between inline tools");
+  assert.equal(layout.totalHeight, 20 + (20 + VIRTUAL_ROW_GAP) + 20);
+});
+
+test("a hidden thinking event becomes a row when its text streams in", () => {
+  let events = [toolEvent(0, "read", "Read"), event(1, "thinking", ""), toolEvent(2, "read", "Read")];
+  let result = eventRowsIncremental(events, 0, null);
+  assert.deepEqual(result.rows.map((row) => row.key), [0, 2]);
+
+  events = events.map((entry, index) => (index === 1 ? { ...entry, text: "now visible" } : entry));
+  result = eventRowsIncremental(events, 0, result.cache);
+  assert.deepEqual(result.rows, eventRows(events, 0));
+  assert.deepEqual(result.rows.map((row) => row.key), [0, 1, 2]);
+});
+
+test("incremental rows and layout stay correct around hidden events", () => {
+  let events = [event(0), event(1, "thinking", ""), event(2, "tool")];
+  let grouped = eventRowsIncremental(events, 0, null);
+  assert.deepEqual(grouped.rows, eventRows(events, 0));
+  const heights = new Map();
+  let incremental = buildVirtualLayoutIncremental(grouped.rows, heights, 0, null, grouped.changedFrom);
+  assert.deepEqual(incremental.layout, buildVirtualLayout(grouped.rows, heights));
+
+  events = [...events, event(3, "thinking", ""), event(4)];
+  grouped = eventRowsIncremental(events, 0, grouped.cache);
+  assert.deepEqual(grouped.rows, eventRows(events, 0));
+  incremental = buildVirtualLayoutIncremental(grouped.rows, heights, 0, incremental.cache, grouped.changedFrom);
+  assert.deepEqual(incremental.layout, buildVirtualLayout(grouped.rows, heights));
+});
+
 test("virtual row spacing follows rendered presentation", () => {
   const rows = eventRows([
     toolEvent(0, "read", "Read"),
