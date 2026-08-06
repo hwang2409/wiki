@@ -43,9 +43,33 @@ export function hasHarnessError(raw: string): boolean {
   return parseHarnessOutput(raw).some((segment) => segment.kind === "error");
 }
 
-export function HarnessOutput({ text, ansi = false }: { text: string; ansi?: boolean }): ReactNode {
-  const segments = parseHarnessOutput(text);
-  return segments.map((segment, index) => (
+export function segmentsForDisplayText(
+  segments: HarnessOutputSegment[],
+  displayText: string,
+): HarnessOutputSegment[] {
+  const fullText = segments.map((segment) => segment.text).join("\n");
+  if (displayText === fullText) return segments;
+  return segments.flatMap((segment, index) => {
+    const start = segments
+      .slice(0, index)
+      .reduce((offset, previous) => offset + previous.text.length + 1, 0);
+    const visibleEnd = Math.max(0, Math.min(segment.text.length, displayText.length - start));
+    const text = visibleEnd > 0 ? segment.text.slice(0, visibleEnd) : "";
+    return text ? [{ ...segment, text }] : [];
+  });
+}
+
+export function HarnessOutput({
+  text,
+  segments,
+  ansi = false,
+}: {
+  text?: string;
+  segments?: HarnessOutputSegment[];
+  ansi?: boolean;
+}): ReactNode {
+  const parsed = segments ?? parseHarnessOutput(text ?? "");
+  return parsed.map((segment, index) => (
     <span key={`${segment.kind}:${index}`}>
       {index > 0 ? "\n" : null}
       <span className={`session-output-segment is-${segment.kind}`}>

@@ -326,49 +326,38 @@ async function main() {
     }
     await expectVisibleText(page, ".session-marker.is-info", "stop hook");
 
-    logStep("tool call: expand activity, assert failed + bounded preview");
+    logStep("tool call: expand activity, assert failed inline detail");
     // WIKI-244: activity groups and tool bodies are open by default.
     await page.locator(".session-activity-head").first().waitFor({ state: "visible" });
-    const failedTool = page.locator(".session-tool", { has: page.locator(".session-tool-err", { hasText: "failed" }) }).first();
+    const failedTool = page.locator(".session-tool.is-failed").first();
     await failedTool.waitFor({ state: "visible" });
     // WIKI-245: failures stay inline until the reader asks for the detail.
     await failedTool.locator(".session-tool-error-toggle").click();
 
-    const outputPreview = failedTool.locator(".transcript-preview.is-error").first();
-    await outputPreview.waitFor({ state: "visible" });
-    // WIKI-241/#177: failed calls are labelled "error output" (purpose, not transport).
-    await outputPreview.locator(".transcript-preview-label", { hasText: "error output" }).waitFor();
-    const summary = await outputPreview.locator(".transcript-preview-summary").first().innerText();
-    if (!/\d+ lines · /.test(summary)) throw new Error(`summary label malformed: ${summary}`);
-    await outputPreview.locator(".transcript-preview-more").waitFor({ state: "visible" });
-    const bodyBefore = await outputPreview.locator(".transcript-preview-body").innerText();
-    if (bodyBefore.includes(`IOError: fixture failure line`)) {
-      throw new Error("bounded preview should hide the final line before expand");
+    await failedTool.locator(".session-tool-inline-result").waitFor({ state: "visible" });
+    const failedInline = await failedTool.locator(".session-tool-inline-result").innerText();
+    if (!failedInline.includes("IOError: fixture failure line")) {
+      throw new Error("expanded failed tool should render its semantic error inline");
     }
-    await outputPreview.locator(".transcript-chip", { hasText: "show all" }).click();
-    await outputPreview.locator(".transcript-chip", { hasText: "show less" }).waitFor({ state: "visible" });
-    const bodyAfter = await outputPreview.locator(".transcript-preview-body").innerText();
-    if (!bodyAfter.includes("IOError: fixture failure line")) {
-      throw new Error("expanded preview should include the final line");
+    if ((await failedTool.locator(".transcript-preview").count()) !== 0) {
+      throw new Error("short failed tool output must stay tier 1");
     }
-    await outputPreview.locator(".transcript-chip", { hasText: "copy output" }).click();
-    await outputPreview.locator(".transcript-chip", { hasText: "copied" }).waitFor({ state: "visible" });
 
-    logStep("bash tool call: input routed through BoundedPreview + shiki");
+    logStep("bash tool call: one block with a muted title and output");
     const bashTool = page.locator(".session-tool", { has: page.locator(".session-tool-summary", { hasText: /wiki-153 tool step/ }) }).first();
     await bashTool.waitFor({ state: "visible" });
-    const bashToolInput = bashTool.locator(".transcript-preview", { has: page.locator(".transcript-preview-label", { hasText: "command input" }) }).first();
-    await bashToolInput.waitFor({ state: "visible" });
-    await bashToolInput.locator(".shiki-block[data-lang='bash']").waitFor({ state: "visible" });
-    const bashToolSummary = await bashToolInput.locator(".transcript-preview-summary").first().innerText();
-    if (!/\d+ lines · /.test(bashToolSummary)) throw new Error(`bash tool input summary malformed: ${bashToolSummary}`);
-    await bashToolInput.locator(".transcript-chip", { hasText: "copy output" }).waitFor({ state: "visible" });
-    await bashToolInput.locator(".transcript-chip", { hasText: "show all" }).waitFor({ state: "visible" });
+    const bashToolBlock = bashTool.locator(".session-tool-block-body").first();
+    await bashToolBlock.waitFor({ state: "visible" });
+    await bashToolBlock.locator(".session-tool-block-title", { hasText: "$" }).waitFor({ state: "visible" });
+    await bashToolBlock.locator(".shiki-block[data-lang='bash']").waitFor({ state: "visible" });
+    if ((await bashToolBlock.locator(".transcript-preview-summary, .transcript-chip").count()) !== 0) {
+      throw new Error("tier-2 bash blocks must not show byte summaries or persistent controls");
+    }
 
     logStep("gh-preview mixed with long output: clip bounds output, expand reveals tail");
     const ghMixTool = page.locator(".session-tool", { has: page.locator(".session-tool-summary", { hasText: /gh pr view 122/ }) }).first();
     await ghMixTool.waitFor({ state: "visible" });
-    const ghMixOutput = ghMixTool.locator(".transcript-preview", { has: page.locator(".transcript-preview-label", { hasText: /^(tool output|command output|file contents|log)$/ }) }).first();
+    const ghMixOutput = ghMixTool.locator(".session-tool-block-preview").first();
     await ghMixOutput.waitFor({ state: "visible" });
     const ghMixBody = ghMixOutput.locator(".transcript-preview-body.is-custom").first();
     await ghMixBody.waitFor({ state: "visible" });
@@ -378,7 +367,6 @@ async function main() {
       throw new Error("gh-preview mixed output should hide tail marker before expand — renderBody must clip via BoundedPreview text");
     }
     await ghMixOutput.locator(`a.external-link[href='${GH_PREVIEW_URL}'], a.gh-preview-card[href='${GH_PREVIEW_URL}']`).first().waitFor({ state: "visible" });
-    await ghMixOutput.locator(".transcript-chip", { hasText: /^(wrap lines|keep lines)$/ }).waitFor({ state: "visible" });
     if (ghMixBodyBefore.includes("\x1b[")) {
       throw new Error("gh-preview text segments must strip ANSI escapes via renderAnsi, not render them raw");
     }
@@ -386,8 +374,8 @@ async function main() {
       throw new Error("gh-preview mixed output should include the ANSI head marker text");
     }
     await ghMixBody.locator(".session-tool-output-text .ansi-fg-2").first().waitFor({ state: "visible" });
-    await ghMixOutput.locator(".transcript-chip", { hasText: "show all" }).click();
-    await ghMixOutput.locator(".transcript-chip", { hasText: "show less" }).waitFor({ state: "visible" });
+    await ghMixOutput.locator(".transcript-preview-more").click();
+    await ghMixOutput.locator(".transcript-preview-more", { hasText: "show less" }).waitFor({ state: "visible" });
     const ghMixBodyAfter = await ghMixBody.innerText();
     if (!ghMixBodyAfter.includes(GH_MIX_OUTPUT_TAIL_MARKER)) {
       throw new Error("expanded gh-preview mixed output should include the tail marker");
@@ -399,28 +387,23 @@ async function main() {
       throw new Error("expanded gh-preview mixed output should include the ANSI tail marker text");
     }
     await ghMixBody.locator(".session-tool-output-text .ansi-fg-1").first().waitFor({ state: "visible" });
-    await ghMixOutput.locator(".transcript-chip", { hasText: "show less" }).click();
+    await ghMixOutput.locator(".transcript-preview-more", { hasText: "show less" }).click();
 
-    logStep("custom-body wrap chip: available on bash tool input");
-    await bashToolInput.locator(".transcript-chip", { hasText: /^(wrap lines|keep lines)$/ }).waitFor({ state: "visible" });
+    logStep("bash block has no persistent wrap or copy chrome");
 
-    logStep("bash block: three labelled sections, ansi preserved");
+    logStep("bash block: one title and one capped output body");
     const bashBlock = page.locator(".session-bash").first();
     await bashBlock.waitFor({ state: "visible" });
-    const commandSection = bashBlock.locator(".transcript-preview", { has: page.locator(".transcript-preview-label", { hasText: "command input" }) }).first();
-    await commandSection.waitFor({ state: "visible" });
-    await commandSection.locator(".session-bash-command .shiki-block[data-lang='bash']").waitFor({ state: "visible" });
-    const commandSummary = await commandSection.locator(".transcript-preview-summary").first().innerText();
-    if (!/\d+ lines · /.test(commandSummary)) throw new Error(`bash command summary malformed: ${commandSummary}`);
-    await commandSection.locator(".transcript-chip", { hasText: "copy output" }).waitFor({ state: "visible" });
-    const outputSection = bashBlock.locator(".transcript-preview", { has: page.locator(".transcript-preview-label", { hasText: "command output" }) }).first();
-    await outputSection.waitFor({ state: "visible" });
-    const errorSection = bashBlock.locator(".transcript-preview.is-error", { has: page.locator(".transcript-preview-label", { hasText: "command error" }) }).first();
-    await errorSection.waitFor({ state: "visible" });
-    const bashSummary = await outputSection.locator(".transcript-preview-summary").first().innerText();
-    if (!/\d+ lines · /.test(bashSummary)) throw new Error(`bash summary malformed: ${bashSummary}`);
-    await outputSection.locator(".ansi-fg-2, .ansi-fg-6").first().waitFor({ state: "visible" });
-    await errorSection.locator(".ansi-fg-1").first().waitFor({ state: "visible" });
+    await bashBlock.locator(".session-tool-block-title", { hasText: "$" }).waitFor({ state: "visible" });
+    await bashBlock.locator(".session-bash-command-code.shiki-block[data-lang='bash']").waitFor({ state: "visible" });
+    const bashOutput = bashBlock.locator(".session-tool-block-preview").first();
+    await bashOutput.waitFor({ state: "visible" });
+    if ((await bashBlock.locator(".transcript-preview-summary, .transcript-chip").count()) !== 0) {
+      throw new Error("bash blocks must have no byte summary or persistent controls");
+    }
+    await bashOutput.locator(".ansi-fg-2, .ansi-fg-6").first().waitFor({ state: "visible" });
+    await bashOutput.locator(".transcript-preview-more").click();
+    await bashOutput.locator(".ansi-fg-1").first().waitFor({ state: "visible" });
 
     logStep("action-required card: question visible, kind hidden");
     // WIKI-152: Action required is promoted to the top-level chrome; there is

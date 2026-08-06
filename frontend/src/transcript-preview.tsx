@@ -78,6 +78,7 @@ type BoundedPreviewProps = {
   renderBody?: (props: BoundedPreviewRenderProps) => ReactNode;
   wrapAvailable?: boolean;
   expandable?: boolean;
+  variant?: "default" | "block";
 };
 
 // Anchor scroll on the preview head so expand/collapse keeps the tool's start
@@ -105,6 +106,7 @@ export function BoundedPreview({
   renderBody,
   wrapAvailable: wrapAvailableOverride,
   expandable = true,
+  variant = "default",
 }: BoundedPreviewProps) {
   const [expanded, setExpanded] = useState(false);
   const [wrap, setWrap] = useState(true);
@@ -193,9 +195,14 @@ export function BoundedPreview({
       : bodyText;
 
   const moreHint = shouldClip && hiddenCount > 0 ? (
-    <span className="transcript-preview-more">
-      <span>+{hiddenCount} more line{hiddenCount === 1 ? "" : "s"}</span>
-    </span>
+    <button
+      aria-expanded={expanded}
+      className="transcript-preview-more"
+      type="button"
+      onClick={toggleExpanded}
+    >
+      +{hiddenCount} more line{hiddenCount === 1 ? "" : "s"}
+    </button>
   ) : null;
 
   const wrapChipLabel = wrap ? "keep lines" : "wrap lines";
@@ -209,40 +216,42 @@ export function BoundedPreview({
 
   return (
     <div
-      className={`transcript-preview${className ? ` ${className}` : ""} is-${tone}${compact ? " is-compact" : ""}${expanded ? " is-expanded" : ""}`}
+      className={`transcript-preview${className ? ` ${className}` : ""} is-${tone} is-${variant}${compact ? " is-compact" : ""}${expanded ? " is-expanded" : ""}`}
     >
-      <div className="transcript-preview-head" ref={headRef}>
-        {label ? <span className="transcript-preview-label">{label}</span> : null}
-        {summary ? <span className="transcript-preview-summary">{summary}</span> : null}
-        <span className="transcript-preview-actions">
-          {wrapAvailable ? (
-            <ChipButton
-              active={!wrap}
-              label={wrapChipLabel}
-              ariaLabel={wrapChipLabel}
-              title={wrapChipTitle}
-              onClick={() => setWrap((value) => !value)}
-            />
-          ) : null}
-          {expandable && (totalLines > previewLines || heightOverflow) ? (
-            <ChipButton
-              active={expanded}
-              label={expandChipLabel}
-              ariaLabel={expandChipLabel}
-              title={expandChipTitle}
-              onClick={toggleExpanded}
-            />
-          ) : null}
-          {text.length > 0 ? (
-            <ChipButton
-              label={copied ? "copied" : "copy output"}
-              ariaLabel="copy output"
-              title="Copy the full text to the clipboard"
-              onClick={copy}
-            />
-          ) : null}
-        </span>
-      </div>
+      {variant === "default" ? (
+        <div className="transcript-preview-head" ref={headRef}>
+          {label ? <span className="transcript-preview-label">{label}</span> : null}
+          {summary ? <span className="transcript-preview-summary">{summary}</span> : null}
+          <span className="transcript-preview-actions">
+            {wrapAvailable ? (
+              <ChipButton
+                active={!wrap}
+                label={wrapChipLabel}
+                ariaLabel={wrapChipLabel}
+                title={wrapChipTitle}
+                onClick={() => setWrap((value) => !value)}
+              />
+            ) : null}
+            {expandable && (totalLines > previewLines || heightOverflow) ? (
+              <ChipButton
+                active={expanded}
+                label={expandChipLabel}
+                ariaLabel={expandChipLabel}
+                title={expandChipTitle}
+                onClick={toggleExpanded}
+              />
+            ) : null}
+            {text.length > 0 ? (
+              <ChipButton
+                label={copied ? "copied" : "copy output"}
+                ariaLabel="copy output"
+                title="Copy the full text to the clipboard"
+                onClick={copy}
+              />
+            ) : null}
+          </span>
+        </div>
+      ) : null}
       {custom ? (
         <div
           className={`transcript-preview-body is-custom${wrap ? " is-wrap" : " is-nowrap"}${heightClamped ? " is-height-clamped" : ""}`}
@@ -262,6 +271,16 @@ export function BoundedPreview({
           {moreHint ? <>{"\n"}{moreHint}</> : null}
         </pre>
       )}
+      {variant === "block" && !shouldClip && expandable && (totalLines > previewLines || heightOverflow) ? (
+        <button
+          aria-expanded={expanded}
+          className="transcript-preview-more"
+          type="button"
+          onClick={toggleExpanded}
+        >
+          {expandChipLabel}
+        </button>
+      ) : null}
     </div>
   );
 }

@@ -1,5 +1,9 @@
 import type { SessionEvent, SessionTool } from "./api";
 
+const UNIFIED_DIFF_HEAD = /^\s*(?:diff --git |--- [ab]?\/|\*\*\* )/m;
+
+export type ToolPresentation = "inline" | "block" | "diff";
+
 export type TraceRow =
   | { kind: "tool"; event: SessionEvent; eventIndex: number; withResult: boolean }
   | { kind: "thinking"; event: SessionEvent; eventIndex: number };
@@ -15,6 +19,55 @@ export function toolSummaryParts(tool: SessionTool): { verb: string; target: str
   return { verb: summary.slice(0, splitAt), target: summary.slice(splitAt).trim() };
 }
 
+function toolName(tool: SessionTool): string {
+  return tool.name.trim().toLowerCase();
+}
+
+export function isBashTool(tool: SessionTool): boolean {
+  return toolName(tool) === "bash" || tool.archetype === "bash" || tool.archetype === "terminal";
+}
+
+export function isReadOrSearchTool(tool: SessionTool): boolean {
+  return tool.archetype === "read"
+    || tool.archetype === "search"
+    || ["read", "notebookread", "grep", "glob"].includes(toolName(tool));
+}
+
+function isEditTool(tool: SessionTool): boolean {
+  return tool.archetype === "edit"
+    || ["edit", "multiedit", "notebookedit", "apply_patch"].includes(toolName(tool));
+}
+
+function isRichWriteOrTaskTool(tool: SessionTool): boolean {
+  return ["write", "writefile", "task", "agent"].includes(toolName(tool))
+    || tool.archetype === "agent";
+}
+
+export function looksLikeUnifiedDiff(text: string | null | undefined): boolean {
+  return Boolean(text && UNIFIED_DIFF_HEAD.test(text));
+}
+
+// Tiering follows the tool kind. A long Read result is still an inline Read;
+// a Bash result is still a block even when it has one short line.
+export function toolPresentation(tool: SessionTool, displayOutput = ""): ToolPresentation {
+  if ((isEditTool(tool) || tool.archetype === "diff") && looksLikeUnifiedDiff(displayOutput)) return "diff";
+  if (isBashTool(tool) || isRichWriteOrTaskTool(tool)) return "block";
+  return "inline";
+}
+
+export function toolInlineResult(tool: SessionTool, displayOutput: string): string | null {
+  const value = displayOutput.replace(/\s+/g, " ").trim();
+  if (!value) return null;
+  const count = displayOutput.split("\n").filter((line) => line.trim()).length;
+  if (isReadOrSearchTool(tool)) {
+    const noun = tool.archetype === "read" || ["read", "notebookread"].includes(toolName(tool))
+      ? count === 1 ? "line" : "lines"
+      : count === 1 ? "match" : "matches";
+    return `(${count} ${noun})`;
+  }
+  return value.length > 120 ? `${value.slice(0, 117)}...` : value;
+}
+
 export function toolStatus(tool: SessionTool): "working" | "done" | "failed" | "completed" {
   if (tool.output === null && tool.ok === null) return "working";
   if (tool.ok === false) return "failed";
@@ -25,7 +78,7 @@ export function toolStatus(tool: SessionTool): "working" | "done" | "failed" | "
 export function outputLabelForTool(tool: SessionTool): string {
   if (tool.ok === false) return "error output";
   if (tool.archetype === "read") return "file contents";
-  if (tool.archetype === "edit") return "acknowledgement";
+  if (tool.archetype === "edit") return "diff";
   if (/\bdiff\b/i.test(tool.name) || /\bdiff\b/i.test(tool.summary)) {
     return "diff";
   }

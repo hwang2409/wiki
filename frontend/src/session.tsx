@@ -76,6 +76,7 @@ import type {
 import { renderAnsi } from "./ansi";
 import { ArtifactBlock } from "./artifact-block";
 import { useArtifactInspector } from "./artifact-inspector";
+import { DiffPatchView } from "./diff-view";
 import {
   filterCommands,
   initialValues,
@@ -103,7 +104,10 @@ import { Timestamp } from "./timestamp";
 import { StatusBadge } from "./status-badge";
 import { BoundedPreview } from "./transcript-preview";
 import {
-  outputLabelForTool,
+  isBashTool,
+  isReadOrSearchTool,
+  toolInlineResult,
+  toolPresentation,
   toolStatus,
   toolSummaryLine,
   toolSummaryParts,
@@ -112,10 +116,11 @@ import {
   type TraceRow,
 } from "./transcript-event-utils";
 import {
-  cleanHarnessOutput,
   HarnessOutput,
-  hasHarnessError,
+  parseHarnessOutput,
+  segmentsForDisplayText,
 } from "./transcript-output";
+import type { HarnessOutputSegment } from "./transcript-output";
 import { CodexStreamHighlights } from "./codex-stream-renderers";
 import { markerRule } from "./hook-message-registry";
 import type { MarkerSeverity } from "./hook-message-registry";
@@ -1140,101 +1145,116 @@ const ARCHETYPE_ICONS: Record<string, LucideIcon> = {
   tool: Wrench,
 };
 
-// Multiline inputs (and Bash commands, whose summary is a description) render
-// as a body block. Single-line inputs are already carried by the row itself:
-// either the summary contains them, or they render as an inline dim detail
-// (OpenCode-style full argument after the tool name). Raw input evidence
-// therefore always stays reachable without a click (WIKI-238 contract).
-function toolInputIsBlock(tool: SessionTool): boolean {
-  if (!tool.input) return false;
-  if (tool.name === "Bash") return true;
-  return tool.input.split("\n")[0].length < tool.input.length;
-}
-
 function toolInlineDetail(tool: SessionTool): string | null {
-  if (!tool.input || toolInputIsBlock(tool)) return null;
+  if (!tool.input || toolPresentation(tool) !== "inline") return null;
   const input = tool.input.trim();
   if (!input || toolSummaryLine(tool).includes(input)) return null;
   return input;
 }
 
-// Purpose labels shared with PR #177 (WIKI-241): name each payload by what it
-// is, not by transport. Reads expose contents; edits acknowledge a change;
-// rich command output is a log.
-function inputLabelForTool(tool: SessionTool): string {
-  return tool.name === "Bash" ? "command input" : "tool input";
+function renderOutputSegments(
+  segments: HarnessOutputSegment[],
+  text: string,
+  withGitHubPreviews = false,
+) {
+  const visible = segmentsForDisplayText(segments, text);
+  if (!withGitHubPreviews) return <HarnessOutput segments={visible} ansi />;
+  return visible.map((segment, index) => (
+    <span key={`${segment.kind}:${index}`}>
+      {index > 0 ? "\n" : null}
+      <span className={`session-output-segment is-${segment.kind}`}>
+        {renderAnsiWithGitHubPreviews(segment.text)}
+      </span>
+    </span>
+  ));
 }
 
-function toolOutputIsBlock(tool: SessionTool, displayOutput: string): boolean {
-  return Boolean(displayOutput) && (
-    tool.name === "Bash" ||
-    tool.archetype === "bash" ||
-    tool.archetype === "terminal" ||
-    tool.archetype === "diff" ||
-    displayOutput.includes("\n") ||
-    displayOutput.length > 120
-  );
+function toolBlockTitle(tool: SessionTool): string {
+  const summary = toolSummaryLine(tool).trim();
+  if (isBashTool(tool)) return `$ ${tool.input.split("\n")[0] || summary}`;
+  return `← ${summary}`;
 }
 
-function ToolInputBody({ tool }: { tool: SessionTool }) {
-  if (!toolInputIsBlock(tool)) return null;
+function ToolOutputBody({
+  displayOutput,
+  rawOutput,
+  segments,
+  tool,
+}: {
+  displayOutput: string;
+  rawOutput: string;
+  segments: HarnessOutputSegment[];
+  tool: SessionTool;
+}) {
+  const presentation = toolPresentation(tool, displayOutput);
+  if (presentation === "inline" || (!displayOutput && !isBashTool(tool))) return null;
+  if (presentation === "diff") {
+    return (
+      <div className="session-tool-body session-tool-diff-body">
+        <div className="session-tool-block-title">{toolBlockTitle(tool)}</div>
+        <DiffPatchView source={displayOutput} />
+      </div>
+    );
+  }
+  const bash = isBashTool(tool);
+  const hasGitHubPreview = containsGitHubPreviewUrl(displayOutput);
+  const outputTone = tool.ok === false || segments.some((segment) => segment.kind === "error")
+    ? "error"
+    : "normal";
   return (
-    <div className="session-tool-body">
-      {tool.name === "Bash" ? (
-        <BoundedPreview
-          label={inputLabelForTool(tool)}
-          text={tool.input}
-          renderBody={({ text }) => (
-            <ShikiCode className="session-tool-input" code={text} lang="bash" transparent />
-          )}
-        />
-      ) : (
-        <BoundedPreview label={inputLabelForTool(tool)} text={tool.input} />
-      )}
+    <div className="session-tool-body session-tool-block-body">
+      <div className="session-tool-block-title">{toolBlockTitle(tool)}</div>
+      {bash && tool.input.includes("\n") ? (
+        <ShikiCode className="session-tool-input" code={tool.input} lang="bash" transparent />
+      ) : null}
+      <BoundedPreview
+        ansi
+        className="session-tool-block-preview"
+        previewLines={bash ? 10 : 3}
+        rawText={rawOutput}
+        showSummary={false}
+        text={displayOutput}
+        tone={outputTone}
+        variant="block"
+        renderBody={({ text }) => (
+          <span className="session-tool-output-text">
+            {renderOutputSegments(segments, text, hasGitHubPreview)}
+          </span>
+        )}
+      />
     </div>
   );
 }
 
-function ToolOutputBody({ tool }: { tool: SessionTool }) {
-  if (!tool.output) return null;
-  const rawOutput = tool.output;
-  const displayOutput = cleanHarnessOutput(rawOutput);
-  if (!toolOutputIsBlock(tool, displayOutput)) return null;
-  const harnessOutput = displayOutput !== rawOutput;
-  const hasGitHubPreview = !harnessOutput && containsGitHubPreviewUrl(displayOutput);
-  const outputTone = tool.ok === false || hasHarnessError(rawOutput) ? "error" : "normal";
+function RawOutputDisclosure({ rawText }: { rawText: string }) {
+  const [open, setOpen] = useState(false);
+  const id = useId();
   return (
-    <div className="session-tool-body">
-      {hasGitHubPreview ? (
-        <BoundedPreview
-          ansi
-          label={outputLabelForTool(tool)}
-          rawText={rawOutput}
-          text={displayOutput}
-          tone={outputTone}
-          renderBody={({ text }) => (
-            <div className="session-tool-output-blocks">
-              <span className="session-tool-output-text">
-                {renderAnsiWithGitHubPreviews(text)}
-              </span>
-            </div>
-          )}
-        />
-      ) : (
-        <BoundedPreview
-          ansi
-          label={outputLabelForTool(tool)}
-          rawText={rawOutput}
-          text={displayOutput}
-          tone={outputTone}
-          renderBody={harnessOutput ? ({ text }) => (
-            <span className="session-tool-output-text">
-              <HarnessOutput text={text} ansi />
-            </span>
-          ) : undefined}
-        />
-      )}
-    </div>
+    <>
+      <button
+        aria-controls={id}
+        aria-expanded={open}
+        aria-label={open ? "hide raw output" : "show raw output"}
+        className="session-tool-raw-toggle"
+        type="button"
+        onClick={(event) => {
+          event.stopPropagation();
+          setOpen((value) => !value);
+        }}
+      >
+        {open ? "hide raw" : "raw"}
+      </button>
+      {open ? (
+        <div className="session-tool-raw" id={id}>
+          <BoundedPreview
+            rawText={rawText}
+            showSummary={false}
+            text={rawText}
+            variant="block"
+          />
+        </div>
+      ) : null}
+    </>
   );
 }
 
@@ -1411,7 +1431,7 @@ function ThinkingRow({ event }: { event: SessionEvent }) {
   );
 }
 
-function ToolCallRow({
+export function ToolCallRow({
   connector,
   event,
   nested = false,
@@ -1432,12 +1452,17 @@ function ToolCallRow({
   const running = status === "working";
   const detail = toolInlineDetail(tool);
   const { verb, target } = toolSummaryParts(tool);
-  const displayOutput = tool.output ? cleanHarnessOutput(tool.output) : "";
-  const outputBlock = toolOutputIsBlock(tool, displayOutput);
+  const rawOutput = tool.output ?? "";
+  const outputSegments = rawOutput ? parseHarnessOutput(rawOutput) : [];
+  const displayOutput = outputSegments.map((segment) => segment.text).join("\n");
+  const presentation = toolPresentation(tool, displayOutput);
+  const outputBlock = presentation !== "inline";
   const [errorExpanded, setErrorExpanded] = useState(false);
   const showOutputBlock = outputBlock && (tool.ok !== false || errorExpanded);
-  const inlineOutput = displayOutput && !outputBlock && (tool.ok !== false || errorExpanded)
-    ? displayOutput
+  const inlineOutput = presentation === "inline" && (tool.ok !== false || errorExpanded)
+    ? tool.ok === false && errorExpanded
+      ? displayOutput
+      : toolInlineResult(tool, displayOutput)
     : null;
   return (
     <div
@@ -1446,7 +1471,11 @@ function ToolCallRow({
     >
       <div className="session-tool-head">
         <span aria-hidden="true" className="session-trace-connector">{connector}</span>
-        <Icon className="session-tool-icon" size={12} />
+        {isBashTool(tool) ? (
+          <span aria-hidden="true" className="session-tool-icon session-tool-icon-text">$</span>
+        ) : (
+          <Icon className="session-tool-icon" size={12} />
+        )}
         <span className="session-tool-summary" title={toolSummaryLine(tool)}>
           <span className="session-tool-verb">{verb}</span>
           {target ? <><span aria-hidden="true">{" "}</span><span className="session-tool-target">{target}</span></> : null}
@@ -1460,10 +1489,13 @@ function ToolCallRow({
         </span>
         {tool.ok === null && !running ? <span className="session-activity-row-meta">unknown</span> : null}
         {inlineOutput ? (
-          <span className="session-tool-inline-result" title={tool.output ?? undefined}>
-            <HarnessOutput text={inlineOutput} ansi />
+          <span className="session-tool-inline-result">
+            {isReadOrSearchTool(tool)
+              ? inlineOutput
+              : renderOutputSegments(outputSegments, displayOutput)}
           </span>
         ) : null}
+        {presentation === "inline" && rawOutput ? <RawOutputDisclosure rawText={rawOutput} /> : null}
         {tool.ok === false && tool.output ? (
           <button
             className="session-tool-error-toggle"
@@ -1495,8 +1527,21 @@ function ToolCallRow({
         ) : null}
       </div>
       <div className="session-trace-indent">
-        <ToolInputBody tool={tool} />
-        {withResult && showOutputBlock ? <ToolOutputBody tool={tool} /> : null}
+        {withResult && showOutputBlock ? (
+          <ToolOutputBody
+            displayOutput={displayOutput}
+            rawOutput={rawOutput}
+            segments={outputSegments}
+            tool={tool}
+          />
+        ) : isBashTool(tool) && running ? (
+          <ToolOutputBody
+            displayOutput={displayOutput}
+            rawOutput={rawOutput}
+            segments={outputSegments}
+            tool={tool}
+          />
+        ) : null}
         {!nested && tool.agent_id ? (
           <SubagentTrace active={running} agentId={tool.agent_id} onInspect={onInspect} ticket={ticket} />
         ) : null}
@@ -1718,30 +1763,37 @@ const sessionMarkdownComponents = {
 
 function BashBlock({ event }: { event: SessionEvent }) {
   const bash = event.bash ?? { input: "", stdout: "", stderr: "" };
+  const segments: HarnessOutputSegment[] = [
+    ...(bash.stdout ? [{ kind: "text" as const, text: bash.stdout }] : []),
+    ...(bash.stderr ? [{ kind: "error" as const, text: bash.stderr }] : []),
+  ];
+  const output = segments.map((segment) => segment.text).join("\n");
   return (
-    <div className="session-bash">
+    <div className="session-bash session-tool-body session-tool-block-body">
+      <div className="session-tool-block-title">$ {bash.input.split("\n")[0] || "bash"}</div>
       {bash.input ? (
-        <BoundedPreview
-          label="command input"
-          text={bash.input}
-          renderBody={({ text }) => (
-            <div className="session-bash-command">
-              <span className="session-bash-prompt">❯</span>
-              <ShikiCode
-                className="session-bash-command-code"
-                code={text}
-                lang="bash"
-                transparent
-              />
-            </div>
-          )}
+        <ShikiCode
+          className="session-tool-input session-bash-command-code"
+          code={bash.input}
+          lang="bash"
+          transparent
         />
       ) : null}
-      {bash.stdout ? (
-        <BoundedPreview ansi label="command output" text={bash.stdout} />
-      ) : null}
-      {bash.stderr ? (
-        <BoundedPreview ansi label="command error" tone="error" text={bash.stderr} />
+      {output ? (
+        <BoundedPreview
+          ansi
+          className="session-tool-block-preview"
+          previewLines={10}
+          showSummary={false}
+          text={output}
+          tone={bash.stderr ? "error" : "normal"}
+          variant="block"
+          renderBody={({ text }) => (
+            <span className="session-tool-output-text">
+              {renderOutputSegments(segments, text)}
+            </span>
+          )}
+        />
       ) : null}
     </div>
   );

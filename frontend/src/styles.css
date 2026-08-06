@@ -7350,6 +7350,15 @@ body.is-resizing-panes .pane-cell {
 
 .session-tool {
   min-width: 0;
+  color: var(--activity-state-done-color);
+}
+
+.session-tool.is-working {
+  color: var(--activity-state-working-color);
+}
+
+.session-tool.is-failed {
+  color: var(--activity-state-failed-color);
 }
 
 .session-activity-row {
@@ -7363,7 +7372,7 @@ body.is-resizing-panes .pane-cell {
   width: 100%;
   min-height: 20px;
   min-width: 0;
-  color: var(--text-muted);
+  color: inherit;
   font-family: var(--font-monospace);
   font-weight: var(--font-monospace-weight);
   font-size: var(--font-ui-smaller);
@@ -7392,7 +7401,7 @@ body.is-resizing-panes .pane-cell {
   flex-shrink: 0;
   width: 2ch;
   height: 1em;
-  color: var(--text-muted);
+  color: inherit;
 }
 
 .session-tool-summary {
@@ -7402,21 +7411,21 @@ body.is-resizing-panes .pane-cell {
   flex-shrink: 0;
   max-width: min(60ch, 70%);
   overflow: hidden;
-  color: var(--activity-metadata-color);
+  color: inherit;
   text-overflow: ellipsis;
   white-space: nowrap;
 }
 
 .session-tool-verb {
   flex-shrink: 0;
-  color: var(--text-normal);
+  color: inherit;
   font-weight: var(--fw-semibold);
 }
 
 .session-tool-target {
   min-width: 0;
   overflow: hidden;
-  color: var(--activity-metadata-color);
+  color: inherit;
   text-overflow: ellipsis;
 }
 
@@ -7426,14 +7435,15 @@ body.is-resizing-panes .pane-cell {
   flex: 1 1 auto;
   min-width: 0;
   overflow: hidden;
-  color: var(--text-faint);
+  color: inherit;
+  opacity: 0.78;
   text-overflow: ellipsis;
   white-space: nowrap;
 }
 
 .session-tool-err {
   flex-shrink: 0;
-  color: var(--activity-state-failed-color);
+  color: inherit;
   font-size: var(--fs-xs);
   font-weight: var(--fw-semibold);
   letter-spacing: 0.02em;
@@ -7442,7 +7452,7 @@ body.is-resizing-panes .pane-cell {
 
 .session-tool-status {
   flex-shrink: 0;
-  color: var(--activity-state-done-color);
+  color: inherit;
   font-size: var(--fs-xs);
   font-weight: var(--fw-semibold);
   letter-spacing: 0.04em;
@@ -7450,21 +7460,21 @@ body.is-resizing-panes .pane-cell {
 }
 
 .session-tool-status.is-working {
-  color: var(--activity-state-working-color);
+  color: inherit;
 }
 
 .session-tool-status.is-failed {
-  color: var(--activity-state-failed-color);
+  color: inherit;
 }
 
 .session-tool-status.is-completed {
-  color: var(--activity-state-done-color);
+  color: inherit;
 }
 
 .session-tool-inline-result {
   min-width: 0;
   overflow: hidden;
-  color: var(--activity-metadata-color);
+  color: inherit;
   text-overflow: ellipsis;
   white-space: nowrap;
 }
@@ -7490,14 +7500,55 @@ body.is-resizing-panes .pane-cell {
   display: flex;
   flex-direction: column;
   gap: 4px;
-  margin: 4px 0 6px;
-  padding: 4px 8px;
+  margin: 3px 0 5px;
+  padding: 2px 0 2px 8px;
   border-left: 1px solid var(--background-modifier-border);
   background-color: var(--background-primary-alt);
 }
 
 .session-tool-body:has(.transcript-preview.is-error) {
   border-left-color: var(--activity-state-failed-color);
+}
+
+.session-tool-block-title {
+  min-width: 0;
+  overflow: hidden;
+  color: inherit;
+  font-family: var(--font-monospace);
+  font-size: var(--font-ui-smaller);
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.session-tool-block-preview {
+  margin-top: 2px;
+}
+
+.session-tool-raw {
+  flex: 1 0 100%;
+  min-width: 100%;
+  padding-left: calc(2ch + 6px);
+}
+
+.session-tool-raw-toggle {
+  flex: 0 0 auto;
+  opacity: 0;
+  color: inherit;
+  font-family: var(--font-monospace);
+  font-size: var(--fs-xs);
+  cursor: pointer;
+  transition: opacity 120ms ease;
+}
+
+.session-tool-head:hover .session-tool-raw-toggle,
+.session-tool-head:focus-within .session-tool-raw-toggle,
+.session-tool-raw-toggle:focus-visible {
+  opacity: 1;
+}
+
+.session-tool-raw-toggle:hover,
+.session-tool-raw-toggle:focus-visible {
+  text-decoration: underline;
 }
 
 .session-activity-row-meta {
@@ -7585,6 +7636,14 @@ body.is-resizing-panes .pane-cell {
   color: var(--activity-metadata-color);
   white-space: pre-wrap;
   overflow-wrap: anywhere;
+}
+
+.session-tool-block-body .session-tool-input,
+.session-tool-block-body .session-tool-input pre {
+  padding: 2px 0;
+  border: 0;
+  border-radius: 0;
+  background: transparent;
 }
 
 .session-tool-output-blocks {
@@ -7818,12 +7877,7 @@ body.is-resizing-panes .pane-cell {
 .session-bash {
   display: flex;
   flex-direction: column;
-  gap: 6px;
-  padding: 10px 12px;
-  border: 1px solid var(--background-modifier-border);
-  border-radius: var(--radius-lg);
-  background-color: var(--background-secondary);
-  color: var(--text-muted);
+  gap: 2px;
   font-family: var(--font-monospace);
   font-weight: var(--font-monospace-weight);
   font-size: var(--font-ui-smaller);
@@ -11952,6 +12006,20 @@ textarea.composer-command-input {
   overflow-x: auto;
 }
 
+/* Tier-2 tool blocks use one title and one left-border surface. They have no
+   byte summary, copy chip, or persistent control row. */
+.transcript-preview.is-block {
+  gap: 2px;
+}
+
+.transcript-preview.is-block .transcript-preview-body {
+  padding: 2px 0;
+  border: 0;
+  border-radius: 0;
+  background: transparent;
+  color: inherit;
+}
+
 /* Short outputs are evidence, not cards. Keep the full action set in the
    tab order, but let hover and focus reveal it when the reader needs it. */
 .transcript-preview.is-compact .transcript-preview-head {
@@ -12024,9 +12092,22 @@ textarea.composer-command-input {
 }
 
 .transcript-preview-more {
+  width: fit-content;
+  padding: 0;
+  border: 0;
+  background: transparent;
+  font: inherit;
+  font-size: var(--fs-xs);
   display: block;
   color: var(--text-faint);
   font-style: italic;
+  cursor: pointer;
+}
+
+.transcript-preview-more:hover,
+.transcript-preview-more:focus-visible {
+  color: var(--text-muted);
+  text-decoration: underline;
 }
 
 .transcript-preview-body.is-custom {
@@ -12066,11 +12147,9 @@ textarea.composer-command-input {
 }
 
 .session-activity .transcript-preview-label,
-.session-activity .transcript-preview.is-error .transcript-preview-label,
 .session-activity .transcript-preview-summary,
-.session-activity .transcript-preview-body,
-.session-activity .transcript-preview.is-error .transcript-preview-body {
-  color: var(--activity-metadata-color);
+.session-activity .transcript-preview-body {
+  color: inherit;
 }
 
 /* WIKI-222: shared stream-output clamp (stream-clamp.tsx) */

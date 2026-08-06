@@ -16,6 +16,7 @@ import {
   HarnessOutput,
   parseHarnessOutput,
 } from "../src/transcript-output";
+import { ToolCallRow } from "../src/session";
 
 class NoopObserver {
   observe() {}
@@ -93,7 +94,7 @@ test("harness wrappers become semantic segments and known boilerplate is removed
 test("tool units expose verb, target, status, and semantic output labels", () => {
   expect(toolSummaryParts(tool())).toEqual({ verb: "edit", target: "hot.md" });
   expect(toolStatus(tool({ output: null, ok: null }))).toBe("working");
-  expect(outputLabelForTool(tool())).toBe("acknowledgement");
+  expect(outputLabelForTool(tool())).toBe("diff");
   expect(outputLabelForTool(tool({ archetype: "read" }))).toBe("file contents");
   expect(outputLabelForTool(tool({ archetype: "git", name: "Diff" }))).toBe("diff");
   expect(outputLabelForTool(tool({ ok: false }))).toBe("error output");
@@ -115,4 +116,87 @@ test("parallel completion timeline still produces one row per tool event", () =>
   expect(rows).toHaveLength(2);
   expect(rows.every((row) => row.kind === "tool")).toBe(true);
   expect(rows.map((row) => row.event.id)).toEqual([1, 2]);
+});
+
+function renderTool(toolOverrides: Partial<SessionTool> = {}) {
+  return render(
+    <ToolCallRow
+      connector="└"
+      event={event(7, { tool: tool(toolOverrides) })}
+      ticket="WIKI-245"
+      withResult
+    />,
+  );
+}
+
+test("real inline rows keep raw output keyboard reachable", () => {
+  const { container, getByRole } = renderTool({
+    name: "Status",
+    archetype: "status",
+    summary: "status",
+    output: "<tool_use_error>failed status</tool_use_error>\n<system-reminder>quiet note</system-reminder>",
+  });
+  const row = container.querySelector(".session-tool");
+  expect(row?.classList.contains("is-inline")).toBe(true);
+  expect(row?.querySelector(".session-output-segment.is-error")?.textContent).toBe("failed status");
+  expect(row?.querySelector(".session-output-segment.is-note")?.textContent).toBe("quiet note");
+  const raw = getByRole("button", { name: "show raw output" });
+  raw.focus();
+  expect(document.activeElement).toBe(raw);
+  expect(raw.getAttribute("aria-expanded")).toBe("false");
+  fireEvent.click(raw);
+  expect(raw.getAttribute("aria-expanded")).toBe("true");
+  expect(container.querySelector(".session-tool-raw")?.textContent).toContain("<tool_use_error>");
+});
+
+test("tier is chosen by tool kind, not multiline output shape", () => {
+  const read = renderTool({
+    name: "Read",
+    archetype: "read",
+    summary: "read hot.md",
+    output: "one\ntwo\nthree\nfour",
+  });
+  expect(read.container.querySelector(".session-tool")?.classList.contains("is-inline")).toBe(true);
+  expect(read.container.querySelector(".session-tool-inline-result")?.textContent).toBe("(4 lines)");
+  expect(read.container.querySelector(".session-tool-body")).toBeNull();
+  cleanup();
+
+  const bash = renderTool({
+    name: "Bash",
+    archetype: "bash",
+    summary: "bash echo ok",
+    input: "echo ok",
+    output: "ok",
+  });
+  expect(bash.container.querySelector(".session-tool")?.classList.contains("is-block")).toBe(true);
+  expect(bash.container.querySelector(".session-tool-block-title")?.textContent).toContain("$ echo ok");
+  expect(bash.container.querySelector(".transcript-preview-summary")).toBeNull();
+  expect(bash.container.querySelector(".transcript-chip")).toBeNull();
+  cleanup();
+
+  const write = renderTool({
+    name: "Write",
+    archetype: "edit",
+    summary: "write hot.md",
+    output: "one\ntwo\nthree\nfour",
+  });
+  expect(write.container.querySelector(".session-tool")?.classList.contains("is-block")).toBe(true);
+  const expand = write.getByRole("button", { name: /more line/ });
+  expect(expand).toBeTruthy();
+  expect(expand.getAttribute("aria-expanded")).toBe("false");
+  expect(write.container.querySelector(".session-tool-output-text")?.textContent).toContain("three");
+  expect(write.container.querySelector(".session-tool-output-text")?.textContent).not.toContain("four");
+});
+
+test("edit rows render an actual stored unified diff", () => {
+  const { container } = renderTool({
+    name: "Edit",
+    archetype: "edit",
+    summary: "edit hot.md",
+    output: "--- a/hot.md\n+++ b/hot.md\n@@ -1 +1 @@\n-old\n+new",
+  });
+  expect(container.querySelector(".session-tool-diff-body")).toBeTruthy();
+  expect(container.querySelector(".diff-view")).toBeTruthy();
+  expect(container.querySelector(".diff-line.is-remove")?.textContent).toContain("old");
+  expect(container.querySelector(".diff-line.is-add")?.textContent).toContain("new");
 });
