@@ -65,8 +65,21 @@ function firstChangedRef<T>(previous: T[], next: T[]): number {
   return index;
 }
 
+// WIKI-259: events that render no visible content must not become virtual
+// rows. An invisible row still reserved its estimated/minimum height plus the
+// inter-row gap, which painted as a random blank band between adjacent rows.
+// Mirrors the render layer: traceRows drops text-less thinking events and
+// payload-less tool events; an empty assistant body renders an empty div.
+export function eventRendersRow(event: SessionEvent): boolean {
+  if (event.kind === "thinking") return Boolean(event.text);
+  if (event.kind === "tool") return Boolean(event.tool);
+  if (event.kind === "assistant") return event.text.trim().length > 0;
+  return true;
+}
+
 function appendRows(rows: EventRow[], events: SessionEvent[], offset: number, start: number): void {
   for (let index = start; index < events.length; index += 1) {
+    if (!eventRendersRow(events[index])) continue;
     rows.push({ event: events[index], key: offset + index });
   }
 }
@@ -115,13 +128,11 @@ export function eventRowsIncremental(
   }
 
   const changedRow = firstAffectedRow(previous.rows, offset, changedEvent);
-  let rebuildEvent = changedEvent;
-  if (changedRow < previous.rows.length) {
-    rebuildEvent = previous.rows[changedRow].key - offset;
-  }
-
+  // Rebuild from the changed EVENT, not from the next kept row's key: a
+  // hidden event (no virtual row yet) can become visible when its ref
+  // changes, e.g. a thinking block whose text just streamed in.
   const rows = previous.rows.slice(0, changedRow);
-  appendRows(rows, events, offset, rebuildEvent);
+  appendRows(rows, events, offset, changedEvent);
   return {
     cache: { events, rows, offset },
     changedFrom: changedRow,
