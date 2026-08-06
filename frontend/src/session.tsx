@@ -1225,16 +1225,18 @@ function ToolOutputBody({
       <BoundedPreview
         ansi
         className="session-tool-block-preview"
-        previewLines={bash ? 10 : 3}
+        previewLines={bash ? 10 : hasGitHubPreview ? 100 : 3}
         rawText={rawOutput}
         showSummary={false}
         text={displayOutput}
         tone={outputTone}
         variant="block"
         renderBody={({ text }) => (
-          <span className="session-tool-output-text">
-            {renderOutputSegments(segments, text, hasGitHubPreview)}
-          </span>
+          <div className="session-tool-output-blocks">
+            <span className="session-tool-output-text">
+              {renderOutputSegments(segments, text, hasGitHubPreview)}
+            </span>
+          </div>
         )}
       />
     </div>
@@ -1479,7 +1481,9 @@ export function ToolCallRow({
         {tool.ok === null && !running ? <span className="session-activity-row-meta">unknown</span> : null}
         {inlineOutput ? (
           <span className="session-tool-inline-result">
-            {isReadOrSearchTool(tool)
+            {nested
+              ? renderAnsi(displayOutput)
+              : isReadOrSearchTool(tool)
               ? renderAnsi(inlineOutput)
               : (
                 <HarnessOutput

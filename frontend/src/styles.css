@@ -7306,12 +7306,12 @@ body.is-resizing-panes .pane-cell {
   display: inline-flex;
   align-items: baseline;
   gap: 8px;
-  margin-top: 6px;
-  padding: 7px 10px;
-  border: 1px solid var(--background-modifier-border);
-  background-color: var(--background-primary-alt);
+  margin-top: 4px;
+  padding: 0;
+  color: var(--activity-metadata-color);
   font-family: var(--font-monospace);
   font-weight: var(--font-monospace-weight);
+  font-size: var(--fs-xs);
 }
 
 .session-collapsible {
@@ -11752,6 +11752,7 @@ textarea.composer-command-input {
   border: 1px solid var(--background-modifier-border);
   border-radius: var(--radius-m);
   background-color: var(--code-background);
+  --diff-font-family: var(--font-monospace);
   font-family: var(--font-monospace);
   font-weight: var(--font-monospace-weight);
   font-size: var(--font-ui-smaller);

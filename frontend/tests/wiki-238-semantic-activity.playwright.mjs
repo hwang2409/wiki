@@ -447,7 +447,7 @@ async function main() {
     }));
     assert(normalDensity.scrollWidth <= normalDensity.clientWidth,
       `expanded normal group overflows: ${normalDensity.scrollWidth} > ${normalDensity.clientWidth}`);
-    assert(normalDensity.rows === 16, `expected 16 per-event timeline rows after interrupted fixtures, got ${normalDensity.rows}`);
+    assert(normalDensity.rows === 14, `expected 14 per-event timeline rows in the base fixture, got ${normalDensity.rows}`);
     await page.locator(".session-scroll").screenshot({ path: SCREENSHOTS.expandedNormal });
 
     await page.setViewportSize({ width: 910, height: 1400 });

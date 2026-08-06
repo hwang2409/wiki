@@ -2,6 +2,7 @@ import type { SessionEvent, SessionTool } from "./api";
 import { editDiffFromInput, editDiffIsTruncated } from "./transcript-output";
 
 const UNIFIED_DIFF_HEAD = /^\s*(?:diff --git |--- [ab]?\/|\*\*\* )/m;
+const GITHUB_PREVIEW_URL = /https:\/\/(?:www\.)?github\.com\/[A-Za-z0-9_.-]+\/[A-Za-z0-9_.-]+\/(?:pull\/\d+|issues\/\d+|commit\/[0-9a-fA-F]{7,40})\/?/;
 
 export type ToolPresentation = "inline" | "block" | "diff";
 
@@ -40,7 +41,7 @@ function isEditTool(tool: SessionTool): boolean {
 }
 
 function isRichWriteOrTaskTool(tool: SessionTool): boolean {
-  return ["write", "writefile", "task", "agent"].includes(toolName(tool))
+  return ["monitor", "write", "writefile", "task", "agent"].includes(toolName(tool))
     || tool.archetype === "agent";
 }
 
@@ -67,6 +68,7 @@ export function toolDiffIsTruncated(tool: SessionTool): boolean {
 // a Bash result is still a block even when it has one short line.
 export function toolPresentation(tool: SessionTool, displayOutput = ""): ToolPresentation {
   if (toolDiffSource(tool, displayOutput) || toolDiffIsTruncated(tool)) return "diff";
+  if (GITHUB_PREVIEW_URL.test(displayOutput)) return "block";
   if (isBashTool(tool) || isRichWriteOrTaskTool(tool)) return "block";
   return "inline";
 }
