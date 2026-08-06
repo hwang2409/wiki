@@ -3353,26 +3353,31 @@ body.is-resizing-panes .pane-cell {
 }
 
 .markdown-preview-view pre {
-  overflow-x: auto;
   margin: 0 0 1em;
   padding: 12px 16px;
   border: 1px solid var(--background-modifier-border);
   border-radius: var(--radius-m);
   background-color: var(--code-background);
   line-height: 1.5;
+  min-width: 0;
 }
 
+/* WIKI-251: code fences soft-wrap so long lines and URLs stay readable
+   without a horizontal scrollbar. Overflow-wrap: anywhere keeps unbroken
+   tokens (SHAs, paths, URLs) from pushing the pane. */
 .markdown-preview-view pre code {
   padding: 0;
   border-radius: 0;
   background: transparent;
   font-size: 0.875em;
-  white-space: pre;
-  overflow-wrap: normal;
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+  word-break: break-word;
 }
 
 .shiki-block {
   margin: 0 0 1em;
+  min-width: 0;
 }
 
 .shiki-block:last-child {
@@ -3380,13 +3385,13 @@ body.is-resizing-panes .pane-cell {
 }
 
 .shiki-block pre {
-  overflow-x: auto;
   margin: 0;
   padding: 12px 16px;
   border: 1px solid var(--background-modifier-border);
   border-radius: var(--radius-m);
   font-size: 0.875em;
   line-height: 1.5;
+  min-width: 0;
 }
 
 .shiki-block pre code {
@@ -3394,8 +3399,9 @@ body.is-resizing-panes .pane-cell {
   border-radius: 0;
   background: transparent;
   font-size: inherit;
-  white-space: pre;
-  overflow-wrap: normal;
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+  word-break: break-word;
 }
 
 .shiki-block.is-transparent {
@@ -3591,17 +3597,21 @@ body.is-resizing-panes .pane-cell {
 
 /* Tables */
 
+/* WIKI-251: tables wrap in place — no horizontal scroll. table-layout: fixed
+   forces column widths to distribute inside the container; overflow-wrap on
+   cells lets long tokens (URLs, paths, SHAs) break instead of pushing. */
 .markdown-table-scroll {
   max-width: 100%;
   margin: 0 0 1em;
-  overflow-x: auto;
   border: 1px solid var(--table-border-color);
   border-radius: var(--radius-s);
+  min-width: 0;
 }
 
 .markdown-preview-view table {
-  width: max-content;
-  min-width: 100%;
+  width: 100%;
+  min-width: 0;
+  table-layout: fixed;
   border-collapse: collapse;
   font-size: 0.9375em;
 }
@@ -3613,20 +3623,13 @@ body.is-resizing-panes .pane-cell {
   border-bottom: 1px solid var(--table-border-color);
   text-align: left;
   vertical-align: top;
+  overflow-wrap: anywhere;
+  word-break: break-word;
 }
 
 .markdown-preview-view th:last-child,
 .markdown-preview-view td:last-child {
   border-right: none;
-}
-
-/* Keep slugs/labels unbroken in the first column, but only while the pane
-   is wide enough that the table never needs to scroll. */
-@container (min-width: 760px) {
-  .markdown-preview-view th:first-child,
-  .markdown-preview-view td:first-child {
-    white-space: nowrap;
-  }
 }
 
 .markdown-preview-view th {
@@ -6339,7 +6342,7 @@ body.is-resizing-panes .pane-cell {
 }
 
 .codex-stream-diff-body {
-  overflow-x: auto;
+  min-width: 0;
   border-top: 1px solid var(--background-modifier-border);
   color: var(--text-muted);
   font-size: var(--fs-2xs);
@@ -6357,9 +6360,11 @@ body.is-resizing-panes .pane-cell {
 
 .codex-stream-diff-line {
   display: flex;
-  min-width: max-content;
+  min-width: 0;
   padding-right: 7px;
-  white-space: pre;
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+  word-break: break-word;
 }
 
 .codex-stream-diff-line.is-add {
@@ -11948,7 +11953,7 @@ textarea.composer-command-input {
 }
 
 .diff-file-body {
-  overflow-x: auto;
+  min-width: 0;
 }
 
 .diff-hunk-header {
@@ -11960,7 +11965,8 @@ textarea.composer-command-input {
   font-family: var(--font-monospace);
   font-size: calc(var(--font-ui-smaller) - 0.5px);
   font-style: italic;
-  white-space: pre;
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
 }
 
 .diff-file-body > .diff-hunk-header:first-child {
@@ -11969,9 +11975,21 @@ textarea.composer-command-input {
 
 .diff-hunk-body {
   display: block;
-  min-width: max-content;
+  min-width: 0;
   padding: 4px 0;
   line-height: 1.55;
+}
+
+/* WIKI-251: side-by-side split — deletions LEFT / insertions RIGHT, aligned
+   row-for-row, blank cell (hatched) on the missing side for pure adds or
+   removes. Grid uses minmax(0, 1fr) so long code wraps inside the cell
+   instead of forcing a horizontal scrollbar. */
+.diff-hunk-body.is-split {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) minmax(0, 1fr);
+  column-gap: 0;
+  row-gap: 0;
+  min-width: 0;
 }
 
 .diff-line {
@@ -11979,7 +11997,10 @@ textarea.composer-command-input {
   align-items: flex-start;
   gap: 0;
   padding: 0;
-  white-space: pre;
+  min-width: 0;
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+  word-break: break-word;
 }
 
 .diff-line.is-add {
@@ -12001,6 +12022,39 @@ textarea.composer-command-input {
   font-style: italic;
 }
 
+.diff-split-cell.is-blank {
+  background-image: repeating-linear-gradient(
+    -45deg,
+    transparent,
+    transparent 6px,
+    var(--diff-hatch-color, color-mix(in srgb, var(--text-faint) 12%, transparent)) 6px,
+    var(--diff-hatch-color, color-mix(in srgb, var(--text-faint) 12%, transparent)) 7px
+  );
+  color: transparent;
+}
+
+.diff-split-cell.is-side-right {
+  border-left: 1px solid var(--background-modifier-border);
+}
+
+.diff-split-cell {
+  min-width: 0;
+}
+
+.diff-split-row {
+  display: contents;
+}
+
+.diff-split-row.is-meta {
+  display: block;
+  grid-column: 1 / -1;
+  padding: 2px 12px;
+  color: var(--text-faint);
+  font-family: var(--font-monospace);
+  font-size: calc(var(--font-ui-smaller) - 0.5px);
+  font-style: italic;
+}
+
 .diff-gutter {
   flex: 0 0 auto;
   min-width: 3ch;
@@ -12010,11 +12064,22 @@ textarea.composer-command-input {
   font-size: calc(var(--font-ui-smaller) - 0.5px);
   text-align: right;
   user-select: none;
+  white-space: nowrap;
+  overflow-wrap: normal;
+  word-break: keep-all;
 }
 
 .diff-gutter-new {
   border-right: 1px solid var(--background-modifier-border);
   margin-right: 6px;
+}
+
+/* Split cells own their own separator — the between-cell border sits on
+   .diff-split-cell.is-side-right — so the unified gutter divider would
+   double it. */
+.diff-split-cell .diff-gutter-new {
+  border-right: 0;
+  margin-right: 0;
 }
 
 .diff-marker {
@@ -12024,6 +12089,7 @@ textarea.composer-command-input {
   color: currentColor;
   opacity: 0.6;
   user-select: none;
+  white-space: nowrap;
 }
 
 .diff-line.is-add .diff-marker,
@@ -12033,8 +12099,11 @@ textarea.composer-command-input {
 
 .diff-code {
   flex: 1 1 auto;
+  min-width: 0;
   padding: 0 10px 0 6px;
-  white-space: pre;
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+  word-break: break-word;
 }
 
 /* WIKI-153 — bounded transcript preview shared by tool + bash blocks */
@@ -12147,7 +12216,20 @@ textarea.composer-command-input {
   font-weight: var(--font-monospace-weight);
   font-size: var(--font-ui-smaller);
   line-height: 1.5;
-  overflow-x: auto;
+  min-width: 0;
+  overflow-wrap: anywhere;
+  word-break: break-word;
+}
+
+/* WIKI-251: whatever renders inside the preview body (raw output, polished
+   code, harness segments) soft-wraps on the inline axis. Preserve the
+   newline-preserving pre-wrap for pre-formatted content. */
+.transcript-preview-body pre,
+.transcript-preview-body code {
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+  word-break: break-word;
+  min-width: 0;
 }
 
 /* Tier-2 tool blocks use one title and one left-border surface. They have no

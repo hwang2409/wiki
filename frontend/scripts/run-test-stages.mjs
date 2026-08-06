@@ -91,6 +91,7 @@ const PLAYWRIGHT_SUITES = [
   "wiki-194-plot-interaction",
   "wiki-234-opencode-restyle",
   "wiki-238-semantic-activity",
+  "wiki-251-diff-wrap",
   "wiki-253-collapse",
 ];
 

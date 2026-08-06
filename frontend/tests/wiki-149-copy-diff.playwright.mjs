@@ -321,7 +321,9 @@ try {
   assert(tones.remove?.background && tones.remove.background !== "rgba(0, 0, 0, 0)", `remove background should be themed, got ${JSON.stringify(tones.remove)}`);
   assert(tones.add.background !== tones.remove.background, `add + remove backgrounds should differ, got ${tones.add.background} vs ${tones.remove.background}`);
   assert(/mono|Consolas|JetBrains|SFMono|Menlo/i.test(tones.body.fontFamily), `diff should be monospace, got ${tones.body.fontFamily}`);
-  assert(tones.body.whiteSpace === "pre", `diff body should render with white-space: pre, got ${tones.body.whiteSpace}`);
+  // WIKI-251: diff bodies soft-wrap so long lines (like the paragraph
+   // edit in vault/hot.md) stay readable without a horizontal scrollbar.
+  assert(tones.body.whiteSpace === "pre-wrap", `diff body should soft-wrap post-WIKI-251, got ${tones.body.whiteSpace}`);
 
   const gutterCount = await diffView.locator(".diff-gutter").count();
   assert(gutterCount === 0, `line numbers should be off by default, got ${gutterCount} gutter cells`);

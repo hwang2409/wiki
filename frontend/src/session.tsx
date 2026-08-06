@@ -1307,7 +1307,7 @@ function ToolOutputBody({
             edit too large to diff — view raw
           </div>
         ) : (
-          <DiffPatchView showLineNumbers source={diffSource ?? displayOutput} />
+          <DiffPatchView showLineNumbers source={diffSource ?? displayOutput} viewType="split" />
         )}
       </div>
     );
@@ -4796,9 +4796,20 @@ export function InspectableSessionTab(props: ComponentProps<typeof SessionTab>) 
 
 const WIDTH_KEY = "wiki-session-sidebar-width";
 const MIN_WIDTH = 320;
+// WIKI-251: default chat pane opens at ~45% of viewport (Henry: "push it to
+// 45-50%"). Floored so it stays usable on small windows, capped so it never
+// crowds the primary pane. Persisted width wins once the user resizes.
+const DEFAULT_WIDTH_RATIO = 0.45;
+const DEFAULT_WIDTH_FLOOR = 560;
+
+function defaultWidth(): number {
+  const viewport = typeof window !== "undefined" ? window.innerWidth : 1440;
+  return clampWidth(Math.max(DEFAULT_WIDTH_FLOOR, Math.round(viewport * DEFAULT_WIDTH_RATIO)));
+}
 
 function clampWidth(width: number): number {
-  return Math.min(Math.max(width, MIN_WIDTH), Math.round(window.innerWidth * 0.7));
+  const viewport = typeof window !== "undefined" ? window.innerWidth : 1440;
+  return Math.min(Math.max(width, MIN_WIDTH), Math.round(viewport * 0.7));
 }
 
 export type SidebarTarget = {
@@ -4825,9 +4836,10 @@ export function SessionSidebar({
   onClose: () => void;
   onOpenAgent: (ticket: string, panel?: "review") => void;
 }) {
-  const [width, setWidth] = useState(() =>
-    clampWidth(Number(localStorage.getItem(WIDTH_KEY)) || 480)
-  );
+  const [width, setWidth] = useState(() => {
+    const stored = Number(localStorage.getItem(WIDTH_KEY));
+    return clampWidth(stored > 0 ? stored : defaultWidth());
+  });
 
   const startResize = (event: React.PointerEvent<HTMLDivElement>) => {
     event.preventDefault();
