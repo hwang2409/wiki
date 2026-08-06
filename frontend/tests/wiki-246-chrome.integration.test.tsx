@@ -197,6 +197,36 @@ describe("WIKI-246 OpenCode chrome states", () => {
     expect(narrowDialogCss).toContain("top: 12px;");
     expect(narrowDialogCss).toContain("max-height: calc(100vh - 24px);");
     expect(narrowDialogCss).toContain("overflow-y: auto;");
+
+    // A later unscoped rule must not win the cascade at narrow widths: the
+    // final .quick-switcher max-height in source order must be the narrow
+    // media override, not the 60vh/overflow-hidden desktop rule.
+    const desktopSwitcher = CHROME_CSS.lastIndexOf(".quick-switcher {\n  max-height: 60vh;");
+    expect(desktopSwitcher).toBeGreaterThanOrEqual(0);
+    const postDesktop = CHROME_CSS.slice(desktopSwitcher);
+    const lateOverride = postDesktop.indexOf("@media (max-width: 640px)");
+    expect(lateOverride).toBeGreaterThan(0);
+    const lateCss = postDesktop.slice(lateOverride);
+    expect(lateCss).toContain(".quick-switcher {");
+    expect(lateCss).toContain("max-height: calc(100vh - 24px);");
+    expect(lateCss).toContain("overflow-y: auto;");
+  });
+
+  test("muted chrome controls have visible hover elevation", () => {
+    // element-on-element or transparent hover backgrounds are invisible.
+    expect(cssDeclarations(".ribbon-action:hover")).toContain("var(--background-modifier-hover)");
+    expect(cssDeclarations(".dialog-button:hover")).toContain("var(--background-modifier-hover)");
+    const tmuxHover = cssDeclarations(".tmux-status-item:hover");
+    expect(tmuxHover).toContain("var(--background-modifier-hover)");
+    expect(tmuxHover).not.toContain("transparent");
+  });
+
+  test("hover rules never promote border color", () => {
+    expect(cssDeclarations(".nav-inline-retry:hover")).not.toMatch(/border-color/);
+    for (const match of CSS_SOURCE.matchAll(/^([^@{}]*:hover[^{]*)\{([^}]*)\}/gm)) {
+      if (match[1].includes(".session-")) continue; // transcript scope (WIKI-245)
+      expect(match[2]).not.toMatch(/(?:^|\n)\s*border-color\s*:\s*var\(--text-/);
+    }
   });
 
   test("converted chrome has no transition sites", () => {

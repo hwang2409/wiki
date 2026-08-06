@@ -122,7 +122,6 @@
   --primary: var(--accent-primary);
   --text: var(--text-normal);
   --selected-list-item-text: var(--text-on-accent);
-  --chrome-motion-duration: 160ms;
 }
 
 * {
@@ -484,7 +483,6 @@ button:disabled {
 
 .nav-inline-retry:hover {
   background-color: var(--background-modifier-hover);
-  border-color: var(--text-faint);
 }
 
 .nav-inline-retry svg {
@@ -1694,7 +1692,7 @@ body.is-resizing-panes .pane-cell {
 }
 
 .settings-row select:hover {
-  border-color: var(--text-muted);
+  background-color: var(--background-modifier-hover);
 }
 
 .settings-row select:focus {
@@ -1775,7 +1773,10 @@ body.is-resizing-panes .pane-cell {
   cursor: pointer;
 }
 
-.font-weight-picker:hover,
+.font-weight-picker:hover {
+  background-color: var(--background-modifier-hover);
+}
+
 .font-weight-picker:focus {
   border-color: var(--text-muted);
   outline: none;
@@ -1796,7 +1797,10 @@ body.is-resizing-panes .pane-cell {
   font-variant-numeric: tabular-nums;
 }
 
-.settings-row .font-weight-input:hover,
+.settings-row .font-weight-input:hover {
+  background-color: var(--background-modifier-hover);
+}
+
 .settings-row .font-weight-input:focus {
   border-color: var(--text-muted);
   outline: none;
@@ -1860,7 +1864,7 @@ body.is-resizing-panes .pane-cell {
 }
 
 .font-picker-trigger:hover {
-  border-color: var(--text-muted);
+  background-color: var(--background-modifier-hover);
 }
 
 .font-picker.is-open .font-picker-trigger {
@@ -1949,8 +1953,8 @@ body.is-resizing-panes .pane-cell {
 }
 
 .theme-choice:hover {
-  border-color: var(--text-muted);
   color: var(--text-normal);
+  background-color: var(--background-modifier-hover);
 }
 
 .theme-choice.is-active {
@@ -2034,7 +2038,7 @@ body.is-resizing-panes .pane-cell {
 }
 
 .dialog-input:hover {
-  border-color: var(--text-faint);
+  background-color: var(--background-modifier-hover);
 }
 
 .dialog-input:focus,
@@ -2072,7 +2076,6 @@ body.is-resizing-panes .pane-cell {
 }
 
 .dialog-confirm:hover {
-  border-color: var(--text-normal);
   background-color: var(--text-muted);
   color: var(--background-primary);
 }
@@ -2199,7 +2202,7 @@ body.is-resizing-panes .pane-cell {
 }
 
 .agent-spawn-select:hover {
-  border-color: var(--text-faint);
+  background-color: var(--background-modifier-hover);
 }
 
 .agent-spawn-select:focus,
@@ -2799,14 +2802,6 @@ body.is-resizing-panes .pane-cell {
   background-color: var(--kanban-lane);
 }
 
-.kanban-column:nth-child(2) {
-  animation-delay: 50ms;
-}
-
-.kanban-column:nth-child(n + 3) {
-  animation-delay: 100ms;
-}
-
 .kanban-column-header {
   display: flex;
   flex-shrink: 0;
@@ -2851,10 +2846,6 @@ body.is-resizing-panes .pane-cell {
   background-color: var(--kanban-card);
   box-shadow: var(--kanban-card-shadow);
   cursor: grab;
-}
-
-.kanban-card:hover {
-  border-color: var(--text-faint);
 }
 
 .kanban-card {
@@ -3255,8 +3246,8 @@ body.is-resizing-panes .pane-cell {
 }
 
 .markdown-preview-view a.tag:hover {
-  border-color: var(--text-faint);
   color: var(--text-normal);
+  background-color: var(--background-modifier-hover);
 }
 
 /* Priority badges */
@@ -3920,7 +3911,6 @@ body.is-resizing-panes .pane-cell {
 
 .utility-state-retry:hover {
   background: var(--background-modifier-hover);
-  border-color: var(--text-faint);
 }
 
 .utility-state-retry:focus-visible {
@@ -3996,7 +3986,6 @@ body.is-resizing-panes .pane-cell {
 
 .activity-refresh-retry:hover {
   background: var(--background-modifier-hover);
-  border-color: var(--text-faint);
 }
 
 .tokens-refresh-banner {
@@ -4036,7 +4025,6 @@ body.is-resizing-panes .pane-cell {
 
 .tokens-refresh-retry:hover {
   background: var(--background-modifier-hover);
-  border-color: var(--text-faint);
 }
 
 .activity-day-heading {
@@ -4100,8 +4088,8 @@ body.is-resizing-panes .pane-cell {
 }
 
 .activity-file:not(:disabled):hover {
-  border-color: var(--text-faint);
   color: var(--text-normal);
+  background-color: var(--background-modifier-hover);
 }
 
 .activity-file:disabled {
@@ -4539,7 +4527,10 @@ body.is-resizing-panes .pane-cell {
   cursor: pointer;
 }
 
-.fleet-graph-chip:hover,
+.fleet-graph-chip:hover {
+  background-color: var(--background-modifier-hover);
+}
+
 .fleet-graph-chip.is-active {
   border-color: var(--text-normal);
   background-color: var(--text-normal);
@@ -4895,7 +4886,6 @@ body.is-resizing-panes .pane-cell {
 }
 
 .agents-spawn-button:hover {
-  border-color: var(--text-faint);
   background-color: var(--background-modifier-hover);
   color: var(--text-normal);
 }
@@ -11519,7 +11509,6 @@ textarea.composer-command-input {
 
 .copy-pill:hover {
   color: var(--text-normal);
-  border-color: var(--text-faint);
   background-color: var(--background-primary);
 }
 
@@ -12256,7 +12245,7 @@ textarea.composer-command-input {
 
 .workgraph-step:not(:disabled):hover {
   color: var(--text-normal);
-  border-color: var(--text-muted);
+  background-color: var(--background-modifier-hover);
 }
 
 .workgraph-play {
@@ -12273,7 +12262,7 @@ textarea.composer-command-input {
 
 .workgraph-play:hover {
   color: var(--text-normal);
-  border-color: var(--text-muted);
+  background-color: var(--background-modifier-hover);
 }
 
 .workgraph-play:focus-visible,
@@ -12940,7 +12929,7 @@ textarea.composer-command-input {
 .replay-step:not(:disabled):hover,
 .replay-play:not([disabled]):hover {
   color: var(--text-normal);
-  border-color: var(--text-muted);
+  background-color: var(--background-modifier-hover);
 }
 
 .replay-play[aria-pressed="true"] {
@@ -14966,7 +14955,6 @@ textarea.composer-command-input {
   border-radius: 0;
 }
 
-.ribbon-action:hover,
 .nav-action-button:hover,
 .tree-item-self:hover,
 .nav-agent:hover,
@@ -14975,6 +14963,11 @@ textarea.composer-command-input {
 .kanban-card:hover,
 .quick-switcher-result:hover:not(.is-selected):not(.is-disabled) {
   background-color: var(--background-element);
+}
+
+/* ribbon rests on element bg; hover needs the modifier token to stay visible */
+.ribbon-action:hover {
+  background-color: var(--background-modifier-hover);
 }
 
 /* Current items are marked by text and a gutter dot. Cursor selection uses
@@ -15243,7 +15236,7 @@ textarea.composer-command-input {
 
 .dialog-button:hover {
   border: 0;
-  background-color: var(--background-element);
+  background-color: var(--background-modifier-hover);
 }
 
 .dialog-confirm,
@@ -15256,6 +15249,13 @@ textarea.composer-command-input {
 .quick-switcher {
   max-height: 60vh;
   overflow: hidden;
+}
+
+@media (max-width: 640px) {
+  .quick-switcher {
+    max-height: calc(100vh - 24px);
+    overflow-y: auto;
+  }
 }
 
 .quick-switcher input {
@@ -15306,7 +15306,7 @@ textarea.composer-command-input {
 }
 
 .tmux-status-item:hover {
-  background-color: transparent;
+  background-color: var(--background-modifier-hover);
 }
 
 .tmux-status-item.is-active {
@@ -15398,4 +15398,11 @@ textarea.composer-command-input {
     scroll-behavior: auto !important;
     transition-duration: 0.01ms !important;
   }
+}
+
+/* transcript scope (WIKI-245/#182): keep main's transition on the tool head until that PR restyles it */
+.session-tool-head {
+  transition-property: background-color, border-color, color, transform, opacity, box-shadow;
+  transition-duration: 120ms;
+  transition-timing-function: ease-out;
 }
