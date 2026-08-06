@@ -288,6 +288,16 @@ async function main() {
   });
   const page = await context.newPage();
 
+  // WIKI-252: prove no tool-output GitHub URL triggers the metadata backend.
+  // The wiki-153 fixture only references GH_PREVIEW_URL from the gh-mix tool
+  // output (no prose card renders it), so ANY hit on /api/gh/preview for that
+  // URL means <GhPreviewCard> mounted somewhere it must not.
+  const ghPreviewRequests = [];
+  page.on("request", (req) => {
+    const url = req.url();
+    if (url.includes("/api/gh/preview")) ghPreviewRequests.push(url);
+  });
+
   await page.route(`**/api/agents/${TICKET}/session*`, async (route) => {
     if (route.request().method() !== "GET") return route.continue();
     const response = await route.fetch();
@@ -399,7 +409,37 @@ async function main() {
     if (ghMixBodyBefore.includes(GH_MIX_OUTPUT_TAIL_MARKER)) {
       throw new Error("gh-preview mixed output should hide tail marker before expand — renderBody must clip via BoundedPreview text");
     }
-    await ghMixOutput.locator(`a.external-link[href='${GH_PREVIEW_URL}'], a.gh-preview-card[href='${GH_PREVIEW_URL}']`).first().waitFor({ state: "visible" });
+    // WIKI-252: tool output renders GitHub URLs as plain external-link anchors,
+    // never as a metadata card unfurl (that stays on the prose surface). We
+    // check three things so the assertion is mutation-sensitive at every layer:
+    //   1) the plain anchor is present with the exact source href;
+    //   2) no GhPreviewCard DOM node exists for the tool-output URL;
+    //   3) no backend metadata fetch was made for the tool-output URL. The
+    //      pending-fetch fallback of GhPreviewCard renders the SAME anchor, so
+    //      the network-call check is what distinguishes card from plain path.
+    const ghMixAnchor = ghMixOutput
+      .locator(`a.external-link[href='${GH_PREVIEW_URL}']`)
+      .first();
+    await ghMixAnchor.waitFor({ state: "visible" });
+    if ((await ghMixAnchor.getAttribute("target")) !== "_blank") {
+      throw new Error("WIKI-252: tool-output GitHub anchor must open in new tab (target='_blank')");
+    }
+    const ghMixAnchorRel = (await ghMixAnchor.getAttribute("rel")) ?? "";
+    if (!/\bnoopener\b/.test(ghMixAnchorRel) || !/\bnoreferrer\b/.test(ghMixAnchorRel)) {
+      throw new Error("WIKI-252: tool-output GitHub anchor must set rel='noopener noreferrer'");
+    }
+    if ((await ghMixOutput.locator(`a.gh-preview-card[href='${GH_PREVIEW_URL}']`).count()) !== 0) {
+      throw new Error("WIKI-252: tool output must not render a gh-preview-card unfurl");
+    }
+    const encodedPreviewUrl = encodeURIComponent(GH_PREVIEW_URL);
+    const toolPreviewFetches = ghPreviewRequests.filter(
+      (u) => u.includes(encodedPreviewUrl) || u.includes(GH_PREVIEW_URL)
+    );
+    if (toolPreviewFetches.length !== 0) {
+      throw new Error(
+        `WIKI-252: tool output triggered ${toolPreviewFetches.length} /api/gh/preview fetch(es) for ${GH_PREVIEW_URL} — must be zero (that fetch is prose-surface only)`
+      );
+    }
     if (ghMixBodyBefore.includes("\x1b[")) {
       throw new Error("gh-preview text segments must strip ANSI escapes via renderAnsi, not render them raw");
     }

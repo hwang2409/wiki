@@ -199,22 +199,35 @@ async function main() {
     const previewTool = page.locator(".session-activity .session-tool").first();
     const previewToolEventId = await previewTool.getAttribute("data-tool-event-id");
     if (!previewToolEventId) throw new Error("preview tool missing data-tool-event-id");
-    // The gh preview output lives either merged in the tool row or in the
-    // standalone result row keyed by the same data-tool-event-id.
-    const previewScope = page
-      .locator(`.session-activity-row[data-tool-event-id='${previewToolEventId}']`)
-      .filter({ has: page.locator(".gh-preview-title") })
-      .first();
-    await previewScope.locator(".gh-preview-title", { hasText: "Add GitHub URL previews" }).waitFor();
-    await previewScope.locator(".transcript-preview-more").click();
-    // WIKI-153 (#122) wrapped tool output in `.session-tool-output-text` so
-    // preview cards render inline with ANSI text; the bare fallback anchor is
-    // now a descendant of `.session-tool-output-blocks`, not a direct child.
-    await previewScope
+    // WIKI-252: tool output must render GitHub URLs as plain external-link
+    // anchors — the metadata card unfurl lives only on the prose surface
+    // (asserted above via .gh-preview-title / .gh-preview-badge on the page).
+    // The tool row (and any standalone result row sharing its data-tool-event-id)
+    // gets no card. Regressions get caught two ways: a re-introduced card fails
+    // the count check below; a stripped URL times out the anchor waitFor.
+    const previewScope = page.locator(
+      `.session-activity-row[data-tool-event-id='${previewToolEventId}']`
+    );
+    await previewScope.locator(".transcript-preview-more").first().click();
+    const toolAnchor = previewScope
       .locator(".session-tool-output-blocks a.external-link", {
         hasText: "https://github.com/hwang2409/wiki/issues/64",
       })
-      .waitFor({ state: "visible" });
+      .first();
+    await toolAnchor.waitFor({ state: "visible" });
+    if ((await toolAnchor.getAttribute("href")) !== "https://github.com/hwang2409/wiki/issues/64") {
+      throw new Error("WIKI-252: tool-output GitHub anchor href must match the source URL");
+    }
+    if ((await toolAnchor.getAttribute("target")) !== "_blank") {
+      throw new Error("WIKI-252: tool-output GitHub anchor must open in a new tab (target='_blank')");
+    }
+    const previewAnchorRel = (await toolAnchor.getAttribute("rel")) ?? "";
+    if (!/\bnoopener\b/.test(previewAnchorRel) || !/\bnoreferrer\b/.test(previewAnchorRel)) {
+      throw new Error("WIKI-252: tool-output GitHub anchor must set rel='noopener noreferrer'");
+    }
+    if ((await previewScope.locator(".gh-preview-card, .gh-preview-title").count()) !== 0) {
+      throw new Error("WIKI-252: tool output must not render a GhPreviewCard unfurl (that lives only in the prose surface)");
+    }
     await page.waitForTimeout(250);
     logStep("capturing GitHub preview screenshot");
     await page.locator(".session-scroll").screenshot({ path: path.join(OUT_DIR, "github-preview-cards.png") });
