@@ -82,7 +82,7 @@ In Progress:
 - PHO-14037 on-call transfer — investigate-then-fix worker spawned
 - PHO-15253 bash rewrite PRs A/B/C — night shift worker
 - PHO-15254 retrieve adoption tranche 1 — night shift worker
-- [P1] WIKI-247 per-event transcript units + quiet composer — split aggregated 'N tool calls · M thinking' turn groups into standalone per-event elements, remove composer 4-sided outline, native block interiors per OpenCode reference (Henry 2026-08-06; screenshots /tmp/WIKI-247-*.png) — cc:WIKI-247 fable-5
+- [P1] WIKI-247 per-event transcript units + quiet composer — split aggregated 'N tool calls · M thinking' turn groups into standalone per-event elements, remove composer 4-sided outline, native block interiors per OpenCode reference + diff-body monospace fallback fix + sidebar orch-row spacing (Henry 2026-08-06; screenshots /tmp/WIKI-247-*.png) — cc:WIKI-247 fable-5
 Backlog:
 
 - [PHO-14974](https://linear.app/phoebework/issue/PHO-14974): implement the planned v3 describe catalog after retrieve and write registry interfaces land
