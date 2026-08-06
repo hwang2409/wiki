@@ -1242,38 +1242,6 @@ function ToolOutputBody({
   );
 }
 
-function RawOutputDisclosure({ rawText }: { rawText: string }) {
-  const [open, setOpen] = useState(false);
-  const id = useId();
-  return (
-    <div className="session-tool-raw-disclosure">
-      <button
-        aria-controls={id}
-        aria-expanded={open}
-        aria-label={open ? "hide raw output" : "show raw output"}
-        className="session-tool-raw-toggle"
-        type="button"
-        onClick={(event) => {
-          event.stopPropagation();
-          setOpen((value) => !value);
-        }}
-      >
-        {open ? "hide raw" : "raw"}
-      </button>
-      {open ? (
-        <div className="session-tool-raw" id={id}>
-          <BoundedPreview
-            rawText={rawText}
-            showSummary={false}
-            text={rawText}
-            variant="block"
-          />
-        </div>
-      ) : null}
-    </div>
-  );
-}
-
 const SUBTRACE_MAX_ROWS = 60;
 // Hard memory bound on retained child events — well above the rendered row
 // window (rows pair calls with results), far below a full long session.
@@ -1469,12 +1437,20 @@ export function ToolCallRow({
   const detail = toolInlineDetail(tool);
   const { verb, target } = toolSummaryParts(tool);
   const rawOutput = tool.output ?? "";
-  const outputSegments = rawOutput ? parseHarnessOutput(rawOutput) : [];
+  const parsedSegments = rawOutput ? parseHarnessOutput(rawOutput) : [];
+  // A failed tool whose output carries no tagged error is still a failure:
+  // plain text segments render with error semantics so the failure reads as
+  // one instead of ordinary output.
+  const outputSegments = tool.ok === false && !parsedSegments.some((segment) => segment.kind === "error")
+    ? parsedSegments.map((segment) => segment.kind === "text" ? { ...segment, kind: "error" as const } : segment)
+    : parsedSegments;
   const displayOutput = outputSegments.map((segment) => segment.text).join("\n");
   const diffSource = toolDiffSource(tool, displayOutput);
   const presentation = toolPresentation(tool, diffSource ?? displayOutput);
   const outputBlock = presentation !== "inline";
   const [errorExpanded, setErrorExpanded] = useState(false);
+  const [rawOpen, setRawOpen] = useState(false);
+  const rawId = useId();
   const hasSemanticFailure = outputSegments.some((segment) => segment.kind === "error");
   const showOutputBlock = outputBlock && (tool.ok !== false || errorExpanded || hasSemanticFailure);
   const inlineOutput = presentation === "inline" && (tool.ok !== false || errorExpanded)
@@ -1510,7 +1486,7 @@ export function ToolCallRow({
           <span className="session-tool-inline-result">
             {isReadOrSearchTool(tool)
               ? renderAnsi(inlineOutput)
-              : renderOutputSegments(outputSegments, displayOutput)}
+              : renderOutputSegments(outputSegments, inlineOutput)}
           </span>
         ) : null}
         {tool.ok === false && tool.output ? (
@@ -1542,9 +1518,28 @@ export function ToolCallRow({
             inspect
           </span>
         ) : null}
+        {rawOutput ? (
+          <button
+            aria-controls={rawId}
+            aria-expanded={rawOpen}
+            aria-label={rawOpen ? "hide raw output" : "show raw output"}
+            className="session-tool-raw-toggle"
+            type="button"
+            onClick={(event) => {
+              event.stopPropagation();
+              setRawOpen((value) => !value);
+            }}
+          >
+            {rawOpen ? "hide raw" : "raw"}
+          </button>
+        ) : null}
       </div>
       <div className="session-trace-indent">
-        {rawOutput ? <RawOutputDisclosure rawText={rawOutput} /> : null}
+        {rawOutput && rawOpen ? (
+          <div className="session-tool-raw" id={rawId}>
+            <BoundedPreview rawText={rawOutput} showSummary={false} text={rawOutput} variant="block" />
+          </div>
+        ) : null}
         {withResult && showOutputBlock ? (
           <ToolOutputBody
             displayOutput={displayOutput}

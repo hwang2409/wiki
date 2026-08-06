@@ -7533,14 +7533,6 @@ body.is-resizing-panes .pane-cell {
   overflow-wrap: anywhere;
 }
 
-.session-tool-raw-disclosure {
-  display: flex;
-  flex-wrap: wrap;
-  align-items: baseline;
-  min-width: 0;
-  margin: 2px 0;
-}
-
 .session-tool-raw-toggle {
   flex: 0 0 auto;
   opacity: 0.7;
@@ -7551,8 +7543,9 @@ body.is-resizing-panes .pane-cell {
   transition: opacity 120ms ease;
 }
 
-.session-tool-raw-disclosure:hover .session-tool-raw-toggle,
-.session-tool-raw-disclosure:focus-within .session-tool-raw-toggle,
+.session-tool-head:hover .session-tool-raw-toggle,
+.session-tool-head:focus-within .session-tool-raw-toggle,
+.session-tool-raw-toggle[aria-expanded="true"],
 .session-tool-raw-toggle:focus-visible {
   opacity: 1;
 }
@@ -15668,4 +15661,21 @@ textarea.composer-command-input {
     scroll-behavior: auto !important;
     transition-duration: 0.01ms !important;
   }
+}
+
+/* WIKI-242 baseline: small transcript controls keep a 24px minimum target. */
+.session-tool-error-toggle,
+.session-tool-raw-toggle,
+.transcript-preview-more,
+.session-thinking-head {
+  position: relative;
+  min-height: 24px;
+}
+
+.session-tool-error-toggle::after,
+.session-tool-raw-toggle::after,
+.transcript-preview-more::after {
+  content: "";
+  position: absolute;
+  inset: -4px;
 }

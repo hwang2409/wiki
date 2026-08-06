@@ -1,5 +1,8 @@
 // WIKI-245 transcript readability contracts: compact evidence, semantic
 // labels, one visual unit per tool event, and render-time harness cleanup.
+import { readFileSync } from "node:fs";
+import { dirname, resolve } from "node:path";
+import { fileURLToPath } from "node:url";
 import { cleanup, fireEvent, render } from "@testing-library/react";
 import { afterEach, beforeEach, expect, test, vi } from "vitest";
 
@@ -141,7 +144,9 @@ test("real inline rows keep raw output keyboard reachable", () => {
   const row = container.querySelector(".session-tool");
   expect(row?.classList.contains("is-inline")).toBe(true);
   expect(row?.querySelector(".session-output-segment.is-error")?.textContent).toBe("failed status");
-  expect(row?.querySelector(".session-output-segment.is-note")?.textContent).toBe("quiet note");
+  // the 120-char inline cap may clip inside the final segment; the semantic
+  // class and prefix are the contract here (full text lives in the raw body).
+  expect(row?.querySelector(".session-output-segment.is-note")?.textContent).toMatch(/^quiet no/);
   const raw = getByRole("button", { name: "show raw output" });
   raw.focus();
   expect(document.activeElement).toBe(raw);
@@ -320,14 +325,82 @@ test("failed edits keep plain failure output primary", () => {
   expect(container.querySelector(".diff-view")).toBeNull();
 });
 
-test("block outputs also expose raw output below the head", () => {
+test("raw toggle lives in the head and opens a body below it", () => {
   const { container, getByRole } = renderTool({
     name: "Bash",
     archetype: "bash",
     input: "echo ok",
     output: "ok",
   });
-  expect(container.querySelector(".session-tool-head + .session-trace-indent .session-tool-raw-disclosure"))
-    .toBeTruthy();
-  expect(getByRole("button", { name: "show raw output" })).toBeTruthy();
+  const toggle = getByRole("button", { name: "show raw output" });
+  expect(toggle.closest(".session-tool-head")).toBeTruthy();
+  expect(container.querySelector(".session-tool-raw")).toBeNull();
+  fireEvent.click(toggle);
+  const body = container.querySelector(".session-trace-indent .session-tool-raw");
+  expect(body).toBeTruthy();
+  expect(toggle.getAttribute("aria-expanded")).toBe("true");
+});
+
+test("plain failed output renders as error segments", () => {
+  const { container } = renderTool({
+    input: "hot.md",
+    edit: { file_path: "hot.md", old_string: "old", new_string: "new" },
+    output: "old text was not found",
+    ok: false,
+  });
+  fireEvent.click(container.querySelector(".session-tool-error-toggle")!);
+  expect(container.querySelector(".session-output-segment.is-error, .harness-output .is-error")?.textContent)
+    .toContain("old text was not found");
+});
+
+test("generic inline tools render the capped inline output", () => {
+  const longLine = "x".repeat(400);
+  const { container } = renderTool({
+    name: "SomeGenericTool",
+    archetype: "generic",
+    input: "run",
+    output: longLine,
+  });
+  const inline = container.querySelector(".session-tool-inline-result");
+  expect(inline).toBeTruthy();
+  expect((inline?.textContent ?? "").length).toBeLessThan(200);
+});
+
+test("apply_patch with a garbage preamble falls back instead of diffing", () => {
+  const patch = [
+    "this is not patch grammar",
+    "*** Begin Patch",
+    "*** Update File: a.txt",
+    "@@",
+    "-old",
+    "+new",
+    "*** End Patch",
+  ].join("\n");
+  const { container } = renderTool({
+    name: "apply_patch",
+    archetype: "edit",
+    input: patch,
+    edit: { patch },
+    output: "Done",
+  });
+  expect(container.querySelector(".diff-view, .diff-line")).toBeNull();
+});
+
+test("small transcript controls keep the 24px target baseline", () => {
+  const css = readFileSync(
+    resolve(dirname(fileURLToPath(import.meta.url)), "..", "src", "styles.css"),
+    "utf-8",
+  );
+  const block = css.slice(css.indexOf("small transcript controls keep a 24px minimum target"));
+  for (const selector of [
+    ".session-tool-error-toggle",
+    ".session-tool-raw-toggle",
+    ".transcript-preview-more",
+    ".session-thinking-head",
+  ]) {
+    expect(block).toContain(selector);
+  }
+  expect(block).toContain("min-height: 24px;");
+  expect(css).toContain('.session-tool-head:hover .session-tool-raw-toggle');
+  expect(css).toContain('.session-tool-raw-toggle[aria-expanded="true"]');
 });

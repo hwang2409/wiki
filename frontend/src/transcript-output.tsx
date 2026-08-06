@@ -236,7 +236,13 @@ function normalizeApplyPatch(source: string): string | null {
       };
       continue;
     }
-    if (current) current.lines.push(line);
+    if (current) {
+      current.lines.push(line);
+    } else if (line.trim() !== "") {
+      // Content before the first file marker is not valid patch grammar;
+      // rendering around it would show a diff for a malformed patch.
+      return null;
+    }
   }
   finish();
   if (sections.length !== 1) return null;
