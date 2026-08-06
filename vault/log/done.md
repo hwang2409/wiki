@@ -9,6 +9,7 @@ updated: 2026-08-06
 
 ## 2026-08-06
 
+- WIKI-261 merged (#197) — numbered read-tool outputs now syntax-highlighted (gutter stripped, tokenized, gutter column)
 - WIKI-260 merged (#196) — font picker enumerates installed families via /api/fonts; no variant grouping, Nerd Fonts separate
 - WIKI-258 merged (#195) — split-diff columns no longer collapse to 1ch; wrap preserved without width collapse
 - WIKI-259 merged (#194) — empty events no longer reserve virtual row height; transcript row gaps deterministic
