@@ -89,6 +89,7 @@ In Progress:
 - PHO-14037 on-call transfer — investigate-then-fix worker spawned
 - PHO-15253 bash rewrite PRs A/B/C — night shift worker
 - PHO-15254 retrieve adoption tranche 1 — night shift worker
+- [P1] wiki-app: WIKI-262 codex runs render raw JS harness + repr blobs; unwrap tools.* calls, classify real cmd, route outputs through claude pipeline (owner: wiki-dev fleet)
 Backlog:
 
 - [PHO-14974](https://linear.app/phoebework/issue/PHO-14974): implement the planned v3 describe catalog after retrieve and write registry interfaces land
