@@ -382,6 +382,19 @@ describe("WIKI-251 wrap sweep", () => {
     expect(body).not.toContain("overflow: auto;");
   });
 
+  // WIKI-258: react-diff-view rows are <tr class="diff-line">. The legacy
+  // div renderer's flex line layout must stay scoped under .diff-view —
+  // display: flex on a <tr> detaches its cells from the table columns and
+  // the split view collapses to ~1ch-wide code columns (min-content under
+  // overflow-wrap: anywhere).
+  test("flex line layout never leaks onto react-diff-view table rows (WIKI-258)", () => {
+    const unscoped = cssDeclarations(".diff-line");
+    expect(unscoped).not.toContain("display: flex;");
+    // The legacy div renderer keeps its flex layout under its own root.
+    const scoped = cssDeclarations(".diff-view .diff-line");
+    expect(scoped).toContain("display: flex;");
+  });
+
   test("no .is-nowrap escape hatch remains in the CSS (WIKI-251 HIGH#3)", () => {
     // The class name and every consumer are removed — nothing in the app can
     // fall back to horizontal-scroll on tool output.

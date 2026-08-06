@@ -38,6 +38,7 @@
     "test:wiki-98": "node tests/wiki-98-raw-html.playwright.mjs",
     "test:wiki-141": "node tests/wiki-141-latex.playwright.mjs",
     "test:wiki-255": "vitest run tests/wiki-255-latex-runaway.integration.test.tsx && node tests/wiki-255-latex-runaway.playwright.mjs",
+    "test:wiki-258": "vitest run tests/wiki-251-diff-wrap.integration.test.tsx && node tests/wiki-258-split-collapse.playwright.mjs",
     "test:wiki-133": "node tests/wiki-133-jk-scroll.playwright.mjs",
     "test:wiki-128": "node tests/wiki-128-code-density.playwright.mjs",
     "test:wiki-105": "node tests/wiki-105-font-weights.playwright.mjs",
