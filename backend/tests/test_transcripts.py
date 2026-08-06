@@ -18,8 +18,8 @@ from tempfile import TemporaryDirectory
 from unittest import mock
 
 from backend.app import transcripts
+from backend.app.agent_runtime.normalizer import normalize_provider_event
 from backend.app.wiki_artifacts import TEXT_LIMIT, sentinel_text
-
 
 FIXTURES_DIR = Path(__file__).resolve().parent / "fixtures"
 
@@ -1136,6 +1136,104 @@ class TranscriptSurfaceTests(unittest.TestCase):
         self.assertEqual(question["question"]["answered_option"], 1)
         self.assertEqual(question["question"]["answered_options"], [1])
         self.assertIsNone(question["question"]["custom_reply"])
+
+
+class TranscriptEditPayloadTests(unittest.TestCase):
+    def setUp(self) -> None:
+        transcripts._cache.clear()
+        transcripts._cache_locks.clear()
+
+    def test_raw_claude_edit_survives_normalization_for_renderer(self) -> None:
+        raw_rows = [
+            json.loads(line)
+            for line in (FIXTURES_DIR / "claude_edit_raw.jsonl")
+            .read_text(encoding="utf-8")
+            .splitlines()
+        ]
+        envelopes = []
+        for raw in raw_rows:
+            normalized = normalize_provider_event("claude", raw)
+            envelopes.append({
+                "kind": normalized.kind,
+                "disposition": normalized.disposition.value,
+                "normalized_at": raw["timestamp"],
+                "payload": normalized.payload,
+            })
+        with TemporaryDirectory() as tmp:
+            path = Path(tmp) / "events.jsonl"
+            path.write_text(
+                "\n".join(json.dumps(envelope) for envelope in envelopes) + "\n",
+                encoding="utf-8",
+            )
+            result = transcripts.read_session_events("claude-normalized", path)
+
+        tool = result["events"][0]["tool"]
+        self.assertEqual(
+            tool["edit"],
+            {
+                "file_path": "/Users/henry/me/fun/wiki/.claude/worktrees/wiki-153/frontend/src/ansi.tsx",
+                "old_string": "function classNamesFor(style: AnsiStyle): string {",
+                "new_string": "export function classNamesFor(style: AnsiStyle): string {",
+                "replace_all": False,
+            },
+        )
+        self.assertIn("updated successfully", tool["output"])
+
+    def test_edit_payload_strings_are_bounded(self) -> None:
+        long_text = "x" * (transcripts.MAX_EDIT_PAYLOAD + 500)
+        payload = {
+            "type": "assistant",
+            "message": {"content": [{
+                "type": "tool_use",
+                "id": "toolu-long-edit",
+                "name": "Edit",
+                "input": {
+                    "file_path": "hot.md",
+                    "old_string": long_text,
+                    "new_string": long_text,
+                },
+            }]},
+        }
+        with TemporaryDirectory() as tmp:
+            path = Path(tmp) / "claude.jsonl"
+            path.write_text(json.dumps(payload) + "\n", encoding="utf-8")
+            result = transcripts.read_session_events("claude", path)
+
+        edit = result["events"][0]["tool"]["edit"]
+        self.assertLessEqual(len(edit["old_string"]), transcripts.MAX_EDIT_PAYLOAD + 64)
+        self.assertEqual(len(edit["old_string"]), transcripts.MAX_EDIT_PAYLOAD)
+        self.assertNotIn("truncated", edit["old_string"])
+        self.assertTrue(edit["old_string_truncated"])
+        self.assertTrue(edit["new_string_truncated"])
+
+    def test_cache_version_rebuilds_old_normalized_events(self) -> None:
+        payload = {
+            "type": "assistant",
+            "message": {"content": [{
+                "type": "tool_use",
+                "id": "toolu-cache-edit",
+                "name": "Edit",
+                "input": {
+                    "file_path": "hot.md",
+                    "old_string": "old",
+                    "new_string": "new",
+                },
+            }]},
+        }
+        envelope = {
+            "kind": "claude_assistant",
+            "disposition": "rendered",
+            "normalized_at": "2026-08-06T00:00:00Z",
+            "payload": payload,
+        }
+        with TemporaryDirectory() as tmp:
+            path = Path(tmp) / "events.jsonl"
+            path.write_text(json.dumps(envelope) + "\n", encoding="utf-8")
+            transcripts.read_session_events("claude-normalized", path)
+            transcripts._cache[str(path)]["cache_version"] = transcripts.TRANSCRIPT_CACHE_VERSION - 1
+            rebuilt = transcripts.read_session_events("claude-normalized", path)
+
+        self.assertEqual(rebuilt["events"][0]["tool"]["edit"]["new_string"], "new")
 
 
 if __name__ == "__main__":

@@ -152,21 +152,27 @@ async function main() {
     logStep("B1: no control can hide the trace");
     await page.locator(".session-activity").first().waitFor({ state: "visible" });
     const hidingControls = await page.locator(
-      ".session-activity-head button, button.session-activity-head, .session-activity [aria-expanded]",
+      ".session-activity-head button, button.session-activity-head",
     ).count();
     assert(hidingControls === 0, `expected no disclosure controls in the trace, found ${hidingControls}`);
     const bodies = await page.locator(".session-activity .session-activity-body").count();
     assert(bodies > 0, "activity body must render unconditionally");
 
-    logStep("B2: over-threshold thinking renders in full, no show-all");
+    logStep("B2: thinking starts as a quiet one-line thought and expands on focus");
+    const thinkingHead = page.locator(".session-thinking-head").first();
+    await thinkingHead.waitFor({ state: "visible" });
+    assert(await thinkingHead.getAttribute("aria-expanded") === "false", "thinking should start collapsed");
+    assert(await page.locator(".session-thinking").count() === 0, "thinking body should stay hidden by default");
+    await thinkingHead.click();
+    assert(await thinkingHead.getAttribute("aria-expanded") === "true", "thinking should expand on click");
     const thinking = page.locator(".session-thinking").first();
     await thinking.waitFor({ state: "visible" });
     const thinkingText = await thinking.innerText();
-    assert(thinkingText.includes("Reasoning line 80"), "long thinking must be fully readable without clicks");
+    assert(thinkingText.includes("Reasoning line 80"), "expanded thinking must be fully readable");
     const clampControls = await page.locator(".session-thinking .stream-clamp-toggle, .session-thinking .stream-clamp").count();
     assert(clampControls === 0, "thinking must not render through an interactive clamp");
 
-    logStep("B3: child trace shows thinking + tool input/output blocks");
+    logStep("B3: child trace shows thinking + inline/block tool evidence");
     const subtrace = page.locator(".session-subtrace").first();
     await subtrace.waitFor({ state: "visible", timeout: 20_000 });
     await subtrace.locator(".session-thinking, .session-activity-row").first().waitFor();
@@ -175,9 +181,9 @@ async function main() {
     assert(childRows <= SUBTRACE_MAX_ROWS, `child rows must be windowed to ${SUBTRACE_MAX_ROWS}, got ${childRows}`);
     const moreNote = await subtrace.locator(".session-subtrace-more").innerText();
     assert(/\+\d+ earlier rows/.test(moreNote), `history window must be labelled, got: ${moreNote}`);
-    const childOutputs = await subtrace.locator(".transcript-preview").count();
-    assert(childOutputs > 0, "child tool outputs must render as visible blocks");
-    const lastChildOutput = await subtrace.locator(".transcript-preview-body").last().innerText();
+    const childOutputs = await subtrace.locator(".session-tool-inline-result, .session-tool-body").count();
+    assert(childOutputs > 0, "child tool outputs must render as visible inline or block evidence");
+    const lastChildOutput = await subtrace.locator(".session-tool-inline-result, .transcript-preview-body").last().innerText();
     assert(lastChildOutput.includes("uses CreateNewUser"), "child output content must be readable inline");
 
     logStep("H2: polling uses cursor deltas with bounded payloads");

@@ -76,6 +76,7 @@ import type {
 import { renderAnsi } from "./ansi";
 import { ArtifactBlock } from "./artifact-block";
 import { useArtifactInspector } from "./artifact-inspector";
+import { DiffPatchView } from "./diff-view";
 import {
   filterCommands,
   initialValues,
@@ -102,6 +103,27 @@ import { createStateKeyWriteBarrier, deletePaneStateEntries } from "./pane-state
 import { Timestamp } from "./timestamp";
 import { StatusBadge } from "./status-badge";
 import { BoundedPreview } from "./transcript-preview";
+import {
+  isBashTool,
+  isReadOrSearchTool,
+  toolDiffIsTruncated,
+  toolInlineResult,
+  toolDiffSource,
+  toolPresentation,
+  toolStatus,
+  toolSummaryLine,
+  toolSummaryParts,
+  traceConnector,
+  traceRows,
+  type TraceRow,
+} from "./transcript-event-utils";
+import {
+  HarnessOutput,
+  clipSegmentsInline,
+  parseHarnessOutput,
+  segmentsForDisplayText,
+} from "./transcript-output";
+import type { HarnessOutputSegment } from "./transcript-output";
 import { CodexStreamHighlights } from "./codex-stream-renderers";
 import { markerRule } from "./hook-message-registry";
 import type { MarkerSeverity } from "./hook-message-registry";
@@ -1126,89 +1148,97 @@ const ARCHETYPE_ICONS: Record<string, LucideIcon> = {
   tool: Wrench,
 };
 
-function toolSummaryLine(tool: SessionTool): string {
-  return tool.summary || tool.input.split("\n")[0].slice(0, 120);
-}
-
-// Multiline inputs (and Bash commands, whose summary is a description) render
-// as a body block. Single-line inputs are already carried by the row itself:
-// either the summary contains them, or they render as an inline dim detail
-// (OpenCode-style full argument after the tool name). Raw input evidence
-// therefore always stays reachable without a click (WIKI-238 contract).
-function toolInputIsBlock(tool: SessionTool): boolean {
-  if (!tool.input) return false;
-  if (tool.name === "Bash") return true;
-  return tool.input.split("\n")[0].length < tool.input.length;
-}
-
 function toolInlineDetail(tool: SessionTool): string | null {
-  if (!tool.input || toolInputIsBlock(tool)) return null;
+  if (!tool.input || toolPresentation(tool) !== "inline") return null;
   const input = tool.input.trim();
   if (!input || toolSummaryLine(tool).includes(input)) return null;
   return input;
 }
 
-// Purpose labels shared with PR #177 (WIKI-241): name the payload by what it
-// is, not by transport. Reads/edits emit file contents; failed calls carry an
-// error message; Bash carries command text.
-function inputLabelForTool(tool: SessionTool): string {
-  return tool.name === "Bash" ? "command input" : "tool input";
+function renderOutputSegments(
+  segments: HarnessOutputSegment[],
+  text: string,
+  withGitHubPreviews = false,
+) {
+  const visible = segmentsForDisplayText(segments, text);
+  if (!withGitHubPreviews) return <HarnessOutput segments={visible} ansi />;
+  return visible.map((segment, index) => (
+    <span key={`${segment.kind}:${index}`}>
+      {index > 0 ? "\n" : null}
+      <span className={`session-output-segment is-${segment.kind}`}>
+        {renderAnsiWithGitHubPreviews(segment.text)}
+      </span>
+    </span>
+  ));
 }
 
-function outputLabelForTool(tool: SessionTool): string {
-  if (tool.ok === false) return "error output";
-  if (tool.archetype === "read") return "file contents";
-  if (tool.archetype === "edit") return "file contents";
-  if (tool.name === "Bash") return "command output";
-  return "tool output";
+function toolBlockTitle(tool: SessionTool): string {
+  const summary = toolSummaryLine(tool).trim();
+  if (isBashTool(tool)) return `$ ${tool.input.split("\n")[0] || summary}`;
+  return `← ${summary}`;
 }
 
-function ToolInputBody({ tool }: { tool: SessionTool }) {
-  if (!toolInputIsBlock(tool)) return null;
+function ToolOutputBody({
+  displayOutput,
+  diffSource,
+  rawOutput,
+  segments,
+  tool,
+}: {
+  displayOutput: string;
+  diffSource: string | null;
+  rawOutput: string;
+  segments: HarnessOutputSegment[];
+  tool: SessionTool;
+}) {
+  const presentation = toolPresentation(tool, displayOutput);
+  if (presentation === "inline" || (!displayOutput && !isBashTool(tool))) return null;
+  const failed = tool.ok === false;
+  const diffDegraded = toolDiffIsTruncated(tool);
+  if (presentation === "diff") {
+    return (
+      <div className="session-tool-body session-tool-diff-body">
+        <div className="session-tool-block-title">{toolBlockTitle(tool)}</div>
+        {failed ? (
+          <div className="session-tool-failure-output">
+            {renderOutputSegments(segments, displayOutput || rawOutput)}
+          </div>
+        ) : diffDegraded ? (
+          <div className="session-tool-degraded-diff">
+            edit too large to diff — view raw
+          </div>
+        ) : (
+          <DiffPatchView source={diffSource ?? displayOutput} />
+        )}
+      </div>
+    );
+  }
+  const bash = isBashTool(tool);
+  const hasGitHubPreview = containsGitHubPreviewUrl(displayOutput);
+  const outputTone = tool.ok === false || segments.some((segment) => segment.kind === "error")
+    ? "error"
+    : "normal";
   return (
-    <div className="session-tool-body">
-      {tool.name === "Bash" ? (
-        <BoundedPreview
-          label={inputLabelForTool(tool)}
-          text={tool.input}
-          renderBody={({ text }) => (
-            <ShikiCode className="session-tool-input" code={text} lang="bash" transparent />
-          )}
-        />
-      ) : (
-        <BoundedPreview label={inputLabelForTool(tool)} text={tool.input} />
-      )}
-    </div>
-  );
-}
-
-function ToolOutputBody({ tool }: { tool: SessionTool }) {
-  if (!tool.output) return null;
-  const hasGitHubPreview = containsGitHubPreviewUrl(tool.output);
-  return (
-    <div className="session-tool-body">
-      {hasGitHubPreview ? (
-        <BoundedPreview
-          ansi
-          label={outputLabelForTool(tool)}
-          text={tool.output}
-          tone={tool.ok === false ? "error" : "normal"}
-          renderBody={({ text }) => (
-            <div className="session-tool-output-blocks">
-              <span className="session-tool-output-text">
-                {renderAnsiWithGitHubPreviews(text)}
-              </span>
-            </div>
-          )}
-        />
-      ) : (
-        <BoundedPreview
-          ansi
-          label={outputLabelForTool(tool)}
-          text={tool.output}
-          tone={tool.ok === false ? "error" : "normal"}
-        />
-      )}
+    <div className="session-tool-body session-tool-block-body">
+      <div className="session-tool-block-title">{toolBlockTitle(tool)}</div>
+      {bash && tool.input.includes("\n") ? (
+        <ShikiCode className="session-tool-input" code={tool.input} lang="bash" transparent />
+      ) : null}
+      <BoundedPreview
+        ansi
+        className="session-tool-block-preview"
+        previewLines={bash ? 10 : 3}
+        rawText={rawOutput}
+        showSummary={false}
+        text={displayOutput}
+        tone={outputTone}
+        variant="block"
+        renderBody={({ text }) => (
+          <span className="session-tool-output-text">
+            {renderOutputSegments(segments, text, hasGitHubPreview)}
+          </span>
+        )}
+      />
     </div>
   );
 }
@@ -1363,20 +1393,30 @@ function SubagentTrace({
 }
 
 function ThinkingRow({ event }: { event: SessionEvent }) {
-  // WIKI-244: thinking renders in full — no clamp, no show-all gate. The
-  // backend already bounds thinking text at parse time.
+  const [expanded, setExpanded] = useState(false);
+  const title = event.text.split("\n")[0].trim().slice(0, 120);
   return (
     <div className="session-activity-row is-reasoning">
-      <div className="session-activity-row-meta">thinking</div>
-      <div className="session-thinking">
+      <button
+        className="session-thinking-head"
+        type="button"
+        aria-expanded={expanded}
+        onClick={() => setExpanded((value) => !value)}
+      >
+        <span className="session-activity-row-meta">thought</span>
+        <span className="session-thinking-title">{title || "thinking"}</span>
         {event.encrypted ? <span className="session-thinking-chip">encrypted</span> : null}
-        {event.text}
-      </div>
+      </button>
+      {expanded ? (
+        <div className="session-thinking">
+          {event.text}
+        </div>
+      ) : null}
     </div>
   );
 }
 
-function ToolCallRow({
+export function ToolCallRow({
   connector,
   event,
   nested = false,
@@ -1393,24 +1433,77 @@ function ToolCallRow({
 }) {
   const tool = event.tool!;
   const Icon = ARCHETYPE_ICONS[tool.archetype] ?? Terminal;
-  const running = tool.output === null && tool.ok === null;
+  const status = toolStatus(tool);
+  const running = status === "working";
   const detail = toolInlineDetail(tool);
+  const { verb, target } = toolSummaryParts(tool);
+  const rawOutput = tool.output ?? "";
+  const parsedSegments = rawOutput ? parseHarnessOutput(rawOutput) : [];
+  // A failed tool whose output carries no tagged error is still a failure:
+  // plain text segments render with error semantics so the failure reads as
+  // one instead of ordinary output.
+  const outputSegments = tool.ok === false && !parsedSegments.some((segment) => segment.kind === "error")
+    ? parsedSegments.map((segment) => segment.kind === "text" ? { ...segment, kind: "error" as const } : segment)
+    : parsedSegments;
+  const displayOutput = outputSegments.map((segment) => segment.text).join("\n");
+  const diffSource = toolDiffSource(tool, displayOutput);
+  const presentation = toolPresentation(tool, diffSource ?? displayOutput);
+  const outputBlock = presentation !== "inline";
+  const [errorExpanded, setErrorExpanded] = useState(false);
+  const [rawOpen, setRawOpen] = useState(false);
+  const rawId = useId();
+  const showOutputBlock = outputBlock && (tool.ok !== false || errorExpanded);
+  const inlineOutput = presentation === "inline" && (tool.ok !== false || errorExpanded)
+    ? tool.ok === false && errorExpanded
+      ? displayOutput
+      : toolInlineResult(tool, displayOutput)
+    : null;
   return (
     <div
-      className={`session-tool session-activity-row is-tool${tool.ok === false ? " is-failed" : ""}`}
+      className={`session-tool session-activity-row is-tool is-${status}${outputBlock ? " is-block" : " is-inline"}${tool.ok === false ? " is-failed" : ""}`}
       data-tool-event-id={nested ? undefined : event.id}
     >
       <div className="session-tool-head">
         <span aria-hidden="true" className="session-trace-connector">{connector}</span>
-        <Icon className="session-tool-icon" size={12} />
-        <span className="session-tool-summary" title={tool.name}>
-          {toolSummaryLine(tool)}
+        {isBashTool(tool) ? (
+          <span aria-hidden="true" className="session-tool-icon session-tool-icon-text">$</span>
+        ) : (
+          <Icon className="session-tool-icon" size={12} />
+        )}
+        <span className="session-tool-summary" title={toolSummaryLine(tool)}>
+          <span className="session-tool-verb">{verb}</span>
+          {target ? <><span aria-hidden="true">{" "}</span><span className="session-tool-target">{target}</span></> : null}
         </span>
         {detail ? (
           <span className="session-tool-detail" title={detail}>{detail}</span>
         ) : null}
         {running ? <span className="session-tool-running" title="running" /> : null}
-        {tool.ok === false ? <span className="session-tool-err">failed</span> : null}
+        <span className={`session-tool-status${status === "failed" ? " session-tool-err" : ""} is-${status}`}>
+          {status}
+        </span>
+        {tool.ok === null && !running ? <span className="session-activity-row-meta">unknown</span> : null}
+        {inlineOutput ? (
+          <span className="session-tool-inline-result">
+            {isReadOrSearchTool(tool)
+              ? renderAnsi(inlineOutput)
+              : (
+                <HarnessOutput
+                  ansi
+                  segments={tool.ok === false && errorExpanded ? outputSegments : clipSegmentsInline(outputSegments)}
+                />
+              )}
+          </span>
+        ) : null}
+        {tool.ok === false && tool.output ? (
+          <button
+            className="session-tool-error-toggle"
+            type="button"
+            aria-expanded={errorExpanded}
+            onClick={() => setErrorExpanded((value) => !value)}
+          >
+            {errorExpanded ? "hide error" : "show error"}
+          </button>
+        ) : null}
         {tool.agent_id && onInspect ? (
           <span
             className="session-tool-inspect"
@@ -1430,10 +1523,45 @@ function ToolCallRow({
             inspect
           </span>
         ) : null}
+        {rawOutput ? (
+          <button
+            aria-controls={rawId}
+            aria-expanded={rawOpen}
+            aria-label={rawOpen ? "hide raw output" : "show raw output"}
+            className="session-tool-raw-toggle"
+            type="button"
+            onClick={(event) => {
+              event.stopPropagation();
+              setRawOpen((value) => !value);
+            }}
+          >
+            {rawOpen ? "hide raw" : "raw"}
+          </button>
+        ) : null}
       </div>
       <div className="session-trace-indent">
-        <ToolInputBody tool={tool} />
-        {withResult ? <ToolOutputBody tool={tool} /> : null}
+        {rawOutput && rawOpen ? (
+          <div className="session-tool-raw" id={rawId}>
+            <BoundedPreview rawText={rawOutput} showSummary={false} text={rawOutput} variant="block" />
+          </div>
+        ) : null}
+        {withResult && showOutputBlock ? (
+          <ToolOutputBody
+            displayOutput={displayOutput}
+            diffSource={diffSource}
+            rawOutput={rawOutput}
+            segments={outputSegments}
+            tool={tool}
+          />
+        ) : isBashTool(tool) && running ? (
+          <ToolOutputBody
+            displayOutput={displayOutput}
+            diffSource={diffSource}
+            rawOutput={rawOutput}
+            segments={outputSegments}
+            tool={tool}
+          />
+        ) : null}
         {!nested && tool.agent_id ? (
           <SubagentTrace active={running} agentId={tool.agent_id} onInspect={onInspect} ticket={ticket} />
         ) : null}
@@ -1461,9 +1589,6 @@ function TraceRowList({
     <>
       {rows.map((row, index) => {
         const key = `${keyBase}:${row.kind}:${row.eventIndex}`;
-        if (row.kind === "result") {
-          return <ToolResultRow connector={traceConnector(rows, index)} event={row.event} key={key} nested={nested} />;
-        }
         if (row.kind === "tool") {
           return (
             <ToolCallRow
@@ -1483,37 +1608,6 @@ function TraceRowList({
   );
 }
 
-// Standalone result row — used when the tool's completion is separated from
-// its call in the timeline (parallel tools completing out of order). The dim
-// identifying line says which call this output belongs to.
-function ToolResultRow({
-  connector,
-  event,
-  nested = false,
-}: {
-  connector: string;
-  event: SessionEvent;
-  nested?: boolean;
-}) {
-  const tool = event.tool!;
-  const resultLabel = tool.ok === false ? "failed" : tool.ok === true ? "done" : "completed";
-  return (
-    <div
-      className={`session-activity-row is-result${tool.ok === false ? " is-failed" : ""}`}
-      data-tool-event-id={nested ? undefined : event.id}
-    >
-      <div className="session-tool-result">
-        <span aria-hidden="true" className="session-trace-connector">{connector}</span>
-        <span className="session-tool-result-state">{resultLabel}</span>
-        {tool.ok === null ? <span className="session-activity-row-meta">unknown</span> : null}
-        <span className="session-tool-result-summary" title={tool.name}>{toolSummaryLine(tool)}</span>
-      </div>
-      <div className="session-trace-indent">
-        <ToolOutputBody tool={tool} />
-      </div>
-    </div>
-  );
-}
 
 type ActivityTimelineItem = {
   event: SessionEvent;
@@ -1689,30 +1783,37 @@ const sessionMarkdownComponents = {
 
 function BashBlock({ event }: { event: SessionEvent }) {
   const bash = event.bash ?? { input: "", stdout: "", stderr: "" };
+  const segments: HarnessOutputSegment[] = [
+    ...(bash.stdout ? [{ kind: "text" as const, text: bash.stdout }] : []),
+    ...(bash.stderr ? [{ kind: "error" as const, text: bash.stderr }] : []),
+  ];
+  const output = segments.map((segment) => segment.text).join("\n");
   return (
-    <div className="session-bash">
+    <div className="session-bash session-tool-body session-tool-block-body">
+      <div className="session-tool-block-title">$ {bash.input.split("\n")[0] || "bash"}</div>
       {bash.input ? (
-        <BoundedPreview
-          label="command input"
-          text={bash.input}
-          renderBody={({ text }) => (
-            <div className="session-bash-command">
-              <span className="session-bash-prompt">❯</span>
-              <ShikiCode
-                className="session-bash-command-code"
-                code={text}
-                lang="bash"
-                transparent
-              />
-            </div>
-          )}
+        <ShikiCode
+          className="session-tool-input session-bash-command-code"
+          code={bash.input}
+          lang="bash"
+          transparent
         />
       ) : null}
-      {bash.stdout ? (
-        <BoundedPreview ansi label="command output" text={bash.stdout} />
-      ) : null}
-      {bash.stderr ? (
-        <BoundedPreview ansi label="command error" tone="error" text={bash.stderr} />
+      {output ? (
+        <BoundedPreview
+          ansi
+          className="session-tool-block-preview"
+          previewLines={10}
+          showSummary={false}
+          text={output}
+          tone={bash.stderr ? "error" : "normal"}
+          variant="block"
+          renderBody={({ text }) => (
+            <span className="session-tool-output-text">
+              {renderOutputSegments(segments, text)}
+            </span>
+          )}
+        />
       ) : null}
     </div>
   );
@@ -2177,47 +2278,6 @@ const MessageBlock = memo(function MessageBlock({
   prev.uiState === next.uiState &&
   sameImageNums(prev.imageNums, next.imageNums)
 );
-
-type TraceRow =
-  | { kind: "tool"; event: SessionEvent; eventIndex: number; withResult: boolean }
-  | { kind: "result"; event: SessionEvent; eventIndex: number }
-  | { kind: "thinking"; event: SessionEvent; eventIndex: number };
-
-// Flatten the timeline into OpenCode-style rows. A call immediately followed
-// by its own result renders as one merged row (call line + output beneath) —
-// the common sequential case. Results separated by interleaved calls keep a
-// standalone row so parallel-tool completion order stays legible.
-function traceRows(timeline: ActivityTimelineItem[]): TraceRow[] {
-  const rows: TraceRow[] = [];
-  for (let index = 0; index < timeline.length; index += 1) {
-    const item = timeline[index];
-    if (item.kind === "result") {
-      rows.push({ kind: "result", event: item.event, eventIndex: item.eventIndex });
-      continue;
-    }
-    if (item.event.kind === "tool") {
-      const next = timeline[index + 1];
-      // Unknown-outcome completions (ok === null, e.g. interrupted sessions)
-      // keep a standalone result row so the neutral "completed/unknown"
-      // labelling survives (WIKI-238 contract).
-      const withResult =
-        !!next && next.kind === "result" && next.event === item.event && item.event.tool!.ok !== null;
-      if (withResult) index += 1;
-      rows.push({ kind: "tool", event: item.event, eventIndex: item.eventIndex, withResult });
-      continue;
-    }
-    if (!item.event.text) continue;
-    rows.push({ kind: "thinking", event: item.event, eventIndex: item.eventIndex });
-  }
-  return rows;
-}
-
-// Tree connector for a tool/result row: last row of a contiguous run of tool
-// rows closes with └, everything before it branches with ├.
-function traceConnector(rows: TraceRow[], index: number): string {
-  const next = rows[index + 1];
-  return next && next.kind !== "thinking" ? "├" : "└";
-}
 
 function ActivityGroupBase({
   events,

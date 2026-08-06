@@ -17,11 +17,11 @@
   --text-selection: rgba(0, 0, 0, 0.12);
 
   --activity-metadata-color: var(--text-normal);
-  --activity-state-done-color: var(--text-normal);
+  --activity-state-done-color: var(--text-muted);
   --activity-state-working-color: var(--text-normal);
-  --activity-state-failed-color: var(--text-normal);
-  --activity-state-interrupted-color: var(--text-normal);
-  --activity-state-waiting-color: var(--text-normal);
+  --activity-state-failed-color: var(--accent-danger);
+  --activity-state-interrupted-color: var(--accent-danger);
+  --activity-state-waiting-color: var(--accent-warning);
 
   --link-color: var(--text-normal);
   --link-color-hover: #000000;
@@ -525,9 +525,9 @@
   --text-selection: rgba(147, 161, 161, 0.38);
 
   --activity-metadata-color: #435a61;
-  --activity-state-done-color: #435a61;
-  --activity-state-working-color: #435a61;
-  --activity-state-failed-color: #435a61;
+  --activity-state-done-color: var(--text-muted);
+  --activity-state-working-color: var(--text-normal);
+  --activity-state-failed-color: var(--accent-danger);
   --activity-state-interrupted-color: #435a61;
   --activity-state-waiting-color: #435a61;
 

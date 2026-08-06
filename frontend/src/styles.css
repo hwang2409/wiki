@@ -7350,6 +7350,15 @@ body.is-resizing-panes .pane-cell {
 
 .session-tool {
   min-width: 0;
+  color: var(--activity-state-done-color);
+}
+
+.session-tool.is-working {
+  color: var(--activity-state-working-color);
+}
+
+.session-tool.is-failed {
+  color: var(--activity-state-failed-color);
 }
 
 .session-activity-row {
@@ -7361,9 +7370,9 @@ body.is-resizing-panes .pane-cell {
   align-items: center;
   gap: 6px;
   width: 100%;
-  min-height: 24px;
+  min-height: 20px;
   min-width: 0;
-  color: var(--text-muted);
+  color: inherit;
   font-family: var(--font-monospace);
   font-weight: var(--font-monospace-weight);
   font-size: var(--font-ui-smaller);
@@ -7390,16 +7399,34 @@ body.is-resizing-panes .pane-cell {
 
 .session-tool-icon {
   flex-shrink: 0;
-  color: var(--text-muted);
+  width: 2ch;
+  height: 1em;
+  color: inherit;
 }
 
 .session-tool-summary {
+  display: inline-flex;
+  align-items: baseline;
+  gap: 6px;
   flex-shrink: 0;
   max-width: min(60ch, 70%);
   overflow: hidden;
-  color: var(--activity-metadata-color);
+  color: inherit;
   text-overflow: ellipsis;
   white-space: nowrap;
+}
+
+.session-tool-verb {
+  flex-shrink: 0;
+  color: inherit;
+  font-weight: var(--fw-semibold);
+}
+
+.session-tool-target {
+  min-width: 0;
+  overflow: hidden;
+  color: inherit;
+  text-overflow: ellipsis;
 }
 
 /* Inline raw argument (full path, pattern) after the summary — dim, one line,
@@ -7408,27 +7435,138 @@ body.is-resizing-panes .pane-cell {
   flex: 1 1 auto;
   min-width: 0;
   overflow: hidden;
-  color: var(--activity-metadata-color);
+  color: inherit;
+  opacity: 0.78;
   text-overflow: ellipsis;
   white-space: nowrap;
 }
 
 .session-tool-err {
   flex-shrink: 0;
-  padding: 1px 7px;
-  border: 1px solid var(--text-muted);
-  border-radius: var(--radius-xs);
-  color: var(--activity-state-failed-color);
+  color: inherit;
   font-size: var(--fs-xs);
+  font-weight: var(--fw-semibold);
   letter-spacing: 0.02em;
   text-transform: uppercase;
+}
+
+.session-tool-status {
+  flex-shrink: 0;
+  color: inherit;
+  font-size: var(--fs-xs);
+  font-weight: var(--fw-semibold);
+  letter-spacing: 0.04em;
+  text-transform: uppercase;
+}
+
+.session-tool-status.is-working {
+  color: inherit;
+}
+
+.session-tool-status.is-failed {
+  color: inherit;
+}
+
+.session-tool-status.is-completed {
+  color: inherit;
+}
+
+.session-tool-inline-result {
+  min-width: 0;
+  overflow: hidden;
+  color: inherit;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.session-tool-error-toggle {
+  flex-shrink: 0;
+  padding: 0;
+  border: 0;
+  background: transparent;
+  color: var(--text-muted);
+  font: inherit;
+  font-size: var(--fs-xs);
+  cursor: pointer;
+}
+
+.session-tool-error-toggle:hover,
+.session-tool-error-toggle:focus-visible {
+  color: var(--activity-state-failed-color);
+  text-decoration: underline;
 }
 
 .session-tool-body {
   display: flex;
   flex-direction: column;
   gap: 4px;
-  margin: 2px 0 6px;
+  margin: 3px 0 5px;
+  padding: 2px 0 2px 8px;
+  border-left: 1px solid var(--background-modifier-border);
+  background-color: var(--background-primary-alt);
+}
+
+.session-tool-body:has(.transcript-preview.is-error) {
+  border-left-color: var(--activity-state-failed-color);
+}
+
+.session-tool-block-title {
+  min-width: 0;
+  overflow: hidden;
+  color: inherit;
+  font-family: var(--font-monospace);
+  font-size: var(--font-ui-smaller);
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.session-tool-block-preview {
+  margin-top: 2px;
+}
+
+.session-tool-raw {
+  box-sizing: border-box;
+  width: 100%;
+  min-width: 0;
+  max-width: 100%;
+  padding-left: 8px;
+  overflow-wrap: anywhere;
+}
+
+.session-tool-raw-toggle {
+  flex: 0 0 auto;
+  opacity: 0.7;
+  color: inherit;
+  font-family: var(--font-monospace);
+  font-size: var(--fs-xs);
+  cursor: pointer;
+  transition: opacity 120ms ease;
+}
+
+.session-tool-head:hover .session-tool-raw-toggle,
+.session-tool-head:focus-within .session-tool-raw-toggle,
+.session-tool-raw-toggle[aria-expanded="true"],
+.session-tool-raw-toggle:focus-visible {
+  opacity: 1;
+}
+
+.session-tool-failure-output {
+  color: var(--activity-state-failed-color);
+  overflow-wrap: anywhere;
+}
+
+.session-tool-degraded-diff {
+  padding: 10px 12px;
+  border: 1px dashed var(--background-modifier-border);
+  border-radius: var(--radius-m);
+  color: var(--text-muted);
+  font-family: var(--font-monospace);
+  font-size: var(--font-ui-smaller);
+}
+
+.session-tool-raw-toggle:hover,
+.session-tool-raw-toggle:focus-visible {
+  text-decoration: underline;
 }
 
 .session-activity-row-meta {
@@ -7518,6 +7656,14 @@ body.is-resizing-panes .pane-cell {
   overflow-wrap: anywhere;
 }
 
+.session-tool-block-body .session-tool-input,
+.session-tool-block-body .session-tool-input pre {
+  padding: 2px 0;
+  border: 0;
+  border-radius: 0;
+  background: transparent;
+}
+
 .session-tool-output-blocks {
   display: flex;
   flex-direction: column;
@@ -7529,7 +7675,9 @@ body.is-resizing-panes .pane-cell {
 }
 
 .session-thinking {
-  padding: 3px 0 10px;
+  margin: 3px 0 8px;
+  padding: 3px 0 3px 2ch;
+  border-left: 1px solid var(--background-modifier-border);
   color: var(--activity-metadata-color);
   font-family: var(--font-agent-prose);
   font-weight: var(--font-agent-prose-weight, var(--font-text-weight));
@@ -7541,7 +7689,46 @@ body.is-resizing-panes .pane-cell {
 }
 
 .session-activity-row.is-reasoning .session-activity-row-meta {
-  padding-top: 8px;
+  padding-top: 6px;
+  color: var(--activity-metadata-color);
+  font-size: var(--fs-xs);
+  letter-spacing: 0.04em;
+  text-transform: uppercase;
+}
+
+.session-activity-row.is-reasoning {
+  margin-left: calc(1ch + 6px);
+  padding-left: 10px;
+  border-left: 1px solid var(--background-modifier-border);
+}
+
+.session-thinking-head {
+  display: flex;
+  align-items: baseline;
+  gap: 8px;
+  width: 100%;
+  min-width: 0;
+  padding: 2px 0;
+  border: 0;
+  background: transparent;
+  color: var(--activity-state-working-color);
+  font: inherit;
+  font-family: var(--font-monospace);
+  text-align: left;
+  cursor: pointer;
+}
+
+.session-thinking-head:hover,
+.session-thinking-head:focus-visible {
+  color: var(--text-normal);
+}
+
+.session-thinking-title {
+  min-width: 0;
+  overflow: hidden;
+  color: var(--text-muted);
+  text-overflow: ellipsis;
+  white-space: nowrap;
 }
 
 .session-thinking-chip {
@@ -7708,12 +7895,7 @@ body.is-resizing-panes .pane-cell {
 .session-bash {
   display: flex;
   flex-direction: column;
-  gap: 6px;
-  padding: 10px 12px;
-  border: 1px solid var(--background-modifier-border);
-  border-radius: var(--radius-lg);
-  background-color: var(--background-secondary);
-  color: var(--text-muted);
+  gap: 2px;
   font-family: var(--font-monospace);
   font-weight: var(--font-monospace-weight);
   font-size: var(--font-ui-smaller);
@@ -11842,6 +12024,76 @@ textarea.composer-command-input {
   overflow-x: auto;
 }
 
+/* Tier-2 tool blocks use one title and one left-border surface. They have no
+   byte summary, copy chip, or persistent control row. */
+.transcript-preview.is-block {
+  gap: 2px;
+}
+
+.transcript-preview.is-block .transcript-preview-body {
+  padding: 2px 0;
+  border: 0;
+  border-radius: 0;
+  background: transparent;
+  color: inherit;
+}
+
+/* Short outputs are evidence, not cards. Keep the full action set in the
+   tab order, but let hover and focus reveal it when the reader needs it. */
+.transcript-preview.is-compact .transcript-preview-head {
+  gap: 6px;
+  padding: 0;
+}
+
+.transcript-preview.is-compact .transcript-preview-actions {
+  opacity: 0;
+  transition-property: opacity;
+  transition-duration: 120ms;
+}
+
+.transcript-preview.is-compact:hover .transcript-preview-actions,
+.transcript-preview.is-compact:focus-within .transcript-preview-actions {
+  opacity: 1;
+}
+
+.transcript-preview.is-compact .transcript-preview-body {
+  padding: 1px 0 3px;
+  border: none;
+  border-radius: 0;
+  background: transparent;
+  color: var(--activity-metadata-color);
+}
+
+.transcript-preview.is-compact .transcript-preview-summary {
+  color: var(--text-faint);
+  font-size: var(--fs-2xs);
+}
+
+.session-tool-body > .transcript-preview {
+  gap: 2px;
+}
+
+.session-tool-body > .transcript-preview .transcript-preview-head {
+  padding: 0;
+  color: var(--text-muted);
+}
+
+.session-tool-body > .transcript-preview .transcript-preview-body {
+  padding: 2px 0;
+  border: 0;
+  border-radius: 0;
+  background: transparent;
+}
+
+.session-output-segment.is-error {
+  color: var(--activity-state-failed-color);
+}
+
+.session-output-segment.is-note {
+  color: var(--text-faint);
+  font-style: italic;
+}
+
 .transcript-preview-body.is-wrap {
   white-space: pre-wrap;
   overflow-wrap: anywhere;
@@ -11858,9 +12110,22 @@ textarea.composer-command-input {
 }
 
 .transcript-preview-more {
+  width: fit-content;
+  padding: 0;
+  border: 0;
+  background: transparent;
+  font: inherit;
+  font-size: var(--fs-xs);
   display: block;
   color: var(--text-faint);
   font-style: italic;
+  cursor: pointer;
+}
+
+.transcript-preview-more:hover,
+.transcript-preview-more:focus-visible {
+  color: var(--text-muted);
+  text-decoration: underline;
 }
 
 .transcript-preview-body.is-custom {
@@ -11900,11 +12165,9 @@ textarea.composer-command-input {
 }
 
 .session-activity .transcript-preview-label,
-.session-activity .transcript-preview.is-error .transcript-preview-label,
 .session-activity .transcript-preview-summary,
-.session-activity .transcript-preview-body,
-.session-activity .transcript-preview.is-error .transcript-preview-body {
-  color: var(--activity-metadata-color);
+.session-activity .transcript-preview-body {
+  color: inherit;
 }
 
 /* WIKI-222: shared stream-output clamp (stream-clamp.tsx) */
@@ -15400,9 +15663,17 @@ textarea.composer-command-input {
   }
 }
 
-/* transcript scope (WIKI-245/#182): keep main's transition on the tool head until that PR restyles it */
-.session-tool-head {
-  transition-property: background-color, border-color, color, transform, opacity, box-shadow;
-  transition-duration: 120ms;
-  transition-timing-function: ease-out;
+/* WIKI-242 baseline: small transcript controls keep a 24px minimum target.
+   Real box size (no negative insets) so adjacent head controls cannot steal
+   each other's clicks across the 6px gaps. */
+.session-tool-error-toggle,
+.session-tool-raw-toggle,
+.transcript-preview-more {
+  min-height: 24px;
+  min-width: 24px;
+  padding: 2px 4px;
+}
+
+.session-thinking-head {
+  min-height: 24px;
 }

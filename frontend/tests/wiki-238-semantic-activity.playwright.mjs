@@ -46,8 +46,8 @@ const ESSENTIAL_CONTRAST_ROLES = [
   ["timeline metadata", ".session-activity-row-meta"],
   ["reasoning", ".session-thinking"],
   ["tool summary", ".session-tool-summary"],
-  ["result status", ".session-tool-result-state"],
-  ["result correlation", ".session-tool-result-summary"],
+  ["tool status", ".session-tool-status"],
+  ["tool target", ".session-tool-target"],
   ["raw preview label", ".transcript-preview-label"],
   ["raw preview body", ".transcript-preview-body"],
   ["failure badge", ".session-tool-err"],
@@ -309,50 +309,51 @@ async function main() {
       (rows) => rows.map((row) => (
         row.classList.contains("is-reasoning")
           ? "REASONING"
-          : row.classList.contains("is-result")
-            ? "RESULT"
-            : "TOOL"
+          : "TOOL"
       )),
     );
     assert(JSON.stringify(firstKinds) === JSON.stringify([
-      "REASONING", "TOOL", "RESULT", "REASONING", "TOOL", "TOOL", "RESULT", "RESULT",
+      "REASONING", "TOOL", "REASONING", "TOOL", "TOOL",
     ]),
       `timeline reading order is wrong: ${firstKinds.join("/")}`);
     const resultOutputs = await groups.nth(0).locator(
-      ".session-activity-row.is-result .transcript-preview-body",
+      ".session-tool-inline-result, .session-tool-body .transcript-preview-body",
     ).evaluateAll((elements) => elements.map((element) => element.textContent?.trim() ?? ""));
     assert(JSON.stringify(resultOutputs) === JSON.stringify([
-      "activity group source exact", "order B finished", "order A finished",
-    ]), `result completion order is wrong: ${resultOutputs.join(" / ")}`);
-    const resultSummaries = await groups.nth(0).locator(".session-tool-result-summary").allInnerTexts();
+      "activity group source exact", "order A finished", "order B finished",
+    ]), `tool output order is wrong: ${resultOutputs.join(" / ")}`);
+    const resultSummaries = (await groups.nth(0).locator(".session-tool-summary").allInnerTexts())
+      .map((text) => text.replace(/\s+/g, " ").trim());
     assert(JSON.stringify(resultSummaries) === JSON.stringify([
-      "read session.tsx", "npm test -- order-b", "read agent-events.ts",
-    ]), `result-to-call correlation order is wrong: ${resultSummaries.join(" / ")}`);
+      "read session.tsx", "read agent-events.ts", "npm test -- order-b",
+    ]), `tool-to-output correlation order is wrong: ${resultSummaries.join(" / ")}`);
 
     const firstTool = groups.nth(0).locator(".session-tool").first();
     const firstToolId = await firstTool.getAttribute("data-tool-event-id");
     assert(firstToolId, "first tool must expose its event identity for result correlation");
-    const firstResult = groups.nth(0).locator(
-      `.session-activity-row.is-result[data-tool-event-id="${firstToolId}"]`,
-    );
-    // WIKI-244: no click needed — single-line raw input renders as an inline
-    // dim detail on the call row; output is always visible in the result row.
+    const firstResult = firstTool;
+    // WIKI-245: one unit holds the call, status, and output. Single-line raw
+    // input stays inline, and output remains visible without a click.
     assert(
       (await firstTool.locator(".session-tool-detail").innerText()).trim()
         === "frontend/src/session.tsx",
       "tool row must retain exact raw input evidence inline",
     );
     assert(
-      (await firstResult.locator(".transcript-preview-body").innerText()).trim()
+      (await firstResult.locator(".session-tool-inline-result, .session-tool-body .transcript-preview-body").innerText()).trim()
         === "activity group source exact",
       "always-visible tool output must retain exact raw evidence",
     );
-    assert((await firstResult.locator(".session-tool-result-state").innerText()).toLowerCase() === "completed",
-      "ok=null results must render a neutral completed label");
+    assert((await firstResult.locator(".session-tool-status").innerText()).toLowerCase() === "completed",
+      "ok=null tools must render a neutral completed label");
     assert((await firstResult.locator(".session-activity-row-meta").innerText()) === "unknown",
       "ok=null results must not invent an ok outcome");
 
-    const longThinking = groups.nth(0).locator(".session-thinking").nth(1);
+    const longThinkingHead = groups.nth(0).locator(".session-thinking-head").nth(1);
+    assert(await longThinkingHead.getAttribute("aria-expanded") === "false",
+      "thinking should start as one quiet collapsed row");
+    await longThinkingHead.click();
+    const longThinking = groups.nth(0).locator(".session-thinking").nth(0);
     const reasoningStyle = await longThinking.evaluate((element) => {
       const style = getComputedStyle(element);
       return {
@@ -364,14 +365,13 @@ async function main() {
     });
     assert(reasoningStyle.fontStyle === "normal", `reasoning must not be italic: ${reasoningStyle.fontStyle}`);
     assert(reasoningStyle.fontSize >= 13.5, `reasoning text is too small: ${reasoningStyle.fontSize}`);
-    assert(reasoningStyle.height > 200, `long reasoning did not remain readable: ${reasoningStyle.height}`);
-    // WIKI-244: thinking renders in full — no clamp container, no show-all
-    // gate, and the final evidence line is present without any interaction.
+    assert(reasoningStyle.height > 200, `expanded reasoning did not remain readable: ${reasoningStyle.height}`);
+    // WIKI-245: thought rows start collapsed, then expose the full body.
     assert((await groups.nth(0).locator(".session-thinking .stream-clamp, .session-thinking .stream-clamp-toggle").count()) === 0,
       "thinking must not render through an interactive clamp");
     const longThinkingText = await longThinking.innerText();
     assert(longThinkingText.includes("Evidence line 18"),
-      "over-threshold reasoning must be fully readable without clicking");
+      "expanded reasoning must be fully readable after one click");
     const assistantStyle = await page.locator(".session-assistant").first().evaluate((element) => {
       const style = getComputedStyle(element);
       return { family: style.fontFamily, size: Number.parseFloat(style.fontSize) };
@@ -429,7 +429,7 @@ async function main() {
     // WIKI-244: the trace has no collapse control anywhere — assert nothing
     // interactive can hide it, then measure density on the always-open body.
     const hidingControls = await groups.nth(0).locator(
-      ".session-activity-head button, button.session-activity-head, .session-activity [aria-expanded]",
+      ".session-activity-head button, button.session-activity-head",
     ).count();
     assert(hidingControls === 0, `activity group must expose no disclosure control, found ${hidingControls}`);
 
@@ -440,12 +440,13 @@ async function main() {
     }));
     assert(normalDensity.scrollWidth <= normalDensity.clientWidth,
       `expanded normal group overflows: ${normalDensity.scrollWidth} > ${normalDensity.clientWidth}`);
-    assert(normalDensity.rows === 8, `expected 8 timeline rows, got ${normalDensity.rows}`);
+    assert(normalDensity.rows === 5, `expected 5 two-tier timeline rows, got ${normalDensity.rows}`);
     await groups.nth(0).screenshot({ path: SCREENSHOTS.expandedNormal });
 
     await page.setViewportSize({ width: 910, height: 1400 });
     await page.locator(".session-scroll").evaluate((element) => { element.scrollTop = 0; });
     await groups.nth(0).scrollIntoViewIfNeeded();
+    await groups.nth(0).locator(".session-thinking-head").first().click();
     await groups.nth(0).locator(".session-thinking").first().waitFor();
     const narrowDensity = await groups.nth(0).evaluate((element) => ({
       clientWidth: element.clientWidth,

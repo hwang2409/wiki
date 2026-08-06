@@ -527,6 +527,16 @@ export type SessionTool = {
   summary: string;
   completed_at?: string | null;
   agent_id?: string;
+  edit?: {
+    file_path?: string;
+    old_string?: string;
+    new_string?: string;
+    replace_all?: boolean;
+    patch?: string;
+    old_string_truncated?: boolean;
+    new_string_truncated?: boolean;
+    patch_truncated?: boolean;
+  };
 };
 
 export type SessionBash = {
