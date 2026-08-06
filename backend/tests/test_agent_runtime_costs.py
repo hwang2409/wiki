@@ -288,6 +288,18 @@ class CostAggregatorTests(unittest.TestCase):
         self.assertEqual(scandir.call_count, 0)
         self.assertEqual(refreshed["runs"]["run-cache"]["offset"], raw.stat().st_size)
 
+    def test_run_created_before_raw_file_is_picked_up_after_cached_refresh(self) -> None:
+        costs.refresh()
+
+        raw = self._run("run-pending")
+        costs.refresh(costs._load_state())
+
+        raw.write_text(json.dumps(_envelope("2026-07-30T10:00:00Z", _usage(10, 2))) + "\n", encoding="utf-8")
+        refreshed = costs.refresh(costs._load_state())
+
+        self.assertEqual(refreshed["runs"]["run-pending"]["offset"], raw.stat().st_size)
+        self.assertEqual(sum(record["input"] for record in refreshed["records"].values()), 10)
+
     def test_state_is_atomic_and_does_not_touch_live_paths(self) -> None:
         raw = self._run("run-atomic")
         raw.write_text(json.dumps(_envelope("2026-07-30T10:00:00Z", _usage(10, 2))) + "\n", encoding="utf-8")
