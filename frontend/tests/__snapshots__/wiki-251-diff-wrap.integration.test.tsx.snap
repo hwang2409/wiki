@@ -1,0 +1,138 @@
+// Vitest Snapshot v1, https://vitest.dev/guide/snapshot.html
+
+exports[`WIKI-251 split-diff default > split-diff snapshot covers context + pure-delete + pure-insert + paired rows 1`] = `
+[
+  {
+    "cells": [
+      {
+        "classes": [
+          "diff-code",
+          "diff-code-normal",
+        ],
+        "text": "context-line-unchanged",
+      },
+      {
+        "classes": [
+          "diff-code",
+          "diff-code-normal",
+        ],
+        "text": "context-line-unchanged",
+      },
+    ],
+    "classes": [
+      "diff-line",
+      "diff-line-normal",
+    ],
+  },
+  {
+    "cells": [
+      {
+        "classes": [
+          "diff-code",
+          "diff-code-delete",
+        ],
+        "text": "pure-delete-line",
+      },
+      {
+        "classes": [
+          "diff-code",
+          "diff-code-omit",
+        ],
+        "text": "",
+      },
+    ],
+    "classes": [
+      "diff-line",
+      "diff-line-old-only",
+    ],
+  },
+  {
+    "cells": [
+      {
+        "classes": [
+          "diff-code",
+          "diff-code-normal",
+        ],
+        "text": "context-two",
+      },
+      {
+        "classes": [
+          "diff-code",
+          "diff-code-normal",
+        ],
+        "text": "context-two",
+      },
+    ],
+    "classes": [
+      "diff-line",
+      "diff-line-normal",
+    ],
+  },
+  {
+    "cells": [
+      {
+        "classes": [
+          "diff-code",
+          "diff-code-delete",
+        ],
+        "text": "paired-old",
+      },
+      {
+        "classes": [
+          "diff-code",
+          "diff-code-insert",
+        ],
+        "text": "paired-new",
+      },
+    ],
+    "classes": [
+      "diff-line",
+      "diff-line-compare",
+    ],
+  },
+  {
+    "cells": [
+      {
+        "classes": [
+          "diff-code",
+          "diff-code-omit",
+        ],
+        "text": "",
+      },
+      {
+        "classes": [
+          "diff-code",
+          "diff-code-insert",
+        ],
+        "text": "pure-insert-line",
+      },
+    ],
+    "classes": [
+      "diff-line",
+      "diff-line-new-only",
+    ],
+  },
+  {
+    "cells": [
+      {
+        "classes": [
+          "diff-code",
+          "diff-code-normal",
+        ],
+        "text": "context-tail",
+      },
+      {
+        "classes": [
+          "diff-code",
+          "diff-code-normal",
+        ],
+        "text": "context-tail",
+      },
+    ],
+    "classes": [
+      "diff-line",
+      "diff-line-normal",
+    ],
+  },
+]
+`;

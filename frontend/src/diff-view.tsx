@@ -84,8 +84,9 @@ export function DiffPatchView({
   }
   return (
     <div
-      className={`diff-view${showLineNumbers ? " has-line-numbers" : ""}`}
+      className={`diff-view is-unified${showLineNumbers ? " has-line-numbers" : ""}`}
       data-line-numbers={showLineNumbers ? "true" : undefined}
+      data-view-type="unified"
     >
       {files.map((file, fileIndex) => {
         const kind = fileKind(file);

@@ -25,6 +25,11 @@ function assert(condition, message) {
 }
 
 async function writeFixture(target) {
+  // WIKI-251: WIKI-244+ presentation policy moved Read tools to always-inline
+  // rendering (the summary chip carries their result). To keep exercising the
+  // long/short tool-output block wrap contract, we swap Read for Bash — Bash
+  // is the canonical block-presented tool, so a long line still lands in a
+  // .session-tool-body block whose wrap CSS this stage validates.
   const rows = [
     codexAssistant(
       [
@@ -42,7 +47,7 @@ async function writeFixture(target) {
       ].join("\n"),
       "2026-07-13T12:00:00Z"
     ),
-    codexToolCall("call-long-output", "Read", '{"path":"long-output.txt"}', "2026-07-13T12:00:01Z"),
+    codexToolCall("call-long-output", "Bash", '{"command":"cat long-output.txt"}', "2026-07-13T12:00:01Z"),
     codexToolOutput("call-long-output", LONG_TOOL_LINE, "2026-07-13T12:00:02Z"),
     codexToolCall("call-short-output", "Read", '{"path":"short-output.txt"}', "2026-07-13T12:00:03Z"),
     codexToolOutput("call-short-output", "short output", "2026-07-13T12:00:04Z"),
@@ -151,23 +156,35 @@ async function main() {
     const output = await boxMetrics(longToolOutput);
     const shortOutput = await boxMetrics(shortToolOutput);
 
-    assert(longCode.overflowX === "auto", `Long code overflow-x is ${longCode.overflowX}`);
-    assert(longCode.whiteSpace === "pre", `Long code white-space is ${longCode.whiteSpace}`);
+    // WIKI-251: code fences now WRAP instead of scrolling — a horizontal
+    // scrollbar on the pre would force the reader to scroll to read the
+    // trailing token, which the design bar forbids. The old assertions here
+    // codified the opposite; they are inverted so any regression that
+    // reintroduces horizontal scroll or `white-space: pre` (without -wrap)
+    // fails this required stage.
     assert(
-      longCode.scrollWidth > longCode.clientWidth,
-      `Long code should scroll horizontally: ${JSON.stringify(longCode)}`
+      longCode.overflowX !== "auto" && longCode.overflowX !== "scroll",
+      `Long code should not scroll horizontally: overflow-x=${longCode.overflowX}`
+    );
+    assert(
+      longCode.scrollWidth <= longCode.clientWidth + 1,
+      `Long code should fit within its container without horizontal scroll: ${JSON.stringify(longCode)}`
     );
     assert(
       longCode.clientWidth === shortCode.clientWidth,
       `Long code escaped its visible container: long=${JSON.stringify(longCode)} short=${JSON.stringify(shortCode)}`
     );
     assert(
-      longCodeText.whiteSpace === "pre" && longCodeText.overflowWrap === "normal",
-      `Long code permits mid-token wrapping: ${JSON.stringify(longCodeText)}`
+      longCodeText.whiteSpace.includes("pre-wrap"),
+      `Long code fence must wrap (white-space: pre-wrap*): got ${longCodeText.whiteSpace}`
     );
     assert(
-      longCodeText.height <= longCodeText.lineHeight * 1.5,
-      `Long code wrapped vertically: ${JSON.stringify(longCodeText)}`
+      longCodeText.overflowWrap === "anywhere" || longCodeText.overflowWrap === "break-word",
+      `Long code fence must break long tokens (overflow-wrap: anywhere|break-word): got ${longCodeText.overflowWrap}`
+    );
+    assert(
+      longCodeText.height > longCodeText.lineHeight * 1.5,
+      `Long code should wrap onto multiple lines: ${JSON.stringify(longCodeText)}`
     );
     assert(
       shortCode.scrollWidth <= shortCode.clientWidth + 1,

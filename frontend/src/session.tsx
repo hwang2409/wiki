@@ -66,7 +66,7 @@ import type {
 import { hasAnsi, renderAnsi } from "./ansi";
 import { ArtifactBlock } from "./artifact-block";
 import { useArtifactInspector } from "./artifact-inspector";
-import { DiffPatchView } from "./diff-view";
+import { SplitDiffView } from "./split-diff";
 import {
   filterCommands,
   initialValues,
@@ -1307,7 +1307,13 @@ function ToolOutputBody({
             edit too large to diff — view raw
           </div>
         ) : (
-          <DiffPatchView showLineNumbers source={diffSource ?? displayOutput} />
+          <SplitDiffView
+            className="session-tool-split-diff"
+            emptyClassName="diff-view-empty"
+            emptyMessage="No diff to display."
+            patch={diffSource ?? displayOutput}
+            viewType="split"
+          />
         )}
       </div>
     );
@@ -1656,12 +1662,20 @@ export function ToolCallRow({
   // heuristics. Offered for successful outputs; failures keep the error flow.
   // Read payloads with line-number gutters would mis-tokenize — no hint then.
   const numberedPayload = /^\s*\d+[\t→|]/.test(displayOutput);
-  const polished = tool.ok !== false && displayOutput
+  // For diff-presenting tools the split-diff view IS the polished form
+  // (WIKI-251 HIGH#1 fix): don't also offer a structured-content polished
+  // toggle over "File updated." (the ack), and route the raw toggle to the
+  // patch source instead of that ack so raw actually shows what the reviewer
+  // expects to inspect.
+  const isDiffPresentation = presentation === "diff" && !!diffSource;
+  const polished = tool.ok !== false && displayOutput && !isDiffPresentation
     ? detectStructuredContent(
         displayOutput,
         numberedPayload ? null : languageForPath(toolPathHint(tool) ?? ""),
       )
     : null;
+  const rawViewSource = isDiffPresentation ? diffSource! : rawOutput;
+  const hasRawView = rawViewSource.length > 0;
   const showOutputBlock = outputBlock && (tool.ok !== false || errorShown);
   const inlineOutput = presentation === "inline" && (tool.ok !== false || errorShown)
     ? tool.ok === false && errorShown
@@ -1748,7 +1762,7 @@ export function ToolCallRow({
             {polishedOpen ? "hide polished" : "polished"}
           </button>
         ) : null}
-        {rawOutput ? (
+        {hasRawView ? (
           <button
             aria-controls={rawId}
             aria-expanded={rawOpen}
@@ -1780,31 +1794,31 @@ export function ToolCallRow({
             />
           </div>
         ) : null}
-        {rawOutput && rawOpen ? (
+        {hasRawView && rawOpen ? (
           <div className="session-tool-raw" id={rawId}>
-            <BoundedPreview rawText={rawOutput} showSummary={false} text={rawOutput} variant="block" />
+            <BoundedPreview
+              rawText={rawViewSource}
+              showSummary={false}
+              text={rawViewSource}
+              variant="block"
+            />
           </div>
         ) : null}
-        {withResult && showOutputBlock ? (
-          <ToolOutputBody
-            displayOutput={displayOutput}
-            diffSource={diffSource}
-            eventId={event.id}
-            presentation={presentation}
-            rawOutput={rawOutput}
-            segments={outputSegments}
-            tool={tool}
-          />
-        ) : isBashTool(tool) && running ? (
-          <ToolOutputBody
-            displayOutput={displayOutput}
-            diffSource={diffSource}
-            eventId={event.id}
-            presentation={presentation}
-            rawOutput={rawOutput}
-            segments={outputSegments}
-            tool={tool}
-          />
+        {/* For diff-presenting tools the split-diff view is the polished
+            branch of the raw/polished toggle: hide it while raw is open so
+            the reader sees exactly one representation at a time. */}
+        {(withResult && showOutputBlock) || (isBashTool(tool) && running) ? (
+          isDiffPresentation && rawOpen ? null : (
+            <ToolOutputBody
+              displayOutput={displayOutput}
+              diffSource={diffSource}
+              eventId={event.id}
+              presentation={presentation}
+              rawOutput={rawOutput}
+              segments={outputSegments}
+              tool={tool}
+            />
+          )
         ) : null}
         {!nested && tool.agent_id ? (
           <SubagentTrace active={running} agentId={tool.agent_id} onInspect={onInspect} ticket={ticket} />
@@ -4795,10 +4809,34 @@ export function InspectableSessionTab(props: ComponentProps<typeof SessionTab>) 
 }
 
 const WIDTH_KEY = "wiki-session-sidebar-width";
+const WIDTH_CUSTOM_KEY = "wiki-session-sidebar-width-custom";
 const MIN_WIDTH = 320;
+// WIKI-251 HIGH#4: while the reader hasn't customized the width the pane
+// width is a pure CSS expression — max(47vw, 560px floor), capped at 70vw,
+// never below 320px. The browser recomputes on resize with no JS listener,
+// so the default tracks the viewport at every screen size (not just at
+// mount). Once the user drags we persist a px value and lock to it.
+const DEFAULT_WIDTH_RATIO = 0.47;
+const DEFAULT_WIDTH_FLOOR = 560;
+const MAX_WIDTH_RATIO = 0.7;
 
-function clampWidth(width: number): number {
-  return Math.min(Math.max(width, MIN_WIDTH), Math.round(window.innerWidth * 0.7));
+// The CSS-side default. Keep the numerics in sync with the constants above.
+// Used by the JSX below and asserted by the wiki-251 playwright fixture at
+// 1280/1440/1920/2560 without a JS resize listener.
+export const DEFAULT_WIDTH_CSS = `max(${MIN_WIDTH}px, min(${MAX_WIDTH_RATIO * 100}vw, max(${DEFAULT_WIDTH_RATIO * 100}vw, ${DEFAULT_WIDTH_FLOOR}px)))`;
+
+export function computeDefaultWidth(viewport: number): number {
+  const preferred = Math.round(viewport * DEFAULT_WIDTH_RATIO);
+  const withFloor = Math.max(preferred, DEFAULT_WIDTH_FLOOR);
+  return Math.min(Math.max(withFloor, MIN_WIDTH), Math.round(viewport * MAX_WIDTH_RATIO));
+}
+
+export function clampSidebarWidth(width: number, viewport: number): number {
+  return Math.min(Math.max(width, MIN_WIDTH), Math.round(viewport * MAX_WIDTH_RATIO));
+}
+
+function clampWidth(width: number, viewport: number): number {
+  return clampSidebarWidth(width, viewport);
 }
 
 export type SidebarTarget = {
@@ -4825,9 +4863,37 @@ export function SessionSidebar({
   onClose: () => void;
   onOpenAgent: (ticket: string, panel?: "review") => void;
 }) {
-  const [width, setWidth] = useState(() =>
-    clampWidth(Number(localStorage.getItem(WIDTH_KEY)) || 480)
+  // WIKI-251 HIGH#4: isCustom tracks whether the user has ever dragged the
+  // resize handle. Until they do, the pane tracks viewport at ~47% and a
+  // window resize picks up the new ratio. After a drag we lock to a px value
+  // and re-mounts / resizes keep the persisted pixel width.
+  const [isCustom, setIsCustom] = useState<boolean>(() => {
+    if (typeof localStorage === "undefined") return false;
+    return localStorage.getItem(WIDTH_CUSTOM_KEY) === "1"
+      && Number(localStorage.getItem(WIDTH_KEY)) > 0;
+  });
+  const [customWidth, setCustomWidth] = useState<number>(() => {
+    if (typeof localStorage === "undefined") return 0;
+    const stored = Number(localStorage.getItem(WIDTH_KEY));
+    return stored > 0 ? stored : 0;
+  });
+  // Resize listener only re-clamps the CUSTOM px width against the current
+  // viewport (so the persisted px stays within the 70vw cap when the window
+  // shrinks). The default path is pure CSS — no state, no listener.
+  const [viewportWidth, setViewportWidth] = useState<number>(
+    () => (typeof window !== "undefined" ? window.innerWidth : 1440),
   );
+  useEffect(() => {
+    if (typeof window === "undefined") return;
+    if (!isCustom) return;
+    const onResize = () => setViewportWidth(window.innerWidth);
+    window.addEventListener("resize", onResize);
+    return () => window.removeEventListener("resize", onResize);
+  }, [isCustom]);
+
+  const width: string | number = isCustom
+    ? clampWidth(customWidth || computeDefaultWidth(viewportWidth), viewportWidth)
+    : DEFAULT_WIDTH_CSS;
 
   const startResize = (event: React.PointerEvent<HTMLDivElement>) => {
     event.preventDefault();
@@ -4838,13 +4904,18 @@ export function SessionSidebar({
       /* synthetic events lack a real pointer — move/up listeners still work */
     }
     const onMove = (move: PointerEvent) => {
-      setWidth(clampWidth(window.innerWidth - move.clientX));
+      const next = clampWidth(window.innerWidth - move.clientX, window.innerWidth);
+      setCustomWidth(next);
+      setIsCustom(true);
     };
     const onUp = () => {
       handle.removeEventListener("pointermove", onMove);
       handle.removeEventListener("pointerup", onUp);
-      setWidth((current) => {
-        localStorage.setItem(WIDTH_KEY, String(current));
+      setCustomWidth((current) => {
+        if (current > 0) {
+          localStorage.setItem(WIDTH_KEY, String(current));
+          localStorage.setItem(WIDTH_CUSTOM_KEY, "1");
+        }
         return current;
       });
     };
@@ -4853,7 +4924,11 @@ export function SessionSidebar({
   };
 
   return (
-    <aside className="session-sidebar" style={{ width }}>
+    <aside
+      className={`session-sidebar${isCustom ? "" : " is-default-width"}`}
+      data-width-mode={isCustom ? "custom" : "responsive"}
+      style={{ width }}
+    >
       <div className="session-resize" onPointerDown={startResize} />
       <div className="session-sidebar-inner">
         <header className="session-header">

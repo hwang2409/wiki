@@ -76,7 +76,6 @@ type BoundedPreviewProps = {
   tone?: "normal" | "error";
   renderExpandedBody?: (text: string) => ReactNode;
   renderBody?: (props: BoundedPreviewRenderProps) => ReactNode;
-  wrapAvailable?: boolean;
   expandable?: boolean;
   variant?: "default" | "block";
 };
@@ -104,12 +103,10 @@ export function BoundedPreview({
   tone = "normal",
   renderExpandedBody,
   renderBody,
-  wrapAvailable: wrapAvailableOverride,
   expandable = true,
   variant = "default",
 }: BoundedPreviewProps) {
   const [expanded, setExpanded] = useState(false);
-  const [wrap, setWrap] = useState(true);
   const [copied, setCopied] = useState(false);
   const bodyRef = useRef<HTMLElement | null>(null);
   const headRef = useRef<HTMLDivElement | null>(null);
@@ -126,8 +123,9 @@ export function BoundedPreview({
   const hiddenCount = totalLines - shownLines.length;
   const summary = showSummary ? summaryLabel(text) : null;
   const usesAnsi = ansi && hasAnsi(text);
-  const wrapAvailable = wrapAvailableOverride
-    ?? (shownLines.some((line) => line.length > 120) || totalLines > 30);
+  // WIKI-251 HIGH#3: the "keep lines" / "wrap lines" chip and its no-wrap
+  // escape hatch are gone. Nothing in this app should require horizontal
+  // scroll to read — everything wraps.
 
   const copy = useCallback(() => {
     void navigator.clipboard?.writeText(rawText).then(
@@ -185,7 +183,7 @@ export function BoundedPreview({
         expanded,
         clipped: shouldClip,
         hiddenCount,
-        wrap,
+        wrap: true,
       })
     : null;
   const defaultBody: ReactNode = renderExpandedBody && expanded
@@ -210,8 +208,6 @@ export function BoundedPreview({
     </button>
   ) : null;
 
-  const wrapChipLabel = wrap ? "keep lines" : "wrap lines";
-  const wrapChipTitle = wrap ? "Stop wrapping long lines" : "Wrap long lines to fit";
   const expandChipLabel = expanded ? "show less" : "show all";
   const expandChipTitle = expanded
     ? "Show only the preview"
@@ -228,15 +224,6 @@ export function BoundedPreview({
           {label ? <span className="transcript-preview-label">{label}</span> : null}
           {summary ? <span className="transcript-preview-summary">{summary}</span> : null}
           <span className="transcript-preview-actions">
-            {wrapAvailable ? (
-              <ChipButton
-                active={!wrap}
-                label={wrapChipLabel}
-                ariaLabel={wrapChipLabel}
-                title={wrapChipTitle}
-                onClick={() => setWrap((value) => !value)}
-              />
-            ) : null}
             {expandable && (totalLines > previewLines || heightOverflow) ? (
               <ChipButton
                 active={expanded}
@@ -259,7 +246,7 @@ export function BoundedPreview({
       ) : null}
       {custom ? (
         <div
-          className={`transcript-preview-body is-custom${wrap ? " is-wrap" : " is-nowrap"}${heightClamped ? " is-height-clamped" : ""}`}
+          className={`transcript-preview-body is-custom is-wrap${heightClamped ? " is-height-clamped" : ""}`}
           ref={(el) => { bodyRef.current = el; }}
           style={heightClamped ? { maxHeight: STREAM_CLAMP_PX } : undefined}
         >
@@ -268,7 +255,7 @@ export function BoundedPreview({
         </div>
       ) : (
         <pre
-          className={`transcript-preview-body${wrap ? " is-wrap" : " is-nowrap"}${heightClamped ? " is-height-clamped" : ""}`}
+          className={`transcript-preview-body is-wrap${heightClamped ? " is-height-clamped" : ""}`}
           ref={(el) => { bodyRef.current = el; }}
           style={heightClamped ? { maxHeight: STREAM_CLAMP_PX } : undefined}
         >

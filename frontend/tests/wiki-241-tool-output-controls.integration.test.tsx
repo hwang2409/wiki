@@ -1,8 +1,11 @@
 // @vitest-environment jsdom
-// WIKI-241: expanded tool detail uses action labels ("wrap lines" / "keep
-// lines", "show all" / "show less", "copy output"), keeps the preview head
-// visible while long bodies scroll, and anchors the transcript scroll so
-// expand and collapse do not jump the reader elsewhere.
+// WIKI-241: expanded tool detail uses action labels ("show all" / "show
+// less", "copy output"), keeps the preview head visible while long bodies
+// scroll, and anchors the transcript scroll so expand and collapse do not
+// jump the reader elsewhere. WIKI-251 removed the "wrap lines"/"keep lines"
+// chip: every tool-output body wraps unconditionally — no more no-wrap
+// escape hatch, and no more toggle whose "off" state would force horizontal
+// scroll on long lines.
 import { cleanup, fireEvent, render } from "@testing-library/react";
 import { afterEach, beforeEach, expect, test, vi } from "vitest";
 
@@ -36,18 +39,18 @@ test("head shows purpose label and summary counts", () => {
   expect(getByText(/lines · /)).toBeTruthy();
 });
 
-test("wrap toggle uses action labels and flips body wrap class", () => {
-  const { container, getByText, queryByText } = render(
+test("tool output body wraps unconditionally — WIKI-251 removed the wrap toggle", () => {
+  const { container, queryByText } = render(
     <BoundedPreview label="tool output" text={longText(35, 200)} />
   );
-  // Body starts wrapped, so the action to take is "keep lines".
-  const keep = getByText("keep lines");
+  // The old "keep lines" / "wrap lines" chip is gone. Long output body
+  // always wears .is-wrap so long tokens fall to overflow-wrap: anywhere
+  // instead of dispatching a horizontal scrollbar.
+  expect(queryByText("keep lines")).toBeNull();
+  expect(queryByText("wrap lines")).toBeNull();
   const body = container.querySelector(".transcript-preview-body");
   expect(body?.classList.contains("is-wrap")).toBe(true);
-  fireEvent.click(keep);
-  expect(queryByText("wrap lines")).toBeTruthy();
-  const body2 = container.querySelector(".transcript-preview-body");
-  expect(body2?.classList.contains("is-nowrap")).toBe(true);
+  expect(body?.classList.contains("is-nowrap")).toBe(false);
 });
 
 test("expand toggle uses show all / show less and drives is-expanded state", () => {
@@ -170,7 +173,7 @@ test("expand corrects container.scrollTop when the head shifts", () => {
   document.body.removeChild(container);
 });
 
-test("narrow layout keeps every action chip present and reachable", () => {
+test("narrow layout keeps every remaining action chip present and reachable", () => {
   const total = STREAM_CLAMP_LINES + 5;
   const { container } = render(
     <div style={{ width: "260px" }}>
@@ -179,12 +182,12 @@ test("narrow layout keeps every action chip present and reachable", () => {
   );
   const chips = Array.from(container.querySelectorAll<HTMLButtonElement>(".transcript-chip"));
   const texts = chips.map((c) => c.textContent);
-  // Every action must be present at narrow widths — chips wrap, they do not
-  // hide.
-  expect(texts).toContain("keep lines");
+  // WIKI-251: the wrap chip is gone. Show-all and copy-output remain and
+  // must both be present + accessible at narrow widths.
+  expect(texts).not.toContain("keep lines");
+  expect(texts).not.toContain("wrap lines");
   expect(texts).toContain("show all");
   expect(texts).toContain("copy output");
-  // Each chip carries an accessible name matching the action.
   for (const chip of chips) {
     expect(chip.getAttribute("aria-label")).toBeTruthy();
   }
