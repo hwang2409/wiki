@@ -9,6 +9,7 @@ updated: 2026-08-06
 
 ## 2026-08-06
 
+- WIKI-245 merged via #182: OpenCode two-tier transcript (inline rows + left-border blocks, state-as-color, Edit diffs from bounded normalizer payload, harness-wrapper semantics, raw access everywhere) — 7 rounds incl. 3 orchestrator take-over rounds
 - WIKI-246 merged via #181: OpenCode chrome language (elevation tokens, left-bar semantics, selection fill, dialog anatomy, motion + hover budgets) — 7 rounds incl. 2 orchestrator take-over rounds
 - WIKI-227 merged via #180: incremental costs scan, atomic run publication, dirty-save retry + heartbeat gating, slim /api/agents payload (5 rounds; changed-tick serialization deferred to store-pruning todo)
 - WIKI-242 merged via #179: agent-surface a11y pass (focus restore, escape paths, roving menus, 24px targets, 320px/400% reflow) after 4 review rounds

@@ -24,6 +24,7 @@ Todo:
 - LC-6: integrate practice runner into roadmap app (misc, in progress, owner: misc orch)
 - [P1] phoebe: PHO-15149 refactor umbrella to ORGANIZATION.md layout — ticket filed under epic PHO-15148; blocked by PHO-15082 (last parity PR)
 - [P2] wiki backend: boot-sweep follow-ups from 2026-08-05 latency fix — skip terminal-state runs in orphan/costs sweeps + prune accumulated run-history store (multi-GB JSONL streaming still O(history) once per boot; related WIKI-227) + incremental/bounded checkpoint for costs state persistence (changed ticks serialize full history off-loop; deferred from WIKI-227 #180 R4 by orch ruling 2026-08-06)
+- [P3] wiki repo hygiene: ~95 stale worktrees under .claude/.codex worktrees (detached review checkouts + branches of long-merged tickets, e.g. 40+ wiki-168-review*) — bulk sweep worktrees+branches for merged/closed tickets, GBs of debris
 
 Silky-smooth artifact rendering arc (Henry 2026-07-29):
 
@@ -81,7 +82,6 @@ In Progress:
 - PHO-14037 on-call transfer — investigate-then-fix worker spawned
 - PHO-15253 bash rewrite PRs A/B/C — night shift worker
 - PHO-15254 retrieve adoption tranche 1 — night shift worker
-- [P1] WIKI-245 transcript readability redesign — one visual unit per tool call, chrome diet on small results, semantic result labels, harness-wrapper stripping at render time, scan hierarchy, quiet thinking traces (Henry 2026-08-06: top priority; screenshots /tmp/WIKI-245-example-{1,2}.png)
 Backlog:
 
 - [PHO-14974](https://linear.app/phoebework/issue/PHO-14974): implement the planned v3 describe catalog after retrieve and write registry interfaces land
