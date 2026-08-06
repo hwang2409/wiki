@@ -2,10 +2,14 @@
 type: log
 tags: [log, done]
 created: 2026-07-06
-updated: 2026-08-05
+updated: 2026-08-06
 ---
 
 # Done
+
+## 2026-08-06
+
+- **wiki** — landed 2026-08-05 uncommitted hotfixes direct to main (3c180a3 orphan-sweep once-per-boot, a0b4f0c agent-prose monospace, c1c86e2 build-script venv python) + vault batch 6970c62; boot-sweep follow-up todo filed
 
 ## 2026-08-05
 
