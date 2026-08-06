@@ -11,7 +11,7 @@ Rolling ≤500-word session cache. Rewrite (don't append) at work-arc boundaries
 
 ## Active threads
 
-- **WIKI (orch `wiki-dev`)**: WIKI-244 MERGED (#178, 2026-08-06): OpenCode-style always-open transcript, block vim cursor both modes, numeric font weight; stage-runner + transcripts.py cache redesign rode along. #177 closed as superseded.
+- **WIKI (orch `wiki-dev`)**: WIKI-244 MERGED (#178, 2026-08-06). 2026-08-05 hotfixes landed direct to main (3c180a3 orphan-sweep once-per-boot, a0b4f0c agent-prose monospace, c1c86e2 build-script venv python). NEW spawn wave 2026-08-06: cdx luna implementers on **WIKI-242** (agent-surface a11y final pass, worktree wiki-242-a11y) + **WIKI-227** (incremental costs scan + slim /api/agents, worktree wiki-227-agents-perf); fleet monitor armed off `.wiki-dev-watchlist`; boot-sweep follow-up (terminal-run skip + store pruning) filed as P2 todo.
 - **PHOEBE (orch `phoebe-dev`) — v3 ladder arc:**
     - **Merge auth changed (Henry 2026-08-06): ALL v3 ladder PRs need approval from another person on the v3 agent project — Henry cannot merge alone. No orchestrator merges.**
     - **PR 1 FOUNDATION #13505 merge-ready at c056a2dc** (6 rounds; scope-down done, containment 9/9). Blocked only on `REVIEW_REQUIRED` + merge word.
