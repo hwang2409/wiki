@@ -420,6 +420,15 @@ type MultiSelectDropdownProps = {
 function MultiSelectDropdown({ label, options, selected, onToggle }: MultiSelectDropdownProps) {
   const [open, setOpen] = useState(false);
   const rootRef = useRef<HTMLDivElement | null>(null);
+  const triggerRef = useRef<HTMLButtonElement | null>(null);
+  const wasOpenRef = useRef(false);
+
+  useEffect(() => {
+    if (wasOpenRef.current && !open) {
+      window.requestAnimationFrame(() => triggerRef.current?.focus());
+    }
+    wasOpenRef.current = open;
+  }, [open]);
 
   useEffect(() => {
     if (!open) return;
@@ -452,18 +461,25 @@ function MultiSelectDropdown({ label, options, selected, onToggle }: MultiSelect
   return (
     <div className="dashboard-filter-multi" ref={rootRef}>
       <button
+        ref={triggerRef}
         type="button"
         className={`dashboard-filter-trigger${selected.length > 0 ? " is-active" : ""}`}
         onClick={() => setOpen((v) => !v)}
         aria-haspopup="listbox"
         aria-expanded={open}
+        aria-controls={`dashboard-filter-${label.toLowerCase()}-options`}
         disabled={disabled}
       >
         <span>{summary}</span>
         <ChevronDown size={12} />
       </button>
       {open ? (
-        <div className="dashboard-filter-popover" role="listbox" aria-label={`${label} filter`}>
+        <div
+          id={`dashboard-filter-${label.toLowerCase()}-options`}
+          className="dashboard-filter-popover"
+          role="listbox"
+          aria-label={`${label} filter`}
+        >
           {options.map((option) => {
             const checked = selected.includes(option);
             return (

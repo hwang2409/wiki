@@ -90,6 +90,7 @@ import {
   slashMenuOptionId,
 } from "./composer-slash-menu";
 import { externalLinkProps } from "./external-links";
+import { useModalA11y } from "./modal-a11y";
 import {
   GhPreviewCard,
   containsGitHubPreviewUrl,
@@ -833,6 +834,7 @@ function SessionModelFooter({
   const [models, setModels] = useState<AgentModelOption[]>([]);
   const [loading, setLoading] = useState(false);
   const [confirmModel, setConfirmModel] = useState<string | null>(null);
+  const modelConfirmRef = useModalA11y<HTMLDivElement>(Boolean(confirmModel));
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const currentModel = session.model ?? "";
@@ -901,6 +903,7 @@ function SessionModelFooter({
       <span className={`session-model-badge${desiredModel ? " has-queued" : ""}`}>
         <button
           aria-expanded={open}
+          aria-haspopup="listbox"
           aria-label="Change model"
           className="session-model-current"
           disabled={busy}
@@ -925,15 +928,17 @@ function SessionModelFooter({
         ) : null}
       </span>
       {open ? (
-        <div className="session-model-menu">
+        <div aria-label="Available models" className="session-model-menu" role="listbox">
           {loading ? <div className="session-model-empty">Loading models</div> : null}
           {!loading && allowedModels.length === 0 ? (
             <div className="session-model-empty">No alternate models</div>
           ) : null}
           {allowedModels.map((option) => (
             <button
+              aria-selected={option.id === currentModel}
               className="session-model-option"
               key={option.id}
+              role="option"
               type="button"
               onClick={() => setConfirmModel(option.id)}
             >
@@ -944,8 +949,16 @@ function SessionModelFooter({
         </div>
       ) : null}
       {confirmModel ? (
-        <div className="session-model-confirm" role="dialog" aria-modal="true">
+        <div
+          aria-labelledby="session-model-confirm-title"
+          className="session-model-confirm"
+          ref={modelConfirmRef}
+          role="dialog"
+          aria-modal="true"
+          tabIndex={-1}
+        >
           <div className="session-model-confirm-text">
+            <strong id="session-model-confirm-title" className="sr-only">Confirm model switch</strong>
             Switch to {confirmModel} after current turn finishes? Currently on {currentModel}.
           </div>
           <div className="session-model-confirm-actions">
