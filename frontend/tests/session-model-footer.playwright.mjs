@@ -180,6 +180,21 @@ async function main() {
     const modelTrigger = page.getByRole("button", { name: "Change model" });
     await modelTrigger.click();
     await expectFocused(page, page.getByRole("menuitem").first());
+    await page.keyboard.press("Tab");
+    await page.getByRole("menu", { name: "Available models" }).waitFor({ state: "detached" });
+
+    await modelTrigger.click();
+    await expectFocused(page, page.getByRole("menuitem").first());
+    await page.keyboard.press("Shift+Tab");
+    await page.getByRole("menu", { name: "Available models" }).waitFor({ state: "detached" });
+
+    await modelTrigger.click();
+    await expectFocused(page, page.getByRole("menuitem").first());
+    await page.keyboard.press("Escape");
+    await page.getByRole("menu", { name: "Available models" }).waitFor({ state: "detached" });
+
+    await modelTrigger.click();
+    await expectFocused(page, page.getByRole("menuitem").first());
     const modelOption = page.getByRole("menuitem", { name: /GPT 5\.5/ });
     await modelOption.click();
     await page.getByText("Switch to gpt-5.5 after current turn finishes? Currently on gpt-5.4.").waitFor();
@@ -215,7 +230,7 @@ async function main() {
     await confirmation.waitFor();
     await page.setViewportSize({ width: 320, height: 900 });
     const bounds = await confirmation.boundingBox();
-    if (!bounds || bounds.x < 12 || bounds.x + bounds.width > 308) {
+    if (!bounds || bounds.x < 56 || bounds.x + bounds.width > 320) {
       throw new Error(`model confirmation clips at 320px: ${JSON.stringify(bounds)}`);
     }
     await page.screenshot({ path: path.join(OUT_DIR, "session-model-footer.png"), fullPage: true });

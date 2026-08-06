@@ -115,9 +115,11 @@ describe("session model accessibility", () => {
     renderFooter();
     await openMenu();
     const options = screen.getAllByRole("menuitem");
+    expect(options.map((option) => option.getAttribute("tabindex"))).toEqual(["0", "-1"]);
 
     fireEvent.keyDown(options[0], { key: "ArrowDown" });
     expect(document.activeElement).toBe(options[1]);
+    expect(options[1].getAttribute("tabindex")).toBe("0");
     fireEvent.keyDown(options[1], { key: "Home" });
     expect(document.activeElement).toBe(options[0]);
     fireEvent.keyDown(options[0], { key: "End" });
@@ -126,6 +128,50 @@ describe("session model accessibility", () => {
     expect(document.activeElement).toBe(options[0]);
     fireEvent.keyDown(options[0], { key: "ArrowUp" });
     expect(document.activeElement).toBe(options.at(-1));
+  });
+
+  test("closes the menu on forward Tab, reverse Tab, and Escape", async () => {
+    renderFooter();
+    await openMenu();
+    const trigger = screen.getByRole("button", { name: "Change model" });
+    fireEvent.keyDown(screen.getAllByRole("menuitem")[0], { key: "Tab" });
+    expect(screen.queryByRole("menu", { name: "Available models" })).toBeNull();
+
+    fireEvent.click(trigger);
+    await waitFor(() => expect(document.activeElement).toBe(screen.getAllByRole("menuitem")[0]));
+    fireEvent.keyDown(screen.getAllByRole("menuitem")[0], { key: "Tab", shiftKey: true });
+    expect(screen.queryByRole("menu", { name: "Available models" })).toBeNull();
+
+    fireEvent.click(trigger);
+    await waitFor(() => expect(document.activeElement).toBe(screen.getAllByRole("menuitem")[0]));
+    fireEvent.keyDown(screen.getAllByRole("menuitem")[0], { key: "Escape" });
+    expect(screen.queryByRole("menu", { name: "Available models" })).toBeNull();
+    expect(document.activeElement).toBe(trigger);
+  });
+
+  test("uses unique menu and dialog ids for split footers", async () => {
+    render(
+      <>
+        <SessionModelFooter session={session} ticket="WIKI-242-a" />
+        <SessionModelFooter session={session} ticket="WIKI-242-b" />
+      </>,
+    );
+    const triggers = screen.getAllByRole("button", { name: "Change model" });
+    fireEvent.click(triggers[0]);
+    fireEvent.click(triggers[1]);
+    await waitFor(() => expect(screen.getAllByRole("menu", { name: "Available models" })).toHaveLength(2));
+
+    const menus = screen.getAllByRole("menu", { name: "Available models" });
+    expect(new Set(menus.map((menu) => menu.id)).size).toBe(2);
+    expect(triggers[0].getAttribute("aria-controls")).toBe(menus[0].id);
+    expect(triggers[1].getAttribute("aria-controls")).toBe(menus[1].id);
+
+    fireEvent.click(screen.getAllByRole("menuitem")[0]);
+    const dialogs = await screen.findAllByRole("dialog");
+    expect(dialogs).toHaveLength(1);
+    const titleId = dialogs[0].getAttribute("aria-labelledby");
+    expect(titleId).toBeTruthy();
+    expect(document.getElementById(titleId!)).toBeTruthy();
   });
 
   test("wraps dialog Tab focus and closes on Escape", async () => {

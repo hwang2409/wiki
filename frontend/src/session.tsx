@@ -835,6 +835,9 @@ export function SessionModelFooter({
   const [loading, setLoading] = useState(false);
   const [confirmModel, setConfirmModel] = useState<string | null>(null);
   const modelTriggerRef = useRef<HTMLButtonElement | null>(null);
+  const modelA11yId = useId();
+  const modelMenuId = `session-model-menu-${modelA11yId}`;
+  const modelConfirmTitleId = `session-model-confirm-title-${modelA11yId}`;
   const modelConfirmRef = useModalA11y<HTMLDivElement>(
     Boolean(confirmModel),
     () => setConfirmModel(null),
@@ -842,6 +845,7 @@ export function SessionModelFooter({
   );
   const modelMenuRef = useRef<HTMLDivElement | null>(null);
   const modelOptionRefs = useRef<Array<HTMLButtonElement | null>>([]);
+  const [menuActiveIndex, setMenuActiveIndex] = useState(0);
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const currentModel = session.model ?? "";
@@ -857,11 +861,24 @@ export function SessionModelFooter({
 
   useEffect(() => {
     if (!open || loading || allowedModels.length === 0) return;
-    const frame = window.requestAnimationFrame(() => modelOptionRefs.current[0]?.focus());
+    const frame = window.requestAnimationFrame(() => {
+      setMenuActiveIndex(0);
+      modelOptionRefs.current[0]?.focus();
+    });
     return () => window.cancelAnimationFrame(frame);
   }, [allowedModels.length, loading, open]);
 
   function handleModelMenuKeyDown(event: React.KeyboardEvent<HTMLDivElement>) {
+    if (event.key === "Tab") {
+      setOpen(false);
+      return;
+    }
+    if (event.key === "Escape") {
+      event.preventDefault();
+      setOpen(false);
+      modelTriggerRef.current?.focus();
+      return;
+    }
     const options = modelOptionRefs.current.filter(
       (option): option is HTMLButtonElement => option !== null,
     );
@@ -872,14 +889,9 @@ export function SessionModelFooter({
     else if (event.key === "ArrowUp") nextIndex = activeIndex < 0 ? options.length - 1 : (activeIndex - 1 + options.length) % options.length;
     else if (event.key === "Home") nextIndex = 0;
     else if (event.key === "End") nextIndex = options.length - 1;
-    else if (event.key === "Escape") {
-      event.preventDefault();
-      setOpen(false);
-      modelTriggerRef.current?.focus();
-      return;
-    }
     if (nextIndex === null) return;
     event.preventDefault();
+    setMenuActiveIndex(nextIndex);
     options[nextIndex]?.focus();
   }
 
@@ -938,7 +950,7 @@ export function SessionModelFooter({
       <span className={`session-model-badge${desiredModel ? " has-queued" : ""}`}>
         <button
           aria-expanded={open}
-          aria-controls="session-model-menu"
+          aria-controls={modelMenuId}
           aria-haspopup="menu"
           aria-label="Change model"
           className="session-model-current"
@@ -968,7 +980,7 @@ export function SessionModelFooter({
         <div
           aria-label="Available models"
           className="session-model-menu"
-          id="session-model-menu"
+          id={modelMenuId}
           ref={modelMenuRef}
           role="menu"
           onKeyDown={handleModelMenuKeyDown}
@@ -983,6 +995,7 @@ export function SessionModelFooter({
               key={option.id}
               ref={(element) => { modelOptionRefs.current[index] = element; }}
               role="menuitem"
+              tabIndex={index === menuActiveIndex ? 0 : -1}
               type="button"
               onClick={() => setConfirmModel(option.id)}
             >
@@ -994,7 +1007,7 @@ export function SessionModelFooter({
       ) : null}
       {confirmModel ? (
         <div
-          aria-labelledby="session-model-confirm-title"
+          aria-labelledby={modelConfirmTitleId}
           className="session-model-confirm"
           ref={modelConfirmRef}
           role="dialog"
@@ -1002,7 +1015,7 @@ export function SessionModelFooter({
           tabIndex={-1}
         >
           <div className="session-model-confirm-text">
-            <strong id="session-model-confirm-title" className="sr-only">Confirm model switch</strong>
+            <strong id={modelConfirmTitleId} className="sr-only">Confirm model switch</strong>
             Switch to {confirmModel} after current turn finishes? Currently on {currentModel}.
           </div>
           <div className="session-model-confirm-actions">

@@ -56,7 +56,9 @@ export function ReplaceAgentModal({
   const [submitting, setSubmitting] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [advancedOpen, setAdvancedOpen] = useState(false);
-  const dialogRef = useModalA11y<HTMLFormElement>(true);
+  const dialogRef = useModalA11y<HTMLFormElement>(true, () => {
+    if (!submitting) onClose();
+  });
 
   useEffect(() => {
     if (models) {
@@ -75,14 +77,6 @@ export function ReplaceAgentModal({
       ignore = true;
     };
   }, [models]);
-
-  useEffect(() => {
-    function onKeyDown(event: globalThis.KeyboardEvent) {
-      if (event.key === "Escape" && !submitting) onClose();
-    }
-    window.addEventListener("keydown", onKeyDown);
-    return () => window.removeEventListener("keydown", onKeyDown);
-  }, [onClose, submitting]);
 
   const filteredModels = availableModels.filter((option) => option.kind === kind);
 

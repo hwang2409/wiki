@@ -270,7 +270,7 @@ export function SpawnWorkerModal({
   const [confirming, setConfirming] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [advancedOpen, setAdvancedOpen] = useState(false);
-  const dialogRef = useModalA11y<HTMLFormElement>(true);
+  const dialogRef = useModalA11y<HTMLFormElement>(true, requestClose);
 
   function requestClose() {
     if (submitting) return;
@@ -288,14 +288,6 @@ export function SpawnWorkerModal({
     setPreludeLoading(true);
     setPreludeError(null);
   }
-
-  useEffect(() => {
-    function onKeyDown(event: globalThis.KeyboardEvent) {
-      if (event.key === "Escape") requestClose();
-    }
-    window.addEventListener("keydown", onKeyDown);
-    return () => window.removeEventListener("keydown", onKeyDown);
-  }, [onClose, submitting]);
 
   useEffect(() => {
     const allowed = modelsForKind(models, kind);
@@ -776,7 +768,7 @@ export function SpawnOrchestratorModal({
   const [confirming, setConfirming] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [advancedOpen, setAdvancedOpen] = useState(false);
-  const dialogRef = useModalA11y<HTMLFormElement>(true);
+  const dialogRef = useModalA11y<HTMLFormElement>(true, requestClose);
   const projectDirTouched = useRef(false);
   const workspaceRootProvided = workspaceRootReady && Boolean(workspaceRoot?.trim());
 
@@ -794,14 +786,6 @@ export function SpawnOrchestratorModal({
     setConfirming(false);
     setError(null);
   }
-
-  useEffect(() => {
-    function onKeyDown(event: globalThis.KeyboardEvent) {
-      if (event.key === "Escape") requestClose();
-    }
-    window.addEventListener("keydown", onKeyDown);
-    return () => window.removeEventListener("keydown", onKeyDown);
-  }, [onClose, submitting]);
 
   useEffect(() => {
     const nextDefault = defaultOrchestratorModel(models, kind);

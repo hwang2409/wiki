@@ -75,9 +75,11 @@ export function useModalA11y<T extends HTMLElement>(
     const frame = window.requestAnimationFrame(focusFirst);
     const onKeyDown = (event: KeyboardEvent) => {
       if (event.key === "Escape") {
+        const onEscape = onEscapeRef.current;
+        if (!onEscape) return;
         event.preventDefault();
         event.stopPropagation();
-        onEscapeRef.current?.();
+        onEscape();
         return;
       }
       if (event.key !== "Tab") return;
