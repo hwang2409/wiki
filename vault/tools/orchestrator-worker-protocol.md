@@ -33,6 +33,15 @@ Flow: orchestrator spawns luna implementer → worker signals merge-ready → or
 
 **Immediate-archive rule applies to ALL one-shot verification workers, not just reviewers (Henry 2026-07-17b).** Sim runners (`-SIM<n>`), eval runners (`-EVAL<n>`), auditors (`-AUDIT<n>`), canary runs (`-CANARY<n>`), thermo-nuclear reviews (`-THERMO<n>`), and any other "produce one report → done" worker follows the same rule: the moment their output is routed (steered to the implementer OR clean-pass surfaced), the very next tool call is `archive_agent` on that worker with `outcome=closed`. Leaving them idle-merge-ready burns a soft-cap slot and (for reviewers) triggers unrouted-verdict re-alarms every 5 min. Applied case 2026-07-17b: PHO-13944-SIM4 findings routed to PHO-13944-PR2 but sim worker not archived; Henry corrected — rule widened from reviewers-only to every one-shot verification worker.
 
+## Worker lifecycle doctrine (Henry 2026-08-06e)
+
+Henry's model of the optimal Wiki workflow, locked as canon:
+
+- **Orchestrators are the ONLY long-running sessions.** Everything else is bounded.
+- **Workers are one-shot contract executors.** They receive a contract (kickoff prompt), complete it, signal, and are archived. Workers do NOT do anything expensive: no spawning subagents, no fan-out, no side quests, no scope expansion beyond the contract. Kickoff prompts must state the no-subagents rule explicitly — implicit was not enough.
+- **Default loop shape: worker1 → reviewer1 → worker2 (fresh, with fix contract) → reviewer2 → ... .** When a review verdict has findings, the default is to archive the implementer and spawn a FRESH implementer with a compact fix contract (findings compressed to observed → why wrong → do instead → constraint). Fresh workers carry no stale context, and writing the contract forces the orchestrator to actually digest the findings.
+- **Steering escape hatch (Henry-approved 2026-08-06e): the orchestrator MAY steer the live implementer instead of replacing it when BOTH hold: (a) the fix contract is small, and (b) the worker's in-flight state — root-cause understanding, debugging context, a built mental model — is the expensive part to rebuild.** Example: a multi-round root-cause hunt like WIKI-259's virtualization bug, where a fresh worker would re-pay full ramp-up for a two-line fix list. Replacement stays the default; steering is the exception and is an orchestrator judgment call, never a worker request.
+
 ## Autonomy invariant (Henry 2026-07-17)
 
 **The orchestrator is autonomous. The only human checkpoint is merge authorization.** Every intermediate step — spawn, steer, respawn, sim, review, eval, audit, thermo, rerun — is orchestrator action, taken without confirming with Henry.
