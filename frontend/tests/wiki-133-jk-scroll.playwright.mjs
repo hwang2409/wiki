@@ -180,10 +180,12 @@ async function main() {
     const settings = page.locator(".settings-modal");
     await settings.waitFor({ state: "visible" });
     await page.keyboard.press("Escape");
+    // WIKI-244: the weight <select> became a numeric input — same contract:
+    // key events inside a modal form control must not scroll the session.
     await assertTextEntryDoesNotScroll(
       page,
       scroller,
-      settings.locator("select").first(),
+      settings.locator("input.font-weight-input").first(),
       "modal",
       { bubbleToDocument: true },
     );

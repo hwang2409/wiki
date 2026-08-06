@@ -535,14 +535,9 @@ async function main() {
       node.dispatchEvent(new Event("scroll"));
     });
     await page.waitForTimeout(200);
-    const activityHead = page.locator(".session-activity-head").first();
-    await activityHead.click();
-    await page.waitForSelector(".session-activity .session-activity-collapsible.is-open");
-    await activityHead.click();
-    await page.waitForFunction(() => {
-      const collapsible = document.querySelector(".session-activity .session-activity-collapsible");
-      return collapsible && !collapsible.classList.contains("is-open");
-    });
+    // WIKI-244: the activity trace is always visible — there is no collapse
+    // state to persist. Assert the body survives a window round-trip instead.
+    await page.waitForSelector(".session-activity .session-activity-body");
     await leaderChord(page, "1");
     await page.waitForFunction(
       () => document.querySelector(".tmux-status-item.is-active .tmux-status-index")?.textContent === "1",
@@ -552,9 +547,7 @@ async function main() {
     await page.waitForFunction(
       () => document.querySelector(".tmux-status-item.is-active .tmux-status-index")?.textContent === "0",
     );
-    const collapsedAfterReturn = await page.locator(".session-activity .session-activity-collapsible").evaluate(
-      (node) => !node.classList.contains("is-open"),
-    );
+    const collapsedAfterReturn = (await page.locator(".session-activity .session-activity-body").count()) > 0;
     await page.screenshot({ path: COLLAPSE_SCREENSHOT, fullPage: true });
 
     const smoke = {};

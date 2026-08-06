@@ -1821,8 +1821,9 @@ body.is-resizing-panes .pane-cell {
   display: flex;
   align-items: center;
   gap: 8px;
-  flex-shrink: 0;
+  min-width: 0;
   flex-wrap: wrap;
+  justify-content: flex-end;
 }
 
 .settings-row:has(.font-setting-controls) .settings-row-info {
@@ -1848,6 +1849,65 @@ body.is-resizing-panes .pane-cell {
 .font-weight-picker:focus {
   border-color: var(--text-muted);
   outline: none;
+}
+
+/* WIKI-244: weight is a free numeric input (1–1000) so variable fonts can
+   use any axis value; detected face stops remain one-click presets. */
+.settings-row .font-weight-input {
+  width: 72px;
+  padding: 6px 8px;
+  border: 1px solid var(--background-modifier-border);
+  border-radius: var(--radius-xs);
+  background-color: var(--background-secondary);
+  color: var(--text-normal);
+  font-family: var(--font-monospace);
+  font-weight: var(--font-monospace-weight);
+  font-size: var(--font-ui-smaller);
+  font-variant-numeric: tabular-nums;
+}
+
+.settings-row .font-weight-input:hover,
+.settings-row .font-weight-input:focus {
+  border-color: var(--text-muted);
+  outline: none;
+}
+
+.font-weight-stops {
+  display: flex;
+  gap: 4px;
+  flex-wrap: wrap;
+}
+
+.font-weight-stop {
+  min-height: 26px;
+  padding: 2px 7px;
+  border: 1px solid transparent;
+  border-radius: var(--radius-xs);
+  background-color: transparent;
+  color: var(--text-muted);
+  font-family: var(--font-monospace);
+  font-weight: var(--font-monospace-weight);
+  font-size: var(--fs-xs);
+  font-variant-numeric: tabular-nums;
+  cursor: pointer;
+  transition-property: color, border-color, background-color;
+  transition-duration: 120ms;
+}
+
+.font-weight-stop:hover {
+  border-color: var(--background-modifier-border);
+  color: var(--text-normal);
+}
+
+.font-weight-stop:focus-visible {
+  outline: 2px solid var(--interactive-accent);
+  outline-offset: 1px;
+}
+
+.font-weight-stop.is-active {
+  border-color: var(--background-modifier-border);
+  background-color: color-mix(in srgb, var(--background-modifier-border) 40%, transparent);
+  color: var(--text-normal);
 }
 
 .font-picker {
@@ -6378,16 +6438,32 @@ body.is-resizing-panes .pane-cell {
   font-weight: var(--fw-normal);
 }
 
-.codex-stream-diff-toggle {
-  width: 100%;
-  text-align: left;
-  transition-property: border-bottom-color;
-  transition-duration: 160ms;
-  transition-timing-function: ease-out;
+/* WIKI-244: the working diff renders open — the section head is a status
+   line with a raw-diff copy control, not a toggle. */
+.codex-stream-diff-copy {
+  margin-left: 8px;
+  padding: 1px 7px;
+  border: 1px solid transparent;
+  border-radius: var(--radius-xs);
+  background: transparent;
+  color: var(--text-muted);
+  font-family: var(--font-monospace);
+  font-weight: var(--font-monospace-weight);
+  font-size: var(--fs-xs);
+  text-transform: lowercase;
+  cursor: pointer;
+  transition-property: color, border-color;
+  transition-duration: 120ms;
 }
 
-.codex-stream-diff.is-collapsed > .codex-stream-diff-toggle {
-  border-bottom-color: transparent;
+.codex-stream-diff-copy:hover {
+  border-color: var(--background-modifier-border);
+  color: var(--text-normal);
+}
+
+.codex-stream-diff-copy:focus-visible {
+  outline: 2px solid var(--interactive-accent);
+  outline-offset: 1px;
 }
 
 .codex-stream-diff-file + .codex-stream-diff-file {
@@ -6402,15 +6478,6 @@ body.is-resizing-panes .pane-cell {
   padding: 5px 7px;
   color: var(--text-normal);
   text-align: left;
-}
-
-.codex-stream-diff-file-head svg {
-  flex: 0 0 auto;
-  transition: transform 100ms ease-out;
-}
-
-.codex-stream-diff-file-head svg.is-open {
-  transform: rotate(90deg);
 }
 
 .codex-stream-diff-file-head > span:first-of-type {
@@ -7312,7 +7379,7 @@ body.is-resizing-panes .pane-cell {
   padding: 2px 0;
   color: var(--text-normal);
   font-family: var(--font-agent-prose);
-  font-weight: var(--font-text-weight);
+  font-weight: var(--font-agent-prose-weight, var(--font-text-weight));
   font-size: var(--font-text-size);
   line-height: 1.65;
   overflow-wrap: break-word;
@@ -7336,27 +7403,22 @@ body.is-resizing-panes .pane-cell {
   overflow-wrap: break-word;
 }
 
+/* WIKI-244: the activity head is a noninteractive status line — no collapse
+   control exists, so no hover affordance and no hit-area minimum. */
 .session-activity-head {
   display: flex;
   align-items: center;
   gap: 6px;
   width: 100%;
-  min-height: 40px;
+  min-height: 30px;
   min-width: 0;
-  padding: 7px 10px;
+  padding: 5px 10px;
+  border-bottom: 1px solid var(--background-modifier-border);
   color: var(--text-subtle-readable);
   font-family: var(--font-monospace);
   font-weight: var(--font-monospace-weight);
   font-size: var(--font-ui-smaller);
   text-align: left;
-  transition-property: background-color, color;
-  transition-duration: 150ms;
-  transition-timing-function: ease-out;
-}
-
-.session-activity-head:hover {
-  background-color: var(--background-modifier-hover);
-  color: var(--text-normal);
 }
 
 .session-activity {
@@ -7432,25 +7494,6 @@ body.is-resizing-panes .pane-cell {
   font-weight: var(--font-monospace-weight);
 }
 
-.session-tool-head {
-  display: flex;
-  align-items: center;
-  gap: 6px;
-  min-width: 0;
-  padding: 5px 8px;
-  border-radius: var(--radius-xs);
-  color: var(--text-muted);
-  font-family: var(--font-monospace);
-  font-weight: var(--font-monospace-weight);
-  font-size: var(--font-ui-smaller);
-  text-align: left;
-}
-
-.session-tool-head:hover {
-  background-color: var(--background-modifier-hover);
-  color: var(--text-normal);
-}
-
 .session-collapsible {
   display: grid;
   grid-template-rows: 0fr;
@@ -7474,20 +7517,54 @@ body.is-resizing-panes .pane-cell {
   overflow: hidden;
 }
 
+/* WIKI-244: OpenCode-style trace — flat, dense, always-visible rows. A tool
+   call is one dim connector line; its input/output sits directly beneath in
+   monospace. No label gutter, no per-row borders, no click-to-read. */
 .session-activity-body {
   display: flex;
   flex-direction: column;
   margin: 0;
-  border-top: 1px solid var(--background-modifier-border);
+  padding: 4px 10px 8px;
 }
 
 .session-tool {
   min-width: 0;
 }
 
+.session-activity-row {
+  min-width: 0;
+}
+
 .session-tool-head {
+  display: flex;
+  align-items: center;
+  gap: 6px;
   width: 100%;
-  min-height: 40px;
+  min-height: 24px;
+  min-width: 0;
+  color: var(--text-muted);
+  font-family: var(--font-monospace);
+  font-weight: var(--font-monospace-weight);
+  font-size: var(--font-ui-smaller);
+  text-align: left;
+}
+
+.session-trace-connector {
+  flex-shrink: 0;
+  width: 1ch;
+  color: var(--text-faint);
+  font-family: var(--font-monospace);
+  font-weight: var(--font-monospace-weight);
+  line-height: 1;
+}
+
+.session-trace-indent {
+  min-width: 0;
+  padding-left: calc(1ch + 6px);
+}
+
+.session-trace-indent:empty {
+  display: none;
 }
 
 .session-tool-icon {
@@ -7496,6 +7573,19 @@ body.is-resizing-panes .pane-cell {
 }
 
 .session-tool-summary {
+  flex-shrink: 0;
+  max-width: min(60ch, 70%);
+  overflow: hidden;
+  color: var(--activity-metadata-color);
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+/* Inline raw argument (full path, pattern) after the summary — dim, one line,
+   full text preserved in the DOM and title for exact evidence. */
+.session-tool-detail {
+  flex: 1 1 auto;
+  min-width: 0;
   overflow: hidden;
   color: var(--activity-metadata-color);
   text-overflow: ellipsis;
@@ -7517,36 +7607,7 @@ body.is-resizing-panes .pane-cell {
   display: flex;
   flex-direction: column;
   gap: 4px;
-  margin-top: 4px;
-}
-
-.session-activity-row {
-  display: grid;
-  grid-template-columns: minmax(78px, 96px) minmax(0, 1fr);
-  min-width: 0;
-  border-bottom: 1px solid var(--background-modifier-border);
-}
-
-.session-activity-body > .session-activity-row:last-child,
-.session-tool:last-child > .session-activity-row:last-child {
-  border-bottom: 0;
-}
-
-.session-activity-row-label {
-  padding: 10px 9px;
-  border-right: 1px solid var(--background-modifier-border);
-  background-color: var(--code-background);
-  color: var(--activity-metadata-color);
-  font-family: var(--font-monospace);
-  font-weight: var(--font-monospace-weight);
-  font-size: var(--fs-xs);
-  letter-spacing: 0.04em;
-  text-transform: uppercase;
-}
-
-.session-activity-row-content {
-  min-width: 0;
-  padding: 0 9px;
+  margin: 2px 0 6px;
 }
 
 .session-activity-row-meta {
@@ -7559,12 +7620,21 @@ body.is-resizing-panes .pane-cell {
 .session-tool-result {
   display: flex;
   align-items: center;
-  gap: 8px;
-  min-height: 40px;
+  gap: 6px;
+  min-height: 24px;
+  min-width: 0;
   color: var(--activity-metadata-color);
   font-family: var(--font-monospace);
   font-weight: var(--font-monospace-weight);
   font-size: var(--font-ui-smaller);
+}
+
+.session-tool-result-state {
+  flex-shrink: 0;
+  color: var(--activity-metadata-color);
+  font-size: var(--fs-xs);
+  letter-spacing: 0.04em;
+  text-transform: uppercase;
 }
 
 .session-tool-result-summary {
@@ -7574,8 +7644,37 @@ body.is-resizing-panes .pane-cell {
   white-space: nowrap;
 }
 
-.session-activity-row.is-failed .session-tool-result {
+.session-activity-row.is-failed .session-tool-result,
+.session-activity-row.is-failed .session-tool-result-state {
   color: var(--activity-state-failed-color);
+}
+
+/* Sub-agent trace: child tool calls as one-line rows indented under the
+   parent agent tool (OpenCode "Explore Task" grouping). */
+.session-subtrace {
+  display: flex;
+  flex-direction: column;
+  margin: 1px 0 4px;
+}
+
+.session-subtrace-row {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  min-height: 22px;
+  min-width: 0;
+  color: var(--text-muted);
+  font-family: var(--font-monospace);
+  font-weight: var(--font-monospace-weight);
+  font-size: var(--fs-xs);
+}
+
+.session-subtrace-more {
+  min-height: 22px;
+  color: var(--text-faint);
+  font-family: var(--font-monospace);
+  font-weight: var(--font-monospace-weight);
+  font-size: var(--fs-xs);
 }
 
 .session-tool-body pre {
@@ -7612,7 +7711,7 @@ body.is-resizing-panes .pane-cell {
   padding: 3px 0 10px;
   color: var(--activity-metadata-color);
   font-family: var(--font-agent-prose);
-  font-weight: var(--font-text-weight);
+  font-weight: var(--font-agent-prose-weight, var(--font-text-weight));
   font-size: var(--font-ui-small);
   font-style: normal;
   line-height: 1.6;
@@ -8487,7 +8586,10 @@ body.is-resizing-panes .pane-cell {
   display: none;
 }
 
-.session-composer textarea.is-vim-normal {
+/* WIKI-244: the composer cursor is a block in every vim mode. The native
+   line caret stays hidden; the overlay block (below) tracks the caret in
+   insert mode, and the one-char selection paints the block in normal mode. */
+.session-input-wrap textarea {
   caret-color: transparent;
 }
 
@@ -8511,10 +8613,14 @@ body.is-resizing-panes .pane-cell {
   position: absolute;
   z-index: 1;
   width: 1ch;
-  height: calc(var(--font-ui-small) * 1.4);
-  background-color: var(--text-faint);
+  height: calc(var(--font-ui-small) * 1.5);
+  overflow: hidden;
+  background-color: var(--selection-inverse-background);
+  color: var(--selection-inverse-color);
   font-family: var(--font-monospace);
   font-weight: var(--font-monospace-weight);
+  font-size: var(--font-ui-small);
+  line-height: 1.5;
   pointer-events: none;
 }
 
@@ -11843,23 +11949,41 @@ textarea.composer-command-input {
 
 .transcript-preview-head {
   display: flex;
-  align-items: baseline;
+  align-items: center;
   gap: 8px;
   min-width: 0;
+  padding: 2px 0;
   font-family: var(--font-monospace);
   font-weight: var(--font-monospace-weight);
   font-size: var(--fs-xs);
   letter-spacing: 0.03em;
-  color: var(--text-faint);
+  color: var(--text-muted);
+  z-index: 3;
+}
+
+/* WIKI-241: while the payload is expanded the head becomes a compact sticky
+   band so section purpose, summary counts, and the wrap/collapse/copy
+   controls stay one glance away no matter how far the reader scrolls. */
+.transcript-preview.is-expanded .transcript-preview-head {
+  position: sticky;
+  top: 0;
+  padding: 4px 6px;
+  border: 1px solid var(--background-modifier-border);
+  border-radius: var(--radius-xs);
+  background-color: color-mix(in srgb, var(--background-primary) 92%, transparent);
+  backdrop-filter: blur(6px);
+  -webkit-backdrop-filter: blur(6px);
 }
 
 .transcript-preview-label {
   text-transform: uppercase;
-  color: var(--text-faint);
+  color: var(--text-normal);
+  font-weight: var(--fw-semibold);
+  letter-spacing: 0.05em;
 }
 
 .transcript-preview.is-error .transcript-preview-label {
-  color: color-mix(in srgb, var(--accent-danger) 70%, var(--text-faint));
+  color: var(--text-normal);
 }
 
 .transcript-preview-summary {
@@ -11877,25 +12001,41 @@ textarea.composer-command-input {
 }
 
 .transcript-chip {
-  padding: 1px 7px;
+  position: relative;
+  padding: 3px 9px;
   border: 1px solid transparent;
   border-radius: var(--radius-xs);
   background: transparent;
-  color: var(--text-faint);
+  color: var(--text-muted);
   font-family: inherit;
   font-size: inherit;
   letter-spacing: inherit;
   text-transform: lowercase;
   cursor: pointer;
+  transition-property: color, border-color, background-color;
+  transition-duration: 120ms;
+}
+
+/* WIKI-241: widen the tap target without inflating the visible chip. */
+.transcript-chip::before {
+  content: "";
+  position: absolute;
+  inset: -8px -6px;
 }
 
 .transcript-chip:hover {
   border-color: var(--background-modifier-border);
-  color: var(--text-muted);
+  color: var(--text-normal);
+}
+
+.transcript-chip:focus-visible {
+  outline: 2px solid var(--interactive-accent);
+  outline-offset: 2px;
 }
 
 .transcript-chip.is-active {
   border-color: var(--background-modifier-border);
+  background-color: color-mix(in srgb, var(--background-modifier-border) 40%, transparent);
   color: var(--text-normal);
 }
 
@@ -11971,9 +12111,9 @@ textarea.composer-command-input {
 }
 
 .session-activity .transcript-preview-label,
+.session-activity .transcript-preview.is-error .transcript-preview-label,
 .session-activity .transcript-preview-summary,
 .session-activity .transcript-preview-body,
-.session-activity .transcript-preview.is-error .transcript-preview-label,
 .session-activity .transcript-preview.is-error .transcript-preview-body {
   color: var(--activity-metadata-color);
 }

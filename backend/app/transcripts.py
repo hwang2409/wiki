@@ -28,6 +28,7 @@ import os
 import re
 import threading
 from collections.abc import Callable
+from contextlib import contextmanager
 from copy import deepcopy
 from datetime import datetime, timedelta, timezone
 from pathlib import Path, PurePosixPath
@@ -2152,18 +2153,129 @@ _APPLY = {
     "codex-normalized": _codex_normalized_apply,
     "claude-normalized": _claude_normalized_apply,
 }
-_cache: dict[str, dict] = {}  # path → parse state; wiped on reload, rebuilt lazily
-_cache_locks: dict[str, threading.Lock] = {}
-_cache_locks_guard = threading.Lock()
+# ---------------------------------------------------------------------------
+# Cache-layer concurrency model (WIKI-244 R8 — one design, all rules here).
+#
+# Locks:
+#   _cache_locks_guard  — ONE short-hold registry mutex. Protects the
+#                         STRUCTURE and entries of all three registries:
+#                         _cache (path → parse state), _cache_locks
+#                         (path → _PathLockEntry incl. refcounts), and
+#                         _subagent_intros (child path → intro tuple).
+#   _PathLockEntry.lock — one per-path critical section, entered via
+#                         _path_lock(key). Covers the FULL read-modify-write
+#                         span for that transcript: the parse state dict,
+#                         its agent_child_assignments map, and any intro
+#                         data consulted while annotating that path.
+#
+# Lock ordering:
+#   A thread MAY take the guard while holding a path lock (guard is a leaf).
+#   A thread MUST NEVER acquire a path lock while holding the guard —
+#   _path_lock releases the guard before blocking on the path lock.
+#   The guard is never held across file I/O or any blocking call.
+#
+# Escape rule:
+#   No mutable registry object may be mutated after its lock is released.
+#   Parse states and their agent_child_assignments are only mutated inside
+#   _path_lock(main path) — including by annotate_agent_events, which holds
+#   the path lock for its whole read-modify-write span. _subagent_intros
+#   entries are immutable tuples; every compound operation on the map
+#   (lookup+validate+delete, evict+insert) happens inside the guard, with
+#   file reads OUTSIDE the guard and a re-stat validation before publish.
+#
+# Identity / reset / bound (per registry):
+#   _cache            — states carry device+inode; identity change or shrink
+#                       rebuilds (dropping the assignment map inside);
+#                       LRU-bounded at _PARSE_CACHE_MAX.
+#   _cache_locks      — refcounted; an entry is only evicted at refcount 0
+#                       (refcounts increment under the guard BEFORE lock
+#                       acquisition, so eviction can never split one path
+#                       across two lock objects); orphan entries swept.
+#   _subagent_intros  — entries carry device+inode+size; replacement or
+#                       shrink reloads; insertion-order bounded.
+#
+# Eviction points:
+#   1. On state creation (under the guard, inside _read_cached_state).
+#   2. On path-lock RELEASE when the refcount falls to zero (under the
+#      guard, inside _path_lock's finally) — so a concurrent burst of many
+#      paths trims back to the bound as soon as holders drain, and the
+#      just-released key itself is evictable. Entries with holders or
+#      waiters (refs > 0) are never evicted.
+#
+# Endpoint transaction rule (R9):
+#   An endpoint's parse + agent annotation is ONE path-lock span.
+#   read_session_delta / read_older_session annotate their response window
+#   in-span (annotate_agents=True) — annotation never runs on a snapshot
+#   after the lock was released, so no eviction or same-path replacement
+#   can interleave between read and annotate. When annotation finds a
+#   fresh state (empty assignment map — new, rebuilt, or evicted-and-
+#   rebuilt), it first reconstructs assignments from the state's FULL
+#   retained parent sequence, bounded by the event-retention window, so
+#   duplicate-prompt parents keep stable one-to-one children across
+#   eviction and replacement.
+# ---------------------------------------------------------------------------
+_PARSE_CACHE_MAX = max(8, int(os.environ.get("WIKI_PARSE_CACHE_MAX", "64")))
+_cache: dict[str, dict] = {}  # path → parse state (insertion order = LRU order)
+_cache_locks: dict[str, "_PathLockEntry"] = {}
+_cache_locks_guard = threading.Lock()  # guards _cache/_cache_locks STRUCTURE
 
 
-def _cache_lock_for(key: str) -> threading.Lock:
+class _PathLockEntry:
+    __slots__ = ("lock", "refs")
+
+    def __init__(self) -> None:
+        self.lock = threading.Lock()
+        self.refs = 0
+
+
+@contextmanager
+def _path_lock(key: str):
+    # Refcount under the guard BEFORE acquiring, so eviction (which only
+    # removes entries with refs == 0) can never race a thread that is about
+    # to acquire the lock it just looked up.
     with _cache_locks_guard:
-        lock = _cache_locks.get(key)
-        if lock is None:
-            lock = threading.Lock()
-            _cache_locks[key] = lock
-        return lock
+        entry = _cache_locks.get(key)
+        if entry is None:
+            entry = _PathLockEntry()
+            _cache_locks[key] = entry
+        entry.refs += 1
+    entry.lock.acquire()
+    try:
+        yield
+    finally:
+        entry.lock.release()
+        with _cache_locks_guard:
+            entry.refs -= 1
+            if entry.refs == 0:
+                # Eviction point 2: trim on release so concurrent bursts of
+                # many distinct paths return to the bound once holders
+                # drain; the just-released key itself is fair game.
+                _evict_parse_states_locked(None)
+
+
+def _evict_parse_states_locked(current_key: str | None) -> None:
+    # Caller holds _cache_locks_guard. Evict least-recently-used states past
+    # the cap, skipping the active key and any path whose lock is in use.
+    for key in list(_cache):
+        if len(_cache) <= _PARSE_CACHE_MAX:
+            break
+        if key == current_key:
+            continue
+        entry = _cache_locks.get(key)
+        if entry is not None and entry.refs > 0:
+            continue
+        _cache.pop(key, None)
+        _cache_locks.pop(key, None)
+    # Prune orphaned lock entries whose state is gone (evicted while the lock
+    # was held, or cleared externally) once nobody references them, so the
+    # lock map is bounded by the state map plus in-flight readers.
+    for key in list(_cache_locks):
+        if key == current_key or key in _cache:
+            continue
+        entry = _cache_locks[key]
+        if entry.refs > 0:
+            continue
+        del _cache_locks[key]
 
 
 def _new_parse_state(fmt: str) -> dict:
@@ -2193,6 +2305,9 @@ def _new_parse_state(fmt: str) -> dict:
         "artifact_ids": set(),
         "dedupe_credits": {},
         "dispositions": {"rendered": 0, "summarized": 0, "ignored": 0, "unknown": 0},
+        # parent event id → child agent id (claude only); dies with the state
+        # so stale links cannot outlive a transcript reset (WIKI-244).
+        "agent_child_assignments": {},
     }
 
 
@@ -2214,10 +2329,23 @@ def _prune_change_log(state: dict) -> None:
 
 def _read_cached_state(fmt: str, path: Path, key: str) -> dict:
     stat = path.stat()
-    state = _cache.get(key)
-    if state is None or stat.st_size < state["offset"]:
-        state = _new_parse_state(fmt)
-        _cache[key] = state
+    with _cache_locks_guard:
+        state = _cache.get(key)
+        if (
+            state is None
+            or stat.st_size < state["offset"]
+            or state.get("ino") != stat.st_ino
+            or state.get("dev") != stat.st_dev
+        ):
+            state = _new_parse_state(fmt)
+            state["ino"] = stat.st_ino
+            state["dev"] = stat.st_dev
+            _cache.pop(key, None)
+            _cache[key] = state
+            _evict_parse_states_locked(key)
+        else:
+            # LRU touch: re-insertion moves the key to the end.
+            _cache[key] = _cache.pop(key)
     if stat.st_size > state["offset"]:
         apply = _APPLY[fmt]
         with path.open(encoding="utf-8", errors="replace") as f:
@@ -2250,6 +2378,27 @@ def _read_cached_state(fmt: str, path: Path, key: str) -> dict:
     return state
 
 
+def _annotate_window_locked(main_path: Path, state: dict, window_events: list) -> list:
+    """Annotate a response window inside the caller's path-lock span.
+
+    Endpoint transaction rule: the caller holds _path_lock(main path) and
+    `state` is the CURRENT parse state — no eviction or replacement can
+    interleave. If the assignment map is empty (fresh, rebuilt, or
+    evicted-and-rebuilt state), reconstruct it from the state's full
+    retained parent sequence first, so windowed responses keep stable
+    one-to-one children even for duplicate prompts without timestamps.
+    """
+    store = _agent_assignment_store(main_path)
+    if not store and any(
+        event.get("kind") == "tool"
+        and (event.get("tool") or {}).get("name") in ("Agent", "Task")
+        for event in state["events"]
+    ):
+        # Bounded reconstruction: the retained event window (<= 2000 events).
+        _annotate_agent_events_locked(main_path, state["events"], store)
+    return _annotate_agent_events_locked(main_path, window_events, store)
+
+
 def read_session_events(fmt: str, path: Path) -> dict:
     """Returns {events, base, tokens, dirty_from}.
 
@@ -2259,7 +2408,7 @@ def read_session_events(fmt: str, path: Path) -> dict:
     consumers must re-fetch from min(cursor, dirty_from).
     """
     key = str(path)
-    with _cache_lock_for(key):
+    with _path_lock(key):
         state = _read_cached_state(fmt, path, key)
         total = state["base"] + len(state["events"])
         dirty_from = total
@@ -2301,9 +2450,11 @@ def read_session_delta(
     cursor: int = 0,
     *,
     tail_window: bool = True,
+    tail_events: int | None = None,
+    annotate_agents: bool = False,
 ) -> dict:
     key = str(path)
-    with _cache_lock_for(key):
+    with _path_lock(key):
         state = _read_cached_state(fmt, path, key)
         base = int(state["base"])
         events = state["events"]
@@ -2323,11 +2474,19 @@ def read_session_delta(
                     full_reset = True
 
         if full_reset:
-            window_base = max(base, total - TAIL_WINDOW_EVENTS) if tail_window else base
+            # An explicit tail_events bound (e.g. the inline sub-agent trace)
+            # overrides the default policy in both directions.
+            if tail_events is not None:
+                window_base = max(base, total - tail_events)
+            else:
+                window_base = max(base, total - TAIL_WINDOW_EVENTS) if tail_window else base
+            # Snapshot only the event objects and mutable nested leaves;
+            # avoid a recursive clone of large immutable payloads.
+            reset_events = _snapshot_events(events[window_base - base :])
+            if annotate_agents:
+                reset_events = _annotate_window_locked(path, state, reset_events)
             return {
-                # Snapshot only the event objects and mutable nested leaves;
-                # avoid a recursive clone of large immutable payloads.
-                "events": _snapshot_events(events[window_base - base :]),
+                "events": reset_events,
                 "base": window_base,
                 "tokens": state["tokens"],
                 "tasks": tasks,
@@ -2350,8 +2509,11 @@ def read_session_delta(
                 patch_map[int(entry["id"])] = entry
 
         if tail_from < base:
+            rewind_events = _snapshot_events(events)
+            if annotate_agents:
+                rewind_events = _annotate_window_locked(path, state, rewind_events)
             return {
-                "events": _snapshot_events(events),
+                "events": rewind_events,
                 "base": base,
                 "tokens": state["tokens"],
                 "tasks": tasks,
@@ -2364,13 +2526,29 @@ def read_session_delta(
                 "has_older": False,
             }
 
+        # WIKI-244 R5 (M2): a stale cursor (unmounted row, sleeping tab) can
+        # trail by far more than the inline bound — clip the incremental tail
+        # to the newest tail_events events, advance tail_from to the first
+        # returned event, and mark the omitted middle as older history.
+        # Patches referring to clipped events are dropped with them; clients
+        # apply patches by event id, so patches for events they never held
+        # are no-ops either way.
+        clipped = False
+        if (
+            tail_events is not None
+            and tail_from < total
+            and total - tail_from > tail_events
+        ):
+            tail_from = total - tail_events
+            clipped = True
+
         if tail_from < total:
-            tail_events = deepcopy(events[tail_from - base :])
+            tail_slice = deepcopy(events[tail_from - base :])
             patch_map = {
                 event_id: entry for event_id, entry in patch_map.items() if int(entry.get("index", total)) < tail_from
             }
         else:
-            tail_events = []
+            tail_slice = []
 
         patches = [
             {
@@ -2381,8 +2559,10 @@ def read_session_delta(
             }
             for entry in sorted(patch_map.values(), key=lambda item: int(item["cursor"]))
         ]
-        return {
-            "events": tail_events,
+        if annotate_agents and tail_slice:
+            tail_slice = _annotate_window_locked(path, state, tail_slice)
+        payload = {
+            "events": tail_slice,
             "base": base,
             "tokens": state["tokens"],
             "tasks": tasks,
@@ -2393,6 +2573,9 @@ def read_session_delta(
             "tail_from": tail_from,
             "patches": patches,
         }
+        if clipped:
+            payload["has_older"] = True
+        return payload
 
 
 def read_older_session(
@@ -2400,18 +2583,23 @@ def read_older_session(
     path: Path,
     before: int,
     count: int,
+    *,
+    annotate_agents: bool = False,
 ) -> dict:
     """Return the retained events immediately before an absolute event index."""
     key = str(path)
-    with _cache_lock_for(key):
+    with _path_lock(key):
         state = _read_cached_state(fmt, path, key)
         base = int(state["base"])
         events = state["events"]
         total = base + len(events)
         end = min(max(before, base), total)
         start = max(base, end - max(1, count))
+        page_events = _snapshot_events(events[start - base : end - base])
+        if annotate_agents:
+            page_events = _annotate_window_locked(path, state, page_events)
         return {
-            "events": _snapshot_events(events[start - base : end - base]),
+            "events": page_events,
             "base": start,
             "has_older": start > base,
         }
@@ -2419,19 +2607,23 @@ def read_older_session(
 
 # ---------------------------------------------------------------- claude subagents
 
-_subagent_heads: dict[str, str] = {}  # file path → first-user-prompt head (immutable once written)
+# file path → (head, started_at, inode, device, size-at-read). The intro is
+# only immutable while the SAME file grows in place — a replaced inode or a
+# shrunken file means a different child transcript now lives at that path,
+# so cached intros carry a stat fingerprint and reload on mismatch
+# (WIKI-244 R6 M3). Bounded so long-lived backends do not accumulate one
+# entry per child file forever.
+_SUBAGENT_INTRO_CACHE_MAX = 2048
+_subagent_intros: dict[str, tuple[str, str, int, int, int]] = {}
 
 
 def subagents_dir(main_path: Path) -> Path:
     return main_path.parent / main_path.stem / "subagents"
 
 
-def _subagent_prompt_head(path: Path) -> str:
-    key = str(path)
-    cached = _subagent_heads.get(key)
-    if cached is not None:
-        return cached
+def _read_intro_rows(path: Path) -> tuple[str, str]:
     head = ""
+    started_at = ""
     try:
         with path.open(encoding="utf-8", errors="replace") as f:
             for _ in range(20):
@@ -2442,6 +2634,8 @@ def _subagent_prompt_head(path: Path) -> str:
                     row = json.loads(line)
                 except ValueError:
                     continue
+                if not started_at and isinstance(row.get("timestamp"), str):
+                    started_at = row["timestamp"]
                 if row.get("type") == "user":
                     content = (row.get("message") or {}).get("content")
                     if isinstance(content, str):
@@ -2449,9 +2643,49 @@ def _subagent_prompt_head(path: Path) -> str:
                     break
     except OSError:
         pass
+    return head, started_at
+
+
+def _subagent_intro(path: Path, stat: os.stat_result | None = None) -> tuple[str, str]:
+    key = str(path)
+    if stat is None:
+        try:
+            stat = path.stat()
+        except OSError:
+            return "", ""
+    # Compound lookup+validate+delete under the guard (concurrency model):
+    # two readers racing a replacement both take this section in turn; the
+    # loser sees the entry already gone and simply falls through to re-read.
+    with _cache_locks_guard:
+        cached = _subagent_intros.get(key)
+        if cached is not None:
+            head, started_at, ino, dev, size = cached
+            # Same inode growing (or unchanged) in place → the first rows
+            # cannot have changed. New inode or shrink = replacement.
+            if ino == stat.st_ino and dev == stat.st_dev and stat.st_size >= size:
+                return head, started_at
+            _subagent_intros.pop(key, None)
+    # File I/O outside the guard.
+    head, started_at = _read_intro_rows(path)
     if head:
-        _subagent_heads[key] = head
-    return head
+        # Revalidate before publish: if the file changed identity while we
+        # read it, our rows may belong to neither generation — return them
+        # to this caller but do not publish to the cache.
+        try:
+            fresh = path.stat()
+        except OSError:
+            return head, started_at
+        if fresh.st_ino != stat.st_ino or fresh.st_dev != stat.st_dev or fresh.st_size < stat.st_size:
+            return head, started_at
+        with _cache_locks_guard:
+            while len(_subagent_intros) >= _SUBAGENT_INTRO_CACHE_MAX:
+                _subagent_intros.pop(next(iter(_subagent_intros)))
+            _subagent_intros[key] = (head, started_at, stat.st_ino, stat.st_dev, stat.st_size)
+    return head, started_at
+
+
+def _subagent_prompt_head(path: Path) -> str:
+    return _subagent_intro(path)[0]
 
 
 def list_subagents(main_path: Path) -> list[dict]:
@@ -2464,10 +2698,12 @@ def list_subagents(main_path: Path) -> list[dict]:
             stat = path.stat()
         except OSError:
             continue
+        head, started_at = _subagent_intro(path, stat)
         entries.append(
             {
                 "id": path.stem.removeprefix("agent-"),
-                "prompt_head": _subagent_prompt_head(path),
+                "prompt_head": head,
+                "started_at": started_at,
                 "mtime": stat.st_mtime,
                 "size": stat.st_size,
             }
@@ -2475,9 +2711,68 @@ def list_subagents(main_path: Path) -> list[dict]:
     return entries
 
 
-def annotate_agent_events(main_path: Path, events: list) -> list:
-    """Attach subagent ids without mutating parser-owned cached events."""
-    heads: dict[str, str] | None = None
+def _agent_assignment_store(main_path: Path) -> dict:
+    """Parent-id → child-id map scoped to the transcript's parse state.
+
+    Living inside the parse-state dict means the map dies with the state:
+    a file shrink, reload, or same-path replacement rebuilds the state and
+    drops every assignment. Entries below the retained event base are
+    pruned. Callers without parse state get an ephemeral map.
+
+    Concurrency model: the returned dict belongs to the parse state — the
+    CALLER must hold _path_lock(main path) for the whole span in which it
+    reads or mutates the map (annotate_agent_events does). This helper only
+    takes the registry guard for the structural lookup/prune.
+    """
+    key = str(main_path)
+    with _cache_locks_guard:
+        state = _cache.get(key)
+        if state is None:
+            return {}
+        store = state.setdefault("agent_child_assignments", {})
+        base = int(state.get("base", 0))
+        if store and base:
+            for event_id in [event_id for event_id in store if event_id < base]:
+                del store[event_id]
+        return store
+
+
+def annotate_agent_events(main_path: Path, events: list, assignments: dict | None = None) -> list:
+    """Attach subagent ids without mutating parser-owned cached events.
+
+    Parents and children correlate by prompt head. Duplicate heads (retries,
+    repeated exploration prompts) resolve deterministically and independently
+    of the delta window that carries the parent:
+
+    - assignments persist per parent event id (stable absolute index) inside
+      the transcript's parse state, so a parent seen again in a later window
+      keeps its child, while a parse-state reset (file shrink, reload) drops
+      the whole map;
+    - a cached assignment is re-validated against the current child list —
+      if the child vanished or its prompt head no longer matches the parent,
+      the stale link is dropped and re-resolved;
+    - a new parent claims the first child (by start time) that no other
+      parent holds AND that started at/after the parent's own timestamp —
+      the timestamp anchor makes the choice identical whether duplicate
+      parents arrive in one response or split across many;
+    - a parent with no claimable child stays unannotated rather than reusing
+      another parent's child.
+    """
+    if assignments is None:
+        # Concurrency model: the state-backed assignment map may only be
+        # read or mutated inside the path's critical section — hold it for
+        # the WHOLE read-modify-write span so two concurrent annotations
+        # cannot hand the same child to two different parents.
+        with _path_lock(str(main_path)):
+            return _annotate_agent_events_locked(
+                main_path, events, _agent_assignment_store(main_path)
+            )
+    return _annotate_agent_events_locked(main_path, events, assignments)
+
+
+def _annotate_agent_events_locked(main_path: Path, events: list, assignments: dict) -> list:
+    heads: dict[str, list[dict]] | None = None
+    children_by_id: dict[str, dict] = {}
     annotated = events
     for index, event in enumerate(events):
         tool = event.get("tool")
@@ -2486,14 +2781,52 @@ def annotate_agent_events(main_path: Path, events: list) -> list:
         prompt_head = tool.get("prompt_head")
         if not prompt_head:
             continue
+        event_id = event.get("id")
         if heads is None:
-            heads = {e["prompt_head"]: e["id"] for e in list_subagents(main_path) if e["prompt_head"]}
-        agent_id = heads.get(prompt_head)
-        if agent_id:
-            if annotated is events:
-                annotated = list(events)
-            annotated[index] = {
-                **event,
-                "tool": {**tool, "agent_id": agent_id},
-            }
+            heads = {}
+            children = sorted(
+                (entry for entry in list_subagents(main_path) if entry["prompt_head"]),
+                key=lambda entry: (entry.get("started_at") or "", entry.get("mtime") or 0),
+            )
+            for child in children:
+                heads.setdefault(child["prompt_head"], []).append(child)
+                children_by_id[child["id"]] = child
+        chosen = assignments.get(event_id) if isinstance(event_id, int) else None
+        if chosen is not None:
+            cached_child = children_by_id.get(chosen)
+            if cached_child is None or cached_child.get("prompt_head") != prompt_head:
+                # Stale link: the child vanished or the parent at this id now
+                # carries a different prompt (path or id reuse). Re-resolve.
+                del assignments[event_id]
+                chosen = None
+        if chosen is None:
+            candidates = heads.get(prompt_head) or []
+            taken_ids = set(assignments.values())
+            parent_ts = event.get("ts") or ""
+            chosen = next(
+                (
+                    child["id"]
+                    for child in candidates
+                    if child["id"] not in taken_ids
+                    and (not parent_ts or not child.get("started_at") or child["started_at"] >= parent_ts)
+                ),
+                None,
+            )
+            if chosen is None:
+                # Clock skew fallback: no child started at/after the parent —
+                # take the first unclaimed child rather than dropping the link.
+                chosen = next(
+                    (child["id"] for child in candidates if child["id"] not in taken_ids),
+                    None,
+                )
+            if chosen is None:
+                continue
+            if isinstance(event_id, int):
+                assignments[event_id] = chosen
+        if annotated is events:
+            annotated = list(events)
+        annotated[index] = {
+            **event,
+            "tool": {**tool, "agent_id": chosen},
+        }
     return annotated

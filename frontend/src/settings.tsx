@@ -268,11 +268,14 @@ function dedupeByLabel(...pools: FontChoice[][]): FontChoice[] {
 }
 
 export const ALL_FONTS: FontChoice[] = dedupeByLabel(MONO_FONTS, UI_FONTS, TEXT_FONTS);
+// Same pool, but System-first so the agent chat role defaults to the current
+// (system sans) transcript appearance instead of a mono face.
+export const AGENT_FONTS: FontChoice[] = dedupeByLabel(UI_FONTS, TEXT_FONTS, MONO_FONTS);
 
 const MONO_SAMPLE = "→ const x = 0O1lIi";
 const PROP_SAMPLE = "The quick brown fox";
 
-type FontRoleId = "ui" | "text" | "mono";
+type FontRoleId = "ui" | "text" | "agent" | "mono";
 type FontRole = {
   name: string;
   desc: string;
@@ -282,6 +285,10 @@ type FontRole = {
   weightKey: string;
   weightCssVar: string;
   sample: string;
+  // When set and no weight is stored, the role inherits this role's weight
+  // (mirrors the CSS var fallback chain) and the control shows an explicit
+  // inherited state instead of a number that disagrees with what applies.
+  inheritsWeightFrom?: FontRoleId;
 };
 
 const FONT_ROLES: Record<FontRoleId, FontRole> = {
@@ -304,6 +311,17 @@ const FONT_ROLES: Record<FontRoleId, FontRole> = {
     weightKey: "wiki-text-font-weight",
     weightCssVar: "--font-text-weight",
     sample: PROP_SAMPLE,
+  },
+  agent: {
+    name: "Agent chat font",
+    desc: "Agent replies and thinking traces in session transcripts.",
+    fonts: AGENT_FONTS,
+    key: "wiki-agent-font",
+    cssVar: "--font-agent-prose",
+    weightKey: "wiki-agent-font-weight",
+    weightCssVar: "--font-agent-prose-weight",
+    sample: PROP_SAMPLE,
+    inheritsWeightFrom: "text",
   },
   mono: {
     name: "Monospace font",
@@ -499,9 +517,18 @@ function applyFontVar(cssVar: string, choice: FontChoice) {
   void loadFont(choice);
 }
 
+// Any CSS font-weight is legal (1–1000): variable fonts render arbitrary
+// values, static fonts round to the nearest face. Values are no longer
+// restricted to the nine canonical stops (WIKI-244).
+function clampWeight(weight: number): number {
+  return Math.min(1000, Math.max(1, Math.round(weight)));
+}
+
 function storedWeight(role: FontRole): number | null {
-  const weight = Number(localStorage.getItem(role.weightKey));
-  return WEIGHT_STOPS.includes(weight) ? weight : null;
+  const raw = localStorage.getItem(role.weightKey);
+  if (raw === null) return null;
+  const weight = Number(raw);
+  return Number.isFinite(weight) && weight >= 1 && weight <= 1000 ? clampWeight(weight) : null;
 }
 
 function applyFontWeightVar(cssVar: string, weight: number | null) {
@@ -646,7 +673,16 @@ function FontPicker({
 function FontRoleRow({ role }: { role: FontRole }) {
   const [label, setLabel] = useState(() => currentLabel(role));
   const [weights, setWeights] = useState<number[]>([]);
-  const [weight, setWeight] = useState(() => storedWeight(role) ?? 400);
+  const inheritRole = role.inheritsWeightFrom ? FONT_ROLES[role.inheritsWeightFrom] : null;
+  const inheritedWeight = () => (inheritRole ? storedWeight(inheritRole) ?? 400 : 400);
+  const [weight, setWeight] = useState(() => storedWeight(role) ?? inheritedWeight());
+  const [weightText, setWeightText] = useState(() => {
+    const saved = storedWeight(role);
+    if (saved !== null) return String(saved);
+    // Inheriting roles display an explicit inherited state (empty input +
+    // placeholder) so the control never disagrees with the applied CSS.
+    return inheritRole ? "" : "400";
+  });
   const choice = useMemo(() => pickChoice(role.fonts, label), [role.fonts, label]);
 
   useEffect(() => {
@@ -654,20 +690,35 @@ function FontRoleRow({ role }: { role: FontRole }) {
     void loadFontFaces(choice).then(() => {
       if (cancelled) return;
       const nextWeights = detectFontWeights(choice.family);
+      // A saved weight is respected as-is, even off the detected stops —
+      // arbitrary values are the point (variable fonts). Only the unset case
+      // adopts the face's preferred default.
       const savedWeight = storedWeight(role);
-      const nextWeight = nextWeights.includes(savedWeight ?? 400)
-        ? savedWeight ?? 400
-        : preferredWeight(nextWeights);
-      if (savedWeight !== nextWeight && (savedWeight !== null || nextWeight !== 400)) {
+      if (savedWeight === null && inheritRole) {
+        // Stay in the inherited state — never auto-write a weight for a role
+        // whose CSS falls back to another role's weight.
+        setWeights(nextWeights);
+        setWeight(inheritedWeight());
+        setWeightText("");
+        return;
+      }
+      const nextWeight = savedWeight ?? preferredWeight(nextWeights);
+      if (savedWeight === null && nextWeight !== 400) {
         setFontWeight(role, nextWeight);
       }
       setWeights(nextWeights);
       setWeight(nextWeight);
+      setWeightText(String(nextWeight));
     });
     return () => {
       cancelled = true;
     };
   }, [choice, role]);
+
+  const applyWeight = (next: number) => {
+    setFontWeight(role, next);
+    setWeight(next);
+  };
 
   return (
     <div className="settings-row">
@@ -687,23 +738,58 @@ function FontRoleRow({ role }: { role: FontRole }) {
             setWeights([]);
           }}
         />
+        <input
+          aria-label={`${role.name} weight (1–1000)`}
+          className="font-weight-input"
+          inputMode="numeric"
+          max={1000}
+          min={1}
+          placeholder={inheritRole ? "inherit" : undefined}
+          step={1}
+          title={inheritRole
+            ? `Font weight 1–1000; empty inherits the ${inheritRole.name.toLowerCase()} weight`
+            : "Font weight, any value from 1 to 1000"}
+          type="number"
+          value={weightText}
+          onBlur={() => {
+            if (weightText.trim() === "" && inheritRole) {
+              // Explicitly return to the inherited state.
+              setFontWeight(role, null);
+              setWeight(inheritedWeight());
+              setWeightText("");
+              return;
+            }
+            const parsed = Number(weightText);
+            const next = Number.isFinite(parsed) && weightText.trim() !== "" ? clampWeight(parsed) : weight;
+            applyWeight(next);
+            setWeightText(String(next));
+          }}
+          onChange={(event) => {
+            const raw = event.target.value;
+            setWeightText(raw);
+            const parsed = Number(raw);
+            if (Number.isFinite(parsed) && parsed >= 1 && parsed <= 1000) {
+              applyWeight(clampWeight(parsed));
+            }
+          }}
+        />
         {weights.length > 1 ? (
-          <select
-            aria-label={`${role.name} weight`}
-            className="font-weight-picker"
-            value={weight}
-            onChange={(event) => {
-              const next = Number(event.target.value);
-              setFontWeight(role, next);
-              setWeight(next);
-            }}
-          >
+          <div aria-label={`${role.name} detected weights`} className="font-weight-stops" role="group">
             {weights.map((option) => (
-              <option key={option} value={option}>
-                {weightLabel(option)}
-              </option>
+              <button
+                key={option}
+                className={`font-weight-stop${option === weight ? " is-active" : ""}`}
+                title={weightLabel(option)}
+                type="button"
+                onClick={() => {
+                  applyWeight(option);
+                  setWeightText(String(option));
+                }}
+              >
+                {option}
+              </button>
             ))}
-          </select>
+          </div>
         ) : null}
       </div>
     </div>
@@ -790,6 +876,16 @@ export function SettingsModal({
             style={{ fontFamily: "var(--font-text)", fontWeight: "var(--font-text-weight)" }}
           >
             The quick brown fox jumps over the lazy dog — 0123456789
+          </div>
+          <FontRoleRow role={FONT_ROLES.agent} />
+          <div
+            className="settings-preview"
+            style={{
+              fontFamily: "var(--font-agent-prose)",
+              fontWeight: "var(--font-agent-prose-weight, var(--font-text-weight))",
+            }}
+          >
+            I updated the composer and reran the suite — 13 passed, 0 failed.
           </div>
           <FontRoleRow role={FONT_ROLES.mono} />
           <div

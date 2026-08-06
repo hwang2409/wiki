@@ -126,14 +126,14 @@ async function main() {
       { timeout: 5000 }
     );
 
-    await page.locator(".session-activity-head").click();
+    // WIKI-244: activity groups and tool outputs are open by default.
+    await page.locator(".session-activity-head").first().waitFor({ state: "visible" });
     const tools = page.locator(".session-tool");
     assert((await tools.count()) === 2, `Expected 2 tool calls, found ${await tools.count()}`);
-    for (const tool of await tools.all()) {
-      await tool.locator(".session-tool-head").click();
-    }
+    // WIKI-241/#177 purpose labels: read = "file contents", bash = "command
+    // output", failed = "error output", generic = "tool output".
     const toolOutputs = page.locator(
-      ".session-tool .transcript-preview:has(.transcript-preview-label:text-is(\"output\")) .transcript-preview-body"
+      ".session-activity-row .transcript-preview:has(.transcript-preview-label:text-matches(\"^(tool output|command output|file contents|error output)$\")) .transcript-preview-body"
     );
     const longToolOutput = toolOutputs.nth(0);
     const shortToolOutput = toolOutputs.nth(1);

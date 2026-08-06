@@ -16,9 +16,9 @@ import {
 const TICKET = "WIKI-238";
 const OUT_DIR = process.env.WIKI_PLAYWRIGHT_OUT_DIR || "/tmp/wiki-238-semantic-activity";
 const SCREENSHOTS = {
-  collapsedNormal: path.join(OUT_DIR, "collapsed-normal.png"),
+  collapsedNormal: path.join(OUT_DIR, "overview-normal.png"),
   expandedNormal: path.join(OUT_DIR, "expanded-normal.png"),
-  collapsedNarrow: path.join(OUT_DIR, "collapsed-narrow.png"),
+  
   expandedNarrow: path.join(OUT_DIR, "expanded-narrow.png"),
 };
 const THEMES = [
@@ -43,11 +43,10 @@ const ESSENTIAL_CONTRAST_ROLES = [
   ["state waiting", ".session-activity-state.is-waiting-for-you"],
   ["semantic summary", ".session-activity-semantic"],
   ["activity metadata", ".session-activity-meta"],
-  ["timeline label", ".session-activity-row-label"],
   ["timeline metadata", ".session-activity-row-meta"],
   ["reasoning", ".session-thinking"],
   ["tool summary", ".session-tool-summary"],
-  ["result status", ".session-tool-result > span:first-child"],
+  ["result status", ".session-tool-result-state"],
   ["result correlation", ".session-tool-result-summary"],
   ["raw preview label", ".transcript-preview-label"],
   ["raw preview body", ".transcript-preview-body"],
@@ -303,13 +302,22 @@ async function main() {
 
     await page.locator(".session-scroll").screenshot({ path: SCREENSHOTS.collapsedNormal });
 
-    await groups.nth(0).locator(".session-activity-head").click();
-    await groups.nth(0).locator(".session-activity-collapsible.is-open .session-activity-row-label").first().waitFor();
-    const firstLabels = await groups.nth(0).locator(".session-activity-row-label").allInnerTexts();
-    assert(JSON.stringify(firstLabels) === JSON.stringify([
+    // WIKI-244: the trace is always visible (no collapse state exists) and
+    // the label gutter is gone — reading order comes from flat row classes.
+    await groups.nth(0).locator(".session-activity-body .session-activity-row").first().waitFor();
+    const firstKinds = await groups.nth(0).locator(".session-activity-body > .session-activity-row").evaluateAll(
+      (rows) => rows.map((row) => (
+        row.classList.contains("is-reasoning")
+          ? "REASONING"
+          : row.classList.contains("is-result")
+            ? "RESULT"
+            : "TOOL"
+      )),
+    );
+    assert(JSON.stringify(firstKinds) === JSON.stringify([
       "REASONING", "TOOL", "RESULT", "REASONING", "TOOL", "TOOL", "RESULT", "RESULT",
     ]),
-      `timeline reading order is wrong: ${firstLabels.join("/")}`);
+      `timeline reading order is wrong: ${firstKinds.join("/")}`);
     const resultOutputs = await groups.nth(0).locator(
       ".session-activity-row.is-result .transcript-preview-body",
     ).evaluateAll((elements) => elements.map((element) => element.textContent?.trim() ?? ""));
@@ -327,19 +335,19 @@ async function main() {
     const firstResult = groups.nth(0).locator(
       `.session-activity-row.is-result[data-tool-event-id="${firstToolId}"]`,
     );
-    await firstTool.locator(".session-tool-head").click();
-    await firstTool.locator(".session-tool-input-collapsible.is-open .transcript-preview-body").waitFor();
+    // WIKI-244: no click needed — single-line raw input renders as an inline
+    // dim detail on the call row; output is always visible in the result row.
     assert(
-      (await firstTool.locator(".session-tool-input-collapsible .transcript-preview-body").innerText()).trim()
+      (await firstTool.locator(".session-tool-detail").innerText()).trim()
         === "frontend/src/session.tsx",
-      "expanded tool input must retain exact raw evidence",
+      "tool row must retain exact raw input evidence inline",
     );
     assert(
-      (await firstResult.locator(".session-tool-collapsible .transcript-preview-body").innerText()).trim()
+      (await firstResult.locator(".transcript-preview-body").innerText()).trim()
         === "activity group source exact",
-      "expanded tool output must retain exact raw evidence",
+      "always-visible tool output must retain exact raw evidence",
     );
-    assert((await firstResult.locator(".session-tool-result > span:first-child").innerText()) === "completed",
+    assert((await firstResult.locator(".session-tool-result-state").innerText()).toLowerCase() === "completed",
       "ok=null results must render a neutral completed label");
     assert((await firstResult.locator(".session-activity-row-meta").innerText()) === "unknown",
       "ok=null results must not invent an ok outcome");
@@ -357,6 +365,13 @@ async function main() {
     assert(reasoningStyle.fontStyle === "normal", `reasoning must not be italic: ${reasoningStyle.fontStyle}`);
     assert(reasoningStyle.fontSize >= 13.5, `reasoning text is too small: ${reasoningStyle.fontSize}`);
     assert(reasoningStyle.height > 200, `long reasoning did not remain readable: ${reasoningStyle.height}`);
+    // WIKI-244: thinking renders in full — no clamp container, no show-all
+    // gate, and the final evidence line is present without any interaction.
+    assert((await groups.nth(0).locator(".session-thinking .stream-clamp, .session-thinking .stream-clamp-toggle").count()) === 0,
+      "thinking must not render through an interactive clamp");
+    const longThinkingText = await longThinking.innerText();
+    assert(longThinkingText.includes("Evidence line 18"),
+      "over-threshold reasoning must be fully readable without clicking");
     const assistantStyle = await page.locator(".session-assistant").first().evaluate((element) => {
       const style = getComputedStyle(element);
       return { family: style.fontFamily, size: Number.parseFloat(style.fontSize) };
@@ -411,11 +426,12 @@ async function main() {
       contrastAudit[theme][workingRoleName] = ratio;
     }
     await page.evaluate(() => { document.documentElement.dataset.theme = "opencode"; });
-    const firstActivityHead = groups.nth(0).locator(".session-activity-head");
-    if (await firstActivityHead.getAttribute("aria-expanded") !== "true") {
-      await firstActivityHead.click();
-    }
-    await groups.nth(0).locator('.session-activity-head[aria-expanded="true"]').waitFor();
+    // WIKI-244: the trace has no collapse control anywhere — assert nothing
+    // interactive can hide it, then measure density on the always-open body.
+    const hidingControls = await groups.nth(0).locator(
+      ".session-activity-head button, button.session-activity-head, .session-activity [aria-expanded]",
+    ).count();
+    assert(hidingControls === 0, `activity group must expose no disclosure control, found ${hidingControls}`);
 
     const normalDensity = await groups.nth(0).evaluate((element) => ({
       clientWidth: element.clientWidth,
@@ -427,37 +443,27 @@ async function main() {
     assert(normalDensity.rows === 8, `expected 8 timeline rows, got ${normalDensity.rows}`);
     await groups.nth(0).screenshot({ path: SCREENSHOTS.expandedNormal });
 
-    await groups.nth(0).locator(".session-activity-head").click();
-    await page.setViewportSize({ width: 910, height: 900 });
-    await page.waitForTimeout(300);
-    await page.screenshot({ path: SCREENSHOTS.collapsedNarrow });
     await page.setViewportSize({ width: 910, height: 1400 });
     await page.locator(".session-scroll").evaluate((element) => { element.scrollTop = 0; });
     await groups.nth(0).scrollIntoViewIfNeeded();
-    await groups.nth(0).locator(".session-activity-head").click();
-    await groups.nth(0).locator('.session-activity-head[aria-expanded="true"]').waitFor();
-    await groups.nth(0).locator(".session-activity-collapsible.is-open .session-thinking").first().waitFor();
-    await groups.nth(0).scrollIntoViewIfNeeded();
+    await groups.nth(0).locator(".session-thinking").first().waitFor();
     const narrowDensity = await groups.nth(0).evaluate((element) => ({
       clientWidth: element.clientWidth,
       scrollWidth: element.scrollWidth,
     }));
     assert(narrowDensity.scrollWidth <= narrowDensity.clientWidth,
       `expanded narrow group overflows: ${narrowDensity.scrollWidth} > ${narrowDensity.clientWidth}`);
-    const hitAreas = await groups.nth(0).locator(".session-activity-head, .session-tool-head").evaluateAll(
-      (elements) => elements.map((element) => element.getBoundingClientRect().height),
-    );
-    assert(hitAreas.every((height) => height >= 40), `activity hit area below 40px: ${hitAreas.join(", ")}`);
+    // WIKI-244: the trace has no interactive heads left; hit-area minimums
+    // apply only to real controls (chips inside BoundedPreview keep theirs).
     await groups.nth(0).screenshot({ path: SCREENSHOTS.expandedNarrow });
 
     await fs.writeFile(path.join(OUT_DIR, "audit.json"), JSON.stringify({
       screenshots: SCREENSHOTS,
-      readingOrder: firstLabels,
+      readingOrder: firstKinds,
       reasoningStyle,
       typeRoles: { assistant: assistantStyle, metadata: metadataStyle },
       minimumContrastByTheme: contrastAudit,
       density: { normal: normalDensity, narrow: narrowDensity },
-      hitAreas,
     }, null, 2));
   } finally {
     await browser.close();

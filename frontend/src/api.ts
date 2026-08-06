@@ -1010,9 +1010,16 @@ export function uploadImage(mediaType: string, base64: string) {
   });
 }
 
-export function getSubagentSession(ticket: string, agentId: string, after = 0, path?: string) {
+export function getSubagentSession(
+  ticket: string,
+  agentId: string,
+  after = 0,
+  path?: string,
+  limit?: number,
+) {
   const params = new URLSearchParams({ cursor: String(after) });
   if (path) params.set("path", path);
+  if (limit) params.set("limit", String(limit));
   return request<AgentSessionData>(
     `/api/agents/${encodeURIComponent(ticket)}/subagents/${encodeURIComponent(agentId)}/session?${params.toString()}`
   );

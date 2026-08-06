@@ -1,5 +1,5 @@
 import { useEffect, useMemo, useRef, useState } from "react";
-import { AlertTriangle, ChevronDown, ChevronRight, ListTodo, Terminal } from "lucide-react";
+import { AlertTriangle, ChevronDown, ListTodo, Terminal } from "lucide-react";
 import { DisclosureContent } from "./disclosure";
 import type { ProviderStreamEvent } from "./api";
 import {
@@ -485,8 +485,6 @@ function ProviderDiagnosticsRenderer({ events }: { events: readonly ProviderStre
   );
 }
 
-const LARGE_DIFF_FILE_LINES = 500;
-const LARGE_DIFF_FILE_BYTES = 64 * 1024;
 const MAX_DIFF_FILE_LINES = 1_000;
 const MAX_DIFF_FILE_BYTES = 128 * 1024;
 const MAX_DIFF_TOTAL_LINES = 2_000;
@@ -501,21 +499,6 @@ type BoundedDiffFile = {
 
 function textBytes(value: string): number {
   return new TextEncoder().encode(value).byteLength;
-}
-
-function diffFileStats(file: DiffFilePatch): { lineCount: number; byteCount: number } {
-  let lineCount = 0;
-  let byteCount = 0;
-  for (const header of file.extendedHeaders) byteCount += textBytes(header) + 1;
-  for (const hunk of file.hunks) {
-    lineCount += 1;
-    byteCount += textBytes(hunk.header) + 1;
-    for (const line of hunk.lines) {
-      lineCount += 1;
-      byteCount += textBytes(line.text) + 1;
-    }
-  }
-  return { lineCount, byteCount };
 }
 
 function boundDiffFile(
@@ -584,6 +567,9 @@ function boundDiffFiles(files: ReadonlyMap<string, DiffFilePatch>): Map<string, 
   return bounded;
 }
 
+// WIKI-244: the working diff renders open — no section toggle, no per-file
+// disclosure. Byte/line bounds stay for performance; truncated data keeps raw
+// access through a copy control that carries the full unparsed diff source.
 function DiffRenderer({ source }: { source: string | null }) {
   const snapshot = useMemo(
     () => (source === null
@@ -592,87 +578,69 @@ function DiffRenderer({ source }: { source: string | null }) {
     [source],
   );
   const boundedFiles = useMemo(() => boundDiffFiles(snapshot.files), [snapshot]);
-  const [sectionOpen, setSectionOpen] = useState(false);
-  const [collapsed, setCollapsed] = useState<Set<string>>(new Set());
-  const [expandedLarge, setExpandedLarge] = useState<Set<string>>(new Set());
+  const [copied, setCopied] = useState(false);
   useEffect(() => {
-    setCollapsed(new Set());
-    setExpandedLarge(new Set());
+    setCopied(false);
   }, [source]);
   if (!boundedFiles.size && !snapshot.omittedFiles) return null;
+  const copyRawDiff = () => {
+    if (!source) return;
+    void navigator.clipboard?.writeText(source).then(() => {
+      setCopied(true);
+      window.setTimeout(() => setCopied(false), 1500);
+    });
+  };
   return (
-    <div
-      className={`codex-stream-artifact codex-stream-diff${sectionOpen ? "" : " is-collapsed"}`}
-      data-testid="codex-diff-renderer"
-    >
-      <button
-        aria-expanded={sectionOpen}
-        className="codex-stream-artifact-head codex-stream-diff-toggle"
-        type="button"
-        onClick={() => setSectionOpen((value) => !value)}
-      >
-        <ChevronDown
-          className={`disclosure-chevron${sectionOpen ? "" : " is-collapsed"}`}
-          size={12}
-        />
+    <div className="codex-stream-artifact codex-stream-diff" data-testid="codex-diff-renderer">
+      <div className="codex-stream-artifact-head">
         <span>working diff</span>
         <span className="codex-stream-artifact-count tabular-nums">{boundedFiles.size} file{boundedFiles.size === 1 ? "" : "s"}</span>
-      </button>
-      <DisclosureContent open={sectionOpen}>
+        {source ? (
+          <button
+            className="codex-stream-diff-copy"
+            title="Copy the full raw diff"
+            type="button"
+            onClick={copyRawDiff}
+          >
+            {copied ? "copied" : "copy raw diff"}
+          </button>
+        ) : null}
+      </div>
       {snapshot.omittedFiles ? (
         <div className="codex-stream-diff-omitted" data-testid="codex-diff-omitted" role="status">
-          additional diff files omitted from preview
+          additional diff files omitted from preview — copy raw diff for the complete data
         </div>
       ) : null}
       {[...boundedFiles.entries()].map(([path, bounded]) => {
         const { file } = bounded;
-        const stats = diffFileStats(file);
-        const isLarge = stats.lineCount > LARGE_DIFF_FILE_LINES || stats.byteCount > LARGE_DIFF_FILE_BYTES;
-        const isCollapsed = isLarge ? !expandedLarge.has(path) : collapsed.has(path);
         const kind = fileKind(file);
         return (
           <div className="codex-stream-diff-file" key={path}>
-            <button
-              className="codex-stream-diff-file-head"
-              type="button"
-              onClick={() => setCollapsed((current) => {
-                if (isLarge) {
-                  setExpandedLarge((expanded) => {
-                    const next = new Set(expanded);
-                    if (next.has(path)) next.delete(path); else next.add(path);
-                    return next;
-                  });
-                  return current;
-                }
-                const next = new Set(current);
-                if (next.has(path)) next.delete(path); else next.add(path);
-                return next;
-              })}
-            >
-              <ChevronRight className={isCollapsed ? "" : "is-open"} size={12} />
+            <div className="codex-stream-diff-file-head">
               <span>{path}</span>
               {kind ? <span className="codex-stream-diff-kind">{fileKindLabel(kind)}</span> : null}
-            </button>
-            {!isCollapsed ? (
-              <div className="codex-stream-diff-body">
-                {file.hunks.map((hunk) => (
-                  <div className="codex-stream-diff-hunk" key={`${path}:${hunk.header}`}>
-                    <div className="codex-stream-diff-hunk-head">{hunk.header}</div>
-                    {hunk.lines.map((line, index) => (
-                      <div className={`codex-stream-diff-line is-${line.kind}`} key={`${hunk.header}:${index}`}>
-                        <span className="codex-stream-diff-marker">{line.kind === "add" ? "+" : line.kind === "remove" ? "-" : " "}</span>
-                        <code>{line.text}</code>
-                      </div>
-                    ))}
-                  </div>
-                ))}
-                {bounded.truncated ? <div className="codex-stream-diff-truncated">diff preview truncated</div> : null}
-              </div>
-            ) : null}
+            </div>
+            <div className="codex-stream-diff-body">
+              {file.hunks.map((hunk) => (
+                <div className="codex-stream-diff-hunk" key={`${path}:${hunk.header}`}>
+                  <div className="codex-stream-diff-hunk-head">{hunk.header}</div>
+                  {hunk.lines.map((line, index) => (
+                    <div className={`codex-stream-diff-line is-${line.kind}`} key={`${hunk.header}:${index}`}>
+                      <span className="codex-stream-diff-marker">{line.kind === "add" ? "+" : line.kind === "remove" ? "-" : " "}</span>
+                      <code>{line.text}</code>
+                    </div>
+                  ))}
+                </div>
+              ))}
+              {bounded.truncated ? (
+                <div className="codex-stream-diff-truncated">
+                  diff preview truncated — copy raw diff for the complete data
+                </div>
+              ) : null}
+            </div>
           </div>
         );
       })}
-      </DisclosureContent>
     </div>
   );
 }

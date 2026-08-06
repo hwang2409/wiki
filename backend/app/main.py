@@ -3425,6 +3425,7 @@ def _session_delta_payload(
     kind: str | None = None,
     provider: str | None = None,
     tail_window: bool = True,
+    tail_events: int | None = None,
 ) -> dict[str, object]:
     effective_cursor = 0 if client_path is not None and client_path != str(path) else cursor
     result = transcripts.read_session_delta(
@@ -3432,6 +3433,10 @@ def _session_delta_payload(
         path,
         effective_cursor,
         tail_window=tail_window,
+        tail_events=tail_events,
+        # Endpoint transaction rule: parse + agent annotation happen inside
+        # one path-lock span, never on a released snapshot.
+        annotate_agents=fmt == "claude",
     )
     raw_path: Path | None = None
     if (
@@ -3448,8 +3453,6 @@ def _session_delta_payload(
             client_cursor=effective_cursor,
         )
     events = result["events"]
-    if fmt == "claude":
-        events = transcripts.annotate_agent_events(path, events)
     payload: dict[str, object] = {
         "version": 2,
         "format": fmt,
@@ -3741,12 +3744,14 @@ def agent_session_older(
             count,
         )
     elif fmt in {"codex", "claude"}:
-        result = transcripts.read_older_session(fmt, path, before, count)
+        # Endpoint transaction rule: annotation runs inside the read's
+        # path-lock span, never on a released snapshot.
+        result = transcripts.read_older_session(
+            fmt, path, before, count, annotate_agents=fmt == "claude"
+        )
     else:
         raise HTTPException(status_code=409, detail="Older transcript events are unavailable")
     events = result["events"]
-    if fmt == "claude":
-        events = transcripts.annotate_agent_events(path, events)
     return {
         "version": 2,
         "format": fmt,
@@ -3824,6 +3829,7 @@ def subagent_session(
     agent_id: str,
     cursor: int = Query(0, ge=0),
     client_path: str | None = Query(None, alias="path"),
+    limit: int | None = Query(None, ge=1, le=1000),
 ) -> dict[str, object]:
     if not valid_agent_id(ticket) or not SUBAGENT_ID_PATTERN.fullmatch(agent_id):
         raise HTTPException(status_code=400, detail="Bad id")
@@ -3833,14 +3839,20 @@ def subagent_session(
     path = transcripts.subagents_dir(main_path) / f"agent-{agent_id}.jsonl"
     if not path.is_file():
         raise HTTPException(status_code=404, detail="No such subagent")
-    # Subagent transcripts have no older-page route in the UI. Keep their
-    # initial response complete so tail-windowed events never become unreachable.
+    # Without a limit the response stays complete (the inspector has no
+    # older-page route, so tail-windowed events would become unreachable).
+    # The inline child trace passes an explicit limit so its first fetch is
+    # bounded server-side instead of transferring the full transcript
+    # (WIKI-244 review round 2, H2).
     return _session_delta_payload(
         "claude-sub",
         path,
         cursor=cursor,
         client_path=client_path,
         tail_window=False,
+        # Direct (non-HTTP) callers skip FastAPI resolution and pass the Query
+        # sentinel; normalize to "no limit" in that case.
+        tail_events=limit if isinstance(limit, int) else None,
     )
 
 

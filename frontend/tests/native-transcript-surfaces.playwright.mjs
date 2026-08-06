@@ -164,15 +164,9 @@ async function main() {
     await branchQuestion.getByText("Custom reply").waitFor();
     await branchQuestion.getByText("Go with the fresh branch").waitFor();
 
-    const activityToggle = page.locator(".session-activity-head").first();
-    await activityToggle.waitFor({ state: "visible" });
-    await activityToggle.click();
+    // WIKI-244: activity groups and tool bodies are open by default.
+    await page.locator(".session-activity-head").first().waitFor({ state: "visible" });
     await expectVisibleText(page, ".session-tool-summary", "monitor: while true; do sleep 45; done");
-    const monitorTool = page
-      .locator(".session-tool")
-      .filter({ hasText: "monitor: while true; do sleep 45; done" })
-      .first();
-    await monitorTool.locator(".session-tool-head").click();
     await expectVisibleText(page, ".transcript-preview-body", "Monitor started (task task123");
 
     logStep("capturing Claude screenshot");
@@ -187,9 +181,8 @@ async function main() {
     if ((await page.locator('[data-testid="session-run-details"]').count()) !== 0) {
       throw new Error("WIKI-235: Codex Run details must not render");
     }
-    const codexActivityToggle = page.locator(".session-activity-head").first();
-    await codexActivityToggle.waitFor({ state: "visible" });
-    await codexActivityToggle.click();
+    // WIKI-244: activity groups are open by default.
+    await page.locator(".session-activity-head").first().waitFor({ state: "visible" });
     await expectVisibleText(page, ".session-thinking-chip", "encrypted");
     await expectVisibleText(page, ".session-marker", "subagent started");
     logStep("capturing Codex screenshot");
@@ -200,18 +193,23 @@ async function main() {
     await expectVisibleText(page, ".gh-preview-title", "WIKI-58 inline thinking rows and font picker");
     await expectVisibleText(page, ".gh-preview-badge", "merged");
     await expectVisibleText(page, ".gh-preview-badge.is-muted", "3 files");
-    const ghActivityToggle = page.locator(".session-activity-head").first();
-    await ghActivityToggle.waitFor({ state: "visible" });
-    await ghActivityToggle.click();
-    await page.locator(".session-activity-collapsible.is-open .session-tool").first().waitFor({ state: "visible" });
-    const previewTool = page.locator(".session-activity-collapsible.is-open .session-tool").first();
-    await previewTool.locator(".session-tool-head").click();
-    await page.locator(".session-tool-collapsible.is-open").first().waitFor({ state: "visible" });
-    await previewTool.locator(".gh-preview-title", { hasText: "Add GitHub URL previews" }).waitFor();
+    // WIKI-244: activity groups and tool bodies are open by default — no
+    // clicks needed; the preview output is always visible in the tool row.
+    await page.locator(".session-activity-body .session-tool").first().waitFor({ state: "visible" });
+    const previewTool = page.locator(".session-activity-body .session-tool").first();
+    const previewToolEventId = await previewTool.getAttribute("data-tool-event-id");
+    if (!previewToolEventId) throw new Error("preview tool missing data-tool-event-id");
+    // The gh preview output lives either merged in the tool row or in the
+    // standalone result row keyed by the same data-tool-event-id.
+    const previewScope = page
+      .locator(`.session-activity-row[data-tool-event-id='${previewToolEventId}']`)
+      .filter({ has: page.locator(".gh-preview-title") })
+      .first();
+    await previewScope.locator(".gh-preview-title", { hasText: "Add GitHub URL previews" }).waitFor();
     // WIKI-153 (#122) wrapped tool output in `.session-tool-output-text` so
     // preview cards render inline with ANSI text; the bare fallback anchor is
     // now a descendant of `.session-tool-output-blocks`, not a direct child.
-    await previewTool
+    await previewScope
       .locator(".session-tool-output-blocks a.external-link", {
         hasText: "https://github.com/hwang2409/wiki/issues/64",
       })
