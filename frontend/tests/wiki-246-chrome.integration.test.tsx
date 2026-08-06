@@ -167,6 +167,38 @@ describe("WIKI-246 OpenCode chrome states", () => {
     expect(cssDeclarations(".kanban-card:hover")).toContain("box-shadow: none;");
   });
 
+  test("chrome hover keeps elevation without foreground or border promotion", () => {
+    for (const selector of [
+      ".ribbon-action:hover",
+      ".nav-action-button:hover",
+      ".tree-item-self:hover",
+      ".dialog-button:hover",
+      ".tmux-status-item:hover",
+      ".nav-agent:hover",
+    ]) {
+      const declarations = cssDeclarations(selector);
+      expect(declarations).toContain("background");
+      expect(declarations).not.toMatch(/(?:^|\n)\s*color\s*:/);
+      expect(declarations).not.toMatch(/(?:^|\n)\s*border-color\s*:/);
+    }
+  });
+
+  test("dialogs keep the WIKI-242 inset at a 320px viewport", () => {
+    const chromeDialog = CHROME_CSS.indexOf(".dialog,\n.quick-switcher,\n.settings-modal {");
+    const narrowOverride = CHROME_CSS.indexOf("@media (max-width: 640px)", chromeDialog);
+    expect(chromeDialog).toBeGreaterThanOrEqual(0);
+    expect(narrowOverride).toBeGreaterThan(chromeDialog);
+
+    const narrowDialogCss = CHROME_CSS.slice(narrowOverride);
+    expect(narrowDialogCss).toContain(".dialog,");
+    expect(narrowDialogCss).toContain(".quick-switcher,");
+    expect(narrowDialogCss).toContain(".settings-modal,");
+    expect(narrowDialogCss).toContain(".agent-spawn-modal {");
+    expect(narrowDialogCss).toContain("top: 12px;");
+    expect(narrowDialogCss).toContain("max-height: calc(100vh - 24px);");
+    expect(narrowDialogCss).toContain("overflow-y: auto;");
+  });
+
   test("converted chrome has no transition sites", () => {
     expect(cssDeclarations(".tmux-status-item")).not.toContain("transition");
     expect(CSS_SOURCE).not.toContain(

@@ -378,7 +378,6 @@ button:disabled {
 
 .ribbon-action:hover {
   background-color: var(--background-modifier-hover);
-  color: var(--text-normal);
 }
 
 .ribbon-action.is-active {
@@ -567,7 +566,6 @@ button:disabled {
 
 .nav-action-button:hover {
   background-color: var(--background-modifier-hover);
-  color: var(--text-normal);
 }
 
 .nav-action-button.is-active {
@@ -596,7 +594,6 @@ button:disabled {
 
 .tree-item-self:hover {
   background-color: var(--background-modifier-hover);
-  color: var(--text-normal);
 }
 
 .tree-item-self.is-active {
@@ -2065,9 +2062,7 @@ body.is-resizing-panes .pane-cell {
 }
 
 .dialog-button:hover {
-  border-color: var(--text-faint);
   background-color: var(--background-modifier-hover);
-  color: var(--text-normal);
 }
 
 .dialog-confirm {
@@ -2617,7 +2612,6 @@ body.is-resizing-panes .pane-cell {
 
 .tmux-status-item:hover {
   background-color: var(--background-modifier-hover);
-  color: var(--text-normal);
 }
 
 .tmux-status-item.is-active {
@@ -8052,7 +8046,6 @@ body.is-resizing-panes .pane-cell {
 
 .nav-agent:hover {
   background-color: var(--background-modifier-hover);
-  color: var(--text-normal);
 }
 
 .nav-agent.is-active {
@@ -15179,6 +15172,17 @@ textarea.composer-command-input {
 .agent-replace-modal {
   top: 25vh;
   width: min(500px, calc(100vw - 32px));
+}
+
+@media (max-width: 640px) {
+  .dialog,
+  .quick-switcher,
+  .settings-modal,
+  .agent-spawn-modal {
+    top: 12px;
+    max-height: calc(100vh - 24px);
+    overflow-y: auto;
+  }
 }
 
 .dialog-title {
