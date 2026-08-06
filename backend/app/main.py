@@ -1949,7 +1949,7 @@ def list_workspaces() -> WorkspaceList:
 
 
 @app.get("/api/agents")
-def agents() -> dict[str, object]:
+def agents(include_history: bool = False) -> dict[str, object]:
     registry: dict = {}
     registry_refreshed_at: str | None = None
     # Notice reconciliation compares against live registry identity, but the
@@ -2119,7 +2119,7 @@ def agents() -> dict[str, object]:
                 "orch": current.get("orch"),
                 "session": current.get("session"),
                 "spawned_at": current.get("spawned_at"),
-                "history": entry.get("history", []),
+                **({"history": entry.get("history", [])} if include_history else {}),
                 "state": (status or {}).get("state") or runtime_state,
                 "pr": (status or {}).get("pr"),
                 "step": (status or {}).get("step"),
@@ -2164,7 +2164,7 @@ def agents() -> dict[str, object]:
                     "orch": None,
                     "session": None,
                     "spawned_at": None,
-                    "history": [],
+                    **({"history": []} if include_history else {}),
                     "state": (status or {}).get("state"),
                     "pr": (status or {}).get("pr"),
                     "step": (status or {}).get("step"),

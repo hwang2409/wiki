@@ -2254,6 +2254,25 @@ class HeadlessMainRouteTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(blocked.exception.status_code, 409)
         self.assertIn("must be migrated", str(blocked.exception.detail))
 
+    async def test_agents_omits_history_unless_requested(self) -> None:
+        self._seed_headless()
+        registry = json.loads(self.registry.read_text(encoding="utf-8"))
+        registry["WIKI-42"]["history"] = [
+            {"kind": "cdx", "role": "implement", "outcome": "handoff"}
+        ]
+        self.registry.write_text(json.dumps(registry), encoding="utf-8")
+
+        default_worker = cast(list[dict[str, Any]], main.agents()["workers"])[0]
+        detailed_worker = cast(
+            list[dict[str, Any]], main.agents(include_history=True)["workers"]
+        )[0]
+
+        self.assertNotIn("history", default_worker)
+        self.assertEqual(
+            detailed_worker["history"],
+            [{"kind": "cdx", "role": "implement", "outcome": "handoff"}],
+        )
+
     async def test_orchestrator_spawn_grouping_and_controls_are_supervisor_owned(
         self,
     ) -> None:

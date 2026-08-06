@@ -1586,7 +1586,7 @@ export default function App() {
 
   useEffect(() => {
     let ignore = false;
-    getAgents()
+    getAgents(true)
       .then((result) => {
         if (ignore) return;
         setAgentsState({
