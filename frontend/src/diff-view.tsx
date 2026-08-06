@@ -5,7 +5,9 @@ import {
   fileTitle,
   parseUnifiedDiff,
   type DiffFilePatch,
+  type DiffHunk,
 } from "./diff-parser";
+import { TokenizedLine, languageForPath, useHighlightTokenLines } from "./shiki";
 
 export type {
   DiffFileKind,
@@ -21,6 +23,49 @@ const HIDDEN_META_PREFIXES = ["diff --git ", "index "];
 function extendedMetaLines(file: DiffFilePatch): string[] {
   return file.extendedHeaders.filter((line) =>
     !HIDDEN_META_PREFIXES.some((prefix) => line.startsWith(prefix)),
+  );
+}
+
+// Token-level syntax inside add/remove/context lines, matching the file's
+// language — the OpenCode edit-diff look (session/index.tsx:2404-2427). One
+// tokenize call per hunk (interleaved old/new text tokenizes line-by-line);
+// the shiki helper returns null over its size caps and the lines fall back
+// to plain text, so bounded payloads stay bounded.
+function DiffHunkBody({
+  hunk,
+  lang,
+  showLineNumbers,
+}: {
+  hunk: DiffHunk;
+  lang: string | null;
+  showLineNumbers: boolean;
+}) {
+  const joined = useMemo(() => hunk.lines.map((line) => line.text).join("\n"), [hunk]);
+  const tokenLines = useHighlightTokenLines(joined, lang);
+  return (
+    <div className="diff-hunk-body">
+      {hunk.lines.map((line, lineIndex) => {
+        const marker = line.kind === "add" ? "+" : line.kind === "remove" ? "-" : " ";
+        return (
+          <div className={`diff-line is-${line.kind}`} key={lineIndex}>
+            {showLineNumbers ? (
+              <>
+                <span className="diff-gutter diff-gutter-old tabular-nums">
+                  {line.oldNumber ?? ""}
+                </span>
+                <span className="diff-gutter diff-gutter-new tabular-nums">
+                  {line.newNumber ?? ""}
+                </span>
+              </>
+            ) : null}
+            <span className="diff-marker" aria-hidden="true">{marker}</span>
+            <span className="diff-code">
+              <TokenizedLine fallback={line.text} tokens={tokenLines?.[lineIndex]} />
+            </span>
+          </div>
+        );
+      })}
+    </div>
   );
 }
 
@@ -65,33 +110,11 @@ export function DiffPatchView({
                   <div className="diff-hunk-header" role="separator">
                     <span>{hunk.header}</span>
                   </div>
-                  <div className="diff-hunk-body">
-                    {hunk.lines.map((line, lineIndex) => {
-                      const marker = line.kind === "add"
-                        ? "+"
-                        : line.kind === "remove"
-                          ? "-"
-                          : line.kind === "meta"
-                            ? " "
-                            : " ";
-                      return (
-                        <div className={`diff-line is-${line.kind}`} key={lineIndex}>
-                          {showLineNumbers ? (
-                            <>
-                              <span className="diff-gutter diff-gutter-old tabular-nums">
-                                {line.oldNumber ?? ""}
-                              </span>
-                              <span className="diff-gutter diff-gutter-new tabular-nums">
-                                {line.newNumber ?? ""}
-                              </span>
-                            </>
-                          ) : null}
-                          <span className="diff-marker" aria-hidden="true">{marker}</span>
-                          <span className="diff-code">{line.text}</span>
-                        </div>
-                      );
-                    })}
-                  </div>
+                  <DiffHunkBody
+                    hunk={hunk}
+                    lang={languageForPath(fileTitle(file))}
+                    showLineNumbers={showLineNumbers}
+                  />
                 </Fragment>
               ))}
             </div>

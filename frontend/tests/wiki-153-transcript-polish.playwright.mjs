@@ -408,7 +408,9 @@ async function main() {
     }
     await ghMixBody.locator(".session-tool-output-text .ansi-fg-2").first().waitFor({ state: "visible" });
     await ghMixOutput.locator(".transcript-preview-more").click();
-    await ghMixOutput.locator(".transcript-preview-more", { hasText: "show less" }).waitFor({ state: "visible" });
+    // WIKI-249: block-variant expand control reads "Click to expand" /
+    // "Click to collapse" (OpenCode session/index.tsx:2083-2085).
+    await ghMixOutput.locator(".transcript-preview-more", { hasText: "Click to collapse" }).waitFor({ state: "visible" });
     const ghMixBodyAfter = await ghMixBody.innerText();
     if (!ghMixBodyAfter.includes(GH_MIX_OUTPUT_TAIL_MARKER)) {
       throw new Error("expanded gh-preview mixed output should include the tail marker");
@@ -420,7 +422,7 @@ async function main() {
       throw new Error("expanded gh-preview mixed output should include the ANSI tail marker text");
     }
     await ghMixBody.locator(".session-tool-output-text .ansi-fg-1").first().waitFor({ state: "visible" });
-    await ghMixOutput.locator(".transcript-preview-more", { hasText: "show less" }).click();
+    await ghMixOutput.locator(".transcript-preview-more", { hasText: "Click to collapse" }).click();
 
     logStep("bash block has no persistent wrap or copy chrome");
 

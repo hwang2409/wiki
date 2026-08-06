@@ -14,6 +14,7 @@ import {
   type MarkdownImageProps,
 } from "./markdown-image";
 import { ShikiCode } from "./shiki";
+import { detectFenceLang } from "./transcript-event-utils";
 import {
   AlertTriangle,
   Bug,
@@ -589,8 +590,9 @@ type MarkdownLinkProps = {
 
 export function MarkdownPre({
   children,
+  detectLang = false,
   ...rest
-}: React.HTMLAttributes<HTMLPreElement>) {
+}: React.HTMLAttributes<HTMLPreElement> & { detectLang?: boolean }) {
   const items = Children.toArray(children);
   const child = items.length === 1 ? items[0] : null;
   if (
@@ -599,8 +601,10 @@ export function MarkdownPre({
     child.type === "code"
   ) {
     const langMatch = /language-([\w-]+)/.exec(child.props.className ?? "");
-    const lang = langMatch?.[1] ?? null;
     const code = textFromReactNode(child.props.children).replace(/\n$/, "");
+    // The agent's own tag always wins; untagged fences get conservative
+    // signature detection (transcript prose only), else stay plain.
+    const lang = langMatch?.[1] ?? (detectLang ? detectFenceLang(code) : null);
     if (lang === "mermaid") {
       return (
         <Suspense fallback={<div className="markdown-mermaid-loading">Rendering diagram…</div>}>

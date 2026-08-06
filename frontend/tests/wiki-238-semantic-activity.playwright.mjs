@@ -37,10 +37,13 @@ const THEMES = [
   "catppuccin-mocha",
 ];
 const ESSENTIAL_CONTRAST_ROLES = [
-  ["timeline metadata", ".session-activity-row-meta"],
+  // WIKI-249: status words and the metadata chip left the row (state = color,
+  // OpenCode index.tsx:1867-1874); the glyph column and inline result carry
+  // the same scan roles now.
+  ["inline result metadata", ".session-tool-inline-result"],
   ["reasoning", ".session-thinking"],
   ["tool summary", ".session-tool:not(.is-failed) .session-tool-summary"],
-  ["tool status", ".session-tool:not(.is-failed) .session-tool-status"],
+  ["tool glyph", ".session-tool:not(.is-failed) .session-tool-icon-text"],
   ["tool target", ".session-tool:not(.is-failed) .session-tool-target"],
   ["raw preview body", ".transcript-preview-body"],
 ];
@@ -360,10 +363,14 @@ async function main() {
         === "order B finished",
       "tool output must remain paired with the exact owning per-event row",
     );
-    assert((await firstTool.locator(".session-tool-status").innerText()).toLowerCase() === "completed",
-      "ok=null tools must render a neutral completed label");
-    assert((await firstTool.locator(".session-activity-row-meta").innerText()) === "unknown",
-      "ok=null results must not invent an ok outcome");
+    // WIKI-249: state is the row's color, never a word (OpenCode
+    // index.tsx:1867-1874). The neutral completion stays for screen readers.
+    assert((await firstTool.locator(".session-tool-status").count()) === 0,
+      "status words must not render in the visual row");
+    assert(/\bis-completed\b/.test(await firstTool.getAttribute("class") ?? ""),
+      "ok=null tools must carry the neutral completed state class");
+    assert((await firstTool.locator(".sr-only").innerText()).trim().toLowerCase() === "completed",
+      "ok=null completion must stay exposed to screen readers");
 
     const longThinkingHead = page.locator(".session-thinking-head").nth(1);
     assert(await longThinkingHead.getAttribute("aria-expanded") === "false",
@@ -392,7 +399,7 @@ async function main() {
       const style = getComputedStyle(element);
       return { family: style.fontFamily, size: Number.parseFloat(style.fontSize) };
     });
-    const metadataStyle = await page.locator(".session-tool-status").first().evaluate((element) => {
+    const metadataStyle = await page.locator(".session-tool-inline-result").first().evaluate((element) => {
       const style = getComputedStyle(element);
       return { family: style.fontFamily, size: Number.parseFloat(style.fontSize) };
     });

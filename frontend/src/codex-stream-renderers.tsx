@@ -8,7 +8,9 @@ import {
   fileTitle,
   parseUnifiedDiff,
   type DiffFilePatch,
+  type DiffHunk,
 } from "./diff-parser";
+import { TokenizedLine, languageForPath, useHighlightTokenLines } from "./shiki";
 
 type RecordValue = Record<string, unknown>;
 
@@ -567,6 +569,26 @@ function boundDiffFiles(files: ReadonlyMap<string, DiffFilePatch>): Map<string, 
   return bounded;
 }
 
+// Token-level syntax inside working-diff lines, matching the file's language.
+// One tokenize call per hunk; the shiki helper returns null past its caps and
+// lines fall back to plain text. The working diff mounts collapsed, so this
+// work only happens after the reader opens it.
+function CodexDiffHunk({ hunk, lang }: { hunk: DiffHunk; lang: string | null }) {
+  const joined = useMemo(() => hunk.lines.map((line) => line.text).join("\n"), [hunk]);
+  const tokenLines = useHighlightTokenLines(joined, lang);
+  return (
+    <div className="codex-stream-diff-hunk">
+      <div className="codex-stream-diff-hunk-head">{hunk.header}</div>
+      {hunk.lines.map((line, index) => (
+        <div className={`codex-stream-diff-line is-${line.kind}`} key={`${hunk.header}:${index}`}>
+          <span className="codex-stream-diff-marker">{line.kind === "add" ? "+" : line.kind === "remove" ? "-" : " "}</span>
+          <code><TokenizedLine fallback={line.text} tokens={tokenLines?.[index]} /></code>
+        </div>
+      ))}
+    </div>
+  );
+}
+
 // WIKI-247: transcript rows stay always open, but the working diff is a
 // separate disclosure. Byte/line bounds stay for performance; truncated data
 // keeps raw access through a copy control that carries the full source.
@@ -635,15 +657,7 @@ function DiffRenderer({ source }: { source: string | null }) {
                 </div>
                 <div className="codex-stream-diff-body">
                   {file.hunks.map((hunk) => (
-                    <div className="codex-stream-diff-hunk" key={`${path}:${hunk.header}`}>
-                      <div className="codex-stream-diff-hunk-head">{hunk.header}</div>
-                      {hunk.lines.map((line, index) => (
-                        <div className={`codex-stream-diff-line is-${line.kind}`} key={`${hunk.header}:${index}`}>
-                          <span className="codex-stream-diff-marker">{line.kind === "add" ? "+" : line.kind === "remove" ? "-" : " "}</span>
-                          <code>{line.text}</code>
-                        </div>
-                      ))}
-                    </div>
+                    <CodexDiffHunk hunk={hunk} key={`${path}:${hunk.header}`} lang={languageForPath(path)} />
                   ))}
                   {bounded.truncated ? (
                     <div className="codex-stream-diff-truncated">
