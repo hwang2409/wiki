@@ -37,6 +37,7 @@ from . import (
     dashboard,
     github_pr,
     github_preview,
+    installed_fonts,
     knowledge,
     palette,
     provider_health,
@@ -4024,6 +4025,12 @@ def list_skills() -> dict[str, object]:
 @app.get("/api/models")
 def list_models() -> dict[str, object]:
     return {"models": list_model_options()}
+
+
+@app.get("/api/fonts")
+async def list_fonts() -> dict[str, object]:
+    families = await asyncio.to_thread(installed_fonts.installed_families)
+    return {"families": families}
 
 
 @app.get("/api/tokens")

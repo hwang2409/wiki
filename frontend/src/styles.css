@@ -1898,6 +1898,30 @@ body.is-resizing-panes .pane-cell {
   overflow-y: auto;
 }
 
+.font-picker-filter {
+  position: sticky;
+  top: 0;
+  z-index: 1;
+  margin: -4px -4px 4px;
+  padding: 6px 10px;
+  border: none;
+  border-bottom: 1px solid var(--background-modifier-border);
+  background-color: var(--background-primary);
+  color: var(--text-normal);
+  font-size: var(--font-ui-smaller);
+  outline: none;
+}
+
+.font-picker-filter::placeholder {
+  color: var(--text-faint);
+}
+
+.font-picker-empty {
+  padding: 8px 10px;
+  color: var(--text-faint);
+  font-size: var(--font-ui-smaller);
+}
+
 .font-picker-option {
   display: flex;
   align-items: baseline;

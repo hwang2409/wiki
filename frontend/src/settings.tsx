@@ -1,12 +1,16 @@
 import { useEffect, useMemo, useRef, useState } from "react";
 import { ChevronDown, X } from "lucide-react";
 import { THEMES, type ThemeId } from "./themes";
+import {
+  classifyEnumerated,
+  fetchInstalledFamilies,
+  makeCanvasMonoProbe,
+  mergePools,
+  synthesizedChoice,
+  type FontChoice,
+} from "./font-enumeration";
 
-export type FontChoice = {
-  label: string;
-  family: string;
-  stack: string;
-};
+export type { FontChoice };
 
 const MONO_TAIL =
   'ui-monospace, SFMono-Regular, "SF Mono", Menlo, Consolas, monospace';
@@ -126,7 +130,11 @@ type FontRoleId = "ui" | "text" | "agent" | "mono";
 type FontRole = {
   name: string;
   desc: string;
-  fonts: FontChoice[];
+  curated: FontChoice[];
+  // Which bucket of enumerated OS families appends to this role's pool.
+  // Mono roles get canvas-classified monospace families; prop roles get the
+  // rest. Curated fonts always survive regardless of classification.
+  enumeratedBucket: "mono" | "prop";
   key: string;
   cssVar: string;
   weightKey: string;
@@ -142,7 +150,8 @@ const FONT_ROLES: Record<FontRoleId, FontRole> = {
   ui: {
     name: "Interface font",
     desc: "App chrome: sidebar, tabs, buttons, status bar, dialogs.",
-    fonts: ALL_FONTS,
+    curated: ALL_FONTS,
+    enumeratedBucket: "prop",
     key: "wiki-ui-font",
     cssVar: "--font-interface",
     weightKey: "wiki-ui-font-weight",
@@ -152,7 +161,8 @@ const FONT_ROLES: Record<FontRoleId, FontRole> = {
   text: {
     name: "Note font",
     desc: "Body text of rendered notes and the source editor.",
-    fonts: ALL_FONTS,
+    curated: ALL_FONTS,
+    enumeratedBucket: "prop",
     key: "wiki-text-font",
     cssVar: "--font-text",
     weightKey: "wiki-text-font-weight",
@@ -162,7 +172,8 @@ const FONT_ROLES: Record<FontRoleId, FontRole> = {
   agent: {
     name: "Agent chat font",
     desc: "Agent replies and thinking traces in session transcripts.",
-    fonts: AGENT_FONTS,
+    curated: AGENT_FONTS,
+    enumeratedBucket: "prop",
     key: "wiki-agent-font",
     cssVar: "--font-agent-prose",
     weightKey: "wiki-agent-font-weight",
@@ -173,7 +184,8 @@ const FONT_ROLES: Record<FontRoleId, FontRole> = {
   mono: {
     name: "Monospace font",
     desc: "Code blocks, agent transcripts, and mono UI chrome.",
-    fonts: ALL_FONTS,
+    curated: MONO_FONTS,
+    enumeratedBucket: "mono",
     key: "wiki-mono-font",
     cssVar: "--font-monospace",
     weightKey: "wiki-mono-font-weight",
@@ -343,8 +355,18 @@ function storedSize(key: string, fallback: number): number {
   return Number.isFinite(raw) && raw >= 10 && raw <= 24 ? raw : fallback;
 }
 
-function pickChoice(fonts: FontChoice[], stored: string | null): FontChoice {
-  return fonts.find((font) => font.label === stored) ?? fonts[0];
+function pickChoice(fonts: FontChoice[], stored: string | null, monoFallback = false): FontChoice {
+  if (stored) {
+    const hit = fonts.find((font) => font.label === stored);
+    if (hit) return hit;
+    // Stored label from a wider prior pool (e.g. before mono/prop split) or
+    // from an enumerated family that has not loaded yet. Synthesize the same
+    // CSS the user had, so persistence never silently swaps the applied font.
+    // isAvailable() still filters the dropdown, so a missing family here
+    // renders via the tail fallback instead of the wrong first entry.
+    return synthesizedChoice(stored, monoFallback);
+  }
+  return fonts[0];
 }
 
 function applyFontVar(cssVar: string, choice: FontChoice) {
@@ -373,7 +395,10 @@ function applyFontWeightVar(cssVar: string, weight: number | null) {
 
 export function applyStoredFonts() {
   for (const role of Object.values(FONT_ROLES)) {
-    applyFontVar(role.cssVar, pickChoice(role.fonts, localStorage.getItem(role.key)));
+    applyFontVar(
+      role.cssVar,
+      pickChoice(role.curated, localStorage.getItem(role.key), role.enumeratedBucket === "mono"),
+    );
     applyFontWeightVar(role.weightCssVar, storedWeight(role));
   }
   applySizes(
@@ -381,14 +406,18 @@ export function applyStoredFonts() {
     storedSize(UI_SIZE_KEY, UI_SIZE_DEFAULT),
     storedSize(MONO_SIZE_KEY, MONO_SIZE_DEFAULT)
   );
+  // Warm the backend font-enumeration cache so the settings modal is
+  // ready when the user opens it. Discard errors — the picker still works
+  // with curated-only pools if the endpoint is missing or slow.
+  void fetchInstalledFamilies().catch(() => []);
 }
 
 function currentLabel(role: FontRole): string {
-  return localStorage.getItem(role.key) ?? role.fonts[0].label;
+  return localStorage.getItem(role.key) ?? role.curated[0].label;
 }
 
 function setFont(role: FontRole, label: string) {
-  const choice = pickChoice(role.fonts, label);
+  const choice = pickChoice(role.curated, label, role.enumeratedBucket === "mono");
   localStorage.setItem(role.key, choice.label);
   applyFontVar(role.cssVar, choice);
 }
@@ -414,14 +443,25 @@ function FontPicker({
 }) {
   const [open, setOpen] = useState(false);
   const [availTick, setAvailTick] = useState(0);
+  const [query, setQuery] = useState("");
   const rootRef = useRef<HTMLDivElement | null>(null);
+  const filterRef = useRef<HTMLInputElement | null>(null);
 
   const currentChoice = useMemo(() => pickChoice(fonts, current), [fonts, current]);
 
   useEffect(() => {
-    if (!open) return;
+    if (!open) {
+      setQuery("");
+      return;
+    }
     setAvailTick((t) => t + 1);
   }, [open, fonts]);
+
+  useEffect(() => {
+    if (!open) return;
+    // Focus the filter on open so power users can type-narrow immediately.
+    filterRef.current?.focus();
+  }, [open]);
 
   useEffect(() => {
     if (!open) return;
@@ -443,11 +483,16 @@ function FontPicker({
     };
   }, [open]);
 
-  const visible = useMemo(
+  const available = useMemo(
     () => fonts.filter((font) => font.label === current || isAvailable(font)),
     // availTick invalidates the memo after loads land
     [fonts, current, availTick]
   );
+  const visible = useMemo(() => {
+    const needle = query.trim().toLowerCase();
+    if (!needle) return available;
+    return available.filter((font) => font.label.toLowerCase().includes(needle));
+  }, [available, query]);
 
   return (
     <div className={`font-picker${open ? " is-open" : ""}`} ref={rootRef}>
@@ -468,6 +513,25 @@ function FontPicker({
       </button>
       {open ? (
         <div className="font-picker-menu" role="listbox">
+          <input
+            aria-label="Filter fonts"
+            className="font-picker-filter"
+            placeholder="Filter fonts"
+            ref={filterRef}
+            type="text"
+            value={query}
+            onChange={(event) => setQuery(event.target.value)}
+            onKeyDown={(event) => {
+              if (event.key === "Enter" && visible.length > 0) {
+                event.preventDefault();
+                onChange(visible[0].label);
+                setOpen(false);
+              }
+            }}
+          />
+          {visible.length === 0 ? (
+            <div className="font-picker-empty">No fonts match “{query}”.</div>
+          ) : null}
           {visible.map((font) => {
             const active = font.label === current;
             return (
@@ -504,7 +568,37 @@ function FontPicker({
   );
 }
 
-function FontRoleRow({ role }: { role: FontRole }) {
+// Enumerated OS families arrive from the backend once per session. Curated
+// pools always render first (with their tuned stacks + labels); enumerated
+// families are appended per-role using the canvas mono-classifier so the
+// mono picker stays focused and the prop pickers absorb the rest.
+function useInstalledFontPools(): Record<FontRoleId, FontChoice[]> {
+  const [installed, setInstalled] = useState<string[]>([]);
+  useEffect(() => {
+    let cancelled = false;
+    void fetchInstalledFamilies().then((families) => {
+      if (cancelled) return;
+      setInstalled(families);
+    });
+    return () => {
+      cancelled = true;
+    };
+  }, []);
+  return useMemo(() => {
+    const probe = makeCanvasMonoProbe();
+    const { mono, prop } = classifyEnumerated(installed, probe);
+    const forProp = (family: string) => synthesizedChoice(family, false);
+    const forMono = (family: string) => synthesizedChoice(family, true);
+    return {
+      ui: mergePools({ curated: FONT_ROLES.ui.curated, installed: prop, synthesize: forProp }),
+      text: mergePools({ curated: FONT_ROLES.text.curated, installed: prop, synthesize: forProp }),
+      agent: mergePools({ curated: FONT_ROLES.agent.curated, installed: prop, synthesize: forProp }),
+      mono: mergePools({ curated: FONT_ROLES.mono.curated, installed: mono, synthesize: forMono }),
+    };
+  }, [installed]);
+}
+
+function FontRoleRow({ role, fonts }: { role: FontRole; fonts: FontChoice[] }) {
   const [label, setLabel] = useState(() => currentLabel(role));
   const [weights, setWeights] = useState<number[]>([]);
   const inheritRole = role.inheritsWeightFrom ? FONT_ROLES[role.inheritsWeightFrom] : null;
@@ -517,7 +611,11 @@ function FontRoleRow({ role }: { role: FontRole }) {
     // placeholder) so the control never disagrees with the applied CSS.
     return inheritRole ? "" : "400";
   });
-  const choice = useMemo(() => pickChoice(role.fonts, label), [role.fonts, label]);
+  const monoFallback = role.enumeratedBucket === "mono";
+  const choice = useMemo(
+    () => pickChoice(fonts, label, monoFallback),
+    [fonts, label, monoFallback],
+  );
 
   useEffect(() => {
     let cancelled = false;
@@ -563,7 +661,7 @@ function FontRoleRow({ role }: { role: FontRole }) {
       <div className="font-setting-controls">
         <FontPicker
           current={label}
-          fonts={role.fonts}
+          fonts={fonts}
           sample={role.sample}
           weight={weight}
           onChange={(next) => {
@@ -642,6 +740,7 @@ export function SettingsModal({
   const [bodySize, setBodySize] = useState(() => storedSize(BODY_SIZE_KEY, BODY_SIZE_DEFAULT));
   const [uiSize, setUiSize] = useState(() => storedSize(UI_SIZE_KEY, UI_SIZE_DEFAULT));
   const [monoSize, setMonoSize] = useState(() => storedSize(MONO_SIZE_KEY, MONO_SIZE_DEFAULT));
+  const fontPools = useInstalledFontPools();
 
   function updateSizes(body: number, ui: number, mono: number) {
     setBodySize(body);
@@ -703,15 +802,15 @@ export function SettingsModal({
               ))}
             </div>
           </div>
-          <FontRoleRow role={FONT_ROLES.ui} />
-          <FontRoleRow role={FONT_ROLES.text} />
+          <FontRoleRow fonts={fontPools.ui} role={FONT_ROLES.ui} />
+          <FontRoleRow fonts={fontPools.text} role={FONT_ROLES.text} />
           <div
             className="settings-preview"
             style={{ fontFamily: "var(--font-text)", fontWeight: "var(--font-text-weight)" }}
           >
             The quick brown fox jumps over the lazy dog — 0123456789
           </div>
-          <FontRoleRow role={FONT_ROLES.agent} />
+          <FontRoleRow fonts={fontPools.agent} role={FONT_ROLES.agent} />
           <div
             className="settings-preview"
             style={{
@@ -721,7 +820,7 @@ export function SettingsModal({
           >
             I updated the composer and reran the suite — 13 passed, 0 failed.
           </div>
-          <FontRoleRow role={FONT_ROLES.mono} />
+          <FontRoleRow fonts={fontPools.mono} role={FONT_ROLES.mono} />
           <div
             className="settings-preview"
             style={{ fontFamily: "var(--font-monospace)", fontWeight: "var(--font-monospace-weight)" }}
