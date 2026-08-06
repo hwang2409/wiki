@@ -3220,8 +3220,16 @@ export default function App() {
 
       // Meta/Ctrl-K opens the palette from ANYWHERE (composer, editor,
       // terminal). The text-entry guard below still blocks unmodified
-      // shortcuts like `j`/`k`/`b` while typing.
-      if (commandModifier && !event.altKey && !event.shiftKey && lowerKey === "k") {
+      // shortcuts like `j`/`k`/`b` while typing. When the palette itself
+      // is open we skip this handler so the palette's own Ctrl+K binding
+      // ("move selection up") can fire.
+      if (
+        commandModifier &&
+        !event.altKey &&
+        !event.shiftKey &&
+        lowerKey === "k" &&
+        !paletteOpen
+      ) {
         event.preventDefault();
         event.stopPropagation();
         if (!modalOpen) setPaletteOpen((open) => !open);
@@ -3248,12 +3256,15 @@ export default function App() {
     }
 
     // Capture-phase Meta/Ctrl-K so terminals + editors + composers can't
-    // intercept the palette shortcut before we see it.
+    // intercept the palette shortcut before we see it. When the palette is
+    // already open, let the event fall through — the palette uses Ctrl+K as
+    // "move selection up" (mirroring Ctrl+J as "down") and needs to see it.
     function onPaletteCapture(event: globalThis.KeyboardEvent) {
       if (event.defaultPrevented) return;
       if (!(event.metaKey || event.ctrlKey)) return;
       if (event.altKey || event.shiftKey) return;
       if (event.key.toLowerCase() !== "k") return;
+      if (paletteOpen) return;
       event.preventDefault();
       event.stopPropagation();
       if (!modalOpen) setPaletteOpen((open) => !open);
@@ -3267,6 +3278,7 @@ export default function App() {
     };
   }, [
     modalOpen,
+    paletteOpen,
     handlePaneScopeKey,
   ]);
 
