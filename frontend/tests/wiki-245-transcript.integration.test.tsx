@@ -305,10 +305,10 @@ test("failed edits show semantic errors before the intended diff", () => {
     output: "<tool_use_error>old text was not found</tool_use_error>",
     ok: false,
   });
-  // failure details sit behind the error toggle; the row itself carries the
-  // failed state color.
-  expect(container.querySelector(".session-tool-body")).toBeNull();
-  fireEvent.click(container.querySelector(".session-tool-error-toggle")!);
+  // WIKI-253: failure details render expanded from the start — hiding a
+  // broken run behind a toggle was the exact scannability regression the
+  // ticket flipped.
+  expect(container.querySelector(".session-tool-body")).toBeTruthy();
   expect(container.querySelector(".session-output-segment.is-error")?.textContent)
     .toContain("old text was not found");
   expect(container.querySelector(".diff-view")).toBeNull();
@@ -321,7 +321,6 @@ test("failed edits keep plain failure output primary", () => {
     output: "old text was not found",
     ok: false,
   });
-  fireEvent.click(container.querySelector(".session-tool-error-toggle")!);
   expect(container.querySelector(".session-tool-failure-output")?.textContent)
     .toContain("old text was not found");
   expect(container.querySelector(".diff-view")).toBeNull();
@@ -350,7 +349,7 @@ test("plain failed output renders as error segments", () => {
     output: "old text was not found",
     ok: false,
   });
-  fireEvent.click(container.querySelector(".session-tool-error-toggle")!);
+  // WIKI-253: no toggle click — failures render expanded from the start.
   expect(container.querySelector(".session-output-segment.is-error, .harness-output .is-error")?.textContent)
     .toContain("old text was not found");
 });
@@ -369,7 +368,11 @@ test("generic inline tools render the capped inline output", () => {
   expect(inline?.textContent ?? "").toMatch(/\.\.\.$/);
 });
 
-test("failed block output stays hidden until the error toggle expands it", () => {
+test("failed block output stays visible by default; the toggle can hide it", () => {
+  // WIKI-253 flipped this: failures render expanded from the start so a
+  // broken run cannot hide behind a chip while the reader scans downstream
+  // rows. The hide-error control still exists for readers who want to
+  // collapse a known failure.
   const { container, getByRole } = renderTool({
     name: "Bash",
     archetype: "bash",
@@ -377,11 +380,11 @@ test("failed block output stays hidden until the error toggle expands it", () =>
     output: "boom",
     ok: false,
   });
-  expect(container.querySelector(".session-tool-body")).toBeNull();
-  fireEvent.click(getByRole("button", { name: "show error" }));
   expect(container.querySelector(".session-tool-body")).toBeTruthy();
   fireEvent.click(getByRole("button", { name: "hide error" }));
   expect(container.querySelector(".session-tool-body")).toBeNull();
+  fireEvent.click(getByRole("button", { name: "show error" }));
+  expect(container.querySelector(".session-tool-body")).toBeTruthy();
 });
 
 test("apply_patch with a garbage preamble falls back instead of diffing", () => {

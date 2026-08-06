@@ -94,6 +94,8 @@ import { Timestamp } from "./timestamp";
 import { StatusBadge } from "./status-badge";
 import { BoundedPreview } from "./transcript-preview";
 import {
+  TOOL_OUTPUT_COLLAPSE_CHARS,
+  TOOL_OUTPUT_COLLAPSE_LINES,
   bashReadTargetPath,
   compactJsonDetail,
   detectStructuredContent,
@@ -106,6 +108,7 @@ import {
   toolGlyph,
   toolInlineResult,
   toolDiffSource,
+  toolOutputPeek,
   toolPathHint,
   toolPresentation,
   toolStatus,
@@ -1180,23 +1183,74 @@ function toolBlockTitle(tool: SessionTool): string {
   return `← ${summary}`;
 }
 
+// WIKI-253: session-scoped memory of which tool-output blocks the reader has
+// explicitly expanded past the default-collapse. Keyed by event id so the
+// choice survives virtualized unmount/remount, and cleared automatically
+// because the session's own module scope is torn down between sessions.
+const explicitlyExpandedTools = new Set<number>();
+const explicitlyCollapsedTools = new Set<number>();
+
+function useToolOutputExpanded(
+  eventId: number,
+  defaultCollapsed: boolean,
+): [boolean, () => void] {
+  const initial = defaultCollapsed
+    ? explicitlyExpandedTools.has(eventId)
+    : !explicitlyCollapsedTools.has(eventId);
+  const [expanded, setExpanded] = useState(initial);
+  const toggle = useCallback(() => {
+    setExpanded((prev) => {
+      const next = !prev;
+      if (defaultCollapsed) {
+        if (next) explicitlyExpandedTools.add(eventId);
+        else explicitlyExpandedTools.delete(eventId);
+      } else {
+        if (next) explicitlyCollapsedTools.delete(eventId);
+        else explicitlyCollapsedTools.add(eventId);
+      }
+      return next;
+    });
+  }, [defaultCollapsed, eventId]);
+  return [expanded, toggle];
+}
+
+function shouldDefaultCollapse(text: string): boolean {
+  if (!text) return false;
+  const lineCount = text.split("\n").length;
+  return lineCount > TOOL_OUTPUT_COLLAPSE_LINES || text.length > TOOL_OUTPUT_COLLAPSE_CHARS;
+}
+
 function ToolOutputBody({
   displayOutput,
   diffSource,
+  eventId,
   rawOutput,
   segments,
   tool,
 }: {
   displayOutput: string;
   diffSource: string | null;
+  eventId: number;
   rawOutput: string;
   segments: HarnessOutputSegment[];
   tool: SessionTool;
 }) {
   const presentation = toolPresentation(tool, displayOutput);
-  if (presentation === "inline" || (!displayOutput && !isBashTool(tool))) return null;
   const failed = tool.ok === false;
+  const running = tool.ok === null;
   const diffDegraded = toolDiffIsTruncated(tool);
+  // WIKI-253: diffs, failures, and still-running streams are exempt from the
+  // default-collapse — a reader opening a turn wants to see them, and hiding
+  // live progress mid-stream breaks the "watching a run happen" affordance.
+  const bodyText = displayOutput || rawOutput;
+  const defaultCollapse = presentation !== "diff"
+    && !failed
+    && !running
+    && shouldDefaultCollapse(bodyText);
+  const [expanded, toggleExpanded] = useToolOutputExpanded(eventId, defaultCollapse);
+  const showCollapsed = defaultCollapse && !expanded;
+
+  if (presentation === "inline" || (!displayOutput && !isBashTool(tool))) return null;
   if (presentation === "diff") {
     return (
       <div className="session-tool-body session-tool-diff-body">
@@ -1236,21 +1290,36 @@ function ToolOutputBody({
     ? bashReadTargetPath(tool.input)
     : null;
   const bashOutputLang = bashReadTarget ? languageForPath(bashReadTarget) : null;
+  const titleNode = bash ? (
+    <div className="session-tool-block-title is-command">
+      $ <CommandHighlight command={tool.input || toolSummaryLine(tool)} />
+    </div>
+  ) : (
+    <div className="session-tool-block-title">{toolBlockTitle(tool)}</div>
+  );
+  if (showCollapsed) {
+    const peek = toolOutputPeek(tool, displayOutput || rawOutput);
+    return (
+      <div className="session-tool-body session-tool-block-body is-collapsed">
+        {titleNode}
+        <ToolOutputPeekRow peek={peek} onExpand={toggleExpanded} />
+      </div>
+    );
+  }
+  // Short payloads (below the collapse threshold) keep the historical
+  // 10/3-line preview so a small block still stays tight without any
+  // reader interaction. When the outer collapse governs, the inner
+  // preview stops line-clipping AND stops height-clamping — the reader
+  // asked for the full payload and should get it in one click.
+  const bodyPreviewLines = defaultCollapse ? Number.POSITIVE_INFINITY : bash ? 10 : 3;
   return (
-    <div className="session-tool-body session-tool-block-body">
-      {/* Bash blocks: the command line reads in text color, output recedes to
-          muted — two tones, no same-color wall (WIKI-247). */}
-      {bash ? (
-        <div className="session-tool-block-title is-command">
-          $ <CommandHighlight command={tool.input || toolSummaryLine(tool)} />
-        </div>
-      ) : (
-        <div className="session-tool-block-title">{toolBlockTitle(tool)}</div>
-      )}
+    <div className={`session-tool-body session-tool-block-body${expanded ? " is-expanded" : ""}`}>
+      {titleNode}
       <BoundedPreview
         ansi
         className="session-tool-block-preview"
-        previewLines={bash ? 10 : 3}
+        expandable={!defaultCollapse}
+        previewLines={bodyPreviewLines}
         rawText={rawOutput}
         showSummary={false}
         text={structured?.text ?? displayOutput}
@@ -1268,7 +1337,42 @@ function ToolOutputBody({
           </div>
         )}
       />
+      {defaultCollapse && expanded ? (
+        <button
+          aria-expanded="true"
+          className="session-tool-output-collapse"
+          type="button"
+          onClick={toggleExpanded}
+        >
+          collapse output
+        </button>
+      ) : null}
     </div>
+  );
+}
+
+function ToolOutputPeekRow({
+  peek,
+  onExpand,
+}: {
+  peek: ReturnType<typeof toolOutputPeek>;
+  onExpand: () => void;
+}) {
+  const lineLabel = peek.lines === 1 ? "line" : "lines";
+  return (
+    <button
+      aria-expanded="false"
+      className="session-tool-output-peek"
+      type="button"
+      onClick={onExpand}
+    >
+      <span aria-hidden="true" className="session-tool-output-peek-chevron">›</span>
+      <span className="session-tool-output-peek-preview">{peek.preview}</span>
+      <span className="session-tool-output-peek-meta">
+        {peek.lines} {lineLabel} · {peek.size}
+      </span>
+      <span className="session-tool-output-peek-hint">show output</span>
+    </button>
   );
 }
 
@@ -1492,7 +1596,11 @@ export function ToolCallRow({
   const diffSource = toolDiffSource(tool, displayOutput);
   const presentation = toolPresentation(tool, diffSource ?? displayOutput);
   const outputBlock = presentation !== "inline";
-  const [errorExpanded, setErrorExpanded] = useState(false);
+  // WIKI-253: failures default expanded so a broken run cannot hide behind a
+  // toggle — the hide-error control still exists for readers who want to
+  // collapse a known failure while scanning downstream rows.
+  const [errorHidden, setErrorHidden] = useState(false);
+  const errorShown = tool.ok === false && !errorHidden;
   const [rawOpen, setRawOpen] = useState(false);
   const [polishedOpen, setPolishedOpen] = useState(false);
   const rawId = useId();
@@ -1507,9 +1615,9 @@ export function ToolCallRow({
         numberedPayload ? null : languageForPath(toolPathHint(tool) ?? ""),
       )
     : null;
-  const showOutputBlock = outputBlock && (tool.ok !== false || errorExpanded);
-  const inlineOutput = presentation === "inline" && (tool.ok !== false || errorExpanded)
-    ? tool.ok === false && errorExpanded
+  const showOutputBlock = outputBlock && (tool.ok !== false || errorShown);
+  const inlineOutput = presentation === "inline" && (tool.ok !== false || errorShown)
+    ? tool.ok === false && errorShown
       ? displayOutput
       : toolInlineResult(tool, displayOutput)
     : null;
@@ -1544,7 +1652,7 @@ export function ToolCallRow({
               : (
                 <HarnessOutput
                   ansi
-                  segments={tool.ok === false && errorExpanded ? outputSegments : clipSegmentsInline(outputSegments)}
+                  segments={tool.ok === false && errorShown ? outputSegments : clipSegmentsInline(outputSegments)}
                 />
               )}
           </span>
@@ -1553,10 +1661,10 @@ export function ToolCallRow({
           <button
             className="session-tool-error-toggle"
             type="button"
-            aria-expanded={errorExpanded}
-            onClick={() => setErrorExpanded((value) => !value)}
+            aria-expanded={errorShown}
+            onClick={() => setErrorHidden((value) => !value)}
           >
-            {errorExpanded ? "hide error" : "show error"}
+            {errorShown ? "hide error" : "show error"}
           </button>
         ) : null}
         {tool.agent_id && onInspect ? (
@@ -1634,6 +1742,7 @@ export function ToolCallRow({
           <ToolOutputBody
             displayOutput={displayOutput}
             diffSource={diffSource}
+            eventId={event.id}
             rawOutput={rawOutput}
             segments={outputSegments}
             tool={tool}
@@ -1642,6 +1751,7 @@ export function ToolCallRow({
           <ToolOutputBody
             displayOutput={displayOutput}
             diffSource={diffSource}
+            eventId={event.id}
             rawOutput={rawOutput}
             segments={outputSegments}
             tool={tool}

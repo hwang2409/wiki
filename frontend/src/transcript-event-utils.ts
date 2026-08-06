@@ -419,6 +419,87 @@ export function detectFenceLang(code: string): string | null {
   return null;
 }
 
+// WIKI-253: default-collapse threshold for tool-output blocks. Anything
+// longer than this many lines is hidden behind a one-line peek row until the
+// reader clicks to expand. Kept low (well under a screenful) so packed turns
+// stay scannable — the same reason OpenCode's BlockTool clips to 3-10 lines.
+export const TOOL_OUTPUT_COLLAPSE_LINES = 12;
+export const TOOL_OUTPUT_COLLAPSE_CHARS = 800;
+
+function formatBytesShort(bytes: number): string {
+  if (bytes < 1024) return `${bytes} B`;
+  if (bytes < 1024 * 1024) return `${(bytes / 1024).toFixed(bytes < 10240 ? 1 : 0)} KB`;
+  return `${(bytes / (1024 * 1024)).toFixed(1)} MB`;
+}
+
+function countBytes(text: string): number {
+  if (typeof TextEncoder !== "undefined") return new TextEncoder().encode(text).length;
+  let bytes = 0;
+  for (let i = 0; i < text.length; i += 1) {
+    const code = text.charCodeAt(i);
+    if (code < 0x80) bytes += 1;
+    else if (code < 0x800) bytes += 2;
+    else if (code >= 0xd800 && code <= 0xdbff) { bytes += 4; i += 1; }
+    else bytes += 3;
+  }
+  return bytes;
+}
+
+function firstNonEmptyLine(text: string, budget = 72): string {
+  for (const line of text.split("\n")) {
+    const trimmed = line.trim();
+    if (!trimmed) continue;
+    return trimmed.length > budget ? `${trimmed.slice(0, budget - 1)}…` : trimmed;
+  }
+  return "";
+}
+
+function jsonPeek(text: string): string | null {
+  const trimmed = text.trim();
+  if (!trimmed) return null;
+  const first = trimmed[0];
+  if (first !== "{" && first !== "[") return null;
+  try {
+    const parsed: unknown = JSON.parse(trimmed);
+    if (Array.isArray(parsed)) {
+      return `[${parsed.length} item${parsed.length === 1 ? "" : "s"}]`;
+    }
+    if (parsed !== null && typeof parsed === "object") {
+      const keys = Object.keys(parsed as Record<string, unknown>);
+      if (keys.length === 0) return "{}";
+      const shown = keys.slice(0, 4).join(", ");
+      const suffix = keys.length > 4 ? `, +${keys.length - 4}` : "";
+      return `{${shown}${suffix}}`;
+    }
+    return null;
+  } catch {
+    return null;
+  }
+}
+
+export type ToolOutputPeek = {
+  // A short structural label — read as `<preview> · <count> lines · <size>`.
+  preview: string;
+  size: string;
+  lines: number;
+};
+
+// Peek row content for a collapsed tool-output block (WIKI-253). Bash reads
+// surface the target path; JSON payloads surface top-level keys / item counts;
+// everything else falls back to the first non-empty line. The count/size tail
+// is always present so the reader can tell how much they're hiding.
+export function toolOutputPeek(tool: SessionTool, text: string): ToolOutputPeek {
+  const cleaned = text.replace(/\s+$/, "");
+  const lines = cleaned.length === 0 ? 0 : cleaned.split("\n").length;
+  const size = formatBytesShort(countBytes(cleaned));
+  const bashTarget = isBashTool(tool) ? bashReadTargetPath(tool.input) : null;
+  if (bashTarget) return { preview: bashTarget, size, lines };
+  const json = jsonPeek(cleaned);
+  if (json) return { preview: json, size, lines };
+  const preview = firstNonEmptyLine(cleaned);
+  return { preview: preview || "(empty)", size, lines };
+}
+
 // Conservative path extraction for filetype hints: structured fields only
 // (edit payload, JSON input fields), then the summary target when it reads
 // as a real path token.

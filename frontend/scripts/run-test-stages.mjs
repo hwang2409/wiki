@@ -91,6 +91,7 @@ const PLAYWRIGHT_SUITES = [
   "wiki-194-plot-interaction",
   "wiki-234-opencode-restyle",
   "wiki-238-semantic-activity",
+  "wiki-253-collapse",
 ];
 
 // Accepted-red baseline: union of the pre-existing red list enumerated in
