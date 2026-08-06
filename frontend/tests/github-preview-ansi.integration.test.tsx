@@ -2,14 +2,18 @@
 import { cleanup, render } from "@testing-library/react";
 import { afterEach, expect, test, vi } from "vitest";
 
+import { getGhPreview } from "../src/api";
 import { renderAnsiWithGitHubLinks } from "../src/github-preview";
 
 vi.mock("../src/api", () => ({
   getGhPreview: vi.fn(() => new Promise(() => {})),
 }));
 
+const getGhPreviewMock = vi.mocked(getGhPreview);
+
 afterEach(() => {
   cleanup();
+  getGhPreviewMock.mockClear();
 });
 
 const URL = "https://github.com/hwang2409/wiki/pull/1";
@@ -39,12 +43,20 @@ test("OSC-8 hyperlink escape is not leaked as visible bytes", () => {
   expect(visible).toContain(" after");
 });
 
-test("WIKI-252: URL renders as plain external-link anchor, not a preview card", () => {
+test("WIKI-252: tool-output renderer emits plain anchor with no metadata fetch", () => {
+  // Mutation sensitivity: <GhPreviewCard> also renders the exact plain
+  // fallback anchor while its metadata fetch is pending, so checking the
+  // anchor alone would pass under BOTH the old (card) and new (no card)
+  // renderers when the mocked fetch never resolves. Anchor the assertion
+  // to what only the plain path does: it never calls getGhPreview.
   const text = `plain ${URL} plain`;
   const { container } = render(<>{renderAnsiWithGitHubLinks(text)}</>);
   const anchor = container.querySelector<HTMLAnchorElement>(`a.external-link[href="${URL}"]`);
   expect(anchor).not.toBeNull();
   expect(anchor?.getAttribute("target")).toBe("_blank");
+  expect(anchor?.getAttribute("rel") ?? "").toMatch(/\bnoopener\b/);
+  expect(anchor?.getAttribute("rel") ?? "").toMatch(/\bnoreferrer\b/);
   expect(anchor?.textContent).toBe(URL);
   expect(container.querySelector(`a.gh-preview-card[href="${URL}"]`)).toBeNull();
+  expect(getGhPreviewMock).not.toHaveBeenCalled();
 });
