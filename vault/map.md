@@ -116,6 +116,8 @@ Topic → note index. **Agents: read this file first, before grepping.** Every n
 
 - [[supervisor-fingerprint-swap-wedge]] — dev-code clients kill the prod agent supervisor via fingerprint swap; shutdown wedges holding the lock
 - [[build-scripts-need-venv-python]] — build helper scripts must not import agent_runtime under system python3 — pydantic/PIL chain via normalizer
+- [[opencode-design-direction]] — Wiki UI adopts OpenCode TUI design language (Henry 2026-08-06) — transcript doctrine + web translation rules
+- [[opencode-tui-design-notes]] — OpenCode TUI design language extraction — color roles, elevation, dialogs, composer, motion; 21 web-transfer rules (feeds WIKI-245/246)
 
 ## Wiki/til
 
