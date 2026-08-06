@@ -251,7 +251,7 @@
   --text-subtle-readable: #a89984;
   --text-faint: #928374;
   --text-on-accent: #1d2021;
-  --text-selection: rgba(235, 219, 178, 0.55);
+  --text-selection: rgba(235, 219, 178, 0.48);
 
   --link-color: #458588;
   --link-color-hover: #8ec07c;
@@ -262,7 +262,7 @@
   --kanban-lane: #272828;
   --kanban-card: #31302f;
   --kanban-card-shadow: 0 1px 2px rgba(0, 0, 0, 0.4);
-  --blockquote-border-color: #5d544d;
+  --blockquote-border-color: #5b544d;
   --scrollbar-thumb: #928374;
   --scrollbar-thumb-hover: #a89984;
 
@@ -301,7 +301,7 @@
   --syntax-function: #b8bb26;
   --syntax-string: #8ec07c;
   --syntax-number: #d65d0e;
-  --syntax-type: #689d6a;
+  --syntax-type: #458588;
   --syntax-variable: #fabd2f;
 }
 
