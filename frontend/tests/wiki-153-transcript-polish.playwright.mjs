@@ -369,21 +369,23 @@ async function main() {
     }
     await expectVisibleText(page, ".session-marker.is-info", "stop hook");
 
-    logStep("tool call: expand activity, assert failed inline detail");
+    logStep("tool call: expand activity, assert failed output body visible");
     // WIKI-244: activity groups and tool bodies are open by default.
     await page.locator(".session-activity > .session-activity-row").first().waitFor({ state: "visible" });
     const failedTool = page.locator(".session-tool.is-failed").first();
     await failedTool.waitFor({ state: "visible" });
-    // WIKI-245: failures stay inline until the reader asks for the detail.
-    await failedTool.locator(".session-tool-error-toggle").click();
-
-    await failedTool.locator(".session-tool-inline-result").waitFor({ state: "visible" });
-    const failedInline = await failedTool.locator(".session-tool-inline-result").innerText();
-    if (!failedInline.includes("IOError: fixture failure line")) {
-      throw new Error("expanded failed tool should render its semantic error inline");
+    // WIKI-253: long failed tool outputs now render through the block path
+    // (the render-layer collapse gate promotes any long tool output to a
+    // block-shaped renderer), but error-tone output is excluded from the
+    // collapse — the body reads directly, no peek row hides a broken run.
+    const failedBody = failedTool.locator(".session-tool-body, .session-tool-inline-result").first();
+    await failedBody.waitFor({ state: "visible" });
+    const failedText = await failedBody.innerText();
+    if (!failedText.includes("IOError: fixture failure line")) {
+      throw new Error("expanded failed tool should render its semantic error body");
     }
-    if ((await failedTool.locator(".transcript-preview").count()) !== 0) {
-      throw new Error("short failed tool output must stay tier 1");
+    if ((await failedTool.locator(".session-tool-output-peek").count()) !== 0) {
+      throw new Error("WIKI-253: error-tone output must never collapse behind a peek row");
     }
 
     logStep("bash tool call: one block with a muted title and output");
@@ -397,18 +399,20 @@ async function main() {
       throw new Error("tier-2 bash blocks must not show byte summaries or persistent controls");
     }
 
-    logStep("gh-preview mixed with long output: clip bounds output, expand reveals tail");
+    logStep("gh-preview mixed with long output: peek row hides body, one click reveals it");
     const ghMixTool = page.locator(".session-tool", { has: page.locator(".session-tool-summary", { hasText: /gh pr view 122/ }) }).first();
     await ghMixTool.waitFor({ state: "visible" });
+    // WIKI-253: long tool outputs collapse behind a peek row by default. The
+    // body is not in the DOM before expansion; the peek row is the affordance.
+    const ghMixPeek = ghMixTool.locator(".session-tool-output-peek").first();
+    await ghMixPeek.waitFor({ state: "visible" });
+    // Expand once so the body renders (we still need to assert its content
+    // matches the anchor / no-card / no-fetch invariants below).
+    await ghMixPeek.click();
     const ghMixOutput = ghMixTool.locator(".session-tool-block-preview").first();
     await ghMixOutput.waitFor({ state: "visible" });
     const ghMixBody = ghMixOutput.locator(".transcript-preview-body.is-custom").first();
     await ghMixBody.waitFor({ state: "visible" });
-    await ghMixOutput.locator(".transcript-preview-more").waitFor({ state: "visible" });
-    const ghMixBodyBefore = await ghMixBody.innerText();
-    if (ghMixBodyBefore.includes(GH_MIX_OUTPUT_TAIL_MARKER)) {
-      throw new Error("gh-preview mixed output should hide tail marker before expand — renderBody must clip via BoundedPreview text");
-    }
     // WIKI-252: tool output renders GitHub URLs as plain external-link anchors,
     // never as a metadata card unfurl (that stays on the prose surface). We
     // check three things so the assertion is mutation-sensitive at every layer:
@@ -440,29 +444,25 @@ async function main() {
         `WIKI-252: tool output triggered ${toolPreviewFetches.length} /api/gh/preview fetch(es) for ${GH_PREVIEW_URL} — must be zero (that fetch is prose-surface only)`
       );
     }
-    if (ghMixBodyBefore.includes("\x1b[")) {
+    const ghMixBodyText = await ghMixBody.innerText();
+    if (ghMixBodyText.includes("\x1b[")) {
       throw new Error("gh-preview text segments must strip ANSI escapes via renderAnsi, not render them raw");
     }
-    if (!ghMixBodyBefore.includes(GH_MIX_ANSI_HEAD_MARKER)) {
+    if (!ghMixBodyText.includes(GH_MIX_ANSI_HEAD_MARKER)) {
       throw new Error("gh-preview mixed output should include the ANSI head marker text");
     }
-    await ghMixBody.locator(".session-tool-output-text .ansi-fg-2").first().waitFor({ state: "visible" });
-    await ghMixOutput.locator(".transcript-preview-more").click();
-    // WIKI-249: block-variant expand control reads "Click to expand" /
-    // "Click to collapse" (OpenCode session/index.tsx:2083-2085).
-    await ghMixOutput.locator(".transcript-preview-more", { hasText: "Click to collapse" }).waitFor({ state: "visible" });
-    const ghMixBodyAfter = await ghMixBody.innerText();
-    if (!ghMixBodyAfter.includes(GH_MIX_OUTPUT_TAIL_MARKER)) {
+    if (!ghMixBodyText.includes(GH_MIX_OUTPUT_TAIL_MARKER)) {
       throw new Error("expanded gh-preview mixed output should include the tail marker");
     }
-    if (ghMixBodyAfter.includes("\x1b[")) {
-      throw new Error("expanded gh-preview text segments must strip ANSI escapes via renderAnsi");
-    }
-    if (!ghMixBodyAfter.includes(GH_MIX_ANSI_TAIL_MARKER)) {
+    if (!ghMixBodyText.includes(GH_MIX_ANSI_TAIL_MARKER)) {
       throw new Error("expanded gh-preview mixed output should include the ANSI tail marker text");
     }
+    await ghMixBody.locator(".session-tool-output-text .ansi-fg-2").first().waitFor({ state: "visible" });
     await ghMixBody.locator(".session-tool-output-text .ansi-fg-1").first().waitFor({ state: "visible" });
-    await ghMixOutput.locator(".transcript-preview-more", { hasText: "Click to collapse" }).click();
+    // WIKI-253: the "collapse output" affordance appears when the block is
+    // expanded past the height gate; clicking it returns to the peek row.
+    await ghMixTool.locator(".session-tool-output-collapse").click();
+    await ghMixTool.locator(".session-tool-output-peek").first().waitFor({ state: "visible" });
 
     logStep("bash block has no persistent wrap or copy chrome");
 

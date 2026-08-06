@@ -420,11 +420,31 @@ export function detectFenceLang(code: string): string | null {
 }
 
 // WIKI-253: default-collapse threshold for tool-output blocks. Anything
-// longer than this many lines is hidden behind a one-line peek row until the
-// reader clicks to expand. Kept low (well under a screenful) so packed turns
-// stay scannable — the same reason OpenCode's BlockTool clips to 3-10 lines.
-export const TOOL_OUTPUT_COLLAPSE_LINES = 12;
-export const TOOL_OUTPUT_COLLAPSE_CHARS = 800;
+// taller than this many pixels (measured after render) collapses behind a
+// one-line peek row until the reader clicks to expand. Height replaces the
+// prior line-count/char-count heuristic — a 12-line block of 200-char lines
+// is much taller than 12 lines of 20 chars, and a pixel budget captures the
+// intent ("keep the turn scannable") in one tuneable dial.
+export const COLLAPSE_HEIGHT_PX = 240;
+// Cheap pre-filter: "is this output long enough that we should promote it
+// from the inline pill into a block-shaped renderer so the height gate can
+// see it?" Line count is fine here because the pre-filter only decides which
+// component tree to render — the collapse decision itself is pixel-measured.
+const TOOL_OUTPUT_PROMOTION_LINES = 12;
+// Retained for existing tests that generate synthetic long outputs against
+// the promotion threshold — kept in sync with the render-time pre-filter.
+export const TOOL_OUTPUT_COLLAPSE_LINES = TOOL_OUTPUT_PROMOTION_LINES;
+
+// Would an inline tool render tall enough that it should be promoted to a
+// block-shaped renderer for the collapse gate to apply? Called from the
+// render layer alongside toolPresentation; a `true` result routes read_agent
+// / list_agents / arbitrary MCP output through the same peek-and-expand
+// affordance as bash and agent tool outputs.
+export function wouldRenderTall(displayOutput: string, _tool: SessionTool): boolean {
+  if (!displayOutput) return false;
+  const lineCount = displayOutput.split("\n").length;
+  return lineCount > TOOL_OUTPUT_PROMOTION_LINES;
+}
 
 function formatBytesShort(bytes: number): string {
   if (bytes < 1024) return `${bytes} B`;
@@ -484,6 +504,25 @@ export type ToolOutputPeek = {
   lines: number;
 };
 
+// Preserve the basename when a path is longer than the peek row can fit.
+// End-truncation would eat the identifying tail (README.md), which is the
+// most useful piece; middle-truncation keeps head and basename with `…` in
+// between. Budget is generous — narrower containers still get a CSS ellipsis
+// fallback, but the common wide row shows the whole `first N…last M` form.
+export function middleTruncatePath(path: string, budget = 60): string {
+  if (path.length <= budget) return path;
+  // Anchor the tail on the basename plus any parent directory that fits, so
+  // "/a/b/very/nested/README.md" reads as "/a/b/very…nested/README.md" rather
+  // than losing the parent context along with the head.
+  const slash = path.lastIndexOf("/");
+  const basename = slash >= 0 ? path.slice(slash) : path;
+  const tail = basename.length + 1 >= budget
+    ? basename.slice(-(budget - 2))
+    : basename;
+  const headBudget = Math.max(1, budget - tail.length - 1);
+  return `${path.slice(0, headBudget)}…${tail}`;
+}
+
 // Peek row content for a collapsed tool-output block (WIKI-253). Bash reads
 // surface the target path; JSON payloads surface top-level keys / item counts;
 // everything else falls back to the first non-empty line. The count/size tail
@@ -493,7 +532,7 @@ export function toolOutputPeek(tool: SessionTool, text: string): ToolOutputPeek 
   const lines = cleaned.length === 0 ? 0 : cleaned.split("\n").length;
   const size = formatBytesShort(countBytes(cleaned));
   const bashTarget = isBashTool(tool) ? bashReadTargetPath(tool.input) : null;
-  if (bashTarget) return { preview: bashTarget, size, lines };
+  if (bashTarget) return { preview: middleTruncatePath(bashTarget), size, lines };
   const json = jsonPeek(cleaned);
   if (json) return { preview: json, size, lines };
   const preview = firstNonEmptyLine(cleaned);

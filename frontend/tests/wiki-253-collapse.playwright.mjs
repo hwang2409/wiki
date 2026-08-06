@@ -68,6 +68,26 @@ async function main() {
     toolResult("toolu_long", longOutput, "2026-08-07T10:00:02Z"),
   ]);
 
+  // WIKI-253 HIGH #1: a nominally-inline tool (read_agent / list_agents /
+  // generic MCP call) with a long payload must ALSO collapse — the render-
+  // layer promotion routes it through the same peek row as bash output.
+  const genericPayload = JSON.stringify(
+    { runs: Array.from({ length: 30 }, (_, i) => ({ id: i, status: "done", label: `run-${i}` })) },
+    null,
+    2,
+  );
+  const genericTranscript = path.join(fixtures.root, "generic-tool-output.jsonl");
+  await writeJsonl(genericTranscript, [
+    { type: "mode", mode: "normal", sessionId: "fixture-wiki-253-generic" },
+    {
+      type: "user",
+      timestamp: "2026-08-07T10:10:00Z",
+      message: { role: "user", content: "list agents" },
+    },
+    assistantToolUse("toolu_generic", "read_agent", { agent_id: "abc" }, "2026-08-07T10:10:01Z"),
+    toolResult("toolu_generic", genericPayload, "2026-08-07T10:10:02Z"),
+  ]);
+
   const failureTranscript = path.join(fixtures.root, "failed-tool.jsonl");
   const failureOutput = [
     "Traceback (most recent call last):",
@@ -91,6 +111,7 @@ async function main() {
   writeRegistry(fixtures.registryPath, [
     ["WIKI-253A", longTranscript],
     ["WIKI-253B", failureTranscript],
+    ["WIKI-253C", genericTranscript],
   ]);
   writeQueue(fixtures.queuePath, "WIKI-253A", []);
 
@@ -143,6 +164,16 @@ async function main() {
       `expected failure body inline, got: ${failureText}`,
     );
     await page.screenshot({ path: path.join(OUT_DIR, "failed-expanded.png"), fullPage: true });
+
+    logStep("asserting generic non-bash tool output (read_agent) also collapses");
+    await openTicket(page, backend.baseUrl, "WIKI-253C");
+    // read_agent has no github URL, isn't bash, isn't rich-write — under the
+    // pre-fix presentation branch it rendered inline and skipped the collapse
+    // gate. The render-layer promotion routes it through the same peek row.
+    const genericPeek = page.locator(".session-tool-output-peek");
+    await genericPeek.first().waitFor({ state: "visible" });
+    assert.equal(await genericPeek.getAttribute("aria-expanded"), "false");
+    await page.screenshot({ path: path.join(OUT_DIR, "generic-collapsed.png"), fullPage: true });
 
     logStep("wiki-253 collapse assertions passed");
   } finally {

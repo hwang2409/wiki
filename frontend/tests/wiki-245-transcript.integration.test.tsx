@@ -185,13 +185,14 @@ test("tier is chosen by tool kind, not multiline output shape", () => {
     output: "one\ntwo\nthree\nfour",
   });
   expect(write.container.querySelector(".session-tool")?.classList.contains("is-block")).toBe(true);
-  // WIKI-249: clipped blocks end in OpenCode's muted "Click to expand" line
-  // (session/index.tsx:2083-2085), not a line-count hint.
-  const expand = write.getByRole("button", { name: /Click to expand/ });
-  expect(expand).toBeTruthy();
-  expect(expand.getAttribute("aria-expanded")).toBe("false");
+  // WIKI-253: short blocks flow full-height (no mid-block "Click to expand"
+  // clip); the whole-block peek row only appears past the pixel threshold.
+  // A 4-line output measures well under the threshold, so all four lines are
+  // visible without any expand affordance.
+  expect(write.queryByRole("button", { name: /Click to expand/ })).toBeNull();
+  expect(write.container.querySelector(".session-tool-output-peek")).toBeNull();
   expect(write.container.querySelector(".session-tool-output-text")?.textContent).toContain("three");
-  expect(write.container.querySelector(".session-tool-output-text")?.textContent).not.toContain("four");
+  expect(write.container.querySelector(".session-tool-output-text")?.textContent).toContain("four");
 });
 
 test("apply_patch input renders its patch body as a diff", () => {

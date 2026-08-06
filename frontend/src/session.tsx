@@ -94,9 +94,9 @@ import { Timestamp } from "./timestamp";
 import { StatusBadge } from "./status-badge";
 import { BoundedPreview } from "./transcript-preview";
 import {
-  TOOL_OUTPUT_COLLAPSE_CHARS,
-  TOOL_OUTPUT_COLLAPSE_LINES,
+  COLLAPSE_HEIGHT_PX,
   bashReadTargetPath,
+  wouldRenderTall,
   compactJsonDetail,
   detectStructuredContent,
   formatEventDuration,
@@ -116,6 +116,7 @@ import {
   toolSummaryParts,
   traceRows,
   turnMetaDurations,
+  type ToolPresentation,
   type TraceRow,
 } from "./transcript-event-utils";
 import { HighlightedCode, ShikiCode, languageForPath } from "./shiki";
@@ -1183,47 +1184,70 @@ function toolBlockTitle(tool: SessionTool): string {
   return `← ${summary}`;
 }
 
-// WIKI-253: session-scoped memory of which tool-output blocks the reader has
-// explicitly expanded past the default-collapse. Keyed by event id so the
-// choice survives virtualized unmount/remount, and cleared automatically
-// because the session's own module scope is torn down between sessions.
-const explicitlyExpandedTools = new Set<number>();
-const explicitlyCollapsedTools = new Set<number>();
-
+// WIKI-253: readers can explicitly override the default-collapse per event.
+// State lives in the per-session UI store (SessionUiStateContext), so numeric
+// event ids that recycle across sessions don't cross-contaminate, and the
+// store is discarded when the session unmounts via clearSessionPaneState.
+// Three-state: undefined (follow default), true (user expanded), false (user
+// collapsed after auto-expand).
 function useToolOutputExpanded(
   eventId: number,
   defaultCollapsed: boolean,
 ): [boolean, () => void] {
-  const initial = defaultCollapsed
-    ? explicitlyExpandedTools.has(eventId)
-    : !explicitlyCollapsedTools.has(eventId);
-  const [expanded, setExpanded] = useState(initial);
+  const uiState = useContext(SessionUiStateContext);
+  const key = `tool-output:${eventId}`;
+  const [override, setOverride] = useState<boolean | undefined>(
+    () => uiState?.overrides.get(key),
+  );
+  const expanded = override ?? !defaultCollapsed;
   const toggle = useCallback(() => {
-    setExpanded((prev) => {
-      const next = !prev;
-      if (defaultCollapsed) {
-        if (next) explicitlyExpandedTools.add(eventId);
-        else explicitlyExpandedTools.delete(eventId);
-      } else {
-        if (next) explicitlyCollapsedTools.delete(eventId);
-        else explicitlyCollapsedTools.add(eventId);
-      }
-      return next;
-    });
-  }, [defaultCollapsed, eventId]);
+    const next = !(override ?? !defaultCollapsed);
+    if (uiState) {
+      if (next === !defaultCollapsed) uiState.overrides.delete(key);
+      else uiState.overrides.set(key, next);
+    }
+    setOverride(next === !defaultCollapsed ? undefined : next);
+  }, [defaultCollapsed, key, override, uiState]);
   return [expanded, toggle];
 }
 
-function shouldDefaultCollapse(text: string): boolean {
-  if (!text) return false;
-  const lineCount = text.split("\n").length;
-  return lineCount > TOOL_OUTPUT_COLLAPSE_LINES || text.length > TOOL_OUTPUT_COLLAPSE_CHARS;
+// WIKI-253 render-layer gate: promote any tool-output block above the height
+// budget to collapsed presentation, regardless of tool kind or sub-renderer.
+// Measurement happens on completion via ResizeObserver — the block renders
+// full first, offsetHeight is observed, and if it clears COLLAPSE_HEIGHT_PX
+// the block snaps to a peek row on the next commit. Explicit user expansion
+// survives the completion transition.
+function useMeasuredHeight(node: HTMLElement | null): number | null {
+  // Latch tallest-seen height in a ref so the value survives the child body
+  // unmounting when we transition to collapsed — otherwise the ref-based
+  // measurement resets, defaultCollapse flips back to false, the body
+  // remounts, measurement re-fires, and we loop. Height is monotonic here by
+  // design: once tall, always tall (streams only grow, static outputs settle).
+  const maxSeenRef = useRef<number | null>(null);
+  const [, bumpRender] = useState(0);
+  useLayoutEffect(() => {
+    if (!node) return;
+    const measure = () => {
+      const observed = node.offsetHeight;
+      if (maxSeenRef.current === null || observed > maxSeenRef.current) {
+        maxSeenRef.current = observed;
+        bumpRender((version) => version + 1);
+      }
+    };
+    measure();
+    if (typeof ResizeObserver === "undefined") return;
+    const observer = new ResizeObserver(measure);
+    observer.observe(node);
+    return () => observer.disconnect();
+  }, [node]);
+  return maxSeenRef.current;
 }
 
 function ToolOutputBody({
   displayOutput,
   diffSource,
   eventId,
+  presentation,
   rawOutput,
   segments,
   tool,
@@ -1231,26 +1255,45 @@ function ToolOutputBody({
   displayOutput: string;
   diffSource: string | null;
   eventId: number;
+  // Effective presentation from the parent (which applies the WIKI-253
+  // inline→block promotion for long generic tool outputs). Recomputing here
+  // would miss the promotion and hide long read_agent / list_agents payloads.
+  presentation: ToolPresentation;
   rawOutput: string;
   segments: HarnessOutputSegment[];
   tool: SessionTool;
 }) {
-  const presentation = toolPresentation(tool, displayOutput);
-  const failed = tool.ok === false;
   const running = tool.ok === null;
   const diffDegraded = toolDiffIsTruncated(tool);
-  // WIKI-253: diffs, failures, and still-running streams are exempt from the
-  // default-collapse — a reader opening a turn wants to see them, and hiding
-  // live progress mid-stream breaks the "watching a run happen" affordance.
-  const bodyText = displayOutput || rawOutput;
-  const defaultCollapse = presentation !== "diff"
-    && !failed
-    && !running
-    && shouldDefaultCollapse(bodyText);
+  const bash = isBashTool(tool);
+  const hasGitHubLink = containsGitHubPreviewUrl(displayOutput);
+  // WIKI-253 error exclusion: error-tone output stays expanded regardless of
+  // the tool.ok flag — some tools mark structured errors with ok:true (e.g. a
+  // failure captured in a JSON payload). Tone comes from either the explicit
+  // ok=false or a tagged error segment; the flag alone is too coarse.
+  const outputTone = tool.ok === false || segments.some((segment) => segment.kind === "error")
+    ? "error"
+    : "normal";
+  // Measured height gates collapse instead of line-count/char-count heuristics
+  // (MED #1). The block renders full, ResizeObserver reports offsetHeight, and
+  // if it clears COLLAPSE_HEIGHT_PX we snap to a peek row on the next commit.
+  // Wrap and font-size are baked into the pixel measurement, so a 12-line
+  // block of 200-char lines and 12 lines of 20 chars are distinguished.
+  const [bodyNode, setBodyNode] = useState<HTMLDivElement | null>(null);
+  const measuredHeight = useMeasuredHeight(bodyNode);
+  const measuredTall = measuredHeight !== null && measuredHeight > COLLAPSE_HEIGHT_PX;
+  // Exclusions: diffs, error-tone output, and live streams stay expanded.
+  // The live-stream exclusion drops at the running→complete transition (HIGH
+  // #3): the block collapses on completion the same way any tall output does,
+  // unless the reader clicked expand mid-stream (override is preserved by
+  // useToolOutputExpanded).
+  const collapsible = presentation !== "diff" && outputTone !== "error" && !running;
+  const defaultCollapse = collapsible && measuredTall;
   const [expanded, toggleExpanded] = useToolOutputExpanded(eventId, defaultCollapse);
   const showCollapsed = defaultCollapse && !expanded;
 
-  if (presentation === "inline" || (!displayOutput && !isBashTool(tool))) return null;
+  if (presentation === "inline" || (!displayOutput && !bash)) return null;
+  const failed = tool.ok === false;
   if (presentation === "diff") {
     return (
       <div className="session-tool-body session-tool-diff-body">
@@ -1269,15 +1312,10 @@ function ToolOutputBody({
       </div>
     );
   }
-  const bash = isBashTool(tool);
   // WIKI-252: GitHub URLs inside tool output render as plain external-link
   // anchors (no PR-metadata card unfurl); highlighter branches yield to the
   // text path so those anchors stay clickable instead of getting swallowed
   // into a Shiki code block.
-  const hasGitHubLink = containsGitHubPreviewUrl(displayOutput);
-  const outputTone = tool.ok === false || segments.some((segment) => segment.kind === "error")
-    ? "error"
-    : "normal";
   // Structured non-bash outputs (JSON and friends) read pretty-printed in the
   // block view; the clipped budget applies to the PRETTY text, raw stays exact.
   const structured = !bash && outputTone === "normal" && !hasGitHubLink
@@ -1306,37 +1344,37 @@ function ToolOutputBody({
       </div>
     );
   }
-  // Short payloads (below the collapse threshold) keep the historical
-  // 10/3-line preview so a small block still stays tight without any
-  // reader interaction. When the outer collapse governs, the inner
-  // preview stops line-clipping AND stops height-clamping — the reader
-  // asked for the full payload and should get it in one click.
-  const bodyPreviewLines = defaultCollapse ? Number.POSITIVE_INFINITY : bash ? 10 : 3;
+  // WIKI-253: content flows full-height so ResizeObserver can measure it. The
+  // old BoundedPreview clip (10/3 lines) is superseded by the collapse gate —
+  // short outputs measure short and stay expanded, tall outputs collapse to a
+  // one-line peek. The ref hangs on a stable wrapper the observer watches.
   return (
     <div className={`session-tool-body session-tool-block-body${expanded ? " is-expanded" : ""}`}>
       {titleNode}
-      <BoundedPreview
-        ansi
-        className="session-tool-block-preview"
-        expandable={!defaultCollapse}
-        previewLines={bodyPreviewLines}
-        rawText={rawOutput}
-        showSummary={false}
-        text={structured?.text ?? displayOutput}
-        tone={outputTone}
-        variant="block"
-        renderBody={({ text }) => (
-          <div className="session-tool-output-blocks">
-            <span className="session-tool-output-text">
-              {structured
-                ? <HighlightedCode code={text} lang={structured.lang} />
-                : bashOutputLang
-                ? <HighlightedCode code={text} lang={bashOutputLang} />
-                : renderOutputSegments(segments, text, hasGitHubLink)}
-            </span>
-          </div>
-        )}
-      />
+      <div className="session-tool-block-preview-measure" ref={setBodyNode}>
+        <BoundedPreview
+          ansi
+          className="session-tool-block-preview"
+          expandable={false}
+          previewLines={Number.POSITIVE_INFINITY}
+          rawText={rawOutput}
+          showSummary={false}
+          text={structured?.text ?? displayOutput}
+          tone={outputTone}
+          variant="block"
+          renderBody={({ text }) => (
+            <div className="session-tool-output-blocks">
+              <span className="session-tool-output-text">
+                {structured
+                  ? <HighlightedCode code={text} lang={structured.lang} />
+                  : bashOutputLang
+                  ? <HighlightedCode code={text} lang={bashOutputLang} />
+                  : renderOutputSegments(segments, text, hasGitHubLink)}
+              </span>
+            </div>
+          )}
+        />
+      </div>
       {defaultCollapse && expanded ? (
         <button
           aria-expanded="true"
@@ -1594,7 +1632,16 @@ export function ToolCallRow({
     : parsedSegments;
   const displayOutput = outputSegments.map((segment) => segment.text).join("\n");
   const diffSource = toolDiffSource(tool, displayOutput);
-  const presentation = toolPresentation(tool, diffSource ?? displayOutput);
+  const basePresentation = toolPresentation(tool, diffSource ?? displayOutput);
+  // WIKI-253 render-layer promotion: a nominally-inline tool (read_agent,
+  // list_agents, arbitrary MCP tool output, JSON dumps) with a body that's
+  // long enough to be worth measuring becomes a block, so the shared collapse
+  // gate in ToolOutputBody applies to every long tool result — not just the
+  // ones whose sub-renderer already routes through block. Height decides the
+  // final collapse; this pre-check just widens the gate's blast radius.
+  const inlineWouldRenderTall = basePresentation === "inline"
+    && wouldRenderTall(displayOutput, tool);
+  const presentation: ToolPresentation = inlineWouldRenderTall ? "block" : basePresentation;
   const outputBlock = presentation !== "inline";
   // WIKI-253: failures default expanded so a broken run cannot hide behind a
   // toggle — the hide-error control still exists for readers who want to
@@ -1743,6 +1790,7 @@ export function ToolCallRow({
             displayOutput={displayOutput}
             diffSource={diffSource}
             eventId={event.id}
+            presentation={presentation}
             rawOutput={rawOutput}
             segments={outputSegments}
             tool={tool}
@@ -1752,6 +1800,7 @@ export function ToolCallRow({
             displayOutput={displayOutput}
             diffSource={diffSource}
             eventId={event.id}
+            presentation={presentation}
             rawOutput={rawOutput}
             segments={outputSegments}
             tool={tool}
@@ -1845,11 +1894,18 @@ function activityTimeline(events: SessionEvent[]): ActivityTimelineItem[] {
 
 export type SessionUiState = {
   booleans: Map<string, boolean>;
+  // WIKI-253: per-tool-output "user explicitly expanded/collapsed" overrides,
+  // keyed by `tool-output:<eventId>`. Lives alongside `booleans` so the store
+  // is one atomic bag per session — cleared together when the session tab
+  // unmounts, so numeric event ids that recycle across sessions cannot leak.
+  overrides: Map<string, boolean>;
 };
 
 function createSessionUiState(): SessionUiState {
-  return { booleans: new Map() };
+  return { booleans: new Map(), overrides: new Map() };
 }
+
+export const SessionUiStateContext = createContext<SessionUiState | null>(null);
 
 function useStoredBooleanState(
   store: SessionUiState,
@@ -3400,6 +3456,7 @@ export function SessionTab({
 
   return (
     <QuestionUiContext.Provider value={questionUi}>
+      <SessionUiStateContext.Provider value={uiState}>
       <div className="session-tab" ref={setContainerNode}>
       {(session.tasks.length > 0 || session.pr || session.sessionMeta.custom_title || session.sessionMeta.agent_name || (rateLimit?.status && rateLimit.status !== "allowed")) ? (
         <div className="session-state-strip">
@@ -3509,6 +3566,7 @@ export function SessionTab({
         )}
       </div>
       </div>
+      </SessionUiStateContext.Provider>
     </QuestionUiContext.Provider>
   );
 }
