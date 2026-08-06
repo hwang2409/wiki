@@ -427,6 +427,24 @@ test("worker card default hides role, model, and technical actions; menu reveals
   expect(view.getByRole("menuitem", { name: /Review PR/ })).toBeTruthy();
 });
 
+test("pointer dismissal preserves focus on the clicked control", async () => {
+  const view = renderView();
+  const menuButton = view.getByRole("button", { name: /More actions for WIKI-1/ });
+  const outside = document.createElement("button");
+  outside.type = "button";
+  outside.textContent = "outside";
+  document.body.appendChild(outside);
+
+  fireEvent.click(menuButton);
+  await waitFor(() => expect(view.getByRole("menu")).toBeTruthy());
+  fireEvent.mouseDown(outside);
+  outside.focus();
+
+  await waitFor(() => expect(view.queryByRole("menu")).toBeNull());
+  expect(document.activeElement).toBe(outside);
+  outside.remove();
+});
+
 test("Replace stays disabled with a reason when a worker has no live runtime", async () => {
   const legacyWorker = {
     ...worker,

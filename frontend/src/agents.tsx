@@ -1268,6 +1268,7 @@ export function AgentsView({
   const [openMenuTicket, setOpenMenuTicket] = useState<string | null>(null);
   const menuButtonRefs = useRef(new Map<string, HTMLButtonElement>());
   const previousOpenMenuRef = useRef<string | null>(null);
+  const closeReasonRef = useRef<"escape" | "pointer" | null>(null);
   // Per-archive selection is WIKI-229: the backend session route currently
   // prefers a live run for the same ticket and consults a ticket-only
   // transcript-path cache before the archived_at hint, so promising a
@@ -1278,22 +1279,32 @@ export function AgentsView({
   // open the ticket's transcript view (as they did pre-WIKI-154).
 
   useEffect(() => {
-    if (openMenuTicket === null && previousOpenMenuRef.current !== null) {
+    if (
+      openMenuTicket === null &&
+      previousOpenMenuRef.current !== null &&
+      closeReasonRef.current === "escape"
+    ) {
       const button = menuButtonRefs.current.get(previousOpenMenuRef.current);
       window.requestAnimationFrame(() => button?.focus());
     }
+    if (openMenuTicket === null) closeReasonRef.current = null;
     previousOpenMenuRef.current = openMenuTicket;
   }, [openMenuTicket]);
+
+  function closeMenu(reason: "escape" | "pointer") {
+    closeReasonRef.current = reason;
+    setOpenMenuTicket(null);
+  }
 
   useEffect(() => {
     if (openMenuTicket === null) return;
     function onDown(event: MouseEvent) {
       const target = event.target as HTMLElement | null;
       if (target && target.closest(`[data-agent-menu-for="${openMenuTicket}"]`)) return;
-      setOpenMenuTicket(null);
+      closeMenu("pointer");
     }
     function onKey(event: KeyboardEvent) {
-      if (event.key === "Escape") setOpenMenuTicket(null);
+      if (event.key === "Escape") closeMenu("escape");
     }
     window.addEventListener("mousedown", onDown);
     window.addEventListener("keydown", onKey);
@@ -1867,7 +1878,7 @@ export function AgentsView({
                             type="button"
                             onClick={() => {
                               if (item.disabled) return;
-                              setOpenMenuTicket(null);
+                              closeMenu("pointer");
                               item.run();
                             }}
                           >

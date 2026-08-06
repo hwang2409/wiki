@@ -230,7 +230,7 @@ async function main() {
     await confirmation.waitFor();
     await page.setViewportSize({ width: 320, height: 900 });
     const bounds = await confirmation.boundingBox();
-    if (!bounds || bounds.x < 56 || bounds.x + bounds.width > 320) {
+    if (!bounds || bounds.x < 56 || bounds.x + bounds.width > 308) {
       throw new Error(`model confirmation clips at 320px: ${JSON.stringify(bounds)}`);
     }
     await page.screenshot({ path: path.join(OUT_DIR, "session-model-footer.png"), fullPage: true });
