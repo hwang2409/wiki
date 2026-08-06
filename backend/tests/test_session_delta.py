@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import os
 import threading
 import time
 import unittest
@@ -347,6 +348,59 @@ class SessionDeltaTests(unittest.TestCase):
             )
             self.assertEqual(third["events"], [])
             self.assertNotIn("has_older", third)
+
+    def test_subagent_intro_cache_detects_child_replacement(self) -> None:
+        # WIKI-244 review round 6 (M3): the intro cache carries a stat
+        # fingerprint. Replacing or truncating a child transcript at the same
+        # path must reload the intro so a parent never attaches to the OLD
+        # child evidence, even long after the first read cached it.
+        def child_row(prompt: str) -> str:
+            return json.dumps({
+                "type": "user",
+                "timestamp": "2026-08-05T12:00:10Z",
+                "message": {"content": prompt},
+            }) + "\n"
+
+        with TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            main_path = root / "session.jsonl"
+            main_path.touch()
+            subdir = root / "session" / "subagents"
+            subdir.mkdir(parents=True)
+            child = subdir / "agent-cafe1234.jsonl"
+            long_prompt = "map the entire billing pipeline and enumerate every downstream consumer"
+            child.write_text(child_row(long_prompt))
+
+            first = transcripts.list_subagents(main_path)
+            self.assertEqual(first[0]["prompt_head"], long_prompt)
+
+            # Replace the file at the same path (new inode via os.replace,
+            # and smaller content so the shrink check also covers in-place
+            # truncation on filesystems that reuse inodes).
+            replacement = subdir / "agent-cafe1234.jsonl.next"
+            replacement.write_text(child_row("check disk usage"))
+            os.replace(replacement, child)
+
+            second = transcripts.list_subagents(main_path)
+            self.assertEqual(second[0]["prompt_head"], "check disk usage")
+
+            parent = {
+                "id": 0,
+                "kind": "tool",
+                "ts": "2026-08-05T12:00:00Z",
+                "tool": {"name": "Task", "prompt_head": "check disk usage"},
+            }
+            annotated = transcripts.annotate_agent_events(main_path, [parent], assignments={})
+            self.assertEqual(annotated[0]["tool"]["agent_id"], "cafe1234")
+
+            stale_parent = {
+                "id": 1,
+                "kind": "tool",
+                "ts": "2026-08-05T12:00:00Z",
+                "tool": {"name": "Task", "prompt_head": long_prompt},
+            }
+            stale = transcripts.annotate_agent_events(main_path, [stale_parent], assignments={})
+            self.assertNotIn("agent_id", stale[0]["tool"], "old prompt must not match the replaced child")
 
     def test_models_endpoint_includes_new_codex_and_claude_options(self) -> None:
         payload = main.list_models()

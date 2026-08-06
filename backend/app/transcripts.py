@@ -2447,20 +2447,35 @@ def read_older_session(
 
 # ---------------------------------------------------------------- claude subagents
 
-# file path → (first-user-prompt head, first-event timestamp); both immutable
-# once written, so the cache never needs invalidation.
-_subagent_intros: dict[str, tuple[str, str]] = {}
+# file path → (head, started_at, inode, device, size-at-read). The intro is
+# only immutable while the SAME file grows in place — a replaced inode or a
+# shrunken file means a different child transcript now lives at that path,
+# so cached intros carry a stat fingerprint and reload on mismatch
+# (WIKI-244 R6 M3). Bounded so long-lived backends do not accumulate one
+# entry per child file forever.
+_SUBAGENT_INTRO_CACHE_MAX = 2048
+_subagent_intros: dict[str, tuple[str, str, int, int, int]] = {}
 
 
 def subagents_dir(main_path: Path) -> Path:
     return main_path.parent / main_path.stem / "subagents"
 
 
-def _subagent_intro(path: Path) -> tuple[str, str]:
+def _subagent_intro(path: Path, stat: os.stat_result | None = None) -> tuple[str, str]:
     key = str(path)
+    if stat is None:
+        try:
+            stat = path.stat()
+        except OSError:
+            return "", ""
     cached = _subagent_intros.get(key)
     if cached is not None:
-        return cached
+        head, started_at, ino, dev, size = cached
+        # Same inode growing (or unchanged) in place → the first rows cannot
+        # have changed. A new inode or a shrink means replacement/truncation.
+        if ino == stat.st_ino and dev == stat.st_dev and stat.st_size >= size:
+            return head, started_at
+        del _subagent_intros[key]
     head = ""
     started_at = ""
     try:
@@ -2483,7 +2498,9 @@ def _subagent_intro(path: Path) -> tuple[str, str]:
     except OSError:
         pass
     if head:
-        _subagent_intros[key] = (head, started_at)
+        while len(_subagent_intros) >= _SUBAGENT_INTRO_CACHE_MAX:
+            _subagent_intros.pop(next(iter(_subagent_intros)))
+        _subagent_intros[key] = (head, started_at, stat.st_ino, stat.st_dev, stat.st_size)
     return head, started_at
 
 
@@ -2501,7 +2518,7 @@ def list_subagents(main_path: Path) -> list[dict]:
             stat = path.stat()
         except OSError:
             continue
-        head, started_at = _subagent_intro(path)
+        head, started_at = _subagent_intro(path, stat)
         entries.append(
             {
                 "id": path.stem.removeprefix("agent-"),

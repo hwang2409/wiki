@@ -256,6 +256,19 @@ async function main() {
       `insert block cursor must have block geometry, got ${insertGeom.width}x${insertGeom.height}`);
     assert(insertGeom.char === "i", `insert block must cover the char under the caret, got "${insertGeom.char}"`);
 
+    // R6 M4: a programmatic selection change (setSelectionRange fires no
+    // select/keyup events) must move the block AND its covered glyph
+    // together — the glyph renders from the same live measurement, never
+    // from stale caret state. "steer the migration"[2] === "e".
+    await composer.evaluate((el) => {
+      el.setSelectionRange(2, 2);
+      el.dispatchEvent(new Event("scroll", { bubbles: true }));
+    });
+    await page.waitForFunction(() => {
+      const cursor = document.querySelector(".session-empty-block-cursor");
+      return cursor?.textContent === "e";
+    }, undefined, { timeout: 5000 });
+
     await page.keyboard.press("Escape");
     await page.waitForTimeout(120);
     const normalState = await composer.evaluate((el) => ({

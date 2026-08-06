@@ -3310,7 +3310,7 @@ function MessageComposer({
   const composerHelpId = `${composerInputId}-help`;
   const [caretPos, setCaretPos] = useState(selectionRef.current.start);
   const [narrowComposer, setNarrowComposer] = useState(false);
-  const [overlayPos, setOverlayPos] = useState<{ top: number; left: number } | null>(null);
+  const [overlayPos, setOverlayPos] = useState<{ top: number; left: number; char: string } | null>(null);
 
   useLayoutEffect(() => {
     const node = composerRef.current;
@@ -3415,7 +3415,11 @@ function MessageComposer({
       setOverlayPos(null);
       return;
     }
-    setOverlayPos(pos);
+    // The covered glyph is captured with the measurement, from the same live
+    // index — rendering from separate state could show a stale character
+    // after programmatic selection changes (WIKI-244 R6 M4).
+    const under = el.value[at];
+    setOverlayPos({ ...pos, char: under && under !== "\n" ? under : "" });
   }, [text, caretPos, vimMode, composerFocused, overlayTick]);
 
   const trigger = (() => {
@@ -4199,11 +4203,7 @@ function MessageComposer({
                   className="session-empty-block-cursor"
                   style={{ top: overlayPos.top, left: overlayPos.left }}
                 >
-                  {(() => {
-                    const at = Math.min(caretPos, text.length);
-                    const under = text[at];
-                    return under && under !== "\n" ? under : "";
-                  })()}
+                  {overlayPos.char}
                 </span>
               ) : null}
               <textarea
