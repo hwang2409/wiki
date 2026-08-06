@@ -89,6 +89,10 @@ In Progress:
 - PHO-14037 on-call transfer — investigate-then-fix worker spawned
 - PHO-15253 bash rewrite PRs A/B/C — night shift worker
 - PHO-15254 retrieve adoption tranche 1 — night shift worker
+- [P1] wiki-app: WIKI-258 split diff columns collapse to 1ch in tool-output edit view (owner: wiki-dev fleet)
+- [P1] wiki-app: WIKI-259 inconsistent large vertical gaps between transcript event rows (owner: wiki-dev fleet)
+- [P1] wiki-app: WIKI-260 font picker enumerates real installed families; no variant grouping (owner: wiki-dev fleet)
+- [P1] wiki-app: WIKI-261 highlight numbered read-tool outputs (strip gutter, tokenize, gutter column) (owner: wiki-dev fleet)
 Backlog:
 
 - [PHO-14974](https://linear.app/phoebework/issue/PHO-14974): implement the planned v3 describe catalog after retrieve and write registry interfaces land
