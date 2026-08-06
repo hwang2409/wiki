@@ -126,7 +126,6 @@ test("parallel completion timeline still produces one row per tool event", () =>
 function renderTool(toolOverrides: Partial<SessionTool> = {}) {
   return render(
     <ToolCallRow
-      connector="└"
       event={event(7, { tool: tool(toolOverrides) })}
       ticket="WIKI-245"
       withResult
@@ -222,7 +221,6 @@ test("edit rows without diff material stay inline", () => {
 test("a normalized raw Claude edit fixture renders through the real tool row", () => {
   const { container } = render(
     <ToolCallRow
-      connector="└"
       event={normalizedEditFixture as unknown as SessionEvent}
       ticket="WIKI-245"
       withResult

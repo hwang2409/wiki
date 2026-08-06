@@ -124,8 +124,3 @@ export function traceRows(timeline: Array<{ event: SessionEvent; eventIndex: num
   }
   return rows;
 }
-
-export function traceConnector(rows: TraceRow[], index: number): string {
-  const next = rows[index + 1];
-  return next && next.kind !== "thinking" ? "├" : "└";
-}
