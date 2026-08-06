@@ -2373,13 +2373,29 @@ def read_session_delta(
                 "has_older": False,
             }
 
+        # WIKI-244 R5 (M2): a stale cursor (unmounted row, sleeping tab) can
+        # trail by far more than the inline bound — clip the incremental tail
+        # to the newest tail_events events, advance tail_from to the first
+        # returned event, and mark the omitted middle as older history.
+        # Patches referring to clipped events are dropped with them; clients
+        # apply patches by event id, so patches for events they never held
+        # are no-ops either way.
+        clipped = False
+        if (
+            tail_events is not None
+            and tail_from < total
+            and total - tail_from > tail_events
+        ):
+            tail_from = total - tail_events
+            clipped = True
+
         if tail_from < total:
-            tail_events = deepcopy(events[tail_from - base :])
+            tail_slice = deepcopy(events[tail_from - base :])
             patch_map = {
                 event_id: entry for event_id, entry in patch_map.items() if int(entry.get("index", total)) < tail_from
             }
         else:
-            tail_events = []
+            tail_slice = []
 
         patches = [
             {
@@ -2390,8 +2406,8 @@ def read_session_delta(
             }
             for entry in sorted(patch_map.values(), key=lambda item: int(item["cursor"]))
         ]
-        return {
-            "events": tail_events,
+        payload = {
+            "events": tail_slice,
             "base": base,
             "tokens": state["tokens"],
             "tasks": tasks,
@@ -2402,6 +2418,9 @@ def read_session_delta(
             "tail_from": tail_from,
             "patches": patches,
         }
+        if clipped:
+            payload["has_older"] = True
+        return payload
 
 
 def read_older_session(

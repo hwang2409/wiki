@@ -305,6 +305,49 @@ class SessionDeltaTests(unittest.TestCase):
             self.assertIsNot(new_state, state, "shrink must rebuild the parse state")
             self.assertNotIn("aaaa1111", new_state["agent_child_assignments"].values())
 
+    def test_incremental_tail_respects_event_limit(self) -> None:
+        # WIKI-244 review round 5 (M2): a stale cursor must not receive an
+        # unbounded incremental tail. With tail_events set, the response is
+        # clipped to the newest N events, tail_from advances to the first
+        # returned event, and the omitted middle is flagged as older history.
+        def assistant_row(index: int) -> dict:
+            return {
+                "type": "assistant",
+                "timestamp": f"2026-08-05T12:00:{index:02d}.000Z",
+                "message": {"role": "assistant", "content": [{"type": "text", "text": f"note {index}"}]},
+            }
+
+        with TemporaryDirectory() as tmp:
+            path = Path(tmp) / "child.jsonl"
+            _write_rows(path, [assistant_row(0)], mode="w")
+            first = transcripts.read_session_delta(
+                "claude-sub", path, 0, tail_window=False, tail_events=5
+            )
+            self.assertEqual(len(first["events"]), 1)
+            cursor = first["cursor"]
+
+            _write_rows(path, [assistant_row(index) for index in range(1, 13)])
+            second = transcripts.read_session_delta(
+                "claude-sub", path, cursor, tail_window=False, tail_events=5
+            )
+
+            self.assertLessEqual(len(second["events"]), 5)
+            self.assertTrue(second.get("has_older"), "clipped incremental tail must flag omitted history")
+            self.assertEqual(second["tail_from"], second["events"][0]["id"])
+            self.assertEqual(second["events"][-1]["id"], 12)
+            self.assertEqual(
+                [event["id"] for event in second["events"]],
+                list(range(second["tail_from"], 13)),
+            )
+            self.assertGreater(second["cursor"], cursor)
+
+            # A follow-up read from the new cursor is a no-op delta.
+            third = transcripts.read_session_delta(
+                "claude-sub", path, second["cursor"], tail_window=False, tail_events=5
+            )
+            self.assertEqual(third["events"], [])
+            self.assertNotIn("has_older", third)
+
     def test_models_endpoint_includes_new_codex_and_claude_options(self) -> None:
         payload = main.list_models()
         models = {model["id"]: model for model in payload["models"]}
