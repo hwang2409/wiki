@@ -84,7 +84,6 @@ In Progress:
 - PHO-15253 bash rewrite PRs A/B/C — night shift worker
 - PHO-15254 retrieve adoption tranche 1 — night shift worker
 - [P1] WIKI-248 transcript follow-ups from #183 round-1 verdict — kill ActivityGroup data-model aggregation (one virtual row per event), restore live/interrupted-state + wiki-238 coverage, composer focus + forced-colors treatment, wiki59 Shiki expectation, font-fallback root cause, working-diff collapsed by default (Henry: 'should not be a thing'); WIP seed branch wiki-248-transcript-followups @ aa0305ce
-- [P1] WIKI-250 Gruvbox dark = gruvbox-dark-hard-contrast.terminal palette — decode macOS profile, retune themes.css tokens (palette-only; elevations derived; ANSI + state colors verified) — cdx:WIKI-250
 Backlog:
 
 - [PHO-14974](https://linear.app/phoebework/issue/PHO-14974): implement the planned v3 describe catalog after retrieve and write registry interfaces land
