@@ -82,7 +82,6 @@ In Progress:
 - PHO-15253 bash rewrite PRs A/B/C — night shift worker
 - PHO-15254 retrieve adoption tranche 1 — night shift worker
 - [P1] WIKI-245 transcript readability redesign — one visual unit per tool call, chrome diet on small results, semantic result labels, harness-wrapper stripping at render time, scan hierarchy, quiet thinking traces (Henry 2026-08-06: top priority; screenshots /tmp/WIKI-245-example-{1,2}.png)
-- [P1] WIKI-246 OpenCode design language for app chrome — elevation system, left-bar semantics, selection/hover states, dialog anatomy, footer, composer dock, toasts, motion budget, empty states per vault/wiki-app/opencode-tui-design-notes.md; transcript excluded (WIKI-245)
 Backlog:
 
 - [PHO-14974](https://linear.app/phoebework/issue/PHO-14974): implement the planned v3 describe catalog after retrieve and write registry interfaces land
