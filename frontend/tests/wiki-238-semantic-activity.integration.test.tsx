@@ -5,7 +5,10 @@ import { describe, expect, test } from "vitest";
 
 import type { SessionEvent, SessionTool } from "../src/api";
 import {
+  activityCountsLabel,
+  activityElapsedLabel,
   activityRunStateFromProvider,
+  activitySemanticSummary,
   activityStateLabel,
 } from "../src/agent-events";
 
@@ -33,7 +36,36 @@ function toolEvent(
   };
 }
 
-describe("model activity run states", () => {
+describe("model activity summaries and run states", () => {
+  test("maps supported tools and reasoning to safe summaries", () => {
+    expect(activitySemanticSummary([toolEvent("read", "read files_test.py")])).toBe("reading files_test.py");
+    expect(activitySemanticSummary([toolEvent("validate", "pytest frontend/tests")])).toBe("running tests");
+    expect(activitySemanticSummary([toolEvent("git", "git diff")])).toBe("checking the final diff");
+    expect(activitySemanticSummary([toolEvent("read", "read api.ts"), {
+      id: 2,
+      kind: "thinking",
+      ts: "2026-08-02T12:00:02.000Z",
+      text: "considering the evidence",
+      disposition: "rendered",
+    }])).toBe("reasoning through the task");
+  });
+
+  test("keeps count and elapsed helpers available to the activity model", () => {
+    const events = [
+      toolEvent("tool", "opaque provider action", {}, "2026-08-02T12:00:00.000Z"),
+      toolEvent("read", "read api.ts", { completed_at: "2026-08-02T12:00:03.000Z" }, "2026-08-02T12:00:01.000Z"),
+    ];
+    expect(activitySemanticSummary([toolEvent("tool", "opaque provider action")])).toBeNull();
+    expect(activityCountsLabel(events)).toBe("2 tool calls");
+    expect(activityElapsedLabel(events)).toBe("3s");
+  });
+
+  test("does not invent meaning for an unsafe unknown archetype", () => {
+    const events = [toolEvent("deploy-production-and-delete-data", "deployment completed")];
+    expect(activitySemanticSummary(events)).toBeNull();
+    expect(activityCountsLabel(events)).toBe("1 tool call");
+  });
+
   test("labels working, done, failed, and waiting-for-you states", () => {
     const completed = [toolEvent("read", "read api.ts")];
     const failed = [toolEvent("validate", "pytest", { ok: false })];

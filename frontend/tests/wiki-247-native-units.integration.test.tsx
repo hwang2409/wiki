@@ -151,7 +151,8 @@ describe("quiet composer", () => {
     // A shorthand border or any non-zero top/right/bottom edge would close
     // the box; explicit `border-*: 0` declarations are the point.
     expect(row).not.toMatch(/(?:^|\n)\s*border\s*:/);
-    expect(row).not.toMatch(/border-(?:top|right|bottom)\s*:\s*(?!0\b)/);
+    const closedEdges = row.match(/border-(?:top|right|bottom)\s*:\s*[^;]+/g) ?? [];
+    expect(closedEdges.every((declaration) => /:\s*0\s*$/.test(declaration))).toBe(true);
     expect(row).not.toMatch(/(?:^|\n)\s*outline\s*:/);
   });
 
@@ -226,6 +227,7 @@ describe("native block interiors", () => {
 describe("sidebar orchestrator rows", () => {
   test("agent rows carry no active dot; current state is primary text", () => {
     expect(CSS_SOURCE).not.toContain(".nav-agent.is-active::before");
+    expect(CSS_SOURCE).not.toMatch(/\.nav-agent[^,{]*::(?:before|after)/);
     const active = finalCssDeclarations(".nav-agent.is-active");
     expect(active).toContain("border-left: 0;");
     const currentTreatment = cssDeclarations(".nav-agent.is-active");

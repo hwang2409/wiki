@@ -165,7 +165,7 @@ async function main() {
     await branchQuestion.getByText("Go with the fresh branch").waitFor();
 
     // WIKI-244: activity groups and tool bodies are open by default.
-    await page.locator(".session-activity-head").first().waitFor({ state: "visible" });
+    await page.locator(".session-activity > .session-activity-row").first().waitFor({ state: "visible" });
     await expectVisibleText(page, ".session-tool-summary", "monitor: while true; do sleep 45; done");
     await expectVisibleText(page, ".transcript-preview-body", "Monitor started (task task123");
 
@@ -182,7 +182,7 @@ async function main() {
       throw new Error("WIKI-235: Codex Run details must not render");
     }
     // WIKI-244: activity groups are open by default.
-    await page.locator(".session-activity-head").first().waitFor({ state: "visible" });
+    await page.locator(".session-activity > .session-activity-row").first().waitFor({ state: "visible" });
     await expectVisibleText(page, ".session-thinking-chip", "encrypted");
     await expectVisibleText(page, ".session-marker", "subagent started");
     logStep("capturing Codex screenshot");
@@ -195,8 +195,8 @@ async function main() {
     await expectVisibleText(page, ".gh-preview-badge.is-muted", "3 files");
     // WIKI-244: activity groups and tool bodies are open by default — no
     // clicks needed; the preview output is always visible in the tool row.
-    await page.locator(".session-activity-body .session-tool").first().waitFor({ state: "visible" });
-    const previewTool = page.locator(".session-activity-body .session-tool").first();
+    await page.locator(".session-activity .session-tool").first().waitFor({ state: "visible" });
+    const previewTool = page.locator(".session-activity .session-tool").first();
     const previewToolEventId = await previewTool.getAttribute("data-tool-event-id");
     if (!previewToolEventId) throw new Error("preview tool missing data-tool-event-id");
     // The gh preview output lives either merged in the tool row or in the

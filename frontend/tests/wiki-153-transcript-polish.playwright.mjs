@@ -328,7 +328,7 @@ async function main() {
 
     logStep("tool call: expand activity, assert failed inline detail");
     // WIKI-244: activity groups and tool bodies are open by default.
-    await page.locator(".session-activity-head").first().waitFor({ state: "visible" });
+    await page.locator(".session-activity > .session-activity-row").first().waitFor({ state: "visible" });
     const failedTool = page.locator(".session-tool.is-failed").first();
     await failedTool.waitFor({ state: "visible" });
     // WIKI-245: failures stay inline until the reader asks for the detail.
@@ -349,7 +349,7 @@ async function main() {
     const bashToolBlock = bashTool.locator(".session-tool-block-body").first();
     await bashToolBlock.waitFor({ state: "visible" });
     await bashToolBlock.locator(".session-tool-block-title", { hasText: "$" }).waitFor({ state: "visible" });
-    await bashToolBlock.locator(".shiki-block[data-lang='bash']").waitFor({ state: "visible" });
+    await bashToolBlock.locator(".session-tool-block-title.is-command").waitFor({ state: "visible" });
     if ((await bashToolBlock.locator(".transcript-preview-summary, .transcript-chip").count()) !== 0) {
       throw new Error("tier-2 bash blocks must not show byte summaries or persistent controls");
     }
@@ -395,7 +395,7 @@ async function main() {
     const bashBlock = page.locator(".session-bash").first();
     await bashBlock.waitFor({ state: "visible" });
     await bashBlock.locator(".session-tool-block-title", { hasText: "$" }).waitFor({ state: "visible" });
-    await bashBlock.locator(".session-bash-command-code.shiki-block[data-lang='bash']").waitFor({ state: "visible" });
+    await bashBlock.locator(".session-tool-block-title.is-command").waitFor({ state: "visible" });
     const bashOutput = bashBlock.locator(".session-tool-block-preview").first();
     await bashOutput.waitFor({ state: "visible" });
     if ((await bashBlock.locator(".transcript-preview-summary, .transcript-chip").count()) !== 0) {

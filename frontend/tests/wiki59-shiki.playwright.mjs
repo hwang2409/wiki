@@ -144,7 +144,7 @@ async function main() {
     });
     await page.goto(`${backend.baseUrl}/#/agent/WIKI-59`, { waitUntil: "domcontentloaded" });
     await page.waitForSelector(".session-scroll");
-    await page.waitForSelector(".session-bash-command-code");
+    await page.waitForSelector(".session-bash .session-tool-block-title.is-command");
 
     // Give shiki a moment to load themes+langs and re-render.
     await page.waitForFunction(

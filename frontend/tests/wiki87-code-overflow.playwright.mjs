@@ -127,7 +127,7 @@ async function main() {
     );
 
     // WIKI-244: activity groups and tool outputs are open by default.
-    await page.locator(".session-activity-head").first().waitFor({ state: "visible" });
+    await page.locator(".session-activity > .session-activity-row").first().waitFor({ state: "visible" });
     const tools = page.locator(".session-tool");
     assert((await tools.count()) === 2, `Expected 2 tool calls, found ${await tools.count()}`);
     // WIKI-245: rich output uses a left-border block; short output stays in

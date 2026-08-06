@@ -257,7 +257,7 @@ describe("WIKI-246 OpenCode chrome states", () => {
     expect(CHROME_CSS).not.toContain("animation: chrome-fade-in");
   });
 
-  test("current navigation items expose one dot and no left rail", () => {
+  test("current navigation items use text state and no agent focus dot", () => {
     expect(cssDeclarations(".tree-item-self.is-active")).toContain("border-left: 0;");
     expect(cssDeclarations(".nav-agent.is-active")).toContain("border-left: 0;");
     expect(CSS_SOURCE).toContain(".tree-item-self.is-active::before");
@@ -265,7 +265,6 @@ describe("WIKI-246 OpenCode chrome states", () => {
     // through primary-colored text only; the attention rail stays reserved
     // for unread/failed.
     expect(CSS_SOURCE).not.toContain(".nav-agent.is-active::before");
-    expect(CSS_SOURCE).toContain('content: "●";');
   });
 
   test("pending-user styling stays outside transcript messages", () => {
