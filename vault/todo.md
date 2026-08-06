@@ -3,7 +3,7 @@ type: reference
 view: kanban
 tags: [todo]
 created: 2026-07-06
-updated: 2026-08-03
+updated: 2026-08-06
 ---
 
 Todo:
@@ -24,6 +24,8 @@ Todo:
 - [P2] WIKI-233 remaining 13 pre-existing frontend suite reds enumerated in PR #168 body (found during WIKI-230) — triage: fixture drift vs real regressions, restore full-suite green so worker gates can run unexcluded
 - LC-6: integrate practice runner into roadmap app (misc, in progress, owner: misc orch)
 - [P1] WIKI-242 final agent-surface focus, target-size, 320px reflow, and 400% zoom pass; start after WIKI-235/237-241
+- [P1] phoebe: PHO-15149 refactor umbrella to ORGANIZATION.md layout — ticket filed under epic PHO-15148; blocked by PHO-15082 (last parity PR)
+- [P2] wiki backend: boot-sweep follow-ups from 2026-08-05 latency fix — skip terminal-state runs in orphan/costs sweeps + prune accumulated run-history store (multi-GB JSONL streaming still O(history) once per boot; related WIKI-227)
 
 Silky-smooth artifact rendering arc (Henry 2026-07-29):
 
@@ -72,7 +74,15 @@ In Progress:
 - [P1] [PHO-14963](https://linear.app/phoebework/issue/PHO-14963): implement provider-neutral v3 tool discovery and Anthropic delivery — cdx:PHO-14963
 - [P1] [PHO-14975](https://linear.app/phoebework/issue/PHO-14975): implement v3 write registry and diff-first flow — cdx:PHO-14975
 - [P1] [PHO-14977](https://linear.app/phoebework/issue/PHO-14977): implement v3 read-only helpers and eval scaffolding — cdx:PHO-14977
-- [P1] WIKI-241 clearer long tool-output controls with stable scroll and full raw-output access — cc:WIKI-241
+- PHO-15151 bash rewrite spec — worker spawned, PR to main (owner: phoebe-dev)
+- PHO-15110 schema derivation prototype — worker spawned, PR to umbrella, held until #13193
+- PHO-15171 v3 local TUI — worker spawned, PR to umbrella (owner: phoebe-dev)
+- PHO-0-DEEPWIKI admin deepwiki investigation — research worker, report to /tmp/PHO-0-DEEPWIKI-report.md
+- PHO-15206 chronic recommendation test fixes — worker spawned, PR to umbrella
+- PHO-14522 orphan cleanup fix — worker spawned, PR to main
+- PHO-14037 on-call transfer — investigate-then-fix worker spawned
+- PHO-15253 bash rewrite PRs A/B/C — night shift worker
+- PHO-15254 retrieve adoption tranche 1 — night shift worker
 Backlog:
 
 - [PHO-14974](https://linear.app/phoebework/issue/PHO-14974): implement the planned v3 describe catalog after retrieve and write registry interfaces land

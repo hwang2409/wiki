@@ -2,13 +2,66 @@
 type: log
 tags: [log, done]
 created: 2026-07-06
-updated: 2026-08-03
+updated: 2026-08-05
 ---
 
 # Done
 
+## 2026-08-05
+
+- WIKI-241 landed via #178 (PR #177 closed superseded): action-labelled tool output controls + sticky head merged inside WIKI-244
+- WIKI-244 merged (#178): OpenCode-style always-open transcript, block vim cursor, numeric font weight; 10 review rounds, cache-concurrency hardening rode along
+- Merged #13238 MCP account-note Slack threads (dash-phoebe's PR, PHO-15150; 4 review rounds: narrow DLQ catch, discriminated responses, operation-UUID idempotency); Henry-authorized
+- Merged #13193 v3 shadow-parity harness into umbrella under standing auth (PHO-15082; gate 3 identical/10 explained/1 pending-allowlisted/0 unexplained; ~12 impl rounds, 10 reviews)
+- Merged #13519 PHO-15280 no_reply fix (reflection episode removed, prompt-owned reflection); Henry-authorized
+- Merged #13501 Slack approval caller-name fix (PHO-15269, RAH Miami report); 3 review rounds; Henry-authorized
+- PHO-15082 #13193 citation contract polished at `31dd8b8761ff117d965d5abefc76bb78486ea4ba`; hosted parity green; PR ready for review
+- Merged #13507 umbrella frontend fixes (timer test sync + v3 flag toggles) under standing auth; unblocks #13193 CI
+- Merged #13384 revenue-account migration follow-up (PHO-14522) after verifying #13383 code deployed to prod; Henry-authorized
+- v3-main integration constructed: #13408 (read+bash+control, fully green, review-verified) + #13417 (write surface byte-identical, held); gates = parity hardening + Henry auth + write design pass
+- PHO-15254 retrieve adoption tranche 1 gated (#13414, 4 rounds; typed read libraries, v2 tools behavior-locked with falsifier contract tests; v3 adapter adoption deferred as deliverable 2)
+
+## 2026-08-04
+
+- PHO-14522 deploy 1 merged to main (#13383; RingCentral + notification-destination org-deletion 500s fixed; #13384 migration held for post-deploy)
+- PHO-15222 surface-aware admin action audit merged to main (#13377, 2 rounds; Slack mutations unblocked, honest no-backfill migration)
+- PHO-15207 merged #13360
+- PHO-15207 schema-derivation rollout phase 1 merged to umbrella (#13360, first round clean; caregivers/clients/scheduling rows drift-impossible, 8 skips classified)
+- PHO-15178 PAT last_used_at throttle merged to main (#13334, Henry's implementation + fleet-added tests; closes the production row-lock RCA)
+- PHO-15206 chronic recommendation test fixes merged to umbrella (#13359, first round clean; write suite now candidate 15/15, allowed-failures asterisk dead)
+- PHO-15178 tests added to Henry's #13334 (two-session SKIP LOCKED proof, window contract, revocation-after-marker)
+- PHO-15175-FIX403 PR #13353 closed at Henry's request (#13350 grant suffices); hardening+regression-test recipe preserved in closed PR + RCA
+- PHO-15110 schema-derivation prototype merged to umbrella (#13294, first-round clean; drift-impossible retrieve rows on care-coordinator extension)
+- PHO-15178 PAT-auth fix PR #13331 closed at Henry's request; ticket stays in backlog (defect documented in RCA)
+- PHO-15174 deepwiki observability merged to main (#13302, 3 rounds + cardinality fix; parent spans on all entry points, fail-open telemetry, snapshot staleness signal)
+- PHO-15171-FIX TUI log interleaving merged to umbrella (#13330; additive initialize_tui_observability entry point, rotating file sink, console WARNING+)
+- PHO-15081 v3 w3 writes merged to umbrella (#13260, 11 rounds; durable child intents, worker lease renewal, parent-completion-gated-on-child, locked-test discipline held)
+- PHO-15175 deepwiki performance merged to main (#13304, 5 rounds; async post-cutover indexing behind authorize, version-scoped pointer lanes, deterministic retained refresh, parallel shard reads + single boto3 client)
+- PHO-15156 worktree_dev hosting fixes merged to main (#13293, 5 rounds; no-auto-stamp drift detection, SSO typed fallback, PEM quoting, tmux fix)
+- PHO-15171 v3 local TUI merged to umbrella (#13300, 3 rounds; DSN locality guard, mode listeners, diff-before-approve verified)
+- PHO-15087 provisional decision recorded: compute-delegate mini-harness = entire v3 subagent surface (Henry 2026-08-04)
+- PHO-15151 bash rewrite spec merged to main (#13283, 3 review rounds)
+- PHO-15138 scratchpad memory merged to main (#13233, admin-merge past security-bot diff cap per Henry)
+- PHO-15110 schema-derivation prototype: both gates passed first round (PR #13294, MERGE-READY verdict); held for #13193 then orch merges
+- PHO-15148 triage: canceled 9 obsolete pre-restart tickets (14972-14976, 15061-15064) as superseded by the merged parity arc
+- PHO-15115 #13259 merged into umbrella: v3 error/retry parity — single retry budget via wrapper-safe one-shot exec, run_bash transient/terminal split, production-persisted sad-path evals (4 review rounds)
+- PHO-15084-TYFIX #13261 merged: umbrella tip ty-clean again (narrowing-assert fix; orchestrator override of over-strict review spec, documented on PR)
+- PHO-15084 #13257 merged into umbrella: v3 control surface — ask_user_question + debug_request_approval as one control skill, real lifecycle tests, idempotent untrusted-wrapped answers, debug probe non-prod only (3 review rounds)
+- PHO-15114 #13258 merged into umbrella: v3 model policy port (customer reply stays opus/medium, 5 bounded-mechanical contracts at haiku tier, no hardcoded models; 2 review rounds)
+- PHO-15149 #13255 merged into umbrella: ORGANIZATION.md refactor — core/skills/sidebar layout, census 47/47 files (-12 vs before), limits test clean, layering enforced in Bazel, behavior preservation AST-proven (3 review rounds)
+- PHO-15065 #13256 merged into umbrella: EXPERIMENTAL in-sandbox subagent runtime (real model loop via broker, 6 fail-closed invariants, lane green; 1 review round clean)
+
 ## 2026-08-03
 
+- PHO-15085 #13251 merged into umbrella: v3 hardening audit — invariant-5 closed (file-inspection failure paths + fallback wrapper), TTL sweep bounded + @process, retrieve/bash observability (3 review rounds)
+- PHO-15147 #13249 merged into umbrella: agent_sandbox post-merge findings + all 8 Devin threads resolved incl SEC triage (2 review rounds)
+- PHO-15086 #13250 merged into umbrella: v3 rollout routing plan + per-surface flag skeleton (1 review round, clean)
+- PHO-15112 #13196 merged into umbrella: containment lane green end-to-end (7-8 production bugs fixed: streams, flush, result synthesis, fence, overflow terminal, crash capture); follow-ups in PHO-15147
+- PHO-15080 #13191 merged into umbrella: v3 write entities + receipt replay ordering (6 review rounds)
+- PHO-15079 #13192 merged into umbrella: v3 retrieve domain parity (7 review rounds)
+- PHO-15083 #13190 merged into umbrella: v3 golden case eval runner (8 review rounds)
+- PHO-15141 #13237 merged: flaky wall-clock deadline test fixed (behavior assertions, total-deadline regression detection restored)
+- PHO-15125 #13198 merged: revert of #12876 (bash recs + agent_sandbox/spill libs off main; rewrite pending per ORGANIZATION.md step 1)
 - WIKI-239 coalesced provider diagnostics merged (#176 as 48eabd1) — group by source+kind+code, severity fold keeps highest, raw retention, advisory clamp notices, transition-only auto-open respecting user close; 3 review rounds (2 lens R1, 2 lens R2, fix-verify R3); full frontend suite 264/264 (WIKI-233's 13 reds no longer reproduce)
 - WIKI-238 semantic model activity + readable transcript hierarchy merged (#174 as 09b8b83) — semantic activity summary from fixed archetype allowlist, prominent state label with live-priority + explicit interrupted/dead terminals, rectangular expanded timeline in completion order, per-role contrast 4.5:1 across 13 themes × 5 states. 4 review rounds (6/8/1/0 findings)
 - WIKI-243 supervisor startup recovery memory streaming merged (#175 as 16a3b2a) — _reconcile_existing_runs + _normalize_orphan_raw_events now stream via _iter_json_lines instead of materializing full raw/normalized lists; WIKI-232 REVIEW9 F2 middle-gap + REVIEW12 H1 legacy-boundary invariants preserved

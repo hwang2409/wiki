@@ -14,6 +14,12 @@ Topic → note index. **Agents: read this file first, before grepping.** Every n
 - [[agent-vault-patterns]] — verified survey of how others structure markdown vaults for agent memory; gap analysis vs this vault
 - [[source-credibility]] — structural source-verification method for research tasks; read when a query needs reputable sourcing (acted-on findings), skip for casual surveys.
 
+## Research
+
+- [[nvidia-nemo-oo-agents]] — NVIDIA-labs OO Agents framework: typed Python agents, CodeAct runtime, provider surface, evals, and fit against Phoebe/wiki.
+- [[applied-compute-self-distillation]] — Applied Compute's OPSD/RMSD self-distillation from agent traces: offline distillation fits Phoebe's non-replayable voice/SMS traces; eval-gated swaps match golden-case doctrine; no cross-model recipe for the compute delegate.
+- [[pi-minimal-harness-autoresearch]] — Earendil's Pi minimal harness + Shopify autoresearch loop: validates v3's bash-only minimal-core bet and the eval-gated cutover shape; vendor numbers, no new technique to adopt.
+
 ## Tools & agent setup
 
 - [[orchestrator-worker-protocol]] — file/tmux schema for mastermind↔worker sessions: status-file JSON contract, prompt/log paths, sentinels, signal priority. Read before building anything that renders or drives worker state.
@@ -63,6 +69,9 @@ Topic → note index. **Agents: read this file first, before grepping.** Every n
 - [[admin-redesign]] — full /admin/* redesign decision (2026-07-27): Ramp×Linear×wiki direction, scrap 14461 primitives, signal-tier IA per laws-of-ux, one mega-PR after in-flight admin set lands
 - [[admin-agent-audit-2026-07-30]] — full admin-agent audit @main 7a3a01e1e2: 182 tools, 5H/11M/4L, remediation order
 - [[v3-harness-design]] — v3 harness design (2026-07-31): implicit sandbox, artifact spill, single retrieve/write/describe doors, per-conversation workspace; Linear project Phoebe Agent V3
+- [[llm-judge-auto-taggers]] — Phoebe LLM judge survey (2026-08-05): two-layer continuous reviewer (conversation judge + episode classifier), Agent Court routing; gaps: no judge goldens, fail-open edges, unredacted PII to providers.
+- [[env-vars-sync-for-credentials]] — phoebe: creds/env missing locally? env-vars sync-local first — synced .env.local files carry Modal tokens, LLM keys, etc.
+- [[debug-loop-pathologies]] — long debug loops: suspect own instrumentation first, full-bisect to last-good, verify probe channels, enumerate not pattern-match, fresh-eyes pass every ~5 rounds
 
 ## Phoebe/til
 
@@ -106,6 +115,7 @@ Topic → note index. **Agents: read this file first, before grepping.** Every n
 ## Wiki-app
 
 - [[supervisor-fingerprint-swap-wedge]] — dev-code clients kill the prod agent supervisor via fingerprint swap; shutdown wedges holding the lock
+- [[build-scripts-need-venv-python]] — build helper scripts must not import agent_runtime under system python3 — pydantic/PIL chain via normalizer
 
 ## Wiki/til
 
