@@ -109,6 +109,20 @@
   --font-ui-small: 13.5px;
   --font-text-size: 16.5px;
   --font-monospace-size: 13.5px;
+
+  /* WIKI-246: semantic chrome roles. These names keep the shell on four
+     elevation steps while each theme keeps its existing palette values. */
+  --background-canvas: var(--background-primary);
+  --background-panel: var(--background-primary-alt);
+  --background-element: var(--background-secondary);
+  --background-menu: var(--background-secondary);
+  --border-subtle: color-mix(in srgb, var(--background-modifier-border) 72%, var(--background-primary));
+  --border-default: var(--background-modifier-border);
+  --border-active: color-mix(in srgb, var(--background-modifier-border) 68%, var(--text-normal));
+  --primary: var(--accent-primary);
+  --text: var(--text-normal);
+  --selected-list-item-text: var(--text-on-accent);
+  --chrome-motion-duration: 160ms;
 }
 
 * {
@@ -15264,5 +15278,475 @@ textarea.composer-command-input {
   .kanban-cards {
     grid-template-columns: minmax(0, 1fr);
     overflow-y: visible;
+  }
+}
+
+/* ------------------------------------------------------------------ */
+/* WIKI-246: OpenCode chrome language                                 */
+/* ------------------------------------------------------------------ */
+
+/* Surfaces use elevation. Borders stay for focus and separators only. */
+.workspace-ribbon,
+.workspace-sidebar,
+.session-sidebar,
+.session-side-panel {
+  background-color: var(--background-panel);
+  border-color: var(--border-subtle);
+}
+
+.workspace-ribbon {
+  background-color: var(--background-element);
+}
+
+.workspace-sidebar {
+  border-right-width: 1px;
+}
+
+.ribbon-zone + .ribbon-zone,
+.sidebar-mode-title,
+.session-footer,
+.agent-session-surface-head,
+.agent-session-head-secondary {
+  border-color: var(--border-subtle);
+}
+
+.ribbon-action,
+.nav-action-button,
+.tree-item-self,
+.nav-agent,
+.search-result,
+.quick-switcher-result,
+.session-skill-item,
+.kanban-card {
+  border-radius: 0;
+}
+
+.ribbon-action:hover,
+.nav-action-button:hover,
+.tree-item-self:hover,
+.nav-agent:hover,
+.search-result:hover,
+.session-skill-item:hover,
+.kanban-card:hover,
+.quick-switcher-result:hover:not(.is-selected) {
+  background-color: var(--background-element);
+  color: var(--text);
+}
+
+/* Current items are marked by text and a gutter dot. Cursor selection uses
+   a solid fill and contrast text. */
+.tree-item-self.is-active,
+.nav-agent.is-active,
+.fleet-switcher-result.is-current:not(.is-selected) {
+  position: relative;
+  background-color: transparent;
+  color: var(--primary, var(--accent-primary));
+  box-shadow: none;
+  font-weight: var(--fw-semibold);
+}
+
+.tree-item-self.is-active::before,
+.nav-agent.is-active::before,
+.fleet-switcher-result.is-current:not(.is-selected)::before {
+  position: absolute;
+  left: 4px;
+  color: var(--accent-primary);
+  content: "●";
+  font-size: 0.58em;
+  line-height: 1;
+}
+
+.tree-item-self.is-active {
+  padding-left: 18px;
+  border-left: 3px solid var(--accent-primary);
+}
+
+.nav-agent.is-active {
+  padding-left: 18px;
+  border-left: 3px solid var(--accent-primary);
+}
+
+.quick-switcher-result.is-selected,
+.command-palette-mode-button.is-selected,
+.session-skill-item.is-active {
+  background-color: var(--accent-primary);
+  color: var(--selected-list-item-text);
+  font-weight: var(--fw-semibold);
+}
+
+.quick-switcher-result.is-selected svg,
+.quick-switcher-result.is-selected .quick-switcher-name,
+.quick-switcher-result.is-selected .quick-switcher-path,
+.quick-switcher-result.is-selected .quick-switcher-session-badge,
+.quick-switcher-result.is-selected .fleet-switcher-current,
+.session-skill-item.is-active .session-skill-name,
+.session-skill-item.is-active .session-skill-desc {
+  color: inherit;
+}
+
+.quick-switcher-result.is-selected .quick-switcher-path,
+.quick-switcher-result.is-selected .quick-switcher-session-badge,
+.session-skill-item.is-active .session-skill-desc {
+  opacity: 0.78;
+}
+
+.agent-card.is-selected {
+  border: 0;
+  border-left: 3px solid var(--accent-primary);
+  border-radius: 0;
+  background-color: var(--accent-primary);
+  color: var(--selected-list-item-text);
+}
+
+.agent-card.is-selected :where(.agent-ticket, .agent-age, .agent-step, .agent-blocker,
+  .agent-flag, .agent-meta, .agent-window, .agent-chain, .agent-worktree,
+  .agent-pr, .agent-log-toggle, .agent-replace-button) {
+  color: inherit;
+}
+
+.kanban-card:hover {
+  border-color: transparent;
+  box-shadow: none;
+}
+
+/* Semantic left rails replace framed chrome. */
+.nav-inline-error,
+.nav-files-retry,
+.agent-inline-error,
+.agent-spawn-preview,
+.agent-tech,
+.session-composer-row,
+.session-user {
+  border-top: 0;
+  border-right: 0;
+  border-bottom: 0;
+  border-radius: 0;
+}
+
+.nav-inline-error,
+.nav-files-retry {
+  border-left: 3px solid var(--accent-warning);
+  background-color: var(--background-panel);
+}
+
+.agent-inline-error {
+  border-left-width: 3px;
+}
+
+.agent-spawn-preview {
+  border-left-width: 3px;
+  background-color: var(--background-panel);
+}
+
+.agent-tech {
+  background-color: var(--background-panel);
+}
+
+.session-composer {
+  gap: 6px;
+  padding-top: 10px;
+  border-top: 0;
+}
+
+.session-composer-row {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto;
+  grid-template-rows: auto minmax(40px, auto);
+  min-height: 64px;
+  padding: 8px 10px;
+  border-left: 3px solid color-mix(in srgb, var(--accent-primary) 62%, transparent);
+  background-color: var(--background-element);
+  transition-property: border-color, background-color;
+  transition-duration: var(--chrome-motion-duration);
+  transition-timing-function: ease-out;
+}
+
+.session-composer-row:focus-within {
+  border-left-color: var(--accent-primary);
+  background-color: var(--background-element);
+}
+
+.session-composer-target {
+  grid-column: 1 / -1;
+  grid-row: 1;
+  width: auto;
+  min-height: 18px;
+  padding: 0;
+  color: var(--text-muted);
+}
+
+.session-composer-row .session-input-wrap {
+  grid-column: 1;
+  grid-row: 2;
+}
+
+.session-composer-row .session-send {
+  grid-column: 2;
+  grid-row: 2;
+}
+
+.session-composer-target strong {
+  color: var(--accent-primary);
+  font-weight: var(--fw-semibold);
+}
+
+.session-composer-status {
+  min-height: 20px;
+  color: var(--text-muted);
+}
+
+/* Dialogs are panels on a scrim. They have no frame or movement. */
+.modal-backdrop,
+.settings-backdrop {
+  background-color: var(--background-overlay-strong);
+  animation: none;
+}
+
+.dialog,
+.quick-switcher,
+.settings-modal {
+  top: 25vh;
+  width: min(480px, calc(100vw - 32px));
+  border: 0;
+  border-radius: 0;
+  background-color: var(--background-panel);
+  box-shadow: none;
+  animation: chrome-fade-in var(--chrome-motion-duration) ease-out both;
+}
+
+.dialog {
+  gap: 12px;
+  padding: 12px 16px 14px;
+}
+
+.settings-modal {
+  width: min(680px, calc(100vw - 32px));
+  max-height: 70vh;
+  translate: -50% 0;
+}
+
+.agent-spawn-modal {
+  top: 25vh;
+  width: min(620px, calc(100vw - 32px));
+}
+
+.agent-replace-modal {
+  top: 25vh;
+  width: min(500px, calc(100vw - 32px));
+}
+
+.dialog-title {
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: 12px;
+  color: var(--text);
+  font-size: var(--font-ui-small);
+  font-weight: var(--fw-semibold);
+  letter-spacing: 0;
+}
+
+.dialog-title::after {
+  color: var(--text-muted);
+  content: "esc";
+  font-size: var(--font-ui-smaller);
+  font-weight: var(--fw-regular);
+}
+
+.dialog-input,
+.agent-spawn-select,
+.agent-spawn-static {
+  border: 0;
+  border-bottom: 1px solid var(--border-default);
+  border-radius: 0;
+  background-color: var(--background-element);
+}
+
+.dialog-input:focus,
+.dialog-input:focus-visible,
+.agent-spawn-select:focus,
+.agent-spawn-select:focus-visible {
+  border-color: var(--accent-primary);
+  box-shadow: none;
+}
+
+.dialog-actions {
+  gap: 8px;
+}
+
+.dialog-button {
+  min-height: 30px;
+  padding: 5px 12px;
+  border: 0;
+  border-radius: 0;
+  background-color: var(--background-menu);
+  color: var(--text-muted);
+  font-weight: var(--fw-medium);
+}
+
+.dialog-button:hover {
+  border: 0;
+  background-color: var(--background-element);
+  color: var(--text);
+}
+
+.dialog-confirm,
+.dialog-confirm:hover {
+  border: 0;
+  background-color: var(--accent-primary);
+  color: var(--selected-list-item-text);
+}
+
+.quick-switcher {
+  max-height: 60vh;
+  overflow: hidden;
+}
+
+.quick-switcher input {
+  padding: 10px 16px;
+  border-bottom: 1px solid var(--border-subtle);
+  background-color: transparent;
+}
+
+.quick-switcher-results {
+  padding: 6px 8px 8px;
+}
+
+.quick-switcher-group + .quick-switcher-group {
+  border-top: 0;
+}
+
+.quick-switcher-group-label {
+  padding: 5px 10px 3px;
+  color: var(--accent-primary);
+  font-weight: var(--fw-semibold);
+}
+
+.quick-switcher-result {
+  padding: 7px 10px;
+  color: var(--text-muted);
+}
+
+.quick-switcher-empty,
+.nav-empty,
+.session-empty,
+.empty-state-title {
+  color: var(--text-muted);
+}
+
+/* Transparent, single-line status rows. */
+.status-bar {
+  min-height: var(--status-bar-height);
+  padding: 0 12px;
+  border-top: 0;
+  background-color: transparent;
+  color: var(--text-muted);
+}
+
+.tmux-status-item {
+  height: auto;
+  padding: 0;
+  border-radius: 0;
+}
+
+.tmux-status-item:hover,
+.tmux-status-item.is-active {
+  background-color: transparent;
+  color: var(--text);
+}
+
+.tmux-status-item.is-active::before {
+  margin-right: 5px;
+  color: var(--accent-primary);
+  content: "●";
+  font-size: 0.55em;
+  vertical-align: middle;
+}
+
+.status-bar-metrics {
+  gap: 16px;
+}
+
+.status-bar-metrics > span {
+  display: inline-flex;
+  align-items: baseline;
+  gap: 4px;
+  color: var(--text);
+}
+
+.status-bar-metrics > span::before {
+  color: var(--accent-primary);
+  content: "·";
+}
+
+.status-bar-metrics > span:first-child::before { content: "∑"; }
+.status-bar-metrics > span:nth-child(2)::before { content: "#"; }
+
+.session-footer {
+  flex-wrap: wrap;
+  min-height: 26px;
+  padding: 2px 14px 8px;
+  border-top: 0;
+  background-color: transparent;
+  color: var(--text-muted);
+}
+
+.session-footer-sep,
+.session-model-queued,
+.session-hint {
+  color: var(--text-muted);
+}
+
+.session-hint-key {
+  color: var(--text);
+  font-weight: var(--fw-medium);
+}
+
+/* Toast contract for current and future callers: one stack, one panel. */
+.toast-stack {
+  position: fixed;
+  top: 16px;
+  right: 16px;
+  z-index: 200;
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  width: min(360px, calc(100vw - 32px));
+  pointer-events: none;
+}
+
+.toast-stack > :not(:last-child) {
+  display: none;
+}
+
+.toast {
+  padding: 10px 12px;
+  border: 0;
+  border-left: 3px solid var(--accent-primary);
+  border-radius: 0;
+  background-color: var(--background-panel);
+  color: var(--text);
+  box-shadow: none;
+  pointer-events: auto;
+}
+
+.toast.is-success { border-left-color: var(--accent-success); }
+.toast.is-warning { border-left-color: var(--accent-warning); }
+.toast.is-error { border-left-color: var(--accent-danger); }
+.toast.is-info { border-left-color: var(--accent-primary); }
+
+@keyframes chrome-fade-in {
+  from { opacity: 0; }
+  to { opacity: 1; }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  *,
+  *::before,
+  *::after {
+    animation-duration: 0.01ms !important;
+    animation-iteration-count: 1 !important;
+    scroll-behavior: auto !important;
+    transition-duration: 0.01ms !important;
   }
 }

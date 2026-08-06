@@ -4261,11 +4261,11 @@ function MessageComposer({
         />
       ) : (
         <>
-          <label className="session-composer-target" htmlFor={composerInputId}>
-            <span>ask or steer</span>
-            <strong>{ticket}</strong>
-          </label>
           <div className="session-composer-row">
+            <label className="session-composer-target" htmlFor={composerInputId}>
+              <span>ask or steer</span>
+              <strong>{ticket}</strong>
+            </label>
             <div className="session-input-wrap">
               {overlayPos ? (
                 <span
