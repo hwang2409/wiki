@@ -6,6 +6,7 @@ import {
   buildVirtualLayoutIncremental,
   eventRows,
   eventRowsIncremental,
+  VIRTUAL_ROW_GAP,
 } from "../src/session-layout.ts";
 import {
   buildSession,
@@ -24,6 +25,13 @@ function event(id, kind = "assistant", text = `event-${id}`) {
     ...(kind === "tool"
       ? { tool: { name: "fixture", input: "", output: null, ok: null, archetype: "other", summary: "" } }
       : {}),
+  };
+}
+
+function toolEvent(id, archetype, name = archetype) {
+  return {
+    ...event(id, "tool"),
+    tool: { name, input: "", output: null, ok: true, archetype, summary: name },
   };
 }
 
@@ -266,6 +274,24 @@ test("eventRowsIncremental keeps one virtual row per event", () => {
   result = eventRowsIncremental(events, 2, result.cache);
   assert.deepEqual(result.rows, eventRows(events, 2));
   assert.equal(result.changedFrom, 0);
+});
+
+test("virtual row spacing follows rendered presentation", () => {
+  const rows = eventRows([
+    toolEvent(0, "read", "Read"),
+    toolEvent(1, "read", "Read"),
+    toolEvent(2, "bash", "Bash"),
+    event(3, "thinking", "thought"),
+    event(4, "assistant", "prose"),
+  ], 0);
+  const heights = new Map(rows.map((row) => [row.key, { refs: [row.event], height: 20 }]));
+  const layout = buildVirtualLayout(rows, heights);
+  const topDeltas = layout.tops.slice(1).map((top, index) => top - layout.tops[index]);
+
+  assert.equal(topDeltas[0], 20, "inline to inline rows have no gap");
+  assert.equal(topDeltas[1], 20 + VIRTUAL_ROW_GAP, "inline to block rows have one gap");
+  assert.equal(topDeltas[2], 20 + VIRTUAL_ROW_GAP, "block to thought rows have one gap");
+  assert.equal(topDeltas[3], 20 + VIRTUAL_ROW_GAP, "thought to prose rows have one gap");
 });
 
 test("buildVirtualLayoutIncremental matches full layout across row and height deltas", () => {

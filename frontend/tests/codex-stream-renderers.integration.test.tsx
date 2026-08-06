@@ -487,7 +487,7 @@ describe("codex stream renderers", () => {
   it("keeps the working diff collapsed until explicit toggle", () => {
     const source = "diff --git a/a.txt b/a.txt\n--- a/a.txt\n+++ b/a.txt\n@@ -1,1 +1,1 @@\n-old\n+new";
     const view = render(<CodexStreamHighlights events={[event("turn_diff_updated", 1, { diff: source })]} />);
-    const toggle = view.getByRole("button", { name: /working diff/ });
+    const toggle = view.getByRole("button", { name: "working diff · 1 file" });
     expect(toggle.getAttribute("aria-expanded")).toBe("false");
     expect(view.queryByText("a.txt")).toBeNull();
     expect(view.container.querySelector(".codex-stream-diff-body")).toBeNull();

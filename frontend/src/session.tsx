@@ -1225,7 +1225,7 @@ function ToolOutputBody({
       <BoundedPreview
         ansi
         className="session-tool-block-preview"
-        previewLines={bash ? 10 : hasGitHubPreview ? 100 : 3}
+        previewLines={bash ? 10 : 3}
         rawText={rawOutput}
         showSummary={false}
         text={displayOutput}
@@ -1482,7 +1482,7 @@ export function ToolCallRow({
         {inlineOutput ? (
           <span className="session-tool-inline-result">
             {nested
-              ? renderAnsi(displayOutput)
+              ? renderAnsi(clipSegmentsInline(outputSegments).map((segment) => segment.text).join("\n"))
               : isReadOrSearchTool(tool)
               ? renderAnsi(inlineOutput)
               : (
@@ -3071,18 +3071,7 @@ export function SessionTab({
   }, [layout.tops, rows, visibleRange.end, visibleRange.start]);
   const timestampKeys = useMemo(() => computeTimestampKeys(rows), [rows]);
   const activityRunState = currentActivityRunState(session);
-  const currentTurnUserKey = activityRunState === "idle"
-    ? null
-    : [...rows].reverse().find((row) => row.event.kind === "user")?.key ?? null;
-  const currentActivityKey = activityRunState === "idle"
-    ? null
-    : [...rows].reverse().find(
-        (row) => (row.event.kind === "tool" || row.event.kind === "thinking") &&
-          (currentTurnUserKey === null || row.key > currentTurnUserKey),
-      )?.key ?? null;
-  const currentTurnStateKey = activityRunState !== "idle" && currentActivityKey === null
-    ? currentTurnUserKey
-    : null;
+  const currentTurnStateKey = activityRunState === "idle" ? null : rows.at(-1)?.key ?? null;
 
   const imageNumbers = useMemo(() => {
     const map = new Map<SessionEvent, number[]>();
@@ -3216,8 +3205,7 @@ export function SessionTab({
             {visibleRows.map(({ row, top }) => (
               <VirtualSessionRow
                 activityRunState={
-                  ((row.event.kind === "tool" || row.event.kind === "thinking") && row.key === currentActivityKey)
-                    || (row.event.kind === "user" && row.key === currentTurnStateKey)
+                  row.key === currentTurnStateKey
                     ? activityRunState
                     : "idle"
                 }

@@ -604,8 +604,7 @@ function DiffRenderer({ source }: { source: string | null }) {
           onClick={() => setExpanded((value) => !value)}
         >
           <ChevronDown aria-hidden="true" className="codex-stream-diff-chevron" size={13} />
-          <span>working diff</span>
-          <span className="codex-stream-artifact-count tabular-nums">{boundedFiles.size} file{boundedFiles.size === 1 ? "" : "s"}</span>
+          <span>working diff · {boundedFiles.size} file{boundedFiles.size === 1 ? "" : "s"}</span>
         </button>
         {source ? (
           <button

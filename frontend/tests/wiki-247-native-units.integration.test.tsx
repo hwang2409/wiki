@@ -9,6 +9,7 @@ import { afterEach, beforeEach, describe, expect, test } from "vitest";
 
 import type { SessionEvent, SessionTool } from "../src/api";
 import { ActivityEventRow, ToolCallRow } from "../src/session";
+import { buildVirtualLayout, eventRows, VIRTUAL_ROW_GAP } from "../src/session-layout";
 import normalizedEditFixture from "./fixtures/wiki-245-claude-edit-normalized.json";
 
 const CSS_SOURCE = readFileSync(
@@ -120,14 +121,26 @@ describe("per-event transcript units", () => {
     expect(units.filter((unit) => unit.querySelector(".is-tool"))).toHaveLength(3);
   });
 
-  test("the aggregation container carries no box chrome and packs inline rows", () => {
+  test("the activity container carries no box chrome and layout owns row rhythm", () => {
     const activity = cssDeclarations(".session-activity");
     expect(activity).not.toMatch(/(?:^|\n)\s*border\s*:/);
     expect(activity).not.toMatch(/(?:^|\n)\s*background/);
-    // Rhythm: blocks and reasoning separate by one 8px unit; the first unit
-    // never opens a gap against the turn boundary.
-    expect(CSS_WITHOUT_COMMENTS).toContain(".session-activity > .session-activity-row.is-block,");
-    expect(cssDeclarations(".session-activity > .session-activity-row:first-child")).toContain("margin-top: 0;");
+    expect(CSS_WITHOUT_COMMENTS).not.toContain(".session-activity > .session-activity-row.is-block");
+    const rows = eventRows([
+      toolEvent(1, { output: "one" }),
+      toolEvent(2, { output: "two" }),
+      toolEvent(3, { name: "Bash", archetype: "bash", output: "three" }),
+      thinkingEvent(4),
+      { id: 5, kind: "assistant", ts: null, text: "prose", disposition: "rendered" },
+    ], 0);
+    const heights = new Map(rows.map((row) => [row.key, { refs: [row.event], height: 20 }]));
+    const layout = buildVirtualLayout(rows, heights);
+    expect(layout.tops.slice(1).map((top, index) => top - layout.tops[index])).toEqual([
+      20,
+      20 + VIRTUAL_ROW_GAP,
+      20 + VIRTUAL_ROW_GAP,
+      20 + VIRTUAL_ROW_GAP,
+    ]);
   });
 
   test("trace rows have no tree connectors", () => {

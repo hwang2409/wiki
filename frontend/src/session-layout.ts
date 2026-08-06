@@ -4,6 +4,21 @@ export const VIRTUAL_ROW_GAP = 14;
 
 export type EventRow = { event: SessionEvent; key: number };
 
+export type RowPresentation = "inline" | "block" | "thought" | "prose";
+
+const GITHUB_PREVIEW_URL = /https:\/\/(?:www\.)?github\.com\/[A-Za-z0-9_.-]+\/[A-Za-z0-9_.-]+\/(?:pull\/\d+|issues\/\d+|commit\/[0-9a-fA-F]{7,40})\/?/;
+
+function blockTool(tool: NonNullable<SessionEvent["tool"]>): boolean {
+  const name = tool.name.trim().toLowerCase();
+  return tool.archetype === "bash"
+    || tool.archetype === "terminal"
+    || tool.archetype === "diff"
+    || tool.archetype === "edit"
+    || tool.archetype === "agent"
+    || ["bash", "edit", "multiedit", "notebookedit", "apply_patch", "monitor", "write", "writefile", "task", "agent"].includes(name)
+    || GITHUB_PREVIEW_URL.test(tool.output ?? "");
+}
+
 export type RowMeasurement = {
   refs: readonly SessionEvent[];
   height: number;
@@ -124,6 +139,15 @@ function estimateWrappedLines(text: string, charsPerLine: number): number {
   return total;
 }
 
+export function rowPresentation(row: EventRow): RowPresentation {
+  if (row.event.kind === "thinking") return "thought";
+  if (row.event.kind === "tool" && row.event.tool) {
+    return blockTool(row.event.tool) ? "block" : "inline";
+  }
+  if (row.event.kind === "bash") return "block";
+  return "prose";
+}
+
 function getEstimatedRowHeight(row: EventRow): number {
   switch (row.event.kind) {
     case "assistant":
@@ -195,6 +219,9 @@ export function buildVirtualLayoutIncremental(
   ) {
     changedFrom = Math.max(0, changedFrom - 1);
   }
+  // A row's presentation controls the gap before it. Rebuild the preceding
+  // row when a changed row can alter that boundary.
+  if (previous && changedFrom > 0) changedFrom -= 1;
 
   const keys = previous?.layout.keys.slice(0, changedFrom) ?? [];
   const tops = previous?.layout.tops.slice(0, changedFrom) ?? [];
@@ -212,10 +239,10 @@ export function buildVirtualLayoutIncremental(
     tops[index] = offset;
     const height = getRowHeight(row, heights);
     const next = rows[index + 1];
-    const adjacentInline = next
-      && (row.event.kind === "tool" || row.event.kind === "thinking")
-      && (next.event.kind === "tool" || next.event.kind === "thinking");
-    const size = height + (adjacentInline ? 0 : (index === rows.length - 1 ? 0 : VIRTUAL_ROW_GAP));
+    const adjacentTierOneInline = next
+      && rowPresentation(row) === "inline"
+      && rowPresentation(next) === "inline";
+    const size = height + (adjacentTierOneInline || index === rows.length - 1 ? 0 : VIRTUAL_ROW_GAP);
     sizes[index] = size;
     offset += size;
   }

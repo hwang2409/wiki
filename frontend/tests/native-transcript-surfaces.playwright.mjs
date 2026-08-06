@@ -193,8 +193,8 @@ async function main() {
     await expectVisibleText(page, ".gh-preview-title", "WIKI-58 inline thinking rows and font picker");
     await expectVisibleText(page, ".gh-preview-badge", "merged");
     await expectVisibleText(page, ".gh-preview-badge.is-muted", "3 files");
-    // WIKI-244: activity groups and tool bodies are open by default — no
-    // clicks needed; the preview output is always visible in the tool row.
+    // WIKI-244: activity groups stay open. Long tool output uses the generic
+    // three-line preview and exposes the remaining evidence through expand.
     await page.locator(".session-activity .session-tool").first().waitFor({ state: "visible" });
     const previewTool = page.locator(".session-activity .session-tool").first();
     const previewToolEventId = await previewTool.getAttribute("data-tool-event-id");
@@ -206,6 +206,7 @@ async function main() {
       .filter({ has: page.locator(".gh-preview-title") })
       .first();
     await previewScope.locator(".gh-preview-title", { hasText: "Add GitHub URL previews" }).waitFor();
+    await previewScope.locator(".transcript-preview-more").click();
     // WIKI-153 (#122) wrapped tool output in `.session-tool-output-text` so
     // preview cards render inline with ANSI text; the bare fallback anchor is
     // now a descendant of `.session-tool-output-blocks`, not a direct child.

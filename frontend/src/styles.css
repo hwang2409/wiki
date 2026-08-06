@@ -7349,20 +7349,6 @@ body.is-resizing-panes .pane-cell {
   min-width: 0;
 }
 
-/* WIKI-247 vertical rhythm: consecutive tier-1 inline rows pack at zero
-   margin; blocks and thinking traces stand alone with one unit of
-   whitespace on each side (doctrine: margin 1 when a neighbor is rich). */
-.session-activity > .session-activity-row.is-block,
-.session-activity > .session-activity-row.is-reasoning,
-.session-activity > .session-activity-row.is-block + .session-activity-row,
-.session-activity > .session-activity-row.is-reasoning + .session-activity-row {
-  margin-top: 8px;
-}
-
-.session-activity > .session-activity-row:first-child {
-  margin-top: 0;
-}
-
 .session-tool-head {
   display: flex;
   align-items: center;

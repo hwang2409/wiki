@@ -293,12 +293,21 @@ async function main() {
       "session source exact",
       "2026-08-02T12:00:34.000Z",
     );
-    await writeTranscript([completedInterruptedTool, completedInterruptedResult]);
+    const interruptedAssistant = codexAssistant(
+      "The interrupted boundary is an assistant row.",
+      "2026-08-02T12:00:35.000Z",
+    );
+    await writeTranscript([completedInterruptedTool, completedInterruptedResult, interruptedAssistant]);
     await page.reload({ waitUntil: "domcontentloaded" });
     await page.waitForSelector('.session-virtual-row[data-row-kind="activity"] .session-activity-row');
     const completedState = page.locator(".session-turn-live-state .session-activity-state");
     assert((await completedState.count()) === 1 && (await completedState.innerText()) === "INTERRUPTED",
       "completed interrupted runs must retain a quiet interrupted state");
+    const liveRow = page.locator(".session-turn-live-state").locator(
+      "xpath=ancestor::div[contains(@class, 'session-virtual-row')][1]",
+    );
+    assert(await liveRow.locator(".session-assistant").count() === 1,
+      "interrupted state must attach to the final assistant row of the current turn");
     await page.locator(".session-scroll").screenshot({ path: SCREENSHOTS.collapsedNormal });
     await page.locator(".session-scroll").evaluate((element) => { element.scrollTop = 0; });
     await page.waitForTimeout(100);
@@ -321,18 +330,11 @@ async function main() {
     ]),
       `timeline reading order is wrong: ${firstKinds.join("/")}`);
     const toolRows = page.locator(".session-tool");
-    const resultOutputs = await toolRows.allInnerTexts();
-    assert(resultOutputs.some((text) => text.includes("order B finished")),
-      `tool output should remain visible: ${resultOutputs.join(" / ")}`);
     const resultSummaries = (await page.locator(".session-tool-summary").allInnerTexts())
       .map((text) => text.replace(/\s+/g, " ").trim());
     const expectedSummaries = ["read session.tsx", "read agent-events.ts", "npm test -- order-b"];
-    let summaryIndex = -1;
-    for (const summary of expectedSummaries) {
-      const nextIndex = resultSummaries.indexOf(summary);
-      assert(nextIndex > summaryIndex, `tool-to-output correlation order is wrong: ${resultSummaries.join(" / ")}`);
-      summaryIndex = nextIndex;
-    }
+    assert(JSON.stringify(resultSummaries.slice(0, expectedSummaries.length)) === JSON.stringify(expectedSummaries),
+      `tool-to-output correlation order is wrong: ${resultSummaries.join(" / ")}`);
 
     const firstTool = toolRows.first();
     const firstToolId = await firstTool.getAttribute("data-tool-event-id");
@@ -343,6 +345,20 @@ async function main() {
       (await firstTool.locator(".session-tool-detail").innerText()).trim()
         === "frontend/src/session.tsx",
       "tool row must retain exact raw input evidence inline",
+    );
+    const firstRawToggle = firstTool.locator(".session-tool-raw-toggle");
+    assert(await firstRawToggle.count() === 1, "first per-event tool row must expose raw disclosure");
+    await firstRawToggle.click();
+    assert(
+      (await firstTool.locator(".session-tool-raw .transcript-preview-body").innerText()).trim()
+        === "activity group source exact",
+      "raw disclosure must retain exact tool output on its owning per-event row",
+    );
+    const orderB = toolRows.nth(2);
+    assert(
+      (await orderB.locator(".session-tool-inline-result, .session-tool-body .transcript-preview-body").innerText()).trim()
+        === "order B finished",
+      "tool output must remain paired with the exact owning per-event row",
     );
     assert((await firstTool.locator(".session-tool-status").innerText()).toLowerCase() === "completed",
       "ok=null tools must render a neutral completed label");
@@ -387,10 +403,10 @@ async function main() {
     await page.mouse.move(0, 0);
     await page.locator(".session-scroll").evaluate((element) => { element.scrollTop = element.scrollHeight; });
     await page.waitForTimeout(100);
-    const rawToggle = page.locator(".session-tool-raw-toggle").first();
+    const rawToggle = page.locator(".session-tool-raw-toggle").last();
     if (await rawToggle.count()) {
       await rawToggle.click();
-      await page.locator(".transcript-preview-body").first().waitFor();
+      await page.locator(".transcript-preview-body").last().waitFor();
     }
     const contrastAudit = {};
     for (const theme of THEMES) {
