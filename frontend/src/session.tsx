@@ -107,6 +107,7 @@ import {
   isBashTool,
   isReadOrSearchTool,
   toolInlineResult,
+  toolDiffSource,
   toolPresentation,
   toolStatus,
   toolSummaryLine,
@@ -1177,11 +1178,13 @@ function toolBlockTitle(tool: SessionTool): string {
 
 function ToolOutputBody({
   displayOutput,
+  diffSource,
   rawOutput,
   segments,
   tool,
 }: {
   displayOutput: string;
+  diffSource: string | null;
   rawOutput: string;
   segments: HarnessOutputSegment[];
   tool: SessionTool;
@@ -1192,7 +1195,7 @@ function ToolOutputBody({
     return (
       <div className="session-tool-body session-tool-diff-body">
         <div className="session-tool-block-title">{toolBlockTitle(tool)}</div>
-        <DiffPatchView source={displayOutput} />
+        <DiffPatchView source={diffSource ?? displayOutput} />
       </div>
     );
   }
@@ -1455,7 +1458,8 @@ export function ToolCallRow({
   const rawOutput = tool.output ?? "";
   const outputSegments = rawOutput ? parseHarnessOutput(rawOutput) : [];
   const displayOutput = outputSegments.map((segment) => segment.text).join("\n");
-  const presentation = toolPresentation(tool, displayOutput);
+  const diffSource = toolDiffSource(tool, displayOutput);
+  const presentation = toolPresentation(tool, diffSource ?? displayOutput);
   const outputBlock = presentation !== "inline";
   const [errorExpanded, setErrorExpanded] = useState(false);
   const showOutputBlock = outputBlock && (tool.ok !== false || errorExpanded);
@@ -1530,6 +1534,7 @@ export function ToolCallRow({
         {withResult && showOutputBlock ? (
           <ToolOutputBody
             displayOutput={displayOutput}
+            diffSource={diffSource}
             rawOutput={rawOutput}
             segments={outputSegments}
             tool={tool}
@@ -1537,6 +1542,7 @@ export function ToolCallRow({
         ) : isBashTool(tool) && running ? (
           <ToolOutputBody
             displayOutput={displayOutput}
+            diffSource={diffSource}
             rawOutput={rawOutput}
             segments={outputSegments}
             tool={tool}

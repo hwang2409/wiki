@@ -1,4 +1,5 @@
 import type { SessionEvent, SessionTool } from "./api";
+import { editDiffFromInput } from "./transcript-output";
 
 const UNIFIED_DIFF_HEAD = /^\s*(?:diff --git |--- [ab]?\/|\*\*\* )/m;
 
@@ -47,10 +48,20 @@ export function looksLikeUnifiedDiff(text: string | null | undefined): boolean {
   return Boolean(text && UNIFIED_DIFF_HEAD.test(text));
 }
 
+export function toolDiffSource(tool: SessionTool, displayOutput = ""): string | null {
+  if (isEditTool(tool)) {
+    return editDiffFromInput(tool.name, tool.input)
+      ?? (looksLikeUnifiedDiff(displayOutput) ? displayOutput : null);
+  }
+  return tool.archetype === "diff" && looksLikeUnifiedDiff(displayOutput)
+    ? displayOutput
+    : null;
+}
+
 // Tiering follows the tool kind. A long Read result is still an inline Read;
 // a Bash result is still a block even when it has one short line.
 export function toolPresentation(tool: SessionTool, displayOutput = ""): ToolPresentation {
-  if ((isEditTool(tool) || tool.archetype === "diff") && looksLikeUnifiedDiff(displayOutput)) return "diff";
+  if (toolDiffSource(tool, displayOutput)) return "diff";
   if (isBashTool(tool) || isRichWriteOrTaskTool(tool)) return "block";
   return "inline";
 }

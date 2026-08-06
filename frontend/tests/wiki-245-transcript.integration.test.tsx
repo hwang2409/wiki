@@ -193,10 +193,42 @@ test("edit rows render an actual stored unified diff", () => {
     name: "Edit",
     archetype: "edit",
     summary: "edit hot.md",
-    output: "--- a/hot.md\n+++ b/hot.md\n@@ -1 +1 @@\n-old\n+new",
+    input: JSON.stringify({
+      file_path: "hot.md",
+      old_string: "before\nold\nafter",
+      new_string: "before\nnew\nafter",
+    }),
+    output: "updated",
   });
   expect(container.querySelector(".session-tool-diff-body")).toBeTruthy();
   expect(container.querySelector(".diff-view")).toBeTruthy();
   expect(container.querySelector(".diff-line.is-remove")?.textContent).toContain("old");
   expect(container.querySelector(".diff-line.is-add")?.textContent).toContain("new");
+  expect(container.querySelector(".diff-line.is-context")?.textContent).toContain("before");
+});
+
+test("apply_patch input renders its patch body as a diff", () => {
+  const { container } = renderTool({
+    name: "apply_patch",
+    archetype: "edit",
+    summary: "apply patch hot.md",
+    input: "*** Begin Patch\n*** Update File: hot.md\n@@\n-old\n+new\n*** End Patch",
+    output: "Done",
+  });
+  expect(container.querySelector(".session-tool-diff-body")).toBeTruthy();
+  expect(container.querySelector(".diff-file-path")?.textContent).toBe("hot.md");
+  expect(container.querySelector(".diff-line.is-remove")?.textContent).toContain("old");
+  expect(container.querySelector(".diff-line.is-add")?.textContent).toContain("new");
+});
+
+test("edit rows without diff material stay inline", () => {
+  const { container } = renderTool({
+    name: "Edit",
+    archetype: "edit",
+    summary: "edit hot.md",
+    input: "/tmp/hot.md",
+    output: "updated",
+  });
+  expect(container.querySelector(".session-tool.is-inline")).toBeTruthy();
+  expect(container.querySelector(".session-tool-diff-body")).toBeNull();
 });
