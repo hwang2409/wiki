@@ -9,6 +9,7 @@ updated: 2026-08-06
 
 ## 2026-08-06
 
+- WIKI-247 merged via #183 (owner call mid-round-2): per-event units, quiet composer, native blocks, font+sidebar fixes; residual review findings split to WIKI-248
 - **wiki** — WIKI-247 fable-5 worker hit Anthropic credit wall mid-implementation (resets Aug 10 2am ET); WIP snapshotted at 97cb298, seat replaced with cdx luna + continuation contract
 - WIKI-245 merged via #182: OpenCode two-tier transcript (inline rows + left-border blocks, state-as-color, Edit diffs from bounded normalizer payload, harness-wrapper semantics, raw access everywhere) — 7 rounds incl. 3 orchestrator take-over rounds
 - WIKI-246 merged via #181: OpenCode chrome language (elevation tokens, left-bar semantics, selection fill, dialog anatomy, motion + hover budgets) — 7 rounds incl. 2 orchestrator take-over rounds
