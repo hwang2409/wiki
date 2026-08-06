@@ -31,7 +31,7 @@
     "test:wiki-145-layout": "node tests/wiki-145-layout.playwright.mjs",
     "test:wiki-145-noise": "node tests/wiki-145-noise.playwright.mjs",
     "test:wiki-145-typography": "node tests/wiki-145-typography.playwright.mjs",
-    "test:unit": "node --experimental-strip-types --test tests/session-performance.unit.mjs tests/wiki32-harness.unit.mjs tests/terminal-transport.unit.ts tests/file-workspaces.test.ts tests/dashboard-logic.unit.ts tests/diff-parser.test.ts tests/visual-diff.test.ts tests/pdfjs-runtime.test.ts tests/pdf-nav.test.ts tests/plot-interaction.test.ts tests/plot-interaction-compile.test.ts tests/font-enumeration.test.ts && vitest run",
+    "test:unit": "node --experimental-strip-types --test tests/session-performance.unit.mjs tests/wiki32-harness.unit.mjs tests/terminal-transport.unit.ts tests/file-workspaces.test.ts tests/dashboard-logic.unit.ts tests/diff-parser.test.ts tests/visual-diff.test.ts tests/pdfjs-runtime.test.ts tests/pdf-nav.test.ts tests/plot-interaction.test.ts tests/plot-interaction-compile.test.ts tests/font-enumeration.test.ts tests/read-gutter.test.ts && vitest run",
     "test:component": "vitest run",
     "test:wiki-125": "node tests/wiki-125-note-markdown.playwright.mjs",
     "test:wiki-97": "node tests/wiki-97-transcript-markdown.playwright.mjs",

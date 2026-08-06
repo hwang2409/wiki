@@ -119,7 +119,8 @@ import {
   type ToolPresentation,
   type TraceRow,
 } from "./transcript-event-utils";
-import { HighlightedCode, ShikiCode, languageForPath } from "./shiki";
+import { HighlightedCode, NumberedReadHighlight, ShikiCode, languageForPath } from "./shiki";
+import { parseNumberedPayload, type NumberedPayload } from "./read-gutter";
 import {
   HarnessOutput,
   clipSegmentsInline,
@@ -1246,6 +1247,8 @@ function ToolOutputBody({
   displayOutput,
   diffSource,
   eventId,
+  numberedRead,
+  pathLang,
   presentation,
   rawOutput,
   segments,
@@ -1254,6 +1257,12 @@ function ToolOutputBody({
   displayOutput: string;
   diffSource: string | null;
   eventId: number;
+  // WIKI-261: pre-parsed numbered read payload (null when the output is not a
+  // read-tool numbered dump or when no filetype hint is available). When
+  // present the block renders as a two-column gutter + highlighted code
+  // instead of a plain ANSI segment stream.
+  numberedRead: NumberedPayload | null;
+  pathLang: string | null;
   // Effective presentation from the parent (which applies the WIKI-253
   // inline→block promotion for long generic tool outputs). Recomputing here
   // would miss the promotion and hide long read_agent / list_agents payloads.
@@ -1370,7 +1379,9 @@ function ToolOutputBody({
           renderBody={({ text }) => (
             <div className="session-tool-output-blocks">
               <span className="session-tool-output-text">
-                {structured
+                {numberedRead && pathLang && outputTone === "normal" && !hasGitHubLink
+                  ? <NumberedReadHighlight payload={numberedRead} lang={pathLang} />
+                  : structured
                   ? <HighlightedCode code={text} lang={structured.lang} />
                   : bashOutputLang
                   ? <HighlightedCode code={text} lang={bashOutputLang} />
@@ -1657,17 +1668,18 @@ export function ToolCallRow({
   const polishedId = useId();
   // Polished view: recognizable content only (parse or filetype hint), never
   // heuristics. Offered for successful outputs; failures keep the error flow.
-  // Read payloads with line-number gutters would mis-tokenize — no hint then.
-  const numberedPayload = /^\s*\d+[\t→|]/.test(displayOutput);
+  // WIKI-261: for numbered read payloads (cat -n / arrow gutter), parse the
+  // gutter off, hand the stripped code to the highlighter with the path's
+  // language, and route rendering through NumberedReadHighlight so real file
+  // line numbers stay in a muted, non-selectable gutter column.
+  const pathLang = languageForPath(toolPathHint(tool) ?? "");
+  const numberedRead = pathLang ? parseNumberedPayload(displayOutput) : null;
   // For diff-presenting tools the split-diff view IS the polished form
   // (WIKI-251 HIGH#1 fix): don't offer a structured-content polished toggle
   // over "File updated." (the ack).
   const isDiffPresentation = presentation === "diff" && !!diffSource;
   const polished = tool.ok !== false && displayOutput && !isDiffPresentation
-    ? detectStructuredContent(
-        displayOutput,
-        numberedPayload ? null : languageForPath(toolPathHint(tool) ?? ""),
-      )
+    ? detectStructuredContent(numberedRead ? numberedRead.code : displayOutput, pathLang)
     : null;
   const showOutputBlock = outputBlock && (tool.ok !== false || errorShown);
   const inlineOutput = presentation === "inline" && (tool.ok !== false || errorShown)
@@ -1768,7 +1780,9 @@ export function ToolCallRow({
               text={polished.text}
               variant="block"
               renderBody={({ text }) => (
-                <HighlightedCode code={text} lang={polished.lang} lineNumbers={polished.code} />
+                numberedRead
+                  ? <NumberedReadHighlight payload={numberedRead} lang={polished.lang} />
+                  : <HighlightedCode code={text} lang={polished.lang} lineNumbers={polished.code} />
               )}
             />
           </div>
@@ -1778,6 +1792,8 @@ export function ToolCallRow({
             displayOutput={displayOutput}
             diffSource={diffSource}
             eventId={event.id}
+            numberedRead={numberedRead}
+            pathLang={pathLang}
             presentation={presentation}
             rawOutput={rawOutput}
             segments={outputSegments}
