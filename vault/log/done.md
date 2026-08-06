@@ -9,6 +9,17 @@ updated: 2026-08-06
 
 ## 2026-08-06
 
+- **wiki** — rebuilt and relaunched Wiki.app at origin/main c84dfe4
+- WIKI-257 merged (#193) — single polish toggle, raw is default (removed redundant raw button + section, aria-pressed on active polish)
+- WIKI-256 merged (#192) — dropped 13 @fontsource/* deps; Wiki.app now renders from OS-installed fonts (JetBrains OTF quality vs Google Fonts subset)
+- WIKI-251 merged (#189) — diff-wrap-width polish (raw/polished toggle, artifact wrap, responsive width, split-diff shiki tokens); orch-merge on clean gate + skip-review-ui-wiki
+- WIKI-253 merged (#190) — collapsible tool-output blocks with peek row; orch-merge on clean gate (skip-review-ui-wiki)
+- WIKI-254 merged: Ctrl+K in the command palette now moves selection up (mirrors Ctrl+J) — capture+bubble handlers were stopPropagating even when palette was open. https://github.com/hwang2409/wiki/pull/187 (squash a8f876d)
+- WIKI-255 merged: disable single-$ KaTeX in chat+prose (singleDollarTextMath: false) — stops assistant prose being rendered as runaway inline math when two $ appear in a sentence. https://github.com/hwang2409/wiki/pull/191 (squash 4d33596)
+- **doctrine** — [[tool-outputs-render-raw]] filed (Henry 2026-08-06) — tool outputs render raw; rich rendering only via explicit render_artifact; kills the artifact-in-tool-output proposal on the same principle as WIKI-252's github preview strip
+- **doctrine** — skip deep-review for pure UI/polish wiki PRs (Henry 2026-08-06c) — gate-only orch-merge; keep review for logic/backend + state-machine UI. protocol doc + hot.md + memory updated
+- WIKI-252 merged: strip GitHub URL preview cards from tool responses (kept in prose) — https://github.com/hwang2409/wiki/pull/188 (squash 923dbb1); 2 rounds, orch-merged
+- fleet routing reverted (Henry 2026-08-06b): reviewer back to cdx gpt-5.6-sol; fable-5 is orchestrator-only; protocol doc + hot.md updated
 - WIKI-249 merged via #186 (gate waived): OpenCode 1:1 run-view fidelity + polish wave — syntax highlighting everywhere (commands, file reads, diffs, thinking), json/python pretty rendering, polished toggle, fence-tag honoring, embedded-heredoc structuring, file-slice output inference, cursor=text — fable-5, 10-item gap table, 347 vitest + 5 playwright green
 - WIKI-248 merged via #185 (review gate waived by Henry at round 2): per-event spacing model, live-state anchor, data-level caps, exact assertions, working-diff summary
 - WIKI-250 merged via #184: Gruvbox dark retuned to gruvbox-dark-hard-contrast.terminal (21 keys decoded + verified twice; derived elevations; selection contrast fixed)

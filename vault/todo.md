@@ -25,6 +25,13 @@ Todo:
 - [P1] phoebe: PHO-15149 refactor umbrella to ORGANIZATION.md layout — ticket filed under epic PHO-15148; blocked by PHO-15082 (last parity PR)
 - [P2] wiki backend: boot-sweep follow-ups from 2026-08-05 latency fix — skip terminal-state runs in orphan/costs sweeps + prune accumulated run-history store (multi-GB JSONL streaming still O(history) once per boot; related WIKI-227) + incremental/bounded checkpoint for costs state persistence (changed ticks serialize full history off-loop; deferred from WIKI-227 #180 R4 by orch ruling 2026-08-06)
 - [P3] wiki repo hygiene: ~95 stale worktrees under .claude/.codex worktrees (detached review checkouts + branches of long-merged tickets, e.g. 40+ wiki-168-review*) — bulk sweep worktrees+branches for merged/closed tickets, GBs of debris
+- [P2] wiki-app: focus mode (cmd+.) — hide sidebar, transcript takes full window
+- [P2] wiki-app: turn-level jump nav — j/k between turns, gg/G first/last, / filter
+- [P2] wiki-app: sticky turn/event header while scrolling long turn
+- [P3] wiki-app: peek-hover for [[wiki-link]] tokens (obsidian parity)
+- [P3] wiki-app: diff-hunk anchor URLs from run summary → first hunk of a file
+- [P3] wiki-app: session breadcrumbs (ticket → PR → round N → turn K)
+- [P2] wiki-app: composer / command menu for orchestrator actions (spawn, steer, archive, gate, replace)
 
 Silky-smooth artifact rendering arc (Henry 2026-07-29):
 

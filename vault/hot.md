@@ -26,6 +26,8 @@ Rolling ≤500-word session cache. Rewrite (don't append) at work-arc boundaries
 
 ## Watchouts
 
+- **Fleet routing REVERTED (Henry 2026-08-06b): implement = cdx gpt-5.6-luna, review = cdx gpt-5.6-sol, orchestrator = cc claude-fable-5. Fable is orchestrator-only** ("fable should just be orchestrators"); the 2026-08-06a fable-reviewer swap is undone. Protocol doc updated.
+- **Skip deep-review for pure UI/polish wiki PRs (Henry 2026-08-06c).** Gate-only, orch-merge on green. Keep review for logic/backend and UI tickets with non-trivial state machines. Applies wiki only, NOT phoebe. See [[skip-review-ui-wiki]] memory + protocol doc.
 - NO LOCAL BAZEL for workers: bb remote evidence MUST use `bin/bb remote --run_from_commit=<full pushed SHA> test ...` one captured session with `git rev-parse HEAD && git status --porcelain`; runner log must show FETCH of that commit.
 - Worker pre-push hooks: don't let workers repair remote-bazel hook plumbing for hours — ruling: `prek run --hook-stage pre-push` once, fix real diagnostics in own diff, `--no-verify` + documented bypass for hook-infra failures, PR CI authoritative (applied 2026-08-06 PHO-0-V3-WRITES).
 - Review-loop protocol: verdict → archive reviewer → compact contract → replace implementer → steer now; reviewers read-only, never run tests.

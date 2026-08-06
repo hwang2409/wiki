@@ -119,6 +119,7 @@ Topic → note index. **Agents: read this file first, before grepping.** Every n
 - [[opencode-design-direction]] — Wiki UI adopts OpenCode TUI design language (Henry 2026-08-06) — transcript doctrine + web translation rules
 - [[opencode-tui-design-notes]] — OpenCode TUI design language extraction — color roles, elevation, dialogs, composer, motion; 21 web-transfer rules (feeds WIKI-245/246)
 - [[opencode-transcript-doctrine]] — OpenCode two-tier transcript rendering doctrine (InlineTool/BlockTool, density, thinking) — landed via WIKI-245/#182
+- [[tool-outputs-render-raw]] — wiki-app: tool outputs render raw; rich rendering only via explicit render_artifact
 
 ## Wiki/til
 
