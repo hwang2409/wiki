@@ -45,7 +45,6 @@ import rehypeKatex from "rehype-katex";
 import remarkGfm from "remark-gfm";
 import remarkMath from "remark-math";
 import { MarkdownPre, MarkdownTable, prepareTranscriptMarkdown, rehypeEscapeRawHtml } from "./markdown";
-import { ShikiCode } from "./shiki";
 import {
   cancelAgentModelChange,
   cancelQueuedMessage,
@@ -113,7 +112,6 @@ import {
   toolStatus,
   toolSummaryLine,
   toolSummaryParts,
-  traceConnector,
   traceRows,
   type TraceRow,
 } from "./transcript-event-utils";
@@ -128,10 +126,7 @@ import { CodexStreamHighlights } from "./codex-stream-renderers";
 import { markerRule } from "./hook-message-registry";
 import type { MarkerSeverity } from "./hook-message-registry";
 import {
-  activityCountsLabel,
-  activityElapsedLabel,
   activityRunStateFromProvider,
-  activitySemanticSummary,
   activityStateLabel,
   type ActivityRunState,
 } from "./agent-events";
@@ -1208,7 +1203,7 @@ function ToolOutputBody({
             edit too large to diff — view raw
           </div>
         ) : (
-          <DiffPatchView source={diffSource ?? displayOutput} />
+          <DiffPatchView showLineNumbers source={diffSource ?? displayOutput} />
         )}
       </div>
     );
@@ -1220,10 +1215,13 @@ function ToolOutputBody({
     : "normal";
   return (
     <div className="session-tool-body session-tool-block-body">
-      <div className="session-tool-block-title">{toolBlockTitle(tool)}</div>
-      {bash && tool.input.includes("\n") ? (
-        <ShikiCode className="session-tool-input" code={tool.input} lang="bash" transparent />
-      ) : null}
+      {/* Bash blocks: the command line reads in text color, output recedes to
+          muted — two tones, no same-color wall (WIKI-247). */}
+      {bash ? (
+        <div className="session-tool-block-title is-command">$ {tool.input || toolSummaryLine(tool)}</div>
+      ) : (
+        <div className="session-tool-block-title">{toolBlockTitle(tool)}</div>
+      )}
       <BoundedPreview
         ansi
         className="session-tool-block-preview"
@@ -1417,14 +1415,12 @@ function ThinkingRow({ event }: { event: SessionEvent }) {
 }
 
 export function ToolCallRow({
-  connector,
   event,
   nested = false,
   onInspect,
   ticket,
   withResult,
 }: {
-  connector: string;
   event: SessionEvent;
   nested?: boolean;
   onInspect?: (agentId: string) => void;
@@ -1464,7 +1460,6 @@ export function ToolCallRow({
       data-tool-event-id={nested ? undefined : event.id}
     >
       <div className="session-tool-head">
-        <span aria-hidden="true" className="session-trace-connector">{connector}</span>
         {isBashTool(tool) ? (
           <span aria-hidden="true" className="session-tool-icon session-tool-icon-text">$</span>
         ) : (
@@ -1587,12 +1582,11 @@ function TraceRowList({
 }) {
   return (
     <>
-      {rows.map((row, index) => {
+      {rows.map((row) => {
         const key = `${keyBase}:${row.kind}:${row.eventIndex}`;
         if (row.kind === "tool") {
           return (
             <ToolCallRow
-              connector={traceConnector(rows, index)}
               event={row.event}
               key={key}
               nested={nested}
@@ -1790,15 +1784,7 @@ function BashBlock({ event }: { event: SessionEvent }) {
   const output = segments.map((segment) => segment.text).join("\n");
   return (
     <div className="session-bash session-tool-body session-tool-block-body">
-      <div className="session-tool-block-title">$ {bash.input.split("\n")[0] || "bash"}</div>
-      {bash.input ? (
-        <ShikiCode
-          className="session-tool-input session-bash-command-code"
-          code={bash.input}
-          lang="bash"
-          transparent
-        />
-      ) : null}
+      <div className="session-tool-block-title is-command">$ {bash.input || "bash"}</div>
       {output ? (
         <BoundedPreview
           ansi
@@ -2279,47 +2265,24 @@ const MessageBlock = memo(function MessageBlock({
   sameImageNums(prev.imageNums, next.imageNums)
 );
 
-function ActivityGroupBase({
+// WIKI-247: no turn aggregation. The activity group exists only as a
+// virtualization container — every tool call and thinking trace renders as
+// its own visual unit in the flow, with no header, counts, or collapse.
+export function ActivityGroupBase({
   events,
   groupKey,
   onInspect,
-  runState,
   ticket,
 }: {
   events: SessionEvent[];
   groupKey: number;
   onInspect?: (agentId: string) => void;
-  runState: ActivityRunState;
   ticket: string;
 }) {
-  const counts = activityCountsLabel(events);
-  const semanticSummary = activitySemanticSummary(events);
-  const state = activityStateLabel(events, runState);
-  const elapsed = activityElapsedLabel(events);
-  const stateClass = state.replace(/\s+/g, "-");
   const rows = useMemo(() => traceRows(activityTimeline(events)), [events]);
   return (
     <div className="session-activity">
-      {/* WIKI-244: the trace is always visible — the head is a noninteractive
-          status line, and no control can hide the rows below it. */}
-      <div className="session-activity-head">
-        <span className="session-activity-summary">
-          <span className="session-activity-primary">
-            <span className={`session-activity-state is-${stateClass}`}>{state}</span>
-            <span className="session-activity-semantic">{semanticSummary ?? counts}</span>
-          </span>
-          {semanticSummary ? (
-            <span className="session-activity-meta tabular-nums">
-              {counts}{elapsed ? ` · ${elapsed}` : ""}
-            </span>
-          ) : elapsed ? (
-            <span className="session-activity-meta tabular-nums">{elapsed}</span>
-          ) : null}
-        </span>
-      </div>
-      <div className="session-activity-body">
-        <TraceRowList keyBase={groupKey} onInspect={onInspect} rows={rows} ticket={ticket} />
-      </div>
+      <TraceRowList keyBase={groupKey} onInspect={onInspect} rows={rows} ticket={ticket} />
     </div>
   );
 }
@@ -2327,7 +2290,6 @@ function ActivityGroupBase({
 const ActivityGroup = memo(ActivityGroupBase, (prev, next) =>
   prev.groupKey === next.groupKey &&
   prev.onInspect === next.onInspect &&
-  prev.runState === next.runState &&
   prev.ticket === next.ticket &&
   prev.events.length === next.events.length &&
   prev.events.every((event, index) => event === next.events[index])
@@ -2454,7 +2416,6 @@ const VirtualSessionRow = memo(function VirtualSessionRow({
           events={group.events}
           groupKey={group.key}
           onInspect={onInspect}
-          runState={activityRunState}
           ticket={ticket}
         />
       ) : (

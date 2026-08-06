@@ -133,7 +133,6 @@
   .session-scroll code,
   .session-pane-log,
   .session-tool-output,
-  .session-bash-command-code,
   .shiki-block,
   .shiki-block pre,
   .shiki-block code,
@@ -7229,43 +7228,12 @@ body.is-resizing-panes .pane-cell {
   overflow-wrap: break-word;
 }
 
-/* WIKI-244: the activity head is a noninteractive status line — no collapse
-   control exists, so no hover affordance and no hit-area minimum. */
-.session-activity-head {
-  display: flex;
-  align-items: center;
-  gap: 6px;
-  width: 100%;
-  min-height: 30px;
-  min-width: 0;
-  padding: 5px 10px;
-  border-bottom: 1px solid var(--background-modifier-border);
-  color: var(--text-subtle-readable);
-  font-family: var(--font-monospace);
-  font-weight: var(--font-monospace-weight);
-  font-size: var(--font-ui-smaller);
-  text-align: left;
-}
-
+/* WIKI-247: no aggregated turn unit. The activity container is an invisible
+   flow wrapper — every tool call and thinking trace is its own visual
+   element, separated by whitespace, never by a header or a box. */
 .session-activity {
-  min-width: 0;
-  border: 1px solid var(--background-modifier-border);
-  background-color: var(--background-primary-alt);
-}
-
-.session-activity-summary {
   display: flex;
-  align-items: baseline;
-  justify-content: space-between;
-  gap: 12px;
-  min-width: 0;
-  width: 100%;
-}
-
-.session-activity-primary {
-  display: flex;
-  align-items: baseline;
-  gap: 8px;
+  flex-direction: column;
   min-width: 0;
 }
 
@@ -7292,14 +7260,6 @@ body.is-resizing-panes .pane-cell {
 
 .session-activity-state.is-waiting-for-you {
   color: var(--activity-state-waiting-color);
-}
-
-.session-activity-semantic {
-  overflow: hidden;
-  color: var(--activity-metadata-color);
-  font-size: var(--font-ui-small);
-  text-overflow: ellipsis;
-  white-space: nowrap;
 }
 
 .session-activity-meta {
@@ -7338,16 +7298,6 @@ body.is-resizing-panes .pane-cell {
   overflow: hidden;
 }
 
-/* WIKI-244: OpenCode-style trace — flat, dense, always-visible rows. A tool
-   call is one dim connector line; its input/output sits directly beneath in
-   monospace. No label gutter, no per-row borders, no click-to-read. */
-.session-activity-body {
-  display: flex;
-  flex-direction: column;
-  margin: 0;
-  padding: 4px 10px 8px;
-}
-
 .session-tool {
   min-width: 0;
   color: var(--activity-state-done-color);
@@ -7365,6 +7315,20 @@ body.is-resizing-panes .pane-cell {
   min-width: 0;
 }
 
+/* WIKI-247 vertical rhythm: consecutive tier-1 inline rows pack at zero
+   margin; blocks and thinking traces stand alone with one unit of
+   whitespace on each side (doctrine: margin 1 when a neighbor is rich). */
+.session-activity > .session-activity-row.is-block,
+.session-activity > .session-activity-row.is-reasoning,
+.session-activity > .session-activity-row.is-block + .session-activity-row,
+.session-activity > .session-activity-row.is-reasoning + .session-activity-row {
+  margin-top: 8px;
+}
+
+.session-activity > .session-activity-row:first-child {
+  margin-top: 0;
+}
+
 .session-tool-head {
   display: flex;
   align-items: center;
@@ -7379,18 +7343,9 @@ body.is-resizing-panes .pane-cell {
   text-align: left;
 }
 
-.session-trace-connector {
-  flex-shrink: 0;
-  width: 1ch;
-  color: var(--text-faint);
-  font-family: var(--font-monospace);
-  font-weight: var(--font-monospace-weight);
-  line-height: 1;
-}
-
 .session-trace-indent {
   min-width: 0;
-  padding-left: calc(1ch + 6px);
+  padding-left: calc(2ch + 6px);
 }
 
 .session-trace-indent:empty {
@@ -7504,6 +7459,33 @@ body.is-resizing-panes .pane-cell {
   padding: 2px 0 2px 8px;
   border-left: 1px solid var(--background-modifier-border);
   background-color: var(--background-primary-alt);
+  /* WIKI-247: block interiors are mono, full stop — pin the stack here so a
+     prose font on any ancestor can never leak into diff or output text. */
+  font-family: var(--font-monospace);
+  font-weight: var(--font-monospace-weight);
+  font-size: var(--font-ui-smaller);
+}
+
+/* WIKI-247: transcript diffs are quiet interiors — no box around the diff,
+   no duplicate file header (the block title already carries the path), no
+   @@ hunk chrome; line-number gutters and red/green backgrounds carry
+   position and change, matching the OpenCode reference. */
+.session-tool-diff-body .diff-view {
+  border: 0;
+  border-radius: 0;
+  background: transparent;
+}
+
+.session-tool-diff-body .diff-file:only-child > .diff-file-header {
+  display: none;
+}
+
+.session-tool-diff-body .diff-hunk-header {
+  display: none;
+}
+
+.session-tool-diff-body .diff-hunk-body ~ .diff-hunk-body {
+  margin-top: 8px;
 }
 
 .session-tool-body:has(.transcript-preview.is-error) {
@@ -7518,6 +7500,15 @@ body.is-resizing-panes .pane-cell {
   font-size: var(--font-ui-smaller);
   text-overflow: ellipsis;
   white-space: nowrap;
+}
+
+/* WIKI-247: the bash command line is content, not chrome — it reads in text
+   color while the output below recedes to the muted row color. */
+.session-tool-block-title.is-command {
+  color: var(--text-normal);
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+  text-overflow: clip;
 }
 
 .session-tool-block-preview {
@@ -7697,7 +7688,6 @@ body.is-resizing-panes .pane-cell {
 }
 
 .session-activity-row.is-reasoning {
-  margin-left: calc(1ch + 6px);
   padding-left: 10px;
   border-left: 1px solid var(--background-modifier-border);
 }
@@ -7900,68 +7890,6 @@ body.is-resizing-panes .pane-cell {
   font-weight: var(--font-monospace-weight);
   font-size: var(--font-ui-smaller);
 }
-
-.session-bash-command {
-  display: flex;
-  align-items: flex-start;
-  gap: 10px;
-  padding: 8px 10px;
-  border: 1px solid var(--background-modifier-border);
-  border-radius: var(--radius-sm);
-  background-color: var(--code-background);
-}
-
-.session-bash-prompt {
-  flex-shrink: 0;
-  color: var(--text-normal);
-  font-weight: var(--fw-semibold);
-}
-
-.session-bash-command pre,
-.session-bash-body pre {
-  min-width: 0;
-  margin: 0;
-  color: inherit;
-  font-family: inherit;
-  font-size: inherit;
-  line-height: 1.5;
-  white-space: pre-wrap;
-  overflow-wrap: break-word;
-}
-
-.session-bash-command-code {
-  flex: 1;
-  min-width: 0;
-}
-
-.session-bash-command-code pre {
-  font-family: inherit;
-  font-size: inherit;
-}
-
-.session-bash-collapsible {
-  margin-top: 4px;
-}
-
-.session-bash-body {
-  display: flex;
-  flex-direction: column;
-  gap: 4px;
-}
-
-.session-bash-stdout,
-.session-bash-stderr {
-  padding: 8px 10px;
-  border: 1px solid var(--background-modifier-border);
-  border-radius: var(--radius-sm);
-  background-color: var(--code-background);
-}
-
-.session-bash-stderr {
-  color: var(--text-faint);
-  font-style: italic;
-}
-
 
 /* ANSI (SGR) — colored terminal-style output inside bash/tool/pane-log pres.
    Palette is legibility-tuned per color-scheme (darker on light, brighter on
@@ -8187,11 +8115,13 @@ body.is-resizing-panes .pane-cell {
   display: none;
 }
 
+/* WIKI-247: the attention rail is the row's only gutter marker (the active
+   dot is gone) — it hugs the row edge and never touches the label. */
 .nav-orch-attention {
   position: absolute;
   top: 10px;
   bottom: 10px;
-  left: 1px;
+  left: 0;
   width: 2px;
   background-color: var(--accent-primary);
 }
@@ -8218,11 +8148,6 @@ body.is-resizing-panes .pane-cell {
 
 .nav-agent:hover {
   background-color: var(--background-modifier-hover);
-}
-
-.nav-agent.is-active {
-  background-color: var(--background-modifier-active-hover, var(--background-modifier-hover));
-  color: var(--text-normal);
 }
 
 .nav-agent-ticket {
@@ -8325,8 +8250,8 @@ body.is-resizing-panes .pane-cell {
 
 .nav-agent.is-owned {
   gap: 4px;
-  padding-right: 6px;
-  padding-left: 8px;
+  min-height: 32px;
+  padding: 4px 6px 4px 8px;
 }
 
 .nav-orch-group,
@@ -8336,10 +8261,12 @@ body.is-resizing-panes .pane-cell {
   gap: 1px;
 }
 
+/* WIKI-247: worker rows align to the parent orchestrator's text column
+   (the 40px toggle gutter) — no guide rail, whitespace does the nesting. */
 .nav-orch-workers {
-  margin-left: 12px;
-  padding-left: 2px;
-  border-left: 1px solid var(--background-modifier-border);
+  margin-left: 40px;
+  padding-left: 0;
+  border-left: 0;
 }
 
 .agents-orch-group {
@@ -8559,10 +8486,12 @@ body.is-resizing-panes .pane-cell {
   resize: none;
 }
 
+/* WIKI-247: no 4-sided outline on the composer, resting or focused. Focus
+   reads through the row's left accent bar reaching full strength plus the
+   background lift (:focus-within above) — the doctrine composer anatomy. */
 .session-composer textarea:focus,
 .session-composer textarea:focus-visible {
-  outline: 2px solid var(--accent-primary, var(--text-normal));
-  outline-offset: 1px;
+  outline: none;
   box-shadow: none;
 }
 
@@ -11911,6 +11840,16 @@ textarea.composer-command-input {
   white-space: pre;
 }
 
+/* WIKI-247: diff interiors resolve to the mono stack on the leaves — an
+   ancestor prose font must never win for diff text or line numbers. */
+.diff-line,
+.diff-code,
+.diff-marker,
+.diff-gutter {
+  font-family: var(--font-monospace);
+  font-weight: var(--font-monospace-weight);
+}
+
 /* WIKI-153 — bounded transcript preview shared by tool + bash blocks */
 
 .transcript-preview {
@@ -12142,7 +12081,7 @@ textarea.composer-command-input {
 .transcript-preview-body.is-custom .session-tool-output-text {
   white-space: pre-wrap;
   overflow-wrap: anywhere;
-  font-family: inherit;
+  font-family: var(--font-monospace);
 }
 
 .transcript-preview-body.is-custom.is-nowrap {
@@ -15246,7 +15185,6 @@ textarea.composer-command-input {
 }
 
 .tree-item-self.is-active::before,
-.nav-agent.is-active::before,
 .fleet-switcher-result.is-current:not(.is-selected)::before {
   position: absolute;
   left: 4px;

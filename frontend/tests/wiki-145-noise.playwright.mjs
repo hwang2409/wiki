@@ -66,17 +66,18 @@ function ruleBody(selector) {
   );
 }
 
-// Offender 9: .session-activity-head must NOT wear the pill border+fill.
+// Offender 9: the per-event activity flow must not wear the old aggregate
+// border+fill.
 {
-  const body = ruleBody(".session-activity-head");
-  assert(body, ".session-activity-head rule missing");
+  const body = ruleBody(".session-activity");
+  assert(body, ".session-activity rule missing");
   assert(
     !/border:\s*1px\s+solid\s+var\(--background-modifier-border\)/.test(body),
-    "session-activity-head still bordered — expected plain text button",
+    "session-activity still bordered — expected plain flow wrapper",
   );
   assert(
     !/background-color:\s*var\(--background-secondary\)/.test(body),
-    "session-activity-head still filled — expected transparent",
+    "session-activity still filled — expected transparent",
   );
 }
 

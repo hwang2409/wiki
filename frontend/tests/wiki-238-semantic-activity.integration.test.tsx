@@ -1,3 +1,6 @@
+// WIKI-238 run-state labels. The aggregated turn header (semantic summaries,
+// counts, elapsed) was removed in WIKI-247 — only the live-state helpers that
+// still drive CurrentTurnState remain under test.
 import { describe, expect, test } from "vitest";
 
 import type { SessionEvent, SessionTool } from "../src/api";
@@ -33,26 +36,32 @@ function toolEvent(
   };
 }
 
-function thinkingEvent(text = "considering the evidence", ts = "2026-08-02T12:00:02.000Z"): SessionEvent {
-  return {
-    id: 2,
-    kind: "thinking",
-    ts,
-    text,
-    disposition: "rendered",
-  };
-}
-
-describe("semantic model activity groups", () => {
+describe("model activity summaries and run states", () => {
   test("maps supported tools and reasoning to safe summaries", () => {
     expect(activitySemanticSummary([toolEvent("read", "read files_test.py")])).toBe("reading files_test.py");
     expect(activitySemanticSummary([toolEvent("validate", "pytest frontend/tests")])).toBe("running tests");
     expect(activitySemanticSummary([toolEvent("git", "git diff")])).toBe("checking the final diff");
-    expect(activitySemanticSummary([toolEvent("read", "read api.ts"), thinkingEvent()])).toBe("reasoning through the task");
+    expect(activitySemanticSummary([toolEvent("read", "read api.ts"), {
+      id: 2,
+      kind: "thinking",
+      ts: "2026-08-02T12:00:02.000Z",
+      text: "considering the evidence",
+      disposition: "rendered",
+    }])).toBe("reasoning through the task");
   });
 
-  test("falls back to the existing count label", () => {
-    const events = [toolEvent("tool", "opaque provider action")];
+  test("keeps count and elapsed helpers available to the activity model", () => {
+    const events = [
+      toolEvent("tool", "opaque provider action", {}, "2026-08-02T12:00:00.000Z"),
+      toolEvent("read", "read api.ts", { completed_at: "2026-08-02T12:00:03.000Z" }, "2026-08-02T12:00:01.000Z"),
+    ];
+    expect(activitySemanticSummary([toolEvent("tool", "opaque provider action")])).toBeNull();
+    expect(activityCountsLabel(events)).toBe("2 tool calls");
+    expect(activityElapsedLabel(events)).toBe("3s");
+  });
+
+  test("does not invent meaning for an unsafe unknown archetype", () => {
+    const events = [toolEvent("deploy-production-and-delete-data", "deployment completed")];
     expect(activitySemanticSummary(events)).toBeNull();
     expect(activityCountsLabel(events)).toBe("1 tool call");
   });
@@ -93,23 +102,5 @@ describe("semantic model activity groups", () => {
     expect(activityRunStateFromProvider("error", 0, false)).toBe("failed");
     expect(activityRunStateFromProvider("blocked", 0, false)).toBe("failed");
     expect(activityRunStateFromProvider("completed", 0, true)).toBe("idle");
-  });
-
-  test("does not invent meaning for an unsafe unknown archetype", () => {
-    const events = [toolEvent("deploy-production-and-delete-data", "deployment completed")];
-    expect(activitySemanticSummary(events)).toBeNull();
-    expect(activityCountsLabel(events)).toBe("1 tool call");
-  });
-
-  test("keeps elapsed time as secondary metadata", () => {
-    expect(activityElapsedLabel([
-      toolEvent(
-        "read",
-        "read api.ts",
-        { completed_at: "2026-08-02T12:00:03.000Z" },
-        "2026-08-02T12:00:00.000Z",
-      ),
-      thinkingEvent("still working", "2026-08-02T12:00:01.000Z"),
-    ])).toBe("3s");
   });
 });

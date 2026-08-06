@@ -37,12 +37,6 @@ const THEMES = [
   "catppuccin-mocha",
 ];
 const ESSENTIAL_CONTRAST_ROLES = [
-  ["state done", ".session-activity-state:not(.is-working):not(.is-failed):not(.is-interrupted):not(.is-waiting-for-you)"],
-  ["state failed", ".session-activity-state.is-failed"],
-  ["state interrupted", ".session-activity-state.is-interrupted"],
-  ["state waiting", ".session-activity-state.is-waiting-for-you"],
-  ["semantic summary", ".session-activity-semantic"],
-  ["activity metadata", ".session-activity-meta"],
   ["timeline metadata", ".session-activity-row-meta"],
   ["reasoning", ".session-thinking"],
   ["tool summary", ".session-tool-summary"],
@@ -219,46 +213,30 @@ async function main() {
       );
     }, TICKET);
     await page.goto(`${backend.baseUrl}/#/agent/${TICKET}`, { waitUntil: "domcontentloaded" });
-    await page.waitForSelector(".session-activity-head");
+    await page.waitForSelector(".session-activity > .session-activity-row");
     await page.evaluate(() => document.fonts.ready);
 
     const groups = page.locator(".session-activity");
     assert((await groups.count()) === 5, `expected 5 activity groups, got ${await groups.count()}`);
 
-    const assertPrimary = async (index, state, summary) => {
-      const primary = groups.nth(index).locator(".session-activity-primary");
-      const children = await primary.locator(":scope > span").allInnerTexts();
-      assert(children[0] === state, `group ${index} state must render first: ${children.join(" / ")}`);
-      assert(children[1] === summary, `group ${index} summary must follow state: ${children.join(" / ")}`);
-    };
-    const assertPrimaryState = async (index, state) => {
-      const actual = await groups.nth(index).locator(".session-activity-state").innerText();
-      assert(actual === state, `group ${index} state mismatch: expected ${state}, got ${actual}`);
-    };
-    await assertPrimary(0, "DONE", "running tests");
-    await assertPrimary(1, "DONE", "1 tool call");
-    await assertPrimary(2, "FAILED", "running tests");
-    await assertPrimary(3, "WAITING FOR YOU", "asking for input");
-    await assertPrimary(4, "DONE", "running tests");
-    assert((await groups.nth(1).locator(".session-activity-semantic").innerText()) === "1 tool call",
-      "unknown tool archetype must use count fallback");
-    assert((await groups.nth(0).locator(".session-activity-meta").innerText()).endsWith("7s"),
-      "elapsed metadata must include the final tool result time");
-    assert((await groups.nth(2).locator(".session-activity-meta").innerText()).endsWith("3s"),
-      "failed event-message results must retain their completion time");
+    for (let index = 0; index < await groups.count(); index += 1) {
+      const group = groups.nth(index);
+      assert(await group.locator(":scope > .session-activity-row").count() > 0,
+        `group ${index} must expose direct per-event rows`);
+      assert(await group.locator(":scope > .session-activity-head, :scope > .session-activity-body").count() === 0,
+        `group ${index} must not render aggregate chrome`);
+    }
 
     runtime = { providerState: "idle", pendingRequestCount: 0, working: false };
     await page.reload({ waitUntil: "domcontentloaded" });
-    await page.waitForSelector(".session-activity-head");
-    await assertPrimary(4, "DONE", "running tests");
+    await page.waitForSelector(".session-activity > .session-activity-row");
     assert((await page.locator(".session-turn-live-state").count()) === 0,
       "idle provider state must not render a current-turn placeholder");
 
     const assertLiveState = async (providerState, pendingRequestCount, working, expected) => {
       runtime = { providerState, pendingRequestCount, working };
       await page.reload({ waitUntil: "domcontentloaded" });
-      await page.waitForSelector(".session-activity-head");
-      await assertPrimary(4, "DONE", "running tests");
+      await page.waitForSelector(".session-activity > .session-activity-row");
       const liveState = page.locator(".session-turn-live-state .session-activity-state");
       assert((await liveState.count()) === 1, "current turn must render one separate live-state placeholder");
       assert((await liveState.innerText()) === expected,
@@ -281,8 +259,7 @@ async function main() {
     runtime = { providerState: "interrupted", pendingRequestCount: 0, working: false };
     await writeTranscript([pendingInterruptedTool]);
     await page.reload({ waitUntil: "domcontentloaded" });
-    await page.waitForSelector(".session-activity-head");
-    await assertPrimaryState(5, "INTERRUPTED");
+    await page.waitForSelector(".session-activity > .session-activity-row");
 
     const completedInterruptedTool = codexToolCall(
       "call-interrupted-completed",
@@ -297,15 +274,14 @@ async function main() {
     );
     await writeTranscript([completedInterruptedTool, completedInterruptedResult]);
     await page.reload({ waitUntil: "domcontentloaded" });
-    await page.waitForSelector(".session-activity-head");
-    await assertPrimaryState(5, "INTERRUPTED");
+    await page.waitForSelector(".session-activity > .session-activity-row");
 
     await page.locator(".session-scroll").screenshot({ path: SCREENSHOTS.collapsedNormal });
 
     // WIKI-244: the trace is always visible (no collapse state exists) and
     // the label gutter is gone — reading order comes from flat row classes.
-    await groups.nth(0).locator(".session-activity-body .session-activity-row").first().waitFor();
-    const firstKinds = await groups.nth(0).locator(".session-activity-body > .session-activity-row").evaluateAll(
+    await groups.nth(0).locator(":scope > .session-activity-row").first().waitFor();
+    const firstKinds = await groups.nth(0).locator(":scope > .session-activity-row").evaluateAll(
       (rows) => rows.map((row) => (
         row.classList.contains("is-reasoning")
           ? "REASONING"
@@ -376,7 +352,7 @@ async function main() {
       const style = getComputedStyle(element);
       return { family: style.fontFamily, size: Number.parseFloat(style.fontSize) };
     });
-    const metadataStyle = await groups.nth(0).locator(".session-activity-meta").evaluate((element) => {
+    const metadataStyle = await groups.nth(0).locator(".session-tool-status").first().evaluate((element) => {
       const style = getComputedStyle(element);
       return { family: style.fontFamily, size: Number.parseFloat(style.fontSize) };
     });

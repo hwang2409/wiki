@@ -49,8 +49,8 @@ function withoutLead(summary: string, pattern: RegExp, fallback: string): string
   return cleanSummary(summary).replace(pattern, "").trim() || fallback;
 }
 
-// This allowlist is the semantic boundary for collapsed model activity.
-// Unknown archetypes stay raw in the expanded transcript and use count fallback.
+// Keep the semantic summary helpers for callers and tests that inspect the
+// activity model. WIKI-247 removes their aggregated header from the renderer.
 const ACTIVITY_TOOL_SUMMARIES: Readonly<Record<string, ToolSummaryMapper>> = Object.freeze({
   read: (summary) => `reading ${withoutLead(summary, /^(?:read|view image)\s+/i, "files")}`,
   search: (summary) => `searching ${withoutLead(summary, /^(?:rg|grep|ugrep|find|fd|ag|glob|grep|web search:)\s*/i, "the codebase")}`,

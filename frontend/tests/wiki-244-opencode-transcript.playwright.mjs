@@ -155,8 +155,8 @@ async function main() {
       ".session-activity-head button, button.session-activity-head",
     ).count();
     assert(hidingControls === 0, `expected no disclosure controls in the trace, found ${hidingControls}`);
-    const bodies = await page.locator(".session-activity .session-activity-body").count();
-    assert(bodies > 0, "activity body must render unconditionally");
+    const rows = await page.locator(".session-activity > .session-activity-row").count();
+    assert(rows > 0, "activity rows must render unconditionally");
 
     logStep("B2: thinking starts as a quiet one-line thought and expands on focus");
     const thinkingHead = page.locator(".session-thinking-head").first();
