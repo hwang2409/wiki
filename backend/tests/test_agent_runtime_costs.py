@@ -281,24 +281,46 @@ class CostAggregatorTests(unittest.TestCase):
         with (
             mock.patch.object(costs.os, "scandir", wraps=costs.os.scandir) as scandir,
             mock.patch.object(costs, "_scan_run", wraps=costs._scan_run) as scan_run,
+            mock.patch.object(costs, "_save_state", wraps=costs._save_state) as save_state,
+            mock.patch.object(costs, "_save_heartbeat", wraps=costs._save_heartbeat) as save_heartbeat,
         ):
             refreshed = costs.refresh(costs._load_state())
 
         self.assertEqual(scan_run.call_count, 0)
         self.assertEqual(scandir.call_count, 0)
+        self.assertEqual(save_state.call_count, 0)
+        self.assertEqual(save_heartbeat.call_count, 1)
         self.assertEqual(refreshed["runs"]["run-cache"]["offset"], raw.stat().st_size)
 
-    def test_run_created_before_raw_file_is_picked_up_after_cached_refresh(self) -> None:
+    def test_atomic_run_publication_appears_on_the_next_refresh(self) -> None:
         costs.refresh()
 
-        raw = self._run("run-pending")
-        costs.refresh(costs._load_state())
-
+        staging = self.runs / ".run-pending"
+        staging.mkdir()
+        (staging / "run.json").write_text(
+            json.dumps(
+                {
+                    "run_id": "run-pending",
+                    "agent_id": "WIKI-178",
+                    "provider": "codex",
+                    "model": "gpt-5.4",
+                    "created_at": "2026-07-30T12:00:00Z",
+                }
+            ),
+            encoding="utf-8",
+        )
+        raw = staging / "raw.jsonl"
         raw.write_text(json.dumps(_envelope("2026-07-30T10:00:00Z", _usage(10, 2))) + "\n", encoding="utf-8")
+        costs.refresh(costs._load_state())
+        self.assertNotIn("run-pending", costs._load_state()["runs"])
+
+        os.replace(staging, self.runs / "run-pending")
+        raw = self.runs / "run-pending" / "raw.jsonl"
         refreshed = costs.refresh(costs._load_state())
 
         self.assertEqual(refreshed["runs"]["run-pending"]["offset"], raw.stat().st_size)
         self.assertEqual(sum(record["input"] for record in refreshed["records"].values()), 10)
+        self.assertNotIn("pending_runs", refreshed)
 
     def test_state_is_atomic_and_does_not_touch_live_paths(self) -> None:
         raw = self._run("run-atomic")

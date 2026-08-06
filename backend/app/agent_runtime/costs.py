@@ -44,7 +44,7 @@ MODEL_ID_ALIASES = {
     "haiku-4.5": "claude-haiku-4-5",
 }
 
-STATE_VERSION = 3
+STATE_VERSION = 4
 CHUNK_BYTES = 64 * 1024
 MAX_EVENT_LINE_BYTES = 4 * 1024 * 1024
 MAX_MESSAGE_DEDUPE_IDS = 4096
@@ -66,12 +66,16 @@ def cost_state_path() -> Path:
     return Path(os.environ.get("WIKI_COST_STATE_PATH") or runtime / "cost-aggregation.json").expanduser()
 
 
+def cost_heartbeat_path() -> Path:
+    return Path(f"{cost_state_path()}.heartbeat")
+
+
 def _empty_state() -> dict[str, Any]:
     return {
         "version": STATE_VERSION,
         "updated_at": None,
         "runs_dir_signature": None,
-        "pending_runs": [],
+        "active_runs": [],
         "runs": {},
         "records": {},
     }
@@ -88,24 +92,30 @@ def _load_state() -> dict[str, Any]:
     if not isinstance(records, dict):
         return _empty_state()
     value.setdefault("updated_at", None)
-    pending_runs = value.get("pending_runs")
-    value["pending_runs"] = (
-        [run_id for run_id in pending_runs if isinstance(run_id, str)]
-        if isinstance(pending_runs, list)
+    active_runs = value.get("active_runs")
+    value["active_runs"] = (
+        [run_id for run_id in active_runs if isinstance(run_id, str)]
+        if isinstance(active_runs, list)
         else []
     )
+    value.pop("pending_runs", None)
+    try:
+        heartbeat = json.loads(cost_heartbeat_path().read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        heartbeat = None
+    if isinstance(heartbeat, dict) and isinstance(heartbeat.get("updated_at"), str):
+        value["updated_at"] = heartbeat["updated_at"]
     return value
 
 
-def _save_state(state: dict[str, Any]) -> None:
-    path = cost_state_path()
+def _save_json(path: Path, value: dict[str, Any]) -> None:
     try:
         path.parent.mkdir(parents=True, exist_ok=True)
         fd, raw_tmp = tempfile.mkstemp(prefix=f".{path.name}.", dir=path.parent)
         tmp = Path(raw_tmp)
         try:
             with os.fdopen(fd, "w", encoding="utf-8") as handle:
-                json.dump(state, handle, separators=(",", ":"), sort_keys=True)
+                json.dump(value, handle, separators=(",", ":"), sort_keys=True)
                 handle.flush()
                 os.fsync(handle.fileno())
             os.replace(tmp, path)
@@ -121,6 +131,14 @@ def _save_state(state: dict[str, Any]) -> None:
             tmp.unlink(missing_ok=True)
     except OSError:
         return
+
+
+def _save_state(state: dict[str, Any]) -> None:
+    _save_json(cost_state_path(), state)
+
+
+def _save_heartbeat(state: dict[str, Any]) -> None:
+    _save_json(cost_heartbeat_path(), {"updated_at": state.get("updated_at")})
 
 
 def _now_iso() -> str:
@@ -372,6 +390,20 @@ def _discard_run(state: dict[str, Any], run_id: str) -> None:
     old_run = state["runs"].pop(run_id, None)
     if isinstance(old_run, dict):
         _remove_run_contributions(state, old_run)
+    active_runs = state.get("active_runs")
+    if isinstance(active_runs, list):
+        state["active_runs"] = [item for item in active_runs if item != run_id]
+
+
+def _set_run_active(state: dict[str, Any], run_id: str, active: bool) -> None:
+    active_runs = state.setdefault("active_runs", [])
+    if not isinstance(active_runs, list):
+        active_runs = []
+        state["active_runs"] = active_runs
+    if active and run_id not in active_runs:
+        active_runs.append(run_id)
+    elif not active and run_id in active_runs:
+        active_runs.remove(run_id)
 
 
 def _stat_signature(value: os.stat_result) -> list[int]:
@@ -528,6 +560,7 @@ def _scan_run(state: dict[str, Any], run_id: str, root_fd: int) -> bool:
             },
         }
     )
+    _set_run_active(state, run_id, bool(run_state["active"]))
     os.close(raw_fd)
     return True
 
@@ -537,16 +570,13 @@ def refresh(state: dict[str, Any] | None = None) -> dict[str, Any]:
         state = _load_state()
     root_fd = _open_root()
     seen_runs: set[str] = set()
-    pending_runs = {
-        run_id for run_id in state.get("pending_runs", []) if isinstance(run_id, str)
-    }
     runs_dir_signature: list[int] | None = None
+    state_changed = False
     if root_fd is not None:
         try:
             runs_dir_signature = _stat_signature(os.fstat(root_fd))
             root_changed = state.get("runs_dir_signature") != runs_dir_signature
             if root_changed:
-                pending_runs = set()
                 # os.scandir(fd) dups the fd internally and closes only its own
                 # dup — an explicit os.dup() here is owned by nobody and leaks
                 # one runs-dir fd per refresh (wedged the backend at the GUI
@@ -555,40 +585,47 @@ def refresh(state: dict[str, Any] | None = None) -> dict[str, Any]:
                     run_ids = [
                         entry.name
                         for entry in entries
-                        if not entry.is_symlink() and entry.is_dir(follow_symlinks=False)
+                        if (
+                            not entry.name.startswith(".")
+                            and not entry.is_symlink()
+                            and entry.is_dir(follow_symlinks=False)
+                        )
                     ]
                 for run_id in run_ids:
                     seen_runs.add(run_id)
-                    # Store publishes the run directory before raw.jsonl.
-                    # Retry this run if that publication gap is observed.
-                    if not _scan_run(state, run_id, root_fd):
-                        pending_runs.add(run_id)
+                    _scan_run(state, run_id, root_fd)
+                state_changed = True
             else:
                 # A run directory's mtime does not change when raw.jsonl grows.
                 # Check only active runs for cheap signatures, then parse new
                 # bytes only when a signature changed. Completed history stays
                 # out of the five-second refresh path.
-                seen_runs.update(state["runs"])
-                # A child file can appear without changing the runs-root mtime.
-                for run_id in list(pending_runs):
-                    seen_runs.add(run_id)
-                    if _scan_run(state, run_id, root_fd):
-                        pending_runs.discard(run_id)
-                for run_id, run_state in list(state["runs"].items()):
+                for run_id in list(state.get("active_runs", [])):
+                    run_state = state["runs"].get(run_id)
                     if not isinstance(run_state, dict) or not run_state.get("active", True):
                         continue
                     if _run_signature(root_fd, run_id) != run_state.get("scan_signature"):
                         _scan_run(state, run_id, root_fd)
+                        state_changed = True
         finally:
             os.close(root_fd)
-    for run_id in list(state["runs"]):
-        if run_id not in seen_runs:
-            _remove_run_contributions(state, state["runs"][run_id])
-            state["runs"].pop(run_id, None)
+    else:
+        root_changed = True
+        state_changed = True
+    if root_changed:
+        for run_id in list(state["runs"]):
+            if run_id not in seen_runs:
+                _discard_run(state, run_id)
+        state["active_runs"] = [
+            run_id
+            for run_id, run_state in state["runs"].items()
+            if isinstance(run_state, dict) and run_state.get("active", True)
+        ]
     state["runs_dir_signature"] = runs_dir_signature
-    state["pending_runs"] = sorted(pending_runs)
     state["updated_at"] = _now_iso()
-    _save_state(state)
+    if state_changed:
+        _save_state(state)
+    _save_heartbeat(state)
     return state
 
 
