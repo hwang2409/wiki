@@ -427,6 +427,12 @@ class Supervisor:
         # previous transport is gone. Sweep once per boot so the on-idle
         # queue drain does not wedge on a stale head (WIKI-232).
         self._sending_effects_reconciled = False
+        # Orphan raw rows only appear when a PRIOR daemon stopped between a
+        # raw append and its deferred normalize flush. Sweep once per boot:
+        # recover_on_start re-runs every second via the daemon recovery loop,
+        # and the sweep streams every run's full raw + normalized JSONL on
+        # the event loop (multi-GB stores block it for minutes per tick).
+        self._orphan_raw_events_normalized = False
         self.pipeline_failures: dict[str, str] = {}
         self.expected_stream_ends: set[int] = set()
         self.subscribers: set[asyncio.Queue[dict[str, Any]]] = set()
@@ -2565,8 +2571,13 @@ Preserve the same identity, role, worktree, orchestrator grouping, PR gates, and
         before the sending-effect sweep replays each orphan raw through
         the normalize + pending-match path so the composer echo is
         recovered from the durable raw row.
+
+        Orphans only originate from a prior daemon's stop, so like
+        ``_reconcile_sending_steer_effects`` this sweeps once per boot.
         """
 
+        if self._orphan_raw_events_normalized:
+            return
         for record in self.store.list_runs():
             run_id = record.run_id
             # WIKI-243: stream both logs to detect orphans instead of
@@ -2637,6 +2648,7 @@ Preserve the same identity, role, worktree, orchestrator grouping, PR gates, and
                     # so record state reflects true provider order
                     # (WIKI-232 REVIEW11 H1).
                     self.store.rebuild_projections_from_normalized(run_id)
+        self._orphan_raw_events_normalized = True
 
     async def _recover_orphan_raw_event(
         self,
