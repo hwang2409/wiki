@@ -170,18 +170,23 @@ test("tool rows carry state as color classes plus sr-only text, not words", () =
 
 // --- click-to-expand placement (OpenCode index.tsx:2083-2085) ---
 
-test("clipped bash blocks end in a muted Click to expand control", () => {
+test("long bash blocks default-collapse to a peek row that expands on click", () => {
+  // WIKI-253: past the 12-line collapse threshold, the block hides behind a
+  // one-line peek row (chevron + preview + size); one click reveals the body
+  // and a matching collapse affordance appears.
   const lines = Array.from({ length: 14 }, (_, i) => `line ${i + 1}`).join("\n");
   const bashTool = tool({ archetype: "bash", name: "Bash", input: "seq 14", summary: "bash seq 14", output: lines });
-  const { container, getByRole } = render(
+  const { container } = render(
     <ToolCallRow event={event(2, { tool: bashTool })} ticket="WIKI-249" withResult />,
   );
-  const hint = getByRole("button", { name: "Click to expand" });
-  expect(hint.classList.contains("transcript-preview-more")).toBe(true);
-  const body = container.querySelector(".transcript-preview-body");
-  expect(body?.lastElementChild).toBe(hint);
-  fireEvent.click(hint);
-  expect(getByRole("button", { name: "Click to collapse" })).toBeTruthy();
+  const peek = container.querySelector<HTMLButtonElement>(".session-tool-output-peek");
+  expect(peek).toBeTruthy();
+  expect(peek?.getAttribute("aria-expanded")).toBe("false");
+  expect(container.querySelector(".transcript-preview")).toBeNull();
+  fireEvent.click(peek!);
+  expect(container.querySelector(".session-tool-output-peek")).toBeNull();
+  expect(container.querySelector(".session-tool-output-collapse")).toBeTruthy();
+  expect(container.querySelector(".transcript-preview")).toBeTruthy();
 });
 
 // --- structured output: pretty in block views, compact inline ---

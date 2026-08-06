@@ -208,7 +208,14 @@ async function main() {
     const previewScope = page.locator(
       `.session-activity-row[data-tool-event-id='${previewToolEventId}']`
     );
-    await previewScope.locator(".transcript-preview-more").first().click();
+    // WIKI-253: mid-block "Click to expand" was replaced by the whole-block
+    // peek row. If a peek is shown (tall enough to trigger the collapse
+    // gate), one click expands the body; otherwise the body is already
+    // visible and no expand step is needed.
+    const previewPeek = previewScope.locator(".session-tool-output-peek");
+    if (await previewPeek.count() > 0) {
+      await previewPeek.first().click();
+    }
     const toolAnchor = previewScope
       .locator(".session-tool-output-blocks a.external-link", {
         hasText: "https://github.com/hwang2409/wiki/issues/64",

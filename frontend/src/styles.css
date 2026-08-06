@@ -7588,6 +7588,96 @@ body.is-resizing-panes .pane-cell {
   margin-top: 2px;
 }
 
+/* WIKI-253: default-collapsed tool-output block. One packed line — chevron,
+   structural preview (path / {keys} / [N items] / first line), size tail,
+   hover-emphasized "show output" affordance on the right. The row itself is
+   the button so Enter/Space/click all expand. */
+.session-tool-output-peek {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  width: 100%;
+  min-width: 0;
+  margin-top: 2px;
+  padding: 3px 0;
+  border: 0;
+  background: transparent;
+  color: var(--text-muted);
+  font-family: var(--font-monospace);
+  font-weight: var(--font-monospace-weight);
+  font-size: var(--font-ui-smaller);
+  text-align: left;
+  cursor: pointer;
+  transition: color 120ms ease;
+}
+
+.session-tool-output-peek:hover,
+.session-tool-output-peek:focus-visible {
+  color: var(--text-normal);
+  outline: none;
+}
+
+.session-tool-output-peek-chevron {
+  flex: 0 0 auto;
+  color: var(--text-faint);
+  transition: transform 120ms ease, color 120ms ease;
+}
+
+.session-tool-output-peek:hover .session-tool-output-peek-chevron,
+.session-tool-output-peek:focus-visible .session-tool-output-peek-chevron {
+  color: var(--text-muted);
+}
+
+.session-tool-output-peek-preview {
+  flex: 1 1 auto;
+  min-width: 0;
+  overflow: hidden;
+  color: inherit;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.session-tool-output-peek-meta {
+  flex: 0 0 auto;
+  color: var(--text-faint);
+  font-size: var(--fs-xs);
+  font-variant-numeric: tabular-nums;
+}
+
+.session-tool-output-peek-hint {
+  flex: 0 0 auto;
+  color: var(--text-faint);
+  font-size: var(--fs-xs);
+  opacity: 0;
+  transition: opacity 120ms ease;
+}
+
+.session-tool-output-peek:hover .session-tool-output-peek-hint,
+.session-tool-output-peek:focus-visible .session-tool-output-peek-hint {
+  opacity: 1;
+}
+
+.session-tool-output-collapse {
+  width: fit-content;
+  margin-top: 2px;
+  padding: 0;
+  border: 0;
+  background: transparent;
+  color: var(--text-faint);
+  font: inherit;
+  font-family: var(--font-monospace);
+  font-size: var(--fs-xs);
+  font-style: italic;
+  cursor: pointer;
+}
+
+.session-tool-output-collapse:hover,
+.session-tool-output-collapse:focus-visible {
+  color: var(--text-muted);
+  outline: none;
+  text-decoration: underline;
+}
+
 .session-tool-raw {
   box-sizing: border-box;
   width: 100%;

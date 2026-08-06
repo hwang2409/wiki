@@ -57,3 +57,32 @@ if (typeof (globalThis as { ResizeObserver?: unknown }).ResizeObserver === "unde
   (globalThis as { ResizeObserver: typeof NoopResizeObserver }).ResizeObserver =
     NoopResizeObserver;
 }
+
+// WIKI-253: jsdom returns offsetHeight = 0 for every node, which would prevent
+// the height-driven collapse gate from ever firing under vitest. Element-level
+// tests override via `data-mock-height` on a specific node; otherwise the
+// block-preview wrapper approximates its rendered height from the text volume
+// it contains (`~20px per line, char-density fallback for wrap-heavy blocks`).
+// A 3-line output measures ~60px (stays inline), a 24-line output measures
+// past the collapse threshold, mirroring real-browser behavior closely enough
+// to exercise the gate deterministically.
+if (typeof HTMLElement !== "undefined") {
+  const existing = Object.getOwnPropertyDescriptor(HTMLElement.prototype, "offsetHeight");
+  if (!existing || existing.configurable !== false) {
+    Object.defineProperty(HTMLElement.prototype, "offsetHeight", {
+      configurable: true,
+      get() {
+        const raw = (this as HTMLElement).dataset?.mockHeight;
+        if (raw !== undefined) return Number(raw);
+        const el = this as HTMLElement;
+        if (el.classList?.contains("session-tool-block-preview-measure")) {
+          const text = el.textContent ?? "";
+          const lines = text.split("\n").length;
+          const chars = text.length;
+          return Math.max(lines * 20, Math.floor(chars / 3));
+        }
+        return 0;
+      },
+    });
+  }
+}

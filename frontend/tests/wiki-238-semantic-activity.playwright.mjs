@@ -39,8 +39,10 @@ const THEMES = [
 const ESSENTIAL_CONTRAST_ROLES = [
   // WIKI-249: status words and the metadata chip left the row (state = color,
   // OpenCode index.tsx:1867-1874); the glyph column and inline result carry
-  // the same scan roles now.
-  ["inline result metadata", ".session-tool-inline-result"],
+  // the same scan roles now. WIKI-253: failed rows are exempt from the 4.5:1
+  // ceiling — error color is deliberately the accent-danger red so failures
+  // scan as failures; the tool row's `.is-failed` marker carries that role.
+  ["inline result metadata", ".session-tool:not(.is-failed) .session-tool-inline-result"],
   ["reasoning", ".session-thinking"],
   ["tool summary", ".session-tool:not(.is-failed) .session-tool-summary"],
   ["tool glyph", ".session-tool:not(.is-failed) .session-tool-icon-text"],

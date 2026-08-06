@@ -185,13 +185,14 @@ test("tier is chosen by tool kind, not multiline output shape", () => {
     output: "one\ntwo\nthree\nfour",
   });
   expect(write.container.querySelector(".session-tool")?.classList.contains("is-block")).toBe(true);
-  // WIKI-249: clipped blocks end in OpenCode's muted "Click to expand" line
-  // (session/index.tsx:2083-2085), not a line-count hint.
-  const expand = write.getByRole("button", { name: /Click to expand/ });
-  expect(expand).toBeTruthy();
-  expect(expand.getAttribute("aria-expanded")).toBe("false");
+  // WIKI-253: short blocks flow full-height (no mid-block "Click to expand"
+  // clip); the whole-block peek row only appears past the pixel threshold.
+  // A 4-line output measures well under the threshold, so all four lines are
+  // visible without any expand affordance.
+  expect(write.queryByRole("button", { name: /Click to expand/ })).toBeNull();
+  expect(write.container.querySelector(".session-tool-output-peek")).toBeNull();
   expect(write.container.querySelector(".session-tool-output-text")?.textContent).toContain("three");
-  expect(write.container.querySelector(".session-tool-output-text")?.textContent).not.toContain("four");
+  expect(write.container.querySelector(".session-tool-output-text")?.textContent).toContain("four");
 });
 
 test("apply_patch input renders its patch body as a diff", () => {
@@ -305,10 +306,10 @@ test("failed edits show semantic errors before the intended diff", () => {
     output: "<tool_use_error>old text was not found</tool_use_error>",
     ok: false,
   });
-  // failure details sit behind the error toggle; the row itself carries the
-  // failed state color.
-  expect(container.querySelector(".session-tool-body")).toBeNull();
-  fireEvent.click(container.querySelector(".session-tool-error-toggle")!);
+  // WIKI-253: failure details render expanded from the start — hiding a
+  // broken run behind a toggle was the exact scannability regression the
+  // ticket flipped.
+  expect(container.querySelector(".session-tool-body")).toBeTruthy();
   expect(container.querySelector(".session-output-segment.is-error")?.textContent)
     .toContain("old text was not found");
   expect(container.querySelector(".diff-view")).toBeNull();
@@ -321,7 +322,6 @@ test("failed edits keep plain failure output primary", () => {
     output: "old text was not found",
     ok: false,
   });
-  fireEvent.click(container.querySelector(".session-tool-error-toggle")!);
   expect(container.querySelector(".session-tool-failure-output")?.textContent)
     .toContain("old text was not found");
   expect(container.querySelector(".diff-view")).toBeNull();
@@ -350,7 +350,7 @@ test("plain failed output renders as error segments", () => {
     output: "old text was not found",
     ok: false,
   });
-  fireEvent.click(container.querySelector(".session-tool-error-toggle")!);
+  // WIKI-253: no toggle click — failures render expanded from the start.
   expect(container.querySelector(".session-output-segment.is-error, .harness-output .is-error")?.textContent)
     .toContain("old text was not found");
 });
@@ -369,7 +369,11 @@ test("generic inline tools render the capped inline output", () => {
   expect(inline?.textContent ?? "").toMatch(/\.\.\.$/);
 });
 
-test("failed block output stays hidden until the error toggle expands it", () => {
+test("failed block output stays visible by default; the toggle can hide it", () => {
+  // WIKI-253 flipped this: failures render expanded from the start so a
+  // broken run cannot hide behind a chip while the reader scans downstream
+  // rows. The hide-error control still exists for readers who want to
+  // collapse a known failure.
   const { container, getByRole } = renderTool({
     name: "Bash",
     archetype: "bash",
@@ -377,11 +381,11 @@ test("failed block output stays hidden until the error toggle expands it", () =>
     output: "boom",
     ok: false,
   });
-  expect(container.querySelector(".session-tool-body")).toBeNull();
-  fireEvent.click(getByRole("button", { name: "show error" }));
   expect(container.querySelector(".session-tool-body")).toBeTruthy();
   fireEvent.click(getByRole("button", { name: "hide error" }));
   expect(container.querySelector(".session-tool-body")).toBeNull();
+  fireEvent.click(getByRole("button", { name: "show error" }));
+  expect(container.querySelector(".session-tool-body")).toBeTruthy();
 });
 
 test("apply_patch with a garbage preamble falls back instead of diffing", () => {

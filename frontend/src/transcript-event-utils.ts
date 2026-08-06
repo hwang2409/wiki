@@ -419,6 +419,126 @@ export function detectFenceLang(code: string): string | null {
   return null;
 }
 
+// WIKI-253: default-collapse threshold for tool-output blocks. Anything
+// taller than this many pixels (measured after render) collapses behind a
+// one-line peek row until the reader clicks to expand. Height replaces the
+// prior line-count/char-count heuristic — a 12-line block of 200-char lines
+// is much taller than 12 lines of 20 chars, and a pixel budget captures the
+// intent ("keep the turn scannable") in one tuneable dial.
+export const COLLAPSE_HEIGHT_PX = 240;
+// Cheap pre-filter: "is this output long enough that we should promote it
+// from the inline pill into a block-shaped renderer so the height gate can
+// see it?" Line count is fine here because the pre-filter only decides which
+// component tree to render — the collapse decision itself is pixel-measured.
+const TOOL_OUTPUT_PROMOTION_LINES = 12;
+// Retained for existing tests that generate synthetic long outputs against
+// the promotion threshold — kept in sync with the render-time pre-filter.
+export const TOOL_OUTPUT_COLLAPSE_LINES = TOOL_OUTPUT_PROMOTION_LINES;
+
+// Would an inline tool render tall enough that it should be promoted to a
+// block-shaped renderer for the collapse gate to apply? Called from the
+// render layer alongside toolPresentation; a `true` result routes read_agent
+// / list_agents / arbitrary MCP output through the same peek-and-expand
+// affordance as bash and agent tool outputs.
+export function wouldRenderTall(displayOutput: string, _tool: SessionTool): boolean {
+  if (!displayOutput) return false;
+  const lineCount = displayOutput.split("\n").length;
+  return lineCount > TOOL_OUTPUT_PROMOTION_LINES;
+}
+
+function formatBytesShort(bytes: number): string {
+  if (bytes < 1024) return `${bytes} B`;
+  if (bytes < 1024 * 1024) return `${(bytes / 1024).toFixed(bytes < 10240 ? 1 : 0)} KB`;
+  return `${(bytes / (1024 * 1024)).toFixed(1)} MB`;
+}
+
+function countBytes(text: string): number {
+  if (typeof TextEncoder !== "undefined") return new TextEncoder().encode(text).length;
+  let bytes = 0;
+  for (let i = 0; i < text.length; i += 1) {
+    const code = text.charCodeAt(i);
+    if (code < 0x80) bytes += 1;
+    else if (code < 0x800) bytes += 2;
+    else if (code >= 0xd800 && code <= 0xdbff) { bytes += 4; i += 1; }
+    else bytes += 3;
+  }
+  return bytes;
+}
+
+function firstNonEmptyLine(text: string, budget = 72): string {
+  for (const line of text.split("\n")) {
+    const trimmed = line.trim();
+    if (!trimmed) continue;
+    return trimmed.length > budget ? `${trimmed.slice(0, budget - 1)}…` : trimmed;
+  }
+  return "";
+}
+
+function jsonPeek(text: string): string | null {
+  const trimmed = text.trim();
+  if (!trimmed) return null;
+  const first = trimmed[0];
+  if (first !== "{" && first !== "[") return null;
+  try {
+    const parsed: unknown = JSON.parse(trimmed);
+    if (Array.isArray(parsed)) {
+      return `[${parsed.length} item${parsed.length === 1 ? "" : "s"}]`;
+    }
+    if (parsed !== null && typeof parsed === "object") {
+      const keys = Object.keys(parsed as Record<string, unknown>);
+      if (keys.length === 0) return "{}";
+      const shown = keys.slice(0, 4).join(", ");
+      const suffix = keys.length > 4 ? `, +${keys.length - 4}` : "";
+      return `{${shown}${suffix}}`;
+    }
+    return null;
+  } catch {
+    return null;
+  }
+}
+
+export type ToolOutputPeek = {
+  // A short structural label — read as `<preview> · <count> lines · <size>`.
+  preview: string;
+  size: string;
+  lines: number;
+};
+
+// Preserve the basename when a path is longer than the peek row can fit.
+// End-truncation would eat the identifying tail (README.md), which is the
+// most useful piece; middle-truncation keeps head and basename with `…` in
+// between. Budget is generous — narrower containers still get a CSS ellipsis
+// fallback, but the common wide row shows the whole `first N…last M` form.
+export function middleTruncatePath(path: string, budget = 60): string {
+  if (path.length <= budget) return path;
+  // Anchor the tail on the basename plus any parent directory that fits, so
+  // "/a/b/very/nested/README.md" reads as "/a/b/very…nested/README.md" rather
+  // than losing the parent context along with the head.
+  const slash = path.lastIndexOf("/");
+  const basename = slash >= 0 ? path.slice(slash) : path;
+  const tail = basename.length + 1 >= budget
+    ? basename.slice(-(budget - 2))
+    : basename;
+  const headBudget = Math.max(1, budget - tail.length - 1);
+  return `${path.slice(0, headBudget)}…${tail}`;
+}
+
+// Peek row content for a collapsed tool-output block (WIKI-253). Bash reads
+// surface the target path; JSON payloads surface top-level keys / item counts;
+// everything else falls back to the first non-empty line. The count/size tail
+// is always present so the reader can tell how much they're hiding.
+export function toolOutputPeek(tool: SessionTool, text: string): ToolOutputPeek {
+  const cleaned = text.replace(/\s+$/, "");
+  const lines = cleaned.length === 0 ? 0 : cleaned.split("\n").length;
+  const size = formatBytesShort(countBytes(cleaned));
+  const bashTarget = isBashTool(tool) ? bashReadTargetPath(tool.input) : null;
+  if (bashTarget) return { preview: middleTruncatePath(bashTarget), size, lines };
+  const json = jsonPeek(cleaned);
+  if (json) return { preview: json, size, lines };
+  const preview = firstNonEmptyLine(cleaned);
+  return { preview: preview || "(empty)", size, lines };
+}
+
 // Conservative path extraction for filetype hints: structured fields only
 // (edit payload, JSON input fields), then the summary target when it reads
 // as a real path token.
