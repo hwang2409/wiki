@@ -22,7 +22,7 @@ function assert(condition, message) {
 const mathMarkdown = [
   "# Math fixture",
   "",
-  "Inline math: $E = mc^2$",
+  "Inline math: \\(E = mc^2\\)",
   "",
   "$$",
   "\\int_0^1 x^2 dx",
