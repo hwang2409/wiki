@@ -3,7 +3,7 @@ type: reference
 view: kanban
 tags: [todo]
 created: 2026-07-06
-updated: 2026-08-06
+updated: 2026-08-07
 ---
 
 Todo:
@@ -89,6 +89,7 @@ In Progress:
 - PHO-14037 on-call transfer — investigate-then-fix worker spawned
 - PHO-15253 bash rewrite PRs A/B/C — night shift worker
 - PHO-15254 retrieve adoption tranche 1 — night shift worker
+- [P1] wiki-app: WIKI-263 codex exec output preamble (Script completed/Wall time/Output:) blocks numbered-payload highlighting; strip to metadata (owner: wiki-dev fleet)
 Backlog:
 
 - [PHO-14974](https://linear.app/phoebework/issue/PHO-14974): implement the planned v3 describe catalog after retrieve and write registry interfaces land
