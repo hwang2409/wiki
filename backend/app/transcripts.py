@@ -572,7 +572,7 @@ def _skip_js_space(source: str, index: int) -> int:
             index = len(source) if newline == -1 else newline + 1
         elif source.startswith("/*", index):
             end = source.find("*/", index + 2)
-            return len(source) if end == -1 else _skip_js_space(source, end + 2)
+            index = len(source) if end == -1 else end + 2
         else:
             break
     return index
@@ -717,7 +717,14 @@ class _CodexJsArgumentParser:
         identifier = _JS_IDENTIFIER.match(self.source, self.index)
         if identifier:
             self.index = identifier.end()
-            return {"true": True, "false": False, "null": None}.get(identifier.group(0))
+            token = identifier.group(0)
+            if token == "true":
+                return True
+            if token == "false":
+                return False
+            if token == "null":
+                return None
+            return None
         return None
 
     def _object(self) -> dict | None:
@@ -788,7 +795,24 @@ class _CodexJsArgumentParser:
         return None
 
     def _is_null_literal(self) -> bool:
-        return self.source[self.index - 4:self.index] == "null"
+        start = self.index - 4
+        return (
+            self.source[start:self.index] == "null"
+            and (
+                start <= 0
+                or not (
+                    self.source[start - 1].isalnum()
+                    or self.source[start - 1] in "_$"
+                )
+            )
+            and (
+                self.index >= len(self.source)
+                or not (
+                    self.source[self.index].isalnum()
+                    or self.source[self.index] in "_$"
+                )
+            )
+        )
 
     def parse(self) -> object | None:
         value = self._value()

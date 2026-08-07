@@ -721,8 +721,9 @@ class CodexNewRuntimeTranscriptTests(unittest.TestCase):
         self.assertEqual(patch_tool["output"], "patched\n")
         self.assertTrue(patch_tool["ok"])
 
-        self.assertEqual(tools[2]["name"], "exec_command")
-        self.assertEqual(tools[2]["archetype"], "run")
+        self.assertEqual(tools[2]["name"], "mcp__someserver__some_tool")
+        self.assertEqual(tools[2]["archetype"], "tool")
+        self.assertEqual(tools[2]["summary"], 'some_tool {"value": "fixture"}')
         self.assertEqual(tools[2]["output"], "mcp harness output\n")
 
         self.assertEqual(tools[3]["name"], "update_plan")
@@ -756,12 +757,16 @@ class CodexNewRuntimeTranscriptTests(unittest.TestCase):
             'const text = "tools.exec_command({cmd: \\"hidden\\"})";',
             "// tools.exec_command({cmd: 'hidden'})",
             'const args = {cmd: "echo hi"}; tools.exec_command(args);',
+            'tools.exec_command({cmd: foo_null});',
             'tools.exec_command({cmd: `echo hi`});',
             'tools.exec_command({cmd: "echo hi"',
         ]
         for source in cases:
             with self.subTest(source=source):
                 self.assertIsNone(transcripts._codex_harness_tool("exec", source))
+
+        comments = "tools.exec_command" + ("/* comment */" * 2000) + '({cmd: "echo hi"});'
+        self.assertIsNotNone(transcripts._codex_harness_tool("exec", comments))
 
 
 def _write_rollout(day_dir: Path, name: str, cwd: str, session_id: str,
