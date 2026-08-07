@@ -696,15 +696,14 @@ class CodexNewRuntimeTranscriptTests(unittest.TestCase):
             "## git\n## wiki-main\n## rg\n1034: custom_tool_call\n",
             "## git\n## wiki-main\n## rg\n1034: custom_tool_call\n",
         ])
-        self.assertTrue(multi_tools[0]["ok"])
-        self.assertTrue(multi_tools[1]["ok"])
 
-        # The wrapper exposes one aggregate result for this batch, so both
-        # child events retain the bounded aggregate rather than losing a call.
+        # The wrapper exposes one aggregate result for this batch. Preserve it
+        # on both children, but do not invent child status.
         multi_tool = multi_tools[0]
         self.assertEqual(multi_tool["name"], "exec_command")
         self.assertEqual(multi_tool["archetype"], "git")
         self.assertEqual(multi_tool["summary"], "git status")
+        self.assertEqual([tool["ok"] for tool in multi_tools], [None, None])
 
         failed_tool = tools[4]
         self.assertEqual(failed_tool["archetype"], "validate")
@@ -761,12 +760,14 @@ class CodexNewRuntimeTranscriptTests(unittest.TestCase):
         self.assertEqual(tools[7]["output"], "plain text\n")
         self.assertTrue(tools[7]["ok"])
 
-        # `const args = {cmd:"..."}; tools.exec_command(args);` is trivial
-        # variable indirection — the harness resolver follows the assignment
-        # and hands the caller a clean exec_command with the underlying cmd.
+        # Object bindings are not safe to resolve. They use the bounded
+        # semantic fallback instead of inventing a command.
         resolved = tools[8]
-        self.assertEqual(resolved["name"], "exec_command")
-        self.assertEqual(resolved["input"], "echo should stay raw")
+        self.assertEqual(resolved["name"], "exec")
+        self.assertEqual(
+            resolved["input"],
+            "Codex tool wrapper could not be decoded: exec_command",
+        )
         self.assertEqual(resolved["archetype"], "run")
 
     def test_wiki265_harness_shapes_never_leak_raw_javascript(self) -> None:
@@ -820,7 +821,9 @@ class CodexNewRuntimeTranscriptTests(unittest.TestCase):
             [tool["output"] for tool in mixed],
             ["pr context\ngate result: green\n"] * 2,
         )
-        self.assertEqual([tool["ok"] for tool in mixed], [True, True])
+        # This fixture has one aggregate result block, not one result per
+        # child. Keep sibling output evidence without claiming both passed.
+        self.assertEqual([tool["ok"] for tool in mixed], [None, None])
 
     def test_codex_runtime_preamble_is_metadata_not_output(self) -> None:
         path = FIXTURES_DIR / "codex_preamble_runtime_rendering.jsonl"
@@ -896,15 +899,12 @@ class CodexNewRuntimeTranscriptTests(unittest.TestCase):
                 self.assertIsNone(transcripts._codex_harness_tool("exec", source))
 
         comments = "tools.exec_command" + ("/* comment */" * 2000) + '({cmd: "echo hi"});'
-        self.assertIsNotNone(transcripts._codex_harness_tool("exec", comments))
+        self.assertIsNone(transcripts._codex_harness_tool("exec", comments))
 
-    def test_harness_scanner_resolves_variable_indirection(self) -> None:
-        """Trivial `const X = ...; tools.name(X)` indirection resolves."""
+    def test_harness_scanner_rejects_object_variable_indirection(self) -> None:
+        """Object bindings are unsafe without a complete mutation proof."""
         args_case = 'const args = {cmd: "echo hi"}; tools.exec_command(args);'
-        harness = transcripts._codex_harness_tool("exec", args_case)
-        self.assertIsNotNone(harness)
-        self.assertEqual(harness["name"], "exec_command")
-        self.assertEqual(harness["input"], "echo hi")
+        self.assertIsNone(transcripts._codex_harness_tool("exec", args_case))
 
         patch_case = (
             'const patch = "*** Begin Patch\\n*** Add File: /a\\n+hi\\n*** End Patch";'
@@ -914,6 +914,18 @@ class CodexNewRuntimeTranscriptTests(unittest.TestCase):
         self.assertIsNotNone(harness)
         self.assertEqual(harness["name"], "apply_patch")
         self.assertIn("*** Begin Patch", harness["input"])
+
+    def test_harness_grammar_rejects_dead_control_flow(self) -> None:
+        cases = [
+            "if (false) tools.exec_command({cmd: 'dead'});",
+            "false && tools.exec_command({cmd: 'dead'});",
+            "function unused() { tools.exec_command({cmd: 'dead'}); }",
+            "for (;;) { tools.exec_command({cmd: 'dead'}); }",
+            "condition ? tools.exec_command({cmd: 'dead'}) : null;",
+        ]
+        for source in cases:
+            with self.subTest(source=source):
+                self.assertIsNone(transcripts._codex_harness_tool("exec", source))
 
     def test_harness_scanner_folds_homogeneous_promise_all(self) -> None:
         """Promise.all of exec_commands collapses to newline-joined bash."""
@@ -1025,16 +1037,85 @@ class CodexNewRuntimeTranscriptTests(unittest.TestCase):
         ])
         self.assertEqual([tool["ok"] for tool in tools], [True, False])
 
+    def test_harness_batch_results_normalize_runtime_input_text_envelope(self) -> None:
+        rows = [
+            {
+                "type": "response_item",
+                "timestamp": "2026-08-07T12:00:00Z",
+                "payload": {
+                    "type": "custom_tool_call",
+                    "call_id": "batch-envelope",
+                    "name": "exec",
+                    "input": (
+                        "const rs = await Promise.all(["
+                        'tools.exec_command({cmd:"first"}),'
+                        'tools.exec_command({cmd:"second"})]); text(rs);'
+                    ),
+                },
+            },
+            {
+                "type": "response_item",
+                "timestamp": "2026-08-07T12:00:01Z",
+                "payload": {
+                    "type": "custom_tool_call_output",
+                    "call_id": "batch-envelope",
+                    "output": [
+                        {
+                            "type": "input_text",
+                            "text": "Script completed\nWall time 0.1 seconds\nOutput:\n",
+                        },
+                        {
+                            "type": "input_text",
+                            "text": (
+                                '[{"output":"first output\\n","exit_code":0},'
+                                '{"output":"second output\\n","exit_code":1}]'
+                            ),
+                        },
+                    ],
+                },
+            },
+        ]
+        with TemporaryDirectory() as tmp:
+            path = Path(tmp) / "codex-batch-envelope.jsonl"
+            path.write_text("\n".join(json.dumps(row) for row in rows) + "\n")
+            tools = [
+                event["tool"]
+                for event in transcripts.read_session_events("codex", path)["events"]
+                if event["kind"] == "tool"
+            ]
+
+        self.assertEqual([tool["output"] for tool in tools], [
+            "first output\n",
+            "second output\n",
+        ])
+        self.assertEqual([tool["ok"] for tool in tools], [True, False])
+
     def test_harness_variable_resolution_rejects_unsafe_declarations(self) -> None:
         cases = [
             "// const args = {cmd: 'fake'};\ntools.exec_command(args);",
             "const args = {cmd: 'real'}; /* comment */ tools.exec_command(args);",
             "{ const args = {cmd: 'scoped'}; } tools.exec_command(args);",
             "const args = {cmd: 'first'}; args = {cmd: 'fake'}; tools.exec_command(args);",
+            'const patch = "safe"; patch = "fake"; tools.apply_patch(patch);',
+            'const patch = "safe"; patch.value = "fake"; tools.apply_patch(patch);',
+            'const patch = "safe"; Object.assign(patch, {value: "fake"}); tools.apply_patch(patch);',
+            'const patch = "safe"; const alias = patch; tools.apply_patch(alias);',
         ]
         for source in cases:
             with self.subTest(source=source):
                 self.assertIsNone(transcripts._codex_harness_tool("exec", source))
+
+    def test_harness_argument_parser_is_bounded(self) -> None:
+        variables = {
+            f"a{index}": f"a{index + 1}"
+            for index in range(transcripts.MAX_CODEX_JS_NODES + 10)
+        }
+        variables[f"a{transcripts.MAX_CODEX_JS_NODES + 10}"] = '"safe"'
+        self.assertIsNone(transcripts._codex_js_arguments("a0", variables))
+
+        nested = '{"a":' * (transcripts.MAX_CODEX_JS_DEPTH + 4)
+        nested += '"x"' + "}" * (transcripts.MAX_CODEX_JS_DEPTH + 4)
+        self.assertIsNone(transcripts._codex_js_arguments(nested))
 
 
 def _write_rollout(day_dir: Path, name: str, cwd: str, session_id: str,

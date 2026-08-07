@@ -61,6 +61,7 @@ MAX_EDIT_PAYLOAD = 10_000
 MAX_CODEX_HARNESS_SOURCE = 100_000
 MAX_CODEX_HARNESS_CALLS = 32
 MAX_CODEX_BATCH_CHILD_INPUT = 600
+MAX_CODEX_BATCH_RESULT_BYTES = MAX_TOOL_IO * MAX_CODEX_HARNESS_CALLS
 
 try:
     TAIL_WINDOW_EVENTS = max(1, int(os.environ.get("WIKI_TRANSCRIPT_TAIL_WINDOW", "500")))
@@ -632,8 +633,8 @@ def _balanced_js_call_end(source: str, opening: int) -> int | None:
     return None
 
 
-def _codex_harness_calls(source: str) -> list[tuple[str, str]] | None:
-    """Find tools calls without matching text inside strings or comments."""
+def _codex_harness_calls(source: str) -> list[tuple[str, str, int, int]] | None:
+    """Find candidate tools calls without matching strings or comments."""
     if len(source) > MAX_CODEX_HARNESS_SOURCE:
         return None
     calls: list[tuple[str, str]] = []
@@ -667,13 +668,102 @@ def _codex_harness_calls(source: str) -> list[tuple[str, str]] | None:
                     end = _balanced_js_call_end(source, opening)
                     if end is None:
                         return None
-                    calls.append((name_match.group(0), source[opening + 1:end].strip()))
+                    calls.append(
+                        (
+                            name_match.group(0),
+                            source[opening + 1:end].strip(),
+                            index,
+                            end + 1,
+                        )
+                    )
                     if len(calls) > MAX_CODEX_HARNESS_CALLS:
                         return None
                     index = end + 1
                     continue
         index += 1
     return calls
+
+
+_CODEX_CONTROL_WORD = re.compile(
+    r"\b(?:if|else|for|while|do|switch|case|default|function|class|try|catch|"
+    r"finally|return|throw|break|continue|with|yield|delete|new|typeof|void)\b"
+)
+_CODEX_DIRECT_CALL_PREFIX = re.compile(
+    r"\s*(?:(?:const|let|var)\s+[A-Za-z_$][\w$]*\s*=\s*)?"
+    r"(?:await\s*)?$"
+)
+_CODEX_TEXT_CALL_PREFIX = re.compile(
+    r"\s*(?:(?:const|let|var)\s+[A-Za-z_$][\w$]*\s*=\s*[^;]+;\s*)?"
+    r"text\s*\(\s*(?:await\s*)?$"
+)
+_CODEX_PROMISE_PREFIX = re.compile(
+    r"\s*(?:(?:const|let|var)\s+"
+    r"(?:[A-Za-z_$][\w$]*|\[[^\]\n]+\])\s*=\s*)?"
+    r"(?:await\s*)?$"
+)
+_CODEX_WRAPPER_SUFFIX = re.compile(
+    r"\s*;\s*(?:(?:text\s*\([^;]*\)\s*;\s*)*)?$"
+)
+_CODEX_TEXT_SUFFIX = re.compile(r"\s*\)\s*;?\s*$")
+
+
+def _codex_harness_grammar_is_simple(
+    source: str, calls: list[tuple[str, str, int, int]]
+) -> bool:
+    """Accept only direct top-level calls or direct Promise.all elements."""
+    masked_result = _mask_js_strings_and_comments(source)
+    if masked_result is None:
+        return False
+    masked, has_comments = masked_result
+    # Keep offsets stable while normalizing escaped fixture whitespace.
+    masked = masked.replace("\\n", "  ").replace("\\r", "  ").replace("\\t", "  ")
+    if has_comments or not calls:
+        return False
+    if _CODEX_CONTROL_WORD.search(masked) or "&&" in masked or "||" in masked or "?" in masked:
+        return False
+
+    promise_matches = list(re.finditer(r"\bPromise\s*\.\s*all\s*\(", masked))
+    if len(promise_matches) > 1:
+        return False
+    if promise_matches:
+        promise_open = promise_matches[0].end() - 1
+        promise_end = _balanced_js_call_end(source, promise_open)
+        if promise_end is None:
+            return False
+        array_start = _skip_js_space(source, promise_open + 1)
+        if array_start >= len(source) or source[array_start] != "[":
+            return False
+        array_end = _js_literal_end(source, array_start)
+        if array_end is None or _skip_js_space(source, array_end) != promise_end:
+            return False
+        if not _CODEX_PROMISE_PREFIX.fullmatch(masked[:promise_matches[0].start()]):
+            return False
+        if not _CODEX_WRAPPER_SUFFIX.fullmatch(masked[promise_end + 1:]):
+            return False
+        ordered_calls = sorted(calls, key=lambda item: item[2])
+        cursor = array_start + 1
+        for index, (_, _, call_start, call_end) in enumerate(ordered_calls):
+            if not (array_start < call_start < call_end <= array_end - 1):
+                return False
+            separator = masked[cursor:call_start].strip()
+            if separator != ("" if index == 0 else ","):
+                return False
+            cursor = call_end
+        return masked[cursor:array_end - 1].strip() in ("", ",")
+
+    if "Promise" in masked or len(calls) != 1:
+        return False
+    _, _, call_start, call_end = calls[0]
+    prefix = masked[:call_start]
+    if not (
+        _CODEX_DIRECT_CALL_PREFIX.fullmatch(prefix)
+        or _CODEX_TEXT_CALL_PREFIX.fullmatch(prefix)
+    ):
+        return False
+    suffix = masked[call_end:]
+    if _CODEX_TEXT_CALL_PREFIX.fullmatch(prefix):
+        return _CODEX_TEXT_SUFFIX.fullmatch(suffix) is not None
+    return _CODEX_WRAPPER_SUFFIX.fullmatch(suffix) is not None
 
 
 def _decode_js_string(source: str, opening: int) -> tuple[str, int] | None:
@@ -691,12 +781,18 @@ def _decode_js_string(source: str, opening: int) -> tuple[str, int] | None:
     return value, end if isinstance(value, str) else None
 
 
+MAX_CODEX_JS_DEPTH = 16
+MAX_CODEX_JS_NODES = 256
+
+
 class _CodexJsArgumentParser:
     def __init__(
         self,
         source: str,
         variables: dict[str, str] | None = None,
         resolving: frozenset[str] | None = None,
+        depth: int = 0,
+        budget: list[int] | None = None,
     ):
         self.source = source
         self.index = 0
@@ -705,6 +801,14 @@ class _CodexJsArgumentParser:
         # arg list survives the trivial variable indirection Codex loves.
         self.variables = variables or {}
         self.resolving = resolving or frozenset()
+        self.depth = depth
+        self.budget = budget if budget is not None else [0]
+
+    def _consume_node(self) -> bool:
+        if self.depth > MAX_CODEX_JS_DEPTH:
+            return False
+        self.budget[0] += 1
+        return self.budget[0] <= MAX_CODEX_JS_NODES
 
     def _space(self) -> None:
         self.index = _skip_js_space(self.source, self.index)
@@ -718,15 +822,29 @@ class _CodexJsArgumentParser:
         return value
 
     def _value(self) -> object | None:
+        if not self._consume_node():
+            return None
         self._space()
         if self.index >= len(self.source) or self.source[self.index] == "`":
             return None
         if self.source[self.index] in ("'", '"'):
             return self._string()
         if self.source[self.index] == "{":
-            return self._object()
+            if self.depth >= MAX_CODEX_JS_DEPTH:
+                return None
+            self.depth += 1
+            try:
+                return self._object()
+            finally:
+                self.depth -= 1
         if self.source[self.index] == "[":
-            return self._array()
+            if self.depth >= MAX_CODEX_JS_DEPTH:
+                return None
+            self.depth += 1
+            try:
+                return self._array()
+            finally:
+                self.depth -= 1
         number = _JS_NUMBER.match(self.source, self.index)
         if number:
             self.index = number.end()
@@ -750,6 +868,8 @@ class _CodexJsArgumentParser:
                     resolved,
                     self.variables,
                     self.resolving | {token},
+                    self.depth + 1,
+                    self.budget,
                 ).parse()
             return None
         return None
@@ -850,7 +970,10 @@ class _CodexJsArgumentParser:
 
 
 def _codex_js_arguments(source: str, variables: dict[str, str] | None = None) -> dict | str | None:
-    return _CodexJsArgumentParser(source, variables).parse()
+    try:
+        return _CodexJsArgumentParser(source, variables).parse()
+    except RecursionError:
+        return None
 
 
 # Trivial variable indirection Codex generates alongside `tools.*` calls:
@@ -997,17 +1120,37 @@ def _codex_extract_variables(source: str) -> dict[str, str] | None:
         if assignment.search(masked, match.end()):
             return None
         start = _skip_js_space(source, match.end())
-        end = _js_literal_end(source, start)
-        if end is None:
-            continue
-        if name in variables:
+        if start >= len(source):
             return None
-        variables[name] = source[start:end]
+        if source[start] in "[{":
+            # Object and array bindings can mutate or escape through aliases.
+            return None
+        if source[start] in ("'", '"'):
+            end = _js_literal_end(source, start)
+            if end is None:
+                return None
+            variables[name] = source[start:end]
+            continue
+        if source.startswith("await tools.", start) or source.startswith(
+            "await Promise.all(", start
+        ):
+            continue
+        return None
 
     for match in re.finditer(
         r"\b(let|var)\s+([A-Za-z_$][\w$]*)\s*=\s*", masked
     ):
         if brace_depth[match.start()] == 0:
+            return None
+
+    for name in variables:
+        member_write = re.compile(
+            rf"\b{re.escape(name)}\s*(?:\.[A-Za-z_$][\w$]*|\[[^\]]+\])\s*"
+            r"(?:=|\+=|-=|\*=|/=|%=|\+\+|--)",
+        )
+        if member_write.search(masked) or re.search(
+            rf"\bObject\.assign\s*\(\s*{re.escape(name)}\b", masked
+        ):
             return None
 
     return variables
@@ -1077,15 +1220,19 @@ def _codex_harness_tool(name: object, raw_input: object) -> dict | None:
     calls = _codex_harness_calls(raw_input)
     if not calls:
         return None
+    if not _codex_harness_grammar_is_simple(raw_input, calls):
+        return None
     variables = _codex_extract_variables(raw_input)
     if variables is None:
         return None
-    parsed_arguments = [_resolve_call_argument(arg, variables) for _, arg in calls]
+    parsed_arguments = [
+        _resolve_call_argument(arg, variables) for _, arg, _, _ in calls
+    ]
     if any(arg is None for arg in parsed_arguments):
         return None
     semantic_inputs: list[str] = []
     children: list[dict[str, object]] = []
-    for (child_name, _), child_arguments in zip(calls, parsed_arguments):
+    for (child_name, _, _, _), child_arguments in zip(calls, parsed_arguments):
         child_input = _codex_tool_input(child_name, child_arguments)
         if child_name == "exec_command" and isinstance(child_arguments, dict):
             command = child_arguments.get("cmd", child_arguments.get("command"))
@@ -1107,7 +1254,7 @@ def _codex_harness_tool(name: object, raw_input: object) -> dict | None:
     if len(calls) > 1:
         # Homogeneous Promise.all batches of shell commands keep bash grammar
         # so the shared inline/block renderer stays compact and useful.
-        if all(fname == "exec_command" for fname, _ in calls):
+        if all(fname == "exec_command" for fname, _, _, _ in calls):
             combined = _codex_synthesized_bash(
                 [args for args in parsed_arguments if isinstance(args, dict)]
             )
@@ -1120,7 +1267,7 @@ def _codex_harness_tool(name: object, raw_input: object) -> dict | None:
             display_input = _clip(
                 "\n".join(
                     f"{_clip(child_name, 120)}: {_clip(child_input, MAX_CODEX_BATCH_CHILD_INPUT)}"
-                    for (child_name, _), child_input in zip(calls, semantic_inputs)
+                    for (child_name, _, _, _), child_input in zip(calls, semantic_inputs)
                 ),
                 MAX_TOOL_IO,
             )
@@ -1339,8 +1486,7 @@ def _codex_tool_output(value: object) -> tuple[str, bool | None]:
     return details.text, details.status
 
 
-def _codex_batch_output_values(value: object, count: int) -> list[object] | None:
-    """Split only result arrays whose child boundaries are explicit."""
+def _codex_explicit_batch_results(value: object, count: int) -> list[object] | None:
     if not isinstance(value, list) or len(value) != count:
         return None
     if all(isinstance(item, str) for item in value):
@@ -1359,6 +1505,39 @@ def _codex_batch_output_values(value: object, count: int) -> list[object] | None
         for item in value
     ):
         return value
+    return None
+
+
+def _codex_batch_output_values(value: object, count: int) -> list[object] | None:
+    """Normalize the runtime envelope before splitting explicit child results."""
+    if count <= 0 or count > MAX_CODEX_HARNESS_CALLS:
+        return None
+    direct = _codex_explicit_batch_results(value, count)
+    if direct is not None:
+        return direct
+    if not isinstance(value, list) or not all(
+        isinstance(item, dict)
+        and item.get("type") == "input_text"
+        and isinstance(item.get("text"), str)
+        for item in value
+    ):
+        return None
+    parts: list[str] = []
+    for item in value:
+        body, _, _ = _strip_codex_runtime_preamble(item["text"])
+        if body.strip():
+            parts.append(body.strip())
+    candidate = "\n".join(parts)
+    if not candidate or len(candidate) > MAX_CODEX_BATCH_RESULT_BYTES:
+        return None
+    for parser in (json.loads, ast.literal_eval):
+        try:
+            parsed = parser(candidate)
+        except (ValueError, SyntaxError):
+            continue
+        explicit = _codex_explicit_batch_results(parsed, count)
+        if explicit is not None:
+            return explicit
     return None
 
 
@@ -1528,12 +1707,18 @@ def _codex_finish_tool_event(
     call_id: object,
     output: object,
     ts: str | None,
+    *,
+    aggregate: bool = False,
 ) -> None:
     output_details = _codex_tool_output_details(output)
     output_text = output_details.text
     # A completed Codex result without an error marker is successful, matching
     # Claude's canonical tool_result semantics.
-    output_ok = output_details.status if output_details.status is not None else True
+    output_ok = (
+        None
+        if aggregate
+        else output_details.status if output_details.status is not None else True
+    )
     if call_id and _complete_artifact(state, call_id, output_text, ts):
         return
     target = state["pending"].pop(call_id, None) if call_id else event
@@ -2039,6 +2224,7 @@ def _codex_apply(state: dict, row: dict) -> None:
             if batch:
                 raw_output = payload.get("output")
                 child_outputs = _codex_batch_output_values(raw_output, len(batch))
+                aggregate = child_outputs is None
                 if child_outputs is None:
                     # The app-server exposes one aggregate wrapper result for
                     # some Promise.all calls. Keep it on every child rather
@@ -2051,6 +2237,7 @@ def _codex_apply(state: dict, row: dict) -> None:
                         reference["call_id"],
                         child_output,
                         ts,
+                        aggregate=aggregate,
                     )
                 _record_row_disposition(state, EVENT_DISPOSITION_RENDERED)
                 return
