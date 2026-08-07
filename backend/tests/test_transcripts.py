@@ -1644,6 +1644,306 @@ class CodexModernTranscriptParityTests(unittest.TestCase):
         )
         self.assertTrue(state["codex_modern_messages"]["visible-open"]["partial"])
 
+    def test_round7_item_lifecycle_matrix_covers_kind_and_path(self) -> None:
+        """Every item kind uses one registry across creation and completion paths."""
+
+        def artifact_item(item_id: str, status: str = "inProgress") -> dict:
+            item = {
+                "type": "mcpToolCall",
+                "id": item_id,
+                "server": "wiki_artifacts",
+                "tool": "render_artifact",
+                "arguments": {
+                    "kind": "mermaid",
+                    "payload": {"source": "graph TD; A-->B"},
+                },
+                "status": status,
+            }
+            if status == "completed":
+                item["result"] = {
+                    "content": [{"type": "text", "text": sentinel_text(_artifact_protocol_event("mermaid", 270))}]
+                }
+            return item
+
+        def modern(kind: str, item_id: str, complete: bool = True) -> list[dict]:
+            if kind == "agentMessage":
+                item = {"type": "agentMessage", "id": item_id, "text": "answer"}
+                started = {**item, "text": ""}
+            elif kind == "reasoning":
+                item = {"type": "reasoning", "id": item_id, "summary": [{"text": "thought"}]}
+                started = {**item, "summary": []}
+            elif kind == "tool":
+                item = {
+                    "type": "commandExecution",
+                    "id": item_id,
+                    "command": "printf child",
+                    "status": "completed",
+                    "aggregatedOutput": "child",
+                }
+                started = {**item, "status": "inProgress", "aggregatedOutput": None}
+            else:
+                item = artifact_item(item_id, "completed")
+                started = artifact_item(item_id)
+            rows = [self._row("item/started", {"item": started}, 1)]
+            if complete:
+                rows.append(self._row("item/completed", {"item": item}, 2))
+            return rows
+
+        def legacy(kind: str, item_id: str, complete: bool = True) -> list[dict]:
+            if kind == "agentMessage":
+                return [
+                    {
+                        "type": "response_item",
+                        "timestamp": "2026-08-07T12:00:01Z",
+                        "payload": {
+                            "type": "message",
+                            "id": item_id,
+                            "role": "assistant",
+                            "content": [{"type": "output_text", "text": "answer"}],
+                        },
+                    }
+                ]
+            if kind == "reasoning":
+                return [
+                    {
+                        "type": "response_item",
+                        "timestamp": "2026-08-07T12:00:01Z",
+                        "payload": {
+                            "type": "reasoning",
+                            "id": item_id,
+                            "summary": [{"text": "thought"}],
+                        },
+                    }
+                ]
+            if kind == "tool":
+                rows = [
+                    {
+                        "type": "response_item",
+                        "timestamp": "2026-08-07T12:00:01Z",
+                        "payload": {
+                            "type": "function_call",
+                            "call_id": item_id,
+                            "name": "exec_command",
+                            "arguments": json.dumps({"cmd": "printf child"}),
+                        },
+                    }
+                ]
+                if complete:
+                    rows.append(
+                        {
+                            "type": "response_item",
+                            "timestamp": "2026-08-07T12:00:02Z",
+                            "payload": {
+                                "type": "function_call_output",
+                                "call_id": item_id,
+                                "output": "child",
+                            },
+                        }
+                    )
+                return rows
+            if kind == "artifact":
+                rows = [
+                    {
+                        "type": "response_item",
+                        "timestamp": "2026-08-07T12:00:01Z",
+                        "payload": {
+                            "type": "function_call",
+                            "call_id": item_id,
+                            "name": "render_artifact",
+                            "arguments": {"kind": "mermaid", "payload": {"source": "graph TD; A-->B"}},
+                        },
+                    }
+                ]
+                if complete:
+                    rows.append(
+                        {
+                            "type": "response_item",
+                            "timestamp": "2026-08-07T12:00:02Z",
+                            "payload": {
+                                "type": "function_call_output",
+                                "call_id": item_id,
+                                "output": sentinel_text(_artifact_protocol_event("mermaid", 270)),
+                            },
+                        }
+                    )
+                return rows
+            harness = (
+                'const rs = await Promise.all(['
+                'tools.mcp__wiki_artifacts__render_artifact({kind:"mermaid",payload:{source:"graph TD; A-->B"}}),'
+                'tools.exec_command({cmd:"printf child"})]); text(rs);'
+            )
+            rows = [
+                {
+                    "type": "response_item",
+                    "timestamp": "2026-08-07T12:00:01Z",
+                    "payload": {
+                        "type": "custom_tool_call",
+                        "call_id": "batch-outer",
+                        "name": "exec",
+                        "input": harness,
+                    },
+                }
+            ]
+            if complete:
+                rows.append(
+                    {
+                        "type": "response_item",
+                        "timestamp": "2026-08-07T12:00:02Z",
+                        "payload": {
+                            "type": "custom_tool_call_output",
+                            "call_id": "batch-outer",
+                            "output": [
+                                {"call_id": "batch-tool", "output": "child"},
+                                {
+                                    "call_id": "batch-artifact",
+                                    "output": sentinel_text(_artifact_protocol_event("mermaid", 270)),
+                                },
+                            ],
+                        },
+                    }
+                )
+            return rows
+
+        matrix = [
+            ("agentMessage", "modern"),
+            ("reasoning", "modern"),
+            ("tool", "modern"),
+            ("artifact", "modern"),
+            ("agentMessage", "legacy"),
+            ("reasoning", "legacy"),
+            ("tool", "legacy"),
+            ("artifact", "legacy"),
+            ("batch child", "legacy"),
+        ]
+        for kind, path_kind in matrix:
+            item_id = f"matrix-{kind.replace(' ', '-')}-{path_kind}"
+            builder = modern if path_kind == "modern" else legacy
+            with self.subTest(kind=kind, path=path_kind), TemporaryDirectory() as tmp:
+                path = Path(tmp) / "matrix.jsonl"
+                rows = builder(kind, item_id)
+                path.write_text("".join(json.dumps(row) + "\n" for row in rows))
+                parsed = transcripts.read_session_events(
+                    "codex-normalized" if path_kind == "modern" else "codex", path
+                )
+                state = transcripts._cache[str(path)]
+            target_ids = (
+                [
+                    key
+                    for key, record in state["codex_item_lifecycle"].items()
+                    if key != "batch-outer"
+                    and record.get("kind") in {"tool", "artifact"}
+                ]
+                if kind == "batch child"
+                else [item_id]
+            )
+            for target_id in target_ids:
+                self.assertEqual(state["codex_item_lifecycle"][target_id]["state"], "terminal")
+            baseline_events = len(parsed["events"])
+            with TemporaryDirectory() as tmp:
+                path = Path(tmp) / "matrix-replay.jsonl"
+                replay_rows = builder(kind, item_id) + builder(kind, item_id)
+                path.write_text("".join(json.dumps(row) + "\n" for row in replay_rows))
+                replayed = transcripts.read_session_events(
+                    "codex-normalized" if path_kind == "modern" else "codex", path
+                )
+            self.assertEqual(len(replayed["events"]), baseline_events, (kind, path_kind))
+
+        interrupt_matrix = [
+            ("agentMessage", "modern"),
+            ("reasoning", "modern"),
+            ("tool", "modern"),
+            ("artifact", "modern"),
+            ("tool", "legacy"),
+            ("artifact", "legacy"),
+            ("batch child", "legacy"),
+        ]
+        for kind, path_kind in interrupt_matrix:
+            item_id = f"partial-{kind.replace(' ', '-')}-{path_kind}"
+            builder = modern if path_kind == "modern" else legacy
+            rows = builder(kind, item_id, complete=False)
+            if path_kind == "modern":
+                turn_started = self._row("turn/started", {"turn": {"id": item_id}}, 0)
+                turn_completed = self._row(
+                    "turn/completed", {"turn": {"status": "interrupted"}}, 99
+                )
+            else:
+                turn_started = {
+                    "type": "event_msg",
+                    "timestamp": "2026-08-07T12:00:00Z",
+                    "payload": {"type": "turn_started", "turn": {"id": item_id}},
+                }
+                turn_completed = {
+                    "type": "event_msg",
+                    "timestamp": "2026-08-07T12:00:99Z",
+                    "payload": {
+                        "type": "turn_completed",
+                        "turn": {"status": "interrupted"},
+                    },
+                }
+            rows.insert(0, turn_started)
+            rows.append(turn_completed)
+            with self.subTest(kind=kind, path=f"{path_kind}-interrupt"), TemporaryDirectory() as tmp:
+                path = Path(tmp) / "matrix-interrupt.jsonl"
+                path.write_text("".join(json.dumps(row) + "\n" for row in rows))
+                transcripts.read_session_events(
+                    "codex-normalized" if path_kind == "modern" else "codex", path
+                )
+                state = transcripts._cache[str(path)]
+            target_ids = (
+                [
+                    key
+                    for key, record in state["codex_item_lifecycle"].items()
+                    if key != "batch-outer"
+                    and record.get("kind") in {"tool", "artifact"}
+                ]
+                if kind == "batch child"
+                else [item_id]
+            )
+            for target_id in target_ids:
+                self.assertEqual(state["codex_item_lifecycle"][target_id]["state"], "partial")
+
+    def test_round7_k1_trim_keeps_buffered_unrendered_deltas(self) -> None:
+        rows = [
+            self._row(
+                "item/commandExecution/outputDelta",
+                {"itemId": "buffered-after-trim", "delta": "before-start"},
+                1,
+            )
+        ]
+        for index in range(2200):
+            item_id = f"trim-{index}"
+            rows.extend(
+                [
+                    self._row(
+                        "item/started",
+                        {"item": {"type": "agentMessage", "id": item_id, "text": item_id}},
+                        index * 2 + 2,
+                    ),
+                    self._row(
+                        "item/completed",
+                        {"item": {"type": "agentMessage", "id": item_id, "text": item_id}},
+                        index * 2 + 3,
+                    ),
+                ]
+            )
+        rows.append(
+            self._row(
+                "item/started",
+                {"item": {"type": "commandExecution", "id": "buffered-after-trim", "command": "echo"}},
+                5000,
+            )
+        )
+        with TemporaryDirectory() as tmp:
+            path = Path(tmp) / "buffered-trim.jsonl"
+            path.write_text("".join(json.dumps(row) + "\n" for row in rows))
+            transcripts.read_session_events("codex-normalized", path)
+            state = transcripts._cache[str(path)]
+        self.assertEqual(
+            state["codex_modern_items"]["buffered-after-trim"]["tool"]["output"],
+            "before-start",
+        )
+        self.assertNotIn("buffered-after-trim", state["pending_modern_deltas"])
+
     def test_round2_f1_wrapper_incremental_replay_matches_full_and_keeps_unmatched(self) -> None:
         wrapper = {
             "type": "response_item",

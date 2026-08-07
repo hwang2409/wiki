@@ -1799,6 +1799,9 @@ def _codex_add_semantic_tool_event(
     wrapper: bool = False,
 ) -> tuple[dict | None, bool]:
     """Add one already-normalized Codex call."""
+    existing = _codex_lifecycle_record(state, call_id)
+    if existing is not None and existing.get("state") in {"partial", "terminal"}:
+        return existing.get("event"), True
     pending: dict = state["pending"]
     if name == "exec" and isinstance(raw_input, str):
         tool_input = _codex_harness_fallback_input(raw_input)
@@ -1815,11 +1818,27 @@ def _codex_add_semantic_tool_event(
     ):
         return None, True
     if _is_artifact_tool(name) and call_id:
+        meta = {"name": name, "input": _tool_arguments(raw_input) or {}}
         _codex_register_pending_artifact(
             state,
             call_id,
-            {"name": name, "input": _tool_arguments(raw_input) or {}},
+            meta,
         )
+        if str(call_id).startswith("__codex_batch_child__:"):
+            event = _codex_append_streaming_event(
+                state,
+                _artifact_tool_status(
+                    meta,
+                    "",
+                    ts,
+                    ok=True,
+                    summary="render_artifact completed",
+                ),
+                item_id=call_id,
+                kind="tool",
+            )
+            event["tool"]["call_id"] = str(call_id)
+            return event, False
         return None, True
     archetype, summary = classify_tool(name, classify_input)
     event = {
@@ -1838,7 +1857,12 @@ def _codex_add_semantic_tool_event(
     edit_payload = _structured_edit_payload(name, structured_input)
     if edit_payload is not None:
         event["tool"]["edit"] = edit_payload
-    _codex_append_streaming_event(state, event)
+    _codex_append_streaming_event(
+        state,
+        event,
+        item_id=call_id,
+        kind="tool",
+    )
     if call_id:
         pending[call_id] = event
         if wrapper and name.startswith("mcp__"):
@@ -1857,6 +1881,9 @@ def _codex_add_tool_event(
     call_id: object,
 ) -> tuple[dict | None, bool]:
     """Add one event per Codex harness child and retain its result links."""
+    existing = _codex_lifecycle_record(state, call_id)
+    if existing is not None and existing.get("state") in {"partial", "terminal"}:
+        return existing.get("event"), True
     harness = _codex_harness_tool(name, raw_input)
     if not harness:
         return _codex_add_semantic_tool_event(state, name, raw_input, ts, call_id)
@@ -1877,13 +1904,15 @@ def _codex_add_tool_event(
 
     outer = _codex_add_batch_outer_event(state, harness, ts, call_id)
     references: list[dict] = []
-    for child in children:
+    for child_index, child in enumerate(children):
         child_arguments = child["arguments"]
         child_call_id = (
             child_arguments.get("call_id", child_arguments.get("callId"))
             if isinstance(child_arguments, dict)
             else None
         )
+        if child_call_id is None and call_id:
+            child_call_id = f"__codex_batch_child__:{call_id}:{child_index}"
         event, handled = _codex_add_semantic_tool_event(
             state,
             child["name"],
@@ -1955,6 +1984,8 @@ def _codex_add_batch_outer_event(
                 "call_id": str(call_id) if call_id else None,
             },
         },
+        item_id=call_id,
+        kind="tool",
     )
     if call_id:
         state["pending"][call_id] = event
@@ -2023,6 +2054,10 @@ def _codex_finish_tool_event(
     *,
     aggregate: bool = False,
 ) -> None:
+    lifecycle_id = call_id or _codex_lifecycle_event_id(state, event)
+    record = _codex_lifecycle_record(state, lifecycle_id)
+    if record is not None and record.get("state") in {"partial", "terminal"}:
+        return
     output_details = _codex_tool_output_details(output)
     output_text = output_details.text
     # A completed Codex result without an error marker is successful, matching
@@ -2055,7 +2090,9 @@ def _codex_finish_tool_event(
             target["tool"]["status"] = (
                 "completed" if target["tool"]["ok"] else "failed"
             )
-            _codex_track_turn_event(state, target, open=False)
+            _codex_track_turn_event(
+                state, target, open=False, item_id=call_id, kind="tool"
+            )
             _record_tool_patch(state, target)
         return
     target = state["pending"].pop(call_id, None) if call_id else event
@@ -2067,7 +2104,9 @@ def _codex_finish_tool_event(
         target["tool"]["completed_at"] = _codex_completion_timestamp(
             target, ts, output_details.wall_time_ms
         )
-        _codex_track_turn_event(state, target, open=False)
+        _codex_track_turn_event(
+            state, target, open=False, item_id=call_id, kind="tool"
+        )
         _record_tool_patch(state, target)
 
 
@@ -2081,7 +2120,13 @@ def _codex_close_batch_children(
         tool = event.get("tool") or {}
         tool["status"] = "completed"
         tool["completed_at"] = ts
-        _codex_track_turn_event(state, event, open=False)
+        _codex_track_turn_event(
+            state,
+            event,
+            open=False,
+            item_id=reference.get("call_id"),
+            kind="tool",
+        )
         _record_tool_patch(state, event)
 
 
@@ -2096,7 +2141,26 @@ def _codex_finish_batch_child(
     name = reference.get("name")
     if isinstance(event, dict):
         event["tool"]["call_id"] = str(call_id)
+        _codex_lifecycle_transition(
+            state,
+            call_id,
+            "open",
+            event=event,
+            kind="artifact" if _is_artifact_tool(name) else "tool",
+        )
     if _is_artifact_tool(name):
+        original_call_id = reference.get("call_id")
+        if _codex_item_key(original_call_id) != _codex_item_key(call_id):
+            meta = state.get("pending_artifacts", {}).pop(original_call_id, None)
+            _codex_lifecycle_transition(
+                state,
+                call_id,
+                "open",
+                kind="artifact",
+                previous_item_id=original_call_id,
+            )
+            if meta is not None:
+                state.setdefault("pending_artifacts", {})[_codex_item_key(call_id)] = meta
         _codex_register_pending_artifact(
             state,
             call_id,
@@ -2175,6 +2239,8 @@ def _codex_apply_mcp_tool_item(state: dict, item: dict, ts: str | None) -> bool:
     name = f"mcp__{server}__{tool}"
     raw_input = item.get("arguments", item.get("input", {}))
     call_id = item.get("call_id", item.get("id"))
+    if _codex_is_terminal_item(state, call_id):
+        return True
     native_key = (name, _codex_tool_input(name, raw_input))
     state.setdefault("codex_native_tools", set()).add(native_key)
     if call_id:
@@ -2250,35 +2316,249 @@ def _codex_reset_turn_scope(state: dict) -> None:
     state.setdefault("codex_native_tools", set()).clear()
     state.setdefault("codex_native_call_ids", set()).clear()
     state.setdefault("pending_wrappers", {}).clear()
-    state.setdefault("codex_turn_open_events", {}).clear()
+    # Item lifecycle belongs to the registry.  Turn reset only clears the
+    # provider-specific suppression scope; open items remain registered so a
+    # later sweep can scope itself to the interrupted turn.
 
 
-def _codex_track_turn_event(state: dict, event: dict, *, open: bool) -> None:
-    events: dict = state.setdefault("codex_turn_open_events", {})
-    key = id(event)
-    if open:
-        events[key] = event
-    else:
-        events.pop(key, None)
+def _codex_start_turn(state: dict, turn: object = None) -> None:
+    """Start a new turn without changing any existing item lifecycle."""
+    _codex_reset_turn_scope(state)
+    counter = int(state.get("codex_turn_counter", 0)) + 1
+    state["codex_turn_counter"] = counter
+    turn_id = None
+    if isinstance(turn, dict):
+        for key in ("id", "turnId", "turn_id"):
+            value = turn.get(key)
+            if isinstance(value, (str, int)) and str(value):
+                turn_id = str(value)
+                break
+    state["codex_current_turn"] = turn_id or f"turn-{counter}"
+
+
+def _codex_item_key(item_id: object) -> str | None:
+    if isinstance(item_id, (str, int)) and str(item_id):
+        return str(item_id)
+    return None
+
+
+def _codex_lifecycle_registry(state: dict) -> dict:
+    return state.setdefault("codex_item_lifecycle", {})
+
+
+def _codex_rekey_lifecycle_record(
+    registry: dict, old_key: str, new_key: str
+) -> dict:
+    """Rename one item without changing its first-registration position."""
+    if old_key == new_key:
+        return registry[old_key]
+    reordered = {
+        (new_key if key == old_key else key): record
+        for key, record in registry.items()
+    }
+    registry.clear()
+    registry.update(reordered)
+    return registry[new_key]
+
+
+def _codex_lifecycle_transition(
+    state: dict,
+    item_id: object,
+    lifecycle: str | None = None,
+    *,
+    event: dict | None = None,
+    kind: str | None = None,
+    turn: object = None,
+    authoritative: bool = False,
+    previous_item_id: object = None,
+) -> dict | None:
+    """Apply the only lifecycle transition for one Codex item.
+
+    An item is ordered by its first registration.  Terminal and partial
+    records never reopen.  Authority is stored on the same record as the
+    lifecycle state, so replay and delta handling share one source of truth.
+    """
+    key = _codex_item_key(item_id)
+    if key is None:
+        return None
+    registry = _codex_lifecycle_registry(state)
+    record = registry.get(key)
+    previous_key = _codex_item_key(previous_item_id)
+    if record is None and previous_key and previous_key in registry:
+        record = _codex_rekey_lifecycle_record(registry, previous_key, key)
+    if record is None and event is not None:
+        for old_key, old_record in list(registry.items()):
+            if old_record.get("event") is event:
+                record = _codex_rekey_lifecycle_record(registry, old_key, key)
+                break
+    if record is None:
+        record = {
+            "state": lifecycle or "open",
+            "event": event,
+            "kind": kind,
+            "turn": turn if turn is not None else state.get("codex_current_turn"),
+            "authoritative": bool(authoritative or lifecycle == "terminal"),
+        }
+        registry[key] = record
+        return record
+
+    if authoritative:
+        record["authoritative"] = True
+    if kind is not None and record.get("kind") is None:
+        record["kind"] = kind
+    if event is not None and record.get("event") is None:
+        record["event"] = event
+
+    current = record.get("state")
+    if lifecycle is None or lifecycle == current:
+        return record
+    # Partial is a terminal outcome for interruption.  A late completion must
+    # not reopen or rewrite an item from the interrupted turn.
+    if current in {"partial", "terminal"}:
+        return record
+    if lifecycle == "open":
+        return record
+    if lifecycle not in {"partial", "terminal"}:
+        return record
+    record["state"] = lifecycle
+    if lifecycle == "terminal":
+        record["authoritative"] = True
+    if turn is not None:
+        record["turn"] = turn
+    return record
+
+
+def _codex_lifecycle_record(state: dict, item_id: object) -> dict | None:
+    key = _codex_item_key(item_id)
+    return _codex_lifecycle_registry(state).get(key) if key is not None else None
+
+
+def _codex_lifecycle_event_id(state: dict, event: dict) -> str | None:
+    for item_id, record in _codex_lifecycle_registry(state).items():
+        if record.get("event") is event:
+            return item_id
+    return None
+
+
+def _codex_transition_event(
+    state: dict,
+    event: dict | None,
+    lifecycle: str,
+    *,
+    item_id: object = None,
+    kind: str | None = None,
+) -> dict | None:
+    if event is None and item_id is None:
+        return None
+    key = _codex_item_key(item_id) or (
+        _codex_lifecycle_event_id(state, event) if event is not None else None
+    )
+    return _codex_lifecycle_transition(
+        state,
+        key or f"event:{id(event)}",
+        lifecycle,
+        event=event,
+        kind=kind,
+    )
+
+
+def _codex_track_turn_event(
+    state: dict,
+    event: dict,
+    *,
+    open: bool,
+    item_id: object = None,
+    kind: str | None = None,
+) -> None:
+    _codex_transition_event(
+        state,
+        event,
+        "open" if open else "terminal",
+        item_id=item_id,
+        kind=kind,
+    )
+
+
+class _CodexLifecycleView:
+    """Read-only compatibility projection over the single lifecycle registry."""
+
+    def __init__(self, state: dict, view: str) -> None:
+        self._state = state
+        self._view = view
+
+    def _items(self) -> list[tuple[str, object]]:
+        registry = _codex_lifecycle_registry(self._state)
+        if self._view == "terminal":
+            return [
+                (key, record.get("event"))
+                for key, record in registry.items()
+                if record.get("state") == "terminal"
+            ]
+        if self._view == "authority":
+            return [
+                (key, True)
+                for key, record in registry.items()
+                if record.get("authoritative")
+            ]
+        return [
+            (id(record.get("event")), record.get("event"))
+            for record in registry.values()
+            if record.get("state") == "open" and record.get("event") is not None
+        ]
+
+    def __len__(self) -> int:
+        return len(self._items())
+
+    def __iter__(self):
+        return (key for key, _ in self._items())
+
+    def __contains__(self, key: object) -> bool:
+        return any(candidate == key for candidate, _ in self._items())
+
+    def __getitem__(self, key: object):
+        for candidate, value in self._items():
+            if candidate == key:
+                return value
+        raise KeyError(key)
+
+    def get(self, key: object, default: object = None):
+        try:
+            return self[key]
+        except KeyError:
+            return default
+
+    def items(self):
+        return self._items()
+
+    def keys(self):
+        return [key for key, _ in self._items()]
+
+    def values(self):
+        return [value for _, value in self._items()]
 
 
 def _codex_append_streaming_event(
-    state: dict, event: dict, *, open: bool = True
+    state: dict,
+    event: dict,
+    *,
+    open: bool = True,
+    item_id: object = None,
+    kind: str | None = None,
 ) -> dict:
     """Create a streaming event and register its turn lifecycle in one place."""
     created = _append_event(state, event)
-    _codex_track_turn_event(state, created, open=open)
+    _codex_track_turn_event(
+        state,
+        created,
+        open=open,
+        item_id=item_id,
+        kind=kind or event.get("kind"),
+    )
     return created
 
 
 def _codex_mark_authoritative_item(state: dict, item_id: object) -> None:
-    if isinstance(item_id, (str, int)) and str(item_id):
-        authoritative = state.setdefault("codex_authoritative_items", set())
-        authoritative.add(str(item_id))
-        if len(authoritative) > CODEX_EVENT_WINDOW:
-            authoritative.difference_update(
-                list(authoritative)[:-CODEX_EVENT_WINDOW]
-            )
+    _codex_lifecycle_transition(state, item_id, authoritative=True)
 
 
 def _codex_bound_lifecycle_map(mapping: dict) -> None:
@@ -2291,26 +2571,33 @@ def _codex_register_pending_artifact(
     state: dict, call_id: object, meta: dict
 ) -> None:
     pending = state.setdefault("pending_artifacts", {})
-    pending[call_id] = meta
+    key = _codex_item_key(call_id)
+    if key is None:
+        return
+    pending[key] = meta
+    _codex_lifecycle_transition(
+        state,
+        key,
+        "open",
+        kind="artifact",
+    )
     _codex_bound_lifecycle_map(pending)
 
 
 def _codex_mark_terminal_item(
     state: dict, item_id: object, event: dict | None = None
 ) -> None:
-    if isinstance(item_id, (str, int)) and str(item_id):
-        terminal = state.setdefault("codex_terminal_items", {})
-        key = str(item_id)
-        if event is not None or key not in terminal:
-            terminal[key] = event
-        _codex_bound_lifecycle_map(terminal)
+    _codex_lifecycle_transition(
+        state,
+        item_id,
+        "terminal",
+        event=event,
+    )
 
 
 def _codex_is_terminal_item(state: dict, item_id: object) -> bool:
-    return (
-        isinstance(item_id, (str, int))
-        and str(item_id) in state.setdefault("codex_terminal_items", {})
-    )
+    record = _codex_lifecycle_record(state, item_id)
+    return record is not None and record.get("state") == "terminal"
 
 
 _CODEX_MODERN_TOOL_TYPES = {
@@ -2539,6 +2826,8 @@ def _codex_modern_item_apply(
     item_id = _codex_modern_item_id(item)
     if item_type not in _CODEX_MODERN_TOOL_TYPES or not item_id:
         return False
+    if _codex_is_terminal_item(state, item_id):
+        return True
     if completed:
         _codex_mark_authoritative_item(state, item_id)
     modern_items: dict = state.setdefault("codex_modern_items", {})
@@ -2577,10 +2866,15 @@ def _codex_modern_item_apply(
         if not completed:
             event["tool"]["status"] = "inProgress"
         modern_items[item_id] = event
+        _codex_lifecycle_transition(state, item_id, "open", event=event, kind="tool")
+        if not completed:
+            _codex_replay_pending_deltas(state, item_id, event)
     if completed and event is not None:
         _codex_patch_modern_tool(state, event, item, ts, completed=True)
         state["pending"].pop(item_id, None)
-        _codex_mark_terminal_item(state, item_id, event)
+        _codex_lifecycle_transition(
+            state, item_id, "terminal", event=event, kind="tool"
+        )
     return True
 
 
@@ -2676,7 +2970,15 @@ def _append_artifact_event(
     if artifact_id in artifact_ids:
         return None
     artifact_ids.add(artifact_id)
-    return _append_event(state, _artifact_event(protocol_event, ts))
+    event = _append_event(state, _artifact_event(protocol_event, ts))
+    _codex_lifecycle_transition(
+        state,
+        artifact_id,
+        "terminal",
+        event=event,
+        kind="artifact",
+    )
+    return event
 
 
 def _artifact_tool_status(
@@ -2737,6 +3039,46 @@ def _codex_mcp_tool_result_text(item: dict) -> str:
         if parts:
             return "\n".join(parts)
     return str(item.get("error") or result.get("error") or json.dumps(result))
+
+
+def _codex_render_artifact_status_event(
+    state: dict, item: dict, ts: str | None
+) -> dict:
+    """Render a distinct failed or unparseable artifact completion.
+
+    Providers can reuse an item id for separate failed completion records.
+    These records are not terminal replays because their result differs.
+    """
+    completed = (
+        item.get("status") == "completed"
+        and item.get("error") is None
+        and not (
+            isinstance(item.get("result"), dict)
+            and item["result"].get("isError") is True
+        )
+    )
+    event = _codex_append_streaming_event(
+        state,
+        _artifact_tool_status(
+            {
+                "name": "render_artifact",
+                "input": _tool_arguments(item.get("arguments")) or {},
+            },
+            _codex_mcp_tool_result_text(item),
+            ts,
+            ok=completed,
+            summary=(
+                "render_artifact completed without a parseable artifact"
+                if completed
+                else "render_artifact rejected"
+            ),
+        ),
+        open=False,
+        item_id=_codex_modern_item_id(item),
+        kind="artifact",
+    )
+    _codex_mark_terminal_item(state, _codex_modern_item_id(item), event)
+    return event
 
 
 def _is_codex_render_artifact_call(item: object) -> bool:
@@ -3030,11 +3372,15 @@ def _codex_apply_delta(
     item_key = str(item_id) if isinstance(item_id, (str, int)) and str(item_id) else None
     if not isinstance(delta, str):
         return False, current
-    if item_key and item_key in state.setdefault("codex_authoritative_items", set()):
+    record = _codex_lifecycle_record(state, item_key)
+    if record is not None and (
+        record.get("authoritative") or record.get("state") in {"partial", "terminal"}
+    ):
         return True, current
     if current is None:
             if not buffer_missing or not item_key:
                 return False, current
+            _codex_lifecycle_transition(state, item_key, "open")
             pending = state.setdefault("pending_modern_deltas", {}).setdefault(item_key, [])
             if len(pending) < MAX_CODEX_DELTA_CACHE:
                 pending.append({"identity": identity, "text": delta})
@@ -3061,10 +3407,21 @@ def _codex_upsert_reasoning(
     *,
     append: bool = False,
     stream_open: bool = False,
+    terminal: bool = False,
     delta_identity: object = None,
 ) -> None:
     """Merge live summary deltas with their completed reasoning item."""
     identity = str(item_id) if isinstance(item_id, str) and item_id else None
+    if identity:
+        record = _codex_lifecycle_record(state, identity)
+        if record is not None and record.get("state") in {"partial", "terminal"}:
+            return
+        _codex_lifecycle_transition(
+            state,
+            identity,
+            "open" if stream_open or terminal is False else None,
+            kind="reasoning",
+        )
     if append and identity:
         current = state.setdefault("codex_reasoning_text", {}).get(identity, "")
         accepted, updated = _codex_apply_delta(
@@ -3077,6 +3434,10 @@ def _codex_upsert_reasoning(
             buffer_missing=False,
         )
         if not accepted or updated is None or updated == current:
+            if identity and terminal:
+                _codex_lifecycle_transition(
+                    state, identity, "terminal", kind="reasoning"
+                )
             return
         text = updated
         state["codex_reasoning_text"][identity] = text
@@ -3084,6 +3445,8 @@ def _codex_upsert_reasoning(
         state.setdefault("codex_reasoning_text", {})[identity] = text
     text = text.strip()
     if not text:
+        if identity and terminal:
+            _codex_lifecycle_transition(state, identity, "terminal", kind="reasoning")
         return
     fragments = _codex_bold_summary_fragments(text)
     values = [f"**{fragment}**" for fragment in fragments] if fragments and len(fragments) > 1 else [text]
@@ -3101,6 +3464,8 @@ def _codex_upsert_reasoning(
                     "encrypted": True,
                 },
                 open=stream_open,
+                item_id=identity,
+                kind="reasoning",
             )
             if key:
                 by_key[key] = event
@@ -3109,6 +3474,22 @@ def _codex_upsert_reasoning(
         if event.get("text") != bounded:
             event["text"] = bounded
             _mark_tail_changed(state, state["events"].index(event))
+    if identity and terminal:
+        event = next(
+            (
+                record.get("event")
+                for key, record in _codex_lifecycle_registry(state).items()
+                if key == identity
+            ),
+            None,
+        )
+        _codex_lifecycle_transition(
+            state,
+            identity,
+            "terminal",
+            event=event,
+            kind="reasoning",
+        )
 
 
 def _codex_apply(state: dict, row: dict) -> None:
@@ -3127,7 +3508,7 @@ def _codex_apply(state: dict, row: dict) -> None:
             _record_row_disposition(state, EVENT_DISPOSITION_IGNORED)
             return
         if ptype == "turn_started":
-            _codex_reset_turn_scope(state)
+            _codex_start_turn(state, payload.get("turn"))
             _record_row_disposition(state, EVENT_DISPOSITION_RENDERED)
         elif ptype == "turn_completed":
             turn = payload.get("turn") or {}
@@ -3174,14 +3555,15 @@ def _codex_apply(state: dict, row: dict) -> None:
             if _complete_artifact(state, call_id, str(out), ts, failed=ok is False):
                 _record_row_disposition(state, EVENT_DISPOSITION_RENDERED)
                 return
-            event = pending.pop(call_id, None)
+            event = pending.get(call_id)
             if event:
-                event["tool"]["output"] = _clip(str(out), MAX_TOOL_IO)
-                event["tool"]["ok"] = ok
-                event["tool"]["completed_at"] = _codex_completion_timestamp(
-                    event, ts, wall_time_ms
+                _codex_finish_tool_event(
+                    state,
+                    event,
+                    call_id,
+                    {"output": out, "isError": ok is False},
+                    ts,
                 )
-                _record_tool_patch(state, event)
             _record_row_disposition(state, EVENT_DISPOSITION_RENDERED)
         else:
             _record_row_disposition(state, EVENT_DISPOSITION_UNKNOWN)
@@ -3204,24 +3586,45 @@ def _codex_apply(state: dict, row: dict) -> None:
                 if isinstance(message_id, (str, int)) and str(message_id)
                 else None
             )
+            if message_key and _codex_is_terminal_item(state, message_key):
+                _record_row_disposition(state, EVENT_DISPOSITION_RENDERED)
+                return
             modern_messages = state.setdefault("codex_modern_messages", {})
             if role == "assistant" and message_key in modern_messages:
                 _record_row_disposition(state, EVENT_DISPOSITION_RENDERED)
                 return
             event = None
             if text and not _dedupe_pair(state, "response_item", role, text):
-                event = _append_event(
-                    state, {"kind": role, "ts": ts, "text": _clip(text, MAX_TEXT)}
+                event = _codex_append_streaming_event(
+                    state,
+                    {"kind": role, "ts": ts, "text": _clip(text, MAX_TEXT)},
+                    open=False,
+                    item_id=message_key,
+                    kind="agentMessage" if role == "assistant" else "userMessage",
                 )
             if role == "assistant" and message_key and event is not None:
                 modern_messages[message_key] = event
+            if message_key:
+                _codex_lifecycle_transition(
+                    state,
+                    message_key,
+                    "terminal",
+                    event=event,
+                    kind="agentMessage" if role == "assistant" else "userMessage",
+                )
             _record_row_disposition(state, EVENT_DISPOSITION_RENDERED)
         elif ptype == "reasoning":
             summary = payload.get("summary") or []
             text = " ".join(
                 s.get("text", "") for s in summary if isinstance(s, dict)
             ).strip()
-            _codex_upsert_reasoning(state, text, ts, payload.get("id"))
+            _codex_upsert_reasoning(
+                state,
+                text,
+                ts,
+                payload.get("id"),
+                terminal=True,
+            )
             _record_row_disposition(state, EVENT_DISPOSITION_RENDERED)
         elif ptype == "mcpToolCall":
             if _codex_apply_mcp_tool_item(state, payload, ts):
@@ -3276,14 +3679,15 @@ def _codex_apply(state: dict, row: dict) -> None:
             ):
                 _record_row_disposition(state, EVENT_DISPOSITION_RENDERED)
                 return
-            event = pending.pop(call_id, None)
+            event = pending.get(call_id)
             if event:
-                event["tool"]["output"] = _clip(output_text, MAX_TOOL_IO)
-                event["tool"]["ok"] = output_ok
-                event["tool"]["completed_at"] = _codex_completion_timestamp(
-                    event, ts, output_details.wall_time_ms
+                _codex_finish_tool_event(
+                    state,
+                    event,
+                    call_id,
+                    payload.get("output"),
+                    ts,
                 )
-                _record_tool_patch(state, event)
             elif call_id:
                 pending_results = state.setdefault("pending_results", {})
                 pending_results[call_id] = (payload.get("output"), ts)
@@ -3351,11 +3755,26 @@ def _codex_modern_message_apply(
     item_id = _codex_modern_item_id(item)
     if item_type not in {"userMessage", "agentMessage", "reasoning"} or not item_id:
         return False
+    if _codex_is_terminal_item(state, item_id):
+        return True
     if completed:
         _codex_mark_authoritative_item(state, item_id)
     text = _codex_modern_text(item)
+    lifecycle_kind = "reasoning" if item_type == "reasoning" else (
+        "userMessage" if item_type == "userMessage" else "agentMessage"
+    )
+    _codex_lifecycle_transition(
+        state,
+        item_id,
+        "open" if not completed else None,
+        kind=lifecycle_kind,
+    )
     if item_type == "reasoning":
         if not text:
+            if completed:
+                _codex_lifecycle_transition(
+                    state, item_id, "terminal", kind=lifecycle_kind
+                )
             return True
         kind = "thinking"
         encrypted = isinstance(item.get("encrypted_content"), str)
@@ -3363,9 +3782,22 @@ def _codex_modern_message_apply(
         kind = "user" if item_type == "userMessage" else "assistant"
         encrypted = False
     messages: dict = state.setdefault("codex_modern_messages", {})
+    _codex_lifecycle_transition(
+        state,
+        item_id,
+        "open" if not completed else None,
+        kind=lifecycle_kind,
+    )
     event = messages.get(item_id)
     if event is None:
         if not text and item_type != "agentMessage":
+            if completed:
+                _codex_lifecycle_transition(
+                    state,
+                    item_id,
+                    "terminal",
+                    kind=lifecycle_kind,
+                )
             return True
         event = _codex_append_streaming_event(
             state,
@@ -3376,6 +3808,8 @@ def _codex_modern_message_apply(
                 **({"encrypted": encrypted} if kind == "thinking" else {}),
             },
             open=not completed,
+            item_id=item_id,
+            kind=lifecycle_kind,
         )
         messages[item_id] = event
         if completed:
@@ -3386,8 +3820,13 @@ def _codex_modern_message_apply(
         event["text"] = _clip(text, MAX_TEXT)
         _record_change(state, {"kind": "tail", "from": int(event["id"])})
     if event is not None and completed:
-        _codex_track_turn_event(state, event, open=False)
-        _codex_mark_terminal_item(state, item_id, event)
+        _codex_lifecycle_transition(
+            state,
+            item_id,
+            "terminal",
+            event=event,
+            kind=lifecycle_kind,
+        )
     return True
 
 
@@ -3442,6 +3881,10 @@ def _codex_modern_reasoning_delta(
             delta_identity=_codex_delta_identity(params),
         )
         return True
+    record = _codex_lifecycle_record(state, item_id)
+    if record is not None and record.get("state") in {"partial", "terminal"}:
+        return True
+    _codex_lifecycle_transition(state, item_id, "open", kind="reasoning")
     current = state.setdefault("codex_reasoning_text", {}).get(item_id, "")
     accepted, updated = _codex_apply_delta(
         state,
@@ -3516,51 +3959,70 @@ def _codex_close_turn(state: dict, turn: dict, ts: str | None) -> dict | None:
     terminal_status = "interrupted" if status in {"interrupted", "aborted"} else (
         "failed" if failed else "completed"
     )
-    pending_events: list[dict] = []
-    seen: set[int] = set()
-    for event in state.get("pending", {}).values():
-        if isinstance(event, dict) and id(event) not in seen:
-            pending_events.append(event)
-            seen.add(id(event))
-    for references in state.get("pending_batches", {}).values():
-        for reference in references:
-            event = reference.get("event")
-            if isinstance(event, dict) and id(event) not in seen:
-                pending_events.append(event)
-                seen.add(id(event))
-    for event in pending_events:
-        tool = event.get("tool") or {}
-        tool["ok"] = not (failed or terminal_status != "completed")
-        tool["status"] = terminal_status
-        tool["completed_at"] = ts
-        tool["partial"] = True
-        _record_tool_patch(state, event)
-    if terminal_status != "completed":
-        message_events = list(
-            state.setdefault("codex_turn_open_events", {}).values()
+    current_turn = state.get("codex_current_turn")
+    open_records = [
+        (item_id, record)
+        for item_id, record in _codex_lifecycle_registry(state).items()
+        if record.get("state") == "open"
+        and record.get("turn") == current_turn
+    ]
+    for item_id, record in open_records:
+        event = record.get("event")
+        kind = record.get("kind")
+        if kind == "artifact" and event is None:
+            meta = state.get("pending_artifacts", {}).pop(item_id, None)
+            if meta is not None:
+                event = _append_event(
+                    state,
+                    _failed_artifact_tool(
+                        meta, f"turn {terminal_status}", ts
+                    ),
+                )
+                _codex_lifecycle_transition(
+                    state, item_id, None, event=event, kind="artifact"
+                )
+        if isinstance(event, dict):
+            if event.get("kind") == "tool":
+                tool = event.get("tool") or {}
+                tool["ok"] = not (failed or terminal_status != "completed")
+                tool["status"] = terminal_status
+                tool["completed_at"] = ts
+                tool["partial"] = True
+                _record_tool_patch(state, event)
+            elif terminal_status != "completed":
+                event["partial"] = True
+                try:
+                    index = state["events"].index(event)
+                except ValueError:
+                    index = None
+                if index is not None:
+                    _mark_tail_changed(state, index)
+        _codex_lifecycle_transition(
+            state,
+            item_id,
+            "terminal" if terminal_status == "completed" else "partial",
+            event=event,
+            kind=kind,
+            turn=current_turn,
         )
-        for event in message_events:
-            if not isinstance(event, dict):
-                continue
-            if id(event) in seen:
-                # Tool lifecycle changes already have an authoritative patch.
-                continue
-            event["partial"] = True
-            try:
-                index = state["events"].index(event)
-            except ValueError:
-                continue
-            _mark_tail_changed(state, index)
     state["pending"].clear()
     state["pending_batches"].clear()
     state["pending_results"].clear()
     for call_id, meta in list(state.get("pending_artifacts", {}).items()):
         state["pending_artifacts"].pop(call_id, None)
-        if _codex_is_terminal_item(state, call_id):
+        record = _codex_lifecycle_record(state, call_id)
+        if record is not None and record.get("state") in {"partial", "terminal"}:
             continue
-        _append_event(
+        event = _append_event(
             state,
             _failed_artifact_tool(meta, f"turn {terminal_status}", ts),
+        )
+        _codex_lifecycle_transition(
+            state,
+            call_id,
+            "terminal" if terminal_status == "completed" else "partial",
+            event=event,
+            kind="artifact",
         )
     _codex_reset_turn_scope(state)
     if not failed:
@@ -3647,7 +4109,7 @@ def _codex_normalized_apply(state: dict, row: dict) -> None:
             _record_row_disposition(state, _normalized_disposition(row))
             return
     elif method == "turn/started":
-        _codex_reset_turn_scope(state)
+        _codex_start_turn(state, params.get("turn"))
         _record_row_disposition(state, _normalized_disposition(row))
         return
     elif method in {
@@ -3659,6 +4121,15 @@ def _codex_normalized_apply(state: dict, row: dict) -> None:
         if isinstance(item, dict):
             item_id = _codex_modern_item_id(item)
             if method == "item/started" and _codex_is_terminal_item(state, item_id):
+                _record_row_disposition(state, _normalized_disposition(row))
+                return
+            if (
+                method != "item/started"
+                and _codex_is_terminal_item(state, item_id)
+                and _is_codex_render_artifact_call(item)
+                and artifact_from_codex_mcp_tool_result(item) is None
+            ):
+                _codex_render_artifact_status_event(state, item, ts)
                 _record_row_disposition(state, _normalized_disposition(row))
                 return
             if method != "item/started":
@@ -3690,19 +4161,8 @@ def _codex_normalized_apply(state: dict, row: dict) -> None:
                     ts,
                     item.get("id"),
                     stream_open=method == "item/started",
+                    terminal=method != "item/started",
                 )
-                if method != "item/started":
-                    _codex_mark_authoritative_item(state, item.get("id"))
-                reasoning_id = str(item.get("id")) if item.get("id") else None
-                if reasoning_id:
-                    for key, event in state.get("codex_reasoning_events", {}).items():
-                        if not key.startswith(f"{reasoning_id}:"):
-                            continue
-                        _codex_track_turn_event(
-                            state,
-                            event,
-                            open=method == "item/started",
-                        )
                 _record_row_disposition(state, _normalized_disposition(row))
                 return
             if _codex_modern_message_apply(
@@ -3769,7 +4229,7 @@ def _codex_normalized_apply(state: dict, row: dict) -> None:
                     and item["result"].get("isError") is True
                 )
             )
-            _append_event(
+            event = _codex_append_streaming_event(
                 state,
                 _artifact_tool_status(
                     {
@@ -3785,7 +4245,11 @@ def _codex_normalized_apply(state: dict, row: dict) -> None:
                         else "render_artifact rejected"
                     ),
                 ),
+                open=False,
+                item_id=_codex_modern_item_id(item),
+                kind="artifact",
             )
+            _codex_mark_terminal_item(state, _codex_modern_item_id(item), event)
             _record_row_disposition(state, _normalized_disposition(row))
             return
         if (
@@ -4912,7 +5376,7 @@ def _evict_parse_states_locked(current_key: str | None) -> None:
 
 
 def _new_parse_state(fmt: str) -> dict:
-    return {
+    state = {
         "offset": 0,
         "buffer": "",
         "events": [],
@@ -4920,11 +5384,16 @@ def _new_parse_state(fmt: str) -> dict:
         "pending_batches": {},
         "pending_results": {},
         "pending_artifacts": {},
+        # The registry is the sole lifecycle authority.  The three legacy
+        # names below are read-only projections for older callers.
+        "codex_item_lifecycle": {},
         "codex_modern_items": {},
         "codex_modern_messages": {},
-        "codex_authoritative_items": set(),
-        "codex_terminal_items": {},
-        "codex_turn_open_events": {},
+        "codex_authoritative_items": None,
+        "codex_terminal_items": None,
+        "codex_turn_open_events": None,
+        "codex_current_turn": None,
+        "codex_turn_counter": 0,
         "codex_reasoning_text": {},
         "codex_reasoning_events": {},
         "pending_modern_deltas": {},
@@ -4957,6 +5426,10 @@ def _new_parse_state(fmt: str) -> dict:
         "agent_child_assignments": {},
         "cache_version": TRANSCRIPT_CACHE_VERSION,
     }
+    state["codex_authoritative_items"] = _CodexLifecycleView(state, "authority")
+    state["codex_terminal_items"] = _CodexLifecycleView(state, "terminal")
+    state["codex_turn_open_events"] = _CodexLifecycleView(state, "open")
+    return state
 
 
 def _prune_change_log(state: dict) -> None:
@@ -4976,20 +5449,40 @@ def _prune_change_log(state: dict) -> None:
 
 
 def _codex_prune_lifecycle_maps(state: dict, kept: set[int]) -> None:
-    """Drop Codex lifecycle entries whose rendered events left the window."""
+    """Evict lifecycle records in order while preserving live authority."""
 
-    terminal: dict = state.setdefault("codex_terminal_items", {})
-    for item_id, event in list(terminal.items()):
-        if isinstance(event, dict) and id(event) not in kept:
-            terminal.pop(item_id, None)
-
+    registry = _codex_lifecycle_registry(state)
+    pending_deltas = state.setdefault("pending_modern_deltas", {})
     pending_artifacts = state.setdefault("pending_artifacts", {})
+
+    # Rendered events and unrendered buffers are protected.  This prevents a
+    # trim from deleting either replay authority or pre-start delta output.
+    protected: set[str] = set(pending_deltas) | set(pending_artifacts)
+    protected.update(
+        item_id
+        for item_id, record in registry.items()
+        if isinstance(record.get("event"), dict)
+        and id(record["event"]) in kept
+    )
+    while len(registry) > CODEX_EVENT_WINDOW:
+        victim = next(
+            (item_id for item_id in registry if item_id not in protected),
+            None,
+        )
+        if victim is None:
+            break
+        registry.pop(victim, None)
+
+    # Delta buffers have no rendered event yet.  Bound their age by insertion
+    # order, but never filter them by the rendered-event window.
+    while len(pending_deltas) > MAX_CODEX_DELTA_CACHE:
+        pending_deltas.pop(next(iter(pending_deltas)), None)
+
     modern_items: dict = state.setdefault("codex_modern_items", {})
     for item_id, event in list(modern_items.items()):
-        if isinstance(event, dict):
-            if id(event) not in kept:
-                modern_items.pop(item_id, None)
-        elif item_id not in pending_artifacts and item_id not in terminal:
+        if isinstance(event, dict) and id(event) not in kept:
+            modern_items.pop(item_id, None)
+        elif event is None and item_id not in pending_deltas:
             modern_items.pop(item_id, None)
 
     modern_messages: dict = state.setdefault("codex_modern_messages", {})
@@ -5002,68 +5495,34 @@ def _codex_prune_lifecycle_maps(state: dict, kept: set[int]) -> None:
         if not isinstance(event, dict) or id(event) not in kept:
             reasoning_events.pop(key, None)
     reasoning_text: dict = state.setdefault("codex_reasoning_text", {})
-    reasoning_text = {
+    state["codex_reasoning_text"] = {
         item_id: text
         for item_id, text in reasoning_text.items()
         if any(key.startswith(f"{item_id}:") for key in reasoning_events)
-    }
-    state["codex_reasoning_text"] = reasoning_text
-
-    open_events: dict = state.setdefault("codex_turn_open_events", {})
-    for key, event in list(open_events.items()):
-        if not isinstance(event, dict) or id(event) not in kept:
-            open_events.pop(key, None)
-
-    visible_item_ids = set(modern_items) | set(modern_messages)
-    visible_item_ids.update(
-        item_id for item_id, event in terminal.items() if isinstance(event, dict)
-    )
-    state["codex_authoritative_items"] = {
-        item_id
-        for item_id in state.setdefault("codex_authoritative_items", set())
-        if item_id in visible_item_ids
-    }
-    state["pending_modern_deltas"] = {
-        item_id: deltas
-        for item_id, deltas in state.setdefault("pending_modern_deltas", {}).items()
-        if item_id in visible_item_ids
+        or item_id in pending_deltas
     }
 
     for item_id in list(pending_artifacts):
-        if item_id in terminal:
+        record = _codex_lifecycle_record(state, item_id)
+        if record is not None and record.get("state") in {"partial", "terminal"}:
             pending_artifacts.pop(item_id, None)
-    if len(pending_artifacts) > CODEX_EVENT_WINDOW:
-        for item_id in list(pending_artifacts)[:-CODEX_EVENT_WINDOW]:
-            pending_artifacts.pop(item_id, None)
+    for mapping in (
+        pending_artifacts,
+        state.setdefault("pending_batches", {}),
+        state.setdefault("pending_results", {}),
+    ):
+        while len(mapping) > CODEX_EVENT_WINDOW:
+            mapping.pop(next(iter(mapping)), None)
 
-    pending_batches: dict = state.setdefault("pending_batches", {})
-    if len(pending_batches) > CODEX_EVENT_WINDOW:
-        for call_id in list(pending_batches)[:-CODEX_EVENT_WINDOW]:
-            pending_batches.pop(call_id, None)
+    # Keep compatibility projections backed by the registry.  No lifecycle
+    # state is copied into a second mutable map.
+    if not isinstance(state.get("codex_terminal_items"), _CodexLifecycleView):
+        state["codex_terminal_items"] = _CodexLifecycleView(state, "terminal")
+    if not isinstance(state.get("codex_authoritative_items"), _CodexLifecycleView):
+        state["codex_authoritative_items"] = _CodexLifecycleView(state, "authority")
+    if not isinstance(state.get("codex_turn_open_events"), _CodexLifecycleView):
+        state["codex_turn_open_events"] = _CodexLifecycleView(state, "open")
 
-    for mapping_name in ("codex_modern_items", "codex_modern_messages", "codex_terminal_items"):
-        mapping = state.setdefault(mapping_name, {})
-        if len(mapping) > CODEX_EVENT_WINDOW:
-            for item_id in list(mapping)[:-CODEX_EVENT_WINDOW]:
-                mapping.pop(item_id, None)
-
-    visible_item_ids = set(state.setdefault("codex_modern_items", {}))
-    visible_item_ids.update(state.setdefault("codex_modern_messages", {}))
-    visible_item_ids.update(
-        item_id
-        for item_id, event in state.setdefault("codex_terminal_items", {}).items()
-        if isinstance(event, dict)
-    )
-    state["codex_authoritative_items"] = {
-        item_id
-        for item_id in state.get("codex_authoritative_items", set())
-        if item_id in visible_item_ids
-    }
-    state["pending_modern_deltas"] = {
-        item_id: deltas
-        for item_id, deltas in state.get("pending_modern_deltas", {}).items()
-        if item_id in visible_item_ids
-    }
     state["artifact_ids"] = {
         event.get("artifact_id")
         for event in state.get("events", [])
