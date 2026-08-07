@@ -125,6 +125,10 @@ Topic → note index. **Agents: read this file first, before grepping.** Every n
 
 - [[supervisor-recovery-memory]] — supervisor startup loads whole JSONL event logs, raising memory footprint
 
+## Wiki-app/til
+
+- [[codex-reasoning-encrypted-summaries]] — Codex app-server exposes only reasoning summaries; full reasoning is encrypted and unavailable to Wiki.app.
+
 ## Families (path patterns, not enumerated)
 
 - `log/YYYY-MM-DD.md` — daily end-of-day changelogs, cross-project.
