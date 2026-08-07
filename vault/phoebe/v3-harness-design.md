@@ -2,7 +2,7 @@
 type: decision
 tags: [phoebe, agent-v3, design]
 created: 2026-07-31
-updated: 2026-08-03
+updated: 2026-08-07
 ---
 
 # Phoebe Agent V3 harness design
@@ -198,6 +198,14 @@ Design decisions locked (2026-08-05, Henry):
   v3-side or strictly additive in shared files. Shared read logic is
   extracted as standalone libraries with their own tests; v2 keeps its
   private copy until v2 retires (temporary duplication accepted).
+
+Design decision locked (2026-08-07, Henry): bash is a permanent v3 core
+tool, not a loadable skill. Every v3 surface and profile mounts `run_bash`
+from the first model turn, and the base v3 system prompt always contains the
+bash/file-first doctrine. Remove the bash skill, skill-load path, and
+bash-specific gates while preserving sandbox and budget controls. This
+supersedes PHO-15151's skill packaging; implementation is tracked in
+[PHO-15373](https://linear.app/phoebework/issue/PHO-15373).
 
 Merge-order decision (2026-08-05, Henry): carve-first. After the v2
 restoration lands on `henry/v3-main-integration`, the branch is carved into a
