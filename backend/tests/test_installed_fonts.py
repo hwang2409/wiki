@@ -1,8 +1,13 @@
 from __future__ import annotations
 
 import unittest
+import asyncio
+import tempfile
+from pathlib import Path
+from unittest import mock
 
 from backend.app import installed_fonts
+from backend.app import main
 
 
 class InstalledFontsExtractTests(unittest.TestCase):
@@ -77,6 +82,81 @@ class InstalledFontsExtractTests(unittest.TestCase):
         self.assertEqual(installed_fonts._extract_families({}), [])
         self.assertEqual(installed_fonts._extract_families(None), [])
         self.assertEqual(installed_fonts._extract_families({"SPFontsDataType": "junk"}), [])
+
+    def test_extracts_file_metadata_and_skips_ttc_collections(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            font_path = root / "JetBrainsMono-Regular.ttf"
+            font_path.write_bytes(b"font")
+            collection_path = root / "Collection.ttc"
+            collection_path.write_bytes(b"collection")
+            payload = {
+                "SPFontsDataType": [
+                    {
+                        "_name": font_path.name,
+                        "Location": str(font_path),
+                        "enabled": "yes",
+                        "typefaces": [
+                            {
+                                "family": "JetBrains Mono",
+                                "style": "Regular",
+                                "weight": "400",
+                                "enabled": "yes",
+                            }
+                        ],
+                    },
+                    {
+                        "_name": collection_path.name,
+                        "Location": str(collection_path),
+                        "enabled": "yes",
+                        "typefaces": [
+                            {"family": "Collection Font", "style": "Regular", "enabled": "yes"}
+                        ],
+                    },
+                ]
+            }
+            with mock.patch.object(installed_fonts, "_FONT_ROOTS", (root,)):
+                fonts = installed_fonts._extract_fonts(payload)
+            self.assertEqual(fonts[0]["family"], "Collection Font")
+            self.assertEqual(fonts[0]["files"], [])
+            jetbrains = next(entry for entry in fonts if entry["family"] == "JetBrains Mono")
+            self.assertEqual(jetbrains["files"][0]["weight"], 400)
+            self.assertEqual(jetbrains["files"][0]["style"], "Regular")
+            self.assertNotIn("path", jetbrains["files"][0])
+
+
+class InstalledFontFileApiTests(unittest.TestCase):
+    def setUp(self) -> None:
+        installed_fonts.reset_cache_for_tests()
+
+    def tearDown(self) -> None:
+        installed_fonts.reset_cache_for_tests()
+
+    def test_id_mapping_serves_font_and_rejects_unknown_ids(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            font_path = root / "font.ttf"
+            font_path.write_bytes(b"font bytes")
+            font_id = "font-id"
+            with mock.patch.object(installed_fonts, "_FONT_ROOTS", (root,)):
+                installed_fonts._CACHE = [{"family": "Test Font", "files": [{"id": font_id}]}]
+                installed_fonts._FILE_MAP = {font_id: font_path}
+                response = asyncio.run(main.get_font_file(font_id))
+                self.assertEqual(response.path, font_path.resolve())
+                self.assertEqual(response.media_type, "font/ttf")
+                self.assertIsNone(installed_fonts.font_path("../font.ttf"))
+
+    def test_symlink_escape_is_rejected_after_enumeration(self) -> None:
+        with tempfile.TemporaryDirectory() as temp, tempfile.TemporaryDirectory() as outside:
+            root = Path(temp)
+            outside_path = Path(outside) / "outside.ttf"
+            outside_path.write_bytes(b"outside")
+            link = root / "link.ttf"
+            link.symlink_to(outside_path)
+            with mock.patch.object(installed_fonts, "_FONT_ROOTS", (root,)):
+                installed_fonts._CACHE = [{"family": "Escaped", "files": [{"id": "escape"}]}]
+                installed_fonts._FILE_MAP = {"escape": link}
+                self.assertIsNone(installed_fonts.font_path("escape"))
 
 
 class InstalledFontsCacheTests(unittest.TestCase):

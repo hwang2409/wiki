@@ -2,8 +2,12 @@ import assert from "node:assert/strict";
 import test from "node:test";
 import {
   classifyEnumerated,
+  isEnumeratedFamily,
   mergePools,
+  registerInstalledFontFaces,
+  resetFontEnumerationCacheForTests,
   synthesizedChoice,
+  type InstalledFontFamily,
   type FontChoice,
   type MonoProbe,
 } from "../src/font-enumeration.ts";
@@ -114,4 +118,52 @@ test("classifyEnumerated: probe decides mono vs prop", () => {
 test("classifyEnumerated: empty enumerated list yields empty buckets", () => {
   const buckets = classifyEnumerated([], () => true);
   assert.deepEqual(buckets, { mono: [], prop: [] });
+});
+
+test("registerInstalledFontFaces: registers lazy faces and keeps enumerated families available", () => {
+  const originalDocument = Object.getOwnPropertyDescriptor(globalThis, "document");
+  const originalFontFace = Object.getOwnPropertyDescriptor(globalThis, "FontFace");
+  const added: Array<{ family: string; source: string; descriptors: Record<string, string> }> = [];
+  const fakeDocument = {
+    fonts: {
+      add(face: { family: string; source: string; descriptors: Record<string, string> }) {
+        added.push(face);
+      },
+    },
+  };
+  class FakeFontFace {
+    family: string;
+    source: string;
+    descriptors: Record<string, string>;
+
+    constructor(family: string, source: string, descriptors: Record<string, string>) {
+      this.family = family;
+      this.source = source;
+      this.descriptors = descriptors;
+    }
+  }
+  const fonts: InstalledFontFamily[] = [
+    { family: "JetBrains Mono", files: [{ id: "jb-regular", weight: 400, style: "Regular" }] },
+    { family: "Menlo", files: [{ id: "menlo", weight: 400 }] },
+  ];
+  try {
+    Object.defineProperty(globalThis, "document", { value: fakeDocument, configurable: true });
+    Object.defineProperty(globalThis, "FontFace", { value: FakeFontFace, configurable: true });
+    resetFontEnumerationCacheForTests();
+    const count = registerInstalledFontFaces(fonts, (family) => family === "Menlo");
+    assert.equal(count, 1);
+    assert.equal(added[0]?.family, "JetBrains Mono");
+    assert.match(added[0]?.source ?? "", /\/api\/fonts\/file\/jb-regular/);
+    assert.equal(added[0]?.descriptors.weight, "400");
+    assert.equal(added[0]?.descriptors.style, "normal");
+    assert.equal(isEnumeratedFamily("JetBrains Mono"), true);
+    assert.equal(isEnumeratedFamily("Menlo"), true);
+    assert.equal(registerInstalledFontFaces(fonts, (family) => family === "Menlo"), 0);
+  } finally {
+    resetFontEnumerationCacheForTests();
+    if (originalDocument) Object.defineProperty(globalThis, "document", originalDocument);
+    else delete (globalThis as { document?: unknown }).document;
+    if (originalFontFace) Object.defineProperty(globalThis, "FontFace", originalFontFace);
+    else delete (globalThis as { FontFace?: unknown }).FontFace;
+  }
 });

@@ -4029,8 +4029,17 @@ def list_models() -> dict[str, object]:
 
 @app.get("/api/fonts")
 async def list_fonts() -> dict[str, object]:
-    families = await asyncio.to_thread(installed_fonts.installed_families)
-    return {"families": families}
+    entries = await asyncio.to_thread(installed_fonts.installed_fonts)
+    return {"families": [entry["family"] for entry in entries], "fonts": entries}
+
+
+@app.get("/api/fonts/file/{font_id}")
+async def get_font_file(font_id: str) -> FileResponse:
+    path = await asyncio.to_thread(installed_fonts.font_path, font_id)
+    if path is None:
+        raise HTTPException(status_code=404, detail="Font not found")
+    media_type = "font/otf" if path.suffix.casefold() == ".otf" else "font/ttf"
+    return FileResponse(path, media_type=media_type, headers={"Cache-Control": "public, max-age=86400"})
 
 
 @app.get("/api/tokens")

@@ -4,8 +4,12 @@ import { THEMES, type ThemeId } from "./themes";
 import {
   classifyEnumerated,
   fetchInstalledFamilies,
+  fetchInstalledFonts,
+  isEnumeratedFamily,
+  loadInstalledFontsForClassification,
   makeCanvasMonoProbe,
   mergePools,
+  type InstalledFontFamily,
   synthesizedChoice,
   type FontChoice,
 } from "./font-enumeration";
@@ -254,6 +258,7 @@ const ALWAYS_AVAILABLE_FAMILIES = new Set([
 
 function isAvailable(choice: FontChoice): boolean {
   if (ALWAYS_AVAILABLE_FAMILIES.has(choice.family)) return true;
+  if (isEnumeratedFamily(choice.family)) return true;
   return isFontInstalled(choice.family);
 }
 
@@ -409,7 +414,7 @@ export function applyStoredFonts() {
   // Warm the backend font-enumeration cache so the settings modal is
   // ready when the user opens it. Discard errors — the picker still works
   // with curated-only pools if the endpoint is missing or slow.
-  void fetchInstalledFamilies().catch(() => []);
+  void fetchInstalledFamilies({ isLocallyResolvable: isFontInstalled }).catch(() => []);
 }
 
 function currentLabel(role: FontRole): string {
@@ -455,6 +460,11 @@ function FontPicker({
       return;
     }
     setAvailTick((t) => t + 1);
+  }, [open, fonts]);
+
+  useEffect(() => {
+    if (!open) return;
+    void Promise.all(fonts.map(loadFontFaces));
   }, [open, fonts]);
 
   useEffect(() => {
@@ -573,12 +583,13 @@ function FontPicker({
 // families are appended per-role using the canvas mono-classifier so the
 // mono picker stays focused and the prop pickers absorb the rest.
 function useInstalledFontPools(): Record<FontRoleId, FontChoice[]> {
-  const [installed, setInstalled] = useState<string[]>([]);
+  const [installed, setInstalled] = useState<InstalledFontFamily[]>([]);
   useEffect(() => {
     let cancelled = false;
-    void fetchInstalledFamilies().then((families) => {
+    void fetchInstalledFonts({ isLocallyResolvable: isFontInstalled }).then(async (fonts) => {
+      await loadInstalledFontsForClassification(fonts);
       if (cancelled) return;
-      setInstalled(families);
+      setInstalled(fonts);
     });
     return () => {
       cancelled = true;
@@ -586,7 +597,7 @@ function useInstalledFontPools(): Record<FontRoleId, FontChoice[]> {
   }, []);
   return useMemo(() => {
     const probe = makeCanvasMonoProbe();
-    const { mono, prop } = classifyEnumerated(installed, probe);
+    const { mono, prop } = classifyEnumerated(installed.map((font) => font.family), probe);
     const forProp = (family: string) => synthesizedChoice(family, false);
     const forMono = (family: string) => synthesizedChoice(family, true);
     return {
