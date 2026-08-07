@@ -10,7 +10,7 @@ import {
   type DiffFilePatch,
   type DiffHunk,
 } from "./diff-parser";
-import { TokenizedLine, languageForPath, useHighlightTokenLines } from "./shiki";
+import { TokenizedLine, languageForPath, languageFromContent, useHighlightTokenLines } from "./shiki";
 
 type RecordValue = Record<string, unknown>;
 
@@ -174,6 +174,24 @@ export function commandExecutionCards(events: ProviderStreamEvent[]): CommandExe
 
 function diffPath(file: DiffFilePatch): string {
   return fileTitle(file);
+}
+
+// Bounded new-side + context sample for language-from-content fallback.
+// Drives the DiffRenderer highlighter when the diff's file path is unknown
+// (headerless codex payloads, first snapshots), keeping the guess cheap.
+function hunkContentSample(hunks: DiffHunk[]): string {
+  const lines: string[] = [];
+  let bytes = 0;
+  const MAX = 4096;
+  for (const hunk of hunks) {
+    for (const line of hunk.lines) {
+      if (line.kind === "remove" || line.kind === "meta") continue;
+      lines.push(line.text);
+      bytes += line.text.length + 1;
+      if (bytes >= MAX) return lines.join("\n");
+    }
+  }
+  return lines.join("\n");
 }
 
 const MAX_DIFF_SOURCE_BYTES = 512 * 1024;
@@ -649,6 +667,7 @@ function DiffRenderer({ source }: { source: string | null }) {
           {[...boundedFiles.entries()].map(([path, bounded]) => {
             const { file } = bounded;
             const kind = fileKind(file);
+            const lang = languageForPath(path) ?? languageFromContent(hunkContentSample(file.hunks));
             return (
               <div className="codex-stream-diff-file" key={path}>
                 <div className="codex-stream-diff-file-head">
@@ -657,7 +676,7 @@ function DiffRenderer({ source }: { source: string | null }) {
                 </div>
                 <div className="codex-stream-diff-body">
                   {file.hunks.map((hunk) => (
-                    <CodexDiffHunk hunk={hunk} key={`${path}:${hunk.header}`} lang={languageForPath(path)} />
+                    <CodexDiffHunk hunk={hunk} key={`${path}:${hunk.header}`} lang={lang} />
                   ))}
                   {bounded.truncated ? (
                     <div className="codex-stream-diff-truncated">

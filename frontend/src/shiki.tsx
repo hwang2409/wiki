@@ -74,6 +74,59 @@ export function languageForPath(path: string): BundledLanguage | null {
   return normalizeLang(filename.split(".").pop() ?? null);
 }
 
+// Cheap syntax-shape heuristics for when the file path is unknown (headerless
+// codex diffs, streaming previews, ad-hoc snippets). Only fires on patterns
+// distinct enough that a wrong guess is unlikely — otherwise returns null and
+// the caller stays with plain text.
+export function languageFromContent(code: string): BundledLanguage | null {
+  if (!code) return null;
+  const sample = code.slice(0, 4096);
+  const nonBlank: string[] = [];
+  for (const raw of sample.split("\n")) {
+    const line = raw.trimEnd();
+    if (line.trim()) nonBlank.push(line);
+    if (nonBlank.length >= 24) break;
+  }
+  if (nonBlank.length === 0) return null;
+  const first = nonBlank[0];
+  const shebang = /^#!\s*(?:\/usr\/bin\/env\s+)?(\S+)/.exec(first);
+  if (shebang) {
+    const tool = shebang[1].split("/").pop()?.toLowerCase() ?? "";
+    if (tool.startsWith("python")) return "python";
+    if (tool === "node" || tool === "bun") return "javascript";
+    if (["bash", "sh", "zsh", "dash", "ksh"].includes(tool)) return "bash";
+    if (tool === "ruby") return "ruby";
+  }
+  const joined = nonBlank.join("\n");
+  const head = first.trim();
+  if (/^(?:\{|\[)/.test(head) && /[":,\d}\]]/.test(joined)) {
+    try {
+      JSON.parse(sample);
+      return "json";
+    } catch {
+      // JSON-shaped but not strictly valid — fall through to keyword checks.
+    }
+  }
+  if (/^---\s*$/.test(head) || /^[A-Za-z_][\w-]*:\s/.test(head)) {
+    if (/^\s*[A-Za-z_][\w-]*:\s/m.test(joined) && !/[{};]/.test(head)) return "yaml";
+  }
+  if (/^(?:from\s+\S+\s+import\b|import\s+\S+\s*(?:as\s+\S+\s*)?$|def\s+\w+\s*\(|class\s+\w+\s*[:(])/m.test(joined)) {
+    return "python";
+  }
+  if (/^(?:interface|type)\s+\w+[\s<={]/m.test(joined)) return "typescript";
+  if (/^(?:import\s+.+\s+from\s+['"]|export\s+(?:default\s+)?(?:function|const|class|interface|type)\b|const\s+\w+\s*[:=]|let\s+\w+\s*[:=]|function\s+\w+\s*\()/m.test(joined)) {
+    return /:\s*(?:string|number|boolean|\w+\s*<)/.test(joined) ? "typescript" : "javascript";
+  }
+  if (/^(?:package\s+\w|func\s+\w+\s*\()/m.test(joined)) return "go";
+  if (/^(?:fn\s+\w+|impl\s+\w|pub\s+(?:fn|struct|enum)\b|use\s+\w+::)/m.test(joined)) return "rust";
+  if (/^\s*<(?:!DOCTYPE|html|body|div|section|main|header|nav)\b/i.test(joined)) return "html";
+  if (/^(?:SELECT|INSERT|UPDATE|DELETE|CREATE|ALTER|DROP)\s/im.test(joined)) return "sql";
+  if (/^#{1,6}\s/.test(head) || (/^\|.+\|/.test(head) && nonBlank.length >= 2 && /^\|\s*[-:| ]+\|/.test(nonBlank[1]))) {
+    return "markdown";
+  }
+  return null;
+}
+
 function resolveShikiTheme(appTheme: ThemeId): BundledTheme {
   return APP_THEME_TO_SHIKI[appTheme] ?? "github-light";
 }
