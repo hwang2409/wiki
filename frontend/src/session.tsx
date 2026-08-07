@@ -84,6 +84,8 @@ import { externalLinkProps } from "./external-links";
 import { useModalA11y } from "./modal-a11y";
 import {
   GhPreviewCard,
+  GhPreviewInline,
+  GhPreviewLayoutContext,
   containsGitHubPreviewUrl,
   isGitHubPreviewUrl,
   renderAnsiWithGitHubLinks,
@@ -2026,8 +2028,13 @@ function ImageChip({
 }
 
 function SessionMarkdownLink({ href, ...props }: ComponentProps<"a">) {
+  const previewLayout = useContext(GhPreviewLayoutContext);
   if (typeof href === "string" && isGitHubPreviewUrl(href)) {
-    return <GhPreviewCard url={href} />;
+    return previewLayout === "inline" ? (
+      <GhPreviewInline url={href} />
+    ) : (
+      <GhPreviewCard url={href} />
+    );
   }
   return <a href={href} {...props} {...externalLinkProps(href)} />;
 }
