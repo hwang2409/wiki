@@ -991,7 +991,6 @@ def _codex_harness_tool(name: object, raw_input: object) -> dict | None:
     parsed_arguments = [_resolve_call_argument(arg, variables) for _, arg in calls]
     if any(arg is None for arg in parsed_arguments):
         return None
-    children: list[dict[str, str]] = []
     semantic_inputs: list[str] = []
     for (child_name, _), child_arguments in zip(calls, parsed_arguments):
         child_input = _codex_tool_input(child_name, child_arguments)
@@ -1000,16 +999,6 @@ def _codex_harness_tool(name: object, raw_input: object) -> dict | None:
             if isinstance(command, str):
                 child_input = _clip(command, MAX_TOOL_IO)
         semantic_inputs.append(child_input)
-        child_archetype, child_summary = classify_tool(child_name, child_input)
-        children.append(
-            {
-                "name": _clip(child_name, 120),
-                "input": _clip(child_input, MAX_CODEX_BATCH_CHILD_INPUT),
-                "archetype": child_archetype,
-                "summary": child_summary,
-            }
-        )
-
     function_name = _clip(calls[0][0], 120)
     primary_arguments = parsed_arguments[0]
     classified_input = semantic_inputs[0]
@@ -1026,9 +1015,12 @@ def _codex_harness_tool(name: object, raw_input: object) -> dict | None:
                 display_input = classified_input
         else:
             # Mixed batches keep every semantic sibling in the bounded parent
-            # input. The child list lets the OpenCode-style row show hierarchy.
+            # input. The shared Claude-compatible tool row remains the renderer.
             display_input = _clip(
-                "\n".join(f"{child['name']}: {child['input']}" for child in children),
+                "\n".join(
+                    f"{_clip(child_name, 120)}: {_clip(child_input, MAX_CODEX_BATCH_CHILD_INPUT)}"
+                    for (child_name, _), child_input in zip(calls, semantic_inputs)
+                ),
                 MAX_TOOL_IO,
             )
     return {
@@ -1036,7 +1028,6 @@ def _codex_harness_tool(name: object, raw_input: object) -> dict | None:
         "input": display_input,
         "classify_input": classified_input,
         "arguments": primary_arguments,
-        "batch": children if len(children) > 1 else None,
         "calls": len(calls),
     }
 
@@ -1356,8 +1347,6 @@ def _codex_add_tool_event(
     edit_payload = _structured_edit_payload(name, structured_input)
     if edit_payload is not None:
         event["tool"]["edit"] = edit_payload
-    if harness and harness.get("batch"):
-        event["tool"]["batch"] = harness["batch"]
     _append_event(state, event)
     if call_id:
         pending[call_id] = event
@@ -1373,7 +1362,9 @@ def _codex_finish_tool_event(
 ) -> None:
     output_details = _codex_tool_output_details(output)
     output_text = output_details.text
-    output_ok = output_details.status
+    # A completed Codex result without an error marker is successful, matching
+    # Claude's canonical tool_result semantics.
+    output_ok = output_details.status if output_details.status is not None else True
     if call_id and _complete_artifact(state, call_id, output_text, ts):
         return
     target = state["pending"].pop(call_id, None) if call_id else event
@@ -1877,7 +1868,11 @@ def _codex_apply(state: dict, row: dict) -> None:
             call_id = payload.get("call_id")
             output_details = _codex_tool_output_details(payload.get("output"))
             output_text = output_details.text
-            output_ok = output_details.status
+            # A completed Codex result without an error marker is successful,
+            # matching Claude's canonical tool_result semantics.
+            output_ok = (
+                output_details.status if output_details.status is not None else True
+            )
             if _complete_artifact(state, call_id, output_text, ts):
                 _record_row_disposition(state, EVENT_DISPOSITION_RENDERED)
                 return

@@ -12,7 +12,7 @@ from unittest import mock
 
 from backend.app.agent_models import MODEL_OPTIONS
 from backend.app.agent_runtime.claude import ClaudeStreamAdapter
-from backend.app.agent_runtime.codex import CodexAppServerAdapter
+from backend.app.agent_runtime.codex import CODEX_REASONING_SUMMARY, CodexAppServerAdapter
 from backend.app.agent_runtime.process import (
     ProviderProcessIdentity,
     select_transcript_identity,
@@ -60,6 +60,29 @@ def _start_request(record: RunRecord, prompt: str = "initial prompt") -> StartRe
 
 
 class OrchestratorMcpConfigTests(unittest.TestCase):
+    def test_codex_reasoning_summary_is_maximum_for_supervisor_roles(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            worktree = root / "worktree"
+            worktree.mkdir()
+            env = {**os.environ, "WIKI_AGENT_RUNTIME_DIR": str(root / "runtime")}
+            for role in ("orchestrator", "plan", "implement", "review"):
+                with self.subTest(role=role):
+                    record = RunRecord.new(
+                        agent_id=f"wiki-{role}",
+                        provider=ProviderKind.CODEX,
+                        role=role,
+                        model="fixture-model",
+                        effort="high",
+                        worktree=str(worktree),
+                        prompt="coordinate",
+                    )
+                    adapter = CodexAppServerAdapter(record, env=env)
+                    self.assertIn(
+                        f'model_reasoning_summary="{CODEX_REASONING_SUMMARY}"',
+                        adapter.command,
+                    )
+
     def test_both_providers_attach_run_isolated_mcp_to_orchestrators(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)

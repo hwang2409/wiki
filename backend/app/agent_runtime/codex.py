@@ -30,6 +30,7 @@ from .types import LifecycleState, ProviderKind, RunRecord
 
 IdentityResolver = Callable[..., Awaitable[ProviderProcessIdentity | None]]
 _IDENTITY_VERIFY_DELAYS_SECONDS = (0.1, 0.2, 0.4, 0.8, 1.0, 1.0, 1.0, 1.0, 1.0)
+CODEX_REASONING_SUMMARY = "detailed"
 
 
 @dataclass
@@ -141,7 +142,7 @@ class CodexAppServerAdapter(ProviderAdapter):
                 # informative Codex-provided summary over the user's global
                 # concise default, without requesting private raw reasoning.
                 "-c",
-                'model_reasoning_summary="detailed"',
+                f'model_reasoning_summary="{CODEX_REASONING_SUMMARY}"',
                 "-c",
                 f"mcp_servers.wiki_artifacts.command={json.dumps(server_command[0])}",
                 "-c",

@@ -803,17 +803,12 @@ class CodexNewRuntimeTranscriptTests(unittest.TestCase):
             "gh pr view 13657 --json state,mergeable,mergeStateStatus",
         )
         self.assertEqual(parallel["archetype"], "run")
-        self.assertEqual([child["name"] for child in parallel["batch"]], ["exec_command", "exec_command"])
 
         mixed = tools[3]
         self.assertEqual(mixed["name"], "mcp__wiki_artifacts__read_agent_pr")
         self.assertEqual(mixed["archetype"], "tool")
         self.assertIn("read_agent_pr", mixed["input"])
         self.assertIn("exec_command", mixed["input"])
-        self.assertEqual(
-            [child["name"] for child in mixed["batch"]],
-            ["mcp__wiki_artifacts__read_agent_pr", "exec_command"],
-        )
 
     def test_codex_runtime_preamble_is_metadata_not_output(self) -> None:
         path = FIXTURES_DIR / "codex_preamble_runtime_rendering.jsonl"
@@ -937,7 +932,6 @@ class CodexNewRuntimeTranscriptTests(unittest.TestCase):
         self.assertNotIn("Promise.all", harness["input"])
         self.assertEqual(harness["calls"], 2)
         self.assertIn("exec_command", harness["input"])
-        self.assertEqual(harness["batch"][1]["input"], "wiki gate 13659")
 
     def test_harness_fallback_hides_malformed_javascript_and_is_bounded(self) -> None:
         """Malformed wrappers keep a bounded semantic note, never raw JS."""
@@ -955,7 +949,7 @@ class CodexNewRuntimeTranscriptTests(unittest.TestCase):
         cycle = 'const args = args; tools.exec_command(args);'
         self.assertIsNone(transcripts._codex_harness_tool("exec", cycle))
 
-    def test_harness_batch_children_are_bounded(self) -> None:
+    def test_harness_batch_inputs_are_bounded(self) -> None:
         command = "echo " + ("x" * (transcripts.MAX_CODEX_BATCH_CHILD_INPUT * 4))
         source = (
             "const rs = await Promise.all(["
@@ -965,10 +959,6 @@ class CodexNewRuntimeTranscriptTests(unittest.TestCase):
         harness = transcripts._codex_harness_tool("exec", source)
         self.assertIsNotNone(harness)
         self.assertLessEqual(len(harness["input"]), transcripts.MAX_TOOL_IO)
-        self.assertLessEqual(
-            len(harness["batch"][0]["input"]),
-            transcripts.MAX_CODEX_BATCH_CHILD_INPUT + 64,
-        )
 
 
 def _write_rollout(day_dir: Path, name: str, cwd: str, session_id: str,
@@ -1348,6 +1338,113 @@ class TranscriptSurfaceTests(unittest.TestCase):
         tool = next(event for event in result["events"] if event["kind"] == "tool")
         self.assertEqual(tool["tool"]["output"], "done\nexited with code 0")
         self.assertTrue(tool["tool"]["ok"])
+
+    def test_codex_reasoning_keeps_detailed_multiline_summary(self) -> None:
+        rows = [
+            {
+                "type": "response_item",
+                "timestamp": "2026-08-07T12:00:00Z",
+                "payload": {
+                    "type": "reasoning",
+                    "summary": [
+                        {
+                            "text": (
+                                "**Planning gate loop verification and CI checks**\n"
+                                "Inspect every supervisor-owned role.\n"
+                                "Keep the shared renderer unchanged."
+                            )
+                        }
+                    ],
+                    "encrypted_content": "opaque-codex-reasoning",
+                },
+            }
+        ]
+        with TemporaryDirectory() as tmp:
+            path = Path(tmp) / "codex-detailed-reasoning.jsonl"
+            path.write_text("\n".join(json.dumps(row) for row in rows) + "\n")
+            result = transcripts.read_session_events("codex", path)
+
+        thinking = result["events"][0]
+        self.assertEqual(thinking["kind"], "thinking")
+        self.assertTrue(thinking["encrypted"])
+        self.assertEqual(
+            thinking["text"],
+            "**Planning gate loop verification and CI checks**\n"
+            "Inspect every supervisor-owned role.\n"
+            "Keep the shared renderer unchanged.",
+        )
+
+    def test_equivalent_claude_and_codex_tools_share_canonical_fields(self) -> None:
+        claude_rows = [
+            {
+                "type": "assistant",
+                "timestamp": "2026-08-07T12:00:00Z",
+                "message": {
+                    "content": [
+                        {
+                            "type": "tool_use",
+                            "id": "claude-read",
+                            "name": "Read",
+                            "input": {"file_path": "src/main.py"},
+                        }
+                    ]
+                },
+            },
+            {
+                "type": "user",
+                "timestamp": "2026-08-07T12:00:01Z",
+                "message": {
+                    "content": [
+                        {
+                            "type": "tool_result",
+                            "tool_use_id": "claude-read",
+                            "content": "line one",
+                        }
+                    ]
+                },
+            },
+        ]
+        codex_rows = [
+            {
+                "type": "response_item",
+                "timestamp": "2026-08-07T12:00:00Z",
+                "payload": {
+                    "type": "function_call",
+                    "call_id": "codex-read",
+                    "name": "Read",
+                    "arguments": json.dumps({"file_path": "src/main.py"}),
+                },
+            },
+            {
+                "type": "response_item",
+                "timestamp": "2026-08-07T12:00:01Z",
+                "payload": {
+                    "type": "function_call_output",
+                    "call_id": "codex-read",
+                    "output": "line one",
+                },
+            },
+        ]
+        with TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            claude_path = root / "claude.jsonl"
+            codex_path = root / "codex.jsonl"
+            claude_path.write_text("\n".join(json.dumps(row) for row in claude_rows) + "\n")
+            codex_path.write_text("\n".join(json.dumps(row) for row in codex_rows) + "\n")
+            claude_tool = next(
+                event["tool"]
+                for event in transcripts.read_session_events("claude", claude_path)["events"]
+                if event["kind"] == "tool"
+            )
+            codex_tool = next(
+                event["tool"]
+                for event in transcripts.read_session_events("codex", codex_path)["events"]
+                if event["kind"] == "tool"
+            )
+
+        for field in ("name", "input", "output", "ok", "archetype", "summary"):
+            with self.subTest(field=field):
+                self.assertEqual(codex_tool[field], claude_tool[field])
 
     def test_multi_select_question_preserves_all_answers_and_custom_reply(self) -> None:
         path = FIXTURES_DIR / "agent_runtime" / "claude_stream_native_surfaces.jsonl"

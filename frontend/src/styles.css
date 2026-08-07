@@ -7505,28 +7505,6 @@ body.is-resizing-panes .pane-cell {
   display: none;
 }
 
-/* Codex Promise.all wrappers become one compact parent row with semantic
-   sibling calls beneath it, matching the OpenCode task/subtrace ladder. */
-.session-tool-batch {
-  display: flex;
-  flex-direction: column;
-  gap: 1px;
-  margin: 1px 0 3px;
-  padding-left: calc(2ch + 6px);
-}
-
-.session-tool-batch-row {
-  display: flex;
-  align-items: baseline;
-  gap: 6px;
-  min-width: 0;
-  min-height: 20px;
-  color: inherit;
-  font-family: var(--font-monospace);
-  font-size: var(--font-ui-smaller);
-  font-weight: var(--font-monospace-weight);
-}
-
 .session-tool-icon {
   flex-shrink: 0;
   width: 2ch;

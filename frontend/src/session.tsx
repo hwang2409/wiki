@@ -1581,11 +1581,22 @@ function SubagentTrace({
 
 // OpenCode reasoning anatomy (session/index.tsx:1635-1677): one warning-hued
 // line `+ Thought: <title> · <duration>`, `-` when open, body as muted
-// markdown at reduced strength. Duration comes from the normalized event
-// timing; omitted silently when unavailable.
+// markdown at reduced strength. Codex supplies only summaries here; its
+// encrypted marker is the provider capability signal for opening them by
+// default. Wiki cannot decrypt the private reasoning payload.
+function normalizeCodexThinkingSummary(text: string): string {
+  const lines = text.split("\n");
+  const first = lines[0].trim();
+  const wrapped = first.match(/^\*\*(.+)\*\*$/);
+  if (wrapped) lines[0] = wrapped[1].trim();
+  return lines.join("\n");
+}
+
 function ThinkingRow({ event, durationMs = null }: { event: SessionEvent; durationMs?: number | null }) {
-  const [expanded, setExpanded] = useState(false);
-  const title = event.text.split("\n")[0].trim().slice(0, 120);
+  const codexSummary = event.encrypted === true;
+  const summary = codexSummary ? normalizeCodexThinkingSummary(event.text) : event.text;
+  const [expanded, setExpanded] = useState(() => codexSummary);
+  const title = summary.split("\n")[0].trim().slice(0, 120);
   const duration = durationMs !== null ? formatEventDuration(durationMs) : null;
   return (
     <div className="session-activity-row is-reasoning">
@@ -1613,7 +1624,7 @@ function ThinkingRow({ event, durationMs = null }: { event: SessionEvent; durati
         <div className="session-thinking">
           {/* Subtle scheme: markdown tokens damped by the container (OpenCode
               renders reasoning syntax at thinkingOpacity, theme/index.ts:292). */}
-          <ShikiCode className="session-thinking-code" code={event.text} lang="markdown" transparent />
+          <ShikiCode className="session-thinking-code" code={summary} lang="markdown" transparent />
         </div>
       ) : null}
     </div>
@@ -1770,34 +1781,6 @@ export function ToolCallRow({
         ) : null}
       </div>
       <div className="session-trace-indent">
-        {tool.batch && tool.batch.length > 1 ? (
-          <div className="session-tool-batch" aria-label={`${tool.batch.length} tool calls in batch`}>
-            {tool.batch.slice(1).map((child, index) => {
-              const childTool: SessionTool = {
-                name: child.name,
-                input: child.input,
-                output: tool.output,
-                ok: tool.ok,
-                archetype: child.archetype,
-                summary: child.summary,
-              };
-              const childParts = toolSummaryParts(childTool);
-              return (
-                <div className="session-tool-batch-row" key={`${child.name}:${index}`} title={child.input}>
-                  <span aria-hidden="true" className="session-tool-icon session-tool-icon-text">
-                    {toolGlyph(childTool, status)}
-                  </span>
-                  <span className="session-tool-summary">
-                    <span className="session-tool-verb">{childParts.verb}</span>
-                    {childParts.target ? (
-                      <><span aria-hidden="true">{" "}</span><span className="session-tool-target">{childParts.target}</span></>
-                    ) : null}
-                  </span>
-                </div>
-              );
-            })}
-          </div>
-        ) : null}
         {polished && polishedOpen ? (
           <div className="session-tool-polished" id={polishedId}>
             <BoundedPreview
