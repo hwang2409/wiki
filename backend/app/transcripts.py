@@ -1836,7 +1836,7 @@ def _codex_add_semantic_tool_event(
     edit_payload = _structured_edit_payload(name, structured_input)
     if edit_payload is not None:
         event["tool"]["edit"] = edit_payload
-    _append_event(state, event)
+    _codex_append_streaming_event(state, event)
     if call_id:
         pending[call_id] = event
         if wrapper and name.startswith("mcp__"):
@@ -1937,7 +1937,7 @@ def _codex_add_batch_outer_event(
 ) -> dict:
     classify_input = harness.get("classify_input") or harness.get("input") or ""
     archetype, summary = classify_tool("exec", str(classify_input))
-    event = _append_event(
+    event = _codex_append_streaming_event(
         state,
         {
             "kind": "tool",
@@ -1960,6 +1960,7 @@ def _codex_add_batch_outer_event(
 
 
 def _codex_remove_event(state: dict, event: dict) -> None:
+    _codex_track_turn_event(state, event, open=False)
     try:
         index = state["events"].index(event)
     except ValueError:
@@ -2052,6 +2053,7 @@ def _codex_finish_tool_event(
             target["tool"]["status"] = (
                 "completed" if target["tool"]["ok"] else "failed"
             )
+            _codex_track_turn_event(state, target, open=False)
             _record_tool_patch(state, target)
         return
     target = state["pending"].pop(call_id, None) if call_id else event
@@ -2063,6 +2065,7 @@ def _codex_finish_tool_event(
         target["tool"]["completed_at"] = _codex_completion_timestamp(
             target, ts, output_details.wall_time_ms
         )
+        _codex_track_turn_event(state, target, open=False)
         _record_tool_patch(state, target)
 
 
@@ -2076,6 +2079,7 @@ def _codex_close_batch_children(
         tool = event.get("tool") or {}
         tool["status"] = "completed"
         tool["completed_at"] = ts
+        _codex_track_turn_event(state, event, open=False)
         _record_tool_patch(state, event)
 
 
@@ -2252,6 +2256,20 @@ def _codex_track_turn_event(state: dict, event: dict, *, open: bool) -> None:
         events.pop(key, None)
 
 
+def _codex_append_streaming_event(
+    state: dict, event: dict, *, open: bool = True
+) -> dict:
+    """Create a streaming event and register its turn lifecycle in one place."""
+    created = _append_event(state, event)
+    _codex_track_turn_event(state, created, open=open)
+    return created
+
+
+def _codex_mark_authoritative_item(state: dict, item_id: object) -> None:
+    if isinstance(item_id, (str, int)) and str(item_id):
+        state.setdefault("codex_authoritative_items", set()).add(str(item_id))
+
+
 _CODEX_MODERN_TOOL_TYPES = {
     "commandExecution",
     "fileChange",
@@ -2398,7 +2416,6 @@ def _codex_replay_pending_deltas(state: dict, item_id: str, event: dict) -> None
         return
     target = event.get("tool") if event.get("kind") == "tool" else event
     current = target.get("output" if event.get("kind") == "tool" else "text") or ""
-    seen_identities: set[object] = set()
     for pending_delta in pending:
         if isinstance(pending_delta, dict):
             identity = pending_delta.get("identity")
@@ -2406,13 +2423,17 @@ def _codex_replay_pending_deltas(state: dict, item_id: str, event: dict) -> None
         else:
             identity = None
             delta = pending_delta
-        if not isinstance(delta, str):
-            continue
-        if identity is not None:
-            if identity in seen_identities:
-                continue
-            seen_identities.add(identity)
-        current += delta
+        accepted, updated = _codex_apply_delta(
+            state,
+            item_id,
+            delta,
+            identity=identity,
+            current=current,
+            limit=MAX_TOOL_IO if event.get("kind") == "tool" else MAX_TEXT,
+            buffer_missing=False,
+        )
+        if accepted and updated is not None:
+            current = updated
     key = "output" if event.get("kind") == "tool" else "text"
     target[key] = _clip(current, MAX_TOOL_IO if key == "output" else MAX_TEXT)
 
@@ -2448,6 +2469,7 @@ def _codex_patch_modern_tool(
         tool["status"] = item.get("status") or (
             "completed" if tool.get("ok") else "failed"
         )
+        _codex_track_turn_event(state, event, open=False)
     metadata = _codex_modern_metadata(item)
     if metadata:
         tool["metadata"] = metadata
@@ -2456,7 +2478,7 @@ def _codex_patch_modern_tool(
         tool["edit"] = edit
     if item_id:
         state.setdefault("codex_modern_items", {})[item_id] = event
-        if completed and output is not None:
+        if completed:
             state.setdefault("pending_modern_deltas", {}).pop(item_id, None)
         else:
             _codex_replay_pending_deltas(state, item_id, event)
@@ -2474,6 +2496,8 @@ def _codex_modern_item_apply(
     item_id = _codex_modern_item_id(item)
     if item_type not in _CODEX_MODERN_TOOL_TYPES or not item_id:
         return False
+    if completed:
+        _codex_mark_authoritative_item(state, item_id)
     modern_items: dict = state.setdefault("codex_modern_items", {})
     event = modern_items.get(item_id)
     if event is None:
@@ -2523,35 +2547,46 @@ def _codex_modern_delta(state: dict, params: dict, ts: str | None) -> bool:
         return False
     event = state.setdefault("codex_modern_items", {}).get(item_id)
     if event is None:
-        if isinstance(delta, str):
-            pending = state.setdefault("pending_modern_deltas", {}).setdefault(
-                item_id, []
-            )
-            if len(pending) < MAX_CODEX_DELTA_CACHE:
-                pending.append({"identity": _codex_delta_identity(params), "text": delta})
-        return False
+        accepted, _ = _codex_apply_delta(
+            state,
+            item_id,
+            delta,
+            identity=_codex_delta_identity(params),
+            current=None,
+            limit=MAX_TOOL_IO,
+        )
+        return accepted
     tool = event.get("tool") or {}
     terminal_input = params.get("input", params.get("text"))
     if isinstance(terminal_input, str):
-        tool["terminal_input"] = _clip(terminal_input, MAX_TOOL_IO)
-        _record_tool_patch(state, event)
-        return True
+        accepted, updated = _codex_apply_delta(
+            state,
+            item_id,
+            terminal_input,
+            identity=_codex_delta_identity(params),
+            current=tool.get("terminal_input") or "",
+            limit=MAX_TOOL_IO,
+            buffer_missing=False,
+            replace=True,
+        )
+        if accepted and updated is not None and updated != tool.get("terminal_input"):
+            tool["terminal_input"] = updated
+            _record_tool_patch(state, event)
+        return accepted
     if not isinstance(delta, str):
         return False
-    current = tool.get("output") or ""
-    seen = state.setdefault("codex_delta_cache", set())
-    identity = _codex_delta_identity(params)
-    signature = (item_id, identity)
-    if identity is not None and signature in seen:
-        return True
-    if identity is not None:
-        seen.add(signature)
-    if len(seen) > MAX_CODEX_DELTA_CACHE:
-        for old in list(seen)[: MAX_CODEX_DELTA_CACHE // 2]:
-            seen.remove(old)
-    tool["output"] = _clip(current + delta, MAX_TOOL_IO)
-    _record_tool_patch(state, event)
-    return True
+    accepted, updated = _codex_apply_delta(
+        state,
+        item_id,
+        delta,
+        identity=_codex_delta_identity(params),
+        current=tool.get("output") or "",
+        limit=MAX_TOOL_IO,
+    )
+    if accepted and updated is not None and updated != tool.get("output"):
+        tool["output"] = updated
+        _record_tool_patch(state, event)
+    return accepted
 
 
 def _is_artifact_tool(name: object) -> bool:
@@ -2936,6 +2971,43 @@ def _codex_bold_summary_fragments(text: str) -> list[str] | None:
         index = close + 2
 
 
+def _codex_apply_delta(
+    state: dict,
+    item_id: object,
+    delta: object,
+    *,
+    identity: object = None,
+    current: str | None,
+    limit: int,
+    buffer_missing: bool = True,
+    replace: bool = False,
+) -> tuple[bool, str | None]:
+    """Apply one streaming delta after the shared authority check."""
+    item_key = str(item_id) if isinstance(item_id, (str, int)) and str(item_id) else None
+    if not isinstance(delta, str):
+        return False, current
+    if item_key and item_key in state.setdefault("codex_authoritative_items", set()):
+        return True, current
+    if current is None:
+        if not buffer_missing or not item_key:
+            return False, current
+        pending = state.setdefault("pending_modern_deltas", {}).setdefault(item_key, [])
+        if len(pending) < MAX_CODEX_DELTA_CACHE:
+            pending.append({"identity": identity, "text": delta})
+        return True, None
+    seen = state.setdefault("codex_delta_cache", set())
+    signature = (item_key, identity)
+    if identity is not None and signature in seen:
+        return True, current
+    if identity is not None:
+        seen.add(signature)
+    if len(seen) > MAX_CODEX_DELTA_CACHE:
+        for old in list(seen)[: MAX_CODEX_DELTA_CACHE // 2]:
+            seen.remove(old)
+    value = delta if replace else current + delta
+    return True, _clip(value, limit)
+
+
 def _codex_upsert_reasoning(
     state: dict,
     text: str,
@@ -2943,11 +3015,25 @@ def _codex_upsert_reasoning(
     item_id: object = None,
     *,
     append: bool = False,
+    stream_open: bool = False,
+    delta_identity: object = None,
 ) -> None:
     """Merge live summary deltas with their completed reasoning item."""
     identity = str(item_id) if isinstance(item_id, str) and item_id else None
     if append and identity:
-        text = f"{state.setdefault('codex_reasoning_text', {}).get(identity, '')}{text}"
+        current = state.setdefault("codex_reasoning_text", {}).get(identity, "")
+        accepted, updated = _codex_apply_delta(
+            state,
+            identity,
+            text,
+            identity=delta_identity,
+            current=current,
+            limit=MAX_TEXT,
+            buffer_missing=False,
+        )
+        if not accepted or updated is None or updated == current:
+            return
+        text = updated
         state["codex_reasoning_text"][identity] = text
     elif identity:
         state.setdefault("codex_reasoning_text", {})[identity] = text
@@ -2961,7 +3047,7 @@ def _codex_upsert_reasoning(
         key = f"{identity}:{index}" if identity else None
         event = by_key.get(key) if key else None
         if event is None:
-            event = _append_event(
+            event = _codex_append_streaming_event(
                 state,
                 {
                     "kind": "thinking",
@@ -2969,6 +3055,7 @@ def _codex_upsert_reasoning(
                     "text": _clip(value, MAX_TEXT),
                     "encrypted": True,
                 },
+                open=stream_open,
             )
             if key:
                 by_key[key] = event
@@ -3204,6 +3291,8 @@ def _codex_modern_message_apply(
     item_id = _codex_modern_item_id(item)
     if item_type not in {"userMessage", "agentMessage", "reasoning"} or not item_id:
         return False
+    if completed:
+        _codex_mark_authoritative_item(state, item_id)
     text = _codex_modern_text(item)
     if item_type == "reasoning":
         if not text:
@@ -3218,7 +3307,7 @@ def _codex_modern_message_apply(
     if event is None:
         if not text and item_type != "agentMessage":
             return True
-        event = _append_event(
+        event = _codex_append_streaming_event(
             state,
             {
                 "kind": kind,
@@ -3226,13 +3315,13 @@ def _codex_modern_message_apply(
                 "text": _clip(text, MAX_TEXT),
                 **({"encrypted": encrypted} if kind == "thinking" else {}),
             },
+            open=not completed,
         )
         messages[item_id] = event
-        if completed and text:
+        if completed:
             state.setdefault("pending_modern_deltas", {}).pop(item_id, None)
         else:
             _codex_replay_pending_deltas(state, item_id, event)
-        _codex_track_turn_event(state, event, open=not completed)
     elif text and event.get("text") != text:
         event["text"] = _clip(text, MAX_TEXT)
         _record_change(state, {"kind": "tail", "from": int(event["id"])})
@@ -3248,23 +3337,75 @@ def _codex_modern_message_delta(state: dict, params: dict) -> bool:
         return False
     event = state.setdefault("codex_modern_messages", {}).get(item_id)
     if event is None:
-        pending = state.setdefault("pending_modern_deltas", {}).setdefault(item_id, [])
-        if len(pending) < MAX_CODEX_DELTA_CACHE:
-            pending.append({"identity": _codex_delta_identity(params), "text": delta})
+        accepted, _ = _codex_apply_delta(
+            state,
+            item_id,
+            delta,
+            identity=_codex_delta_identity(params),
+            current=None,
+            limit=MAX_TEXT,
+        )
+        return accepted
+    accepted, updated = _codex_apply_delta(
+        state,
+        item_id,
+        delta,
+        identity=_codex_delta_identity(params),
+        current=event.get("text") or "",
+        limit=MAX_TEXT,
+    )
+    if not accepted:
         return False
-    current = event.get("text") or ""
-    seen = state.setdefault("codex_delta_cache", set())
-    identity = _codex_delta_identity(params)
-    signature = (item_id, identity)
-    if identity is not None and signature in seen:
+    if updated is not None and updated != event.get("text"):
+        event["text"] = updated
+        _record_change(state, {"kind": "tail", "from": int(event["id"])})
+    return True
+
+
+def _codex_modern_reasoning_delta(
+    state: dict, params: dict, ts: str | None
+) -> bool:
+    delta = params.get("delta")
+    if not isinstance(delta, str):
+        part = params.get("part")
+        delta = part.get("text") if isinstance(part, dict) else None
+    if not isinstance(delta, str):
+        return False
+    item_id = _codex_modern_item_id({}, params)
+    if not item_id:
+        _codex_upsert_reasoning(
+            state,
+            delta,
+            ts,
+            stream_open=True,
+            delta_identity=_codex_delta_identity(params),
+        )
         return True
-    if identity is not None:
-        seen.add(signature)
-    if len(seen) > MAX_CODEX_DELTA_CACHE:
-        for old in list(seen)[: MAX_CODEX_DELTA_CACHE // 2]:
-            seen.remove(old)
-    event["text"] = _clip(current + delta, MAX_TEXT)
-    _record_change(state, {"kind": "tail", "from": int(event["id"])})
+    current = state.setdefault("codex_reasoning_text", {}).get(item_id, "")
+    accepted, updated = _codex_apply_delta(
+        state,
+        item_id,
+        delta,
+        identity=_codex_delta_identity(params),
+        current=current,
+        limit=MAX_TEXT,
+        buffer_missing=False,
+    )
+    if not accepted:
+        return False
+    if updated is None or updated == current:
+        return True
+    has_event = any(
+        key.startswith(f"{item_id}:")
+        for key in state.setdefault("codex_reasoning_events", {})
+    )
+    _codex_upsert_reasoning(
+        state,
+        updated,
+        ts,
+        item_id,
+        stream_open=not has_event,
+    )
     return True
 
 
@@ -3339,6 +3480,9 @@ def _codex_close_turn(state: dict, turn: dict, ts: str | None) -> dict | None:
         )
         for event in message_events:
             if not isinstance(event, dict):
+                continue
+            if id(event) in seen:
+                # Tool lifecycle changes already have an authoritative patch.
                 continue
             event["partial"] = True
             try:
@@ -3450,6 +3594,8 @@ def _codex_normalized_apply(state: dict, row: dict) -> None:
     }:
         item = params.get("item")
         if isinstance(item, dict):
+            if method != "item/started":
+                _codex_mark_authoritative_item(state, _codex_modern_item_id(item))
             item_status = item.get("status")
             item_result = item.get("result")
             item_failed = (
@@ -3475,7 +3621,10 @@ def _codex_normalized_apply(state: dict, row: dict) -> None:
                     _codex_modern_text(item),
                     ts,
                     item.get("id"),
+                    stream_open=method == "item/started",
                 )
+                if method != "item/started":
+                    _codex_mark_authoritative_item(state, item.get("id"))
                 reasoning_id = str(item.get("id")) if item.get("id") else None
                 if reasoning_id:
                     for key, event in state.get("codex_reasoning_events", {}).items():
@@ -3500,10 +3649,14 @@ def _codex_normalized_apply(state: dict, row: dict) -> None:
                 return
 
     if method in {
-        "item/agentMessage/delta",
         "item/reasoning/summaryTextDelta",
         "item/reasoning/summaryPartAdded",
-    } and _codex_modern_message_delta(state, params):
+    } and _codex_modern_reasoning_delta(state, params, ts):
+        _record_row_disposition(state, _normalized_disposition(row))
+        return
+    if method == "item/agentMessage/delta" and _codex_modern_message_delta(
+        state, params
+    ):
         _record_row_disposition(state, _normalized_disposition(row))
         return
     if method in {
@@ -3522,12 +3675,7 @@ def _codex_normalized_apply(state: dict, row: dict) -> None:
         if isinstance(item, dict):
             native_row = {"type": "response_item", "timestamp": ts, "payload": item}
     elif method in {"item/reasoning/summaryTextDelta", "item/reasoning/summaryPartAdded"}:
-        delta = params.get("delta")
-        if not isinstance(delta, str):
-            part = params.get("part")
-            delta = part.get("text") if isinstance(part, dict) else None
-        if isinstance(delta, str):
-            _codex_upsert_reasoning(state, delta, ts, params.get("itemId"), append=True)
+        _codex_modern_reasoning_delta(state, params, ts)
         _record_row_disposition(state, _normalized_disposition(row))
         return
     elif method == "item/completed":
@@ -4701,6 +4849,7 @@ def _new_parse_state(fmt: str) -> dict:
         "pending_artifacts": {},
         "codex_modern_items": {},
         "codex_modern_messages": {},
+        "codex_authoritative_items": set(),
         "codex_turn_open_events": {},
         "pending_modern_deltas": {},
         "codex_delta_cache": set(),

@@ -1963,6 +1963,179 @@ class CodexModernTranscriptParityTests(unittest.TestCase):
         self.assertEqual(len(tools), 1)
         self.assertEqual(tools[0]["output"], "final")
 
+    def test_round5_i1_interrupt_marks_every_delta_stream_kind_partial(self) -> None:
+        cases = {
+            "agentMessage": [
+                self._row(
+                    "item/started",
+                    {"item": {"type": "agentMessage", "id": "agent-live", "text": ""}},
+                    1,
+                ),
+                self._row(
+                    "item/agentMessage/delta",
+                    {"itemId": "agent-live", "delta": "unfinished answer"},
+                    2,
+                ),
+            ],
+            "reasoning": [
+                self._row(
+                    "item/started",
+                    {"item": {"type": "reasoning", "id": "reasoning-live", "summary": []}},
+                    1,
+                ),
+                self._row(
+                    "item/reasoning/summaryTextDelta",
+                    {"itemId": "reasoning-live", "delta": "unfinished thought"},
+                    2,
+                ),
+            ],
+            "tool output": [
+                self._row(
+                    "item/started",
+                    {
+                        "item": {
+                            "type": "commandExecution",
+                            "id": "tool-live",
+                            "command": "echo live",
+                        }
+                    },
+                    1,
+                ),
+                self._row(
+                    "item/commandExecution/outputDelta",
+                    {"itemId": "tool-live", "delta": "unfinished output"},
+                    2,
+                ),
+            ],
+        }
+        for kind, rows in cases.items():
+            with self.subTest(kind=kind), TemporaryDirectory() as tmp:
+                rows.append(
+                    self._row(
+                        "turn/completed",
+                        {"turn": {"status": "interrupted"}},
+                        3,
+                    )
+                )
+                path = Path(tmp) / "interrupt.jsonl"
+                path.write_text("".join(json.dumps(row) + "\n" for row in rows))
+                parsed = transcripts.read_session_events("codex-normalized", path)
+
+            event = next(event for event in parsed["events"] if event["kind"] != "interrupt")
+            if event["kind"] == "tool":
+                self.assertTrue(event["tool"].get("partial"), kind)
+            else:
+                self.assertTrue(event.get("partial"), kind)
+
+    def test_round5_i2_authoritative_completion_drops_every_late_delta_path(self) -> None:
+        cases = {
+            "agentMessage": [
+                self._row(
+                    "item/started",
+                    {"item": {"type": "agentMessage", "id": "agent-authoritative", "text": ""}},
+                    1,
+                ),
+                self._row(
+                    "item/agentMessage/delta",
+                    {"itemId": "agent-authoritative", "delta": "before "},
+                    2,
+                ),
+                self._row(
+                    "item/completed",
+                    {"item": {"type": "agentMessage", "id": "agent-authoritative", "text": "final"}},
+                    3,
+                ),
+                self._row(
+                    "item/agentMessage/delta",
+                    {"itemId": "agent-authoritative", "delta": "after"},
+                    4,
+                ),
+            ],
+            "reasoning": [
+                self._row(
+                    "item/started",
+                    {"item": {"type": "reasoning", "id": "reasoning-authoritative", "summary": []}},
+                    1,
+                ),
+                self._row(
+                    "item/reasoning/summaryTextDelta",
+                    {"itemId": "reasoning-authoritative", "delta": "before "},
+                    2,
+                ),
+                self._row(
+                    "item/completed",
+                    {
+                        "item": {
+                            "type": "reasoning",
+                            "id": "reasoning-authoritative",
+                            "summary": [{"text": "final"}],
+                        }
+                    },
+                    3,
+                ),
+                self._row(
+                    "item/reasoning/summaryTextDelta",
+                    {"itemId": "reasoning-authoritative", "delta": "after"},
+                    4,
+                ),
+            ],
+            "tool output": [
+                self._row(
+                    "item/started",
+                    {
+                        "item": {
+                            "type": "commandExecution",
+                            "id": "tool-authoritative",
+                            "command": "echo final",
+                        }
+                    },
+                    1,
+                ),
+                self._row(
+                    "item/commandExecution/outputDelta",
+                    {"itemId": "tool-authoritative", "delta": "before "},
+                    2,
+                ),
+                self._row(
+                    "item/completed",
+                    {
+                        "item": {
+                            "type": "commandExecution",
+                            "id": "tool-authoritative",
+                            "command": "echo final",
+                            "status": "completed",
+                            "aggregatedOutput": "final",
+                        }
+                    },
+                    3,
+                ),
+                self._row(
+                    "item/commandExecution/outputDelta",
+                    {"itemId": "tool-authoritative", "delta": "after"},
+                    4,
+                ),
+            ],
+        }
+        for kind, rows in cases.items():
+            with self.subTest(kind=kind), TemporaryDirectory() as tmp:
+                rows.append(
+                    self._row(
+                        "turn/completed",
+                        {"turn": {"status": "completed"}},
+                        5,
+                    )
+                )
+                path = Path(tmp) / "authoritative.jsonl"
+                path.write_text("".join(json.dumps(row) + "\n" for row in rows))
+                parsed = transcripts.read_session_events("codex-normalized", path)
+
+            events = [event for event in parsed["events"] if event["kind"] != "interrupt"]
+            self.assertEqual(len(events), 1, kind)
+            event = events[0]
+            value = event["tool"]["output"] if event["kind"] == "tool" else event["text"]
+            self.assertEqual(value, "final", kind)
+            self.assertNotIn("after", value, kind)
+
     def test_round3_g5_successful_turn_closes_pending_tools(self) -> None:
         rows = [
             self._row(
