@@ -809,9 +809,10 @@ class CodexNewRuntimeTranscriptTests(unittest.TestCase):
         self.assertEqual(resolved["name"], "exec")
         self.assertEqual(
             resolved["input"],
-            "Codex tool wrapper could not be decoded: exec_command",
+            "dynamic tool program",
         )
         self.assertEqual(resolved["archetype"], "run")
+        self.assertEqual(resolved["summary"], "exec dynamic tool program")
 
     def test_wiki265_harness_shapes_never_leak_raw_javascript(self) -> None:
         """WIKI-265: real custom_tool_call shapes render as semantic tools.
@@ -867,6 +868,22 @@ class CodexNewRuntimeTranscriptTests(unittest.TestCase):
         # This fixture has one aggregate result block, not one result per
         # child. Keep sibling output evidence without claiming both passed.
         self.assertEqual([tool["ok"] for tool in mixed], [None, None])
+
+    def test_wiki267_live_order_prefers_reasoning_and_native_mcp_rows(self) -> None:
+        path = FIXTURES_DIR / "codex_wiki267_live_order.jsonl"
+
+        parsed = transcripts.read_session_events("codex-normalized", path)
+        thinking = [event for event in parsed["events"] if event["kind"] == "thinking"]
+        tools = [event["tool"] for event in parsed["events"] if event["kind"] == "tool"]
+
+        self.assertEqual([event["text"] for event in thinking], ["**Exploring agent/events terminal module**"])
+        self.assertTrue(thinking[0]["encrypted"])
+        self.assertEqual(
+            [tool["name"] for tool in tools],
+            ["mcp__wiki_artifacts__read_agent", "mcp__wiki_artifacts__read_agent_events"],
+        )
+        self.assertEqual([tool["output"] for tool in tools], ["agent details", "event details"])
+        self.assertTrue(all("const" not in tool["input"] and "await tools" not in tool["input"] for tool in tools))
 
     def test_codex_runtime_preamble_is_metadata_not_output(self) -> None:
         path = FIXTURES_DIR / "codex_preamble_runtime_rendering.jsonl"
@@ -955,7 +972,7 @@ class CodexNewRuntimeTranscriptTests(unittest.TestCase):
                 fallback = transcripts._codex_harness_fallback_input(source)
                 self.assertEqual(
                     fallback,
-                    "Codex tool wrapper could not be decoded: exec_command",
+                    "dynamic tool program",
                 )
 
     def test_harness_scanner_rejects_object_variable_indirection(self) -> None:
@@ -1044,7 +1061,7 @@ class CodexNewRuntimeTranscriptTests(unittest.TestCase):
         self.assertLessEqual(len(fallback), transcripts.MAX_TOOL_IO)
         self.assertNotIn("const r =", fallback)
         self.assertNotIn("await tools.", fallback)
-        self.assertIn("exec_command", fallback)
+        self.assertEqual(fallback, "dynamic tool program")
 
         oversized = "tools.exec_command({cmd: \"echo hi\"});" + (" " * transcripts.MAX_CODEX_HARNESS_SOURCE)
         self.assertIsNone(transcripts._codex_harness_tool("exec", oversized))

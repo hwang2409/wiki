@@ -431,6 +431,8 @@ def _classify_tool(name: str, tool_input: str) -> tuple[str, str]:
     mcp = re.match(r"mcp__[\w-]+__(\w+)$", name)
     if mcp:
         name = mcp.group(1)
+    if name == "exec" and tool_input == "dynamic tool program":
+        return ("run", "exec dynamic tool program")
     if name == "wait":
         return ("wait", "wait" if not tool_input else f"wait {_clip(tool_input, 54)}")
     if name == "apply_patch":
@@ -1326,19 +1328,21 @@ def _codex_synthesized_bash(call_arguments: list[dict]) -> str | None:
 
 def _codex_harness_fallback_input(raw_input: str) -> str:
     """Describe an undecodable wrapper without exposing its JavaScript body."""
-    names: list[str] = []
-    for match in re.finditer(r"\btools\.([A-Za-z_$][\w$]*)", raw_input[:MAX_CODEX_HARNESS_SOURCE]):
-        name = match.group(1)
-        if name not in names:
-            names.append(name)
-        if len(names) == 8:
-            break
-    if names:
-        label = ", ".join(names)
-        if len(names) == 8:
-            label += ", …"
-        return _clip(f"Codex tool wrapper could not be decoded: {label}", MAX_TOOL_IO)
-    return "Codex tool wrapper could not be decoded"
+    del raw_input
+    return "dynamic tool program"
+
+
+def _codex_wrapper_has_native_mcp(state: dict, raw_input: object) -> bool:
+    """Check whether native MCP rows replace an outer wrapper's MCP work."""
+    if not isinstance(raw_input, str):
+        return False
+    all_names = {
+        match.group(1)
+        for match in re.finditer(r"\btools\.([A-Za-z0-9_$-]+)", raw_input)
+    }
+    names = {name for name in all_names if name.startswith("mcp__")}
+    native_names = {name for name, _ in state.get("codex_native_tools", set())}
+    return bool(names) and names == all_names and names.issubset(native_names)
 
 
 def _codex_harness_tool(name: object, raw_input: object) -> dict | None:
@@ -1745,6 +1749,8 @@ def _codex_add_semantic_tool_event(
     raw_input: object,
     ts: str | None,
     call_id: object,
+    *,
+    wrapper: bool = False,
 ) -> tuple[dict | None, bool]:
     """Add one already-normalized Codex call."""
     pending: dict = state["pending"]
@@ -1755,6 +1761,11 @@ def _codex_add_semantic_tool_event(
     classify_input = tool_input
     structured_input = raw_input
     name = str(name or "")
+    if name == "exec" and _codex_wrapper_has_native_mcp(state, raw_input):
+        return None, True
+    native_key = (name, tool_input)
+    if wrapper and native_key in state.get("codex_native_tools", set()):
+        return None, True
     if _is_artifact_tool(name) and call_id:
         state.setdefault("pending_artifacts", {})[call_id] = {
             "name": name,
@@ -1807,6 +1818,7 @@ def _codex_add_tool_event(
             child["arguments"],
             ts,
             call_id,
+            wrapper=True,
         )
 
     references: list[dict] = []
@@ -1817,6 +1829,7 @@ def _codex_add_tool_event(
             child["arguments"],
             ts,
             None,
+            wrapper=True,
         )
         references.append(
             {
@@ -1897,6 +1910,30 @@ def _codex_apply_mcp_tool_item(state: dict, item: dict, ts: str | None) -> bool:
         return False
     _codex_finish_tool_event(state, event, call_id, _codex_mcp_output(item), ts)
     return True
+
+
+def _codex_native_tool_key(row: dict) -> tuple[str, str] | None:
+    """Return the semantic identity of an authoritative native MCP item."""
+    payload = row.get("payload")
+    if not isinstance(payload, dict):
+        return None
+    item = payload
+    if row.get("type") == "response_item":
+        if payload.get("type") != "mcpToolCall":
+            return None
+    else:
+        method = payload.get("method")
+        if method not in {"item/completed", "rawResponseItem/completed"}:
+            return None
+        params = payload.get("params")
+        item = params.get("item") if isinstance(params, dict) else None
+        if not isinstance(item, dict) or item.get("type") != "mcpToolCall":
+            return None
+    server = item.get("server")
+    tool = item.get("tool")
+    if not isinstance(server, str) or not isinstance(tool, str):
+        return None
+    return (f"mcp__{server}__{tool}", _codex_tool_input(tool, item.get("arguments", item.get("input", {}))))
 
 
 def _is_artifact_tool(name: object) -> bool:
@@ -2274,6 +2311,49 @@ def _codex_bold_summary_fragments(text: str) -> list[str] | None:
         index = close + 2
 
 
+def _codex_upsert_reasoning(
+    state: dict,
+    text: str,
+    ts: str | None,
+    item_id: object = None,
+    *,
+    append: bool = False,
+) -> None:
+    """Merge live summary deltas with their completed reasoning item."""
+    identity = str(item_id) if isinstance(item_id, str) and item_id else None
+    if append and identity:
+        text = f"{state.setdefault('codex_reasoning_text', {}).get(identity, '')}{text}"
+        state["codex_reasoning_text"][identity] = text
+    elif identity:
+        state.setdefault("codex_reasoning_text", {})[identity] = text
+    text = text.strip()
+    if not text:
+        return
+    fragments = _codex_bold_summary_fragments(text)
+    values = [f"**{fragment}**" for fragment in fragments] if fragments and len(fragments) > 1 else [text]
+    by_key = state.setdefault("codex_reasoning_events", {})
+    for index, value in enumerate(values):
+        key = f"{identity}:{index}" if identity else None
+        event = by_key.get(key) if key else None
+        if event is None:
+            event = _append_event(
+                state,
+                {
+                    "kind": "thinking",
+                    "ts": ts,
+                    "text": _clip(value, MAX_TEXT),
+                    "encrypted": True,
+                },
+            )
+            if key:
+                by_key[key] = event
+            continue
+        bounded = _clip(value, MAX_TEXT)
+        if event.get("text") != bounded:
+            event["text"] = bounded
+            _mark_tail_changed(state, state["events"].index(event))
+
+
 def _codex_apply(state: dict, row: dict) -> None:
     pending: dict = state["pending"]  # call_id → event (awaiting output)
     ts = row.get("timestamp")
@@ -2359,23 +2439,7 @@ def _codex_apply(state: dict, row: dict) -> None:
             text = " ".join(
                 s.get("text", "") for s in summary if isinstance(s, dict)
             ).strip()
-            encrypted = isinstance(payload.get("encrypted_content"), str)
-            fragments = _codex_bold_summary_fragments(text)
-            thinking_texts = (
-                [f"**{fragment}**" for fragment in fragments]
-                if fragments and len(fragments) > 1
-                else [text]
-            )
-            for thinking_text in thinking_texts:
-                _append_event(
-                    state,
-                    {
-                        "kind": "thinking",
-                        "ts": ts,
-                        "text": _clip(thinking_text, MAX_TEXT),
-                        "encrypted": encrypted,
-                    },
-                )
+            _codex_upsert_reasoning(state, text, ts, payload.get("id"))
             _record_row_disposition(state, EVENT_DISPOSITION_RENDERED)
         elif ptype == "mcpToolCall":
             if _codex_apply_mcp_tool_item(state, payload, ts):
@@ -2546,6 +2610,15 @@ def _codex_normalized_apply(state: dict, row: dict) -> None:
         item = params.get("item")
         if isinstance(item, dict):
             native_row = {"type": "response_item", "timestamp": ts, "payload": item}
+    elif method in {"item/reasoning/summaryTextDelta", "item/reasoning/summaryPartAdded"}:
+        delta = params.get("delta")
+        if not isinstance(delta, str):
+            part = params.get("part")
+            delta = part.get("text") if isinstance(part, dict) else None
+        if isinstance(delta, str):
+            _codex_upsert_reasoning(state, delta, ts, params.get("itemId"), append=True)
+        _record_row_disposition(state, _normalized_disposition(row))
+        return
     elif method == "item/completed":
         # App-server also emits rawResponseItem/completed for rich content.
         # These two message forms are retained as a defensive fallback and the
@@ -2584,10 +2657,13 @@ def _codex_normalized_apply(state: dict, row: dict) -> None:
             )
             _record_row_disposition(state, _normalized_disposition(row))
             return
-        if isinstance(item, dict) and item.get("type") == "mcpToolCall":
-            if _codex_apply_mcp_tool_item(state, item, ts):
-                _record_row_disposition(state, _normalized_disposition(row))
-                return
+        if (
+            isinstance(item, dict)
+            and item.get("type") == "mcpToolCall"
+            and _codex_apply_mcp_tool_item(state, item, ts)
+        ):
+            _record_row_disposition(state, _normalized_disposition(row))
+            return
         if isinstance(item, dict) and item.get("type") == "userMessage":
             text = "\n".join(
                 str(block.get("text"))
@@ -2607,6 +2683,12 @@ def _codex_normalized_apply(state: dict, row: dict) -> None:
                     "type": "agent_message",
                     "message": str(item.get("text") or ""),
                 },
+            }
+        elif isinstance(item, dict) and item.get("type") == "reasoning":
+            native_row = {
+                "type": "response_item",
+                "timestamp": ts,
+                "payload": item,
             }
     elif method == "thread/tokenUsage/updated":
         usage = params.get("tokenUsage")
@@ -3714,6 +3796,7 @@ def _new_parse_state(fmt: str) -> dict:
         "thinking_tokens": 0,
         "artifact_ids": set(),
         "dedupe_credits": {},
+        "codex_native_tools": set(),
         "dispositions": {"rendered": 0, "summarized": 0, "ignored": 0, "unknown": 0},
         # parent event id → child agent id (claude only); dies with the state
         # so stale links cannot outlive a transcript reset (WIKI-244).
@@ -3766,6 +3849,7 @@ def _read_cached_state(fmt: str, path: Path, key: str) -> dict:
             state["offset"] = f.tell()
         lines = chunk.split("\n")
         state["buffer"] = lines.pop()  # trailing partial line waits for next read
+        parsed_rows: list[dict] = []
         for line in lines:
             if not line.strip():
                 continue
@@ -3773,6 +3857,15 @@ def _read_cached_state(fmt: str, path: Path, key: str) -> dict:
                 row = json.loads(line)
             except (ValueError, RecursionError, MemoryError):
                 continue
+            if isinstance(row, dict):
+                parsed_rows.append(row)
+        if fmt.startswith("codex"):
+            native_tools = state.setdefault("codex_native_tools", set())
+            for row in parsed_rows:
+                native_key = _codex_native_tool_key(row)
+                if native_key is not None:
+                    native_tools.add(native_key)
+        for row in parsed_rows:
             try:
                 apply(state, row)
             except (KeyError, TypeError, AttributeError):
