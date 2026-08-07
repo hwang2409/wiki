@@ -872,6 +872,7 @@ class _CodexOutputDetails:
     text: str
     status: bool | None
     status_explicit: bool
+    status_priority: int
     wall_time_ms: int | None
 
 
@@ -880,7 +881,9 @@ def _strip_codex_runtime_preamble(text: str) -> tuple[str, bool | None, int | No
     lines = text.splitlines(keepends=True)
     if len(lines) >= 3:
         script = lines[0].strip()
-        script_match = re.fullmatch(r"Script\s+(completed|failed)", script, re.IGNORECASE)
+        script_match = re.fullmatch(
+            r"Script\s+(completed|failed|terminated)", script, re.IGNORECASE
+        )
         wall_match = re.fullmatch(
             r"Wall\s+time\s+([0-9]+(?:\.[0-9]+)?)\s+seconds",
             lines[1].strip(),
@@ -891,7 +894,7 @@ def _strip_codex_runtime_preamble(text: str) -> tuple[str, bool | None, int | No
             wall_time_ms = round(float(wall_match.group(1)) * 1000)
             return "".join(lines[3:]), status, wall_time_ms
     escaped_match = re.match(
-        r"^Script\s+(completed|failed)\\n"
+        r"^Script\s+(completed|failed|terminated)\\n"
         r"Wall\s+time\s+([0-9]+(?:\.[0-9]+)?)\s+seconds\\n"
         r"Output:\\n",
         text,
@@ -904,12 +907,17 @@ def _strip_codex_runtime_preamble(text: str) -> tuple[str, bool | None, int | No
     return text, None, None
 
 
-def _codex_tool_output_details(value: object) -> _CodexOutputDetails:
+def _codex_tool_output_details(
+    value: object, *, strip_runtime_preamble: bool = True
+) -> _CodexOutputDetails:
     """Extract command text from Codex output envelopes and infer success."""
     if value is None:
-        return _CodexOutputDetails("", None, False, None)
+        return _CodexOutputDetails("", None, False, 0, None)
     if isinstance(value, str):
-        body, runtime_status, wall_time_ms = _strip_codex_runtime_preamble(value)
+        if strip_runtime_preamble:
+            body, runtime_status, wall_time_ms = _strip_codex_runtime_preamble(value)
+        else:
+            body, runtime_status, wall_time_ms = value, None, None
         had_preamble = runtime_status is not None
         candidate = body.strip()
         for parser in (json.loads, ast.literal_eval):
@@ -920,51 +928,87 @@ def _codex_tool_output_details(value: object) -> _CodexOutputDetails:
             except (ValueError, SyntaxError):
                 continue
             if isinstance(parsed, (dict, list)):
-                nested = _codex_tool_output_details(parsed)
+                nested = _codex_tool_output_details(parsed, strip_runtime_preamble=False)
                 if had_preamble or nested.status is not None or nested.text != candidate:
-                    status = nested.status if nested.status_explicit else runtime_status
+                    if nested.status_priority >= 3:
+                        status = nested.status
+                        status_priority = nested.status_priority
+                    elif runtime_status is not None:
+                        status = runtime_status
+                        status_priority = 2
+                    else:
+                        status = nested.status
+                        status_priority = nested.status_priority
                     return _CodexOutputDetails(
                         nested.text,
                         status,
-                        nested.status_explicit,
+                        status_priority >= 3,
+                        status_priority,
                         wall_time_ms if wall_time_ms is not None else nested.wall_time_ms,
                     )
         if re.search(r"\bexited with code 0\b", body):
-            return _CodexOutputDetails(body, True, True, wall_time_ms)
+            status = runtime_status if runtime_status is not None else True
+            return _CodexOutputDetails(
+                body,
+                status,
+                runtime_status is None,
+                2 if runtime_status is not None else 1,
+                wall_time_ms,
+            )
         match = re.search(r"\b(?:exit(?:ed)?|exit_code)\D+(\d+)\b", body)
         if match:
-            return _CodexOutputDetails(body, int(match.group(1)) == 0, True, wall_time_ms)
-        return _CodexOutputDetails(body, runtime_status, False, wall_time_ms)
+            status = runtime_status if runtime_status is not None else int(match.group(1)) == 0
+            return _CodexOutputDetails(
+                body,
+                status,
+                runtime_status is None,
+                2 if runtime_status is not None else 1,
+                wall_time_ms,
+            )
+        return _CodexOutputDetails(
+            body,
+            runtime_status,
+            False,
+            2 if runtime_status is not None else 0,
+            wall_time_ms,
+        )
     if isinstance(value, list):
         nested: list[tuple[_CodexOutputDetails, bool]] = []
-        for item in value:
+        for index, item in enumerate(value):
             if isinstance(item, dict) and isinstance(item.get("text"), str):
                 text = item["text"]
-                details = _codex_tool_output_details(text)
+                details = _codex_tool_output_details(
+                    text,
+                    strip_runtime_preamble=strip_runtime_preamble and index == 0,
+                )
                 # Preserve old list semantics: plain text did not infer an
                 # exit status unless normalization changed that text.
                 nested.append((details, details.text != text))
             else:
-                nested.append((_codex_tool_output_details(item), True))
-        explicit_statuses = [
-            item.status
+                nested.append(
+                    (
+                        _codex_tool_output_details(item, strip_runtime_preamble=False),
+                        True,
+                    )
+                )
+        status_candidates = [
+            item
             for item, status_candidate in nested
-            if status_candidate and item.status_explicit and item.status is not None
+            if status_candidate and item.status is not None
         ]
-        fallback_statuses = [
-            item.status
-            for item, status_candidate in nested
-            if status_candidate and not item.status_explicit and item.status is not None
-        ]
-        if explicit_statuses:
-            status = all(explicit_statuses)
-            status_explicit = True
-        elif fallback_statuses:
-            status = all(fallback_statuses)
-            status_explicit = False
+        if status_candidates:
+            status_priority = max(item.status_priority for item in status_candidates)
+            statuses = [
+                item.status
+                for item in status_candidates
+                if item.status_priority == status_priority
+            ]
+            status = all(statuses)
+            status_explicit = status_priority >= 3
         else:
             status = None
             status_explicit = False
+            status_priority = 0
         wall_time_ms = next(
             (item.wall_time_ms for item, _ in nested if item.wall_time_ms is not None),
             None,
@@ -973,35 +1017,43 @@ def _codex_tool_output_details(value: object) -> _CodexOutputDetails:
             "\n".join(item.text for item, _ in nested if item.text),
             status,
             status_explicit,
+            status_priority,
             wall_time_ms,
         )
     if isinstance(value, dict):
         status = _codex_output_status(value)
         status_explicit = status is not None
+        status_priority = 3 if status_explicit else 0
         if "output" in value:
-            nested = _codex_tool_output_details(value.get("output"))
+            nested = _codex_tool_output_details(
+                value.get("output"), strip_runtime_preamble=False
+            )
             return _CodexOutputDetails(
                 nested.text,
                 status if status_explicit else nested.status,
                 status_explicit or nested.status_explicit,
+                status_priority if status_explicit else nested.status_priority,
                 nested.wall_time_ms,
             )
         content = value.get("content")
         if content is not None:
-            nested = _codex_tool_output_details(content)
+            nested = _codex_tool_output_details(content, strip_runtime_preamble=False)
             return _CodexOutputDetails(
                 nested.text,
                 status if status_explicit else nested.status,
                 status_explicit or nested.status_explicit,
+                status_priority if status_explicit else nested.status_priority,
                 nested.wall_time_ms,
             )
         error = value.get("error")
         if error is not None:
             return _CodexOutputDetails(
-                str(error), False if status is None else status, True, None
+                str(error), False if status is None else status, True, 3, None
             )
-        return _CodexOutputDetails(json.dumps(value), status, status_explicit, None)
-    return _CodexOutputDetails(str(value), None, False, None)
+        return _CodexOutputDetails(
+            json.dumps(value), status, status_explicit, status_priority, None
+        )
+    return _CodexOutputDetails(str(value), None, False, 0, None)
 
 
 def _codex_tool_output(value: object) -> tuple[str, bool | None]:

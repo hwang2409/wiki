@@ -774,6 +774,15 @@ class CodexNewRuntimeTranscriptTests(unittest.TestCase):
         )
         self.assertEqual(tools[4]["output"], "first line\nOutput:\nsecond line\n")
         self.assertTrue(tools[4]["ok"])
+        self.assertEqual(
+            tools[5]["output"],
+            "Script completed\nWall time 1.0 seconds\nOutput:\nbody data\n",
+        )
+        self.assertTrue(tools[5]["ok"])
+        self.assertEqual(tools[6]["output"], "terminated output\n")
+        self.assertFalse(tools[6]["ok"])
+        self.assertEqual(tools[7]["output"], "command exited with code 0\n")
+        self.assertFalse(tools[7]["ok"])
 
     def test_codex_runtime_wall_time_fills_missing_completion_timestamp(self) -> None:
         rows = [
