@@ -66,7 +66,7 @@ Never guess child calls. Never assign an outer result to extracted children. The
 - Use one shared registry and the existing Claude-compatible tool, diff, running, failed, and approval components.
 - Keep non-artifact content as inspectable raw text or JSON. Only `render_artifact` earns rich rendering.
 - Apply the safe source-to-IR grammar above. Keep wrapper JavaScript behind the fallback row's inspector only.
-- Normalize simple and adjacent bold Codex summary fragments without changing their text. Keep the encrypted capability marker.
+- Normalize simple bold Codex summary fragments without changing their text. Split a complete sequence such as `**thought one** **thought two**` into separate ordered thinking events. Keep mixed or ambiguous markdown as one event. Preserve the encrypted capability marker on every derived event.
 
 ## Definition of done
 
@@ -76,6 +76,7 @@ Never guess child calls. Never assign an outer result to extracted children. The
 - Unsafe wrappers always use one `DynamicToolProgram` fallback. Tests prove no dead branch, uncalled function, mutation, alias, template, spread, or malformed source invents a child call.
 - Ordered calls produce one ordered group. Direct `Promise.all` calls produce one parallel group.
 - Child results link only through proven child boundaries or identities. An aggregate outer result never becomes a guessed child result.
+- Complete same-line and newline-separated bold Codex summary sequences render as separate thought rows. Mixed prose and generic Claude thinking do not split.
 - One item identity produces one visible row across raw/completed twins and resumed replay.
 - Session deltas patch existing rows without duplication or order changes.
 - Screenshot-equivalent shell, read, plan, and web calls match hypothetical Claude rows in structure, syntax highlighting, state, and expansion behavior.
