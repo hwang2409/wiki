@@ -89,7 +89,6 @@ In Progress:
 - PHO-14037 on-call transfer — investigate-then-fix worker spawned
 - PHO-15253 bash rewrite PRs A/B/C — night shift worker
 - PHO-15254 retrieve adoption tranche 1 — night shift worker
-- [P1] wiki-app: WIKI-263 codex exec output preamble (Script completed/Wall time/Output:) blocks numbered-payload highlighting; strip to metadata (owner: wiki-dev fleet)
 - [P1] wiki-app: WIKI-264 WKWebView blocks user-installed fonts (~/Library/Fonts) — serve font files via sidecar @font-face; fixes picker availability AND silent SF Mono fallback since WIKI-256 (owner: wiki-dev fleet)
 Backlog:
 

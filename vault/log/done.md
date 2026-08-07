@@ -2,13 +2,19 @@
 type: log
 tags: [log, done]
 created: 2026-07-06
-updated: 2026-08-06
+updated: 2026-08-07
 ---
 
 # Done
 
+## 2026-08-07
+
+- WIKI-263 merged (#199) — codex exec preamble stripped to metadata (outer-only, Script terminated form, status precedence); numbered-payload highlighting engages on codex reads
+- **PHOEBE** — OpenCode attach shim review-clean after 5 rounds (PR 13587 draft, 543d223b) — stock opencode TUI attaches to v3 agent via python shim, pinned v1.18.14
+
 ## 2026-08-06
 
+- **PHOEBE** — #13557 to_sandbox opt-in staging MERGED to main (06bb8da3) — agent-chosen sandbox staging on the spool seam; survived foundation restructure port + post-squash main merge
 - WIKI-262 merged (#198) — codex transcript parity: JS harness unwrap, apply_patch decode, wait/mcpToolCall classification, strict lexical scanner; 3 review rounds
 - **PHOEBE** — v3 ladder foundation #13505 MERGED to main (511c1696) — sandbox foundation, run_bash, output spool, local TUI; 8 review rounds + CI-outage rescue (.buildkite sync)
 - WIKI-261 merged (#197) — numbered read-tool outputs now syntax-highlighted (gutter stripped, tokenized, gutter column)
