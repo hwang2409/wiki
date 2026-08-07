@@ -2036,6 +2036,23 @@ def _codex_finish_tool_event(
         ts,
         failed=output_details.status is False,
     ):
+        # A batch child can have a provisional tool row before its child call
+        # id is known. Keep that row live while also emitting the artifact.
+        target = event
+        if target is not None:
+            target["tool"]["output"] = _clip(output_text, MAX_TOOL_IO)
+            target["tool"]["ok"] = (
+                output_details.status
+                if output_details.status is not None
+                else True
+            )
+            target["tool"]["completed_at"] = _codex_completion_timestamp(
+                target, ts, output_details.wall_time_ms
+            )
+            target["tool"]["status"] = (
+                "completed" if target["tool"]["ok"] else "failed"
+            )
+            _record_tool_patch(state, target)
         return
     target = state["pending"].pop(call_id, None) if call_id else event
     if target is None:
@@ -2223,6 +2240,16 @@ def _codex_reset_turn_scope(state: dict) -> None:
     state.setdefault("codex_native_tools", set()).clear()
     state.setdefault("codex_native_call_ids", set()).clear()
     state.setdefault("pending_wrappers", {}).clear()
+    state.setdefault("codex_turn_open_events", {}).clear()
+
+
+def _codex_track_turn_event(state: dict, event: dict, *, open: bool) -> None:
+    events: dict = state.setdefault("codex_turn_open_events", {})
+    key = id(event)
+    if open:
+        events[key] = event
+    else:
+        events.pop(key, None)
 
 
 _CODEX_MODERN_TOOL_TYPES = {
@@ -2429,7 +2456,10 @@ def _codex_patch_modern_tool(
         tool["edit"] = edit
     if item_id:
         state.setdefault("codex_modern_items", {})[item_id] = event
-        _codex_replay_pending_deltas(state, item_id, event)
+        if completed and output is not None:
+            state.setdefault("pending_modern_deltas", {}).pop(item_id, None)
+        else:
+            _codex_replay_pending_deltas(state, item_id, event)
     _record_tool_patch(state, event)
 
 
@@ -3198,10 +3228,16 @@ def _codex_modern_message_apply(
             },
         )
         messages[item_id] = event
-        _codex_replay_pending_deltas(state, item_id, event)
+        if completed and text:
+            state.setdefault("pending_modern_deltas", {}).pop(item_id, None)
+        else:
+            _codex_replay_pending_deltas(state, item_id, event)
+        _codex_track_turn_event(state, event, open=not completed)
     elif text and event.get("text") != text:
         event["text"] = _clip(text, MAX_TEXT)
         _record_change(state, {"kind": "tail", "from": int(event["id"])})
+    if event is not None and completed:
+        _codex_track_turn_event(state, event, open=False)
     return True
 
 
@@ -3298,23 +3334,18 @@ def _codex_close_turn(state: dict, turn: dict, ts: str | None) -> dict | None:
         tool["partial"] = True
         _record_tool_patch(state, event)
     if terminal_status != "completed":
-        message_events = [
-            event
-            for event in state.get("codex_modern_messages", {}).values()
-            if isinstance(event, dict)
-        ]
-        message_events.extend(
-            event
-            for event in state.get("codex_reasoning_events", {}).values()
-            if isinstance(event, dict)
+        message_events = list(
+            state.setdefault("codex_turn_open_events", {}).values()
         )
-        seen_messages: set[int] = set()
         for event in message_events:
-            if id(event) in seen_messages:
+            if not isinstance(event, dict):
                 continue
-            seen_messages.add(id(event))
             event["partial"] = True
-            _mark_tail_changed(state, state["events"].index(event))
+            try:
+                index = state["events"].index(event)
+            except ValueError:
+                continue
+            _mark_tail_changed(state, index)
     state["pending"].clear()
     state["pending_batches"].clear()
     state["pending_results"].clear()
@@ -3432,6 +3463,9 @@ def _codex_normalized_apply(state: dict, row: dict) -> None:
             )
             artifact = None if item_failed else artifact_from_codex_mcp_tool_result(item)
             if artifact is not None:
+                item_id = _codex_modern_item_id(item)
+                if item_id:
+                    state.get("pending_artifacts", {}).pop(item_id, None)
                 _append_artifact_event(state, artifact, ts)
                 _record_row_disposition(state, _normalized_disposition(row))
                 return
@@ -3442,6 +3476,16 @@ def _codex_normalized_apply(state: dict, row: dict) -> None:
                     ts,
                     item.get("id"),
                 )
+                reasoning_id = str(item.get("id")) if item.get("id") else None
+                if reasoning_id:
+                    for key, event in state.get("codex_reasoning_events", {}).items():
+                        if not key.startswith(f"{reasoning_id}:"):
+                            continue
+                        _codex_track_turn_event(
+                            state,
+                            event,
+                            open=method == "item/started",
+                        )
                 _record_row_disposition(state, _normalized_disposition(row))
                 return
             if _codex_modern_message_apply(
@@ -3493,6 +3537,9 @@ def _codex_normalized_apply(state: dict, row: dict) -> None:
         item = params.get("item")
         artifact = artifact_from_codex_mcp_tool_result(item)
         if artifact is not None:
+            item_id = _codex_modern_item_id(item)
+            if item_id:
+                state.get("pending_artifacts", {}).pop(item_id, None)
             _append_artifact_event(state, artifact, ts)
             _record_row_disposition(state, _normalized_disposition(row))
             return
@@ -4654,6 +4701,7 @@ def _new_parse_state(fmt: str) -> dict:
         "pending_artifacts": {},
         "codex_modern_items": {},
         "codex_modern_messages": {},
+        "codex_turn_open_events": {},
         "pending_modern_deltas": {},
         "codex_delta_cache": set(),
         "pending_questions": {},

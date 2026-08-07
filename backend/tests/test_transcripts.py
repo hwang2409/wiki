@@ -1756,6 +1756,213 @@ class CodexModernTranscriptParityTests(unittest.TestCase):
             [artifact["id"]],
         )
 
+    def test_round4_h1_batch_artifact_child_emits_live_completion_patch(self) -> None:
+        artifact = {
+            "kind": "artifact",
+            "id": "00000000-0000-4000-8000-000000000267",
+            "title": "round 4",
+            "caption": "fixture",
+            "artifact": {"kind": "mermaid", "source": "graph TD; A-->B"},
+            "ts": "2026-08-07T12:00:01Z",
+        }
+        source = (
+            'const rs = await Promise.all(['
+            'tools.mcp__wiki_artifacts__render_artifact({kind:"mermaid",payload:{source:"graph TD; A-->B"}}),'
+            'tools.exec_command({cmd:"echo hi"})]); text(rs);'
+        )
+        started = {
+            "type": "response_item",
+            "timestamp": "2026-08-07T12:00:00Z",
+            "payload": {
+                "type": "custom_tool_call",
+                "call_id": "outer-267",
+                "name": "exec",
+                "input": source,
+            },
+        }
+        completed = {
+            "type": "response_item",
+            "timestamp": "2026-08-07T12:00:01Z",
+            "payload": {
+                "type": "custom_tool_call_output",
+                "call_id": "outer-267",
+                "output": [
+                    {"call_id": "artifact-267", "output": sentinel_text(artifact)},
+                    {"call_id": "command-267", "output": "hi\n", "exit_code": 0},
+                ],
+            },
+        }
+        with TemporaryDirectory() as tmp:
+            path = Path(tmp) / "batch-artifact-live.jsonl"
+            path.write_text(json.dumps(started) + "\n")
+            initial = transcripts.read_session_delta("codex", path, 0)
+            path.write_text(
+                json.dumps(started) + "\n" + json.dumps(completed) + "\n"
+            )
+            delta = transcripts.read_session_delta("codex", path, initial["cursor"])
+
+        artifact_patch = next(
+            patch for patch in delta["patches"] if patch["call_id"] == "artifact-267"
+        )
+        self.assertEqual(artifact_patch["output"], sentinel_text(artifact))
+        self.assertTrue(artifact_patch["ok"])
+        self.assertEqual(
+            [event["artifact_id"] for event in delta["events"] if event["kind"] == "artifact"],
+            [artifact["id"]],
+        )
+
+    def test_round4_h2_interrupt_only_marks_open_current_items_after_trim(self) -> None:
+        rows = [
+            self._row("turn/started", {"turn": {"id": "prior-turn"}}, 1),
+            self._row(
+                "item/started",
+                {"item": {"type": "agentMessage", "id": "prior", "text": "prior"}},
+                2,
+            ),
+            self._row(
+                "item/completed",
+                {"item": {"type": "agentMessage", "id": "prior", "text": "prior"}},
+                3,
+            ),
+            self._row("turn/completed", {"turn": {"status": "completed"}}, 4),
+            self._row("turn/started", {"turn": {"id": "current-turn"}}, 5),
+            self._row(
+                "item/started",
+                {
+                    "item": {
+                        "type": "agentMessage",
+                        "id": "current-complete",
+                        "text": "current complete",
+                    }
+                },
+                6,
+            ),
+            self._row(
+                "item/completed",
+                {
+                    "item": {
+                        "type": "agentMessage",
+                        "id": "current-complete",
+                        "text": "current complete",
+                    }
+                },
+                7,
+            ),
+            self._row(
+                "item/started",
+                {
+                    "item": {
+                        "type": "agentMessage",
+                        "id": "current-open",
+                        "text": "current open",
+                    }
+                },
+                8,
+            ),
+        ]
+        for index in range(2000):
+            item_id = f"filler-{index}"
+            rows.extend(
+                [
+                    self._row(
+                        "item/started",
+                        {"item": {"type": "agentMessage", "id": item_id, "text": item_id}},
+                        9 + index * 2,
+                    ),
+                    self._row(
+                        "item/completed",
+                        {"item": {"type": "agentMessage", "id": item_id, "text": item_id}},
+                        10 + index * 2,
+                    ),
+                ]
+            )
+        with TemporaryDirectory() as tmp:
+            path = Path(tmp) / "interrupt-trimmed.jsonl"
+            path.write_text("".join(json.dumps(row) + "\n" for row in rows))
+            transcripts.read_session_events("codex-normalized", path)
+            path.write_text(
+                path.read_text()
+                + json.dumps(
+                    self._row(
+                        "turn/completed",
+                        {"turn": {"status": "interrupted"}},
+                        5000,
+                    )
+                )
+                + "\n"
+            )
+            transcripts.read_session_events("codex-normalized", path)
+            state = transcripts._cache[str(path)]
+
+        self.assertNotIn("partial", state["codex_modern_messages"]["prior"])
+        self.assertNotIn("partial", state["codex_modern_messages"]["current-complete"])
+        self.assertTrue(state["codex_modern_messages"]["current-open"]["partial"])
+
+    def test_round4_h3_successful_native_artifact_has_no_rejected_row(self) -> None:
+        artifact = _artifact_protocol_event("mermaid", 268)
+        item = {
+            "type": "mcpToolCall",
+            "id": "native-artifact-268",
+            "server": "wiki_artifacts",
+            "tool": "render_artifact",
+            "arguments": {
+                "kind": "mermaid",
+                "payload": {"source": "graph TD; A-->B"},
+            },
+            "status": "inProgress",
+        }
+        completed = {
+            **item,
+            "status": "completed",
+            "result": {"content": [{"type": "text", "text": sentinel_text(artifact)}]},
+        }
+        rows = [
+            self._row("turn/started", {"turn": {"id": "artifact-turn"}}, 1),
+            self._row("item/started", {"item": item}, 2),
+            self._row("item/completed", {"item": completed}, 3),
+            self._row("turn/completed", {"turn": {"status": "completed"}}, 4),
+        ]
+        with TemporaryDirectory() as tmp:
+            path = Path(tmp) / "native-artifact-success.jsonl"
+            path.write_text("".join(json.dumps(row) + "\n" for row in rows))
+            parsed = transcripts.read_session_events("codex-normalized", path)
+
+        self.assertEqual([event["kind"] for event in parsed["events"]], ["artifact"])
+        self.assertEqual(
+            [event for event in parsed["events"] if event["kind"] == "tool"], []
+        )
+
+    def test_round4_h4_authoritative_item_output_replaces_buffered_delta(self) -> None:
+        rows = [
+            self._row(
+                "item/commandExecution/outputDelta",
+                {"itemId": "authoritative-269", "delta": "stale "},
+                1,
+            ),
+            self._row(
+                "item/completed",
+                {
+                    "item": {
+                        "type": "commandExecution",
+                        "id": "authoritative-269",
+                        "command": "echo final",
+                        "status": "completed",
+                        "aggregatedOutput": "final",
+                        "exitCode": 0,
+                    }
+                },
+                2,
+            ),
+        ]
+        with TemporaryDirectory() as tmp:
+            path = Path(tmp) / "authoritative-output.jsonl"
+            path.write_text("".join(json.dumps(row) + "\n" for row in rows))
+            parsed = transcripts.read_session_events("codex-normalized", path)
+
+        tools = [event["tool"] for event in parsed["events"] if event["kind"] == "tool"]
+        self.assertEqual(len(tools), 1)
+        self.assertEqual(tools[0]["output"], "final")
+
     def test_round3_g5_successful_turn_closes_pending_tools(self) -> None:
         rows = [
             self._row(
