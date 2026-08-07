@@ -752,6 +752,58 @@ class CodexNewRuntimeTranscriptTests(unittest.TestCase):
         self.assertIn("tools.exec_command(args)", malformed["input"])
         self.assertEqual(malformed["archetype"], "run")
 
+    def test_codex_runtime_preamble_is_metadata_not_output(self) -> None:
+        path = FIXTURES_DIR / "codex_preamble_runtime_rendering.jsonl"
+
+        parsed = transcripts.read_session_events("codex", path)
+
+        tools = [event["tool"] for event in parsed["events"] if event["kind"] == "tool"]
+        self.assertEqual(
+            tools[0]["output"],
+            "90\tdef _clip(text: str, limit: int) -> str:\n"
+            "91\t    if len(text) <= limit:\n",
+        )
+        self.assertTrue(tools[0]["ok"])
+        self.assertEqual(tools[1]["output"], "1\t# wiki\n2\t\n")
+        self.assertTrue(tools[1]["ok"])
+        self.assertEqual(tools[2]["output"], "command failed\n")
+        self.assertFalse(tools[2]["ok"])
+        self.assertEqual(
+            tools[3]["output"],
+            "1\tfirst line\n2\tsecond line\n... [120 chars truncated]",
+        )
+        self.assertEqual(tools[4]["output"], "first line\nOutput:\nsecond line\n")
+        self.assertTrue(tools[4]["ok"])
+
+    def test_codex_runtime_wall_time_fills_missing_completion_timestamp(self) -> None:
+        rows = [
+            {
+                "type": "response_item",
+                "timestamp": "2026-08-07T12:00:00Z",
+                "payload": {
+                    "type": "custom_tool_call",
+                    "call_id": "wall-time-only",
+                    "name": "exec",
+                    "input": 'tools.exec_command({cmd: "printf ok"})',
+                },
+            },
+            {
+                "type": "response_item",
+                "payload": {
+                    "type": "custom_tool_call_output",
+                    "call_id": "wall-time-only",
+                    "output": "Script completed\nWall time 1.2 seconds\nOutput:\nok\n",
+                },
+            },
+        ]
+        with TemporaryDirectory() as tmp:
+            path = Path(tmp) / "codex-wall-time.jsonl"
+            path.write_text("".join(json.dumps(row) + "\n" for row in rows))
+            parsed = transcripts.read_session_events("codex", path)
+
+        tool = parsed["events"][0]["tool"]
+        self.assertEqual(tool["completed_at"], "2026-08-07T12:00:01.200000Z")
+
     def test_harness_scanner_ignores_strings_comments_and_unsupported_args(self) -> None:
         cases = [
             'const text = "tools.exec_command({cmd: \\"hidden\\"})";',

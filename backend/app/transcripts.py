@@ -31,6 +31,7 @@ import threading
 from collections.abc import Callable
 from contextlib import contextmanager
 from copy import deepcopy
+from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from pathlib import Path, PurePosixPath
 
@@ -866,67 +867,166 @@ def _codex_output_status(value: dict) -> bool | None:
     return None
 
 
-def _codex_tool_output(value: object) -> tuple[str, bool | None]:
+@dataclass(frozen=True)
+class _CodexOutputDetails:
+    text: str
+    status: bool | None
+    status_explicit: bool
+    wall_time_ms: int | None
+
+
+def _strip_codex_runtime_preamble(text: str) -> tuple[str, bool | None, int | None]:
+    """Strip one leading Codex exec preamble and return its metadata."""
+    lines = text.splitlines(keepends=True)
+    if len(lines) >= 3:
+        script = lines[0].strip()
+        script_match = re.fullmatch(r"Script\s+(completed|failed)", script, re.IGNORECASE)
+        wall_match = re.fullmatch(
+            r"Wall\s+time\s+([0-9]+(?:\.[0-9]+)?)\s+seconds",
+            lines[1].strip(),
+            re.IGNORECASE,
+        )
+        if script_match and wall_match and lines[2].strip() == "Output:":
+            status = script_match.group(1).lower() == "completed"
+            wall_time_ms = round(float(wall_match.group(1)) * 1000)
+            return "".join(lines[3:]), status, wall_time_ms
+    escaped_match = re.match(
+        r"^Script\s+(completed|failed)\\n"
+        r"Wall\s+time\s+([0-9]+(?:\.[0-9]+)?)\s+seconds\\n"
+        r"Output:\\n",
+        text,
+        re.IGNORECASE,
+    )
+    if escaped_match:
+        status = escaped_match.group(1).lower() == "completed"
+        wall_time_ms = round(float(escaped_match.group(2)) * 1000)
+        return text[escaped_match.end() :], status, wall_time_ms
+    return text, None, None
+
+
+def _codex_tool_output_details(value: object) -> _CodexOutputDetails:
     """Extract command text from Codex output envelopes and infer success."""
     if value is None:
-        return "", None
+        return _CodexOutputDetails("", None, False, None)
     if isinstance(value, str):
-        stripped = value.strip()
+        body, runtime_status, wall_time_ms = _strip_codex_runtime_preamble(value)
+        had_preamble = runtime_status is not None
+        candidate = body.strip()
         for parser in (json.loads, ast.literal_eval):
-            if not stripped.startswith(("{", "[")):
+            if not candidate.startswith(("{", "[")):
                 break
             try:
-                parsed = parser(stripped)
+                parsed = parser(candidate)
             except (ValueError, SyntaxError):
                 continue
             if isinstance(parsed, (dict, list)):
-                extracted, status = _codex_tool_output(parsed)
-                if status is not None or extracted != stripped:
-                    return extracted, status
-        if re.search(r"\bexited with code 0\b", value):
-            return value, True
-        match = re.search(r"\b(?:exit(?:ed)?|exit_code)\D+(\d+)\b", value)
-        return value, int(match.group(1)) == 0 if match else None
+                nested = _codex_tool_output_details(parsed)
+                if had_preamble or nested.status is not None or nested.text != candidate:
+                    status = nested.status if nested.status_explicit else runtime_status
+                    return _CodexOutputDetails(
+                        nested.text,
+                        status,
+                        nested.status_explicit,
+                        wall_time_ms if wall_time_ms is not None else nested.wall_time_ms,
+                    )
+        if re.search(r"\bexited with code 0\b", body):
+            return _CodexOutputDetails(body, True, True, wall_time_ms)
+        match = re.search(r"\b(?:exit(?:ed)?|exit_code)\D+(\d+)\b", body)
+        if match:
+            return _CodexOutputDetails(body, int(match.group(1)) == 0, True, wall_time_ms)
+        return _CodexOutputDetails(body, runtime_status, False, wall_time_ms)
     if isinstance(value, list):
-        text_parts = [
-            item.get("text")
-            for item in value
-            if isinstance(item, dict) and isinstance(item.get("text"), str)
+        nested: list[tuple[_CodexOutputDetails, bool]] = []
+        for item in value:
+            if isinstance(item, dict) and isinstance(item.get("text"), str):
+                text = item["text"]
+                details = _codex_tool_output_details(text)
+                # Preserve old list semantics: plain text did not infer an
+                # exit status unless normalization changed that text.
+                nested.append((details, details.text != text))
+            else:
+                nested.append((_codex_tool_output_details(item), True))
+        explicit_statuses = [
+            item.status
+            for item, status_candidate in nested
+            if status_candidate and item.status_explicit and item.status is not None
         ]
-        if not text_parts and value and all(isinstance(item, dict) for item in value):
-            nested_outputs: list[str] = []
-            nested_statuses: list[bool] = []
-            for item in value:
-                extracted, nested_status = _codex_tool_output(item)
-                nested_outputs.append(extracted)
-                if nested_status is not None:
-                    nested_statuses.append(nested_status)
-            if nested_outputs:
-                return "\n".join(output for output in nested_outputs if output), (
-                    all(nested_statuses) if nested_statuses else None
-                )
-        for text in text_parts:
-            extracted, status = _codex_tool_output(text)
-            if status is not None and extracted != text:
-                return extracted, status
-        return "\n".join(text_parts), None
+        fallback_statuses = [
+            item.status
+            for item, status_candidate in nested
+            if status_candidate and not item.status_explicit and item.status is not None
+        ]
+        if explicit_statuses:
+            status = all(explicit_statuses)
+            status_explicit = True
+        elif fallback_statuses:
+            status = all(fallback_statuses)
+            status_explicit = False
+        else:
+            status = None
+            status_explicit = False
+        wall_time_ms = next(
+            (item.wall_time_ms for item, _ in nested if item.wall_time_ms is not None),
+            None,
+        )
+        return _CodexOutputDetails(
+            "\n".join(item.text for item, _ in nested if item.text),
+            status,
+            status_explicit,
+            wall_time_ms,
+        )
     if isinstance(value, dict):
         status = _codex_output_status(value)
+        status_explicit = status is not None
         if "output" in value:
-            output = value.get("output")
-            if isinstance(output, str):
-                return output, status
-            extracted, nested_status = _codex_tool_output(output)
-            return extracted, status if status is not None else nested_status
+            nested = _codex_tool_output_details(value.get("output"))
+            return _CodexOutputDetails(
+                nested.text,
+                status if status_explicit else nested.status,
+                status_explicit or nested.status_explicit,
+                nested.wall_time_ms,
+            )
         content = value.get("content")
         if content is not None:
-            extracted, nested_status = _codex_tool_output(content)
-            return extracted, status if status is not None else nested_status
+            nested = _codex_tool_output_details(content)
+            return _CodexOutputDetails(
+                nested.text,
+                status if status_explicit else nested.status,
+                status_explicit or nested.status_explicit,
+                nested.wall_time_ms,
+            )
         error = value.get("error")
         if error is not None:
-            return str(error), False if status is None else status
-        return json.dumps(value), status
-    return str(value), None
+            return _CodexOutputDetails(
+                str(error), False if status is None else status, True, None
+            )
+        return _CodexOutputDetails(json.dumps(value), status, status_explicit, None)
+    return _CodexOutputDetails(str(value), None, False, None)
+
+
+def _codex_tool_output(value: object) -> tuple[str, bool | None]:
+    details = _codex_tool_output_details(value)
+    return details.text, details.status
+
+
+def _codex_completion_timestamp(
+    event: dict, ts: str | None, wall_time_ms: int | None
+) -> str | None:
+    """Use the runtime wall time only when no result timestamp exists."""
+    if ts is not None:
+        return ts
+    existing = (event.get("tool") or {}).get("completed_at")
+    if existing is not None or wall_time_ms is None:
+        return existing
+    started = event.get("ts")
+    if not isinstance(started, str):
+        return None
+    try:
+        start = datetime.fromisoformat(started.replace("Z", "+00:00"))
+    except ValueError:
+        return None
+    completed = start + timedelta(milliseconds=wall_time_ms)
+    return completed.isoformat().replace("+00:00", "Z")
 
 
 def _structured_edit_payload(name: object, raw_input: object) -> dict | None:
@@ -1029,14 +1129,18 @@ def _codex_finish_tool_event(
     output: object,
     ts: str | None,
 ) -> None:
-    output_text, output_ok = _codex_tool_output(output)
+    output_details = _codex_tool_output_details(output)
+    output_text = output_details.text
+    output_ok = output_details.status
     if call_id and _complete_artifact(state, call_id, output_text, ts):
         return
     target = state["pending"].pop(call_id, None) if call_id else event
     if target:
         target["tool"]["output"] = _clip(output_text, MAX_TOOL_IO)
         target["tool"]["ok"] = output_ok
-        target["tool"]["completed_at"] = ts
+        target["tool"]["completed_at"] = _codex_completion_timestamp(
+            target, ts, output_details.wall_time_ms
+        )
         _record_tool_patch(state, target)
 
 
@@ -1282,16 +1386,20 @@ def _complete_artifact(
     return True
 
 
-def _codex_tool_end_output(ptype: str, payload: dict) -> tuple[str, bool | None]:
+def _codex_tool_end_output(
+    ptype: str, payload: dict
+) -> tuple[str, bool | None, int | None]:
     """patch_apply_end / mcp_tool_call_end carry the authoritative tool output
     the corresponding function_call/custom_tool_call left `output: null`."""
     if ptype == "patch_apply_end":
         parts = [payload.get("stdout") or "", payload.get("stderr") or ""]
-        return "\n".join(p for p in parts if p), bool(payload.get("success"))
+        details = _codex_tool_output_details("\n".join(p for p in parts if p))
+        return details.text, bool(payload.get("success")), details.wall_time_ms
     if ptype == "mcp_tool_call_end":
         result = payload.get("result") or {}
         if not isinstance(result, dict):
-            return str(result), None
+            details = _codex_tool_output_details(result)
+            return details.text, details.status, details.wall_time_ms
         ok_side, err_side = result.get("Ok"), result.get("Err")
         target = ok_side if ok_side is not None else err_side
         ok = ok_side is not None and err_side is None
@@ -1303,10 +1411,14 @@ def _codex_tool_end_output(ptype: str, payload: dict) -> tuple[str, bool | None]
                     for c in content
                     if isinstance(c, dict) and c.get("type") == "text"
                 )
-                return text or json.dumps(target), ok
-            return json.dumps(target), ok
-        return str(target if target is not None else result), ok
-    return json.dumps(payload), None
+                details = _codex_tool_output_details(text or json.dumps(target))
+                return details.text, ok, details.wall_time_ms
+            details = _codex_tool_output_details(json.dumps(target))
+            return details.text, ok, details.wall_time_ms
+        details = _codex_tool_output_details(target if target is not None else result)
+        return details.text, ok, details.wall_time_ms
+    details = _codex_tool_output_details(payload)
+    return details.text, details.status, details.wall_time_ms
 
 
 def _dedupe_pair(state: dict, source: str, role: str, text: str) -> bool:
@@ -1462,7 +1574,7 @@ def _codex_apply(state: dict, row: dict) -> None:
             _record_row_disposition(state, EVENT_DISPOSITION_RENDERED)
         elif ptype in ("patch_apply_end", "mcp_tool_call_end", "web_search_end"):
             call_id = payload.get("call_id")
-            out, ok = _codex_tool_end_output(ptype, payload)
+            out, ok, wall_time_ms = _codex_tool_end_output(ptype, payload)
             if _complete_artifact(state, call_id, str(out), ts, failed=ok is False):
                 _record_row_disposition(state, EVENT_DISPOSITION_RENDERED)
                 return
@@ -1470,7 +1582,9 @@ def _codex_apply(state: dict, row: dict) -> None:
             if event:
                 event["tool"]["output"] = _clip(str(out), MAX_TOOL_IO)
                 event["tool"]["ok"] = ok
-                event["tool"]["completed_at"] = ts
+                event["tool"]["completed_at"] = _codex_completion_timestamp(
+                    event, ts, wall_time_ms
+                )
                 _record_tool_patch(state, event)
             _record_row_disposition(state, EVENT_DISPOSITION_RENDERED)
         else:
@@ -1519,7 +1633,9 @@ def _codex_apply(state: dict, row: dict) -> None:
             _record_row_disposition(state, EVENT_DISPOSITION_RENDERED)
         elif ptype in ("function_call_output", "custom_tool_call_output", "tool_search_output"):
             call_id = payload.get("call_id")
-            output_text, output_ok = _codex_tool_output(payload.get("output"))
+            output_details = _codex_tool_output_details(payload.get("output"))
+            output_text = output_details.text
+            output_ok = output_details.status
             if _complete_artifact(state, call_id, output_text, ts):
                 _record_row_disposition(state, EVENT_DISPOSITION_RENDERED)
                 return
@@ -1527,7 +1643,9 @@ def _codex_apply(state: dict, row: dict) -> None:
             if event:
                 event["tool"]["output"] = _clip(output_text, MAX_TOOL_IO)
                 event["tool"]["ok"] = output_ok
-                event["tool"]["completed_at"] = ts
+                event["tool"]["completed_at"] = _codex_completion_timestamp(
+                    event, ts, output_details.wall_time_ms
+                )
                 _record_tool_patch(state, event)
             _record_row_disposition(state, EVENT_DISPOSITION_RENDERED)
         else:
