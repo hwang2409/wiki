@@ -2184,6 +2184,47 @@ def _codex_native_tool_key(row: dict) -> tuple[str, str] | None:
     return (f"mcp__{server}__{tool}", _codex_tool_input(tool, item.get("arguments", item.get("input", {}))))
 
 
+def _codex_turn_method(row: dict) -> str | None:
+    payload = row.get("payload")
+    if not isinstance(payload, dict):
+        return None
+    method = payload.get("method")
+    if isinstance(method, str):
+        return method
+    ptype = payload.get("type")
+    if ptype == "turn_started":
+        return "turn/started"
+    if ptype == "turn_completed":
+        return "turn/completed"
+    return None
+
+
+def _codex_native_call_id(row: dict) -> str | None:
+    payload = row.get("payload")
+    if not isinstance(payload, dict):
+        return None
+    item = payload
+    if row.get("type") == "response_item":
+        if payload.get("type") != "mcpToolCall":
+            return None
+    else:
+        params = payload.get("params")
+        item = params.get("item") if isinstance(params, dict) else None
+        if not isinstance(item, dict) or item.get("type") != "mcpToolCall":
+            return None
+    for key in ("id", "itemId", "call_id", "callId"):
+        value = item.get(key)
+        if isinstance(value, (str, int)) and str(value):
+            return str(value)
+    return None
+
+
+def _codex_reset_turn_scope(state: dict) -> None:
+    state.setdefault("codex_native_tools", set()).clear()
+    state.setdefault("codex_native_call_ids", set()).clear()
+    state.setdefault("pending_wrappers", {}).clear()
+
+
 _CODEX_MODERN_TOOL_TYPES = {
     "commandExecution",
     "fileChange",
@@ -2229,12 +2270,6 @@ def _codex_modern_tool_spec(item: dict) -> tuple[str, object] | None:
     if item_type == "dynamicToolCall":
         name = item.get("tool", item.get("name", "dynamicToolCall"))
         arguments = item.get("arguments", item.get("input", {}))
-        content_items = item.get("contentItems")
-        if content_items is not None:
-            if arguments in ({}, None):
-                arguments = {"contentItems": content_items}
-            else:
-                arguments = {"arguments": arguments, "contentItems": content_items}
         return str(name), arguments
     if item_type in {"collabToolCall", "collabAgentToolCall"}:
         return item_type, item.get(
@@ -2260,6 +2295,8 @@ def _codex_modern_item_output(item: dict) -> object:
         return output
     if item_type == "mcpToolCall":
         return _codex_mcp_output(item)
+    if "contentItems" in item:
+        return item["contentItems"]
     for key in ("output", "result", "content", "error"):
         if key in item:
             return item[key]
@@ -2272,6 +2309,9 @@ def _codex_modern_item_status(item: dict) -> bool | None:
     result = item.get("result")
     if isinstance(result, dict) and result.get("isError") is True:
         return False
+    success = item.get("success")
+    if isinstance(success, bool):
+        return success
     status = item.get("status")
     if isinstance(status, str):
         normalized = status.lower()
@@ -2799,6 +2839,7 @@ def _record_tool_patch(state: dict, event: dict) -> None:
             "kind": "patch",
             "id": int(event["id"]),
             "index": int(event["id"]),
+            "call_id": tool.get("call_id"),
             "output": tool.get("output"),
             "ok": tool.get("ok"),
             "completed_at": tool.get("completed_at"),
@@ -2923,7 +2964,16 @@ def _codex_apply(state: dict, row: dict) -> None:
         if ptype == "thread_settings_applied":
             _record_row_disposition(state, EVENT_DISPOSITION_IGNORED)
             return
-        if ptype == "user_message":
+        if ptype == "turn_started":
+            _codex_reset_turn_scope(state)
+            _record_row_disposition(state, EVENT_DISPOSITION_RENDERED)
+        elif ptype == "turn_completed":
+            turn = payload.get("turn") or {}
+            marker = _codex_close_turn(state, turn, ts) if isinstance(turn, dict) else None
+            if marker is not None:
+                _append_event(state, marker)
+            _record_row_disposition(state, EVENT_DISPOSITION_RENDERED)
+        elif ptype == "user_message":
             text = _clip(payload.get("message") or "", MAX_TEXT)
             if text and not _dedupe_pair(state, "event_msg", "user", text):
                 _append_event(state, {"kind": "user", "ts": ts, "text": text})
@@ -3247,6 +3297,24 @@ def _codex_close_turn(state: dict, turn: dict, ts: str | None) -> dict | None:
         tool["completed_at"] = ts
         tool["partial"] = True
         _record_tool_patch(state, event)
+    if terminal_status != "completed":
+        message_events = [
+            event
+            for event in state.get("codex_modern_messages", {}).values()
+            if isinstance(event, dict)
+        ]
+        message_events.extend(
+            event
+            for event in state.get("codex_reasoning_events", {}).values()
+            if isinstance(event, dict)
+        )
+        seen_messages: set[int] = set()
+        for event in message_events:
+            if id(event) in seen_messages:
+                continue
+            seen_messages.add(id(event))
+            event["partial"] = True
+            _mark_tail_changed(state, state["events"].index(event))
     state["pending"].clear()
     state["pending_batches"].clear()
     state["pending_results"].clear()
@@ -3256,6 +3324,7 @@ def _codex_close_turn(state: dict, turn: dict, ts: str | None) -> dict | None:
             state,
             _failed_artifact_tool(meta, f"turn {terminal_status}", ts),
         )
+    _codex_reset_turn_scope(state)
     if not failed:
         return None
     reason = turn.get("error") or turn.get("reason") or status
@@ -3339,6 +3408,10 @@ def _codex_normalized_apply(state: dict, row: dict) -> None:
         if _codex_modern_approval_event(state, payload, ts):
             _record_row_disposition(state, _normalized_disposition(row))
             return
+    elif method == "turn/started":
+        _codex_reset_turn_scope(state)
+        _record_row_disposition(state, _normalized_disposition(row))
+        return
     elif method in {
         "item/started",
         "item/completed",
@@ -4667,14 +4740,47 @@ def _read_cached_state(fmt: str, path: Path, key: str) -> dict:
                 continue
             if isinstance(row, dict):
                 parsed_rows.append(row)
+        native_scopes: list[tuple[set[tuple[str, str]], set[str]]] = []
         if fmt.startswith("codex"):
-            native_tools = state.setdefault("codex_native_tools", set())
-            for row in parsed_rows:
-                native_key = _codex_native_tool_key(row)
-                if native_key is not None:
-                    native_tools.add(native_key)
-        for row in parsed_rows:
+            base_tools = set(state.setdefault("codex_native_tools", set()))
+            base_call_ids = set(state.setdefault("codex_native_call_ids", set()))
+
+            def prime_scope(start: int, end: int) -> None:
+                scope_tools = set(base_tools)
+                scope_call_ids = set(base_call_ids)
+                for scoped_row in parsed_rows[start:end]:
+                    native_key = _codex_native_tool_key(scoped_row)
+                    if native_key is not None:
+                        scope_tools.add(native_key)
+                    native_call_id = _codex_native_call_id(scoped_row)
+                    if native_call_id is not None:
+                        scope_call_ids.add(native_call_id)
+                native_scopes.extend(
+                    (set(scope_tools), set(scope_call_ids)) for _ in range(end - start)
+                )
+
+            segment_start = 0
+            for index, row in enumerate(parsed_rows):
+                method = _codex_turn_method(row)
+                if method == "turn/started":
+                    if index > segment_start:
+                        prime_scope(segment_start, index)
+                    segment_start = index
+                    base_tools = set()
+                    base_call_ids = set()
+                if method == "turn/completed":
+                    prime_scope(segment_start, index + 1)
+                    segment_start = index + 1
+                    base_tools = set()
+                    base_call_ids = set()
+            if segment_start < len(parsed_rows):
+                prime_scope(segment_start, len(parsed_rows))
+        for index, row in enumerate(parsed_rows):
             try:
+                if fmt.startswith("codex") and index < len(native_scopes):
+                    tools, call_ids = native_scopes[index]
+                    state["codex_native_tools"] = tools
+                    state["codex_native_call_ids"] = call_ids
                 apply(state, row)
             except (KeyError, TypeError, AttributeError):
                 continue
@@ -4881,11 +4987,13 @@ def read_session_delta(
         patches = [
             {
                 "id": int(entry["id"]),
+                "call_id": entry.get("call_id"),
                 "output": entry.get("output"),
                 "ok": entry.get("ok"),
                 "completed_at": entry.get("completed_at"),
                 "duration_ms": entry.get("duration_ms"),
                 "status": entry.get("status"),
+                "partial": entry.get("partial"),
                 "terminal_input": entry.get("terminal_input"),
                 "metadata": entry.get("metadata"),
                 "edit": entry.get("edit"),

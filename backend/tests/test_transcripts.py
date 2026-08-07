@@ -1505,6 +1505,55 @@ class CodexModernTranscriptParityTests(unittest.TestCase):
             '{"value": "other"}',
         ])
 
+    def test_round3_g1_wrapper_suppression_is_scoped_to_one_turn(self) -> None:
+        def raw(seq: int, row_type: str, payload: dict) -> dict:
+            return {
+                "type": row_type,
+                "timestamp": f"2026-08-07T12:00:{seq:02d}Z",
+                "payload": payload,
+            }
+
+        wrapper_input = 'tools.mcp__fixture__lookup({value:"wanted"});'
+        rows = [
+            raw(1, "event_msg", {"type": "turn_started"}),
+            raw(2, "response_item", {
+                "type": "custom_tool_call",
+                "call_id": "wrapper-1",
+                "name": "exec",
+                "input": wrapper_input,
+            }),
+            raw(3, "response_item", {
+                "type": "mcpToolCall",
+                "id": "native-1",
+                "server": "fixture",
+                "tool": "lookup",
+                "arguments": {"value": "wanted"},
+                "status": "completed",
+                "result": {"content": [{"type": "text", "text": "native"}]},
+            }),
+            raw(4, "event_msg", {"type": "turn_completed", "turn": {"status": "completed"}}),
+            raw(5, "event_msg", {"type": "turn_started"}),
+            raw(6, "response_item", {
+                "type": "custom_tool_call",
+                "call_id": "wrapper-2",
+                "name": "exec",
+                "input": wrapper_input,
+            }),
+        ]
+        with TemporaryDirectory() as tmp:
+            path = Path(tmp) / "turn-scoped-wrapper.jsonl"
+            path.write_text("\n".join(json.dumps(row) for row in rows) + "\n")
+            parsed = transcripts.read_session_events("codex", path)
+
+        tools = [event["tool"] for event in parsed["events"] if event["kind"] == "tool"]
+        self.assertEqual([tool["name"] for tool in tools], [
+            "mcp__fixture__lookup",
+            "mcp__fixture__lookup",
+        ])
+        self.assertEqual(tools[0]["output"], "native")
+        self.assertIsNone(tools[1]["output"])
+        self.assertIsNone(tools[1]["ok"])
+
     def test_round2_f2_statusless_completed_items_are_done(self) -> None:
         parsed = transcripts.read_session_events(
             "codex-normalized", FIXTURES_DIR / "codex_wiki266_round2_lifecycle.jsonl"
@@ -1523,8 +1572,34 @@ class CodexModernTranscriptParityTests(unittest.TestCase):
         tools = [event["tool"] for event in parsed["events"] if event["kind"] == "tool"]
         by_call_id = {tool["call_id"]: tool for tool in tools}
         self.assertEqual(by_call_id["collab-1"]["name"], "collabAgentToolCall")
-        self.assertIn("contentItems", by_call_id["dynamic-1"]["input"])
-        self.assertIn("needle", by_call_id["dynamic-1"]["input"])
+        self.assertNotIn("contentItems", by_call_id["dynamic-1"]["input"])
+        self.assertEqual(by_call_id["dynamic-1"]["output"], "needle")
+
+    def test_round3_g2_dynamic_content_items_are_output_and_success_is_authoritative(self) -> None:
+        item = {
+            "type": "dynamicToolCall",
+            "id": "dynamic-failed",
+            "tool": "lookup",
+            "arguments": {"query": "needle"},
+        }
+        completed = {
+            **item,
+            "contentItems": [{"type": "text", "text": "not found"}],
+            "success": False,
+        }
+        rows = [
+            self._row("item/started", {"item": item}, 1),
+            self._row("item/completed", {"item": completed}, 2),
+        ]
+        with TemporaryDirectory() as tmp:
+            path = Path(tmp) / "dynamic-output.jsonl"
+            path.write_text("".join(json.dumps(row) + "\n" for row in rows))
+            parsed = transcripts.read_session_events("codex-normalized", path)
+
+        tool = next(event["tool"] for event in parsed["events"] if event["kind"] == "tool")
+        self.assertEqual(tool["input"], "needle")
+        self.assertEqual(tool["output"], "not found")
+        self.assertFalse(tool["ok"])
 
     def test_round2_f4_failed_turn_closes_pending_tool_and_marks_turn(self) -> None:
         parsed = transcripts.read_session_events(
@@ -1558,6 +1633,64 @@ class CodexModernTranscriptParityTests(unittest.TestCase):
         tool = next(event["tool"] for event in parsed["events"] if event["kind"] == "tool")
         self.assertEqual(tool["output"], "samesame")
         self.assertTrue(tool["partial"])
+
+    def test_round3_g3_interrupted_assistant_and_reasoning_are_partial(self) -> None:
+        rows = [
+            self._row(
+                "item/started",
+                {"item": {"type": "agentMessage", "id": "assistant-partial", "text": "unfinished"}},
+                1,
+            ),
+            self._row(
+                "item/started",
+                {
+                    "item": {
+                        "type": "reasoning",
+                        "id": "reasoning-partial",
+                        "summary": [{"text": "unfinished thought"}],
+                        "encrypted_content": "opaque",
+                    }
+                },
+                2,
+            ),
+            self._row("turn/completed", {"turn": {"status": "interrupted"}}, 3),
+        ]
+        with TemporaryDirectory() as tmp:
+            path = Path(tmp) / "partial-messages.jsonl"
+            path.write_text("".join(json.dumps(row) + "\n" for row in rows))
+            parsed = transcripts.read_session_events("codex-normalized", path)
+
+        events = {
+            event["text"]: event
+            for event in parsed["events"]
+            if event["kind"] in {"assistant", "thinking"}
+        }
+        self.assertTrue(events["unfinished"]["partial"])
+        self.assertTrue(events["unfinished thought"]["partial"])
+
+    def test_round3_g4_live_patch_carries_call_id_and_partial(self) -> None:
+        started = self._row(
+            "item/started",
+            {"item": {"type": "commandExecution", "id": "live-command", "command": "echo hi"}},
+            1,
+        )
+        completed = self._row(
+            "turn/completed",
+            {"turn": {"status": "interrupted"}},
+            2,
+        )
+        with TemporaryDirectory() as tmp:
+            path = Path(tmp) / "live-patch.jsonl"
+            path.write_text(json.dumps(started) + "\n")
+            initial = transcripts.read_session_delta("codex-normalized", path, 0)
+            with path.open("a") as handle:
+                handle.write(json.dumps(completed) + "\n")
+            delta = transcripts.read_session_delta("codex-normalized", path, initial["cursor"])
+
+        self.assertEqual(len(delta["patches"]), 1)
+        patch = delta["patches"][0]
+        self.assertEqual(patch["call_id"], "live-command")
+        self.assertTrue(patch["partial"])
 
     def test_round2_f6_blank_agent_message_registers_before_delta(self) -> None:
         rows = [
@@ -1622,6 +1755,25 @@ class CodexModernTranscriptParityTests(unittest.TestCase):
             [event["artifact_id"] for event in parsed["events"] if event["kind"] == "artifact"],
             [artifact["id"]],
         )
+
+    def test_round3_g5_successful_turn_closes_pending_tools(self) -> None:
+        rows = [
+            self._row(
+                "item/started",
+                {"item": {"type": "commandExecution", "id": "successful-pending", "command": "echo hi"}},
+                1,
+            ),
+            self._row("turn/completed", {"turn": {"status": "completed"}}, 2),
+        ]
+        with TemporaryDirectory() as tmp:
+            path = Path(tmp) / "successful-turn.jsonl"
+            path.write_text("".join(json.dumps(row) + "\n" for row in rows))
+            parsed = transcripts.read_session_events("codex-normalized", path)
+
+        tool = next(event["tool"] for event in parsed["events"] if event["kind"] == "tool")
+        self.assertTrue(tool["ok"])
+        self.assertEqual(tool["status"], "completed")
+        self.assertIsNotNone(tool["completed_at"])
 
     def test_legacy_result_first_is_buffered_until_call_identity_arrives(self) -> None:
         rows = [

@@ -6,13 +6,14 @@ import { fileURLToPath } from "node:url";
 import { cleanup, fireEvent, render } from "@testing-library/react";
 import { afterEach, beforeEach, expect, test, vi } from "vitest";
 
-import type { SessionEvent, SessionTool } from "../src/api";
+import type { AgentSessionData, SessionEvent, SessionTool } from "../src/api";
 import {
   outputLabelForTool,
   traceRows,
   toolStatus,
   toolSummaryParts,
 } from "../src/transcript-event-utils";
+import { mergeSession } from "../src/transcript-merge";
 import { BoundedPreview } from "../src/transcript-preview";
 import { clipSegmentsInline,
   cleanHarnessOutput,
@@ -106,6 +107,39 @@ test("tool units expose verb, target, status, and semantic output labels", () =>
   expect(outputLabelForTool(tool({ archetype: "read" }))).toBe("file contents");
   expect(outputLabelForTool(tool({ archetype: "git", name: "Diff" }))).toBe("diff");
   expect(outputLabelForTool(tool({ ok: false }))).toBe("error output");
+});
+
+test("live patches propagate child call identity and partial state", () => {
+  const initial: AgentSessionData = {
+    version: 2,
+    format: "codex",
+    path: "/tmp/codex.jsonl",
+    tokens: null,
+    base: 0,
+    cursor: 1,
+    tail_from: 0,
+    events: [event(7, { tool: tool({ output: null, ok: null, call_id: null }) })],
+    patches: [],
+  };
+  const next: AgentSessionData = {
+    ...initial,
+    cursor: 2,
+    tail_from: 1,
+    events: [],
+    patches: [{
+      id: 7,
+      call_id: "artifact-child",
+      output: "completed",
+      ok: true,
+      completed_at: "2026-08-07T12:00:01Z",
+      partial: true,
+    }],
+  };
+
+  const merged = mergeSession(mergeSession(null, initial), next);
+  expect(merged.events[0].tool?.call_id).toBe("artifact-child");
+  expect(merged.events[0].tool?.partial).toBe(true);
+  expect(merged.events[0].tool?.output).toBe("completed");
 });
 
 test("parallel completion timeline still produces one row per tool event", () => {

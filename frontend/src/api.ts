@@ -769,6 +769,7 @@ export type SessionEvent = {
   ts: string | null;
   text: string;
   disposition: SessionDisposition;
+  partial?: boolean;
   tool?: SessionTool;
   bash?: SessionBash;
   tasks?: SessionTask[];
@@ -796,11 +797,13 @@ export type SubagentInfo = {
 
 export type SessionPatch = {
   id: number;
+  call_id?: string | null;
   output: string | null;
   ok: boolean | null;
   completed_at?: string | null;
   duration_ms?: number | null;
   status?: string | null;
+  partial?: boolean | null;
   terminal_input?: string | null;
   metadata?: Record<string, unknown>;
   edit?: SessionTool["edit"];
