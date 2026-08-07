@@ -2,7 +2,7 @@
 type: reference
 tags: [tools, claude, codex, skills]
 created: 2026-07-06
-updated: 2026-07-29
+updated: 2026-08-07
 ---
 
 # Agent Skills & Plugins — Current State
@@ -55,7 +55,7 @@ Clusters: PR lifecycle (ship-pr, babysit-pr, own-pr, commit-push-pr, pushing-cod
 
 ## Cross-machine sync (2026-07-20)
 
-Canonical portable copy lives in the private repo **github.com/hwang2409/agent-config** (local checkout `~/me/fun/config`). Contains `claude/skills/` (13), `codex/skills/` (22), global `CLAUDE.md`/`AGENTS.md`, `install.sh` (idempotent, copy-mode, conflict-safe on instruction files) and `sync.sh` (live → repo, commit+push). ASD-STE100 style switch + caveman removal at commit `b234fb4` (2026-07-29). Flow: edit live skills → `./sync.sh` → other laptop `git pull && ./install.sh`. Plugins/MCP/settings.json deliberately NOT synced (machine-specific); plugin list documented in the repo README. After any skill edit session, run sync.sh or the repo drifts.
+Canonical portable copy lives in the private repo **github.com/hwang2409/agent-config** (local checkout `~/me/fun/config`). Contains `claude/skills/` (13), `codex/skills/` (22), global `CLAUDE.md`/`AGENTS.md`, `install.sh` (idempotent, copy-mode, conflict-safe on instruction files) and `sync.sh` (live → repo, commit+push). ASD-STE100 style switch + caveman removal landed at `b234fb4` (2026-07-29); the Codex foreground-wait ban landed at `e02d275` (2026-08-07). Flow: edit live skills → `./sync.sh` → other laptop `git pull && ./install.sh`. Plugins/MCP/settings.json deliberately NOT synced (machine-specific); plugin list documented in the repo README. After any skill edit session, run sync.sh or the repo drifts.
 
 ## Cleanse log (2026-07-06)
 
