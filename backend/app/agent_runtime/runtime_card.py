@@ -4,13 +4,15 @@ import subprocess
 from pathlib import Path
 
 from ..backend_runtime import normalize_loopback_url
-from .types import RunRecord
+from .types import ProviderKind, RunRecord
 
 
 MAX_RUNTIME_CARD_BYTES = 4_096
 MAX_PROVIDER_PROMPT_BYTES = 100_000
 PROTOCOL_NOTE = "~/me/fun/wiki/vault/tools/orchestrator-worker-protocol.md"
 VAULT_CONVENTIONS = "~/me/fun/wiki/vault/meta/conventions.md"
+CODEX_TOOL_TRANSCRIPT_GUIDANCE = """Codex tool transcript: prefer one inner `tools.*` call per `exec` script. After each result, reassess before the next call. Use multi-call scripts only for parallel reads, retries, or local control flow.
+"""
 
 
 def worktree_branch(worktree: str) -> str:
@@ -60,6 +62,9 @@ docs: protocol={PROTOCOL_NOTE} vault_conventions={VAULT_CONVENTIONS}
 native surface: {native_surface}
 skills: follow injected AGENTS.md/SKILL.md instructions and use available skills before improvising
 """
+    provider_guidance = (
+        CODEX_TOOL_TRANSCRIPT_GUIDANCE if record.provider is ProviderKind.CODEX else ""
+    )
     if record.role == "orchestrator":
         role = f"""ORCHESTRATOR controls (prefer MCP; CLI equivalents shown exactly):
 - list/read: `list_agents`, `read_agent`, `read_agent_events`, `read_agent_pr`; `wiki agent status <id>`; `wiki gate <pr> --expect-sha <sha>`
@@ -74,7 +79,7 @@ Use request_id idempotency for retried spawn/steer calls. Gate and archive per t
 Status file: {status_path} — atomically rewrite `{{"state":"working|merge-ready|blocked","pr":null|"<url>","step":"<one line>","blocker":null|"<reason>"}}` on every transition and before long operations.
 Isolation: this worktree/run directory is writable; live registry/runtime, other runs, ~/.claude, ~/.codex, vault, live app, and tmux are read-only unless the ticket explicitly says otherwise.
 """
-    card = common + role + "</WIKI_RUNTIME_CARD>"
+    card = common + provider_guidance + role + "</WIKI_RUNTIME_CARD>"
     if len(card.encode("utf-8")) > MAX_RUNTIME_CARD_BYTES:
         raise ValueError("Wiki runtime card exceeds its 4KB budget")
     return card

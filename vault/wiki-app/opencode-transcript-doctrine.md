@@ -15,6 +15,7 @@ Extracted first-hand from https://github.com/anomalyco/opencode at packages/tui/
 - Normalize provider-specific events at the backend boundary into one canonical transcript model.
 - Equivalent Claude and Codex messages, thoughts, tools, results, and errors use the same frontend components.
 - Codex harness JavaScript must never reach the rendering layer. Convert each call into the same semantic tool shape Claude uses.
+- Codex runtime cards prefer one inner `tools.*` call per `exec` script. Allow multi-call scripts only for parallel reads, retries, or local control flow; this improves transcript fidelity without removing useful agent behavior.
 - Provider-specific UI is allowed only when the provider lacks equivalent source data. Show that limit directly.
 - Encrypted Codex reasoning is one valid difference: render the fullest supplied summary, but never imply that Wiki can decrypt private reasoning.
 - Parity tests must compare canonical events and rendered behavior across both providers. Do not build a second Codex rendering framework.

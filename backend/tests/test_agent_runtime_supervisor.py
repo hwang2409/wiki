@@ -512,6 +512,11 @@ class SupervisorTests(unittest.IsolatedAsyncioTestCase):
                     self.assertIn("branch: codex/fixture-runtime-card", prompt)
                     self.assertTrue(prompt.endswith(f"Original prompt for {agent_id}"))
                     self.assertLess(len(prompt.encode("utf-8")), 100_000)
+                    if provider is ProviderKind.CODEX:
+                        self.assertIn("Codex tool transcript", prompt)
+                        self.assertIn("one inner `tools.*` call per `exec` script", prompt)
+                    else:
+                        self.assertNotIn("Codex tool transcript", prompt)
                     if role == "orchestrator":
                         self.assertIn("ORCHESTRATOR controls", prompt)
                         self.assertIn("wiki agent spawn <ticket>", prompt)
