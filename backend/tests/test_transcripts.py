@@ -1603,6 +1603,43 @@ class CodexModernTranscriptParityTests(unittest.TestCase):
         self.assertIn("artifact-terminal", state["codex_terminal_items"])
         self.assertNotIn("artifact-terminal", state["pending_artifacts"])
 
+    def test_round9_m1_interrupted_artifact_suppresses_late_completion(self) -> None:
+        artifact = _artifact_protocol_event("mermaid", 270)
+        item = {
+            "type": "mcpToolCall",
+            "id": "artifact-partial-replay",
+            "server": "wiki_artifacts",
+            "tool": "render_artifact",
+            "arguments": {"kind": "mermaid", "payload": {"source": "graph TD; A-->B"}},
+            "status": "inProgress",
+        }
+        completed = {
+            **item,
+            "status": "completed",
+            "result": {"content": [{"type": "text", "text": sentinel_text(artifact)}]},
+        }
+        rows = [
+            self._row("turn/started", {"turn": {"id": "partial-artifact-turn"}}, 1),
+            self._row("item/started", {"item": item}, 2),
+            self._row("turn/completed", {"turn": {"status": "interrupted"}}, 3),
+            self._row("item/completed", {"item": completed}, 4),
+        ]
+        with TemporaryDirectory() as tmp:
+            path = Path(tmp) / "partial-artifact-replay.jsonl"
+            path.write_text("".join(json.dumps(row) + "\n" for row in rows))
+            parsed = transcripts.read_session_events("codex-normalized", path)
+            state = transcripts._cache[str(path)]
+
+        outcomes = [
+            event for event in parsed["events"] if event["kind"] in {"tool", "artifact"}
+        ]
+        self.assertEqual(len(outcomes), 1)
+        self.assertEqual(outcomes[0]["kind"], "tool")
+        self.assertEqual(
+            state["codex_item_lifecycle"]["artifact-partial-replay"]["state"],
+            "partial",
+        )
+
     def test_round6_j3_trim_evicts_old_maps_and_preserves_visible_lifecycle(self) -> None:
         rows = []
         for index in range(2200):
@@ -2221,6 +2258,30 @@ class CodexModernTranscriptParityTests(unittest.TestCase):
             self.assertIn(last_id, state[pending_key])
             self.assertLessEqual(len(state["codex_item_lifecycle"]), transcripts.CODEX_EVENT_WINDOW)
 
+    def test_round9_m4_empty_reasoning_lifecycle_records_are_bounded(self) -> None:
+        rows = [
+            self._row(
+                "item/completed",
+                {"item": {"type": "reasoning", "id": f"empty-{index}", "summary": []}},
+                index,
+            )
+            for index in range(transcripts.CODEX_EVENT_WINDOW + 1)
+        ]
+        with TemporaryDirectory() as tmp:
+            path = Path(tmp) / "empty-reasoning.jsonl"
+            path.write_text("".join(json.dumps(row) + "\n" for row in rows))
+            transcripts.read_session_events("codex-normalized", path)
+            state = transcripts._cache[str(path)]
+
+        self.assertLessEqual(
+            len(state["codex_item_lifecycle"]), transcripts.CODEX_EVENT_WINDOW
+        )
+        self.assertNotIn("empty-0", state["codex_item_lifecycle"])
+        self.assertEqual(
+            state["codex_item_lifecycle"][f"empty-{transcripts.CODEX_EVENT_WINDOW}"]["state"],
+            "terminal",
+        )
+
     def test_round2_f1_wrapper_incremental_replay_matches_full_and_keeps_unmatched(self) -> None:
         wrapper = {
             "type": "response_item",
@@ -2366,6 +2427,73 @@ class CodexModernTranscriptParityTests(unittest.TestCase):
         self.assertEqual(len(tools), 1)
         self.assertEqual(tools[0]["output"], "native")
         self.assertEqual(state["codex_item_lifecycle"]["shared-native-id"]["state"], "terminal")
+
+    def test_round9_m2_incremental_batch_native_rows_clear_provisional_artifacts(self) -> None:
+        source = (
+            "const rs = await Promise.all(["
+            "tools.mcp__wiki_artifacts__render_artifact({kind:\"mermaid\",payload:{source:\"graph TD; A-->B\"}}),"
+            "tools.mcp__wiki_artifacts__render_artifact({kind:\"mermaid\",payload:{source:\"graph TD; A-->B\"}})"
+            "]); text(rs);"
+        )
+        wrapper = {
+            "type": "response_item",
+            "timestamp": "2026-08-07T12:00:00Z",
+            "payload": {
+                "type": "custom_tool_call",
+                "call_id": "batch-artifact-wrapper",
+                "name": "exec",
+                "input": source,
+            },
+        }
+        native_rows = [
+            {
+                "type": "response_item",
+                "timestamp": f"2026-08-07T12:00:0{index + 1}Z",
+                "payload": {
+                    "type": "mcpToolCall",
+                    "id": f"native-batch-artifact-{index}",
+                    "server": "wiki_artifacts",
+                    "tool": "render_artifact",
+                    "arguments": {
+                        "kind": "mermaid",
+                        "payload": {"source": "graph TD; A-->B"},
+                    },
+                    "status": "completed",
+                    "result": {
+                        "content": [
+                            {
+                                "type": "text",
+                                "text": sentinel_text(_artifact_protocol_event("mermaid", 271 + index)),
+                            }
+                        ]
+                    },
+                },
+            }
+            for index in range(2)
+        ]
+        turn_completed = {
+            "type": "event_msg",
+            "timestamp": "2026-08-07T12:00:03Z",
+            "payload": {"type": "turn_completed", "turn": {"status": "completed"}},
+        }
+        with TemporaryDirectory() as tmp:
+            path = Path(tmp) / "incremental-batch-artifact.jsonl"
+            path.write_text(json.dumps(wrapper) + "\n")
+            transcripts.read_session_events("codex", path)
+            path.write_text(
+                "\n".join(json.dumps(row) for row in [wrapper, *native_rows, turn_completed])
+                + "\n"
+            )
+            parsed = transcripts.read_session_events("codex", path)
+
+        self.assertEqual(
+            [event["kind"] for event in parsed["events"]],
+            ["artifact", "artifact"],
+        )
+        self.assertNotIn(
+            "render_artifact rejected",
+            [event["tool"]["summary"] for event in parsed["events"] if event["kind"] == "tool"],
+        )
 
     def test_round2_f2_statusless_completed_items_are_done(self) -> None:
         parsed = transcripts.read_session_events(
@@ -2622,6 +2750,44 @@ class CodexModernTranscriptParityTests(unittest.TestCase):
         self.assertEqual(
             [event["artifact_id"] for event in delta["events"] if event["kind"] == "artifact"],
             [artifact["id"]],
+        )
+
+    def test_round9_m3_batch_artifact_child_starts_pending(self) -> None:
+        source = (
+            "const rs = await Promise.all(["
+            "tools.mcp__wiki_artifacts__render_artifact({kind:\"mermaid\",payload:{source:\"graph TD; A-->B\"}}),"
+            "tools.exec_command({cmd:\"echo hi\"})"
+            "]); text(rs);"
+        )
+        row = {
+            "type": "response_item",
+            "timestamp": "2026-08-07T12:00:00Z",
+            "payload": {
+                "type": "custom_tool_call",
+                "call_id": "batch-pending-artifact",
+                "name": "exec",
+                "input": source,
+            },
+        }
+        with TemporaryDirectory() as tmp:
+            path = Path(tmp) / "batch-pending-artifact.jsonl"
+            path.write_text(json.dumps(row) + "\n")
+            parsed = transcripts.read_session_events("codex", path)
+            state = transcripts._cache[str(path)]
+
+        tool = next(
+            event["tool"]
+            for event in parsed["events"]
+            if event["kind"] == "tool"
+            and event["tool"]["name"] == "mcp__wiki_artifacts__render_artifact"
+        )
+        self.assertIsNone(tool["ok"])
+        self.assertIsNone(tool["output"])
+        self.assertEqual(tool["status"], "inProgress")
+        self.assertEqual(tool["summary"], "render_artifact pending")
+        self.assertEqual(
+            state["codex_item_lifecycle"]["__codex_batch_child__:batch-pending-artifact:0"]["state"],
+            "open",
         )
 
     def test_round4_h2_interrupt_only_marks_open_current_items_after_trim(self) -> None:

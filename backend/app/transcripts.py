@@ -1829,10 +1829,11 @@ def _codex_add_semantic_tool_event(
                 state,
                 _artifact_tool_status(
                     meta,
-                    "",
+                    None,
                     ts,
-                    ok=True,
-                    summary="render_artifact completed",
+                    ok=None,
+                    summary="render_artifact pending",
+                    status="inProgress",
                 ),
                 item_id=call_id,
                 kind="tool",
@@ -1931,6 +1932,10 @@ def _codex_add_tool_event(
             }
         )
     if call_id and all(str(item["name"]).startswith("mcp__") for item in references):
+        for item in references:
+            child_call_id = item.get("call_id")
+            if child_call_id is not None:
+                state.setdefault("pending_wrappers", {}).pop(str(child_call_id), None)
         state.setdefault("pending_wrappers", {})[str(call_id)] = {
             "expected": {
                 (str(item["name"]), _codex_tool_input(str(item["name"]), item["arguments"]))
@@ -2048,8 +2053,11 @@ def _codex_resolve_pending_wrappers(
             state["pending_batches"].pop(batch_id, None)
             state.get("pending_results", {}).pop(batch_id, None)
     for call_id in list(state.get("pending_artifacts", {})):
-        if str(call_id) == wrapper_id:
+        if str(call_id) == wrapper_id or str(call_id).startswith(
+            f"__codex_batch_child__:{wrapper_id}:"
+        ):
             state["pending_artifacts"].pop(call_id, None)
+            _codex_drop_unrendered_lifecycle(state, call_id)
     pending.pop(wrapper_id, None)
 
 
@@ -2435,6 +2443,7 @@ def _codex_lifecycle_transition(
             "authoritative": bool(authoritative or lifecycle == "terminal"),
         }
         registry[key] = record
+        _codex_bound_lifecycle_registry(state, protected_item_id=key)
         return record
 
     if authoritative:
@@ -2607,8 +2616,11 @@ def _codex_mark_authoritative_item(state: dict, item_id: object) -> None:
     _codex_lifecycle_transition(state, item_id, authoritative=True)
 
 
-def _codex_bound_lifecycle_registry(state: dict) -> None:
+def _codex_bound_lifecycle_registry(
+    state: dict, *, protected_item_id: object = None
+) -> None:
     registry = _codex_lifecycle_registry(state)
+    protected_key = _codex_item_key(protected_item_id)
     pending = set(state.get("pending_modern_deltas", {})) | set(
         state.get("pending_artifacts", {})
     )
@@ -2617,7 +2629,11 @@ def _codex_bound_lifecycle_registry(state: dict) -> None:
             (
                 item_id
                 for item_id, record in registry.items()
-                if item_id not in pending and not _codex_lifecycle_events(record)
+                if (
+                    item_id != protected_key
+                    and item_id not in pending
+                    and not _codex_lifecycle_events(record)
+                )
             ),
             None,
         )
@@ -2664,7 +2680,7 @@ def _codex_mark_terminal_item(
 
 def _codex_is_terminal_item(state: dict, item_id: object) -> bool:
     record = _codex_lifecycle_record(state, item_id)
-    return record is not None and record.get("state") == "terminal"
+    return record is not None and record.get("state") in {"partial", "terminal"}
 
 
 _CODEX_MODERN_TOOL_TYPES = {
@@ -3050,25 +3066,29 @@ def _append_artifact_event(
 
 def _artifact_tool_status(
     meta: dict,
-    output: str,
+    output: str | None,
     ts: str | None,
     *,
-    ok: bool,
+    ok: bool | None,
     summary: str,
+    status: str | None = None,
 ) -> dict:
     raw_input = meta.get("input") or {}
+    tool = {
+        "name": meta.get("name") or "render_artifact",
+        "input": _clip(json.dumps(raw_input), MAX_TOOL_IO),
+        "output": _clip(output, MAX_TOOL_IO) if output is not None else None,
+        "ok": ok,
+        "archetype": "tool",
+        "summary": summary,
+    }
+    if status is not None:
+        tool["status"] = status
     return {
         "kind": "tool",
         "ts": ts,
         "text": "",
-        "tool": {
-            "name": meta.get("name") or "render_artifact",
-            "input": _clip(json.dumps(raw_input), MAX_TOOL_IO),
-            "output": _clip(output, MAX_TOOL_IO),
-            "ok": ok,
-            "archetype": "tool",
-            "summary": summary,
-        },
+        "tool": tool,
     }
 
 
