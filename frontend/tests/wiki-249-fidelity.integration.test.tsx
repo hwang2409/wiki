@@ -146,7 +146,7 @@ test("thought row without timing omits the duration suffix", () => {
   expect(getByRole("button").textContent).toBe("+Thought: quiet");
 });
 
-test("Codex detailed summaries open by default and normalize bold title wrappers", () => {
+test("Codex detailed summaries render collapsed and normalize bold title wrappers", () => {
   const thinking = event(10, {
     kind: "thinking",
     text: "**Planning gate loop verification and CI checks**\nInspect every supervisor-owned role.\nKeep the shared renderer unchanged.",
@@ -157,14 +157,16 @@ test("Codex detailed summaries open by default and normalize bold title wrappers
     <ActivityEventRow event={thinking} rowKey={10} ticket="WIKI-265" />,
   );
   const head = getByRole("button");
-  expect(head.getAttribute("aria-expanded")).toBe("true");
+  expect(head.getAttribute("aria-expanded")).toBe("false");
   expect(head.textContent).toContain("Thought: Planning gate loop verification and CI checks");
   expect(head.textContent).not.toContain("**");
+  expect(container.querySelector(".session-thinking")).toBeNull();
+  fireEvent.click(head);
   expect(container.querySelector(".session-thinking")?.textContent).toContain("Inspect every supervisor-owned role.");
   expect(container.querySelector(".session-thinking")?.textContent).not.toContain("**Planning");
 });
 
-test("truthy Codex capability markers keep summaries open", () => {
+test("truthy Codex capability markers keep summaries collapsed", () => {
   const thinking = event(17, {
     kind: "thinking",
     text: "**Exploring agent/events terminal module**",
@@ -174,8 +176,11 @@ test("truthy Codex capability markers keep summaries open", () => {
   const { container, getByRole } = render(
     <ActivityEventRow event={thinking} rowKey={17} ticket="WIKI-267" />,
   );
-  expect(getByRole("button").getAttribute("aria-expanded")).toBe("true");
-  expect(getByRole("button").textContent).not.toContain("**");
+  const head = getByRole("button");
+  expect(head.getAttribute("aria-expanded")).toBe("false");
+  expect(head.textContent).not.toContain("**");
+  expect(container.querySelector(".session-thinking")).toBeNull();
+  fireEvent.click(head);
   expect(container.querySelector(".session-thinking")?.textContent).toBe(
     "Exploring agent/events terminal module",
   );
@@ -198,10 +203,10 @@ test("Codex adjacent same-line and newline fragments render as separate thought 
   const heads = Array.from(container.querySelectorAll(".session-thinking-head"));
   expect(heads).toHaveLength(4);
   expect(heads.map((head) => head.textContent)).toEqual([
-    "-Thought: thought oneencrypted",
-    "-Thought: thought twoencrypted",
-    "-Thought: thought threeencrypted",
-    "-Thought: thought fourencrypted",
+    "+Thought: thought oneencrypted",
+    "+Thought: thought twoencrypted",
+    "+Thought: thought threeencrypted",
+    "+Thought: thought fourencrypted",
   ]);
 });
 
