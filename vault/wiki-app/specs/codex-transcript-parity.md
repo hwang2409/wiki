@@ -11,6 +11,45 @@ updated: 2026-08-07
 
 **Dependency:** Start after WIKI-265 merges. Build on its safe legacy-wrapper normalization and detailed thinking summaries.
 
+## Architecture
+
+Treat Codex wrapper JavaScript as a small source language. Compile its safe static subset into Wiki's provider-neutral tool-call IR. Then link lifecycle events and render the shared transcript components.
+
+```text
+exec(script)
+  -> safe static extractor
+  -> ToolGroup + ToolCall children
+  -> lifecycle linker
+  -> shared transcript renderer
+```
+
+This is a deliberately incomplete compiler pass. It is not a JavaScript runtime. Never evaluate wrapper source.
+
+The IR has three relevant forms:
+
+- `ToolGroup`: one outer call with `ordered` or `parallel` mode and zero or more child calls.
+- `ToolCall`: a proven tool name, literal input, stable identity, and linked lifecycle data.
+- `DynamicToolProgram`: one honest outer `exec` call when safe static extraction fails.
+
+The extractor supports only:
+
+- Direct `await tools.name({ literal: "input" })` calls.
+- Static object, array, string, number, and boolean arguments.
+- Ordered top-level calls.
+- Direct `Promise.all([...])` children as one parallel group.
+
+The extractor rejects:
+
+- Variables whose values require execution.
+- Conditions, short-circuit expressions, loops, and arbitrary functions.
+- Imports, aliases, computed or dynamic property access, and runtime spreads.
+- Templates or expressions that require evaluation.
+- Malformed or unsupported JavaScript.
+
+Any rejected or ambiguous source produces one `exec · dynamic tool program` row. Keep the source behind an explicit inspector. Do not show it in the normal transcript.
+
+Never guess child calls. Never assign an outer result to extracted children. The lifecycle linker can attach a result to a child only when the provider supplies a proven child boundary or identity. Otherwise, keep the result on the outer group.
+
 ## Evidence
 
 - A 50-rollout audit found 94.2% semantic decoding for legacy `exec` wrappers at PR #201 SHA `ec27230c`.
@@ -26,15 +65,17 @@ updated: 2026-08-07
 - Map one actual semantic call to one provider-neutral event. Preserve command output, status, duration, edits, terminal input, and tool metadata.
 - Use one shared registry and the existing Claude-compatible tool, diff, running, failed, and approval components.
 - Keep non-artifact content as inspectable raw text or JSON. Only `render_artifact` earns rich rendering.
-- Never show Codex wrapper JavaScript. Decode only proven straight-line calls and direct `Promise.all` children. Use bounded generic `exec` fallback for ambiguity.
+- Apply the safe source-to-IR grammar above. Keep wrapper JavaScript behind the fallback row's inspector only.
 - Normalize simple and adjacent bold Codex summary fragments without changing their text. Keep the encrypted capability marker.
 
 ## Definition of done
 
 - Golden fixtures cover every legacy and modern event/result pair above, including result-first, replay, interruption, failure, declined approval, and compaction.
 - Equivalent Claude and Codex fixtures have equal canonical `name`, `input`, `output`, `ok`, `archetype`, `summary`, timing, and edit fields where both providers expose them.
-- The audited rollout corpus renders 100% of outer calls, exposes zero wrapper JavaScript, and maps at least 99% of proven-safe actual calls correctly.
-- Unsafe wrappers always use generic fallback. Tests prove no dead branch, uncalled function, mutation, alias, template, spread, or malformed source invents a call.
+- The audited rollout corpus renders 100% of outer calls, exposes no wrapper JavaScript in the normal transcript, and maps at least 99% of proven-safe actual calls correctly.
+- Unsafe wrappers always use one `DynamicToolProgram` fallback. Tests prove no dead branch, uncalled function, mutation, alias, template, spread, or malformed source invents a child call.
+- Ordered calls produce one ordered group. Direct `Promise.all` calls produce one parallel group.
+- Child results link only through proven child boundaries or identities. An aggregate outer result never becomes a guessed child result.
 - One item identity produces one visible row across raw/completed twins and resumed replay.
 - Session deltas patch existing rows without duplication or order changes.
 - Screenshot-equivalent shell, read, plan, and web calls match hypothetical Claude rows in structure, syntax highlighting, state, and expansion behavior.
