@@ -58,6 +58,10 @@ MAX_TOOL_IO = 3_000
 MAX_CHANGE_LOG = 4_096
 TRANSCRIPT_CACHE_VERSION = 2
 MAX_EDIT_PAYLOAD = 10_000
+MAX_CODEX_HARNESS_SOURCE = 100_000
+MAX_CODEX_HARNESS_CALLS = 32
+MAX_CODEX_BATCH_CHILD_INPUT = 600
+MAX_CODEX_BATCH_RESULT_BYTES = MAX_TOOL_IO * MAX_CODEX_HARNESS_CALLS
 
 try:
     TAIL_WINDOW_EVENTS = max(1, int(os.environ.get("WIKI_TRANSCRIPT_TAIL_WINDOW", "500")))
@@ -629,8 +633,10 @@ def _balanced_js_call_end(source: str, opening: int) -> int | None:
     return None
 
 
-def _codex_harness_calls(source: str) -> list[tuple[str, str]] | None:
-    """Find tools calls without matching text inside strings or comments."""
+def _codex_harness_calls(source: str) -> list[tuple[str, str, int, int]] | None:
+    """Find candidate tools calls without matching strings or comments."""
+    if len(source) > MAX_CODEX_HARNESS_SOURCE:
+        return None
     calls: list[tuple[str, str]] = []
     index = 0
     while index < len(source):
@@ -662,32 +668,241 @@ def _codex_harness_calls(source: str) -> list[tuple[str, str]] | None:
                     end = _balanced_js_call_end(source, opening)
                     if end is None:
                         return None
-                    calls.append((name_match.group(0), source[opening + 1:end].strip()))
+                    calls.append(
+                        (
+                            name_match.group(0),
+                            source[opening + 1:end].strip(),
+                            index,
+                            end + 1,
+                        )
+                    )
+                    if len(calls) > MAX_CODEX_HARNESS_CALLS:
+                        return None
                     index = end + 1
                     continue
         index += 1
     return calls
 
 
+_CODEX_CONTROL_WORD = re.compile(
+    r"\b(?:if|else|for|while|do|switch|case|default|function|class|try|catch|"
+    r"finally|return|throw|break|continue|with|yield|delete|new|typeof|void)\b"
+)
+_CODEX_DIRECT_CALL_PREFIX = re.compile(
+    r"\s*(?:(?:const|let|var)\s+[A-Za-z_$][\w$]*\s*=\s*)?"
+    r"(?:await\s*)?$"
+)
+_CODEX_TEXT_CALL_PREFIX = re.compile(
+    r"\s*(?:(?:const|let|var)\s+[A-Za-z_$][\w$]*\s*=\s*[^;]+;\s*)?"
+    r"text\s*\(\s*(?:await\s*)?$"
+)
+_CODEX_PROMISE_PREFIX = re.compile(
+    r"\s*(?:(?:const|let|var)\s+"
+    r"(?P<binding>[A-Za-z_$][\w$]*|\[[^\]\n]+\])\s*=\s*)?"
+    r"(?:await\s*)?$"
+)
+_CODEX_TEXT_SUFFIX = re.compile(r"\s*\)\s*;?\s*$")
+
+
+def _codex_text_result_refs(suffix: str) -> list[str] | None:
+    """Parse only text(identifier); result writes."""
+    index = _skip_js_space(suffix, 0)
+    if index >= len(suffix) or suffix[index] != ";":
+        return None
+    refs: list[str] = []
+    index += 1
+    while True:
+        index = _skip_js_space(suffix, index)
+        if index == len(suffix):
+            return refs
+        match = re.match(
+            r"text\s*\(\s*([A-Za-z_$][\w$]*(?:\.output)?)\s*\)\s*;",
+            suffix[index:],
+        )
+        if match is None:
+            return None
+        refs.append(match.group(1))
+        index += match.end()
+
+
+def _codex_promise_result_names(binding: str | None) -> list[str]:
+    if binding is None:
+        return []
+    if not binding.startswith("["):
+        return [binding]
+    names = [part.strip() for part in binding[1:-1].split(",")]
+    if not names or any(_JS_IDENTIFIER.fullmatch(name) is None for name in names):
+        return []
+    if len(set(names)) != len(names):
+        return []
+    return names
+
+
+def _codex_harness_grammar_is_simple(
+    source: str, calls: list[tuple[str, str, int, int]]
+) -> bool:
+    """Accept only direct top-level calls or direct Promise.all elements."""
+    masked_result = _mask_js_strings_and_comments(source)
+    if masked_result is None:
+        return False
+    masked, has_comments = masked_result
+    # Keep offsets stable while normalizing escaped fixture whitespace.
+    masked = masked.replace("\\n", "  ").replace("\\r", "  ").replace("\\t", "  ")
+    if has_comments or not calls:
+        return False
+    if _CODEX_CONTROL_WORD.search(masked) or "&&" in masked or "||" in masked or "?" in masked:
+        return False
+
+    promise_matches = list(re.finditer(r"\bPromise\s*\.\s*all\s*\(", masked))
+    if len(promise_matches) > 1:
+        return False
+    if promise_matches:
+        promise_open = promise_matches[0].end() - 1
+        promise_end = _balanced_js_call_end(source, promise_open)
+        if promise_end is None:
+            return False
+        array_start = _skip_js_space(source, promise_open + 1)
+        if array_start >= len(source) or source[array_start] != "[":
+            return False
+        array_end = _js_literal_end(source, array_start)
+        if array_end is None or _skip_js_space(source, array_end) != promise_end:
+            return False
+        promise_prefix = _CODEX_PROMISE_PREFIX.fullmatch(
+            masked[:promise_matches[0].start()]
+        )
+        if promise_prefix is None:
+            return False
+        expected_refs = _codex_promise_result_names(promise_prefix.group("binding"))
+        if promise_prefix.group("binding") is not None and not expected_refs:
+            return False
+        refs = _codex_text_result_refs(masked[promise_end + 1:])
+        if refs is None or (refs and refs != expected_refs):
+            return False
+        ordered_calls = sorted(calls, key=lambda item: item[2])
+        cursor = array_start + 1
+        for index, (_, _, call_start, call_end) in enumerate(ordered_calls):
+            if not (array_start < call_start < call_end <= array_end - 1):
+                return False
+            separator = masked[cursor:call_start].strip()
+            if separator != ("" if index == 0 else ","):
+                return False
+            cursor = call_end
+        return masked[cursor:array_end - 1].strip() in ("", ",")
+
+    if "Promise" in masked or len(calls) != 1:
+        return False
+    _, _, call_start, call_end = calls[0]
+    prefix = masked[:call_start]
+    if not (
+        _CODEX_DIRECT_CALL_PREFIX.fullmatch(prefix)
+        or _CODEX_TEXT_CALL_PREFIX.fullmatch(prefix)
+    ):
+        return False
+    suffix = masked[call_end:]
+    if _CODEX_TEXT_CALL_PREFIX.fullmatch(prefix):
+        return _CODEX_TEXT_SUFFIX.fullmatch(suffix) is not None
+    direct_prefix = _CODEX_DIRECT_CALL_PREFIX.fullmatch(prefix)
+    if direct_prefix is None:
+        return False
+    refs = _codex_text_result_refs(suffix)
+    if refs is None:
+        return False
+    binding_match = re.fullmatch(
+        r"\s*(?:const|let|var)\s+([A-Za-z_$][\w$]*)\s*=\s*(?:await\s*)?",
+        prefix,
+    )
+    binding = binding_match.group(1) if binding_match else None
+    if binding is None:
+        return not refs
+    return all(ref in {binding, f"{binding}.output"} for ref in refs)
+
+
 def _decode_js_string(source: str, opening: int) -> tuple[str, int] | None:
     end = _js_string_end(source, opening)
     if end is None:
         return None
-    literal = source[opening:end]
-    try:
-        value = json.loads(literal)
-    except (TypeError, ValueError):
-        try:
-            value = ast.literal_eval(literal)
-        except (SyntaxError, ValueError):
+    quote = source[opening]
+    value: list[str] = []
+    index = opening + 1
+    escapes = {
+        "b": "\b",
+        "f": "\f",
+        "n": "\n",
+        "r": "\r",
+        "t": "\t",
+        "v": "\v",
+        "0": "\0",
+        "\\": "\\",
+        "/": "/",
+        "'": "'",
+        '"': '"',
+    }
+    while index < end - 1:
+        char = source[index]
+        if char != "\\":
+            value.append(char)
+            index += 1
+            continue
+        index += 1
+        if index >= end - 1:
             return None
-    return value, end if isinstance(value, str) else None
+        escaped = source[index]
+        if escaped in escapes:
+            if escaped == "0" and index + 1 < end - 1 and source[index + 1].isdigit():
+                return None
+            value.append(escapes[escaped])
+            index += 1
+            continue
+        if escaped == "x":
+            digits = source[index + 1:index + 3]
+            if len(digits) != 2 or re.fullmatch(r"[0-9A-Fa-f]{2}", digits) is None:
+                return None
+            value.append(chr(int(digits, 16)))
+            index += 3
+            continue
+        if escaped == "u":
+            digits = source[index + 1:index + 5]
+            if len(digits) != 4 or re.fullmatch(r"[0-9A-Fa-f]{4}", digits) is None:
+                return None
+            value.append(chr(int(digits, 16)))
+            index += 5
+            continue
+        return None
+    if source[end - 1] != quote:
+        return None
+    return "".join(value), end
+
+
+MAX_CODEX_JS_DEPTH = 16
+MAX_CODEX_JS_NODES = 256
+MAX_CODEX_OUTPUT_DEPTH = 32
+MAX_CODEX_OUTPUT_NODES = 2048
 
 
 class _CodexJsArgumentParser:
-    def __init__(self, source: str):
+    def __init__(
+        self,
+        source: str,
+        variables: dict[str, str] | None = None,
+        resolving: frozenset[str] | None = None,
+        depth: int = 0,
+        budget: list[int] | None = None,
+    ):
         self.source = source
         self.index = 0
+        # Bare identifiers get resolved against locally-declared string/object
+        # literals (`const patch = "..."; tools.apply_patch(patch)`) so the
+        # arg list survives the trivial variable indirection Codex loves.
+        self.variables = variables or {}
+        self.resolving = resolving or frozenset()
+        self.depth = depth
+        self.budget = budget if budget is not None else [0]
+
+    def _consume_node(self) -> bool:
+        if self.depth > MAX_CODEX_JS_DEPTH:
+            return False
+        self.budget[0] += 1
+        return self.budget[0] <= MAX_CODEX_JS_NODES
 
     def _space(self) -> None:
         self.index = _skip_js_space(self.source, self.index)
@@ -701,15 +916,29 @@ class _CodexJsArgumentParser:
         return value
 
     def _value(self) -> object | None:
+        if not self._consume_node():
+            return None
         self._space()
         if self.index >= len(self.source) or self.source[self.index] == "`":
             return None
         if self.source[self.index] in ("'", '"'):
             return self._string()
         if self.source[self.index] == "{":
-            return self._object()
+            if self.depth >= MAX_CODEX_JS_DEPTH:
+                return None
+            self.depth += 1
+            try:
+                return self._object()
+            finally:
+                self.depth -= 1
         if self.source[self.index] == "[":
-            return self._array()
+            if self.depth >= MAX_CODEX_JS_DEPTH:
+                return None
+            self.depth += 1
+            try:
+                return self._array()
+            finally:
+                self.depth -= 1
         number = _JS_NUMBER.match(self.source, self.index)
         if number:
             self.index = number.end()
@@ -725,6 +954,17 @@ class _CodexJsArgumentParser:
                 return False
             if token == "null":
                 return None
+            resolved = self.variables.get(token)
+            if resolved is not None and token not in self.resolving:
+                # Re-parse the referenced literal in its own parser so nested
+                # object/array literals resolve too — no shared cursor state.
+                return _CodexJsArgumentParser(
+                    resolved,
+                    self.variables,
+                    self.resolving | {token},
+                    self.depth + 1,
+                    self.budget,
+                ).parse()
             return None
         return None
 
@@ -823,36 +1063,355 @@ class _CodexJsArgumentParser:
         return value
 
 
-def _codex_js_arguments(source: str) -> dict | str | None:
-    return _CodexJsArgumentParser(source).parse()
+def _codex_js_arguments(source: str, variables: dict[str, str] | None = None) -> dict | str | None:
+    try:
+        return _CodexJsArgumentParser(source, variables).parse()
+    except RecursionError:
+        return None
+
+
+def _codex_output_value_is_bounded(value: object) -> bool:
+    stack: list[tuple[object, int]] = [(value, 0)]
+    seen: set[int] = set()
+    nodes = 0
+    while stack:
+        current, depth = stack.pop()
+        nodes += 1
+        if nodes > MAX_CODEX_OUTPUT_NODES or depth > MAX_CODEX_OUTPUT_DEPTH:
+            return False
+        if isinstance(current, dict):
+            identity = id(current)
+            if identity in seen:
+                return False
+            seen.add(identity)
+            stack.extend((child, depth + 1) for child in current.values())
+        elif isinstance(current, list):
+            identity = id(current)
+            if identity in seen:
+                return False
+            seen.add(identity)
+            stack.extend((child, depth + 1) for child in current)
+    return True
+
+
+def _codex_parse_output_literal(candidate: str) -> object | None:
+    if len(candidate) > MAX_CODEX_BATCH_RESULT_BYTES:
+        return None
+    for parser in (json.loads, ast.literal_eval):
+        try:
+            parsed = parser(candidate)
+        except (ValueError, SyntaxError, RecursionError, MemoryError):
+            continue
+        if _codex_output_value_is_bounded(parsed):
+            return parsed
+    return None
+
+
+# Trivial variable indirection Codex generates alongside `tools.*` calls:
+#
+#   const patch = "*** Begin Patch ... *** End Patch";
+#   text(await tools.apply_patch(patch));
+#
+# The parser needs to see the literal to synthesize a semantic apply_patch
+# call. We collect the source text of each assigned literal (not the parsed
+# value) so the argument parser can re-scan it under its usual grammar rules.
+_JS_DECLARATION = re.compile(
+    r"\b(const|let|var)\s+([A-Za-z_$][\w$]*)\s*=",
+)
+
+
+def _mask_js_strings_and_comments(source: str) -> tuple[str, bool] | None:
+    """Mask literals and comments while preserving source offsets."""
+    chars = list(source)
+    has_comments = False
+    index = 0
+    while index < len(source):
+        char = source[index]
+        if char in ("'", '"'):
+            end = _js_string_end(source, index)
+            if end is None:
+                return None
+            for masked_index in range(index, end):
+                if chars[masked_index] not in "\r\n":
+                    chars[masked_index] = " "
+            index = end
+            continue
+        if source.startswith("//", index):
+            has_comments = True
+            end = source.find("\n", index + 2)
+            end = len(source) if end == -1 else end
+            for masked_index in range(index, end):
+                chars[masked_index] = " "
+            index = end
+            continue
+        if source.startswith("/*", index):
+            has_comments = True
+            end = source.find("*/", index + 2)
+            if end == -1:
+                return None
+            end += 2
+            for masked_index in range(index, end):
+                if chars[masked_index] not in "\r\n":
+                    chars[masked_index] = " "
+            index = end
+            continue
+        if char == "`":
+            return None
+        index += 1
+    return "".join(chars), has_comments
+
+
+def _js_literal_end(source: str, start: int) -> int | None:
+    if start >= len(source):
+        return None
+    char = source[start]
+    if char in ("'", '"'):
+        return _js_string_end(source, start)
+    if char in "([{":
+        pairs = {"(": ")", "[": "]", "{": "}"}
+        stack = [pairs[char]]
+        index = start + 1
+        while index < len(source):
+            ch = source[index]
+            if ch in ("'", '"'):
+                end = _js_string_end(source, index)
+                if end is None:
+                    return None
+                index = end
+                continue
+            if ch == "`":
+                return None
+            if source.startswith("//", index):
+                newline = source.find("\n", index + 2)
+                index = len(source) if newline == -1 else newline + 1
+                continue
+            if source.startswith("/*", index):
+                end = source.find("*/", index + 2)
+                if end == -1:
+                    return None
+                index = end + 2
+                continue
+            if ch in pairs:
+                stack.append(pairs[ch])
+            elif ch in ")]}":
+                if not stack or ch != stack.pop():
+                    return None
+                if not stack:
+                    return index + 1
+            index += 1
+        return None
+    return None
+
+
+def _codex_extract_variables(source: str) -> dict[str, str] | None:
+    """Map safe top-level immutable declarations to their literal sources."""
+    masked_result = _mask_js_strings_and_comments(source)
+    if masked_result is None:
+        return None
+    masked, has_comments = masked_result
+    declarations = list(_JS_DECLARATION.finditer(masked))
+    if not declarations:
+        return {}
+    if has_comments:
+        # Comments can hide declarations or alter the apparent statement scope.
+        return None
+    first_tool_call = masked.find("tools.")
+    if first_tool_call < 0 or any(
+        declaration.start() > first_tool_call for declaration in declarations
+    ):
+        return None
+
+    brace_depth = [0] * (len(masked) + 1)
+    depth = 0
+    for index, char in enumerate(masked):
+        brace_depth[index] = depth
+        if char == "{":
+            depth += 1
+        elif char == "}":
+            depth -= 1
+            if depth < 0:
+                return None
+    brace_depth[-1] = depth
+    if depth != 0:
+        return None
+
+    variables: dict[str, str] = {}
+    declared_names: set[str] = set()
+    for match in declarations:
+        declaration_kind, name = match.groups()
+        if declaration_kind != "const" or brace_depth[match.start()] != 0:
+            return None
+        if name in declared_names:
+            return None
+        declared_names.add(name)
+        assignment = re.compile(
+            rf"(?<![A-Za-z0-9_$.]){re.escape(name)}\s*(?:"
+            r"=(?!=)|\+=|-=|\*=|/=|%=|\+\+|--)",
+        )
+        if assignment.search(masked, match.end()):
+            return None
+        start = _skip_js_space(source, match.end())
+        if start >= len(source):
+            return None
+        if source[start] in "[{":
+            # Object and array bindings can mutate or escape through aliases.
+            return None
+        if source[start] in ("'", '"'):
+            end = _js_literal_end(source, start)
+            if end is None:
+                return None
+            after_literal = _skip_js_space(source, end)
+            if after_literal < len(source) and source[after_literal] != ";":
+                return None
+            variables[name] = source[start:end]
+            continue
+        if source.startswith("await tools.", start) or source.startswith(
+            "await Promise.all(", start
+        ):
+            continue
+        return None
+
+    for match in re.finditer(
+        r"\b(let|var)\s+([A-Za-z_$][\w$]*)\s*=\s*", masked
+    ):
+        if brace_depth[match.start()] == 0:
+            return None
+
+    for name in variables:
+        member_write = re.compile(
+            rf"\b{re.escape(name)}\s*(?:\.[A-Za-z_$][\w$]*|\[[^\]]+\])\s*"
+            r"(?:=|\+=|-=|\*=|/=|%=|\+\+|--)",
+        )
+        if member_write.search(masked) or re.search(
+            rf"\bObject\.assign\s*\(\s*{re.escape(name)}\b", masked
+        ):
+            return None
+
+    return variables
+
+
+def _resolve_call_argument(source: str, variables: dict[str, str]) -> object | None:
+    """Parse an arg source, resolving trailing/whole-token identifiers."""
+    stripped = source.strip()
+    # Bare identifier: use the variable table directly so the literal parses in
+    # its own top-level scope (the argument parser only accepts dict/string).
+    identifier_match = _JS_IDENTIFIER.fullmatch(stripped)
+    if identifier_match:
+        resolved = variables.get(stripped)
+        if resolved is None:
+            return None
+        return _codex_js_arguments(resolved, variables)
+    return _codex_js_arguments(source, variables)
+
+
+def _codex_synthesized_bash(call_arguments: list[dict]) -> str | None:
+    """Fold a Promise.all of exec_command calls into a shell-flavoured summary.
+
+    All calls must be ``exec_command`` with a string ``cmd``/``command``. The
+    commands join with newlines so the shared bash renderer can highlight and
+    truncate the composite the same way it does any multi-line shell command.
+    """
+    commands: list[str] = []
+    for arguments in call_arguments:
+        if not isinstance(arguments, dict):
+            return None
+        command = arguments.get("cmd", arguments.get("command"))
+        if not isinstance(command, str) or not command.strip():
+            return None
+        commands.append(command)
+    if not commands:
+        return None
+    return "\n".join(commands)
+
+
+def _codex_harness_fallback_input(raw_input: str) -> str:
+    """Describe an undecodable wrapper without exposing its JavaScript body."""
+    names: list[str] = []
+    for match in re.finditer(r"\btools\.([A-Za-z_$][\w$]*)", raw_input[:MAX_CODEX_HARNESS_SOURCE]):
+        name = match.group(1)
+        if name not in names:
+            names.append(name)
+        if len(names) == 8:
+            break
+    if names:
+        label = ", ".join(names)
+        if len(names) == 8:
+            label += ", …"
+        return _clip(f"Codex tool wrapper could not be decoded: {label}", MAX_TOOL_IO)
+    return "Codex tool wrapper could not be decoded"
 
 
 def _codex_harness_tool(name: object, raw_input: object) -> dict | None:
-    """Unwrap the new Codex runtime's ``const r = await tools.*(...)`` input."""
+    """Unwrap the new Codex runtime's ``const r = await tools.*(...)`` input.
+
+    The wrapper is transport, not user intent: pull each ``tools.<name>(...)``
+    call up as if the model had invoked the underlying tool directly, so the
+    shared inline/block renderer gets clean bash / edit / mcp semantics rather
+    than a fenced JavaScript blob to display.
+    """
     if name != "exec" or not isinstance(raw_input, str):
         return None
     calls = _codex_harness_calls(raw_input)
-    if not calls or any(_codex_js_arguments(arguments) is None for _, arguments in calls):
+    if not calls:
         return None
-    function_name, argument_source = calls[0]
-    arguments = _codex_js_arguments(argument_source)
-    if arguments is None:
+    if not _codex_harness_grammar_is_simple(raw_input, calls):
         return None
-    classified_input = _codex_tool_input(function_name, arguments)
-    if function_name == "exec_command" and isinstance(arguments, dict):
-        command = arguments.get("cmd", arguments.get("command"))
-        if isinstance(command, str):
-            classified_input = _clip(command, MAX_TOOL_IO)
-    if len(calls) == 1:
-        display_input = classified_input
-    else:
-        display_input = _clip(f"```js\n{raw_input.strip()}\n```", MAX_TOOL_IO)
+    variables = _codex_extract_variables(raw_input)
+    if variables is None:
+        return None
+    parsed_arguments = [
+        _resolve_call_argument(arg, variables) for _, arg, _, _ in calls
+    ]
+    if any(arg is None for arg in parsed_arguments):
+        return None
+    semantic_inputs: list[str] = []
+    children: list[dict[str, object]] = []
+    for (child_name, _, _, _), child_arguments in zip(calls, parsed_arguments):
+        child_input = _codex_tool_input(child_name, child_arguments)
+        if child_name == "exec_command" and isinstance(child_arguments, dict):
+            command = child_arguments.get("cmd", child_arguments.get("command"))
+            if isinstance(command, str):
+                child_input = _clip(command, MAX_TOOL_IO)
+        semantic_inputs.append(child_input)
+        children.append(
+            {
+                "name": _clip(child_name, 120),
+                "input": child_input,
+                "classify_input": child_input,
+                "arguments": child_arguments,
+            }
+        )
+    function_name = _clip(calls[0][0], 120)
+    primary_arguments = parsed_arguments[0]
+    classified_input = semantic_inputs[0]
+    display_input = classified_input
+    if len(calls) > 1:
+        # Homogeneous Promise.all batches of shell commands keep bash grammar
+        # so the shared inline/block renderer stays compact and useful.
+        if all(fname == "exec_command" for fname, _, _, _ in calls):
+            combined = _codex_synthesized_bash(
+                [args for args in parsed_arguments if isinstance(args, dict)]
+            )
+            if combined is not None:
+                classified_input = _clip(combined, MAX_TOOL_IO)
+                display_input = classified_input
+        else:
+            # Mixed batches keep every semantic sibling in the bounded parent
+            # input. The shared Claude-compatible tool row remains the renderer.
+            display_input = _clip(
+                "\n".join(
+                    f"{_clip(child_name, 120)}: {_clip(child_input, MAX_CODEX_BATCH_CHILD_INPUT)}"
+                    for (child_name, _, _, _), child_input in zip(calls, semantic_inputs)
+                ),
+                MAX_TOOL_IO,
+            )
     return {
         "name": function_name,
         "input": display_input,
         "classify_input": classified_input,
-        "arguments": arguments,
+        "arguments": primary_arguments,
         "calls": len(calls),
+        "children": children,
     }
 
 
@@ -913,6 +1472,14 @@ def _codex_tool_output_details(
     """Extract command text from Codex output envelopes and infer success."""
     if value is None:
         return _CodexOutputDetails("", None, False, 0, None)
+    if isinstance(value, (dict, list)) and not _codex_output_value_is_bounded(value):
+        return _CodexOutputDetails(
+            "Codex output omitted: nested result exceeded limits",
+            None,
+            False,
+            0,
+            None,
+        )
     if isinstance(value, str):
         if strip_runtime_preamble:
             body, runtime_status, wall_time_ms = _strip_codex_runtime_preamble(value)
@@ -920,13 +1487,8 @@ def _codex_tool_output_details(
             body, runtime_status, wall_time_ms = value, None, None
         had_preamble = runtime_status is not None
         candidate = body.strip()
-        for parser in (json.loads, ast.literal_eval):
-            if not candidate.startswith(("{", "[")):
-                break
-            try:
-                parsed = parser(candidate)
-            except (ValueError, SyntaxError):
-                continue
+        if candidate.startswith(("{", "[")):
+            parsed = _codex_parse_output_literal(candidate)
             if isinstance(parsed, (dict, list)):
                 nested = _codex_tool_output_details(parsed, strip_runtime_preamble=False)
                 if had_preamble or nested.status is not None or nested.text != candidate:
@@ -1061,6 +1623,62 @@ def _codex_tool_output(value: object) -> tuple[str, bool | None]:
     return details.text, details.status
 
 
+def _codex_explicit_batch_results(value: object, count: int) -> list[object] | None:
+    if not isinstance(value, list) or len(value) != count:
+        return None
+    if all(isinstance(item, str) for item in value):
+        return value
+    result_keys = {
+        "output",
+        "content",
+        "error",
+        "is_error",
+        "isError",
+        "failed",
+        "exit_code",
+    }
+    if all(
+        isinstance(item, dict) and result_keys.intersection(item)
+        for item in value
+    ):
+        return value
+    return None
+
+
+def _codex_batch_output_values(value: object, count: int) -> list[object] | None:
+    """Normalize the runtime envelope before splitting explicit child results."""
+    if count <= 0 or count > MAX_CODEX_HARNESS_CALLS:
+        return None
+    direct = _codex_explicit_batch_results(value, count)
+    if direct is not None:
+        return direct if _codex_output_value_is_bounded(direct) else None
+    if not isinstance(value, list) or not all(
+        isinstance(item, dict)
+        and item.get("type") == "input_text"
+        and isinstance(item.get("text"), str)
+        for item in value
+    ):
+        return None
+    parts: list[str] = []
+    total_bytes = 0
+    for item in value:
+        body, _, _ = _strip_codex_runtime_preamble(item["text"])
+        if len(body) > MAX_CODEX_BATCH_RESULT_BYTES - total_bytes:
+            return None
+        body = body.strip()
+        if body:
+            total_bytes += len(body)
+            parts.append(body)
+    candidate = "\n".join(parts)
+    if not candidate:
+        return None
+    parsed = _codex_parse_output_literal(candidate)
+    explicit = _codex_explicit_batch_results(parsed, count)
+    if explicit is not None:
+        return explicit
+    return None
+
+
 def _codex_completion_timestamp(
     event: dict, ts: str | None, wall_time_ms: int | None
 ) -> str | None:
@@ -1121,34 +1739,26 @@ def _structured_edit_payload(name: object, raw_input: object) -> dict | None:
     return payload or None
 
 
-def _codex_add_tool_event(
+def _codex_add_semantic_tool_event(
     state: dict,
     name: object,
     raw_input: object,
     ts: str | None,
     call_id: object,
 ) -> tuple[dict | None, bool]:
-    """Add one Codex call and return (event, handled-as-artifact)."""
+    """Add one already-normalized Codex call."""
     pending: dict = state["pending"]
-    harness = _codex_harness_tool(name, raw_input)
-    if harness:
-        name = harness["name"]
-        tool_input = harness["input"]
-        classify_input = harness["classify_input"]
-        structured_input = harness["arguments"]
+    if name == "exec" and isinstance(raw_input, str):
+        tool_input = _codex_harness_fallback_input(raw_input)
     else:
         tool_input = _codex_tool_input(str(name or ""), raw_input)
-        classify_input = tool_input
-        structured_input = raw_input
+    classify_input = tool_input
+    structured_input = raw_input
     name = str(name or "")
     if _is_artifact_tool(name) and call_id:
         state.setdefault("pending_artifacts", {})[call_id] = {
             "name": name,
-            "input": (
-                harness.get("arguments")
-                if harness and isinstance(harness.get("arguments"), dict)
-                else _tool_arguments(raw_input)
-            ) or {},
+            "input": _tool_arguments(raw_input) or {},
         }
         return None, True
     archetype, summary = classify_tool(name, classify_input)
@@ -1174,17 +1784,79 @@ def _codex_add_tool_event(
     return event, False
 
 
+def _codex_add_tool_event(
+    state: dict,
+    name: object,
+    raw_input: object,
+    ts: str | None,
+    call_id: object,
+) -> tuple[dict | None, bool]:
+    """Add one event per Codex harness child and retain its result links."""
+    harness = _codex_harness_tool(name, raw_input)
+    if not harness:
+        return _codex_add_semantic_tool_event(state, name, raw_input, ts, call_id)
+
+    children = harness.get("children") or []
+    if not children:
+        return None, False
+    if len(children) == 1:
+        child = children[0]
+        return _codex_add_semantic_tool_event(
+            state,
+            child["name"],
+            child["arguments"],
+            ts,
+            call_id,
+        )
+
+    references: list[dict] = []
+    for child in children:
+        event, handled = _codex_add_semantic_tool_event(
+            state,
+            child["name"],
+            child["arguments"],
+            ts,
+            None,
+        )
+        references.append(
+            {
+                "call_id": None,
+                "event": event,
+                "handled": handled,
+            }
+        )
+    if call_id:
+        state.setdefault("pending_batches", {})[call_id] = references
+    return next((item["event"] for item in references if item["event"]), None), all(
+        item["handled"] for item in references
+    )
+
+
 def _codex_finish_tool_event(
     state: dict,
     event: dict | None,
     call_id: object,
     output: object,
     ts: str | None,
+    *,
+    aggregate: bool = False,
 ) -> None:
     output_details = _codex_tool_output_details(output)
     output_text = output_details.text
-    output_ok = output_details.status
-    if call_id and _complete_artifact(state, call_id, output_text, ts):
+    # A completed Codex result without an error marker is successful, matching
+    # Claude's canonical tool_result semantics.
+    output_ok = (
+        None
+        if aggregate
+        else output_details.status if output_details.status is not None else True
+    )
+    if call_id and _complete_artifact(
+        state,
+        call_id,
+        output_text,
+        ts,
+        failed=output_details.status is False,
+    ):
         return
     target = state["pending"].pop(call_id, None) if call_id else event
     if target:
@@ -1577,6 +2249,31 @@ def _codex_background_event(payload: dict, ts: str | None) -> dict | None:
     return None
 
 
+def _codex_bold_summary_fragments(text: str) -> list[str] | None:
+    """Return complete bold fragments when no other prose is present."""
+    fragments: list[str] = []
+    index = 0
+    while True:
+        separator_start = index
+        while index < len(text) and text[index].isspace():
+            index += 1
+        if index == len(text):
+            return fragments or None
+        if fragments and index == separator_start:
+            return None
+        if not text.startswith("**", index):
+            return None
+        body_start = index + 2
+        close = text.find("**", body_start)
+        if close < 0:
+            return None
+        body = text[body_start:close]
+        if not body.strip() or "*" in body:
+            return None
+        fragments.append(body.strip())
+        index = close + 2
+
+
 def _codex_apply(state: dict, row: dict) -> None:
     pending: dict = state["pending"]  # call_id → event (awaiting output)
     ts = row.get("timestamp")
@@ -1662,15 +2359,23 @@ def _codex_apply(state: dict, row: dict) -> None:
             text = " ".join(
                 s.get("text", "") for s in summary if isinstance(s, dict)
             ).strip()
-            _append_event(
-                state,
-                {
-                    "kind": "thinking",
-                    "ts": ts,
-                    "text": _clip(text, MAX_TEXT),
-                    "encrypted": isinstance(payload.get("encrypted_content"), str),
-                },
+            encrypted = isinstance(payload.get("encrypted_content"), str)
+            fragments = _codex_bold_summary_fragments(text)
+            thinking_texts = (
+                [f"**{fragment}**" for fragment in fragments]
+                if fragments and len(fragments) > 1
+                else [text]
             )
+            for thinking_text in thinking_texts:
+                _append_event(
+                    state,
+                    {
+                        "kind": "thinking",
+                        "ts": ts,
+                        "text": _clip(thinking_text, MAX_TEXT),
+                        "encrypted": encrypted,
+                    },
+                )
             _record_row_disposition(state, EVENT_DISPOSITION_RENDERED)
         elif ptype == "mcpToolCall":
             if _codex_apply_mcp_tool_item(state, payload, ts):
@@ -1685,10 +2390,42 @@ def _codex_apply(state: dict, row: dict) -> None:
             _record_row_disposition(state, EVENT_DISPOSITION_RENDERED)
         elif ptype in ("function_call_output", "custom_tool_call_output", "tool_search_output"):
             call_id = payload.get("call_id")
+            batch = state.get("pending_batches", {}).get(call_id)
+            if batch:
+                raw_output = payload.get("output")
+                child_outputs = _codex_batch_output_values(raw_output, len(batch))
+                aggregate = child_outputs is None
+                if child_outputs is None:
+                    # The app-server exposes one aggregate wrapper result for
+                    # some Promise.all calls. Keep it on every child rather
+                    # than dropping sibling evidence or inventing a split.
+                    child_outputs = [raw_output] * len(batch)
+                for reference, child_output in zip(batch, child_outputs):
+                    _codex_finish_tool_event(
+                        state,
+                        reference["event"],
+                        reference["call_id"],
+                        child_output,
+                        ts,
+                        aggregate=aggregate,
+                    )
+                state.get("pending_batches", {}).pop(call_id, None)
+                _record_row_disposition(state, EVENT_DISPOSITION_RENDERED)
+                return
             output_details = _codex_tool_output_details(payload.get("output"))
             output_text = output_details.text
-            output_ok = output_details.status
-            if _complete_artifact(state, call_id, output_text, ts):
+            # A completed Codex result without an error marker is successful,
+            # matching Claude's canonical tool_result semantics.
+            output_ok = (
+                output_details.status if output_details.status is not None else True
+            )
+            if _complete_artifact(
+                state,
+                call_id,
+                output_text,
+                ts,
+                failed=output_details.status is False,
+            ):
                 _record_row_disposition(state, EVENT_DISPOSITION_RENDERED)
                 return
             event = pending.pop(call_id, None)
@@ -2956,6 +3693,7 @@ def _new_parse_state(fmt: str) -> dict:
         "buffer": "",
         "events": [],
         "pending": {},
+        "pending_batches": {},
         "pending_artifacts": {},
         "pending_questions": {},
         "tokens": None,
@@ -3033,7 +3771,7 @@ def _read_cached_state(fmt: str, path: Path, key: str) -> dict:
                 continue
             try:
                 row = json.loads(line)
-            except ValueError:
+            except (ValueError, RecursionError, MemoryError):
                 continue
             try:
                 apply(state, row)
@@ -3046,6 +3784,15 @@ def _read_cached_state(fmt: str, path: Path, key: str) -> dict:
             kept = set(map(id, state["events"]))
             state["pending"] = {
                 call_id: event for call_id, event in state["pending"].items() if id(event) in kept
+            }
+            state["pending_batches"] = {
+                call_id: references
+                for call_id, references in state.get("pending_batches", {}).items()
+                if any(
+                    reference.get("event") is None
+                    or id(reference["event"]) in kept
+                    for reference in references
+                )
             }
             _prune_change_log(state)
             state["last_bash"] = None
@@ -3087,6 +3834,12 @@ def read_session_events(fmt: str, path: Path) -> dict:
         total = state["base"] + len(state["events"])
         dirty_from = total
         pending_events = set(map(id, state["pending"].values()))
+        for references in state.get("pending_batches", {}).values():
+            pending_events.update(
+                id(reference["event"])
+                for reference in references
+                if reference.get("event") is not None
+            )
         if pending_events:
             for i, event in enumerate(state["events"]):
                 if id(event) in pending_events:

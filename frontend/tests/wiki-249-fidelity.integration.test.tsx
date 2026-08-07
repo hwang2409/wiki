@@ -146,6 +146,76 @@ test("thought row without timing omits the duration suffix", () => {
   expect(getByRole("button").textContent).toBe("+Thought: quiet");
 });
 
+test("Codex detailed summaries open by default and normalize bold title wrappers", () => {
+  const thinking = event(10, {
+    kind: "thinking",
+    text: "**Planning gate loop verification and CI checks**\nInspect every supervisor-owned role.\nKeep the shared renderer unchanged.",
+    encrypted: true,
+    tool: undefined,
+  });
+  const { container, getByRole } = render(
+    <ActivityEventRow event={thinking} rowKey={10} ticket="WIKI-265" />,
+  );
+  const head = getByRole("button");
+  expect(head.getAttribute("aria-expanded")).toBe("true");
+  expect(head.textContent).toContain("Thought: Planning gate loop verification and CI checks");
+  expect(head.textContent).not.toContain("**");
+  expect(container.querySelector(".session-thinking")?.textContent).toContain("Inspect every supervisor-owned role.");
+  expect(container.querySelector(".session-thinking")?.textContent).not.toContain("**Planning");
+});
+
+test("Codex adjacent same-line and newline fragments render as separate thought rows", () => {
+  const fragments = [
+    event(12, { kind: "thinking", text: "**thought one**", encrypted: true, tool: undefined }),
+    event(13, { kind: "thinking", text: "**thought two**", encrypted: true, tool: undefined }),
+    event(14, { kind: "thinking", text: "**thought three**", encrypted: true, tool: undefined }),
+    event(15, { kind: "thinking", text: "**thought four**", encrypted: true, tool: undefined }),
+  ];
+  const { container } = render(
+    <>
+      {fragments.map((fragment) => (
+        <ActivityEventRow event={fragment} rowKey={fragment.id} ticket="WIKI-265" key={fragment.id} />
+      ))}
+    </>,
+  );
+  const heads = Array.from(container.querySelectorAll(".session-thinking-head"));
+  expect(heads).toHaveLength(4);
+  expect(heads.map((head) => head.textContent)).toEqual([
+    "-Thought: thought oneencrypted",
+    "-Thought: thought twoencrypted",
+    "-Thought: thought threeencrypted",
+    "-Thought: thought fourencrypted",
+  ]);
+});
+
+test("Codex ambiguous bold prose stays one honest unsplit thought", () => {
+  const thinking = event(16, {
+    kind: "thinking",
+    text: "**thought one** and **thought two**",
+    encrypted: true,
+    tool: undefined,
+  });
+  const { getByRole } = render(
+    <ActivityEventRow event={thinking} rowKey={16} ticket="WIKI-265" />,
+  );
+  expect(getByRole("button").textContent).toContain("**thought one** and **thought two**");
+});
+
+test("non-Codex thinking keeps the existing collapsed behavior", () => {
+  const thinking = event(11, {
+    kind: "thinking",
+    text: "**Claude summary**\nClaude body detail",
+    tool: undefined,
+  });
+  const { container, getByRole } = render(
+    <ActivityEventRow event={thinking} rowKey={11} ticket="WIKI-265" />,
+  );
+  const head = getByRole("button");
+  expect(head.getAttribute("aria-expanded")).toBe("false");
+  expect(head.textContent).toContain("**Claude summary**");
+  expect(container.querySelector(".session-thinking")).toBeNull();
+});
+
 // --- glyph vocabulary + color-only state ---
 
 test("toolGlyph maps the OpenCode icon vocabulary", () => {
@@ -166,6 +236,48 @@ test("tool rows carry state as color classes plus sr-only text, not words", () =
   expect(container.querySelector(".session-tool")?.classList.contains("is-done")).toBe(true);
   expect(container.querySelector(".session-tool-icon-text")?.textContent).toBe("→");
   expect(container.querySelector(".sr-only")?.textContent).toBe("done");
+});
+
+test("equivalent Claude and Codex canonical tools use the same shared row", () => {
+  const claudeRaw = {
+    name: "Read",
+    input: { file_path: "src/main.py" },
+    result: "line one",
+  };
+  const claudeCanonical = tool({
+    name: claudeRaw.name,
+    input: claudeRaw.input.file_path,
+    output: claudeRaw.result,
+    archetype: "read",
+    summary: "read main.py",
+  });
+  const codexRaw = {
+    name: "Read",
+    arguments: '{"file_path":"src/main.py"}',
+    output: "line one",
+  };
+  const codexArguments = JSON.parse(codexRaw.arguments) as { file_path: string };
+  const codexCanonical = tool({
+    name: codexRaw.name,
+    input: codexArguments.file_path,
+    output: codexRaw.output,
+    archetype: "read",
+    summary: "read main.py",
+  });
+  for (const field of ["name", "input", "output", "archetype", "summary"] as const) {
+    expect(codexCanonical[field]).toBe(claudeCanonical[field]);
+  }
+  const { container } = render(
+    <>
+      <ToolCallRow event={event(20, { tool: claudeCanonical })} ticket="WIKI-265" withResult />
+      <ToolCallRow event={event(21, { tool: codexCanonical })} ticket="WIKI-265" withResult />
+    </>,
+  );
+  const rows = Array.from(container.querySelectorAll(".session-tool"));
+  expect(rows).toHaveLength(2);
+  expect(rows[0].className).toBe(rows[1].className);
+  expect(rows[0].querySelector(".session-tool-summary")?.textContent)
+    .toBe(rows[1].querySelector(".session-tool-summary")?.textContent);
 });
 
 // --- click-to-expand placement (OpenCode index.tsx:2083-2085) ---

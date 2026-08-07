@@ -1,0 +1,5 @@
+{"type":"response_item","timestamp":"2026-08-07T15:00:00Z","payload":{"type":"reasoning","summary":[{"text":"**thought one** **thought two**"}],"encrypted_content":"opaque-one"}}
+{"type":"response_item","timestamp":"2026-08-07T15:00:01Z","payload":{"type":"reasoning","summary":[{"text":"**thought three**\n**thought four**"}],"encrypted_content":"opaque-two"}}
+{"type":"response_item","timestamp":"2026-08-07T15:00:02Z","payload":{"type":"reasoning","summary":[{"text":"**thought five** and **thought six**"}],"encrypted_content":"opaque-mixed"}}
+{"type":"response_item","timestamp":"2026-08-07T15:00:03Z","payload":{"type":"reasoning","summary":[{"text":"**thought **nested**"}],"encrypted_content":"opaque-nested"}}
+{"type":"response_item","timestamp":"2026-08-07T15:00:04Z","payload":{"type":"reasoning","summary":[{"text":"**thought seven"}],"encrypted_content":"opaque-unmatched"}}
