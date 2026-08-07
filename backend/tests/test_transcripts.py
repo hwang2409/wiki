@@ -58,6 +58,49 @@ class ArtifactTranscriptTests(unittest.TestCase):
         )
         self.assertFalse(transcripts._is_artifact_tool("other_server__render_artifact"))
 
+    def test_codex_artifact_result_error_shapes_mark_completion_failed(self) -> None:
+        input_payload = {
+            "kind": "mermaid",
+            "payload": {"source": "graph TD; A-->B"},
+        }
+        outputs = [
+            {"error": "bad", "is_error": True},
+            {"error": "bad", "isError": True},
+            {"error": "bad", "failed": True},
+            {"error": "bad", "exit_code": 1},
+        ]
+        for index, output in enumerate(outputs):
+            with self.subTest(index=index), TemporaryDirectory() as tmp:
+                call_id = f"artifact-error-{index}"
+                rows = [
+                    {
+                        "type": "response_item",
+                        "timestamp": "2026-08-07T12:00:00Z",
+                        "payload": {
+                            "type": "function_call",
+                            "call_id": call_id,
+                            "name": "mcp__wiki_artifacts__render_artifact",
+                            "arguments": json.dumps(input_payload),
+                        },
+                    },
+                    {
+                        "type": "response_item",
+                        "timestamp": "2026-08-07T12:00:01Z",
+                        "payload": {
+                            "type": "function_call_output",
+                            "call_id": call_id,
+                            "output": output,
+                        },
+                    },
+                ]
+                path = Path(tmp) / "codex-artifact-error.jsonl"
+                path.write_text("\n".join(json.dumps(row) for row in rows) + "\n")
+                parsed = transcripts.read_session_events("codex", path)
+
+            self.assertEqual(len(parsed["events"]), 1)
+            self.assertEqual(parsed["events"][0]["kind"], "tool")
+            self.assertFalse(parsed["events"][0]["tool"]["ok"])
+
     def test_codex_and_claude_artifact_tools_emit_specialized_events(self) -> None:
         kinds = ["mermaid", "svg", "image", "table", "plot", "code"]
         with TemporaryDirectory() as tmp:
@@ -901,6 +944,20 @@ class CodexNewRuntimeTranscriptTests(unittest.TestCase):
         comments = "tools.exec_command" + ("/* comment */" * 2000) + '({cmd: "echo hi"});'
         self.assertIsNone(transcripts._codex_harness_tool("exec", comments))
 
+        invalid_suffixes = [
+            'const r = await tools.exec_command({cmd: "echo hi"}); text(r.output)));',
+            'const r = await tools.exec_command({cmd: "echo hi"}); text(r.output = "fake");',
+            'const r = await tools.exec_command({cmd: "echo hi"}); mutate(r);',
+        ]
+        for source in invalid_suffixes:
+            with self.subTest(source=source):
+                self.assertIsNone(transcripts._codex_harness_tool("exec", source))
+                fallback = transcripts._codex_harness_fallback_input(source)
+                self.assertEqual(
+                    fallback,
+                    "Codex tool wrapper could not be decoded: exec_command",
+                )
+
     def test_harness_scanner_rejects_object_variable_indirection(self) -> None:
         """Object bindings are unsafe without a complete mutation proof."""
         args_case = 'const args = {cmd: "echo hi"}; tools.exec_command(args);'
@@ -961,6 +1018,23 @@ class CodexNewRuntimeTranscriptTests(unittest.TestCase):
             '{"id": "X"}',
             "wiki gate 13659",
         ])
+
+    def test_harness_scanner_rejects_reordered_batch_result_bindings(self) -> None:
+        source = (
+            "const [first, second] = await Promise.all(["
+            'tools.exec_command({cmd:"first"}),'
+            'tools.exec_command({cmd:"second"})]);'
+            "text(second); text(first);"
+        )
+        self.assertIsNone(transcripts._codex_harness_tool("exec", source))
+
+        aggregate_source = (
+            "const rs = await Promise.all(["
+            'tools.exec_command({cmd:"first"}),'
+            'tools.exec_command({cmd:"second"})]);'
+            "text([rs[1], rs[0]]);"
+        )
+        self.assertIsNone(transcripts._codex_harness_tool("exec", aggregate_source))
 
     def test_harness_fallback_hides_malformed_javascript_and_is_bounded(self) -> None:
         """Malformed wrappers keep a bounded semantic note, never raw JS."""
@@ -1090,6 +1164,117 @@ class CodexNewRuntimeTranscriptTests(unittest.TestCase):
         ])
         self.assertEqual([tool["ok"] for tool in tools], [True, False])
 
+    def test_harness_batch_child_references_cannot_collide_with_provider_ids(self) -> None:
+        rows = [
+            {
+                "type": "response_item",
+                "timestamp": "2026-08-07T12:00:00Z",
+                "payload": {
+                    "type": "custom_tool_call",
+                    "call_id": "batch",
+                    "name": "exec",
+                    "input": (
+                        "const rs = await Promise.all(["
+                        'tools.exec_command({cmd:"first"}),'
+                        'tools.exec_command({cmd:"second"})]); text(rs);'
+                    ),
+                },
+            },
+            {
+                "type": "response_item",
+                "timestamp": "2026-08-07T12:00:01Z",
+                "payload": {
+                    "type": "function_call",
+                    "call_id": "batch:child:0",
+                    "name": "wait",
+                    "arguments": '{"seconds":1}',
+                },
+            },
+            {
+                "type": "response_item",
+                "timestamp": "2026-08-07T12:00:02Z",
+                "payload": {
+                    "type": "custom_tool_call_output",
+                    "call_id": "batch",
+                    "output": [
+                        {"output": "first\n", "exit_code": 0},
+                        {"output": "second\n", "exit_code": 0},
+                    ],
+                },
+            },
+            {
+                "type": "response_item",
+                "timestamp": "2026-08-07T12:00:03Z",
+                "payload": {
+                    "type": "function_call_output",
+                    "call_id": "batch:child:0",
+                    "output": "waited\n",
+                },
+            },
+        ]
+        with TemporaryDirectory() as tmp:
+            path = Path(tmp) / "codex-batch-id-collision.jsonl"
+            path.write_text("\n".join(json.dumps(row) for row in rows) + "\n")
+            tools = [
+                event["tool"]
+                for event in transcripts.read_session_events("codex", path)["events"]
+                if event["kind"] == "tool"
+            ]
+
+        self.assertEqual([tool["output"] for tool in tools], ["first\n", "second\n", "waited\n"])
+
+    def test_harness_deep_output_is_bounded_and_replay_is_deterministic(self) -> None:
+        nested = '{"value":' * (transcripts.MAX_CODEX_OUTPUT_DEPTH + 10)
+        nested += '"deep"' + "}" * (transcripts.MAX_CODEX_OUTPUT_DEPTH + 10)
+        rows = [
+            {
+                "type": "response_item",
+                "timestamp": "2026-08-07T12:00:00Z",
+                "payload": {
+                    "type": "custom_tool_call",
+                    "call_id": "deep-batch",
+                    "name": "exec",
+                    "input": (
+                        "const rs = await Promise.all(["
+                        'tools.exec_command({cmd:"first"}),'
+                        'tools.exec_command({cmd:"second"})]); text(rs);'
+                    ),
+                },
+            },
+            {
+                "type": "response_item",
+                "timestamp": "2026-08-07T12:00:01Z",
+                "payload": {
+                    "type": "custom_tool_call_output",
+                    "call_id": "deep-batch",
+                    "output": [{"type": "input_text", "text": nested}],
+                },
+            },
+        ]
+        with TemporaryDirectory() as tmp:
+            path = Path(tmp) / "codex-deep-output.jsonl"
+            path.write_text("\n".join(json.dumps(row) for row in rows) + "\n")
+            cold = transcripts.read_session_events("codex", path)
+            transcripts._cache.clear()
+            replay = transcripts.read_session_events("codex", path)
+
+        self.assertEqual(cold["events"], replay["events"])
+        self.assertEqual(
+            [event["tool"]["ok"] for event in cold["events"] if event["kind"] == "tool"],
+            [None, None],
+        )
+        oversized = [
+            {
+                "type": "input_text",
+                "text": "x" * (transcripts.MAX_CODEX_BATCH_RESULT_BYTES // 2 + 1),
+            },
+            {
+                "type": "input_text",
+                "text": "y" * (transcripts.MAX_CODEX_BATCH_RESULT_BYTES // 2 + 1),
+            },
+        ]
+        self.assertIsNone(transcripts._codex_batch_output_values(oversized, 2))
+
     def test_harness_variable_resolution_rejects_unsafe_declarations(self) -> None:
         cases = [
             "// const args = {cmd: 'fake'};\ntools.exec_command(args);",
@@ -1100,6 +1285,8 @@ class CodexNewRuntimeTranscriptTests(unittest.TestCase):
             'const patch = "safe"; patch.value = "fake"; tools.apply_patch(patch);',
             'const patch = "safe"; Object.assign(patch, {value: "fake"}); tools.apply_patch(patch);',
             'const patch = "safe"; const alias = patch; tools.apply_patch(alias);',
+            'const args = "echo".replace("echo", "fake"); tools.exec_command(args);',
+            'const args = "echo" + " fake"; tools.exec_command(args);',
         ]
         for source in cases:
             with self.subTest(source=source):
@@ -1116,6 +1303,17 @@ class CodexNewRuntimeTranscriptTests(unittest.TestCase):
         nested = '{"a":' * (transcripts.MAX_CODEX_JS_DEPTH + 4)
         nested += '"x"' + "}" * (transcripts.MAX_CODEX_JS_DEPTH + 4)
         self.assertIsNone(transcripts._codex_js_arguments(nested))
+
+    def test_harness_argument_parser_rejects_unsupported_javascript_escapes(self) -> None:
+        for escape in ("a", "N{SNOWMAN}", "U0001F600", "q"):
+            source = f'tools.exec_command({{cmd:"bad\\{escape}"}});'
+            with self.subTest(escape=escape):
+                self.assertIsNone(transcripts._codex_harness_tool("exec", source))
+
+        source = r'''tools.exec_command({cmd:"line\nhex\x41unicode\u0042"});'''
+        harness = transcripts._codex_harness_tool("exec", source)
+        self.assertIsNotNone(harness)
+        self.assertEqual(harness["input"], "line\nhexAunicodeB")
 
 
 def _write_rollout(day_dir: Path, name: str, cwd: str, session_id: str,
@@ -1530,6 +1728,37 @@ class TranscriptSurfaceTests(unittest.TestCase):
             "Inspect every supervisor-owned role.\n"
             "Keep the shared renderer unchanged.",
         )
+
+    def test_codex_reasoning_fragment_fixture_splits_only_complete_sequences(self) -> None:
+        path = FIXTURES_DIR / "codex_reasoning_fragments.jsonl"
+        result = transcripts.read_session_events("codex", path)
+        thinking = [event for event in result["events"] if event["kind"] == "thinking"]
+
+        self.assertEqual(
+            [event["text"] for event in thinking],
+            [
+                "**thought one**",
+                "**thought two**",
+                "**thought three**",
+                "**thought four**",
+                "**thought five** and **thought six**",
+                "**thought **nested**",
+                "**thought seven",
+            ],
+        )
+        self.assertEqual(
+            [event["ts"] for event in thinking],
+            [
+                "2026-08-07T15:00:00Z",
+                "2026-08-07T15:00:00Z",
+                "2026-08-07T15:00:01Z",
+                "2026-08-07T15:00:01Z",
+                "2026-08-07T15:00:02Z",
+                "2026-08-07T15:00:03Z",
+                "2026-08-07T15:00:04Z",
+            ],
+        )
+        self.assertTrue(all(event["encrypted"] for event in thinking))
 
     def test_equivalent_claude_and_codex_tools_share_canonical_fields(self) -> None:
         claude_rows = [

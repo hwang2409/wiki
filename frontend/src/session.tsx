@@ -1587,7 +1587,7 @@ function SubagentTrace({
 function normalizeCodexThinkingSummary(text: string): string {
   const lines = text.split("\n");
   const first = lines[0].trim();
-  const wrapped = first.match(/^\*\*(.+)\*\*$/);
+  const wrapped = first.match(/^\*\*([^*]+)\*\*$/);
   if (wrapped) lines[0] = wrapped[1].trim();
   return lines.join("\n");
 }
