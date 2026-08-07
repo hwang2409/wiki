@@ -83,6 +83,10 @@ class OrchestratorMcpConfigTests(unittest.TestCase):
                     )
                     if provider is ProviderKind.CODEX:
                         adapter = CodexAppServerAdapter(record, env=env)
+                        self.assertIn(
+                            'model_reasoning_summary="detailed"',
+                            adapter.command,
+                        )
                         server_env = next(
                             argument.removeprefix("mcp_servers.wiki_artifacts.env=")
                             for argument in adapter.command

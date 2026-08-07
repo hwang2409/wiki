@@ -137,6 +137,11 @@ class CodexAppServerAdapter(ProviderAdapter):
         self.command = command_tuple(
             (
                 *self.base_command,
+                # Wiki's transcript is an audit surface. Prefer the most
+                # informative Codex-provided summary over the user's global
+                # concise default, without requesting private raw reasoning.
+                "-c",
+                'model_reasoning_summary="detailed"',
                 "-c",
                 f"mcp_servers.wiki_artifacts.command={json.dumps(server_command[0])}",
                 "-c",
