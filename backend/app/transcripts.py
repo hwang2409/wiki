@@ -426,6 +426,8 @@ def _classify_tool(name: str, tool_input: str) -> tuple[str, str]:
     mcp = re.match(r"mcp__[\w-]+__(\w+)$", name)
     if mcp:
         name = mcp.group(1)
+    if name == "wait":
+        return ("wait", "wait" if not tool_input else f"wait {_clip(tool_input, 54)}")
     if name == "apply_patch":
         files = _PATCH_FILE_PATTERN.findall(tool_input)
         short = ", ".join(PurePosixPath(f).name for f in files[:4])
@@ -557,59 +559,247 @@ def _codex_tool_input(name: str, arguments: object) -> str:
     return _clip(str(arguments), MAX_TOOL_IO)
 
 
-_CODEX_HARNESS_CALL = re.compile(r"\btools\.([A-Za-z_$][\w$]*)\s*\(")
+_JS_IDENTIFIER = re.compile(r"[A-Za-z_$][\w$]*")
+_JS_NUMBER = re.compile(r"-?(?:0|[1-9]\d*)(?:\.\d+)?(?:[eE][+-]?\d+)?")
 
 
-def _balanced_js_call_end(source: str, opening: int) -> int | None:
-    depth = 1
-    quote: str | None = None
+def _skip_js_space(source: str, index: int) -> int:
+    while index < len(source):
+        if source[index].isspace():
+            index += 1
+        elif source.startswith("//", index):
+            newline = source.find("\n", index + 2)
+            index = len(source) if newline == -1 else newline + 1
+        elif source.startswith("/*", index):
+            end = source.find("*/", index + 2)
+            return len(source) if end == -1 else _skip_js_space(source, end + 2)
+        else:
+            break
+    return index
+
+
+def _js_string_end(source: str, opening: int) -> int | None:
+    quote = source[opening]
     escaped = False
     for index in range(opening + 1, len(source)):
         char = source[index]
-        if quote:
-            if escaped:
-                escaped = False
-            elif char == "\\":
-                escaped = True
-            elif char == quote:
-                quote = None
-            continue
-        if char in ("'", '"', "`"):
-            quote = char
-        elif char == "(":
-            depth += 1
-        elif char == ")":
-            depth -= 1
-            if depth == 0:
-                return index
+        if escaped:
+            escaped = False
+        elif char == "\\":
+            escaped = True
+        elif char == quote:
+            return index + 1
+        elif char in "\r\n":
+            return None
     return None
 
 
-def _codex_harness_calls(source: str) -> list[tuple[str, str]]:
+def _balanced_js_call_end(source: str, opening: int) -> int | None:
+    stack = [")"]
+    index = opening + 1
+    pairs = {"(": ")", "[": "]", "{": "}"}
+    while index < len(source):
+        char = source[index]
+        if char in ("'", '"'):
+            index = _js_string_end(source, index)
+            if index is None:
+                return None
+            continue
+        if char == "`":
+            return None
+        if source.startswith("//", index):
+            newline = source.find("\n", index + 2)
+            index = len(source) if newline == -1 else newline + 1
+            continue
+        if source.startswith("/*", index):
+            end = source.find("*/", index + 2)
+            if end == -1:
+                return None
+            index = end + 2
+            continue
+        if char in pairs:
+            stack.append(pairs[char])
+        elif char in ")]}":
+            if not stack or char != stack.pop():
+                return None
+            if not stack:
+                return index
+        index += 1
+    return None
+
+
+def _codex_harness_calls(source: str) -> list[tuple[str, str]] | None:
+    """Find tools calls without matching text inside strings or comments."""
     calls: list[tuple[str, str]] = []
-    for match in _CODEX_HARNESS_CALL.finditer(source):
-        end = _balanced_js_call_end(source, match.end() - 1)
-        if end is not None:
-            calls.append((match.group(1), source[match.end():end].strip()))
+    index = 0
+    while index < len(source):
+        char = source[index]
+        if char in ("'", '"'):
+            index = _js_string_end(source, index)
+            if index is None:
+                return None
+            continue
+        if char == "`":
+            return None
+        if source.startswith("//", index):
+            newline = source.find("\n", index + 2)
+            index = len(source) if newline == -1 else newline + 1
+            continue
+        if source.startswith("/*", index):
+            end = source.find("*/", index + 2)
+            if end == -1:
+                return None
+            index = end + 2
+            continue
+        if source.startswith("tools.", index) and (
+            index == 0 or not (source[index - 1].isalnum() or source[index - 1] in "_$")
+        ):
+            name_match = _JS_IDENTIFIER.match(source, index + len("tools."))
+            if name_match:
+                opening = _skip_js_space(source, name_match.end())
+                if opening < len(source) and source[opening] == "(":
+                    end = _balanced_js_call_end(source, opening)
+                    if end is None:
+                        return None
+                    calls.append((name_match.group(0), source[opening + 1:end].strip()))
+                    index = end + 1
+                    continue
+        index += 1
     return calls
 
 
-def _codex_js_arguments(source: str) -> dict | None:
-    value = source.strip()
-    if not value.startswith("{"):
+def _decode_js_string(source: str, opening: int) -> tuple[str, int] | None:
+    end = _js_string_end(source, opening)
+    if end is None:
         return None
-    for candidate in (value, re.sub(r"([,{]\s*)([A-Za-z_$][\w$]*)\s*:", r'\1"\2":', value)):
-        candidate = re.sub(r",\s*([}\]])", r"\1", candidate)
+    literal = source[opening:end]
+    try:
+        value = json.loads(literal)
+    except (TypeError, ValueError):
         try:
-            parsed = json.loads(candidate)
-        except ValueError:
-            try:
-                parsed = ast.literal_eval(candidate)
-            except (SyntaxError, ValueError):
-                continue
-        if isinstance(parsed, dict):
-            return parsed
-    return None
+            value = ast.literal_eval(literal)
+        except (SyntaxError, ValueError):
+            return None
+    return value, end if isinstance(value, str) else None
+
+
+class _CodexJsArgumentParser:
+    def __init__(self, source: str):
+        self.source = source
+        self.index = 0
+
+    def _space(self) -> None:
+        self.index = _skip_js_space(self.source, self.index)
+
+    def _string(self) -> str | None:
+        decoded = _decode_js_string(self.source, self.index)
+        if decoded is None:
+            return None
+        value, end = decoded
+        self.index = end
+        return value
+
+    def _value(self) -> object | None:
+        self._space()
+        if self.index >= len(self.source) or self.source[self.index] == "`":
+            return None
+        if self.source[self.index] in ("'", '"'):
+            return self._string()
+        if self.source[self.index] == "{":
+            return self._object()
+        if self.source[self.index] == "[":
+            return self._array()
+        number = _JS_NUMBER.match(self.source, self.index)
+        if number:
+            self.index = number.end()
+            text = number.group(0)
+            return float(text) if any(c in text for c in ".eE") else int(text)
+        identifier = _JS_IDENTIFIER.match(self.source, self.index)
+        if identifier:
+            self.index = identifier.end()
+            return {"true": True, "false": False, "null": None}.get(identifier.group(0))
+        return None
+
+    def _object(self) -> dict | None:
+        self.index += 1
+        result: dict = {}
+        self._space()
+        if self.index < len(self.source) and self.source[self.index] == "}":
+            self.index += 1
+            return result
+        while self.index < len(self.source):
+            self._space()
+            if self.source[self.index] in ("'", '"'):
+                key = self._string()
+            else:
+                key_match = _JS_IDENTIFIER.match(self.source, self.index)
+                if not key_match:
+                    return None
+                key = key_match.group(0)
+                self.index = key_match.end()
+            self._space()
+            if self.index >= len(self.source) or self.source[self.index] != ":":
+                return None
+            self.index += 1
+            value = self._value()
+            if value is None and not self._is_null_literal():
+                return None
+            result[key] = value
+            self._space()
+            if self.index >= len(self.source):
+                return None
+            if self.source[self.index] == "}":
+                self.index += 1
+                return result
+            if self.source[self.index] != ",":
+                return None
+            self.index += 1
+            self._space()
+            if self.index < len(self.source) and self.source[self.index] == "}":
+                self.index += 1
+                return result
+        return None
+
+    def _array(self) -> list | None:
+        self.index += 1
+        result: list = []
+        self._space()
+        if self.index < len(self.source) and self.source[self.index] == "]":
+            self.index += 1
+            return result
+        while self.index < len(self.source):
+            value = self._value()
+            if value is None and not self._is_null_literal():
+                return None
+            result.append(value)
+            self._space()
+            if self.index >= len(self.source):
+                return None
+            if self.source[self.index] == "]":
+                self.index += 1
+                return result
+            if self.source[self.index] != ",":
+                return None
+            self.index += 1
+            self._space()
+            if self.index < len(self.source) and self.source[self.index] == "]":
+                self.index += 1
+                return result
+        return None
+
+    def _is_null_literal(self) -> bool:
+        return self.source[self.index - 4:self.index] == "null"
+
+    def parse(self) -> object | None:
+        value = self._value()
+        self._space()
+        if self.index != len(self.source) or not isinstance(value, (dict, str)):
+            return None
+        return value
+
+
+def _codex_js_arguments(source: str) -> dict | str | None:
+    return _CodexJsArgumentParser(source).parse()
 
 
 def _codex_harness_tool(name: object, raw_input: object) -> dict | None:
@@ -617,12 +807,14 @@ def _codex_harness_tool(name: object, raw_input: object) -> dict | None:
     if name != "exec" or not isinstance(raw_input, str):
         return None
     calls = _codex_harness_calls(raw_input)
-    if not calls:
+    if not calls or any(_codex_js_arguments(arguments) is None for _, arguments in calls):
         return None
     function_name, argument_source = calls[0]
     arguments = _codex_js_arguments(argument_source)
-    classified_input = _codex_tool_input(function_name, arguments or argument_source)
-    if function_name == "exec_command" and arguments:
+    if arguments is None:
+        return None
+    classified_input = _codex_tool_input(function_name, arguments)
+    if function_name == "exec_command" and isinstance(arguments, dict):
         command = arguments.get("cmd", arguments.get("command"))
         if isinstance(command, str):
             classified_input = _clip(command, MAX_TOOL_IO)
@@ -751,6 +943,108 @@ def _structured_edit_payload(name: object, raw_input: object) -> dict | None:
         if isinstance(patch, str):
             bounded_value("patch", patch)
     return payload or None
+
+
+def _codex_add_tool_event(
+    state: dict,
+    name: object,
+    raw_input: object,
+    ts: str | None,
+    call_id: object,
+) -> tuple[dict | None, bool]:
+    """Add one Codex call and return (event, handled-as-artifact)."""
+    pending: dict = state["pending"]
+    harness = _codex_harness_tool(name, raw_input)
+    if harness:
+        name = harness["name"]
+        tool_input = harness["input"]
+        classify_input = harness["classify_input"]
+        structured_input = harness["arguments"]
+    else:
+        tool_input = _codex_tool_input(str(name or ""), raw_input)
+        classify_input = tool_input
+        structured_input = raw_input
+    name = str(name or "")
+    if _is_artifact_tool(name) and call_id:
+        state.setdefault("pending_artifacts", {})[call_id] = {
+            "name": name,
+            "input": (
+                harness.get("arguments")
+                if harness and isinstance(harness.get("arguments"), dict)
+                else _tool_arguments(raw_input)
+            ) or {},
+        }
+        return None, True
+    archetype, summary = classify_tool(name, classify_input)
+    event = {
+        "kind": "tool",
+        "ts": ts,
+        "text": "",
+        "tool": {
+            "name": name,
+            "input": tool_input,
+            "output": None,
+            "ok": None,
+            "archetype": archetype,
+            "summary": summary,
+        },
+    }
+    edit_payload = _structured_edit_payload(name, structured_input)
+    if edit_payload is not None:
+        event["tool"]["edit"] = edit_payload
+    _append_event(state, event)
+    if call_id:
+        pending[call_id] = event
+    return event, False
+
+
+def _codex_finish_tool_event(
+    state: dict,
+    event: dict | None,
+    call_id: object,
+    output: object,
+    ts: str | None,
+) -> None:
+    output_text, output_ok = _codex_tool_output(output)
+    if call_id and _complete_artifact(state, call_id, output_text, ts):
+        return
+    target = state["pending"].pop(call_id, None) if call_id else event
+    if target:
+        target["tool"]["output"] = _clip(output_text, MAX_TOOL_IO)
+        target["tool"]["ok"] = output_ok
+        target["tool"]["completed_at"] = ts
+        _record_tool_patch(state, target)
+
+
+def _codex_mcp_output(item: dict) -> object:
+    error = item.get("error")
+    if error is not None:
+        return {"error": error, "isError": True}
+    result = item.get("result")
+    if isinstance(result, dict):
+        output = dict(result)
+    else:
+        output = {"output": result}
+    if not any(key in output for key in ("is_error", "isError", "failed", "exit_code")):
+        output["isError"] = item.get("status") not in (None, "completed")
+    return output
+
+
+def _codex_apply_mcp_tool_item(state: dict, item: dict, ts: str | None) -> bool:
+    if item.get("type") != "mcpToolCall":
+        return False
+    server = item.get("server")
+    tool = item.get("tool")
+    if not isinstance(server, str) or not isinstance(tool, str):
+        return False
+    name = f"mcp__{server}__{tool}"
+    raw_input = item.get("arguments", item.get("input", {}))
+    call_id = item.get("call_id", item.get("id"))
+    event, handled = _codex_add_tool_event(state, name, raw_input, ts, call_id)
+    if not handled and event is None:
+        return False
+    _codex_finish_tool_event(state, event, call_id, _codex_mcp_output(item), ts)
+    return True
 
 
 def _is_artifact_tool(name: object) -> bool:
@@ -1188,49 +1482,16 @@ def _codex_apply(state: dict, row: dict) -> None:
                 },
             )
             _record_row_disposition(state, EVENT_DISPOSITION_RENDERED)
+        elif ptype == "mcpToolCall":
+            if _codex_apply_mcp_tool_item(state, payload, ts):
+                _record_row_disposition(state, EVENT_DISPOSITION_RENDERED)
+            else:
+                _record_row_disposition(state, EVENT_DISPOSITION_UNKNOWN)
         elif ptype in ("function_call", "custom_tool_call", "web_search_call", "tool_search_call"):
             name = payload.get("name") or ptype.replace("_call", "")
             raw_input = payload.get("arguments", payload.get("input", payload.get("action", "")))
             call_id = payload.get("call_id")
-            harness = _codex_harness_tool(name, raw_input)
-            if harness:
-                name = harness["name"]
-                tool_input = harness["input"]
-                classify_input = harness["classify_input"]
-            else:
-                tool_input = _codex_tool_input(name, raw_input)
-                classify_input = tool_input
-            if _is_artifact_tool(name) and call_id:
-                state.setdefault("pending_artifacts", {})[call_id] = {
-                    "name": name,
-                    "input": (
-                        harness.get("arguments")
-                        if harness and isinstance(harness.get("arguments"), dict)
-                        else _tool_arguments(raw_input)
-                    ) or {},
-                }
-                _record_row_disposition(state, EVENT_DISPOSITION_RENDERED)
-                return
-            archetype, summary = classify_tool(name, classify_input)
-            event = {
-                "kind": "tool",
-                "ts": ts,
-                "text": "",
-                "tool": {
-                    "name": name,
-                    "input": tool_input,
-                    "output": None,
-                    "ok": None,
-                    "archetype": archetype,
-                    "summary": summary,
-                },
-            }
-            edit_payload = _structured_edit_payload(name, raw_input)
-            if edit_payload is not None:
-                event["tool"]["edit"] = edit_payload
-            _append_event(state, event)
-            if call_id:
-                pending[call_id] = event
+            _codex_add_tool_event(state, name, raw_input, ts, call_id)
             _record_row_disposition(state, EVENT_DISPOSITION_RENDERED)
         elif ptype in ("function_call_output", "custom_tool_call_output", "tool_search_output"):
             call_id = payload.get("call_id")
@@ -1392,6 +1653,10 @@ def _codex_normalized_apply(state: dict, row: dict) -> None:
             )
             _record_row_disposition(state, _normalized_disposition(row))
             return
+        if isinstance(item, dict) and item.get("type") == "mcpToolCall":
+            if _codex_apply_mcp_tool_item(state, item, ts):
+                _record_row_disposition(state, _normalized_disposition(row))
+                return
         if isinstance(item, dict) and item.get("type") == "userMessage":
             text = "\n".join(
                 str(block.get("text"))

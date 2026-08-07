@@ -697,6 +697,72 @@ class CodexNewRuntimeTranscriptTests(unittest.TestCase):
         self.assertFalse(failed_tool["ok"])
         self.assertEqual(failed_tool["output"], "test command failed\n")
 
+    def test_round2_runtime_harness_and_native_mcp_fixture(self) -> None:
+        path = FIXTURES_DIR / "codex_round2_runtime_rendering.jsonl"
+
+        parsed = transcripts.read_session_events("codex", path)
+        tools = [event["tool"] for event in parsed["events"] if event["kind"] == "tool"]
+
+        self.assertEqual(len(tools), 9)
+        self.assertEqual(tools[0]["name"], "write_stdin")
+        self.assertEqual(tools[0]["archetype"], "wait")
+        self.assertEqual(tools[0]["summary"], "waiting on terminal")
+        self.assertEqual(tools[0]["output"], "done\n")
+        self.assertTrue(tools[0]["ok"])
+
+        patch_tool = tools[1]
+        self.assertEqual(patch_tool["name"], "apply_patch")
+        self.assertEqual(patch_tool["archetype"], "edit")
+        self.assertEqual(patch_tool["summary"], "edit example.py")
+        self.assertEqual(
+            patch_tool["edit"]["patch"],
+            "*** Begin Patch\n*** Update File: backend/app/example.py\n@@\n-old\n+new\n*** End Patch",
+        )
+        self.assertEqual(patch_tool["output"], "patched\n")
+        self.assertTrue(patch_tool["ok"])
+
+        self.assertEqual(tools[2]["name"], "exec_command")
+        self.assertEqual(tools[2]["archetype"], "run")
+        self.assertEqual(tools[2]["output"], "mcp harness output\n")
+
+        self.assertEqual(tools[3]["name"], "update_plan")
+        self.assertEqual(tools[3]["archetype"], "plan")
+        self.assertEqual(tools[3]["summary"], "updated plan")
+
+        self.assertEqual(tools[4]["name"], "view_image")
+        self.assertEqual(tools[4]["archetype"], "read")
+        self.assertEqual(tools[4]["summary"], "view image preview.png")
+
+        self.assertEqual(tools[5]["name"], "wait")
+        self.assertEqual(tools[5]["archetype"], "wait")
+        self.assertEqual(tools[5]["summary"], 'wait {"seconds": 2}')
+
+        native_mcp = tools[6]
+        self.assertEqual(native_mcp["name"], "mcp__filesystem__list_dir")
+        self.assertEqual(native_mcp["archetype"], "tool")
+        self.assertEqual(native_mcp["output"], "a.txt\n")
+        self.assertTrue(native_mcp["ok"])
+
+        self.assertEqual(tools[7]["output"], "plain text\n")
+        self.assertTrue(tools[7]["ok"])
+
+        malformed = tools[8]
+        self.assertEqual(malformed["name"], "exec")
+        self.assertIn("tools.exec_command(args)", malformed["input"])
+        self.assertEqual(malformed["archetype"], "run")
+
+    def test_harness_scanner_ignores_strings_comments_and_unsupported_args(self) -> None:
+        cases = [
+            'const text = "tools.exec_command({cmd: \\"hidden\\"})";',
+            "// tools.exec_command({cmd: 'hidden'})",
+            'const args = {cmd: "echo hi"}; tools.exec_command(args);',
+            'tools.exec_command({cmd: `echo hi`});',
+            'tools.exec_command({cmd: "echo hi"',
+        ]
+        for source in cases:
+            with self.subTest(source=source):
+                self.assertIsNone(transcripts._codex_harness_tool("exec", source))
+
 
 def _write_rollout(day_dir: Path, name: str, cwd: str, session_id: str,
                    kickoff_ticket: str | None = None, mtime: float | None = None) -> Path:
