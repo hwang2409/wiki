@@ -8,7 +8,7 @@ import {
   type RenderToken,
   type TokenNode,
 } from "react-diff-view";
-import { languageForPath, useHighlightTokenLines, type TokenLine } from "./shiki";
+import { languageForPath, languageFromContent, useHighlightTokenLines, type TokenLine } from "./shiki";
 
 export type DiffFile = FileData;
 
@@ -56,6 +56,25 @@ const renderShikiToken: RenderToken = (token, renderDefault, index) => {
 // A single hunk is contiguous by definition, so the joined text preserves
 // cross-line syntax context within one hunk; gaps between hunks are the same
 // blind spot the built-in `tokenize` has.
+// Language-detection sample: prefer new-side content (added lines + context)
+// so a headerless codex diff still surfaces the file's real syntax shape.
+// Bounded to keep the heuristic cheap regardless of hunk size.
+function collectContentSample(hunks: FileData["hunks"]): string {
+  const lines: string[] = [];
+  let bytes = 0;
+  const MAX = 4096;
+  for (const hunk of hunks) {
+    for (const change of hunk.changes) {
+      if (change.type === "delete") continue;
+      const text = change.content;
+      lines.push(text);
+      bytes += text.length + 1;
+      if (bytes >= MAX) return lines.join("\n");
+    }
+  }
+  return lines.join("\n");
+}
+
 function collectSideText(hunks: FileData["hunks"], side: "old" | "new") {
   const lines: Array<{ lineNumber: number; content: string }> = [];
   for (const hunk of hunks) {
@@ -114,7 +133,11 @@ function SplitDiffFile({
   viewType: "split" | "unified";
 }) {
   const path = fileHeader(file);
-  const lang = useMemo(() => languageForPath(path), [path]);
+  const contentSample = useMemo(() => collectContentSample(file.hunks), [file.hunks]);
+  const lang = useMemo(
+    () => languageForPath(path) ?? languageFromContent(contentSample),
+    [path, contentSample],
+  );
   const tokens = useSplitDiffTokens(file, lang);
   return (
     <div className="split-diff-file">
