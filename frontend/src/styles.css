@@ -5911,6 +5911,54 @@ body.is-resizing-panes .pane-cell {
   text-transform: uppercase;
 }
 
+/* Compact single-line GitHub reference for markdown table cells. Chosen to
+   stay on the same line as surrounding cell text — one row per data row, no
+   card unfurl (WIKI-268). */
+.gh-preview-inline {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  max-width: 100%;
+  padding: 1px 5px;
+  border: 1px solid transparent;
+  border-radius: var(--radius-xs);
+  color: var(--text-normal);
+  font-family: var(--font-monospace);
+  font-weight: var(--font-monospace-weight);
+  font-size: var(--font-ui-smaller);
+  line-height: 1.4;
+  text-decoration: none;
+  vertical-align: baseline;
+  white-space: nowrap;
+}
+
+.gh-preview-inline:hover {
+  border-color: color-mix(in srgb, var(--accent-primary) 32%, var(--background-modifier-border));
+  background-color: color-mix(in srgb, var(--accent-primary) 10%, transparent);
+  color: var(--text-normal);
+}
+
+.gh-preview-inline-icon {
+  display: inline-flex;
+  flex: 0 0 auto;
+  align-items: center;
+  color: var(--text-muted);
+}
+
+.gh-preview-inline.is-pr .gh-preview-inline-icon {
+  color: var(--accent-primary);
+}
+
+.gh-preview-inline.is-commit .gh-preview-inline-icon {
+  color: var(--accent-success);
+}
+
+.gh-preview-inline-label {
+  overflow: hidden;
+  min-width: 0;
+  text-overflow: ellipsis;
+}
+
 .session-marker {
   /* Stretch to the transcript column so marker rows and synthetic-source
      rows share one uniform width (Henry 2026-07-22). */

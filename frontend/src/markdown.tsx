@@ -1,4 +1,4 @@
-import { Children, isValidElement, lazy, Suspense, useMemo, useState } from "react";
+import { Children, isValidElement, lazy, Suspense, useContext, useMemo, useState } from "react";
 import type { MouseEvent, ReactNode, TableHTMLAttributes } from "react";
 import ReactMarkdown from "react-markdown";
 import rehypeKatex from "rehype-katex";
@@ -32,7 +32,12 @@ import {
   Zap
 } from "lucide-react";
 import { externalLinkProps, isExternalHttpUrl } from "./external-links";
-import { GhPreviewCard, isGitHubPreviewUrl } from "./github-preview";
+import {
+  GhPreviewCard,
+  GhPreviewInline,
+  GhPreviewLayoutContext,
+  isGitHubPreviewUrl,
+} from "./github-preview";
 import type { NoteSummary } from "./types";
 
 type MdNode = {
@@ -678,7 +683,9 @@ const LazyMermaidBlock = lazy(() =>
 export function MarkdownTable({ children, ...props }: TableHTMLAttributes<HTMLTableElement>) {
   return (
     <div className="markdown-table-scroll">
-      <table {...props}>{children}</table>
+      <GhPreviewLayoutContext.Provider value="inline">
+        <table {...props}>{children}</table>
+      </GhPreviewLayoutContext.Provider>
     </div>
   );
 }
@@ -691,6 +698,7 @@ function createComponents(
 ) {
   function MarkdownLink({ children, className, href, node: _node, ...props }: MarkdownLinkProps) {
     const wikilink = props["data-wikilink"];
+    const previewLayout = useContext(GhPreviewLayoutContext);
 
     if (typeof wikilink === "string") {
       const resolved = resolve(wikilink);
@@ -724,7 +732,11 @@ function createComponents(
     const isExternal = isExternalHttpUrl(href);
     if (isExternal) {
       if (typeof href === "string" && isGitHubPreviewUrl(href)) {
-        return <GhPreviewCard url={href} />;
+        return previewLayout === "inline" ? (
+          <GhPreviewInline url={href} />
+        ) : (
+          <GhPreviewCard url={href} />
+        );
       }
       return (
         <a className="external-link" href={href} {...externalLinkProps(href)}>

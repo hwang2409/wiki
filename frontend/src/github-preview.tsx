@@ -1,8 +1,13 @@
-import { Fragment, useEffect, useState, type ReactNode } from "react";
+import { createContext, Fragment, useEffect, useState, type ReactNode } from "react";
 import { GitCommit, GitPullRequest, Info } from "lucide-react";
 import { externalLinkProps } from "./external-links";
 import { classNamesFor, parseAnsi } from "./ansi";
 import { getGhPreview, type GhPreviewData } from "./api";
+
+// Set by MarkdownTable so GitHub links inside table cells render as the
+// compact inline form instead of the full card. Prose/list contexts inherit
+// the default (false).
+export const GhPreviewLayoutContext = createContext<"card" | "inline">("card");
 
 const GITHUB_PREVIEW_URL_PATTERN =
   /^https:\/\/(?:www\.)?github\.com\/[A-Za-z0-9_.-]+\/[A-Za-z0-9_.-]+\/(?:pull\/\d+|issues\/\d+|commit\/[0-9a-fA-F]{7,40})\/?$/;
@@ -263,6 +268,61 @@ export function GhPreviewCard({ url }: { url: string }) {
         </span>
         {timestamp ? <span className="gh-preview-updated">{timestamp}</span> : null}
       </span>
+    </a>
+  );
+}
+
+type ParsedGitHubRef =
+  | { kind: "pr" | "issue"; repo: string; owner: string; number: string; label: string }
+  | { kind: "commit"; repo: string; owner: string; sha: string; label: string };
+
+const GITHUB_PARSE_PATTERN =
+  /^https:\/\/(?:www\.)?github\.com\/([A-Za-z0-9_.-]+)\/([A-Za-z0-9_.-]+)\/(pull|issues|commit)\/([^/]+)\/?$/;
+
+export function parseGitHubPreviewUrl(url: string): ParsedGitHubRef | null {
+  const match = GITHUB_PARSE_PATTERN.exec(url);
+  if (!match) return null;
+  const [, owner, repo, kindPath, tail] = match;
+  if (kindPath === "commit") {
+    const sha = shortSha(tail);
+    if (!sha) return null;
+    return { kind: "commit", owner, repo, sha, label: `${repo}@${sha}` };
+  }
+  const kind = kindPath === "pull" ? "pr" : "issue";
+  return { kind, owner, repo, number: tail, label: `${repo}#${tail}` };
+}
+
+// Compact single-line reference for dense contexts (markdown table cells).
+// Deliberately does NOT fetch preview metadata — that would trigger a burst of
+// requests when a fleet-status table lands with dozens of PR links, and the
+// full card already covers prose. Full URL stays in the tooltip.
+export function GhPreviewInline({ url }: { url: string }) {
+  const normalizedUrl = normalizePreviewUrl(url);
+  const parsed = parseGitHubPreviewUrl(normalizedUrl);
+  if (!parsed) {
+    return (
+      <a
+        className="external-link"
+        href={normalizedUrl}
+        title={normalizedUrl}
+        {...externalLinkProps(normalizedUrl)}
+      >
+        {normalizedUrl}
+      </a>
+    );
+  }
+
+  return (
+    <a
+      className={`gh-preview-inline is-${parsed.kind}`}
+      href={normalizedUrl}
+      title={normalizedUrl}
+      {...externalLinkProps(normalizedUrl)}
+    >
+      <span className="gh-preview-inline-icon" aria-hidden="true">
+        {previewIcon(parsed.kind)}
+      </span>
+      <span className="gh-preview-inline-label">{parsed.label}</span>
     </a>
   );
 }
