@@ -9,6 +9,8 @@ updated: 2026-08-06
 
 ## 2026-08-06
 
+- WIKI-262 merged (#198) — codex transcript parity: JS harness unwrap, apply_patch decode, wait/mcpToolCall classification, strict lexical scanner; 3 review rounds
+- **PHOEBE** — v3 ladder foundation #13505 MERGED to main (511c1696) — sandbox foundation, run_bash, output spool, local TUI; 8 review rounds + CI-outage rescue (.buildkite sync)
 - WIKI-261 merged (#197) — numbered read-tool outputs now syntax-highlighted (gutter stripped, tokenized, gutter column)
 - WIKI-260 merged (#196) — font picker enumerates installed families via /api/fonts; no variant grouping, Nerd Fonts separate
 - WIKI-258 merged (#195) — split-diff columns no longer collapse to 1ch; wrap preserved without width collapse
