@@ -2,7 +2,7 @@
 type: reference
 tags: [tools, agents, tmux]
 created: 2026-07-07
-updated: 2026-08-06
+updated: 2026-08-07
 ---
 
 # Orchestrator ↔ Worker Protocol (file/tmux schema)
@@ -106,6 +106,8 @@ Agents choose how their output renders by DECLARING it in the markdown they emit
 Monitors = persistent background shell loops (Claude Code Monitor tool), one per worker, ~180s poll; each stdout line becomes an orchestrator notification. Dedupe per event type or they spam.
 
 **Monitors are the PRIMARY wake signal.** `ScheduleWakeup`/cron ticks are a fallback heartbeat only (idle at 1200–1800s) — never the path a merge-ready/blocked transition travels. Orchestrator that drives iteration cadence off timed ticks instead of state-transition monitors is broken by construction: it misses fast transitions, burns tokens, and drifts against the "watchlist file + re-alarms" doctrine (`hot.md`). If you catch yourself scheduling a short wakeup to re-check `merge-ready`, stop — arm the Monitor instead.
+
+**Foreground-wait ban (Henry 2026-08-07): orchestrators must stay available for conversation.** Before worker, CI, review, eval, or deployment work can outlast one tool call, arm a persistent background monitor or supervisor autopilot and verify its first state. Then return control to Henry. Never occupy the session with repeated `sleep`, `gh pr checks --watch`, short polling calls, or manual 15–180 second wait loops. Direct checks are only for monitor setup, a monitor signal, the silence backstop, or an explicit status request. If the preferred monitor fails, install a working background fallback; do not resume foreground polling.
 
 **Monitor construction rules (MANDATORY — a merge-ready sat undetected 21min on 2026-07-15 because of rule 1):**
 

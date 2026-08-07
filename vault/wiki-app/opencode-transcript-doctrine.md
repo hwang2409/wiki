@@ -2,12 +2,22 @@
 type: reference
 tags: [wiki-app, design]
 created: 2026-08-06
-updated: 2026-08-06
+updated: 2026-08-07
 ---
 
 # OpenCode transcript doctrine
 
 Extracted first-hand from https://github.com/anomalyco/opencode at packages/tui/src/routes/session/index.tsx (shallow clone at /tmp/opencode-ref — read the cited lines yourself). This is the design Henry wants Wiki's transcript to feel like. Adopt the DESIGN, not the harness.
+
+## Provider parity target
+
+- Claude rendering is the product benchmark for Codex agent runs.
+- Normalize provider-specific events at the backend boundary into one canonical transcript model.
+- Equivalent Claude and Codex messages, thoughts, tools, results, and errors use the same frontend components.
+- Codex harness JavaScript must never reach the rendering layer. Convert each call into the same semantic tool shape Claude uses.
+- Provider-specific UI is allowed only when the provider lacks equivalent source data. Show that limit directly.
+- Encrypted Codex reasoning is one valid difference: render the fullest supplied summary, but never imply that Wiki can decrypt private reasoning.
+- Parity tests must compare canonical events and rendered behavior across both providers. Do not build a second Codex rendering framework.
 
 ## The two-tier tool rendering model (core)
 
