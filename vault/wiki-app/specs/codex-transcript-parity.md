@@ -54,6 +54,7 @@ Never guess child calls. Never assign an outer result to extracted children. The
 
 - A 50-rollout audit found 94.2% semantic decoding for legacy `exec` wrappers at PR #201 SHA `ec27230c`.
 - PR #201 reviews found invented dead-branch calls, mutable argument drift, incorrect batch result splitting, and unbounded variable recursion.
+- PR #201 merged by explicit Henry override with two known residual defects: ordered destructured results can become one aggregate on every child, and batched `render_artifact` results can bypass artifact completion.
 - Modern app-server items mostly remain raw provider events or Codex-only highlights.
 - Screenshot `acd82e1ac22c.png` shows legacy commands that should match Claude rows, plus adjacent bold thought fragments that remain unpolished.
 
@@ -67,6 +68,7 @@ Never guess child calls. Never assign an outer result to extracted children. The
 - Keep non-artifact content as inspectable raw text or JSON. Only `render_artifact` earns rich rendering.
 - Apply the safe source-to-IR grammar above. Keep wrapper JavaScript behind the fallback row's inspector only.
 - Normalize simple bold Codex summary fragments without changing their text. Split a complete sequence such as `**thought one** **thought two**` into separate ordered thinking events. Keep mixed or ambiguous markdown as one event. Preserve the encrypted capability marker on every derived event.
+- Fix the two PR #201 residuals. Prove ordered child-result binding or keep one outer aggregate. Route proven batched `render_artifact` results through direct-call completion, dedupe, and replay logic.
 
 ## Definition of done
 
