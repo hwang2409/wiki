@@ -23,6 +23,10 @@ def _get_font_response(font_id: str) -> httpx.Response:
     return asyncio.run(request())
 
 
+def _root_components(root: Path) -> tuple[str, ...]:
+    return tuple(part for part in root.resolve().parts if part != "/")
+
+
 class InstalledFontsExtractTests(unittest.TestCase):
     def setUp(self) -> None:
         installed_fonts.reset_cache_for_tests()
@@ -173,15 +177,18 @@ class InstalledFontFileApiTests(unittest.TestCase):
             font_path = root / "font.ttf"
             font_path.write_bytes(b"font bytes")
             font_id = "font-id"
-            with mock.patch.object(installed_fonts, "_FONT_ROOTS", (root,)):
+            location = installed_fonts.FontLocation(0, ("font.ttf",), ".ttf")
+            with mock.patch.object(installed_fonts, "_FONT_ROOTS", (root,)), mock.patch.object(
+                installed_fonts, "_FONT_ROOT_COMPONENTS", (_root_components(root),)
+            ):
                 installed_fonts._CACHE = [{"family": "Test Font", "files": [{"id": font_id}]}]
-                installed_fonts._FILE_MAP = {font_id: font_path}
+                installed_fonts._FILE_MAP = {font_id: location}
                 response = _get_font_response(font_id)
                 self.assertEqual(response.status_code, 200)
                 self.assertEqual(response.content, b"font bytes")
                 self.assertEqual(response.headers["content-type"], "font/ttf")
                 self.assertEqual(response.headers["content-length"], "10")
-                self.assertIsNone(installed_fonts.font_path("../font.ttf"))
+                self.assertEqual(_get_font_response("unknown").status_code, 404)
 
     def test_symlink_escape_is_rejected_after_enumeration(self) -> None:
         with tempfile.TemporaryDirectory() as temp, tempfile.TemporaryDirectory() as outside:
@@ -190,10 +197,14 @@ class InstalledFontFileApiTests(unittest.TestCase):
             outside_path.write_bytes(b"outside")
             link = root / "link.ttf"
             link.symlink_to(outside_path)
-            with mock.patch.object(installed_fonts, "_FONT_ROOTS", (root,)):
+            location = installed_fonts.FontLocation(0, ("link.ttf",), ".ttf")
+            with mock.patch.object(installed_fonts, "_FONT_ROOTS", (root,)), mock.patch.object(
+                installed_fonts, "_FONT_ROOT_COMPONENTS", (_root_components(root),)
+            ):
                 installed_fonts._CACHE = [{"family": "Escaped", "files": [{"id": "escape"}]}]
-                installed_fonts._FILE_MAP = {"escape": link}
-                self.assertIsNone(installed_fonts.font_path("escape"))
+                installed_fonts._FILE_MAP = {"escape": location}
+                response = _get_font_response("escape")
+                self.assertEqual(response.status_code, 404)
 
     def test_request_rejects_symlink_swap_between_enumeration_and_open(self) -> None:
         with tempfile.TemporaryDirectory() as temp, tempfile.TemporaryDirectory() as outside:
@@ -203,12 +214,14 @@ class InstalledFontFileApiTests(unittest.TestCase):
             outside_path = Path(outside) / "outside.ttf"
             outside_path.write_bytes(b"outside")
             font_id = "race"
-            enumerated_path = font_path.resolve()
-            with mock.patch.object(installed_fonts, "_FONT_ROOTS", (root,)):
+            enumerated_location = installed_fonts.FontLocation(0, ("font.ttf",), ".ttf")
+            with mock.patch.object(installed_fonts, "_FONT_ROOTS", (root,)), mock.patch.object(
+                installed_fonts, "_FONT_ROOT_COMPONENTS", (_root_components(root),)
+            ):
                 original_enumerate = installed_fonts._enumerate
                 installed_fonts._enumerate = lambda: (
                     [{"family": "Race Font", "files": [{"id": font_id}]}],
-                    {font_id: enumerated_path},
+                    {font_id: enumerated_location},
                 )  # type: ignore[assignment]
                 try:
                     installed_fonts.installed_fonts()
@@ -216,11 +229,11 @@ class InstalledFontFileApiTests(unittest.TestCase):
                     installed_fonts._enumerate = original_enumerate  # type: ignore[assignment]
                 original_open = installed_fonts._open_font_fd
 
-                def swap_before_open(path: Path, flags: int) -> int:
-                    if Path(path) == enumerated_path:
+                def swap_before_open(location: installed_fonts.FontLocation, flags: int) -> int | None:
+                    if location == enumerated_location:
                         font_path.unlink()
                         font_path.symlink_to(outside_path)
-                    return original_open(path, flags)
+                    return original_open(location, flags)
 
                 with mock.patch.object(installed_fonts, "_open_font_fd", side_effect=swap_before_open):
                     response = _get_font_response(font_id)
@@ -236,9 +249,12 @@ class InstalledFontFileApiTests(unittest.TestCase):
             outside_dir = Path(outside) / "nested"
             outside_dir.mkdir()
             font_id = "parent-race"
-            with mock.patch.object(installed_fonts, "_FONT_ROOTS", (root,)):
+            location = installed_fonts.FontLocation(0, ("nested", "font.ttf"), ".ttf")
+            with mock.patch.object(installed_fonts, "_FONT_ROOTS", (root,)), mock.patch.object(
+                installed_fonts, "_FONT_ROOT_COMPONENTS", (_root_components(root),)
+            ):
                 installed_fonts._CACHE = [{"family": "Race Font", "files": [{"id": font_id}]}]
-                installed_fonts._FILE_MAP = {font_id: font_path.resolve()}
+                installed_fonts._FILE_MAP = {font_id: location}
                 original_open_at = installed_fonts._open_at
                 swapped = False
 
@@ -256,6 +272,43 @@ class InstalledFontFileApiTests(unittest.TestCase):
                 self.assertTrue(swapped)
                 self.assertEqual(response.status_code, 404)
 
+    def test_request_rejects_root_component_swap_before_walk(self) -> None:
+        with tempfile.TemporaryDirectory() as temp, tempfile.TemporaryDirectory() as outside:
+            base = Path(temp)
+            root_library = base / "Library"
+            root = root_library / "Fonts"
+            root.mkdir(parents=True)
+            font_path = root / "font.ttf"
+            font_path.write_bytes(b"inside")
+            outside_library = Path(outside) / "Library"
+            outside_fonts = outside_library / "Fonts"
+            outside_fonts.mkdir(parents=True)
+            (outside_fonts / "font.ttf").write_bytes(b"outside")
+            font_id = "root-race"
+            location = installed_fonts.FontLocation(0, ("font.ttf",), ".ttf")
+            with mock.patch.object(installed_fonts, "_FONT_ROOTS", (root,)), mock.patch.object(
+                installed_fonts, "_FONT_ROOT_COMPONENTS", (_root_components(root),)
+            ):
+                installed_fonts._CACHE = [{"family": "Race Font", "files": [{"id": font_id}]}]
+                installed_fonts._FILE_MAP = {font_id: location}
+                original_open_at = installed_fonts._open_at
+                swapped = False
+
+                def swap_root_component(
+                    path: str | Path, flags: int, *, dir_fd: int | None = None
+                ) -> int:
+                    nonlocal swapped
+                    if str(path) == "Library" and not swapped:
+                        root_library.rename(base / "Library-real")
+                        root_library.symlink_to(outside_library, target_is_directory=True)
+                        swapped = True
+                    return original_open_at(path, flags, dir_fd=dir_fd)
+
+                with mock.patch.object(installed_fonts, "_open_at", side_effect=swap_root_component):
+                    response = _get_font_response(font_id)
+            self.assertTrue(swapped)
+            self.assertEqual(response.status_code, 404)
+
     def test_oversized_opened_font_is_rejected(self) -> None:
         with tempfile.TemporaryDirectory() as temp:
             root = Path(temp)
@@ -263,10 +316,12 @@ class InstalledFontFileApiTests(unittest.TestCase):
             font_path.write_bytes(b"large")
             font_id = "large"
             with mock.patch.object(installed_fonts, "_FONT_ROOTS", (root,)), mock.patch.object(
-                installed_fonts, "MAX_FONT_FILE_BYTES", 4
-            ):
+                installed_fonts, "_FONT_ROOT_COMPONENTS", (_root_components(root),)
+            ), mock.patch.object(installed_fonts, "MAX_FONT_FILE_BYTES", 4):
                 installed_fonts._CACHE = [{"family": "Large Font", "files": [{"id": font_id}]}]
-                installed_fonts._FILE_MAP = {font_id: font_path}
+                installed_fonts._FILE_MAP = {
+                    font_id: installed_fonts.FontLocation(0, ("large.ttf",), ".ttf")
+                }
                 response = _get_font_response(font_id)
             self.assertEqual(response.status_code, 413)
 
@@ -319,7 +374,7 @@ class InstalledFontsCacheTests(unittest.TestCase):
                 ]
             }
 
-            def fake_enumerate() -> tuple[list[installed_fonts.FontFamily], dict[str, Path]]:
+            def fake_enumerate() -> tuple[list[installed_fonts.FontFamily], dict[str, installed_fonts.FontLocation]]:
                 calls["n"] += 1
                 entered.set()
                 release.wait(timeout=2)
@@ -328,7 +383,9 @@ class InstalledFontsCacheTests(unittest.TestCase):
             original = installed_fonts._enumerate
             installed_fonts._enumerate = fake_enumerate  # type: ignore[assignment]
             try:
-                with mock.patch.object(installed_fonts, "_FONT_ROOTS", (root,)):
+                with mock.patch.object(installed_fonts, "_FONT_ROOTS", (root,)), mock.patch.object(
+                    installed_fonts, "_FONT_ROOT_COMPONENTS", (_root_components(root),)
+                ):
                     with concurrent.futures.ThreadPoolExecutor(max_workers=2) as pool:
                         first = pool.submit(installed_fonts.installed_fonts)
                         self.assertTrue(entered.wait(timeout=2))

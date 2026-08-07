@@ -4054,7 +4054,7 @@ async def get_font_file(font_id: str) -> Response:
         raise HTTPException(status_code=413, detail="Font file exceeds the 50MB serving limit")
     if handle is None:
         raise HTTPException(status_code=404, detail="Font not found")
-    media_type = "font/otf" if handle.path.suffix.casefold() == ".otf" else "font/ttf"
+    media_type = "font/otf" if handle.suffix == ".otf" else "font/ttf"
     return StreamingResponse(
         _stream_font_file(handle),
         media_type=media_type,

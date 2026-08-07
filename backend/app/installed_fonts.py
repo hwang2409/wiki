@@ -17,11 +17,14 @@ from typing import Any, BinaryIO, TypedDict
 logger = logging.getLogger(__name__)
 _LOCK = threading.Lock()
 _CACHE: list[FontFamily] | None = None
-_FILE_MAP: dict[str, Path] = {}
-_EXTRACTED_PATHS: dict[str, Path] = {}
+_FILE_MAP: dict[str, FontLocation] = {}
+_EXTRACTED_PATHS: dict[str, FontLocation] = {}
 _FONT_ROOTS = tuple(Path.home() / part for part in ("Library/Fonts",)) + (
     Path("/Library/Fonts"),
     Path("/System/Library/Fonts"),
+)
+_FONT_ROOT_COMPONENTS = tuple(
+    tuple(part for part in root.expanduser().parts if part != "/") for root in _FONT_ROOTS
 )
 _FONT_SUFFIXES = {".ttf", ".otf"}
 MAX_FONT_FILE_BYTES = 50 * 1024 * 1024
@@ -38,6 +41,13 @@ class FontFamily(TypedDict):
     files: list[FontFile]
 
 
+@dataclass(frozen=True)
+class FontLocation:
+    root_id: int
+    relative_parts: tuple[str, ...]
+    suffix: str
+
+
 class FontFileTooLarge(Exception):
     """The opened font file exceeds the serving limit."""
 
@@ -45,7 +55,7 @@ class FontFileTooLarge(Exception):
 @dataclass
 class OpenedFontFile:
     stream: BinaryIO
-    path: Path
+    suffix: str
     size: int
 
 
@@ -63,6 +73,24 @@ def _allowed_font_path(path: Path) -> Path | None:
             return resolved
         except ValueError:
             continue
+    return None
+
+
+def _font_location(path: Path) -> FontLocation | None:
+    """Convert an enumerated path to static root and relative components."""
+    try:
+        resolved = path.expanduser().resolve(strict=True)
+    except OSError:
+        return None
+    for root_id, root in enumerate(_FONT_ROOTS):
+        try:
+            root_path = root.expanduser().resolve(strict=True)
+            relative = resolved.relative_to(root_path)
+        except (OSError, ValueError):
+            continue
+        if not relative.parts or any(part in {"", ".", ".."} for part in relative.parts):
+            continue
+        return FontLocation(root_id=root_id, relative_parts=relative.parts, suffix=resolved.suffix.casefold())
     return None
 
 
@@ -134,8 +162,8 @@ def _location(*entries: dict[str, Any]) -> Path | None:
     return None
 
 
-def _extract_fonts_with_paths(payload: Any) -> tuple[list[FontFamily], dict[str, Path]]:
-    extracted_paths: dict[str, Path] = {}
+def _extract_fonts_with_paths(payload: Any) -> tuple[list[FontFamily], dict[str, FontLocation]]:
+    extracted_paths: dict[str, FontLocation] = {}
     grouped: dict[str, FontFamily] = {}
     entries = payload.get("SPFontsDataType", []) if isinstance(payload, dict) else []
     if not isinstance(entries, list):
@@ -161,8 +189,11 @@ def _extract_fonts_with_paths(payload: Any) -> tuple[list[FontFamily], dict[str,
             result = grouped.setdefault(family, {"family": family, "files": []})
             if location is None:
                 continue
+            font_location = _font_location(location)
+            if font_location is None:
+                continue
             font_id = _font_id(location)
-            extracted_paths[font_id] = location
+            extracted_paths[font_id] = font_location
             font_file: FontFile = {"id": font_id}
             weight = _typeface_weight(typeface)
             style = typeface.get("style")
@@ -185,7 +216,7 @@ def _extract_families(payload: Any) -> list[str]:
     return [entry["family"] for entry in _extract_fonts(payload)]
 
 
-def _enumerate() -> tuple[list[FontFamily], dict[str, Path]]:
+def _enumerate() -> tuple[list[FontFamily], dict[str, FontLocation]]:
     try:
         completed = subprocess.run(
             ["system_profiler", "SPFontsDataType", "-json"],
@@ -230,17 +261,20 @@ def installed_fonts() -> list[FontFamily]:
             # Preserve compatibility with old test doubles and callers.
             raw_fonts, extracted_paths = enumerated, {}
         computed = _normalise(raw_fonts)
-        file_map: dict[str, Path] = {}
+        file_map: dict[str, FontLocation] = {}
         for entry in computed:
             for font_file in entry["files"]:
                 font_id = font_file.get("id")
                 if not isinstance(font_id, str):
                     continue
-                # Re-resolve every enumerated path before adding it to the map.
-                # The map is populated from server-side data, never client input.
-                resolved = _allowed_font_path(extracted_paths.get(font_id, Path("")))
-                if resolved is not None:
-                    file_map[font_id] = resolved
+                location = extracted_paths.get(font_id)
+                if location is None:
+                    continue
+                if not 0 <= location.root_id < len(_FONT_ROOT_COMPONENTS):
+                    continue
+                if location.suffix not in _FONT_SUFFIXES or not location.relative_parts:
+                    continue
+                file_map[font_id] = location
         _EXTRACTED_PATHS.clear()
         _EXTRACTED_PATHS.update(extracted_paths)
         if _CACHE is None:
@@ -253,69 +287,48 @@ def installed_families() -> list[str]:
     return [entry["family"] for entry in installed_fonts()]
 
 
-def font_path(font_id: str) -> Path | None:
-    installed_fonts()
-    with _LOCK:
-        path = _FILE_MAP.get(font_id)
-    if path is None:
-        return None
-    return _allowed_font_path(path)
-
-
 def _open_at(path: str | Path, flags: int, *, dir_fd: int | None = None) -> int:
     return os.open(path, flags, dir_fd=dir_fd)
 
 
-def _open_font_fd(path: Path, flags: int) -> int | None:
-    """Open a mapped font by walking from an allowlisted root descriptor."""
-    if path.suffix.casefold() not in _FONT_SUFFIXES:
+def _open_font_fd(location: FontLocation, flags: int) -> int | None:
+    """Open a mapped font beneath a fixed root using descriptor-relative walks."""
+    if location.suffix not in _FONT_SUFFIXES:
         return None
+    if not 0 <= location.root_id < len(_FONT_ROOT_COMPONENTS):
+        return None
+    parts = (*_FONT_ROOT_COMPONENTS[location.root_id], *location.relative_parts)
+    if not parts or any(part in {"", ".", ".."} for part in parts):
+        return None
+
+    current_fd: int | None = None
     try:
-        candidate = path.expanduser().resolve(strict=False)
+        anchor_flags = flags | getattr(os, "O_DIRECTORY", 0)
+        current_fd = _open_at("/", anchor_flags)
+        for index, part in enumerate(parts):
+            component_flags = flags
+            if index < len(parts) - 1:
+                component_flags |= getattr(os, "O_DIRECTORY", 0)
+            next_fd = _open_at(part, component_flags, dir_fd=current_fd)
+            os.close(current_fd)
+            current_fd = next_fd
+        return current_fd
     except OSError:
+        if current_fd is not None:
+            os.close(current_fd)
         return None
-
-    for root in _FONT_ROOTS:
-        try:
-            root_path = root.expanduser().resolve(strict=True)
-            relative = candidate.relative_to(root_path)
-        except (OSError, ValueError):
-            continue
-        parts = relative.parts
-        if not parts or any(part in {"", ".", ".."} for part in parts):
-            continue
-
-        current_fd: int | None = None
-        try:
-            current_fd = _open_at(
-                root_path,
-                flags | getattr(os, "O_DIRECTORY", 0),
-            )
-            for index, part in enumerate(parts):
-                component_flags = flags
-                if index < len(parts) - 1:
-                    component_flags |= getattr(os, "O_DIRECTORY", 0)
-                next_fd = _open_at(part, component_flags, dir_fd=current_fd)
-                os.close(current_fd)
-                current_fd = next_fd
-            return current_fd
-        except OSError:
-            if current_fd is not None:
-                os.close(current_fd)
-            continue
-    return None
 
 
 def open_font_file(font_id: str) -> OpenedFontFile | None:
     """Open an allowlisted font and keep the opened descriptor for streaming."""
     installed_fonts()
     with _LOCK:
-        path = _FILE_MAP.get(font_id)
-    if path is None:
+        location = _FILE_MAP.get(font_id)
+    if location is None:
         return None
 
     flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_CLOEXEC", 0)
-    fd = _open_font_fd(path, flags)
+    fd = _open_font_fd(location, flags)
     if fd is None:
         return None
     stream: BinaryIO | None = None
@@ -327,7 +340,7 @@ def open_font_file(font_id: str) -> OpenedFontFile | None:
         if metadata.st_size > MAX_FONT_FILE_BYTES:
             raise FontFileTooLarge
         stream = os.fdopen(fd, "rb", closefd=True)
-        return OpenedFontFile(stream=stream, path=path, size=metadata.st_size)
+        return OpenedFontFile(stream=stream, suffix=location.suffix, size=metadata.st_size)
     except BaseException:
         if stream is None:
             os.close(fd)
