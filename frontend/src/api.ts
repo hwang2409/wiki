@@ -525,9 +525,15 @@ export type SessionTool = {
   ok: boolean | null;
   archetype: string;
   summary: string;
+  call_id?: string | null;
+  status?: string | null;
+  duration_ms?: number | null;
+  terminal_input?: string | null;
+  metadata?: Record<string, unknown>;
   completed_at?: string | null;
   agent_id?: string;
   edit?: {
+    changes?: unknown;
     file_path?: string;
     old_string?: string;
     new_string?: string;
@@ -792,6 +798,11 @@ export type SessionPatch = {
   output: string | null;
   ok: boolean | null;
   completed_at?: string | null;
+  duration_ms?: number | null;
+  status?: string | null;
+  terminal_input?: string | null;
+  metadata?: Record<string, unknown>;
+  edit?: SessionTool["edit"];
 };
 
 export type AgentSessionData = {

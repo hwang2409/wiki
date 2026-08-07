@@ -1333,6 +1333,154 @@ class CodexNewRuntimeTranscriptTests(unittest.TestCase):
         self.assertEqual(harness["input"], "line\nhexAunicodeB")
 
 
+class CodexModernTranscriptParityTests(unittest.TestCase):
+    def setUp(self) -> None:
+        transcripts._cache.clear()
+
+    @staticmethod
+    def _row(method: str, params: dict, seq: int) -> dict:
+        return {
+            "seq": seq,
+            "raw_seq": seq,
+            "normalized_at": f"2026-08-07T12:00:{seq:02d}Z",
+            "disposition": "rendered",
+            "kind": method.replace("/", "_"),
+            "payload": {"method": method, "params": params},
+        }
+
+    def test_modern_item_lifecycle_deltas_and_replay_share_one_tool(self) -> None:
+        item = {
+            "type": "commandExecution",
+            "id": "cmd-1",
+            "command": "printf hi",
+            "cwd": "/workspace",
+            "status": "inProgress",
+        }
+        completed = {
+            **item,
+            "status": "completed",
+            "aggregatedOutput": "hi\n",
+            "exitCode": 0,
+            "durationMs": 12,
+        }
+        rows = [
+            self._row("item/started", {"item": item}, 1),
+            self._row("item/commandExecution/outputDelta", {"itemId": "cmd-1", "delta": "hi\n"}, 2),
+            self._row("item/commandExecution/terminalInteraction", {"itemId": "cmd-1", "input": "y\n"}, 3),
+            self._row("item/completed", {"item": completed}, 4),
+            self._row("rawResponseItem/completed", {"item": completed}, 5),
+        ]
+        with TemporaryDirectory() as tmp:
+            path = Path(tmp) / "events.jsonl"
+            path.write_text("".join(json.dumps(row) + "\n" for row in rows))
+            parsed = transcripts.read_session_events("codex-normalized", path)
+
+        tools = [event["tool"] for event in parsed["events"] if event["kind"] == "tool"]
+        self.assertEqual(len(tools), 1)
+        self.assertEqual(tools[0]["name"], "exec_command")
+        self.assertEqual(tools[0]["output"], "hi\n")
+        self.assertTrue(tools[0]["ok"])
+        self.assertEqual(tools[0]["duration_ms"], 12)
+        self.assertEqual(tools[0]["terminal_input"], "y\n")
+        self.assertEqual(tools[0]["call_id"], "cmd-1")
+
+    def test_result_first_modern_item_is_linked_when_start_replays_later(self) -> None:
+        completed = {
+            "type": "mcpToolCall",
+            "id": "mcp-1",
+            "server": "filesystem",
+            "tool": "read_file",
+            "arguments": {"path": "README.md"},
+            "result": {"content": [{"type": "text", "text": "hello"}]},
+            "status": "completed",
+        }
+        rows = [
+            self._row("item/completed", {"item": completed}, 1),
+            self._row("item/started", {"item": {**completed, "status": "inProgress", "result": None}}, 2),
+        ]
+        with TemporaryDirectory() as tmp:
+            path = Path(tmp) / "events.jsonl"
+            path.write_text("".join(json.dumps(row) + "\n" for row in rows))
+            parsed = transcripts.read_session_events("codex-normalized", path)
+
+        tools = [event["tool"] for event in parsed["events"] if event["kind"] == "tool"]
+        self.assertEqual(len(tools), 1)
+        self.assertEqual(tools[0]["name"], "mcp__filesystem__read_file")
+        self.assertEqual(tools[0]["output"], "hello")
+        self.assertTrue(tools[0]["ok"])
+
+    def test_modern_agent_message_delta_and_approval_are_visible_once(self) -> None:
+        rows = [
+            self._row(
+                "item/started",
+                {"item": {"type": "agentMessage", "id": "msg-1", "text": ""}},
+                1,
+            ),
+            self._row("item/agentMessage/delta", {"itemId": "msg-1", "delta": "hello"}, 2),
+            self._row("item/agentMessage/delta", {"itemId": "msg-1", "delta": " world"}, 3),
+            self._row(
+                "item/completed",
+                {"item": {"type": "agentMessage", "id": "msg-1", "text": "hello world"}},
+                4,
+            ),
+            self._row(
+                "item/commandExecution/requestApproval",
+                {"itemId": "cmd-2", "reason": "needs terminal access"},
+                5,
+            ),
+            self._row(
+                "serverRequest/resolved",
+                {"requestId": "cmd-2", "response": {"approved": False}},
+                6,
+            ),
+        ]
+        with TemporaryDirectory() as tmp:
+            path = Path(tmp) / "events.jsonl"
+            path.write_text("".join(json.dumps(row) + "\n" for row in rows))
+            parsed = transcripts.read_session_events("codex-normalized", path)
+
+        self.assertEqual(
+            [(event["kind"], event["text"]) for event in parsed["events"]],
+            [
+                ("assistant", "hello world"),
+                ("marker", "approval requested"),
+                ("marker", "approval resolved"),
+            ],
+        )
+
+    def test_legacy_result_first_is_buffered_until_call_identity_arrives(self) -> None:
+        rows = [
+            {
+                "type": "response_item",
+                "timestamp": "2026-08-07T12:00:00Z",
+                "payload": {
+                    "type": "function_call_output",
+                    "call_id": "call-first",
+                    "output": "done\n",
+                },
+            },
+            {
+                "type": "response_item",
+                "timestamp": "2026-08-07T12:00:01Z",
+                "payload": {
+                    "type": "function_call",
+                    "call_id": "call-first",
+                    "name": "exec_command",
+                    "arguments": json.dumps({"cmd": "printf done"}),
+                },
+            },
+        ]
+        with TemporaryDirectory() as tmp:
+            path = Path(tmp) / "codex.jsonl"
+            path.write_text("".join(json.dumps(row) + "\n" for row in rows))
+            parsed = transcripts.read_session_events("codex", path)
+
+        tools = [event["tool"] for event in parsed["events"] if event["kind"] == "tool"]
+        self.assertEqual(len(tools), 1)
+        self.assertEqual(tools[0]["output"], "done\n")
+        self.assertTrue(tools[0]["ok"])
+
+
 def _write_rollout(day_dir: Path, name: str, cwd: str, session_id: str,
                    kickoff_ticket: str | None = None, mtime: float | None = None) -> Path:
     day_dir.mkdir(parents=True, exist_ok=True)

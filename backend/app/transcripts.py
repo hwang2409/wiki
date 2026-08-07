@@ -62,6 +62,8 @@ MAX_CODEX_HARNESS_SOURCE = 100_000
 MAX_CODEX_HARNESS_CALLS = 32
 MAX_CODEX_BATCH_CHILD_INPUT = 600
 MAX_CODEX_BATCH_RESULT_BYTES = MAX_TOOL_IO * MAX_CODEX_HARNESS_CALLS
+MAX_CODEX_PENDING_RESULTS = 128
+MAX_CODEX_DELTA_CACHE = 512
 
 try:
     TAIL_WINDOW_EVENTS = max(1, int(os.environ.get("WIKI_TRANSCRIPT_TAIL_WINDOW", "500")))
@@ -543,6 +545,16 @@ _CODEX_IGNORED_TYPES = {
     "thread_settings_applied": "Thread settings are verbose startup metadata with no incremental transcript value.",
     "turn_context": "Turn context rows are parser bookkeeping, not user-visible activity.",
     "world_state": "World-state snapshots are large internal state dumps.",
+}
+
+_CODEX_APPROVAL_METHODS = {
+    "item/commandExecution/requestApproval",
+    "item/fileChange/requestApproval",
+    "item/permissions/requestApproval",
+    "item/tool/requestUserInput",
+    "mcpServer/elicitation/request",
+    "execCommandApproval",
+    "applyPatchApproval",
 }
 
 
@@ -1881,6 +1893,45 @@ def _codex_finish_tool_event(
         _record_tool_patch(state, target)
 
 
+def _codex_apply_pending_result(state: dict, call_id: object) -> None:
+    if not call_id:
+        return
+    pending_results: dict = state.setdefault("pending_results", {})
+    saved = pending_results.pop(call_id, None)
+    if saved is None:
+        return
+    raw_output, result_ts = saved
+    if call_id in state.get("pending_artifacts", {}):
+        details = _codex_tool_output_details(raw_output)
+        _complete_artifact(
+            state,
+            call_id,
+            details.text,
+            result_ts,
+            failed=details.status is False,
+        )
+        return
+    batch = state.get("pending_batches", {}).pop(call_id, None)
+    if batch:
+        child_outputs = _codex_batch_output_values(raw_output, len(batch))
+        aggregate = child_outputs is None
+        if child_outputs is None:
+            child_outputs = [raw_output] * len(batch)
+        for reference, child_output in zip(batch, child_outputs):
+            _codex_finish_tool_event(
+                state,
+                reference["event"],
+                reference["call_id"],
+                child_output,
+                result_ts,
+                aggregate=aggregate,
+            )
+        return
+    event = state.get("pending", {}).get(call_id)
+    if event is not None:
+        _codex_finish_tool_event(state, event, call_id, raw_output, result_ts)
+
+
 def _codex_mcp_output(item: dict) -> object:
     error = item.get("error")
     if error is not None:
@@ -1934,6 +1985,285 @@ def _codex_native_tool_key(row: dict) -> tuple[str, str] | None:
     if not isinstance(server, str) or not isinstance(tool, str):
         return None
     return (f"mcp__{server}__{tool}", _codex_tool_input(tool, item.get("arguments", item.get("input", {}))))
+
+
+_CODEX_MODERN_TOOL_TYPES = {
+    "commandExecution",
+    "fileChange",
+    "mcpToolCall",
+    "dynamicToolCall",
+    "collabToolCall",
+    "webSearch",
+    "imageView",
+}
+
+
+def _codex_modern_item_id(item: dict, params: dict | None = None) -> str | None:
+    for key in ("id", "itemId", "call_id", "callId"):
+        value = item.get(key)
+        if isinstance(value, (str, int)) and str(value):
+            return str(value)
+    if isinstance(params, dict):
+        for key in ("itemId", "call_id", "callId"):
+            value = params.get(key)
+            if isinstance(value, (str, int)) and str(value):
+                return str(value)
+    return None
+
+
+def _codex_modern_tool_spec(item: dict) -> tuple[str, object] | None:
+    item_type = item.get("type")
+    if item_type == "commandExecution":
+        command = item.get("command", item.get("cmd", item.get("input", "")))
+        raw_input: dict = {"cmd": command}
+        if isinstance(item.get("cwd"), str):
+            raw_input["cwd"] = item["cwd"]
+        return "exec_command", raw_input
+    if item_type == "fileChange":
+        raw_input = item.get("changes", item.get("input", item.get("patch", {})))
+        return "apply_patch", raw_input
+    if item_type == "mcpToolCall":
+        server = item.get("server")
+        tool = item.get("tool")
+        if not isinstance(server, str) or not isinstance(tool, str):
+            return None
+        return f"mcp__{server}__{tool}", item.get("arguments", item.get("input", {}))
+    if item_type == "dynamicToolCall":
+        name = item.get("tool", item.get("name", "dynamicToolCall"))
+        return str(name), item.get("arguments", item.get("input", {}))
+    if item_type == "collabToolCall":
+        return "collabToolCall", item.get(
+            "input", item.get("arguments", item.get("action", {}))
+        )
+    if item_type == "webSearch":
+        return "web_search", item.get("query", item.get("input", {}))
+    if item_type == "imageView":
+        return "view_image", item.get("path", item.get("input", {}))
+    return None
+
+
+def _codex_modern_item_output(item: dict) -> object:
+    item_type = item.get("type")
+    if item_type == "commandExecution":
+        output: object = item.get("aggregatedOutput", item.get("output"))
+        if output is None and (
+            item.get("stdout") is not None or item.get("stderr") is not None
+        ):
+            output = "\n".join(
+                str(part) for part in (item.get("stdout"), item.get("stderr")) if part
+            )
+        return output
+    if item_type == "mcpToolCall":
+        return _codex_mcp_output(item)
+    for key in ("output", "result", "content", "error"):
+        if key in item:
+            return item[key]
+    return None
+
+
+def _codex_modern_item_status(item: dict) -> bool | None:
+    if item.get("error") is not None:
+        return False
+    result = item.get("result")
+    if isinstance(result, dict) and result.get("isError") is True:
+        return False
+    status = item.get("status")
+    if isinstance(status, str):
+        normalized = status.lower()
+        if normalized in {"inprogress", "in_progress", "running", "started", "pending"}:
+            return None
+        if normalized in {"completed", "complete", "success", "succeeded"}:
+            return True
+        if normalized in {
+            "failed",
+            "error",
+            "declined",
+            "cancelled",
+            "canceled",
+            "interrupted",
+        }:
+            return False
+    exit_code = item.get("exitCode", item.get("exit_code"))
+    if isinstance(exit_code, (int, float)):
+        return exit_code == 0
+    return None
+
+
+def _codex_modern_metadata(item: dict) -> dict:
+    metadata: dict = {}
+    for key in (
+        "server",
+        "tool",
+        "cwd",
+        "command",
+        "action",
+        "query",
+        "path",
+        "exitCode",
+        "status",
+        "phase",
+        "turnId",
+    ):
+        value = item.get(key)
+        if isinstance(value, (str, int, float, bool)):
+            metadata[key] = value
+    return metadata
+
+
+def _codex_modern_edit(item: dict) -> dict | None:
+    if item.get("type") != "fileChange":
+        return None
+    changes = item.get("changes", item.get("edits"))
+    if changes is None:
+        return None
+    return {"changes": deepcopy(changes)}
+
+
+def _codex_replay_pending_deltas(state: dict, item_id: str, event: dict) -> None:
+    deltas: dict = state.setdefault("pending_modern_deltas", {})
+    pending = deltas.pop(item_id, [])
+    if not pending:
+        return
+    target = event.get("tool") if event.get("kind") == "tool" else event
+    current = target.get("output" if event.get("kind") == "tool" else "text") or ""
+    for delta in pending:
+        if not isinstance(delta, str) or delta in current:
+            continue
+        current += delta
+    key = "output" if event.get("kind") == "tool" else "text"
+    target[key] = _clip(current, MAX_TOOL_IO if key == "output" else MAX_TEXT)
+
+
+def _codex_patch_modern_tool(
+    state: dict,
+    event: dict,
+    item: dict,
+    ts: str | None,
+    *,
+    completed: bool,
+) -> None:
+    tool = event["tool"]
+    item_id = _codex_modern_item_id(item)
+    output = _codex_modern_item_output(item)
+    if output is not None and completed:
+        details = _codex_tool_output_details(output)
+        tool["output"] = _clip(details.text, MAX_TOOL_IO)
+        tool["ok"] = _codex_modern_item_status(item)
+        if tool["ok"] is None:
+            tool["ok"] = details.status if details.status is not None else True
+    elif completed and tool.get("output") is None:
+        tool["ok"] = _codex_modern_item_status(item)
+        if tool["ok"] is None and item.get("status") not in {None, "inProgress"}:
+            tool["ok"] = True
+    if completed:
+        tool["completed_at"] = ts
+        duration = item.get("durationMs", item.get("duration_ms"))
+        if isinstance(duration, (int, float)):
+            tool["duration_ms"] = int(duration)
+        tool["status"] = item.get("status") or (
+            "completed" if tool.get("ok") else "failed"
+        )
+    metadata = _codex_modern_metadata(item)
+    if metadata:
+        tool["metadata"] = metadata
+    edit = _codex_modern_edit(item)
+    if edit is not None:
+        tool["edit"] = edit
+    if item_id:
+        state.setdefault("codex_modern_items", {})[item_id] = event
+        _codex_replay_pending_deltas(state, item_id, event)
+    _record_tool_patch(state, event)
+
+
+def _codex_modern_item_apply(
+    state: dict,
+    item: dict,
+    ts: str | None,
+    *,
+    completed: bool,
+) -> bool:
+    item_type = item.get("type")
+    item_id = _codex_modern_item_id(item)
+    if item_type not in _CODEX_MODERN_TOOL_TYPES or not item_id:
+        return False
+    modern_items: dict = state.setdefault("codex_modern_items", {})
+    event = modern_items.get(item_id)
+    if event is None:
+        spec = _codex_modern_tool_spec(item)
+        if spec is None:
+            return False
+        name, raw_input = spec
+        event, handled = _codex_add_semantic_tool_event(
+            state, name, raw_input, ts, item_id
+        )
+        if handled and event is None:
+            modern_items[item_id] = None
+            if completed:
+                output = (
+                    _codex_mcp_tool_result_text(item)
+                    if item.get("type") == "mcpToolCall"
+                    else _codex_modern_item_output(item)
+                )
+                details = _codex_tool_output_details(output)
+                _complete_artifact(
+                    state,
+                    item_id,
+                    details.text,
+                    ts,
+                    failed=(
+                        details.status is False
+                        or _codex_modern_item_status(item) is False
+                    ),
+                )
+            return True
+        if event is None:
+            return False
+        event["tool"]["call_id"] = item_id
+        if not completed:
+            event["tool"]["status"] = "inProgress"
+        modern_items[item_id] = event
+    if completed and event is not None:
+        _codex_patch_modern_tool(state, event, item, ts, completed=True)
+        state["pending"].pop(item_id, None)
+    return True
+
+
+def _codex_modern_delta(state: dict, params: dict, ts: str | None) -> bool:
+    item_id = _codex_modern_item_id({}, params)
+    delta = params.get("delta")
+    if not item_id:
+        return False
+    event = state.setdefault("codex_modern_items", {}).get(item_id)
+    if event is None:
+        if isinstance(delta, str):
+            pending = state.setdefault("pending_modern_deltas", {}).setdefault(
+                item_id, []
+            )
+            if len(pending) < MAX_CODEX_DELTA_CACHE:
+                pending.append(delta)
+        return False
+    tool = event.get("tool") or {}
+    terminal_input = params.get("input", params.get("text"))
+    if isinstance(terminal_input, str):
+        tool["terminal_input"] = _clip(terminal_input, MAX_TOOL_IO)
+        _record_tool_patch(state, event)
+        return True
+    if not isinstance(delta, str):
+        return False
+    current = tool.get("output") or ""
+    if current.endswith(delta):
+        return True
+    seen = state.setdefault("codex_delta_cache", set())
+    signature = (item_id, delta)
+    if signature in seen:
+        return True
+    seen.add(signature)
+    if len(seen) > MAX_CODEX_DELTA_CACHE:
+        for old in list(seen)[: MAX_CODEX_DELTA_CACHE // 2]:
+            seen.remove(old)
+    tool["output"] = _clip(current + delta, MAX_TOOL_IO)
+    _record_tool_patch(state, event)
+    return True
 
 
 def _is_artifact_tool(name: object) -> bool:
@@ -2254,6 +2584,11 @@ def _record_tool_patch(state: dict, event: dict) -> None:
             "output": tool.get("output"),
             "ok": tool.get("ok"),
             "completed_at": tool.get("completed_at"),
+            "duration_ms": tool.get("duration_ms"),
+            "status": tool.get("status"),
+            "terminal_input": tool.get("terminal_input"),
+            "metadata": tool.get("metadata"),
+            "edit": tool.get("edit"),
         },
     )
 
@@ -2451,6 +2786,7 @@ def _codex_apply(state: dict, row: dict) -> None:
             raw_input = payload.get("arguments", payload.get("input", payload.get("action", "")))
             call_id = payload.get("call_id")
             _codex_add_tool_event(state, name, raw_input, ts, call_id)
+            _codex_apply_pending_result(state, call_id)
             _record_row_disposition(state, EVENT_DISPOSITION_RENDERED)
         elif ptype in ("function_call_output", "custom_tool_call_output", "tool_search_output"):
             call_id = payload.get("call_id")
@@ -2500,6 +2836,12 @@ def _codex_apply(state: dict, row: dict) -> None:
                     event, ts, output_details.wall_time_ms
                 )
                 _record_tool_patch(state, event)
+            elif call_id:
+                pending_results = state.setdefault("pending_results", {})
+                pending_results[call_id] = (payload.get("output"), ts)
+                if len(pending_results) > MAX_CODEX_PENDING_RESULTS:
+                    for old_call_id in list(pending_results)[: MAX_CODEX_PENDING_RESULTS // 2]:
+                        pending_results.pop(old_call_id, None)
             _record_row_disposition(state, EVENT_DISPOSITION_RENDERED)
         else:
             _record_row_disposition(state, EVENT_DISPOSITION_UNKNOWN)
@@ -2535,6 +2877,102 @@ def _validated_normalized_pending_id(payload: object) -> str | None:
     if not isinstance(value, str) or not _PENDING_ID_PATTERN.match(value):
         return None
     return value
+
+
+def _codex_modern_text(item: dict) -> str:
+    if isinstance(item.get("text"), str):
+        return item["text"]
+    parts = item.get("content") or item.get("summary") or []
+    if isinstance(parts, list):
+        return "\n".join(
+            str(block.get("text"))
+            for block in parts
+            if isinstance(block, dict) and isinstance(block.get("text"), str)
+        ).strip()
+    return ""
+
+
+def _codex_modern_message_apply(
+    state: dict,
+    item: dict,
+    ts: str | None,
+    *,
+    completed: bool,
+) -> bool:
+    item_type = item.get("type")
+    item_id = _codex_modern_item_id(item)
+    if item_type not in {"userMessage", "agentMessage", "reasoning"} or not item_id:
+        return False
+    text = _codex_modern_text(item)
+    if item_type == "reasoning":
+        if not text:
+            return True
+        kind = "thinking"
+        encrypted = isinstance(item.get("encrypted_content"), str)
+    else:
+        kind = "user" if item_type == "userMessage" else "assistant"
+        encrypted = False
+    messages: dict = state.setdefault("codex_modern_messages", {})
+    event = messages.get(item_id)
+    if event is None:
+        if not text:
+            return True
+        event = _append_event(
+            state,
+            {
+                "kind": kind,
+                "ts": ts,
+                "text": _clip(text, MAX_TEXT),
+                **({"encrypted": encrypted} if kind == "thinking" else {}),
+            },
+        )
+        messages[item_id] = event
+        _codex_replay_pending_deltas(state, item_id, event)
+    elif text and event.get("text") != text:
+        event["text"] = _clip(text, MAX_TEXT)
+        _record_change(state, {"kind": "tail", "from": int(event["id"])})
+    return True
+
+
+def _codex_modern_message_delta(state: dict, params: dict) -> bool:
+    item_id = _codex_modern_item_id({}, params)
+    delta = params.get("delta")
+    if not item_id or not isinstance(delta, str):
+        return False
+    event = state.setdefault("codex_modern_messages", {}).get(item_id)
+    if event is None:
+        pending = state.setdefault("pending_modern_deltas", {}).setdefault(item_id, [])
+        if len(pending) < MAX_CODEX_DELTA_CACHE:
+            pending.append(delta)
+        return False
+    current = event.get("text") or ""
+    if current.endswith(delta):
+        return True
+    seen = state.setdefault("codex_delta_cache", set())
+    signature = (item_id, delta)
+    if signature in seen:
+        return True
+    seen.add(signature)
+    if len(seen) > MAX_CODEX_DELTA_CACHE:
+        for old in list(seen)[: MAX_CODEX_DELTA_CACHE // 2]:
+            seen.remove(old)
+    event["text"] = _clip(current + delta, MAX_TEXT)
+    _record_change(state, {"kind": "tail", "from": int(event["id"])})
+    return True
+
+
+def _codex_modern_approval_event(state: dict, payload: dict, ts: str | None) -> bool:
+    method = payload.get("method")
+    if method in _CODEX_APPROVAL_METHODS:
+        text = "approval requested"
+        marker = "approval_requested"
+    elif method == "serverRequest/resolved":
+        text = "approval resolved"
+        marker = "approval_resolved"
+    else:
+        return False
+    _append_event(state, _marker_event(ts, text, marker))
+    return True
 
 
 def _stamp_last_user_event_source(
@@ -2605,6 +3043,62 @@ def _codex_normalized_apply(state: dict, row: dict) -> None:
     params = params if isinstance(params, dict) else {}
     ts = row.get("normalized_at")
     native_row: dict | None = None
+
+    if method in _CODEX_APPROVAL_METHODS or method == "serverRequest/resolved":
+        if _codex_modern_approval_event(state, payload, ts):
+            _record_row_disposition(state, _normalized_disposition(row))
+            return
+    elif method in {
+        "item/started",
+        "item/completed",
+        "rawResponseItem/completed",
+    }:
+        item = params.get("item")
+        if isinstance(item, dict):
+            item_status = item.get("status")
+            item_result = item.get("result")
+            item_failed = (
+                item.get("error") is not None
+                or item_status
+                in {"failed", "declined", "cancelled", "canceled", "interrupted"}
+                or (
+                    isinstance(item_result, dict)
+                    and item_result.get("isError") is True
+                )
+            )
+            artifact = None if item_failed else artifact_from_codex_mcp_tool_result(item)
+            if artifact is not None:
+                _append_artifact_event(state, artifact, ts)
+                _record_row_disposition(state, _normalized_disposition(row))
+                return
+            if _codex_modern_message_apply(
+                state, item, ts, completed=method != "item/started"
+            ):
+                _record_row_disposition(state, _normalized_disposition(row))
+                return
+            if _codex_modern_item_apply(
+                state, item, ts, completed=method != "item/started"
+            ):
+                _record_row_disposition(state, _normalized_disposition(row))
+                return
+
+    if method in {
+        "item/agentMessage/delta",
+        "item/reasoning/summaryTextDelta",
+        "item/reasoning/summaryPartAdded",
+    } and _codex_modern_message_delta(state, params):
+        _record_row_disposition(state, _normalized_disposition(row))
+        return
+    if method in {
+        "item/delta",
+        "item/commandExecution/outputDelta",
+        "item/fileChange/outputDelta",
+        "item/mcpToolCall/outputDelta",
+        "item/dynamicToolCall/outputDelta",
+        "item/commandExecution/terminalInteraction",
+    } and _codex_modern_delta(state, params, ts):
+        _record_row_disposition(state, _normalized_disposition(row))
+        return
 
     if method == "rawResponseItem/completed":
         item = params.get("item")
@@ -3776,7 +4270,12 @@ def _new_parse_state(fmt: str) -> dict:
         "events": [],
         "pending": {},
         "pending_batches": {},
+        "pending_results": {},
         "pending_artifacts": {},
+        "codex_modern_items": {},
+        "codex_modern_messages": {},
+        "pending_modern_deltas": {},
+        "codex_delta_cache": set(),
         "pending_questions": {},
         "tokens": None,
         "base": 0,
@@ -4076,6 +4575,11 @@ def read_session_delta(
                 "output": entry.get("output"),
                 "ok": entry.get("ok"),
                 "completed_at": entry.get("completed_at"),
+                "duration_ms": entry.get("duration_ms"),
+                "status": entry.get("status"),
+                "terminal_input": entry.get("terminal_input"),
+                "metadata": entry.get("metadata"),
+                "edit": entry.get("edit"),
             }
             for entry in sorted(patch_map.values(), key=lambda item: int(item["cursor"]))
         ]
