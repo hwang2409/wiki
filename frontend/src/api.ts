@@ -527,6 +527,7 @@ export type SessionTool = {
   summary: string;
   call_id?: string | null;
   status?: string | null;
+  partial?: boolean;
   duration_ms?: number | null;
   terminal_input?: string | null;
   metadata?: Record<string, unknown>;

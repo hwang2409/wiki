@@ -1344,17 +1344,31 @@ def _codex_harness_fallback_input(raw_input: str) -> str:
     return "dynamic tool program"
 
 
-def _codex_wrapper_has_native_mcp(state: dict, raw_input: object) -> bool:
+def _codex_wrapper_has_native_mcp(
+    state: dict, raw_input: object, call_id: object = None
+) -> bool:
     """Check whether native MCP rows replace an outer wrapper's MCP work."""
+    if call_id and str(call_id) in state.get("codex_native_call_ids", set()):
+        return True
     if not isinstance(raw_input, str):
         return False
-    all_names = {
-        match.group(1)
-        for match in re.finditer(r"\btools\.([A-Za-z0-9_$-]+)", raw_input)
+    calls = _codex_harness_calls(raw_input)
+    if not calls:
+        return False
+    variables = _codex_extract_variables(raw_input) or {}
+    parsed = [_resolve_call_argument(arg, variables) for _, arg, _, _ in calls]
+    if any(value is None for value in parsed):
+        return False
+    expected = {
+        (str(name), _codex_tool_input(str(name), value))
+        for (name, _, _, _), value in zip(calls, parsed)
+        if str(name).startswith("mcp__")
     }
-    names = {name for name in all_names if name.startswith("mcp__")}
+    all_names = {str(name) for name, _, _, _ in calls}
     native_names = {name for name, _ in state.get("codex_native_tools", set())}
-    return bool(names) and names == all_names and names.issubset(native_names)
+    return bool(expected) and all(name.startswith("mcp__") for name in all_names) and all(
+        key in state.get("codex_native_tools", set()) for key in expected
+    ) and all(name in native_names for name in all_names if name.startswith("mcp__"))
 
 
 def _codex_harness_tool(name: object, raw_input: object) -> dict | None:
@@ -1695,6 +1709,25 @@ def _codex_batch_output_values(value: object, count: int) -> list[object] | None
     return None
 
 
+def _codex_batch_output_entries(
+    value: object, count: int
+) -> list[tuple[object, object]] | None:
+    """Return child call IDs and outputs only for explicit identity-bearing rows."""
+    values = _codex_batch_output_values(value, count)
+    if values is None:
+        return None
+    entries: list[tuple[object, object]] = []
+    for item in values:
+        if not isinstance(item, dict):
+            return None
+        child_call_id = item.get("call_id", item.get("callId", item.get("id")))
+        if not isinstance(child_call_id, (str, int)) or not str(child_call_id):
+            return None
+        output = item.get("output", item.get("result", item))
+        entries.append((str(child_call_id), output))
+    return entries
+
+
 def _codex_completion_timestamp(
     event: dict, ts: str | None, wall_time_ms: int | None
 ) -> str | None:
@@ -1773,10 +1806,12 @@ def _codex_add_semantic_tool_event(
     classify_input = tool_input
     structured_input = raw_input
     name = str(name or "")
-    if name == "exec" and _codex_wrapper_has_native_mcp(state, raw_input):
+    if name == "exec" and _codex_wrapper_has_native_mcp(state, raw_input, call_id):
         return None, True
     native_key = (name, tool_input)
-    if wrapper and native_key in state.get("codex_native_tools", set()):
+    if wrapper and name.startswith("mcp__") and native_key in state.get(
+        "codex_native_tools", set()
+    ):
         return None, True
     if _is_artifact_tool(name) and call_id:
         state.setdefault("pending_artifacts", {})[call_id] = {
@@ -1804,6 +1839,11 @@ def _codex_add_semantic_tool_event(
     _append_event(state, event)
     if call_id:
         pending[call_id] = event
+        if wrapper and name.startswith("mcp__"):
+            state.setdefault("pending_wrappers", {})[str(call_id)] = {
+                "expected": {native_key},
+                "events": [event],
+            }
     return event, False
 
 
@@ -1833,28 +1873,142 @@ def _codex_add_tool_event(
             wrapper=True,
         )
 
+    outer = _codex_add_batch_outer_event(state, harness, ts, call_id)
     references: list[dict] = []
     for child in children:
+        child_arguments = child["arguments"]
+        child_call_id = (
+            child_arguments.get("call_id", child_arguments.get("callId"))
+            if isinstance(child_arguments, dict)
+            else None
+        )
         event, handled = _codex_add_semantic_tool_event(
             state,
             child["name"],
-            child["arguments"],
+            child_arguments,
             ts,
-            None,
+            child_call_id,
             wrapper=True,
         )
         references.append(
             {
-                "call_id": None,
+                "call_id": child_call_id,
                 "event": event,
                 "handled": handled,
+                "name": child["name"],
+                "arguments": child_arguments,
             }
         )
+    if call_id and all(str(item["name"]).startswith("mcp__") for item in references):
+        state.setdefault("pending_wrappers", {})[str(call_id)] = {
+            "expected": {
+                (str(item["name"]), _codex_tool_input(str(item["name"]), item["arguments"]))
+                for item in references
+            },
+            "events": [
+                event
+                for event in [outer, *(item["event"] for item in references)]
+                if isinstance(event, dict)
+            ],
+        }
     if call_id:
         state.setdefault("pending_batches", {})[call_id] = references
-    return next((item["event"] for item in references if item["event"]), None), all(
-        item["handled"] for item in references
+    all_suppressed = all(
+        item["handled"]
+        and item["event"] is None
+        and not _is_artifact_tool(item["name"])
+        for item in references
     )
+    if all_suppressed:
+        # Native MCP rows replace the wrapper. Remove the outer row if every
+        # child was suppressed, while keeping unmatched wrapper work visible.
+        if outer is not None:
+            _codex_remove_event(state, outer)
+            if call_id:
+                state["pending"].pop(call_id, None)
+            state.get("pending_batches", {}).pop(call_id, None)
+            state.get("pending_wrappers", {}).pop(str(call_id), None)
+        return None, True
+    return outer, False
+
+
+def _codex_add_batch_outer_event(
+    state: dict, harness: dict, ts: str | None, call_id: object
+) -> dict:
+    classify_input = harness.get("classify_input") or harness.get("input") or ""
+    archetype, summary = classify_tool("exec", str(classify_input))
+    event = _append_event(
+        state,
+        {
+            "kind": "tool",
+            "ts": ts,
+            "text": "",
+            "tool": {
+                "name": "exec",
+                "input": _clip(str(harness.get("input") or ""), MAX_TOOL_IO),
+                "output": None,
+                "ok": None,
+                "archetype": archetype,
+                "summary": summary,
+                "call_id": str(call_id) if call_id else None,
+            },
+        },
+    )
+    if call_id:
+        state["pending"][call_id] = event
+    return event
+
+
+def _codex_remove_event(state: dict, event: dict) -> None:
+    try:
+        index = state["events"].index(event)
+    except ValueError:
+        return
+    state["events"].pop(index)
+    first_id = int(state.get("base", 0)) + index
+    for offset, remaining in enumerate(state["events"][index:]):
+        remaining["id"] = first_id + offset
+    state["next_event_id"] = int(state.get("base", 0)) + len(state["events"])
+    _record_change(state, {"kind": "tail", "from": first_id})
+
+
+def _codex_resolve_pending_wrappers(
+    state: dict, native_key: tuple[str, str], native_call_id: object
+) -> None:
+    """Remove only a wrapper proven to have native replacements."""
+    pending = state.get("pending_wrappers", {})
+    candidates = [
+        (wrapper_id, record)
+        for wrapper_id, record in pending.items()
+        if native_key in record.get("expected", set())
+    ]
+    if not candidates:
+        return
+    exact = [item for item in candidates if str(native_call_id) == item[0]]
+    if exact:
+        candidates = exact
+    elif len(candidates) != 1:
+        # Matching by a shared tool name is unsafe when two wrappers are live.
+        return
+    wrapper_id, record = candidates[0]
+    remaining = record.get("expected", set()) - {native_key}
+    if remaining:
+        record["expected"] = remaining
+        return
+    events = [event for event in record.get("events", []) if isinstance(event, dict)]
+    for event in events:
+        _codex_remove_event(state, event)
+    for call_id, event in list(state.get("pending", {}).items()):
+        if event in events:
+            state["pending"].pop(call_id, None)
+    for batch_id, references in list(state.get("pending_batches", {}).items()):
+        if any(reference.get("event") in events for reference in references):
+            state["pending_batches"].pop(batch_id, None)
+            state.get("pending_results", {}).pop(batch_id, None)
+    for call_id in list(state.get("pending_artifacts", {})):
+        if str(call_id) == wrapper_id:
+            state["pending_artifacts"].pop(call_id, None)
+    pending.pop(wrapper_id, None)
 
 
 def _codex_finish_tool_event(
@@ -1884,6 +2038,8 @@ def _codex_finish_tool_event(
     ):
         return
     target = state["pending"].pop(call_id, None) if call_id else event
+    if target is None:
+        target = event
     if target:
         target["tool"]["output"] = _clip(output_text, MAX_TOOL_IO)
         target["tool"]["ok"] = output_ok
@@ -1891,6 +2047,38 @@ def _codex_finish_tool_event(
             target, ts, output_details.wall_time_ms
         )
         _record_tool_patch(state, target)
+
+
+def _codex_close_batch_children(
+    state: dict, batch: list[dict], ts: str | None
+) -> None:
+    for reference in batch:
+        event = reference.get("event")
+        if not isinstance(event, dict):
+            continue
+        tool = event.get("tool") or {}
+        tool["status"] = "completed"
+        tool["completed_at"] = ts
+        _record_tool_patch(state, event)
+
+
+def _codex_finish_batch_child(
+    state: dict,
+    reference: dict,
+    call_id: object,
+    output: object,
+    ts: str | None,
+) -> None:
+    event = reference.get("event")
+    name = reference.get("name")
+    if isinstance(event, dict):
+        event["tool"]["call_id"] = str(call_id)
+    if _is_artifact_tool(name):
+        state.setdefault("pending_artifacts", {})[call_id] = {
+            "name": name,
+            "input": _tool_arguments(reference.get("arguments")) or {},
+        }
+    _codex_finish_tool_event(state, event, call_id, output, ts)
 
 
 def _codex_apply_pending_result(state: dict, call_id: object) -> None:
@@ -1913,18 +2101,22 @@ def _codex_apply_pending_result(state: dict, call_id: object) -> None:
         return
     batch = state.get("pending_batches", {}).pop(call_id, None)
     if batch:
-        child_outputs = _codex_batch_output_values(raw_output, len(batch))
-        aggregate = child_outputs is None
-        if child_outputs is None:
-            child_outputs = [raw_output] * len(batch)
-        for reference, child_output in zip(batch, child_outputs):
+        entries = _codex_batch_output_entries(raw_output, len(batch))
+        outer = state.get("pending", {}).get(call_id)
+        if entries is None:
+            if outer is not None:
+                _codex_finish_tool_event(
+                    state, outer, call_id, raw_output, result_ts, aggregate=True
+                )
+            _codex_close_batch_children(state, batch, result_ts)
+            return
+        if outer is not None:
             _codex_finish_tool_event(
-                state,
-                reference["event"],
-                reference["call_id"],
-                child_output,
-                result_ts,
-                aggregate=aggregate,
+                state, outer, call_id, raw_output, result_ts, aggregate=True
+            )
+        for reference, (child_call_id, child_output) in zip(batch, entries):
+            _codex_finish_batch_child(
+                state, reference, child_call_id, child_output, result_ts
             )
         return
     event = state.get("pending", {}).get(call_id)
@@ -1956,6 +2148,11 @@ def _codex_apply_mcp_tool_item(state: dict, item: dict, ts: str | None) -> bool:
     name = f"mcp__{server}__{tool}"
     raw_input = item.get("arguments", item.get("input", {}))
     call_id = item.get("call_id", item.get("id"))
+    native_key = (name, _codex_tool_input(name, raw_input))
+    state.setdefault("codex_native_tools", set()).add(native_key)
+    if call_id:
+        state.setdefault("codex_native_call_ids", set()).add(str(call_id))
+    _codex_resolve_pending_wrappers(state, native_key, call_id)
     event, handled = _codex_add_tool_event(state, name, raw_input, ts, call_id)
     if not handled and event is None:
         return False
@@ -1993,6 +2190,7 @@ _CODEX_MODERN_TOOL_TYPES = {
     "mcpToolCall",
     "dynamicToolCall",
     "collabToolCall",
+    "collabAgentToolCall",
     "webSearch",
     "imageView",
 }
@@ -2030,9 +2228,16 @@ def _codex_modern_tool_spec(item: dict) -> tuple[str, object] | None:
         return f"mcp__{server}__{tool}", item.get("arguments", item.get("input", {}))
     if item_type == "dynamicToolCall":
         name = item.get("tool", item.get("name", "dynamicToolCall"))
-        return str(name), item.get("arguments", item.get("input", {}))
-    if item_type == "collabToolCall":
-        return "collabToolCall", item.get(
+        arguments = item.get("arguments", item.get("input", {}))
+        content_items = item.get("contentItems")
+        if content_items is not None:
+            if arguments in ({}, None):
+                arguments = {"contentItems": content_items}
+            else:
+                arguments = {"arguments": arguments, "contentItems": content_items}
+        return str(name), arguments
+    if item_type in {"collabToolCall", "collabAgentToolCall"}:
+        return item_type, item.get(
             "input", item.get("arguments", item.get("action", {}))
         )
     if item_type == "webSearch":
@@ -2126,9 +2331,20 @@ def _codex_replay_pending_deltas(state: dict, item_id: str, event: dict) -> None
         return
     target = event.get("tool") if event.get("kind") == "tool" else event
     current = target.get("output" if event.get("kind") == "tool" else "text") or ""
-    for delta in pending:
-        if not isinstance(delta, str) or delta in current:
+    seen_identities: set[object] = set()
+    for pending_delta in pending:
+        if isinstance(pending_delta, dict):
+            identity = pending_delta.get("identity")
+            delta = pending_delta.get("text")
+        else:
+            identity = None
+            delta = pending_delta
+        if not isinstance(delta, str):
             continue
+        if identity is not None:
+            if identity in seen_identities:
+                continue
+            seen_identities.add(identity)
         current += delta
     key = "output" if event.get("kind") == "tool" else "text"
     target[key] = _clip(current, MAX_TOOL_IO if key == "output" else MAX_TEXT)
@@ -2153,7 +2369,9 @@ def _codex_patch_modern_tool(
             tool["ok"] = details.status if details.status is not None else True
     elif completed and tool.get("output") is None:
         tool["ok"] = _codex_modern_item_status(item)
-        if tool["ok"] is None and item.get("status") not in {None, "inProgress"}:
+        if tool["ok"] is None:
+            # item/completed is authoritative, even when a provider omits a
+            # status and result for successful webSearch/imageView items.
             tool["ok"] = True
     if completed:
         tool["completed_at"] = ts
@@ -2240,7 +2458,7 @@ def _codex_modern_delta(state: dict, params: dict, ts: str | None) -> bool:
                 item_id, []
             )
             if len(pending) < MAX_CODEX_DELTA_CACHE:
-                pending.append(delta)
+                pending.append({"identity": _codex_delta_identity(params), "text": delta})
         return False
     tool = event.get("tool") or {}
     terminal_input = params.get("input", params.get("text"))
@@ -2251,13 +2469,13 @@ def _codex_modern_delta(state: dict, params: dict, ts: str | None) -> bool:
     if not isinstance(delta, str):
         return False
     current = tool.get("output") or ""
-    if current.endswith(delta):
-        return True
     seen = state.setdefault("codex_delta_cache", set())
-    signature = (item_id, delta)
-    if signature in seen:
+    identity = _codex_delta_identity(params)
+    signature = (item_id, identity)
+    if identity is not None and signature in seen:
         return True
-    seen.add(signature)
+    if identity is not None:
+        seen.add(signature)
     if len(seen) > MAX_CODEX_DELTA_CACHE:
         for old in list(seen)[: MAX_CODEX_DELTA_CACHE // 2]:
             seen.remove(old)
@@ -2586,6 +2804,7 @@ def _record_tool_patch(state: dict, event: dict) -> None:
             "completed_at": tool.get("completed_at"),
             "duration_ms": tool.get("duration_ms"),
             "status": tool.get("status"),
+            "partial": tool.get("partial"),
             "terminal_input": tool.get("terminal_input"),
             "metadata": tool.get("metadata"),
             "edit": tool.get("edit"),
@@ -2723,10 +2942,11 @@ def _codex_apply(state: dict, row: dict) -> None:
         elif ptype == "context_compacted":
             _append_event(state, {"kind": "thinking", "ts": ts, "text": "context compacted"})
             _record_row_disposition(state, EVENT_DISPOSITION_RENDERED)
-        elif ptype == "turn_aborted":
+        elif ptype in {"turn_aborted", "turn_failed"}:
             reason = payload.get("reason") or "aborted"
             duration_ms = payload.get("duration_ms")
-            text = f"turn aborted ({reason})"
+            label = "failed" if ptype == "turn_failed" else "aborted"
+            text = f"turn {label} ({reason})"
             if isinstance(duration_ms, (int, float)) and duration_ms:
                 text += f" · {int(duration_ms // 1000)}s"
             _append_event(state, {"kind": "interrupt", "ts": ts, "text": text})
@@ -2793,22 +3013,23 @@ def _codex_apply(state: dict, row: dict) -> None:
             batch = state.get("pending_batches", {}).get(call_id)
             if batch:
                 raw_output = payload.get("output")
-                child_outputs = _codex_batch_output_values(raw_output, len(batch))
-                aggregate = child_outputs is None
-                if child_outputs is None:
-                    # The app-server exposes one aggregate wrapper result for
-                    # some Promise.all calls. Keep it on every child rather
-                    # than dropping sibling evidence or inventing a split.
-                    child_outputs = [raw_output] * len(batch)
-                for reference, child_output in zip(batch, child_outputs):
-                    _codex_finish_tool_event(
-                        state,
-                        reference["event"],
-                        reference["call_id"],
-                        child_output,
-                        ts,
-                        aggregate=aggregate,
-                    )
+                entries = _codex_batch_output_entries(raw_output, len(batch))
+                outer = state.get("pending", {}).get(call_id)
+                if entries is None:
+                    if outer is not None:
+                        _codex_finish_tool_event(
+                            state, outer, call_id, raw_output, ts, aggregate=True
+                        )
+                    _codex_close_batch_children(state, batch, ts)
+                else:
+                    if outer is not None:
+                        _codex_finish_tool_event(
+                            state, outer, call_id, raw_output, ts, aggregate=True
+                        )
+                    for reference, (child_call_id, child_output) in zip(batch, entries):
+                        _codex_finish_batch_child(
+                            state, reference, child_call_id, child_output, ts
+                        )
                 state.get("pending_batches", {}).pop(call_id, None)
                 _record_row_disposition(state, EVENT_DISPOSITION_RENDERED)
                 return
@@ -2915,7 +3136,7 @@ def _codex_modern_message_apply(
     messages: dict = state.setdefault("codex_modern_messages", {})
     event = messages.get(item_id)
     if event is None:
-        if not text:
+        if not text and item_type != "agentMessage":
             return True
         event = _append_event(
             state,
@@ -2943,22 +3164,40 @@ def _codex_modern_message_delta(state: dict, params: dict) -> bool:
     if event is None:
         pending = state.setdefault("pending_modern_deltas", {}).setdefault(item_id, [])
         if len(pending) < MAX_CODEX_DELTA_CACHE:
-            pending.append(delta)
+            pending.append({"identity": _codex_delta_identity(params), "text": delta})
         return False
     current = event.get("text") or ""
-    if current.endswith(delta):
-        return True
     seen = state.setdefault("codex_delta_cache", set())
-    signature = (item_id, delta)
-    if signature in seen:
+    identity = _codex_delta_identity(params)
+    signature = (item_id, identity)
+    if identity is not None and signature in seen:
         return True
-    seen.add(signature)
+    if identity is not None:
+        seen.add(signature)
     if len(seen) > MAX_CODEX_DELTA_CACHE:
         for old in list(seen)[: MAX_CODEX_DELTA_CACHE // 2]:
             seen.remove(old)
     event["text"] = _clip(current + delta, MAX_TEXT)
     _record_change(state, {"kind": "tail", "from": int(event["id"])})
     return True
+
+
+def _codex_delta_identity(params: dict) -> object | None:
+    for key in (
+        "_event_identity",
+        "eventId",
+        "event_id",
+        "deltaId",
+        "delta_id",
+        "sequence",
+        "seq",
+        "index",
+        "id",
+    ):
+        value = params.get(key)
+        if isinstance(value, (str, int)) and str(value):
+            return (key, str(value))
+    return None
 
 
 def _codex_modern_approval_event(state: dict, payload: dict, ts: str | None) -> bool:
@@ -2973,6 +3212,55 @@ def _codex_modern_approval_event(state: dict, payload: dict, ts: str | None) -> 
         return False
     _append_event(state, _marker_event(ts, text, marker))
     return True
+
+
+def _codex_close_turn(state: dict, turn: dict, ts: str | None) -> dict | None:
+    """Close unfinished work before rendering the turn's terminal marker."""
+    status = str(turn.get("status") or "completed").lower()
+    failed = status in {
+        "failed",
+        "error",
+        "cancelled",
+        "canceled",
+        "interrupted",
+        "aborted",
+    }
+    terminal_status = "interrupted" if status in {"interrupted", "aborted"} else (
+        "failed" if failed else "completed"
+    )
+    pending_events: list[dict] = []
+    seen: set[int] = set()
+    for event in state.get("pending", {}).values():
+        if isinstance(event, dict) and id(event) not in seen:
+            pending_events.append(event)
+            seen.add(id(event))
+    for references in state.get("pending_batches", {}).values():
+        for reference in references:
+            event = reference.get("event")
+            if isinstance(event, dict) and id(event) not in seen:
+                pending_events.append(event)
+                seen.add(id(event))
+    for event in pending_events:
+        tool = event.get("tool") or {}
+        tool["ok"] = not (failed or terminal_status != "completed")
+        tool["status"] = terminal_status
+        tool["completed_at"] = ts
+        tool["partial"] = True
+        _record_tool_patch(state, event)
+    state["pending"].clear()
+    state["pending_batches"].clear()
+    state["pending_results"].clear()
+    for call_id, meta in list(state.get("pending_artifacts", {}).items()):
+        state["pending_artifacts"].pop(call_id, None)
+        _append_event(
+            state,
+            _failed_artifact_tool(meta, f"turn {terminal_status}", ts),
+        )
+    if not failed:
+        return None
+    reason = turn.get("error") or turn.get("reason") or status
+    text = f"turn {terminal_status} ({reason})"
+    return _marker_event(ts, _clip(text, 400), f"turn_{terminal_status}")
 
 
 def _stamp_last_user_event_source(
@@ -3041,6 +3329,9 @@ def _codex_normalized_apply(state: dict, row: dict) -> None:
     method = payload.get("method")
     params = payload.get("params")
     params = params if isinstance(params, dict) else {}
+    if row.get("seq") is not None or row.get("raw_seq") is not None:
+        params = dict(params)
+        params["_event_identity"] = row.get("seq", row.get("raw_seq"))
     ts = row.get("normalized_at")
     native_row: dict | None = None
 
@@ -3212,16 +3503,23 @@ def _codex_normalized_apply(state: dict, row: dict) -> None:
         }
     elif method == "turn/completed":
         turn = params.get("turn")
-        if isinstance(turn, dict) and turn.get("status") == "interrupted":
-            native_row = {
-                "type": "event_msg",
-                "timestamp": ts,
-                "payload": {
-                    "type": "turn_aborted",
-                    "reason": "interrupted",
-                    "duration_ms": turn.get("durationMs"),
-                },
-            }
+        if isinstance(turn, dict):
+            marker = _codex_close_turn(state, turn, ts)
+            if marker is not None:
+                native_row = {
+                    "type": "event_msg",
+                    "timestamp": ts,
+                    "payload": {
+                        "type": (
+                            "turn_failed"
+                            if str(turn.get("status") or "").lower()
+                            in {"failed", "error", "cancelled", "canceled"}
+                            else "turn_aborted"
+                        ),
+                        "reason": turn.get("reason") or turn.get("error") or turn.get("status"),
+                        "duration_ms": turn.get("durationMs"),
+                    },
+                }
 
     _apply_normalized_payload(state, row, _codex_apply, native_row)
     _stamp_last_user_event_source(
@@ -4305,6 +4603,8 @@ def _new_parse_state(fmt: str) -> dict:
         "artifact_ids": set(),
         "dedupe_credits": {},
         "codex_native_tools": set(),
+        "codex_native_call_ids": set(),
+        "pending_wrappers": {},
         "dispositions": {"rendered": 0, "summarized": 0, "ignored": 0, "unknown": 0},
         # parent event id → child agent id (claude only); dies with the state
         # so stale links cannot outlive a transcript reset (WIKI-244).

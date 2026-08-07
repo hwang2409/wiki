@@ -713,7 +713,7 @@ class CodexNewRuntimeTranscriptTests(unittest.TestCase):
         parsed = transcripts.read_session_events("codex", path)
 
         tools = [event["tool"] for event in parsed["events"] if event["kind"] == "tool"]
-        self.assertEqual(len(tools), 5)
+        self.assertEqual(len(tools), 6)
 
         read_tool = tools[0]
         self.assertEqual(read_tool["name"], "exec_command")
@@ -729,16 +729,15 @@ class CodexNewRuntimeTranscriptTests(unittest.TestCase):
 
         # Homogeneous Promise.all children keep their own canonical identity
         # and input, so each actual call reaches the shared tool renderer.
-        multi_tools = tools[2:4]
+        multi_outer = tools[2]
+        multi_tools = tools[3:5]
         self.assertEqual([tool["name"] for tool in multi_tools], ["exec_command", "exec_command"])
         self.assertEqual([tool["input"] for tool in multi_tools], [
             'git status --short --branch',
             'rg -n "custom_tool_call" backend/app/transcripts.py',
         ])
-        self.assertEqual([tool["output"] for tool in multi_tools], [
-            "## git\n## wiki-main\n## rg\n1034: custom_tool_call\n",
-            "## git\n## wiki-main\n## rg\n1034: custom_tool_call\n",
-        ])
+        self.assertEqual(multi_outer["output"], "## git\n## wiki-main\n## rg\n1034: custom_tool_call\n")
+        self.assertEqual([tool["output"] for tool in multi_tools], [None, None])
 
         # The wrapper exposes one aggregate result for this batch. Preserve it
         # on both children, but do not invent child status.
@@ -748,7 +747,7 @@ class CodexNewRuntimeTranscriptTests(unittest.TestCase):
         self.assertEqual(multi_tool["summary"], "git status")
         self.assertEqual([tool["ok"] for tool in multi_tools], [None, None])
 
-        failed_tool = tools[4]
+        failed_tool = tools[5]
         self.assertEqual(failed_tool["archetype"], "validate")
         self.assertFalse(failed_tool["ok"])
         self.assertEqual(failed_tool["output"], "test command failed\n")
@@ -827,7 +826,7 @@ class CodexNewRuntimeTranscriptTests(unittest.TestCase):
         parsed = transcripts.read_session_events("codex", path)
         tools = [event["tool"] for event in parsed["events"] if event["kind"] == "tool"]
 
-        self.assertEqual(len(tools), 6)
+        self.assertEqual(len(tools), 8)
         for tool in tools:
             self.assertNotIn("```js", tool["input"])
             self.assertNotIn("await tools.", tool["input"])
@@ -847,15 +846,18 @@ class CodexNewRuntimeTranscriptTests(unittest.TestCase):
         # apply_patch preserves the structured edit payload for the diff view.
         self.assertIn("patch", patch["edit"])
 
-        parallel = tools[2:4]
+        parallel_outer = tools[2]
+        parallel = tools[3:5]
         self.assertEqual([tool["name"] for tool in parallel], ["exec_command", "exec_command"])
         self.assertEqual([tool["input"] for tool in parallel], [
             "/tmp/agent-status/pr_watch_summary.sh 13657",
             "gh pr view 13657 --json state,mergeable,mergeStateStatus",
         ])
         self.assertEqual([tool["archetype"] for tool in parallel], ["run", "github"])
+        self.assertIsNotNone(parallel_outer["output"])
 
-        mixed = tools[4:6]
+        mixed_outer = tools[5]
+        mixed = tools[6:8]
         self.assertEqual(
             [tool["name"] for tool in mixed],
             ["mcp__wiki_artifacts__read_agent_pr", "exec_command"],
@@ -863,11 +865,12 @@ class CodexNewRuntimeTranscriptTests(unittest.TestCase):
         self.assertEqual([tool["archetype"] for tool in mixed], ["tool", "run"])
         self.assertEqual(
             [tool["output"] for tool in mixed],
-            ["pr context\ngate result: green\n"] * 2,
+            [None, None],
         )
         # This fixture has one aggregate result block, not one result per
         # child. Keep sibling output evidence without claiming both passed.
         self.assertEqual([tool["ok"] for tool in mixed], [None, None])
+        self.assertEqual(mixed_outer["output"], "pr context\ngate result: green\n")
 
     def test_wiki267_live_order_prefers_reasoning_and_native_mcp_rows(self) -> None:
         path = FIXTURES_DIR / "codex_wiki267_live_order.jsonl"
@@ -1121,12 +1124,9 @@ class CodexNewRuntimeTranscriptTests(unittest.TestCase):
                 if event["kind"] == "tool"
             ]
 
-        self.assertEqual([tool["input"] for tool in tools], ["first", "second"])
-        self.assertEqual([tool["output"] for tool in tools], [
-            "first output\n",
-            "second output\n",
-        ])
-        self.assertEqual([tool["ok"] for tool in tools], [True, False])
+        self.assertEqual([tool["input"] for tool in tools], ["first\nsecond", "first", "second"])
+        self.assertEqual([tool["output"] for tool in tools], ["first output\n\nsecond output\n", None, None])
+        self.assertEqual([tool["ok"] for tool in tools], [None, None, None])
 
     def test_harness_batch_results_normalize_runtime_input_text_envelope(self) -> None:
         rows = [
@@ -1175,11 +1175,8 @@ class CodexNewRuntimeTranscriptTests(unittest.TestCase):
                 if event["kind"] == "tool"
             ]
 
-        self.assertEqual([tool["output"] for tool in tools], [
-            "first output\n",
-            "second output\n",
-        ])
-        self.assertEqual([tool["ok"] for tool in tools], [True, False])
+        self.assertEqual([tool["output"] for tool in tools], ["first output\n\nsecond output\n", None, None])
+        self.assertEqual([tool["ok"] for tool in tools], [None, None, None])
 
     def test_harness_batch_child_references_cannot_collide_with_provider_ids(self) -> None:
         rows = [
@@ -1238,7 +1235,7 @@ class CodexNewRuntimeTranscriptTests(unittest.TestCase):
                 if event["kind"] == "tool"
             ]
 
-        self.assertEqual([tool["output"] for tool in tools], ["first\n", "second\n", "waited\n"])
+        self.assertEqual([tool["output"] for tool in tools], ["first\n\nsecond\n", None, None, "waited\n"])
 
     def test_harness_deep_output_is_bounded_and_replay_is_deterministic(self) -> None:
         nested = '{"value":' * (transcripts.MAX_CODEX_OUTPUT_DEPTH + 10)
@@ -1278,7 +1275,7 @@ class CodexNewRuntimeTranscriptTests(unittest.TestCase):
         self.assertEqual(cold["events"], replay["events"])
         self.assertEqual(
             [event["tool"]["ok"] for event in cold["events"] if event["kind"] == "tool"],
-            [None, None],
+            [None, None, None],
         )
         oversized = [
             {
@@ -1446,6 +1443,184 @@ class CodexModernTranscriptParityTests(unittest.TestCase):
                 ("marker", "approval requested"),
                 ("marker", "approval resolved"),
             ],
+        )
+
+    def test_round2_f1_wrapper_incremental_replay_matches_full_and_keeps_unmatched(self) -> None:
+        wrapper = {
+            "type": "response_item",
+            "timestamp": "2026-08-07T12:00:00Z",
+            "payload": {
+                "type": "custom_tool_call",
+                "call_id": "wrapper-1",
+                "name": "exec",
+                "input": 'tools.mcp__fixture__lookup({value:"wanted"});',
+            },
+        }
+        native = {
+            "type": "response_item",
+            "timestamp": "2026-08-07T12:00:01Z",
+            "payload": {
+                "type": "mcpToolCall",
+                "id": "native-1",
+                "server": "fixture",
+                "tool": "lookup",
+                "arguments": {"value": "wanted"},
+                "status": "completed",
+                "result": {"content": [{"type": "text", "text": "native"}]},
+            },
+        }
+        unmatched = {
+            **wrapper,
+            "payload": {
+                **wrapper["payload"],
+                "call_id": "wrapper-2",
+                "input": 'tools.mcp__fixture__lookup({value:"other"});',
+            },
+        }
+        with TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            incremental = root / "incremental.jsonl"
+            incremental.write_text(json.dumps(wrapper) + "\n")
+            transcripts._cache.clear()
+            transcripts.read_session_events("codex", incremental)
+            incremental.write_text(
+                "\n".join(json.dumps(row) for row in (wrapper, native, unmatched)) + "\n"
+            )
+            incremental_result = transcripts.read_session_events("codex", incremental)
+            full = root / "full.jsonl"
+            full.write_text(
+                "\n".join(json.dumps(row) for row in (wrapper, native, unmatched)) + "\n"
+            )
+            transcripts._cache.clear()
+            full_result = transcripts.read_session_events("codex", full)
+
+        self.assertEqual(incremental_result["events"], full_result["events"])
+        tools = [event["tool"] for event in full_result["events"] if event["kind"] == "tool"]
+        self.assertEqual([tool["name"] for tool in tools], [
+            "mcp__fixture__lookup",
+            "mcp__fixture__lookup",
+        ])
+        self.assertEqual([tool["input"] for tool in tools], [
+            '{"value": "wanted"}',
+            '{"value": "other"}',
+        ])
+
+    def test_round2_f2_statusless_completed_items_are_done(self) -> None:
+        parsed = transcripts.read_session_events(
+            "codex-normalized", FIXTURES_DIR / "codex_wiki266_round2_lifecycle.jsonl"
+        )
+        tools = [event["tool"] for event in parsed["events"] if event["kind"] == "tool"]
+        by_call_id = {tool["call_id"]: tool for tool in tools}
+        for call_id in ("search-1", "image-1"):
+            self.assertIsNone(by_call_id[call_id]["output"])
+            self.assertTrue(by_call_id[call_id]["ok"])
+            self.assertEqual(by_call_id[call_id]["status"], "completed")
+
+    def test_round2_f3_real_collab_type_and_dynamic_content_items_render(self) -> None:
+        parsed = transcripts.read_session_events(
+            "codex-normalized", FIXTURES_DIR / "codex_wiki266_round2_lifecycle.jsonl"
+        )
+        tools = [event["tool"] for event in parsed["events"] if event["kind"] == "tool"]
+        by_call_id = {tool["call_id"]: tool for tool in tools}
+        self.assertEqual(by_call_id["collab-1"]["name"], "collabAgentToolCall")
+        self.assertIn("contentItems", by_call_id["dynamic-1"]["input"])
+        self.assertIn("needle", by_call_id["dynamic-1"]["input"])
+
+    def test_round2_f4_failed_turn_closes_pending_tool_and_marks_turn(self) -> None:
+        parsed = transcripts.read_session_events(
+            "codex-normalized", FIXTURES_DIR / "codex_wiki266_round2_lifecycle.jsonl"
+        )
+        pending = next(
+            event["tool"]
+            for event in parsed["events"]
+            if event["kind"] == "tool" and event["tool"]["call_id"] == "pending-1"
+        )
+        self.assertFalse(pending["ok"])
+        self.assertEqual(pending["status"], "failed")
+        self.assertTrue(pending["partial"])
+        self.assertTrue(any(
+            event["kind"] == "interrupt" and event["text"].startswith("turn failed")
+            for event in parsed["events"]
+        ))
+
+    def test_round2_f5_delta_identity_keeps_repeated_content_and_marks_interrupt(self) -> None:
+        rows = [
+            self._row("item/started", {"item": {"type": "commandExecution", "id": "delta-1", "command": "x"}}, 1),
+            self._row("item/commandExecution/outputDelta", {"itemId": "delta-1", "delta": "same"}, 2),
+            self._row("item/commandExecution/outputDelta", {"itemId": "delta-1", "delta": "same"}, 3),
+            self._row("item/commandExecution/outputDelta", {"itemId": "delta-1", "delta": "same"}, 3),
+            self._row("turn/completed", {"turn": {"status": "interrupted"}}, 4),
+        ]
+        with TemporaryDirectory() as tmp:
+            path = Path(tmp) / "delta.jsonl"
+            path.write_text("".join(json.dumps(row) + "\n" for row in rows))
+            parsed = transcripts.read_session_events("codex-normalized", path)
+        tool = next(event["tool"] for event in parsed["events"] if event["kind"] == "tool")
+        self.assertEqual(tool["output"], "samesame")
+        self.assertTrue(tool["partial"])
+
+    def test_round2_f6_blank_agent_message_registers_before_delta(self) -> None:
+        rows = [
+            self._row("item/started", {"item": {"type": "agentMessage", "id": "live-1", "text": ""}}, 1),
+        ]
+        with TemporaryDirectory() as tmp:
+            path = Path(tmp) / "live.jsonl"
+            path.write_text(json.dumps(rows[0]) + "\n")
+            first = transcripts.read_session_events("codex-normalized", path)
+            path.write_text(
+                "\n".join(
+                    json.dumps(row)
+                    for row in rows + [
+                        self._row("item/agentMessage/delta", {"itemId": "live-1", "delta": "live"}, 2)
+                    ]
+                )
+                + "\n"
+            )
+            second = transcripts.read_session_events("codex-normalized", path)
+        self.assertEqual([(event["kind"], event["text"]) for event in first["events"]], [("assistant", "")])
+        self.assertEqual(second["events"][0]["text"], "live")
+
+    def test_round2_f7_aggregate_batch_output_stays_on_outer_envelope(self) -> None:
+        parsed = transcripts.read_session_events(
+            "codex", FIXTURES_DIR / "codex_wiki266_round2_batch.jsonl"
+        )
+        tools = [event["tool"] for event in parsed["events"] if event["kind"] == "tool"]
+        self.assertEqual(tools[0]["name"], "exec")
+        self.assertEqual(tools[0]["output"], "one aggregate result")
+        self.assertEqual([tool["output"] for tool in tools[1:]], [None, None])
+
+    def test_round2_f8_explicit_child_call_ids_complete_artifact_and_tool(self) -> None:
+        artifact = {
+            "kind": "artifact",
+            "id": "00000000-0000-4000-8000-000000000266",
+            "title": "round 2",
+            "caption": "fixture",
+            "artifact": {"kind": "mermaid", "source": "graph TD; A-->B"},
+            "ts": "2026-08-07T12:00:01Z",
+        }
+        source = (
+            'const rs = await Promise.all(['
+            'tools.mcp__wiki_artifacts__render_artifact({kind:"mermaid",payload:{source:"graph TD; A-->B"}}),'
+            'tools.exec_command({cmd:"echo hi"})]); text(rs);'
+        )
+        rows = [
+            {"type": "response_item", "timestamp": "2026-08-07T12:00:00Z", "payload": {"type": "custom_tool_call", "call_id": "outer-266", "name": "exec", "input": source}},
+            {"type": "response_item", "timestamp": "2026-08-07T12:00:01Z", "payload": {"type": "custom_tool_call_output", "call_id": "outer-266", "output": [
+                {"call_id": "artifact-266", "output": sentinel_text(artifact)},
+                {"call_id": "command-266", "output": "hi\n", "exit_code": 0},
+            ]}},
+        ]
+        with TemporaryDirectory() as tmp:
+            path = Path(tmp) / "batch-artifact.jsonl"
+            path.write_text("\n".join(json.dumps(row) for row in rows) + "\n")
+            parsed = transcripts.read_session_events("codex", path)
+        tools = [event["tool"] for event in parsed["events"] if event["kind"] == "tool"]
+        self.assertEqual(tools[1]["call_id"], "artifact-266")
+        self.assertEqual(tools[2]["call_id"], "command-266")
+        self.assertEqual(tools[2]["output"], "hi\n")
+        self.assertEqual(
+            [event["artifact_id"] for event in parsed["events"] if event["kind"] == "artifact"],
+            [artifact["id"]],
         )
 
     def test_legacy_result_first_is_buffered_until_call_identity_arrives(self) -> None:

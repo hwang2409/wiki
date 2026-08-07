@@ -87,9 +87,15 @@ export function toolInlineResult(tool: SessionTool, displayOutput: string): stri
 }
 
 export function toolStatus(tool: SessionTool): "working" | "done" | "failed" | "completed" {
-  if (tool.output === null && tool.ok === null) return "working";
   if (tool.ok === false) return "failed";
   if (tool.ok === true) return "done";
+  if (["failed", "error", "interrupted", "cancelled", "canceled"].includes(tool.status ?? "")) {
+    return "failed";
+  }
+  if (tool.completed_at || ["completed", "complete", "success", "succeeded"].includes(tool.status ?? "")) {
+    return "done";
+  }
+  if (tool.output === null && tool.ok === null) return "working";
   return "completed";
 }
 

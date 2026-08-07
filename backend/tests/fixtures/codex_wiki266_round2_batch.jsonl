@@ -1,0 +1,2 @@
+{"type":"response_item","timestamp":"2026-08-07T12:01:00Z","payload":{"type":"custom_tool_call","call_id":"batch-aggregate","name":"exec","input":"const rs = await Promise.all([tools.exec_command({cmd:\"first\"}),tools.exec_command({cmd:\"second\"})]); text(rs);"}}
+{"type":"response_item","timestamp":"2026-08-07T12:01:01Z","payload":{"type":"custom_tool_call_output","call_id":"batch-aggregate","output":"one aggregate result"}}

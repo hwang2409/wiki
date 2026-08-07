@@ -99,6 +99,9 @@ test("harness wrappers become semantic segments and known boilerplate is removed
 test("tool units expose verb, target, status, and semantic output labels", () => {
   expect(toolSummaryParts(tool())).toEqual({ verb: "edit", target: "hot.md" });
   expect(toolStatus(tool({ output: null, ok: null }))).toBe("working");
+  expect(toolStatus(tool({ output: null, ok: null, status: "completed" }))).toBe("done");
+  expect(toolStatus(tool({ output: null, ok: null, status: "interrupted" }))).toBe("failed");
+  expect(toolStatus(tool({ output: null, ok: null, completed_at: "2026-08-07T12:00:00Z" }))).toBe("done");
   expect(outputLabelForTool(tool())).toBe("diff");
   expect(outputLabelForTool(tool({ archetype: "read" }))).toBe("file contents");
   expect(outputLabelForTool(tool({ archetype: "git", name: "Diff" }))).toBe("diff");
