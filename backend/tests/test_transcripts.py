@@ -670,7 +670,7 @@ class CodexNewRuntimeTranscriptTests(unittest.TestCase):
         parsed = transcripts.read_session_events("codex", path)
 
         tools = [event["tool"] for event in parsed["events"] if event["kind"] == "tool"]
-        self.assertEqual(len(tools), 4)
+        self.assertEqual(len(tools), 5)
 
         read_tool = tools[0]
         self.assertEqual(read_tool["name"], "exec_command")
@@ -684,22 +684,29 @@ class CodexNewRuntimeTranscriptTests(unittest.TestCase):
         self.assertEqual(github_tool["summary"], "gh pr checks 13606 --repo hwang2409/wiki")
         self.assertEqual(github_tool["output"], "all checks passed\n")
 
-        # Homogeneous Promise.all of exec_commands now collapses to one bash
-        # row whose classified input is the newline-joined shell commands, so
-        # the shared inline/block renderer treats it like any batched shell
-        # run rather than a fenced JavaScript literal.
-        multi_tool = tools[2]
+        # Homogeneous Promise.all children keep their own canonical identity
+        # and input, so each actual call reaches the shared tool renderer.
+        multi_tools = tools[2:4]
+        self.assertEqual([tool["name"] for tool in multi_tools], ["exec_command", "exec_command"])
+        self.assertEqual([tool["input"] for tool in multi_tools], [
+            'git status --short --branch',
+            'rg -n "custom_tool_call" backend/app/transcripts.py',
+        ])
+        self.assertEqual([tool["output"] for tool in multi_tools], [
+            "## git\n## wiki-main\n## rg\n1034: custom_tool_call\n",
+            "## git\n## wiki-main\n## rg\n1034: custom_tool_call\n",
+        ])
+        self.assertTrue(multi_tools[0]["ok"])
+        self.assertTrue(multi_tools[1]["ok"])
+
+        # The wrapper exposes one aggregate result for this batch, so both
+        # child events retain the bounded aggregate rather than losing a call.
+        multi_tool = multi_tools[0]
         self.assertEqual(multi_tool["name"], "exec_command")
-        self.assertEqual(
-            multi_tool["input"],
-            'git status --short --branch\nrg -n "custom_tool_call" backend/app/transcripts.py',
-        )
         self.assertEqual(multi_tool["archetype"], "git")
         self.assertEqual(multi_tool["summary"], "git status")
-        self.assertEqual(multi_tool["output"], "## git\n## wiki-main\n## rg\n1034: custom_tool_call\n")
-        self.assertTrue(multi_tool["ok"])
 
-        failed_tool = tools[3]
+        failed_tool = tools[4]
         self.assertEqual(failed_tool["archetype"], "validate")
         self.assertFalse(failed_tool["ok"])
         self.assertEqual(failed_tool["output"], "test command failed\n")
@@ -775,7 +782,7 @@ class CodexNewRuntimeTranscriptTests(unittest.TestCase):
         parsed = transcripts.read_session_events("codex", path)
         tools = [event["tool"] for event in parsed["events"] if event["kind"] == "tool"]
 
-        self.assertEqual(len(tools), 4)
+        self.assertEqual(len(tools), 6)
         for tool in tools:
             self.assertNotIn("```js", tool["input"])
             self.assertNotIn("await tools.", tool["input"])
@@ -795,20 +802,25 @@ class CodexNewRuntimeTranscriptTests(unittest.TestCase):
         # apply_patch preserves the structured edit payload for the diff view.
         self.assertIn("patch", patch["edit"])
 
-        parallel = tools[2]
-        self.assertEqual(parallel["name"], "exec_command")
-        self.assertEqual(
-            parallel["input"],
-            "/tmp/agent-status/pr_watch_summary.sh 13657\n"
+        parallel = tools[2:4]
+        self.assertEqual([tool["name"] for tool in parallel], ["exec_command", "exec_command"])
+        self.assertEqual([tool["input"] for tool in parallel], [
+            "/tmp/agent-status/pr_watch_summary.sh 13657",
             "gh pr view 13657 --json state,mergeable,mergeStateStatus",
-        )
-        self.assertEqual(parallel["archetype"], "run")
+        ])
+        self.assertEqual([tool["archetype"] for tool in parallel], ["run", "github"])
 
-        mixed = tools[3]
-        self.assertEqual(mixed["name"], "mcp__wiki_artifacts__read_agent_pr")
-        self.assertEqual(mixed["archetype"], "tool")
-        self.assertIn("read_agent_pr", mixed["input"])
-        self.assertIn("exec_command", mixed["input"])
+        mixed = tools[4:6]
+        self.assertEqual(
+            [tool["name"] for tool in mixed],
+            ["mcp__wiki_artifacts__read_agent_pr", "exec_command"],
+        )
+        self.assertEqual([tool["archetype"] for tool in mixed], ["tool", "run"])
+        self.assertEqual(
+            [tool["output"] for tool in mixed],
+            ["pr context\ngate result: green\n"] * 2,
+        )
+        self.assertEqual([tool["ok"] for tool in mixed], [True, True])
 
     def test_codex_runtime_preamble_is_metadata_not_output(self) -> None:
         path = FIXTURES_DIR / "codex_preamble_runtime_rendering.jsonl"
@@ -916,9 +928,10 @@ class CodexNewRuntimeTranscriptTests(unittest.TestCase):
         self.assertEqual(harness["name"], "exec_command")
         self.assertEqual(harness["input"], "ls\npwd")
         self.assertEqual(harness["calls"], 2)
+        self.assertEqual([child["input"] for child in harness["children"]], ["ls", "pwd"])
 
-    def test_harness_scanner_mixed_batch_keeps_first_call_semantics(self) -> None:
-        """Mixed Promise.all keeps first call's semantic header (no raw JS)."""
+    def test_harness_scanner_mixed_batch_preserves_each_call(self) -> None:
+        """Mixed Promise.all emits one semantic child per actual call."""
         source = (
             "const [pr, st] = await Promise.all([\n"
             '  tools.mcp__wiki_artifacts__read_agent_pr({id:"X"}),\n'
@@ -927,11 +940,15 @@ class CodexNewRuntimeTranscriptTests(unittest.TestCase):
         )
         harness = transcripts._codex_harness_tool("exec", source)
         self.assertIsNotNone(harness)
-        self.assertEqual(harness["name"], "mcp__wiki_artifacts__read_agent_pr")
-        self.assertNotIn("```", harness["input"])
-        self.assertNotIn("Promise.all", harness["input"])
         self.assertEqual(harness["calls"], 2)
-        self.assertIn("exec_command", harness["input"])
+        self.assertEqual(
+            [child["name"] for child in harness["children"]],
+            ["mcp__wiki_artifacts__read_agent_pr", "exec_command"],
+        )
+        self.assertEqual([child["input"] for child in harness["children"]], [
+            '{"id": "X"}',
+            "wiki gate 13659",
+        ])
 
     def test_harness_fallback_hides_malformed_javascript_and_is_bounded(self) -> None:
         """Malformed wrappers keep a bounded semantic note, never raw JS."""
@@ -958,7 +975,66 @@ class CodexNewRuntimeTranscriptTests(unittest.TestCase):
         )
         harness = transcripts._codex_harness_tool("exec", source)
         self.assertIsNotNone(harness)
-        self.assertLessEqual(len(harness["input"]), transcripts.MAX_TOOL_IO)
+        self.assertTrue(all(
+            len(child["input"]) <= transcripts.MAX_TOOL_IO
+            for child in harness["children"]
+        ))
+
+    def test_harness_batch_results_match_explicit_child_results(self) -> None:
+        rows = [
+            {
+                "type": "response_item",
+                "timestamp": "2026-08-07T12:00:00Z",
+                "payload": {
+                    "type": "custom_tool_call",
+                    "call_id": "batch-results",
+                    "name": "exec",
+                    "input": (
+                        "const rs = await Promise.all(["
+                        'tools.exec_command({cmd:"first"}),'
+                        'tools.exec_command({cmd:"second"})]); text(rs);'
+                    ),
+                },
+            },
+            {
+                "type": "response_item",
+                "timestamp": "2026-08-07T12:00:01Z",
+                "payload": {
+                    "type": "custom_tool_call_output",
+                    "call_id": "batch-results",
+                    "output": [
+                        {"output": "first output\n", "exit_code": 0},
+                        {"output": "second output\n", "exit_code": 1},
+                    ],
+                },
+            },
+        ]
+        with TemporaryDirectory() as tmp:
+            path = Path(tmp) / "codex-batch-results.jsonl"
+            path.write_text("\n".join(json.dumps(row) for row in rows) + "\n")
+            tools = [
+                event["tool"]
+                for event in transcripts.read_session_events("codex", path)["events"]
+                if event["kind"] == "tool"
+            ]
+
+        self.assertEqual([tool["input"] for tool in tools], ["first", "second"])
+        self.assertEqual([tool["output"] for tool in tools], [
+            "first output\n",
+            "second output\n",
+        ])
+        self.assertEqual([tool["ok"] for tool in tools], [True, False])
+
+    def test_harness_variable_resolution_rejects_unsafe_declarations(self) -> None:
+        cases = [
+            "// const args = {cmd: 'fake'};\ntools.exec_command(args);",
+            "const args = {cmd: 'real'}; /* comment */ tools.exec_command(args);",
+            "{ const args = {cmd: 'scoped'}; } tools.exec_command(args);",
+            "const args = {cmd: 'first'}; args = {cmd: 'fake'}; tools.exec_command(args);",
+        ]
+        for source in cases:
+            with self.subTest(source=source):
+                self.assertIsNone(transcripts._codex_harness_tool("exec", source))
 
 
 def _write_rollout(day_dir: Path, name: str, cwd: str, session_id: str,
