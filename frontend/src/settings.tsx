@@ -228,6 +228,18 @@ const WEIGHT_LABELS: Record<number, string> = {
   900: "Black",
 };
 
+export function invalidateFontCachesForFamily(family: string): void {
+  AVAIL_CACHE.delete(family);
+  WEIGHT_CACHE.delete(family);
+}
+
+export function handleInstalledFontFaceRegistered(event: Event): string | undefined {
+  const family = (event as CustomEvent<{ family?: unknown }>).detail?.family;
+  if (typeof family !== "string") return undefined;
+  invalidateFontCachesForFamily(family);
+  return family;
+}
+
 function isFontInstalled(family: string): boolean {
   const cached = AVAIL_CACHE.get(family);
   if (cached !== undefined) return cached;
@@ -632,10 +644,8 @@ function FontRoleRow({ role, fonts }: { role: FontRole; fonts: FontChoice[] }) {
 
   useEffect(() => {
     const onFaceRegistered = (event: Event) => {
-      const family = (event as CustomEvent<{ family?: unknown }>).detail?.family;
+      const family = handleInstalledFontFaceRegistered(event);
       if (family !== choice.family) return;
-      AVAIL_CACHE.delete(choice.family);
-      WEIGHT_CACHE.delete(choice.family);
       setFontFaceRevision((revision) => revision + 1);
     };
     window.addEventListener(INSTALLED_FONT_FACE_REGISTERED_EVENT, onFaceRegistered);

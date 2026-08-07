@@ -96,6 +96,10 @@ class InstalledFontsExtractTests(unittest.TestCase):
         self.assertEqual(installed_fonts._extract_families(None), [])
         self.assertEqual(installed_fonts._extract_families({"SPFontsDataType": "junk"}), [])
 
+    def test_compound_profiler_styles_find_weight_aliases_inside_style_name(self) -> None:
+        self.assertEqual(installed_fonts._weight("SemiCondensed Black Italic"), 900)
+        self.assertEqual(installed_fonts._weight("Compressed Ultralight G1"), 200)
+
     def test_extracts_file_metadata_and_skips_ttc_collections(self) -> None:
         with tempfile.TemporaryDirectory() as temp:
             root = Path(temp)
@@ -220,6 +224,36 @@ class InstalledFontFileApiTests(unittest.TestCase):
 
                 with mock.patch.object(installed_fonts, "_open_font_fd", side_effect=swap_before_open):
                     response = _get_font_response(font_id)
+                self.assertEqual(response.status_code, 404)
+
+    def test_request_rejects_parent_directory_swap_during_openat_walk(self) -> None:
+        with tempfile.TemporaryDirectory() as temp, tempfile.TemporaryDirectory() as outside:
+            root = Path(temp)
+            nested = root / "nested"
+            nested.mkdir()
+            font_path = nested / "font.ttf"
+            font_path.write_bytes(b"inside")
+            outside_dir = Path(outside) / "nested"
+            outside_dir.mkdir()
+            font_id = "parent-race"
+            with mock.patch.object(installed_fonts, "_FONT_ROOTS", (root,)):
+                installed_fonts._CACHE = [{"family": "Race Font", "files": [{"id": font_id}]}]
+                installed_fonts._FILE_MAP = {font_id: font_path.resolve()}
+                original_open_at = installed_fonts._open_at
+                swapped = False
+
+                def swap_parent(path: str | Path, flags: int, *, dir_fd: int | None = None) -> int:
+                    nonlocal swapped
+                    result = original_open_at(path, flags, dir_fd=dir_fd)
+                    if dir_fd is None and not swapped:
+                        nested.rename(root / "nested-real")
+                        nested.symlink_to(outside_dir, target_is_directory=True)
+                        swapped = True
+                    return result
+
+                with mock.patch.object(installed_fonts, "_open_at", side_effect=swap_parent):
+                    response = _get_font_response(font_id)
+                self.assertTrue(swapped)
                 self.assertEqual(response.status_code, 404)
 
     def test_oversized_opened_font_is_rejected(self) -> None:

@@ -1,0 +1,83 @@
+import { afterEach, test } from "vitest";
+import {
+  INSTALLED_FONT_FACE_REGISTERED_EVENT,
+  registerInstalledFontFaces,
+  resetFontEnumerationCacheForTests,
+} from "../src/font-enumeration";
+import {
+  detectFontWeights,
+  handleInstalledFontFaceRegistered,
+} from "../src/settings";
+
+const originalDocument = Object.getOwnPropertyDescriptor(globalThis, "document");
+const originalWindow = Object.getOwnPropertyDescriptor(globalThis, "window");
+const originalFontFace = Object.getOwnPropertyDescriptor(globalThis, "FontFace");
+
+afterEach(() => {
+  resetFontEnumerationCacheForTests();
+  if (originalDocument) Object.defineProperty(globalThis, "document", originalDocument);
+  else delete (globalThis as { document?: unknown }).document;
+  if (originalWindow) Object.defineProperty(globalThis, "window", originalWindow);
+  else delete (globalThis as { window?: unknown }).window;
+  if (originalFontFace) Object.defineProperty(globalThis, "FontFace", originalFontFace);
+  else delete (globalThis as { FontFace?: unknown }).FontFace;
+});
+
+test("font registration invalidates a cached family after the row selected another family", () => {
+  const family = "Registered Family";
+  const currentSelection = "Other Family";
+  const fakeWindow = new EventTarget();
+  const faces: Array<{ family: string; weight: string }> = [];
+  const context = {
+    font: "",
+    measureText() {
+      const weight = Number(context.font.match(/^\d+/)?.[0] ?? 400);
+      const width = weight === 700 ? 200 : 100;
+      return {
+        width,
+        actualBoundingBoxLeft: 0,
+        actualBoundingBoxRight: width,
+        actualBoundingBoxAscent: 50,
+        actualBoundingBoxDescent: 10,
+      };
+    },
+  };
+  const fakeDocument = {
+    createElement() {
+      return { getContext: () => context };
+    },
+    fonts: {
+      add(face: { family: string; descriptors: { weight: string } }) {
+        faces.push({ family: face.family, weight: face.descriptors.weight });
+      },
+      *[Symbol.iterator]() {
+        yield* faces;
+      },
+    },
+  };
+  class FakeFontFace {
+    family: string;
+    descriptors: { weight: string };
+
+    constructor(_family: string, _source: string, descriptors: { weight: string }) {
+      this.family = _family;
+      this.descriptors = descriptors;
+    }
+  }
+
+  Object.defineProperty(globalThis, "document", { value: fakeDocument, configurable: true });
+  Object.defineProperty(globalThis, "window", { value: fakeWindow, configurable: true });
+  Object.defineProperty(globalThis, "FontFace", { value: FakeFontFace, configurable: true });
+
+  if (currentSelection === family) throw new Error("test requires a different current selection");
+  expectWeights(detectFontWeights(family), [400]);
+  fakeWindow.addEventListener(INSTALLED_FONT_FACE_REGISTERED_EVENT, handleInstalledFontFaceRegistered);
+  registerInstalledFontFaces([{ family, files: [{ id: "registered", weight: 700 }] }]);
+  expectWeights(detectFontWeights(family), [700]);
+});
+
+function expectWeights(actual: number[], expected: number[]): void {
+  if (actual.length !== expected.length || actual.some((value, index) => value !== expected[index])) {
+    throw new Error(`expected weights ${expected.join(", ")}, got ${actual.join(", ")}`);
+  }
+}

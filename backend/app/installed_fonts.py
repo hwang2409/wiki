@@ -6,10 +6,9 @@ import hashlib
 import json
 import logging
 import os
-import subprocess
 import stat
+import subprocess
 import threading
-import fcntl
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, BinaryIO, TypedDict
@@ -90,25 +89,29 @@ def _weight(value: Any) -> int | None:
         if compact.endswith(suffix):
             compact = compact[: -len(suffix)]
             break
-    compact_names = {
-        "thin": 100,
-        "hairline": 100,
-        "ultralight": 200,
-        "extralight": 200,
-        "light": 300,
-        "book": 350,
-        "regular": 400,
-        "normal": 400,
-        "medium": 500,
-        "semibold": 600,
-        "demibold": 600,
-        "bold": 700,
-        "extrabold": 800,
-        "ultrabold": 800,
-        "black": 900,
-        "heavy": 900,
-    }
-    return compact_names.get(compact)
+    # Scan longer aliases first so ``ultralight`` does not match ``light``.
+    aliases = (
+        ("ultralight", 200),
+        ("extralight", 200),
+        ("ultrabold", 800),
+        ("extrabold", 800),
+        ("semibold", 600),
+        ("demibold", 600),
+        ("hairline", 100),
+        ("regular", 400),
+        ("normal", 400),
+        ("medium", 500),
+        ("heavy", 900),
+        ("black", 900),
+        ("thin", 100),
+        ("light", 300),
+        ("bold", 700),
+        ("book", 350),
+    )
+    for alias, weight in aliases:
+        if alias in compact:
+            return weight
+    return None
 
 
 def _typeface_weight(typeface: dict[str, Any]) -> int | None:
@@ -259,42 +262,48 @@ def font_path(font_id: str) -> Path | None:
     return _allowed_font_path(path)
 
 
-def _path_from_open_fd(fd: int) -> Path | None:
-    getpath = getattr(fcntl, "F_GETPATH", None)
-    if getpath is not None:
-        try:
-            raw = fcntl.fcntl(fd, getpath, b"\0" * 1024)
-            if isinstance(raw, bytes):
-                return Path(raw.split(b"\0", 1)[0].decode("utf-8"))
-        except (OSError, UnicodeDecodeError):
-            pass
-    for fd_root in (Path("/proc/self/fd"), Path("/dev/fd")):
-        try:
-            raw = os.readlink(fd_root / str(fd))
-        except OSError:
-            continue
-        if raw.endswith(" (deleted)"):
-            return None
-        return Path(raw)
-    return None
+def _open_at(path: str | Path, flags: int, *, dir_fd: int | None = None) -> int:
+    return os.open(path, flags, dir_fd=dir_fd)
 
 
-def _validated_opened_path(fd: int, metadata: os.stat_result) -> Path | None:
-    if not stat.S_ISREG(metadata.st_mode):
-        return None
-    opened_path = _path_from_open_fd(fd)
-    if opened_path is None:
-        return None
-    resolved = _allowed_font_path(opened_path)
-    if resolved is None:
+def _open_font_fd(path: Path, flags: int) -> int | None:
+    """Open a mapped font by walking from an allowlisted root descriptor."""
+    if path.suffix.casefold() not in _FONT_SUFFIXES:
         return None
     try:
-        current = resolved.stat()
+        candidate = path.expanduser().resolve(strict=False)
     except OSError:
         return None
-    if (current.st_dev, current.st_ino) != (metadata.st_dev, metadata.st_ino):
-        return None
-    return resolved
+
+    for root in _FONT_ROOTS:
+        try:
+            root_path = root.expanduser().resolve(strict=True)
+            relative = candidate.relative_to(root_path)
+        except (OSError, ValueError):
+            continue
+        parts = relative.parts
+        if not parts or any(part in {"", ".", ".."} for part in parts):
+            continue
+
+        current_fd: int | None = None
+        try:
+            current_fd = _open_at(
+                root_path,
+                flags | getattr(os, "O_DIRECTORY", 0),
+            )
+            for index, part in enumerate(parts):
+                component_flags = flags
+                if index < len(parts) - 1:
+                    component_flags |= getattr(os, "O_DIRECTORY", 0)
+                next_fd = _open_at(part, component_flags, dir_fd=current_fd)
+                os.close(current_fd)
+                current_fd = next_fd
+            return current_fd
+        except OSError:
+            if current_fd is not None:
+                os.close(current_fd)
+            continue
+    return None
 
 
 def open_font_file(font_id: str) -> OpenedFontFile | None:
@@ -306,29 +315,23 @@ def open_font_file(font_id: str) -> OpenedFontFile | None:
         return None
 
     flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_CLOEXEC", 0)
-    try:
-        fd = _open_font_fd(path, flags)
-    except OSError:
+    fd = _open_font_fd(path, flags)
+    if fd is None:
         return None
     stream: BinaryIO | None = None
     try:
         metadata = os.fstat(fd)
-        resolved = _validated_opened_path(fd, metadata)
-        if resolved is None:
+        if not stat.S_ISREG(metadata.st_mode):
             os.close(fd)
             return None
         if metadata.st_size > MAX_FONT_FILE_BYTES:
             raise FontFileTooLarge
         stream = os.fdopen(fd, "rb", closefd=True)
-        return OpenedFontFile(stream=stream, path=resolved, size=metadata.st_size)
+        return OpenedFontFile(stream=stream, path=path, size=metadata.st_size)
     except BaseException:
         if stream is None:
             os.close(fd)
         raise
-
-
-def _open_font_fd(path: Path, flags: int) -> int:
-    return os.open(path, flags)
 
 
 def reset_cache_for_tests() -> None:
