@@ -1593,7 +1593,9 @@ function normalizeCodexThinkingSummary(text: string): string {
 }
 
 function ThinkingRow({ event, durationMs = null }: { event: SessionEvent; durationMs?: number | null }) {
-  const codexSummary = event.encrypted === true;
+  // Provider capability markers can arrive as truthy wire values after an
+  // app-server round trip. Do not require a strict boolean identity.
+  const codexSummary = Boolean(event.encrypted);
   const summary = codexSummary ? normalizeCodexThinkingSummary(event.text) : event.text;
   const [expanded, setExpanded] = useState(() => codexSummary);
   const title = summary.split("\n")[0].trim().slice(0, 120);

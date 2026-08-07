@@ -767,7 +767,7 @@ export type SessionEvent = {
   tasks?: SessionTask[];
   pr?: SessionPr;
   marker?: string;
-  encrypted?: boolean;
+  encrypted?: boolean | string;
   question?: SessionQuestion;
   artifact_id?: string;
   title?: string | null;

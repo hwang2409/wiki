@@ -164,6 +164,23 @@ test("Codex detailed summaries open by default and normalize bold title wrappers
   expect(container.querySelector(".session-thinking")?.textContent).not.toContain("**Planning");
 });
 
+test("truthy Codex capability markers keep summaries open", () => {
+  const thinking = event(17, {
+    kind: "thinking",
+    text: "**Exploring agent/events terminal module**",
+    encrypted: "codex-summary",
+    tool: undefined,
+  });
+  const { container, getByRole } = render(
+    <ActivityEventRow event={thinking} rowKey={17} ticket="WIKI-267" />,
+  );
+  expect(getByRole("button").getAttribute("aria-expanded")).toBe("true");
+  expect(getByRole("button").textContent).not.toContain("**");
+  expect(container.querySelector(".session-thinking")?.textContent).toBe(
+    "Exploring agent/events terminal module",
+  );
+});
+
 test("Codex adjacent same-line and newline fragments render as separate thought rows", () => {
   const fragments = [
     event(12, { kind: "thinking", text: "**thought one**", encrypted: true, tool: undefined }),
