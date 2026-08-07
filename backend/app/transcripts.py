@@ -21,6 +21,7 @@ Normalized event:
 
 from __future__ import annotations
 
+import ast
 import base64
 import binascii
 import json
@@ -425,6 +426,8 @@ def _classify_tool(name: str, tool_input: str) -> tuple[str, str]:
     mcp = re.match(r"mcp__[\w-]+__(\w+)$", name)
     if mcp:
         name = mcp.group(1)
+    if name == "wait":
+        return ("wait", "wait" if not tool_input else f"wait {_clip(tool_input, 54)}")
     if name == "apply_patch":
         files = _PATCH_FILE_PATTERN.findall(tool_input)
         short = ", ".join(PurePosixPath(f).name for f in files[:4])
@@ -556,6 +559,376 @@ def _codex_tool_input(name: str, arguments: object) -> str:
     return _clip(str(arguments), MAX_TOOL_IO)
 
 
+_JS_IDENTIFIER = re.compile(r"[A-Za-z_$][\w$]*")
+_JS_NUMBER = re.compile(r"-?(?:0|[1-9]\d*)(?:\.\d+)?(?:[eE][+-]?\d+)?")
+
+
+def _skip_js_space(source: str, index: int) -> int:
+    while index < len(source):
+        if source[index].isspace():
+            index += 1
+        elif source.startswith("//", index):
+            newline = source.find("\n", index + 2)
+            index = len(source) if newline == -1 else newline + 1
+        elif source.startswith("/*", index):
+            end = source.find("*/", index + 2)
+            index = len(source) if end == -1 else end + 2
+        else:
+            break
+    return index
+
+
+def _js_string_end(source: str, opening: int) -> int | None:
+    quote = source[opening]
+    escaped = False
+    for index in range(opening + 1, len(source)):
+        char = source[index]
+        if escaped:
+            escaped = False
+        elif char == "\\":
+            escaped = True
+        elif char == quote:
+            return index + 1
+        elif char in "\r\n":
+            return None
+    return None
+
+
+def _balanced_js_call_end(source: str, opening: int) -> int | None:
+    stack = [")"]
+    index = opening + 1
+    pairs = {"(": ")", "[": "]", "{": "}"}
+    while index < len(source):
+        char = source[index]
+        if char in ("'", '"'):
+            index = _js_string_end(source, index)
+            if index is None:
+                return None
+            continue
+        if char == "`":
+            return None
+        if source.startswith("//", index):
+            newline = source.find("\n", index + 2)
+            index = len(source) if newline == -1 else newline + 1
+            continue
+        if source.startswith("/*", index):
+            end = source.find("*/", index + 2)
+            if end == -1:
+                return None
+            index = end + 2
+            continue
+        if char in pairs:
+            stack.append(pairs[char])
+        elif char in ")]}":
+            if not stack or char != stack.pop():
+                return None
+            if not stack:
+                return index
+        index += 1
+    return None
+
+
+def _codex_harness_calls(source: str) -> list[tuple[str, str]] | None:
+    """Find tools calls without matching text inside strings or comments."""
+    calls: list[tuple[str, str]] = []
+    index = 0
+    while index < len(source):
+        char = source[index]
+        if char in ("'", '"'):
+            index = _js_string_end(source, index)
+            if index is None:
+                return None
+            continue
+        if char == "`":
+            return None
+        if source.startswith("//", index):
+            newline = source.find("\n", index + 2)
+            index = len(source) if newline == -1 else newline + 1
+            continue
+        if source.startswith("/*", index):
+            end = source.find("*/", index + 2)
+            if end == -1:
+                return None
+            index = end + 2
+            continue
+        if source.startswith("tools.", index) and (
+            index == 0 or not (source[index - 1].isalnum() or source[index - 1] in "_$")
+        ):
+            name_match = _JS_IDENTIFIER.match(source, index + len("tools."))
+            if name_match:
+                opening = _skip_js_space(source, name_match.end())
+                if opening < len(source) and source[opening] == "(":
+                    end = _balanced_js_call_end(source, opening)
+                    if end is None:
+                        return None
+                    calls.append((name_match.group(0), source[opening + 1:end].strip()))
+                    index = end + 1
+                    continue
+        index += 1
+    return calls
+
+
+def _decode_js_string(source: str, opening: int) -> tuple[str, int] | None:
+    end = _js_string_end(source, opening)
+    if end is None:
+        return None
+    literal = source[opening:end]
+    try:
+        value = json.loads(literal)
+    except (TypeError, ValueError):
+        try:
+            value = ast.literal_eval(literal)
+        except (SyntaxError, ValueError):
+            return None
+    return value, end if isinstance(value, str) else None
+
+
+class _CodexJsArgumentParser:
+    def __init__(self, source: str):
+        self.source = source
+        self.index = 0
+
+    def _space(self) -> None:
+        self.index = _skip_js_space(self.source, self.index)
+
+    def _string(self) -> str | None:
+        decoded = _decode_js_string(self.source, self.index)
+        if decoded is None:
+            return None
+        value, end = decoded
+        self.index = end
+        return value
+
+    def _value(self) -> object | None:
+        self._space()
+        if self.index >= len(self.source) or self.source[self.index] == "`":
+            return None
+        if self.source[self.index] in ("'", '"'):
+            return self._string()
+        if self.source[self.index] == "{":
+            return self._object()
+        if self.source[self.index] == "[":
+            return self._array()
+        number = _JS_NUMBER.match(self.source, self.index)
+        if number:
+            self.index = number.end()
+            text = number.group(0)
+            return float(text) if any(c in text for c in ".eE") else int(text)
+        identifier = _JS_IDENTIFIER.match(self.source, self.index)
+        if identifier:
+            self.index = identifier.end()
+            token = identifier.group(0)
+            if token == "true":
+                return True
+            if token == "false":
+                return False
+            if token == "null":
+                return None
+            return None
+        return None
+
+    def _object(self) -> dict | None:
+        self.index += 1
+        result: dict = {}
+        self._space()
+        if self.index < len(self.source) and self.source[self.index] == "}":
+            self.index += 1
+            return result
+        while self.index < len(self.source):
+            self._space()
+            if self.source[self.index] in ("'", '"'):
+                key = self._string()
+            else:
+                key_match = _JS_IDENTIFIER.match(self.source, self.index)
+                if not key_match:
+                    return None
+                key = key_match.group(0)
+                self.index = key_match.end()
+            self._space()
+            if self.index >= len(self.source) or self.source[self.index] != ":":
+                return None
+            self.index += 1
+            value = self._value()
+            if value is None and not self._is_null_literal():
+                return None
+            result[key] = value
+            self._space()
+            if self.index >= len(self.source):
+                return None
+            if self.source[self.index] == "}":
+                self.index += 1
+                return result
+            if self.source[self.index] != ",":
+                return None
+            self.index += 1
+            self._space()
+            if self.index < len(self.source) and self.source[self.index] == "}":
+                self.index += 1
+                return result
+        return None
+
+    def _array(self) -> list | None:
+        self.index += 1
+        result: list = []
+        self._space()
+        if self.index < len(self.source) and self.source[self.index] == "]":
+            self.index += 1
+            return result
+        while self.index < len(self.source):
+            value = self._value()
+            if value is None and not self._is_null_literal():
+                return None
+            result.append(value)
+            self._space()
+            if self.index >= len(self.source):
+                return None
+            if self.source[self.index] == "]":
+                self.index += 1
+                return result
+            if self.source[self.index] != ",":
+                return None
+            self.index += 1
+            self._space()
+            if self.index < len(self.source) and self.source[self.index] == "]":
+                self.index += 1
+                return result
+        return None
+
+    def _is_null_literal(self) -> bool:
+        start = self.index - 4
+        return (
+            self.source[start:self.index] == "null"
+            and (
+                start <= 0
+                or not (
+                    self.source[start - 1].isalnum()
+                    or self.source[start - 1] in "_$"
+                )
+            )
+            and (
+                self.index >= len(self.source)
+                or not (
+                    self.source[self.index].isalnum()
+                    or self.source[self.index] in "_$"
+                )
+            )
+        )
+
+    def parse(self) -> object | None:
+        value = self._value()
+        self._space()
+        if self.index != len(self.source) or not isinstance(value, (dict, str)):
+            return None
+        return value
+
+
+def _codex_js_arguments(source: str) -> dict | str | None:
+    return _CodexJsArgumentParser(source).parse()
+
+
+def _codex_harness_tool(name: object, raw_input: object) -> dict | None:
+    """Unwrap the new Codex runtime's ``const r = await tools.*(...)`` input."""
+    if name != "exec" or not isinstance(raw_input, str):
+        return None
+    calls = _codex_harness_calls(raw_input)
+    if not calls or any(_codex_js_arguments(arguments) is None for _, arguments in calls):
+        return None
+    function_name, argument_source = calls[0]
+    arguments = _codex_js_arguments(argument_source)
+    if arguments is None:
+        return None
+    classified_input = _codex_tool_input(function_name, arguments)
+    if function_name == "exec_command" and isinstance(arguments, dict):
+        command = arguments.get("cmd", arguments.get("command"))
+        if isinstance(command, str):
+            classified_input = _clip(command, MAX_TOOL_IO)
+    if len(calls) == 1:
+        display_input = classified_input
+    else:
+        display_input = _clip(f"```js\n{raw_input.strip()}\n```", MAX_TOOL_IO)
+    return {
+        "name": function_name,
+        "input": display_input,
+        "classify_input": classified_input,
+        "arguments": arguments,
+        "calls": len(calls),
+    }
+
+
+def _codex_output_status(value: dict) -> bool | None:
+    for key in ("is_error", "isError", "failed"):
+        if isinstance(value.get(key), bool):
+            return not value[key]
+    if "exit_code" in value:
+        exit_code = value.get("exit_code")
+        if isinstance(exit_code, (int, float)):
+            return exit_code == 0
+    return None
+
+
+def _codex_tool_output(value: object) -> tuple[str, bool | None]:
+    """Extract command text from Codex output envelopes and infer success."""
+    if value is None:
+        return "", None
+    if isinstance(value, str):
+        stripped = value.strip()
+        for parser in (json.loads, ast.literal_eval):
+            if not stripped.startswith(("{", "[")):
+                break
+            try:
+                parsed = parser(stripped)
+            except (ValueError, SyntaxError):
+                continue
+            if isinstance(parsed, (dict, list)):
+                extracted, status = _codex_tool_output(parsed)
+                if status is not None or extracted != stripped:
+                    return extracted, status
+        if re.search(r"\bexited with code 0\b", value):
+            return value, True
+        match = re.search(r"\b(?:exit(?:ed)?|exit_code)\D+(\d+)\b", value)
+        return value, int(match.group(1)) == 0 if match else None
+    if isinstance(value, list):
+        text_parts = [
+            item.get("text")
+            for item in value
+            if isinstance(item, dict) and isinstance(item.get("text"), str)
+        ]
+        if not text_parts and value and all(isinstance(item, dict) for item in value):
+            nested_outputs: list[str] = []
+            nested_statuses: list[bool] = []
+            for item in value:
+                extracted, nested_status = _codex_tool_output(item)
+                nested_outputs.append(extracted)
+                if nested_status is not None:
+                    nested_statuses.append(nested_status)
+            if nested_outputs:
+                return "\n".join(output for output in nested_outputs if output), (
+                    all(nested_statuses) if nested_statuses else None
+                )
+        for text in text_parts:
+            extracted, status = _codex_tool_output(text)
+            if status is not None and extracted != text:
+                return extracted, status
+        return "\n".join(text_parts), None
+    if isinstance(value, dict):
+        status = _codex_output_status(value)
+        if "output" in value:
+            output = value.get("output")
+            if isinstance(output, str):
+                return output, status
+            extracted, nested_status = _codex_tool_output(output)
+            return extracted, status if status is not None else nested_status
+        content = value.get("content")
+        if content is not None:
+            extracted, nested_status = _codex_tool_output(content)
+            return extracted, status if status is not None else nested_status
+        error = value.get("error")
+        if error is not None:
+            return str(error), False if status is None else status
+        return json.dumps(value), status
+    return str(value), None
+
+
 def _structured_edit_payload(name: object, raw_input: object) -> dict | None:
     """Keep bounded edit data needed by the transcript diff renderer."""
     tool_name = str(name or "").strip().lower()
@@ -594,6 +967,108 @@ def _structured_edit_payload(name: object, raw_input: object) -> dict | None:
         if isinstance(patch, str):
             bounded_value("patch", patch)
     return payload or None
+
+
+def _codex_add_tool_event(
+    state: dict,
+    name: object,
+    raw_input: object,
+    ts: str | None,
+    call_id: object,
+) -> tuple[dict | None, bool]:
+    """Add one Codex call and return (event, handled-as-artifact)."""
+    pending: dict = state["pending"]
+    harness = _codex_harness_tool(name, raw_input)
+    if harness:
+        name = harness["name"]
+        tool_input = harness["input"]
+        classify_input = harness["classify_input"]
+        structured_input = harness["arguments"]
+    else:
+        tool_input = _codex_tool_input(str(name or ""), raw_input)
+        classify_input = tool_input
+        structured_input = raw_input
+    name = str(name or "")
+    if _is_artifact_tool(name) and call_id:
+        state.setdefault("pending_artifacts", {})[call_id] = {
+            "name": name,
+            "input": (
+                harness.get("arguments")
+                if harness and isinstance(harness.get("arguments"), dict)
+                else _tool_arguments(raw_input)
+            ) or {},
+        }
+        return None, True
+    archetype, summary = classify_tool(name, classify_input)
+    event = {
+        "kind": "tool",
+        "ts": ts,
+        "text": "",
+        "tool": {
+            "name": name,
+            "input": tool_input,
+            "output": None,
+            "ok": None,
+            "archetype": archetype,
+            "summary": summary,
+        },
+    }
+    edit_payload = _structured_edit_payload(name, structured_input)
+    if edit_payload is not None:
+        event["tool"]["edit"] = edit_payload
+    _append_event(state, event)
+    if call_id:
+        pending[call_id] = event
+    return event, False
+
+
+def _codex_finish_tool_event(
+    state: dict,
+    event: dict | None,
+    call_id: object,
+    output: object,
+    ts: str | None,
+) -> None:
+    output_text, output_ok = _codex_tool_output(output)
+    if call_id and _complete_artifact(state, call_id, output_text, ts):
+        return
+    target = state["pending"].pop(call_id, None) if call_id else event
+    if target:
+        target["tool"]["output"] = _clip(output_text, MAX_TOOL_IO)
+        target["tool"]["ok"] = output_ok
+        target["tool"]["completed_at"] = ts
+        _record_tool_patch(state, target)
+
+
+def _codex_mcp_output(item: dict) -> object:
+    error = item.get("error")
+    if error is not None:
+        return {"error": error, "isError": True}
+    result = item.get("result")
+    if isinstance(result, dict):
+        output = dict(result)
+    else:
+        output = {"output": result}
+    if not any(key in output for key in ("is_error", "isError", "failed", "exit_code")):
+        output["isError"] = item.get("status") not in (None, "completed")
+    return output
+
+
+def _codex_apply_mcp_tool_item(state: dict, item: dict, ts: str | None) -> bool:
+    if item.get("type") != "mcpToolCall":
+        return False
+    server = item.get("server")
+    tool = item.get("tool")
+    if not isinstance(server, str) or not isinstance(tool, str):
+        return False
+    name = f"mcp__{server}__{tool}"
+    raw_input = item.get("arguments", item.get("input", {}))
+    call_id = item.get("call_id", item.get("id"))
+    event, handled = _codex_add_tool_event(state, name, raw_input, ts, call_id)
+    if not handled and event is None:
+        return False
+    _codex_finish_tool_event(state, event, call_id, _codex_mcp_output(item), ts)
+    return True
 
 
 def _is_artifact_tool(name: object) -> bool:
@@ -1031,52 +1506,27 @@ def _codex_apply(state: dict, row: dict) -> None:
                 },
             )
             _record_row_disposition(state, EVENT_DISPOSITION_RENDERED)
+        elif ptype == "mcpToolCall":
+            if _codex_apply_mcp_tool_item(state, payload, ts):
+                _record_row_disposition(state, EVENT_DISPOSITION_RENDERED)
+            else:
+                _record_row_disposition(state, EVENT_DISPOSITION_UNKNOWN)
         elif ptype in ("function_call", "custom_tool_call", "web_search_call", "tool_search_call"):
             name = payload.get("name") or ptype.replace("_call", "")
             raw_input = payload.get("arguments", payload.get("input", payload.get("action", "")))
             call_id = payload.get("call_id")
-            if _is_artifact_tool(name) and call_id:
-                state.setdefault("pending_artifacts", {})[call_id] = {
-                    "name": name,
-                    "input": _tool_arguments(raw_input) or {},
-                }
-                _record_row_disposition(state, EVENT_DISPOSITION_RENDERED)
-                return
-            tool_input = _codex_tool_input(name, raw_input)
-            archetype, summary = classify_tool(name, tool_input)
-            event = {
-                "kind": "tool",
-                "ts": ts,
-                "text": "",
-                "tool": {
-                    "name": name,
-                    "input": tool_input,
-                    "output": None,
-                    "ok": None,
-                    "archetype": archetype,
-                    "summary": summary,
-                },
-            }
-            edit_payload = _structured_edit_payload(name, raw_input)
-            if edit_payload is not None:
-                event["tool"]["edit"] = edit_payload
-            _append_event(state, event)
-            if call_id:
-                pending[call_id] = event
+            _codex_add_tool_event(state, name, raw_input, ts, call_id)
             _record_row_disposition(state, EVENT_DISPOSITION_RENDERED)
         elif ptype in ("function_call_output", "custom_tool_call_output", "tool_search_output"):
             call_id = payload.get("call_id")
-            output = payload.get("output")
-            if isinstance(output, dict):
-                output = output.get("content") or json.dumps(output)
-            output_text = str(output or "")
+            output_text, output_ok = _codex_tool_output(payload.get("output"))
             if _complete_artifact(state, call_id, output_text, ts):
                 _record_row_disposition(state, EVENT_DISPOSITION_RENDERED)
                 return
             event = pending.pop(call_id, None)
             if event:
                 event["tool"]["output"] = _clip(output_text, MAX_TOOL_IO)
-                event["tool"]["ok"] = "exited with code 0" in output_text or None
+                event["tool"]["ok"] = output_ok
                 event["tool"]["completed_at"] = ts
                 _record_tool_patch(state, event)
             _record_row_disposition(state, EVENT_DISPOSITION_RENDERED)
@@ -1227,6 +1677,10 @@ def _codex_normalized_apply(state: dict, row: dict) -> None:
             )
             _record_row_disposition(state, _normalized_disposition(row))
             return
+        if isinstance(item, dict) and item.get("type") == "mcpToolCall":
+            if _codex_apply_mcp_tool_item(state, item, ts):
+                _record_row_disposition(state, _normalized_disposition(row))
+                return
         if isinstance(item, dict) and item.get("type") == "userMessage":
             text = "\n".join(
                 str(block.get("text"))
