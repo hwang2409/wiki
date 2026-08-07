@@ -91,6 +91,7 @@ In Progress:
 - PHO-15254 retrieve adoption tranche 1 — night shift worker
 - [P1] WIKI-265 Codex transcript fidelity: semantic tools, compact hierarchy, and maximum-detail polished thinking traces — cdx:WIKI-265
 - [P1] WIKI-266 Codex provider-neutral transcript parity: modern app-server events, ordering, replay, and 99% semantic fidelity — blocked by WIKI-265
+- [P1] [PHO-15373](https://linear.app/phoebework/issue/PHO-15373): make Bash a permanent v3 core tool — cdx:PHO-15373
 Backlog:
 
 - [PHO-14974](https://linear.app/phoebework/issue/PHO-14974): implement the planned v3 describe catalog after retrieve and write registry interfaces land

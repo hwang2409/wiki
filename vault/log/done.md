@@ -9,6 +9,7 @@ updated: 2026-08-07
 
 ## 2026-08-07
 
+- **phoebe** — audited 2,500 unique production agent runs and produced 30 PII-free golden eval cases across 22 workflow types
 - WIKI-264 merged (#200) — user-installed fonts served via sidecar @font-face (openat fd walk, variable faces, compound weights); 4 review rounds, TOCTOU closed structurally
 - WIKI-263 merged (#199) — codex exec preamble stripped to metadata (outer-only, Script terminated form, status precedence); numbered-payload highlighting engages on codex reads
 - **PHOEBE** — OpenCode attach shim review-clean after 5 rounds (PR 13587 draft, 543d223b) — stock opencode TUI attaches to v3 agent via python shim, pinned v1.18.14
