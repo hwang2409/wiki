@@ -4,8 +4,13 @@ import { THEMES, type ThemeId } from "./themes";
 import {
   classifyEnumerated,
   fetchInstalledFamilies,
+  fetchInstalledFonts,
+  INSTALLED_FONT_FACE_REGISTERED_EVENT,
+  isEnumeratedFamily,
+  loadInstalledFontsForClassification,
   makeCanvasMonoProbe,
   mergePools,
+  type InstalledFontFamily,
   synthesizedChoice,
   type FontChoice,
 } from "./font-enumeration";
@@ -223,6 +228,18 @@ const WEIGHT_LABELS: Record<number, string> = {
   900: "Black",
 };
 
+export function invalidateFontCachesForFamily(family: string): void {
+  AVAIL_CACHE.delete(family);
+  WEIGHT_CACHE.delete(family);
+}
+
+export function handleInstalledFontFaceRegistered(event: Event): string | undefined {
+  const family = (event as CustomEvent<{ family?: unknown }>).detail?.family;
+  if (typeof family !== "string") return undefined;
+  invalidateFontCachesForFamily(family);
+  return family;
+}
+
 function isFontInstalled(family: string): boolean {
   const cached = AVAIL_CACHE.get(family);
   if (cached !== undefined) return cached;
@@ -254,6 +271,7 @@ const ALWAYS_AVAILABLE_FAMILIES = new Set([
 
 function isAvailable(choice: FontChoice): boolean {
   if (ALWAYS_AVAILABLE_FAMILIES.has(choice.family)) return true;
+  if (isEnumeratedFamily(choice.family)) return true;
   return isFontInstalled(choice.family);
 }
 
@@ -409,7 +427,7 @@ export function applyStoredFonts() {
   // Warm the backend font-enumeration cache so the settings modal is
   // ready when the user opens it. Discard errors — the picker still works
   // with curated-only pools if the endpoint is missing or slow.
-  void fetchInstalledFamilies().catch(() => []);
+  void fetchInstalledFamilies({ isLocallyResolvable: isFontInstalled }).catch(() => []);
 }
 
 function currentLabel(role: FontRole): string {
@@ -455,6 +473,11 @@ function FontPicker({
       return;
     }
     setAvailTick((t) => t + 1);
+  }, [open, fonts]);
+
+  useEffect(() => {
+    if (!open) return;
+    void Promise.all(fonts.map(loadFontFaces));
   }, [open, fonts]);
 
   useEffect(() => {
@@ -573,12 +596,13 @@ function FontPicker({
 // families are appended per-role using the canvas mono-classifier so the
 // mono picker stays focused and the prop pickers absorb the rest.
 function useInstalledFontPools(): Record<FontRoleId, FontChoice[]> {
-  const [installed, setInstalled] = useState<string[]>([]);
+  const [installed, setInstalled] = useState<InstalledFontFamily[]>([]);
   useEffect(() => {
     let cancelled = false;
-    void fetchInstalledFamilies().then((families) => {
+    void fetchInstalledFonts({ isLocallyResolvable: isFontInstalled }).then(async (fonts) => {
+      await loadInstalledFontsForClassification(fonts);
       if (cancelled) return;
-      setInstalled(families);
+      setInstalled(fonts);
     });
     return () => {
       cancelled = true;
@@ -586,7 +610,7 @@ function useInstalledFontPools(): Record<FontRoleId, FontChoice[]> {
   }, []);
   return useMemo(() => {
     const probe = makeCanvasMonoProbe();
-    const { mono, prop } = classifyEnumerated(installed, probe);
+    const { mono, prop } = classifyEnumerated(installed.map((font) => font.family), probe);
     const forProp = (family: string) => synthesizedChoice(family, false);
     const forMono = (family: string) => synthesizedChoice(family, true);
     return {
@@ -601,6 +625,7 @@ function useInstalledFontPools(): Record<FontRoleId, FontChoice[]> {
 function FontRoleRow({ role, fonts }: { role: FontRole; fonts: FontChoice[] }) {
   const [label, setLabel] = useState(() => currentLabel(role));
   const [weights, setWeights] = useState<number[]>([]);
+  const [fontFaceRevision, setFontFaceRevision] = useState(0);
   const inheritRole = role.inheritsWeightFrom ? FONT_ROLES[role.inheritsWeightFrom] : null;
   const inheritedWeight = () => (inheritRole ? storedWeight(inheritRole) ?? 400 : 400);
   const [weight, setWeight] = useState(() => storedWeight(role) ?? inheritedWeight());
@@ -616,6 +641,16 @@ function FontRoleRow({ role, fonts }: { role: FontRole; fonts: FontChoice[] }) {
     () => pickChoice(fonts, label, monoFallback),
     [fonts, label, monoFallback],
   );
+
+  useEffect(() => {
+    const onFaceRegistered = (event: Event) => {
+      const family = handleInstalledFontFaceRegistered(event);
+      if (family !== choice.family) return;
+      setFontFaceRevision((revision) => revision + 1);
+    };
+    window.addEventListener(INSTALLED_FONT_FACE_REGISTERED_EVENT, onFaceRegistered);
+    return () => window.removeEventListener(INSTALLED_FONT_FACE_REGISTERED_EVENT, onFaceRegistered);
+  }, [choice.family]);
 
   useEffect(() => {
     let cancelled = false;
@@ -645,7 +680,7 @@ function FontRoleRow({ role, fonts }: { role: FontRole; fonts: FontChoice[] }) {
     return () => {
       cancelled = true;
     };
-  }, [choice, role]);
+  }, [choice, role, fontFaceRevision]);
 
   const applyWeight = (next: number) => {
     setFontWeight(role, next);

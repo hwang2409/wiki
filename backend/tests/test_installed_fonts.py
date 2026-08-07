@@ -1,8 +1,30 @@
 from __future__ import annotations
 
 import unittest
+import asyncio
+import concurrent.futures
+import tempfile
+import threading
+from pathlib import Path
+from unittest import mock
+
+import httpx
 
 from backend.app import installed_fonts
+from backend.app import main
+
+
+def _get_font_response(font_id: str) -> httpx.Response:
+    async def request() -> httpx.Response:
+        transport = httpx.ASGITransport(app=main.app)
+        async with httpx.AsyncClient(transport=transport, base_url="http://127.0.0.1") as client:
+            return await client.get(f"/api/fonts/file/{font_id}")
+
+    return asyncio.run(request())
+
+
+def _root_components(root: Path) -> tuple[str, ...]:
+    return tuple(part for part in root.resolve().parts if part != "/")
 
 
 class InstalledFontsExtractTests(unittest.TestCase):
@@ -78,6 +100,231 @@ class InstalledFontsExtractTests(unittest.TestCase):
         self.assertEqual(installed_fonts._extract_families(None), [])
         self.assertEqual(installed_fonts._extract_families({"SPFontsDataType": "junk"}), [])
 
+    def test_compound_profiler_styles_find_weight_aliases_inside_style_name(self) -> None:
+        self.assertEqual(installed_fonts._weight("SemiCondensed Black Italic"), 900)
+        self.assertEqual(installed_fonts._weight("Compressed Ultralight G1"), 200)
+
+    def test_extracts_file_metadata_and_skips_ttc_collections(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            font_path = root / "SourceCodePro[wght].ttf"
+            font_path.write_bytes(b"variable font")
+            collection_path = root / "Collection.ttc"
+            collection_path.write_bytes(b"collection")
+            payload = {
+                "SPFontsDataType": [
+                    {
+                        "_name": "Source Code Pro",
+                        "enabled": "yes",
+                        "typefaces": [
+                            {
+                                "family": "JetBrains Mono",
+                                "style": "Regular",
+                                "location": str(font_path),
+                                "enabled": "yes",
+                            },
+                            {
+                                "family": "JetBrains Mono",
+                                "style": "ExtraLight",
+                                "location": str(font_path),
+                                "enabled": "yes",
+                            },
+                            {
+                                "family": "JetBrains Mono",
+                                "style": "Black Italic",
+                                "location": str(font_path),
+                                "enabled": "yes",
+                            }
+                        ],
+                    },
+                    {
+                        "_name": collection_path.name,
+                        "enabled": "yes",
+                        "typefaces": [
+                            {
+                                "family": "Collection Font",
+                                "style": "Regular",
+                                "location": str(collection_path),
+                                "enabled": "yes",
+                            }
+                        ],
+                    },
+                ]
+            }
+            with mock.patch.object(installed_fonts, "_FONT_ROOTS", (root,)):
+                fonts = installed_fonts._extract_fonts(payload)
+            self.assertEqual(fonts[0]["family"], "Collection Font")
+            self.assertEqual(fonts[0]["files"], [])
+            jetbrains = next(entry for entry in fonts if entry["family"] == "JetBrains Mono")
+            self.assertEqual(
+                {(font["weight"], font["style"]) for font in jetbrains["files"]},
+                {(200, "ExtraLight"), (400, "Regular"), (900, "Black Italic")},
+            )
+            self.assertEqual(len({font["id"] for font in jetbrains["files"]}), 1)
+            self.assertNotIn("path", jetbrains["files"][0])
+
+
+class InstalledFontFileApiTests(unittest.TestCase):
+    def setUp(self) -> None:
+        installed_fonts.reset_cache_for_tests()
+
+    def tearDown(self) -> None:
+        installed_fonts.reset_cache_for_tests()
+
+    def test_id_mapping_serves_font_and_rejects_unknown_ids(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            font_path = root / "font.ttf"
+            font_path.write_bytes(b"font bytes")
+            font_id = "font-id"
+            location = installed_fonts.FontLocation(0, ("font.ttf",), ".ttf")
+            with mock.patch.object(installed_fonts, "_FONT_ROOTS", (root,)), mock.patch.object(
+                installed_fonts, "_FONT_ROOT_COMPONENTS", (_root_components(root),)
+            ):
+                installed_fonts._CACHE = [{"family": "Test Font", "files": [{"id": font_id}]}]
+                installed_fonts._FILE_MAP = {font_id: location}
+                response = _get_font_response(font_id)
+                self.assertEqual(response.status_code, 200)
+                self.assertEqual(response.content, b"font bytes")
+                self.assertEqual(response.headers["content-type"], "font/ttf")
+                self.assertEqual(response.headers["content-length"], "10")
+                self.assertEqual(_get_font_response("unknown").status_code, 404)
+
+    def test_symlink_escape_is_rejected_after_enumeration(self) -> None:
+        with tempfile.TemporaryDirectory() as temp, tempfile.TemporaryDirectory() as outside:
+            root = Path(temp)
+            outside_path = Path(outside) / "outside.ttf"
+            outside_path.write_bytes(b"outside")
+            link = root / "link.ttf"
+            link.symlink_to(outside_path)
+            location = installed_fonts.FontLocation(0, ("link.ttf",), ".ttf")
+            with mock.patch.object(installed_fonts, "_FONT_ROOTS", (root,)), mock.patch.object(
+                installed_fonts, "_FONT_ROOT_COMPONENTS", (_root_components(root),)
+            ):
+                installed_fonts._CACHE = [{"family": "Escaped", "files": [{"id": "escape"}]}]
+                installed_fonts._FILE_MAP = {"escape": location}
+                response = _get_font_response("escape")
+                self.assertEqual(response.status_code, 404)
+
+    def test_request_rejects_symlink_swap_between_enumeration_and_open(self) -> None:
+        with tempfile.TemporaryDirectory() as temp, tempfile.TemporaryDirectory() as outside:
+            root = Path(temp)
+            font_path = root / "font.ttf"
+            font_path.write_bytes(b"inside")
+            outside_path = Path(outside) / "outside.ttf"
+            outside_path.write_bytes(b"outside")
+            font_id = "race"
+            enumerated_location = installed_fonts.FontLocation(0, ("font.ttf",), ".ttf")
+            with mock.patch.object(installed_fonts, "_FONT_ROOTS", (root,)), mock.patch.object(
+                installed_fonts, "_FONT_ROOT_COMPONENTS", (_root_components(root),)
+            ):
+                original_enumerate = installed_fonts._enumerate
+                installed_fonts._enumerate = lambda: (
+                    [{"family": "Race Font", "files": [{"id": font_id}]}],
+                    {font_id: enumerated_location},
+                )  # type: ignore[assignment]
+                try:
+                    installed_fonts.installed_fonts()
+                finally:
+                    installed_fonts._enumerate = original_enumerate  # type: ignore[assignment]
+                original_open = installed_fonts._open_font_fd
+
+                def swap_before_open(location: installed_fonts.FontLocation, flags: int) -> int | None:
+                    if location == enumerated_location:
+                        font_path.unlink()
+                        font_path.symlink_to(outside_path)
+                    return original_open(location, flags)
+
+                with mock.patch.object(installed_fonts, "_open_font_fd", side_effect=swap_before_open):
+                    response = _get_font_response(font_id)
+                self.assertEqual(response.status_code, 404)
+
+    def test_request_rejects_parent_directory_swap_during_openat_walk(self) -> None:
+        with tempfile.TemporaryDirectory() as temp, tempfile.TemporaryDirectory() as outside:
+            root = Path(temp)
+            nested = root / "nested"
+            nested.mkdir()
+            font_path = nested / "font.ttf"
+            font_path.write_bytes(b"inside")
+            outside_dir = Path(outside) / "nested"
+            outside_dir.mkdir()
+            font_id = "parent-race"
+            location = installed_fonts.FontLocation(0, ("nested", "font.ttf"), ".ttf")
+            with mock.patch.object(installed_fonts, "_FONT_ROOTS", (root,)), mock.patch.object(
+                installed_fonts, "_FONT_ROOT_COMPONENTS", (_root_components(root),)
+            ):
+                installed_fonts._CACHE = [{"family": "Race Font", "files": [{"id": font_id}]}]
+                installed_fonts._FILE_MAP = {font_id: location}
+                original_open_at = installed_fonts._open_at
+                swapped = False
+
+                def swap_parent(path: str | Path, flags: int, *, dir_fd: int | None = None) -> int:
+                    nonlocal swapped
+                    result = original_open_at(path, flags, dir_fd=dir_fd)
+                    if dir_fd is None and not swapped:
+                        nested.rename(root / "nested-real")
+                        nested.symlink_to(outside_dir, target_is_directory=True)
+                        swapped = True
+                    return result
+
+                with mock.patch.object(installed_fonts, "_open_at", side_effect=swap_parent):
+                    response = _get_font_response(font_id)
+                self.assertTrue(swapped)
+                self.assertEqual(response.status_code, 404)
+
+    def test_request_rejects_root_component_swap_before_walk(self) -> None:
+        with tempfile.TemporaryDirectory() as temp, tempfile.TemporaryDirectory() as outside:
+            base = Path(temp)
+            root_library = base / "Library"
+            root = root_library / "Fonts"
+            root.mkdir(parents=True)
+            font_path = root / "font.ttf"
+            font_path.write_bytes(b"inside")
+            outside_library = Path(outside) / "Library"
+            outside_fonts = outside_library / "Fonts"
+            outside_fonts.mkdir(parents=True)
+            (outside_fonts / "font.ttf").write_bytes(b"outside")
+            font_id = "root-race"
+            location = installed_fonts.FontLocation(0, ("font.ttf",), ".ttf")
+            with mock.patch.object(installed_fonts, "_FONT_ROOTS", (root,)), mock.patch.object(
+                installed_fonts, "_FONT_ROOT_COMPONENTS", (_root_components(root),)
+            ):
+                installed_fonts._CACHE = [{"family": "Race Font", "files": [{"id": font_id}]}]
+                installed_fonts._FILE_MAP = {font_id: location}
+                original_open_at = installed_fonts._open_at
+                swapped = False
+
+                def swap_root_component(
+                    path: str | Path, flags: int, *, dir_fd: int | None = None
+                ) -> int:
+                    nonlocal swapped
+                    if str(path) == "Library" and not swapped:
+                        root_library.rename(base / "Library-real")
+                        root_library.symlink_to(outside_library, target_is_directory=True)
+                        swapped = True
+                    return original_open_at(path, flags, dir_fd=dir_fd)
+
+                with mock.patch.object(installed_fonts, "_open_at", side_effect=swap_root_component):
+                    response = _get_font_response(font_id)
+            self.assertTrue(swapped)
+            self.assertEqual(response.status_code, 404)
+
+    def test_oversized_opened_font_is_rejected(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            font_path = root / "large.ttf"
+            font_path.write_bytes(b"large")
+            font_id = "large"
+            with mock.patch.object(installed_fonts, "_FONT_ROOTS", (root,)), mock.patch.object(
+                installed_fonts, "_FONT_ROOT_COMPONENTS", (_root_components(root),)
+            ), mock.patch.object(installed_fonts, "MAX_FONT_FILE_BYTES", 4):
+                installed_fonts._CACHE = [{"family": "Large Font", "files": [{"id": font_id}]}]
+                installed_fonts._FILE_MAP = {
+                    font_id: installed_fonts.FontLocation(0, ("large.ttf",), ".ttf")
+                }
+                response = _get_font_response(font_id)
+            self.assertEqual(response.status_code, 413)
+
 
 class InstalledFontsCacheTests(unittest.TestCase):
     def setUp(self) -> None:
@@ -101,6 +348,55 @@ class InstalledFontsCacheTests(unittest.TestCase):
             self.assertEqual(calls["n"], 1)
         finally:
             installed_fonts._enumerate = original  # type: ignore[assignment]
+
+    def test_concurrent_first_requests_initialize_one_complete_file_map(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            font_path = root / "font.ttf"
+            font_path.write_bytes(b"font")
+            calls = {"n": 0}
+            entered = threading.Event()
+            release = threading.Event()
+            payload = {
+                "SPFontsDataType": [
+                    {
+                        "_name": "Concurrent",
+                        "enabled": "yes",
+                        "typefaces": [
+                            {
+                                "family": "Concurrent Font",
+                                "location": str(font_path),
+                                "style": "Regular",
+                                "enabled": "yes",
+                            }
+                        ],
+                    }
+                ]
+            }
+
+            def fake_enumerate() -> tuple[list[installed_fonts.FontFamily], dict[str, installed_fonts.FontLocation]]:
+                calls["n"] += 1
+                entered.set()
+                release.wait(timeout=2)
+                return installed_fonts._extract_fonts_with_paths(payload)
+
+            original = installed_fonts._enumerate
+            installed_fonts._enumerate = fake_enumerate  # type: ignore[assignment]
+            try:
+                with mock.patch.object(installed_fonts, "_FONT_ROOTS", (root,)), mock.patch.object(
+                    installed_fonts, "_FONT_ROOT_COMPONENTS", (_root_components(root),)
+                ):
+                    with concurrent.futures.ThreadPoolExecutor(max_workers=2) as pool:
+                        first = pool.submit(installed_fonts.installed_fonts)
+                        self.assertTrue(entered.wait(timeout=2))
+                        second = pool.submit(installed_fonts.installed_fonts)
+                        release.set()
+                        first.result(timeout=2)
+                        second.result(timeout=2)
+                self.assertEqual(calls["n"], 1)
+                self.assertEqual(set(installed_fonts._FILE_MAP), {installed_fonts._font_id(font_path.resolve())})
+            finally:
+                installed_fonts._enumerate = original  # type: ignore[assignment]
 
 
 if __name__ == "__main__":
