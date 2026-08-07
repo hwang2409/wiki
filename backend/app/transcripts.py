@@ -1993,7 +1993,15 @@ def _codex_add_batch_outer_event(
 
 
 def _codex_remove_event(state: dict, event: dict) -> None:
-    _codex_track_turn_event(state, event, open=False)
+    # Wrapper removal suppresses rendering only. The native item with the
+    # shared id still owns the lifecycle and must be allowed to complete.
+    for record in _codex_lifecycle_registry(state).values():
+        events = _codex_lifecycle_events(record)
+        if any(candidate is event for candidate in events):
+            events[:] = [candidate for candidate in events if candidate is not event]
+            if record.get("event") is event:
+                record["event"] = events[0] if events else None
+            break
     try:
         index = state["events"].index(event)
     except ValueError:
@@ -2346,6 +2354,29 @@ def _codex_lifecycle_registry(state: dict) -> dict:
     return state.setdefault("codex_item_lifecycle", {})
 
 
+def _codex_lifecycle_events(record: dict) -> list[dict]:
+    """Return every rendered event registered for one item."""
+    events = record.get("events")
+    if not isinstance(events, list):
+        events = []
+        record["events"] = events
+    legacy_event = record.get("event")
+    if legacy_event is not None and not any(
+        candidate is legacy_event for candidate in events
+    ):
+        events.insert(0, legacy_event)
+    return events
+
+
+def _codex_drop_unrendered_lifecycle(state: dict, item_id: object) -> None:
+    key = _codex_item_key(item_id)
+    if key is None:
+        return
+    record = _codex_lifecycle_registry(state).get(key)
+    if record is not None and not _codex_lifecycle_events(record):
+        _codex_lifecycle_registry(state).pop(key, None)
+
+
 def _codex_rekey_lifecycle_record(
     registry: dict, old_key: str, new_key: str
 ) -> dict:
@@ -2388,13 +2419,17 @@ def _codex_lifecycle_transition(
         record = _codex_rekey_lifecycle_record(registry, previous_key, key)
     if record is None and event is not None:
         for old_key, old_record in list(registry.items()):
-            if old_record.get("event") is event:
+            if any(
+                candidate is event
+                for candidate in _codex_lifecycle_events(old_record)
+            ):
                 record = _codex_rekey_lifecycle_record(registry, old_key, key)
                 break
     if record is None:
         record = {
             "state": lifecycle or "open",
             "event": event,
+            "events": [event] if event is not None else [],
             "kind": kind,
             "turn": turn if turn is not None else state.get("codex_current_turn"),
             "authoritative": bool(authoritative or lifecycle == "terminal"),
@@ -2406,8 +2441,12 @@ def _codex_lifecycle_transition(
         record["authoritative"] = True
     if kind is not None and record.get("kind") is None:
         record["kind"] = kind
-    if event is not None and record.get("event") is None:
-        record["event"] = event
+    if event is not None:
+        events = _codex_lifecycle_events(record)
+        if not any(candidate is event for candidate in events):
+            events.append(event)
+        if record.get("event") is None:
+            record["event"] = event
 
     current = record.get("state")
     if lifecycle is None or lifecycle == current:
@@ -2435,7 +2474,7 @@ def _codex_lifecycle_record(state: dict, item_id: object) -> dict | None:
 
 def _codex_lifecycle_event_id(state: dict, event: dict) -> str | None:
     for item_id, record in _codex_lifecycle_registry(state).items():
-        if record.get("event") is event:
+        if any(candidate is event for candidate in _codex_lifecycle_events(record)):
             return item_id
     return None
 
@@ -2490,7 +2529,12 @@ class _CodexLifecycleView:
         registry = _codex_lifecycle_registry(self._state)
         if self._view == "terminal":
             return [
-                (key, record.get("event"))
+                (
+                    key,
+                    _codex_lifecycle_events(record)[0]
+                    if _codex_lifecycle_events(record)
+                    else None,
+                )
                 for key, record in registry.items()
                 if record.get("state") == "terminal"
             ]
@@ -2501,9 +2545,11 @@ class _CodexLifecycleView:
                 if record.get("authoritative")
             ]
         return [
-            (id(record.get("event")), record.get("event"))
+            (id(event), event)
             for record in registry.values()
-            if record.get("state") == "open" and record.get("event") is not None
+            if record.get("state") == "open"
+            for event in _codex_lifecycle_events(record)
+            if event is not None
         ]
 
     def __len__(self) -> int:
@@ -2561,10 +2607,31 @@ def _codex_mark_authoritative_item(state: dict, item_id: object) -> None:
     _codex_lifecycle_transition(state, item_id, authoritative=True)
 
 
-def _codex_bound_lifecycle_map(mapping: dict) -> None:
+def _codex_bound_lifecycle_registry(state: dict) -> None:
+    registry = _codex_lifecycle_registry(state)
+    pending = set(state.get("pending_modern_deltas", {})) | set(
+        state.get("pending_artifacts", {})
+    )
+    while len(registry) > CODEX_EVENT_WINDOW:
+        victim = next(
+            (
+                item_id
+                for item_id, record in registry.items()
+                if item_id not in pending and not _codex_lifecycle_events(record)
+            ),
+            None,
+        )
+        if victim is None:
+            break
+        registry.pop(victim, None)
+
+
+def _codex_bound_lifecycle_map(state: dict, mapping: dict) -> None:
     if len(mapping) > CODEX_EVENT_WINDOW:
         for key in list(mapping)[:-CODEX_EVENT_WINDOW]:
             mapping.pop(key, None)
+            _codex_drop_unrendered_lifecycle(state, key)
+    _codex_bound_lifecycle_registry(state)
 
 
 def _codex_register_pending_artifact(
@@ -2581,7 +2648,7 @@ def _codex_register_pending_artifact(
         "open",
         kind="artifact",
     )
-    _codex_bound_lifecycle_map(pending)
+    _codex_bound_lifecycle_map(state, pending)
 
 
 def _codex_mark_terminal_item(
@@ -3043,42 +3110,35 @@ def _codex_mcp_tool_result_text(item: dict) -> str:
 
 def _codex_render_artifact_status_event(
     state: dict, item: dict, ts: str | None
-) -> dict:
-    """Render a distinct failed or unparseable artifact completion.
-
-    Providers can reuse an item id for separate failed completion records.
-    These records are not terminal replays because their result differs.
-    """
-    completed = (
-        item.get("status") == "completed"
-        and item.get("error") is None
-        and not (
+) -> dict | None:
+    """Complete every native artifact outcome through the shared registry."""
+    item_id = _codex_modern_item_id(item)
+    if item_id is None:
+        return None
+    item_failed = (
+        item.get("error") is not None
+        or item.get("status")
+        in {"failed", "declined", "cancelled", "canceled", "interrupted"}
+        or (
             isinstance(item.get("result"), dict)
             and item["result"].get("isError") is True
         )
     )
-    event = _codex_append_streaming_event(
+    meta = {
+        "name": "render_artifact",
+        "input": _tool_arguments(item.get("arguments")) or {},
+    }
+    _codex_register_pending_artifact(state, item_id, meta)
+    _complete_artifact(
         state,
-        _artifact_tool_status(
-            {
-                "name": "render_artifact",
-                "input": _tool_arguments(item.get("arguments")) or {},
-            },
-            _codex_mcp_tool_result_text(item),
-            ts,
-            ok=completed,
-            summary=(
-                "render_artifact completed without a parseable artifact"
-                if completed
-                else "render_artifact rejected"
-            ),
-        ),
-        open=False,
-        item_id=_codex_modern_item_id(item),
-        kind="artifact",
+        item_id,
+        _codex_mcp_tool_result_text(item),
+        ts,
+        failed=item_failed,
     )
-    _codex_mark_terminal_item(state, _codex_modern_item_id(item), event)
-    return event
+    record = _codex_lifecycle_record(state, item_id)
+    events = _codex_lifecycle_events(record) if record is not None else []
+    return events[-1] if events else None
 
 
 def _is_codex_render_artifact_call(item: object) -> bool:
@@ -3378,14 +3438,14 @@ def _codex_apply_delta(
     ):
         return True, current
     if current is None:
-            if not buffer_missing or not item_key:
-                return False, current
-            _codex_lifecycle_transition(state, item_key, "open")
-            pending = state.setdefault("pending_modern_deltas", {}).setdefault(item_key, [])
-            if len(pending) < MAX_CODEX_DELTA_CACHE:
-                pending.append({"identity": identity, "text": delta})
-            _codex_bound_lifecycle_map(state["pending_modern_deltas"])
-            return True, None
+        if not buffer_missing or not item_key:
+            return False, current
+        _codex_lifecycle_transition(state, item_key, "open")
+        pending = state.setdefault("pending_modern_deltas", {}).setdefault(item_key, [])
+        if len(pending) < MAX_CODEX_DELTA_CACHE:
+            pending.append({"identity": identity, "text": delta})
+        _codex_bound_lifecycle_map(state, state["pending_modern_deltas"])
+        return True, None
     seen = state.setdefault("codex_delta_cache", set())
     signature = (item_key, identity)
     if identity is not None and signature in seen:
@@ -3475,19 +3535,13 @@ def _codex_upsert_reasoning(
             event["text"] = bounded
             _mark_tail_changed(state, state["events"].index(event))
     if identity and terminal:
-        event = next(
-            (
-                record.get("event")
-                for key, record in _codex_lifecycle_registry(state).items()
-                if key == identity
-            ),
-            None,
-        )
+        record = _codex_lifecycle_record(state, identity)
+        events = _codex_lifecycle_events(record) if record is not None else []
         _codex_lifecycle_transition(
             state,
             identity,
             "terminal",
-            event=event,
+            event=events[-1] if events else None,
             kind="reasoning",
         )
 
@@ -3967,9 +4021,9 @@ def _codex_close_turn(state: dict, turn: dict, ts: str | None) -> dict | None:
         and record.get("turn") == current_turn
     ]
     for item_id, record in open_records:
-        event = record.get("event")
         kind = record.get("kind")
-        if kind == "artifact" and event is None:
+        events = _codex_lifecycle_events(record)
+        if kind == "artifact" and not events:
             meta = state.get("pending_artifacts", {}).pop(item_id, None)
             if meta is not None:
                 event = _append_event(
@@ -3981,7 +4035,8 @@ def _codex_close_turn(state: dict, turn: dict, ts: str | None) -> dict | None:
                 _codex_lifecycle_transition(
                     state, item_id, None, event=event, kind="artifact"
                 )
-        if isinstance(event, dict):
+        events = _codex_lifecycle_events(record)
+        for event in events:
             if event.get("kind") == "tool":
                 tool = event.get("tool") or {}
                 tool["ok"] = not (failed or terminal_status != "completed")
@@ -4001,7 +4056,7 @@ def _codex_close_turn(state: dict, turn: dict, ts: str | None) -> dict | None:
             state,
             item_id,
             "terminal" if terminal_status == "completed" else "partial",
-            event=event,
+            event=events[-1] if events else None,
             kind=kind,
             turn=current_turn,
         )
@@ -4127,8 +4182,12 @@ def _codex_normalized_apply(state: dict, row: dict) -> None:
                 method != "item/started"
                 and _codex_is_terminal_item(state, item_id)
                 and _is_codex_render_artifact_call(item)
-                and artifact_from_codex_mcp_tool_result(item) is None
             ):
+                # A completed artifact item or its raw twin is a replay.
+                # Suppress it after the registry has recorded any outcome.
+                _record_row_disposition(state, _normalized_disposition(row))
+                return
+            if method != "item/started" and _is_codex_render_artifact_call(item):
                 _codex_render_artifact_status_event(state, item, ts)
                 _record_row_disposition(state, _normalized_disposition(row))
                 return
@@ -4211,45 +4270,9 @@ def _codex_normalized_apply(state: dict, row: dict) -> None:
         # These two message forms are retained as a defensive fallback and the
         # native parser's pair-credit dedupe removes the app-server twin.
         item = params.get("item")
-        artifact = artifact_from_codex_mcp_tool_result(item)
-        if artifact is not None:
-            item_id = _codex_modern_item_id(item)
-            if item_id:
-                state.get("pending_artifacts", {}).pop(item_id, None)
-            event = _append_artifact_event(state, artifact, ts)
-            _codex_mark_terminal_item(state, item_id, event)
-            _record_row_disposition(state, _normalized_disposition(row))
-            return
         if _is_codex_render_artifact_call(item):
-            completed = (
-                item.get("status") == "completed"
-                and item.get("error") is None
-                and not (
-                    isinstance(item.get("result"), dict)
-                    and item["result"].get("isError") is True
-                )
-            )
-            event = _codex_append_streaming_event(
-                state,
-                _artifact_tool_status(
-                    {
-                        "name": "render_artifact",
-                        "input": _tool_arguments(item.get("arguments")) or {},
-                    },
-                    _codex_mcp_tool_result_text(item),
-                    ts,
-                    ok=completed,
-                    summary=(
-                        "render_artifact completed without a parseable artifact"
-                        if completed
-                        else "render_artifact rejected"
-                    ),
-                ),
-                open=False,
-                item_id=_codex_modern_item_id(item),
-                kind="artifact",
-            )
-            _codex_mark_terminal_item(state, _codex_modern_item_id(item), event)
+            if not _codex_is_terminal_item(state, _codex_modern_item_id(item)):
+                _codex_render_artifact_status_event(state, item, ts)
             _record_row_disposition(state, _normalized_disposition(row))
             return
         if (
@@ -5461,22 +5484,33 @@ def _codex_prune_lifecycle_maps(state: dict, kept: set[int]) -> None:
     protected.update(
         item_id
         for item_id, record in registry.items()
-        if isinstance(record.get("event"), dict)
-        and id(record["event"]) in kept
-    )
-    while len(registry) > CODEX_EVENT_WINDOW:
-        victim = next(
-            (item_id for item_id in registry if item_id not in protected),
-            None,
+        if any(
+            isinstance(event, dict) and id(event) in kept
+            for event in _codex_lifecycle_events(record)
         )
-        if victim is None:
-            break
-        registry.pop(victim, None)
+    )
+    for item_id, record in list(registry.items()):
+        events = _codex_lifecycle_events(record)
+        visible = [
+            event
+            for event in events
+            if isinstance(event, dict) and id(event) in kept
+        ]
+        if visible:
+            record["events"] = visible
+            record["event"] = visible[0]
+        elif item_id not in protected:
+            registry.pop(item_id, None)
+        else:
+            record["events"] = []
+            record["event"] = None
 
     # Delta buffers have no rendered event yet.  Bound their age by insertion
     # order, but never filter them by the rendered-event window.
     while len(pending_deltas) > MAX_CODEX_DELTA_CACHE:
-        pending_deltas.pop(next(iter(pending_deltas)), None)
+        victim = next(iter(pending_deltas))
+        pending_deltas.pop(victim, None)
+        _codex_drop_unrendered_lifecycle(state, victim)
 
     modern_items: dict = state.setdefault("codex_modern_items", {})
     for item_id, event in list(modern_items.items()):
@@ -5512,7 +5546,17 @@ def _codex_prune_lifecycle_maps(state: dict, kept: set[int]) -> None:
         state.setdefault("pending_results", {}),
     ):
         while len(mapping) > CODEX_EVENT_WINDOW:
-            mapping.pop(next(iter(mapping)), None)
+            victim = next(iter(mapping))
+            mapping.pop(victim, None)
+            if mapping is pending_artifacts:
+                _codex_drop_unrendered_lifecycle(state, victim)
+
+    for item_id, record in list(registry.items()):
+        if not _codex_lifecycle_events(record) and item_id not in (
+            set(pending_deltas) | set(pending_artifacts)
+        ):
+            registry.pop(item_id, None)
+    _codex_bound_lifecycle_registry(state)
 
     # Keep compatibility projections backed by the registry.  No lifecycle
     # state is copied into a second mutable map.

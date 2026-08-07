@@ -525,6 +525,58 @@ class ArtifactTranscriptTests(unittest.TestCase):
             "render_artifact completed without a parseable artifact",
         )
 
+    def test_round8_l2_artifact_failures_and_unparseable_twins_are_terminal_once(self) -> None:
+        for item_id, item_updates in (
+            (
+                "artifact-failed-round8",
+                {"status": "failed", "error": "render rejected", "result": {}},
+            ),
+            (
+                "artifact-unparseable-round8",
+                {
+                    "status": "completed",
+                    "result": {"content": [{"type": "text", "text": "not a sentinel"}]},
+                },
+            ),
+        ):
+            item = {
+                "type": "mcpToolCall",
+                "id": item_id,
+                "server": "wiki_artifacts",
+                "tool": "render_artifact",
+                "arguments": {
+                    "kind": "mermaid",
+                    "payload": {"source": "graph TD; A-->B"},
+                },
+                **item_updates,
+            }
+            rows = [
+                {
+                    "kind": "item_completed",
+                    "disposition": "rendered",
+                    "payload": {"method": "item/completed", "params": {"item": item}},
+                    "normalized_at": "2026-08-07T12:00:01Z",
+                },
+                {
+                    "kind": "rawResponseItem_completed",
+                    "disposition": "rendered",
+                    "payload": {
+                        "method": "rawResponseItem/completed",
+                        "params": {"item": item},
+                    },
+                    "normalized_at": "2026-08-07T12:00:02Z",
+                },
+            ]
+            with self.subTest(item_id=item_id), TemporaryDirectory() as tmp:
+                path = Path(tmp) / "artifact-twins.jsonl"
+                path.write_text("".join(json.dumps(row) + "\n" for row in rows))
+                parsed = transcripts.read_session_events("codex-normalized", path)
+                state = transcripts._cache[str(path)]
+
+            tools = [event["tool"] for event in parsed["events"] if event["kind"] == "tool"]
+            self.assertEqual(len(tools), 1)
+            self.assertEqual(state["codex_item_lifecycle"][item_id]["state"], "terminal")
+
     def test_structured_image_result_reconstructs_artifact_reference(self) -> None:
         artifact_id = "33b1c159-9d1e-4804-9b14-3d880ac2e3c7"
 
@@ -1804,28 +1856,104 @@ class CodexModernTranscriptParityTests(unittest.TestCase):
                 )
             return rows
 
-        matrix = [
-            ("agentMessage", "modern"),
-            ("reasoning", "modern"),
-            ("tool", "modern"),
-            ("artifact", "modern"),
-            ("agentMessage", "legacy"),
-            ("reasoning", "legacy"),
-            ("tool", "legacy"),
-            ("artifact", "legacy"),
-            ("batch child", "legacy"),
-        ]
-        for kind, path_kind in matrix:
-            item_id = f"matrix-{kind.replace(' ', '-')}-{path_kind}"
+        def raw_twin(kind: str, item_id: str) -> dict:
+            if kind == "agentMessage":
+                item = {
+                    "type": "message",
+                    "id": item_id,
+                    "role": "assistant",
+                    "content": [{"type": "output_text", "text": "answer"}],
+                }
+            elif kind == "reasoning":
+                item = {
+                    "type": "reasoning",
+                    "id": item_id,
+                    "summary": [{"text": "thought"}],
+                }
+            elif kind == "tool":
+                item = {
+                    "type": "commandExecution",
+                    "id": item_id,
+                    "command": "printf child",
+                    "status": "completed",
+                    "aggregatedOutput": "child",
+                }
+            else:
+                item = artifact_item(item_id, "completed")
+            return self._row("rawResponseItem/completed", {"item": item}, 3)
+
+        def trim_prefix(path_kind: str) -> list[dict]:
+            rows: list[dict] = []
+            for index in range(transcripts.CODEX_EVENT_WINDOW + 1):
+                filler_id = f"matrix-trim-{path_kind}-{index}"
+                if path_kind == "modern":
+                    rows.append(
+                        self._row(
+                            "item/completed",
+                            {
+                                "item": {
+                                    "type": "agentMessage",
+                                    "id": filler_id,
+                                    "text": filler_id,
+                                }
+                            },
+                            index + 1,
+                        )
+                    )
+                else:
+                    rows.append(
+                        {
+                            "type": "response_item",
+                            "timestamp": "2026-08-07T12:00:01Z",
+                            "payload": {
+                                "type": "message",
+                                "id": filler_id,
+                                "role": "assistant",
+                                "content": [{"type": "output_text", "text": filler_id}],
+                            },
+                        }
+                    )
+            return rows
+
+        def case_rows(
+            kind: str,
+            path_kind: str,
+            item_id: str,
+            include_raw_twin: bool,
+            trim: bool,
+        ) -> list[dict]:
             builder = modern if path_kind == "modern" else legacy
+            rows = builder(kind, item_id)
+            if include_raw_twin:
+                rows.append(raw_twin(kind, item_id))
+            return (trim_prefix(path_kind) if trim else []) + rows
+
+        matrix = [
+            ("agentMessage", "modern", True, True),
+            ("reasoning", "modern", True, True),
+            ("tool", "modern", True, True),
+            ("artifact", "modern", True, True),
+            ("agentMessage", "legacy", False, True),
+            ("reasoning", "legacy", False, True),
+            ("tool", "legacy", False, True),
+            ("artifact", "legacy", False, True),
+            ("batch child", "legacy", False, False),
+        ]
+        for kind, path_kind, include_raw_twin, trim in matrix:
+            item_id = f"matrix-{kind.replace(' ', '-')}-{path_kind}"
             with self.subTest(kind=kind, path=path_kind), TemporaryDirectory() as tmp:
                 path = Path(tmp) / "matrix.jsonl"
-                rows = builder(kind, item_id)
+                rows = case_rows(kind, path_kind, item_id, include_raw_twin, trim)
                 path.write_text("".join(json.dumps(row) + "\n" for row in rows))
                 parsed = transcripts.read_session_events(
                     "codex-normalized" if path_kind == "modern" else "codex", path
                 )
                 state = transcripts._cache[str(path)]
+            expected_ids = (
+                {"batch-tool", "batch-artifact"}
+                if kind == "batch child"
+                else {item_id}
+            )
             target_ids = (
                 [
                     key
@@ -1836,12 +1964,17 @@ class CodexModernTranscriptParityTests(unittest.TestCase):
                 if kind == "batch child"
                 else [item_id]
             )
+            self.assertEqual(set(target_ids), expected_ids)
+            self.assertEqual(len(target_ids), len(expected_ids))
             for target_id in target_ids:
                 self.assertEqual(state["codex_item_lifecycle"][target_id]["state"], "terminal")
             baseline_events = len(parsed["events"])
             with TemporaryDirectory() as tmp:
                 path = Path(tmp) / "matrix-replay.jsonl"
-                replay_rows = builder(kind, item_id) + builder(kind, item_id)
+                replay_case = case_rows(
+                    kind, path_kind, item_id, include_raw_twin, trim
+                )
+                replay_rows = replay_case + replay_case
                 path.write_text("".join(json.dumps(row) + "\n" for row in replay_rows))
                 replayed = transcripts.read_session_events(
                     "codex-normalized" if path_kind == "modern" else "codex", path
@@ -1943,6 +2076,150 @@ class CodexModernTranscriptParityTests(unittest.TestCase):
             "before-start",
         )
         self.assertNotIn("buffered-after-trim", state["pending_modern_deltas"])
+
+    def test_round7_k2_post_eviction_replay_does_not_reuse_trimmed_authority(self) -> None:
+        target = self._row(
+            "item/completed",
+            {"item": {"type": "agentMessage", "id": "evicted-authority", "text": "final"}},
+            1,
+        )
+        rows = [target]
+        for index in range(transcripts.CODEX_EVENT_WINDOW - 1):
+            filler_id = f"authority-filler-{index}"
+            rows.append(
+                self._row(
+                    "item/completed",
+                    {"item": {"type": "agentMessage", "id": filler_id, "text": filler_id}},
+                    index + 2,
+                )
+            )
+        with TemporaryDirectory() as tmp:
+            path = Path(tmp) / "authority-eviction.jsonl"
+            path.write_text("".join(json.dumps(row) + "\n" for row in rows))
+            transcripts.read_session_events("codex-normalized", path)
+
+            path.write_text(
+                path.read_text()
+                + json.dumps(
+                    self._row(
+                        "item/agentMessage/delta",
+                        {"itemId": "evicted-authority", "delta": " replay"},
+                        3000,
+                    )
+                )
+                + "\n"
+            )
+            transcripts.read_session_events("codex-normalized", path)
+            state = transcripts._cache[str(path)]
+            self.assertEqual(
+                state["codex_modern_messages"]["evicted-authority"]["text"],
+                "final",
+            )
+            self.assertNotIn("evicted-authority", state["pending_modern_deltas"])
+
+            path.write_text(
+                path.read_text()
+                + json.dumps(
+                    self._row(
+                        "item/completed",
+                        {"item": {"type": "agentMessage", "id": "last-filler", "text": "last"}},
+                        3001,
+                    )
+                )
+                + "\n"
+            )
+            transcripts.read_session_events("codex-normalized", path)
+            self.assertNotIn("evicted-authority", state["codex_item_lifecycle"])
+
+            path.write_text(
+                path.read_text()
+                + json.dumps(
+                    self._row(
+                        "item/agentMessage/delta",
+                        {"itemId": "evicted-authority", "delta": " after-eviction"},
+                        3002,
+                    )
+                )
+                + "\n"
+            )
+            transcripts.read_session_events("codex-normalized", path)
+
+        self.assertEqual(
+            state["pending_modern_deltas"]["evicted-authority"][0]["text"],
+            " after-eviction",
+        )
+
+    def test_round8_l3_reasoning_registry_tracks_every_split_event(self) -> None:
+        rows = [
+            self._row(
+                "item/started",
+                {"item": {"type": "reasoning", "id": "split-reasoning", "summary": []}},
+                1,
+            ),
+            self._row(
+                "item/reasoning/summaryTextDelta",
+                {"itemId": "split-reasoning", "delta": "**first** **second**"},
+                2,
+            ),
+            self._row(
+                "turn/completed",
+                {"turn": {"status": "interrupted"}},
+                3,
+            ),
+        ]
+        with TemporaryDirectory() as tmp:
+            path = Path(tmp) / "reasoning-split.jsonl"
+            path.write_text("".join(json.dumps(row) + "\n" for row in rows))
+            transcripts.read_session_events("codex-normalized", path)
+            state = transcripts._cache[str(path)]
+
+        record = state["codex_item_lifecycle"]["split-reasoning"]
+        self.assertEqual(record["state"], "partial")
+        self.assertEqual(len(record["events"]), 2)
+        self.assertTrue(all(event.get("partial") for event in record["events"]))
+
+    def test_round8_l4_never_rendered_registry_entries_evict_with_pending_maps(self) -> None:
+        cases = {
+            "delta": lambda index: self._row(
+                "item/commandExecution/outputDelta",
+                {"itemId": f"delta-only-{index}", "delta": "buffered"},
+                index,
+            ),
+            "artifact": lambda index: self._row(
+                "item/started",
+                {
+                    "item": {
+                        "type": "mcpToolCall",
+                        "id": f"artifact-start-only-{index}",
+                        "server": "wiki_artifacts",
+                        "tool": "render_artifact",
+                        "arguments": {
+                            "kind": "mermaid",
+                            "payload": {"source": "graph TD; A-->B"},
+                        },
+                        "status": "inProgress",
+                    }
+                },
+                index,
+            ),
+        }
+        for kind, build in cases.items():
+            rows = [build(index) for index in range(transcripts.CODEX_EVENT_WINDOW + 1)]
+            with self.subTest(kind=kind), TemporaryDirectory() as tmp:
+                path = Path(tmp) / f"{kind}-only.jsonl"
+                path.write_text("".join(json.dumps(row) + "\n" for row in rows))
+                transcripts.read_session_events("codex-normalized", path)
+                state = transcripts._cache[str(path)]
+
+            prefix = "delta-only" if kind == "delta" else "artifact-start-only"
+            first_id = f"{prefix}-0"
+            last_id = f"{prefix}-{transcripts.CODEX_EVENT_WINDOW}"
+            pending_key = "pending_modern_deltas" if kind == "delta" else "pending_artifacts"
+            self.assertNotIn(first_id, state["codex_item_lifecycle"])
+            self.assertNotIn(first_id, state[pending_key])
+            self.assertIn(last_id, state["codex_item_lifecycle"])
+            self.assertIn(last_id, state[pending_key])
+            self.assertLessEqual(len(state["codex_item_lifecycle"]), transcripts.CODEX_EVENT_WINDOW)
 
     def test_round2_f1_wrapper_incremental_replay_matches_full_and_keeps_unmatched(self) -> None:
         wrapper = {
@@ -2052,6 +2329,43 @@ class CodexModernTranscriptParityTests(unittest.TestCase):
         self.assertEqual(tools[0]["output"], "native")
         self.assertIsNone(tools[1]["output"])
         self.assertIsNone(tools[1]["ok"])
+
+    def test_round8_l1_wrapper_suppression_keeps_shared_native_lifecycle_open(self) -> None:
+        wrapper = {
+            "type": "response_item",
+            "timestamp": "2026-08-07T12:00:00Z",
+            "payload": {
+                "type": "custom_tool_call",
+                "call_id": "shared-native-id",
+                "name": "exec",
+                "input": 'tools.mcp__fixture__lookup({value:"wanted"});',
+            },
+        }
+        native = {
+            "type": "response_item",
+            "timestamp": "2026-08-07T12:00:01Z",
+            "payload": {
+                "type": "mcpToolCall",
+                "id": "shared-native-id",
+                "server": "fixture",
+                "tool": "lookup",
+                "arguments": {"value": "wanted"},
+                "status": "completed",
+                "result": {"content": [{"type": "text", "text": "native"}]},
+            },
+        }
+        with TemporaryDirectory() as tmp:
+            path = Path(tmp) / "shared-native.jsonl"
+            path.write_text(json.dumps(wrapper) + "\n")
+            transcripts.read_session_events("codex", path)
+            path.write_text(json.dumps(wrapper) + "\n" + json.dumps(native) + "\n")
+            parsed = transcripts.read_session_events("codex", path)
+            state = transcripts._cache[str(path)]
+
+        tools = [event["tool"] for event in parsed["events"] if event["kind"] == "tool"]
+        self.assertEqual(len(tools), 1)
+        self.assertEqual(tools[0]["output"], "native")
+        self.assertEqual(state["codex_item_lifecycle"]["shared-native-id"]["state"], "terminal")
 
     def test_round2_f2_statusless_completed_items_are_done(self) -> None:
         parsed = transcripts.read_session_events(
