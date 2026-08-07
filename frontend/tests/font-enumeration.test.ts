@@ -167,3 +167,53 @@ test("registerInstalledFontFaces: registers lazy faces and keeps enumerated fami
     else delete (globalThis as { FontFace?: unknown }).FontFace;
   }
 });
+
+test("registerInstalledFontFaces: registers every variable face sharing one file", () => {
+  const originalDocument = Object.getOwnPropertyDescriptor(globalThis, "document");
+  const originalFontFace = Object.getOwnPropertyDescriptor(globalThis, "FontFace");
+  const added: Array<{ descriptors: Record<string, string> }> = [];
+  const fakeDocument = {
+    fonts: {
+      add(face: { descriptors: Record<string, string> }) {
+        added.push(face);
+      },
+    },
+  };
+  class FakeFontFace {
+    descriptors: Record<string, string>;
+
+    constructor(_family: string, _source: string, descriptors: Record<string, string>) {
+      this.descriptors = descriptors;
+    }
+  }
+  try {
+    Object.defineProperty(globalThis, "document", { value: fakeDocument, configurable: true });
+    Object.defineProperty(globalThis, "FontFace", { value: FakeFontFace, configurable: true });
+    resetFontEnumerationCacheForTests();
+    const count = registerInstalledFontFaces([
+      {
+        family: "Source Code Pro",
+        files: [
+          { id: "source-code-pro-wght", weight: 200, style: "ExtraLight" },
+          { id: "source-code-pro-wght", weight: 400, style: "Regular" },
+          { id: "source-code-pro-wght", weight: 900, style: "Black Italic" },
+        ],
+      },
+    ]);
+    assert.equal(count, 3);
+    assert.deepEqual(
+      added.map((face) => face.descriptors),
+      [
+        { weight: "200", style: "normal" },
+        { weight: "400", style: "normal" },
+        { weight: "900", style: "italic" },
+      ],
+    );
+  } finally {
+    resetFontEnumerationCacheForTests();
+    if (originalDocument) Object.defineProperty(globalThis, "document", originalDocument);
+    else delete (globalThis as { document?: unknown }).document;
+    if (originalFontFace) Object.defineProperty(globalThis, "FontFace", originalFontFace);
+    else delete (globalThis as { FontFace?: unknown }).FontFace;
+  }
+});

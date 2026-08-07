@@ -5,6 +5,7 @@ import {
   classifyEnumerated,
   fetchInstalledFamilies,
   fetchInstalledFonts,
+  INSTALLED_FONT_FACE_REGISTERED_EVENT,
   isEnumeratedFamily,
   loadInstalledFontsForClassification,
   makeCanvasMonoProbe,
@@ -612,6 +613,7 @@ function useInstalledFontPools(): Record<FontRoleId, FontChoice[]> {
 function FontRoleRow({ role, fonts }: { role: FontRole; fonts: FontChoice[] }) {
   const [label, setLabel] = useState(() => currentLabel(role));
   const [weights, setWeights] = useState<number[]>([]);
+  const [fontFaceRevision, setFontFaceRevision] = useState(0);
   const inheritRole = role.inheritsWeightFrom ? FONT_ROLES[role.inheritsWeightFrom] : null;
   const inheritedWeight = () => (inheritRole ? storedWeight(inheritRole) ?? 400 : 400);
   const [weight, setWeight] = useState(() => storedWeight(role) ?? inheritedWeight());
@@ -627,6 +629,18 @@ function FontRoleRow({ role, fonts }: { role: FontRole; fonts: FontChoice[] }) {
     () => pickChoice(fonts, label, monoFallback),
     [fonts, label, monoFallback],
   );
+
+  useEffect(() => {
+    const onFaceRegistered = (event: Event) => {
+      const family = (event as CustomEvent<{ family?: unknown }>).detail?.family;
+      if (family !== choice.family) return;
+      AVAIL_CACHE.delete(choice.family);
+      WEIGHT_CACHE.delete(choice.family);
+      setFontFaceRevision((revision) => revision + 1);
+    };
+    window.addEventListener(INSTALLED_FONT_FACE_REGISTERED_EVENT, onFaceRegistered);
+    return () => window.removeEventListener(INSTALLED_FONT_FACE_REGISTERED_EVENT, onFaceRegistered);
+  }, [choice.family]);
 
   useEffect(() => {
     let cancelled = false;
@@ -656,7 +670,7 @@ function FontRoleRow({ role, fonts }: { role: FontRole; fonts: FontChoice[] }) {
     return () => {
       cancelled = true;
     };
-  }, [choice, role]);
+  }, [choice, role, fontFaceRevision]);
 
   const applyWeight = (next: number) => {
     setFontWeight(role, next);

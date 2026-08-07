@@ -15,6 +15,8 @@ export type InstalledFontFamily = {
   files: InstalledFontFile[];
 };
 
+export const INSTALLED_FONT_FACE_REGISTERED_EVENT = "wiki-installed-font-face-registered";
+
 // Backend enumerates installed OS families once and caches. The first fetch
 // on cold start may take several seconds while system_profiler runs; every
 // later call is instant. We cache the resolved promise in-module so multiple
@@ -22,6 +24,20 @@ export type InstalledFontFamily = {
 let pending: Promise<InstalledFontFamily[]> | null = null;
 let cached: InstalledFontFamily[] | null = null;
 const registeredFamilies = new Set<string>();
+
+function cssFontStyle(style?: string): "normal" | "italic" | "oblique" {
+  const normalized = style?.toLowerCase() ?? "";
+  if (normalized.includes("italic")) return "italic";
+  if (normalized.includes("oblique")) return "oblique";
+  return "normal";
+}
+
+function announceFontFaceRegistered(family: string): void {
+  if (typeof window === "undefined") return;
+  window.dispatchEvent(
+    new CustomEvent(INSTALLED_FONT_FACE_REGISTERED_EVENT, { detail: { family } }),
+  );
+}
 
 function quoteFamily(family: string): string {
   return `"${family.replaceAll("\\", "\\\\").replaceAll('"', '\\"')}"`;
@@ -80,21 +96,22 @@ export function registerInstalledFontFaces(
       local = false;
     }
     if (local || font.files.length === 0) continue;
+    let familyRegistered = false;
     for (const file of font.files) {
-      const key = `${font.family}\u0000${file.id}`;
+      const weight = String(file.weight ?? 400);
+      const style = cssFontStyle(file.style);
+      const key = `${font.family}\u0000${file.id}\u0000${weight}\u0000${style}`;
       if (registeredFamilies.has(key)) continue;
       const face = new globalThis.FontFace(font.family, `url("/api/fonts/file/${encodeURIComponent(file.id)}")`, {
-        weight: String(file.weight ?? 400),
-        style: file.style?.toLowerCase().includes("italic")
-          ? "italic"
-          : file.style?.toLowerCase().includes("oblique")
-            ? "oblique"
-            : "normal",
+        weight,
+        style,
       });
       document.fonts.add(face);
       registeredFamilies.add(key);
       registered += 1;
+      familyRegistered = true;
     }
+    if (familyRegistered) announceFontFaceRegistered(font.family);
   }
   return registered;
 }

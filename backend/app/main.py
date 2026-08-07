@@ -4033,13 +4033,36 @@ async def list_fonts() -> dict[str, object]:
     return {"families": [entry["family"] for entry in entries], "fonts": entries}
 
 
+def _stream_font_file(handle: installed_fonts.OpenedFontFile) -> Iterator[bytes]:
+    remaining = handle.size
+    try:
+        while remaining > 0:
+            chunk = handle.stream.read(min(64 * 1024, remaining))
+            if not chunk:
+                break
+            remaining -= len(chunk)
+            yield chunk
+    finally:
+        handle.stream.close()
+
+
 @app.get("/api/fonts/file/{font_id}")
-async def get_font_file(font_id: str) -> FileResponse:
-    path = await asyncio.to_thread(installed_fonts.font_path, font_id)
-    if path is None:
+async def get_font_file(font_id: str) -> Response:
+    try:
+        handle = await asyncio.to_thread(installed_fonts.open_font_file, font_id)
+    except installed_fonts.FontFileTooLarge:
+        raise HTTPException(status_code=413, detail="Font file exceeds the 50MB serving limit")
+    if handle is None:
         raise HTTPException(status_code=404, detail="Font not found")
-    media_type = "font/otf" if path.suffix.casefold() == ".otf" else "font/ttf"
-    return FileResponse(path, media_type=media_type, headers={"Cache-Control": "public, max-age=86400"})
+    media_type = "font/otf" if handle.path.suffix.casefold() == ".otf" else "font/ttf"
+    return StreamingResponse(
+        _stream_font_file(handle),
+        media_type=media_type,
+        headers={
+            "Cache-Control": "public, max-age=86400",
+            "Content-Length": str(handle.size),
+        },
+    )
 
 
 @app.get("/api/tokens")

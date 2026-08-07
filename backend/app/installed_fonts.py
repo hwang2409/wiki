@@ -5,10 +5,14 @@ from __future__ import annotations
 import hashlib
 import json
 import logging
+import os
 import subprocess
+import stat
 import threading
+import fcntl
+from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, TypedDict
+from typing import Any, BinaryIO, TypedDict
 
 
 logger = logging.getLogger(__name__)
@@ -21,6 +25,7 @@ _FONT_ROOTS = tuple(Path.home() / part for part in ("Library/Fonts",)) + (
     Path("/System/Library/Fonts"),
 )
 _FONT_SUFFIXES = {".ttf", ".otf"}
+MAX_FONT_FILE_BYTES = 50 * 1024 * 1024
 
 
 class FontFile(TypedDict, total=False):
@@ -32,6 +37,17 @@ class FontFile(TypedDict, total=False):
 class FontFamily(TypedDict):
     family: str
     files: list[FontFile]
+
+
+class FontFileTooLarge(Exception):
+    """The opened font file exceeds the serving limit."""
+
+
+@dataclass
+class OpenedFontFile:
+    stream: BinaryIO
+    path: Path
+    size: int
 
 
 def _allowed_font_path(path: Path) -> Path | None:
@@ -69,32 +85,30 @@ def _weight(value: Any) -> int | None:
         return number if 1 <= number <= 1000 else None
     except ValueError:
         pass
-    names = {
+    compact = "".join(character for character in text if character.isalnum())
+    for suffix in ("italic", "oblique"):
+        if compact.endswith(suffix):
+            compact = compact[: -len(suffix)]
+            break
+    compact_names = {
         "thin": 100,
         "hairline": 100,
-        "extra light": 200,
-        "ultra light": 200,
+        "ultralight": 200,
+        "extralight": 200,
         "light": 300,
         "book": 350,
         "regular": 400,
         "normal": 400,
         "medium": 500,
         "semibold": 600,
-        "semi bold": 600,
         "demibold": 600,
         "bold": 700,
         "extrabold": 800,
-        "extra bold": 800,
         "ultrabold": 800,
-        "ultra bold": 800,
         "black": 900,
         "heavy": 900,
     }
-    style_name = " ".join(
-        part for part in text.replace("-", " ").replace("_", " ").split()
-        if part not in {"italic", "oblique"}
-    )
-    return names.get(text) or names.get(style_name)
+    return compact_names.get(compact)
 
 
 def _typeface_weight(typeface: dict[str, Any]) -> int | None:
@@ -105,37 +119,38 @@ def _typeface_weight(typeface: dict[str, Any]) -> int | None:
     return _weight(typeface.get("style"))
 
 
-def _location(entry: dict[str, Any]) -> Path | None:
-    for key in ("Location", "location", "path", "Path"):
-        value = entry.get(key)
-        if isinstance(value, str) and value.strip():
-            raw = value.strip()
-            if raw.startswith("file://"):
-                raw = raw[7:]
-            return _allowed_font_path(Path(raw))
+def _location(*entries: dict[str, Any]) -> Path | None:
+    for entry in entries:
+        for key in ("location", "path", "Location", "Path"):
+            value = entry.get(key)
+            if isinstance(value, str) and value.strip():
+                raw = value.strip()
+                if raw.startswith("file://"):
+                    raw = raw[7:]
+                return _allowed_font_path(Path(raw))
     return None
 
 
-def _extract_fonts(payload: Any) -> list[FontFamily]:
-    _EXTRACTED_PATHS.clear()
+def _extract_fonts_with_paths(payload: Any) -> tuple[list[FontFamily], dict[str, Path]]:
+    extracted_paths: dict[str, Path] = {}
     grouped: dict[str, FontFamily] = {}
     entries = payload.get("SPFontsDataType", []) if isinstance(payload, dict) else []
     if not isinstance(entries, list):
-        return []
+        return [], extracted_paths
     for entry in entries:
         if not isinstance(entry, dict) or entry.get("enabled") != "yes":
             continue
-        location = _location(entry)
         suffix = str(entry.get("_name", "")).casefold()
-        if suffix.endswith(".ttc") or (location is not None and location.suffix.casefold() == ".ttc"):
-            logger.warning("skipping unsupported font collection: %s", entry.get("_name"))
-            location = None
         typefaces = entry.get("typefaces", []) or []
         if not isinstance(typefaces, list):
             continue
         for typeface in typefaces:
             if not isinstance(typeface, dict) or typeface.get("enabled") != "yes":
                 continue
+            location = _location(typeface, entry)
+            if suffix.endswith(".ttc") or (location is not None and location.suffix.casefold() == ".ttc"):
+                logger.warning("skipping unsupported font collection: %s", entry.get("_name"))
+                location = None
             family = typeface.get("family")
             if not isinstance(family, str) or not family.strip():
                 continue
@@ -144,7 +159,7 @@ def _extract_fonts(payload: Any) -> list[FontFamily]:
             if location is None:
                 continue
             font_id = _font_id(location)
-            _EXTRACTED_PATHS[font_id] = location
+            extracted_paths[font_id] = location
             font_file: FontFile = {"id": font_id}
             weight = _typeface_weight(typeface)
             style = typeface.get("style")
@@ -154,7 +169,12 @@ def _extract_fonts(payload: Any) -> list[FontFamily]:
                 font_file["style"] = style.strip()
             if not any(item == font_file for item in result["files"]):
                 result["files"].append(font_file)
-    return sorted(grouped.values(), key=lambda item: item["family"].casefold())
+    return sorted(grouped.values(), key=lambda item: item["family"].casefold()), extracted_paths
+
+
+def _extract_fonts(payload: Any) -> list[FontFamily]:
+    fonts, _ = _extract_fonts_with_paths(payload)
+    return fonts
 
 
 def _extract_families(payload: Any) -> list[str]:
@@ -162,7 +182,7 @@ def _extract_families(payload: Any) -> list[str]:
     return [entry["family"] for entry in _extract_fonts(payload)]
 
 
-def _enumerate() -> list[FontFamily]:
+def _enumerate() -> tuple[list[FontFamily], dict[str, Path]]:
     try:
         completed = subprocess.run(
             ["system_profiler", "SPFontsDataType", "-json"],
@@ -172,14 +192,14 @@ def _enumerate() -> list[FontFamily]:
             check=False,
         )
     except (FileNotFoundError, subprocess.TimeoutExpired):
-        return []
+        return [], {}
     if completed.returncode != 0 or not completed.stdout:
-        return []
+        return [], {}
     try:
         payload = json.loads(completed.stdout)
     except json.JSONDecodeError:
-        return []
-    return _extract_fonts(payload)
+        return [], {}
+    return _extract_fonts_with_paths(payload)
 
 
 def _normalise(value: list[FontFamily] | list[str]) -> list[FontFamily]:
@@ -198,19 +218,28 @@ def installed_fonts() -> list[FontFamily]:
     with _LOCK:
         if _CACHE is not None:
             return _CACHE
-    computed = _normalise(_enumerate())
-    file_map: dict[str, Path] = {}
-    for entry in computed:
-        for font_file in entry["files"]:
-            font_id = font_file.get("id")
-            if not isinstance(font_id, str):
-                continue
-            # Re-resolve every enumerated path before adding it to the map.
-            # The map is populated from server-side data, never client input.
-            resolved = _allowed_font_path(_EXTRACTED_PATHS.get(font_id, Path("")))
-            if resolved is not None:
-                file_map[font_id] = resolved
-    with _LOCK:
+        # Keep enumeration and map construction under the same lock. The
+        # double-check above lets later calls return without running it.
+        enumerated = _enumerate()
+        if isinstance(enumerated, tuple):
+            raw_fonts, extracted_paths = enumerated
+        else:
+            # Preserve compatibility with old test doubles and callers.
+            raw_fonts, extracted_paths = enumerated, {}
+        computed = _normalise(raw_fonts)
+        file_map: dict[str, Path] = {}
+        for entry in computed:
+            for font_file in entry["files"]:
+                font_id = font_file.get("id")
+                if not isinstance(font_id, str):
+                    continue
+                # Re-resolve every enumerated path before adding it to the map.
+                # The map is populated from server-side data, never client input.
+                resolved = _allowed_font_path(extracted_paths.get(font_id, Path("")))
+                if resolved is not None:
+                    file_map[font_id] = resolved
+        _EXTRACTED_PATHS.clear()
+        _EXTRACTED_PATHS.update(extracted_paths)
         if _CACHE is None:
             _CACHE = computed
             _FILE_MAP = file_map
@@ -228,6 +257,78 @@ def font_path(font_id: str) -> Path | None:
     if path is None:
         return None
     return _allowed_font_path(path)
+
+
+def _path_from_open_fd(fd: int) -> Path | None:
+    getpath = getattr(fcntl, "F_GETPATH", None)
+    if getpath is not None:
+        try:
+            raw = fcntl.fcntl(fd, getpath, b"\0" * 1024)
+            if isinstance(raw, bytes):
+                return Path(raw.split(b"\0", 1)[0].decode("utf-8"))
+        except (OSError, UnicodeDecodeError):
+            pass
+    for fd_root in (Path("/proc/self/fd"), Path("/dev/fd")):
+        try:
+            raw = os.readlink(fd_root / str(fd))
+        except OSError:
+            continue
+        if raw.endswith(" (deleted)"):
+            return None
+        return Path(raw)
+    return None
+
+
+def _validated_opened_path(fd: int, metadata: os.stat_result) -> Path | None:
+    if not stat.S_ISREG(metadata.st_mode):
+        return None
+    opened_path = _path_from_open_fd(fd)
+    if opened_path is None:
+        return None
+    resolved = _allowed_font_path(opened_path)
+    if resolved is None:
+        return None
+    try:
+        current = resolved.stat()
+    except OSError:
+        return None
+    if (current.st_dev, current.st_ino) != (metadata.st_dev, metadata.st_ino):
+        return None
+    return resolved
+
+
+def open_font_file(font_id: str) -> OpenedFontFile | None:
+    """Open an allowlisted font and keep the opened descriptor for streaming."""
+    installed_fonts()
+    with _LOCK:
+        path = _FILE_MAP.get(font_id)
+    if path is None:
+        return None
+
+    flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_CLOEXEC", 0)
+    try:
+        fd = _open_font_fd(path, flags)
+    except OSError:
+        return None
+    stream: BinaryIO | None = None
+    try:
+        metadata = os.fstat(fd)
+        resolved = _validated_opened_path(fd, metadata)
+        if resolved is None:
+            os.close(fd)
+            return None
+        if metadata.st_size > MAX_FONT_FILE_BYTES:
+            raise FontFileTooLarge
+        stream = os.fdopen(fd, "rb", closefd=True)
+        return OpenedFontFile(stream=stream, path=resolved, size=metadata.st_size)
+    except BaseException:
+        if stream is None:
+            os.close(fd)
+        raise
+
+
+def _open_font_fd(path: Path, flags: int) -> int:
+    return os.open(path, flags)
 
 
 def reset_cache_for_tests() -> None:
