@@ -1332,11 +1332,6 @@ function ToolOutputBody({
   // anchors (no PR-metadata card unfurl); highlighter branches yield to the
   // text path so those anchors stay clickable instead of getting swallowed
   // into a Shiki code block.
-  // Structured non-bash outputs (JSON and friends) read pretty-printed in the
-  // block view; the clipped budget applies to the PRETTY text, raw stays exact.
-  const structured = !bash && outputTone === "normal" && !hasGitHubLink
-    ? detectStructuredContent(displayOutput)
-    : null;
   // File-slice bash reads (sed -n over one .py file etc.) highlight their
   // OUTPUT in the target file's language; ANSI-decorated output keeps the
   // ansi path, everything ambiguous stays plain.
@@ -1344,6 +1339,14 @@ function ToolOutputBody({
     ? bashReadTargetPath(tool.input)
     : null;
   const bashOutputLang = bashReadTarget ? languageForPath(bashReadTarget) : null;
+  // WIKI-270: JSON tool outputs (agent tools AND bash — think `gh api graphql`)
+  // read pretty-printed in the block view instead of a one-line escape wall.
+  // `detectStructuredContent` guards on size and only commits on a successful
+  // parse, so truncated / mixed / non-JSON payloads fall through to raw. ANSI-
+  // decorated bash output and file-slice reads keep their existing renderers.
+  const structured = outputTone === "normal" && !hasGitHubLink && !bashOutputLang && !(bash && hasAnsi(displayOutput))
+    ? detectStructuredContent(displayOutput)
+    : null;
   const titleNode = bash ? (
     <div className="session-tool-block-title is-command">
       $ <CommandHighlight command={tool.input || toolSummaryLine(tool)} />
