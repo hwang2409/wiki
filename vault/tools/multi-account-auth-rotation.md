@@ -2,7 +2,7 @@
 type: reference
 tags: [tools, agents, auth]
 created: 2026-07-08
-updated: 2026-07-08
+updated: 2026-08-07
 ---
 
 # Multi-Account Auth Rotation (codex + claude)
@@ -23,6 +23,7 @@ Verified research (2026-07-08, deep-research workflow, primary sources + local v
 ## Claude
 
 - macOS creds: login Keychain generic-password `service="Claude Code-credentials"` (account=$USER). `~/.claude/.credentials.json` = Linux/headless fallback only. `~/.claude.json` = non-secret state.
+- Since 2026-06-15, `claude -p` / Agent SDK calls use a separate monthly Agent SDK credit. They do not use the interactive Claude plan limit. After that credit, they need usage credits. Wiki launches its Claude adapter with `claude -p`; see <https://support.claude.com/en/articles/15036540-use-the-claude-agent-sdk-with-your-claude-plan>.
 - `CLAUDE_CONFIG_DIR` relocates everything incl. `projects/` AND isolates auth (Keychain service name keyed by sha256 of config dir) — verified locally. Same runtime rejection as CODEX_HOME: moving projects/ breaks the wiki transcript reader.
 - Rotation approach (v2, unbuilt): per-account setup-tokens (`claude setup-token`) injected as `CLAUDE_CODE_OAUTH_TOKEN` inline at worker respawn — env outranks Keychain; `claude --resume` is account-agnostic. NEVER export shell-wide (would hijack orchestrator identity).
 - UNVERIFIED before building cc rotation: (a) CLAUDE_CODE_OAUTH_TOKEN docs say "inference-only scope" — confirm full interactive worker (tools, MCP) runs on it; (b) no real cc limit banner ever captured on disk — detector speculative, capture live sample; (c) `--resume` may mint new session id — confirm + registry-update.
