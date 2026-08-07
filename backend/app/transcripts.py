@@ -3071,6 +3071,15 @@ def _codex_normalized_apply(state: dict, row: dict) -> None:
                 _append_artifact_event(state, artifact, ts)
                 _record_row_disposition(state, _normalized_disposition(row))
                 return
+            if item.get("type") == "reasoning":
+                _codex_upsert_reasoning(
+                    state,
+                    _codex_modern_text(item),
+                    ts,
+                    item.get("id"),
+                )
+                _record_row_disposition(state, _normalized_disposition(row))
+                return
             if _codex_modern_message_apply(
                 state, item, ts, completed=method != "item/started"
             ):
