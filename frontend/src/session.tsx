@@ -1770,6 +1770,34 @@ export function ToolCallRow({
         ) : null}
       </div>
       <div className="session-trace-indent">
+        {tool.batch && tool.batch.length > 1 ? (
+          <div className="session-tool-batch" aria-label={`${tool.batch.length} tool calls in batch`}>
+            {tool.batch.slice(1).map((child, index) => {
+              const childTool: SessionTool = {
+                name: child.name,
+                input: child.input,
+                output: tool.output,
+                ok: tool.ok,
+                archetype: child.archetype,
+                summary: child.summary,
+              };
+              const childParts = toolSummaryParts(childTool);
+              return (
+                <div className="session-tool-batch-row" key={`${child.name}:${index}`} title={child.input}>
+                  <span aria-hidden="true" className="session-tool-icon session-tool-icon-text">
+                    {toolGlyph(childTool, status)}
+                  </span>
+                  <span className="session-tool-summary">
+                    <span className="session-tool-verb">{childParts.verb}</span>
+                    {childParts.target ? (
+                      <><span aria-hidden="true">{" "}</span><span className="session-tool-target">{childParts.target}</span></>
+                    ) : null}
+                  </span>
+                </div>
+              );
+            })}
+          </div>
+        ) : null}
         {polished && polishedOpen ? (
           <div className="session-tool-polished" id={polishedId}>
             <BoundedPreview

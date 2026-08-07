@@ -684,9 +684,16 @@ class CodexNewRuntimeTranscriptTests(unittest.TestCase):
         self.assertEqual(github_tool["summary"], "gh pr checks 13606 --repo hwang2409/wiki")
         self.assertEqual(github_tool["output"], "all checks passed\n")
 
+        # Homogeneous Promise.all of exec_commands now collapses to one bash
+        # row whose classified input is the newline-joined shell commands, so
+        # the shared inline/block renderer treats it like any batched shell
+        # run rather than a fenced JavaScript literal.
         multi_tool = tools[2]
-        self.assertTrue(multi_tool["input"].startswith("```js\nconst results"))
-        self.assertTrue(multi_tool["input"].endswith("\n```"))
+        self.assertEqual(multi_tool["name"], "exec_command")
+        self.assertEqual(
+            multi_tool["input"],
+            'git status --short --branch\nrg -n "custom_tool_call" backend/app/transcripts.py',
+        )
         self.assertEqual(multi_tool["archetype"], "git")
         self.assertEqual(multi_tool["summary"], "git status")
         self.assertEqual(multi_tool["output"], "## git\n## wiki-main\n## rg\n1034: custom_tool_call\n")
@@ -747,10 +754,66 @@ class CodexNewRuntimeTranscriptTests(unittest.TestCase):
         self.assertEqual(tools[7]["output"], "plain text\n")
         self.assertTrue(tools[7]["ok"])
 
-        malformed = tools[8]
-        self.assertEqual(malformed["name"], "exec")
-        self.assertIn("tools.exec_command(args)", malformed["input"])
-        self.assertEqual(malformed["archetype"], "run")
+        # `const args = {cmd:"..."}; tools.exec_command(args);` is trivial
+        # variable indirection — the harness resolver follows the assignment
+        # and hands the caller a clean exec_command with the underlying cmd.
+        resolved = tools[8]
+        self.assertEqual(resolved["name"], "exec_command")
+        self.assertEqual(resolved["input"], "echo should stay raw")
+        self.assertEqual(resolved["archetype"], "run")
+
+    def test_wiki265_harness_shapes_never_leak_raw_javascript(self) -> None:
+        """WIKI-265: real custom_tool_call shapes render as semantic tools.
+
+        The four fixture rows cover the shapes the bug screenshot showed:
+        one exec_command call, a `const patch = "..."; tools.apply_patch(patch)`
+        wrapper, a homogeneous ``Promise.all`` of exec_commands, and a mixed
+        ``Promise.all`` of MCP + exec. None may surface the harness JS.
+        """
+        path = FIXTURES_DIR / "codex_wiki265_harness_shapes.jsonl"
+
+        parsed = transcripts.read_session_events("codex", path)
+        tools = [event["tool"] for event in parsed["events"] if event["kind"] == "tool"]
+
+        self.assertEqual(len(tools), 4)
+        for tool in tools:
+            self.assertNotIn("```js", tool["input"])
+            self.assertNotIn("await tools.", tool["input"])
+            self.assertNotIn("Promise.all", tool["input"])
+            self.assertNotIn("const r =", tool["input"])
+            self.assertNotIn("const patch =", tool["input"])
+
+        single = tools[0]
+        self.assertEqual(single["name"], "exec_command")
+        self.assertEqual(single["archetype"], "read")
+        self.assertEqual(single["summary"], "read phoebe-dev.json:1-120")
+
+        patch = tools[1]
+        self.assertEqual(patch["name"], "apply_patch")
+        self.assertEqual(patch["archetype"], "edit")
+        self.assertIn("*** Update File", patch["input"])
+        # apply_patch preserves the structured edit payload for the diff view.
+        self.assertIn("patch", patch["edit"])
+
+        parallel = tools[2]
+        self.assertEqual(parallel["name"], "exec_command")
+        self.assertEqual(
+            parallel["input"],
+            "/tmp/agent-status/pr_watch_summary.sh 13657\n"
+            "gh pr view 13657 --json state,mergeable,mergeStateStatus",
+        )
+        self.assertEqual(parallel["archetype"], "run")
+        self.assertEqual([child["name"] for child in parallel["batch"]], ["exec_command", "exec_command"])
+
+        mixed = tools[3]
+        self.assertEqual(mixed["name"], "mcp__wiki_artifacts__read_agent_pr")
+        self.assertEqual(mixed["archetype"], "tool")
+        self.assertIn("read_agent_pr", mixed["input"])
+        self.assertIn("exec_command", mixed["input"])
+        self.assertEqual(
+            [child["name"] for child in mixed["batch"]],
+            ["mcp__wiki_artifacts__read_agent_pr", "exec_command"],
+        )
 
     def test_codex_runtime_preamble_is_metadata_not_output(self) -> None:
         path = FIXTURES_DIR / "codex_preamble_runtime_rendering.jsonl"
@@ -817,7 +880,6 @@ class CodexNewRuntimeTranscriptTests(unittest.TestCase):
         cases = [
             'const text = "tools.exec_command({cmd: \\"hidden\\"})";',
             "// tools.exec_command({cmd: 'hidden'})",
-            'const args = {cmd: "echo hi"}; tools.exec_command(args);',
             'tools.exec_command({cmd: foo_null});',
             'tools.exec_command({cmd: `echo hi`});',
             'tools.exec_command({cmd: "echo hi"',
@@ -828,6 +890,85 @@ class CodexNewRuntimeTranscriptTests(unittest.TestCase):
 
         comments = "tools.exec_command" + ("/* comment */" * 2000) + '({cmd: "echo hi"});'
         self.assertIsNotNone(transcripts._codex_harness_tool("exec", comments))
+
+    def test_harness_scanner_resolves_variable_indirection(self) -> None:
+        """Trivial `const X = ...; tools.name(X)` indirection resolves."""
+        args_case = 'const args = {cmd: "echo hi"}; tools.exec_command(args);'
+        harness = transcripts._codex_harness_tool("exec", args_case)
+        self.assertIsNotNone(harness)
+        self.assertEqual(harness["name"], "exec_command")
+        self.assertEqual(harness["input"], "echo hi")
+
+        patch_case = (
+            'const patch = "*** Begin Patch\\n*** Add File: /a\\n+hi\\n*** End Patch";'
+            "\ntext(await tools.apply_patch(patch));\n"
+        )
+        harness = transcripts._codex_harness_tool("exec", patch_case)
+        self.assertIsNotNone(harness)
+        self.assertEqual(harness["name"], "apply_patch")
+        self.assertIn("*** Begin Patch", harness["input"])
+
+    def test_harness_scanner_folds_homogeneous_promise_all(self) -> None:
+        """Promise.all of exec_commands collapses to newline-joined bash."""
+        source = (
+            "const rs = await Promise.all([\n"
+            '  tools.exec_command({cmd:"ls", workdir:"/x", yield_time_ms:100, max_output_tokens:100}),\n'
+            '  tools.exec_command({cmd:"pwd", workdir:"/x", yield_time_ms:100, max_output_tokens:100}),\n'
+            "]);\ntext(rs);\n"
+        )
+        harness = transcripts._codex_harness_tool("exec", source)
+        self.assertIsNotNone(harness)
+        self.assertEqual(harness["name"], "exec_command")
+        self.assertEqual(harness["input"], "ls\npwd")
+        self.assertEqual(harness["calls"], 2)
+
+    def test_harness_scanner_mixed_batch_keeps_first_call_semantics(self) -> None:
+        """Mixed Promise.all keeps first call's semantic header (no raw JS)."""
+        source = (
+            "const [pr, st] = await Promise.all([\n"
+            '  tools.mcp__wiki_artifacts__read_agent_pr({id:"X"}),\n'
+            '  tools.exec_command({cmd:"wiki gate 13659", workdir:"/x", yield_time_ms:100, max_output_tokens:100}),\n'
+            "]);\ntext(pr); text(st);\n"
+        )
+        harness = transcripts._codex_harness_tool("exec", source)
+        self.assertIsNotNone(harness)
+        self.assertEqual(harness["name"], "mcp__wiki_artifacts__read_agent_pr")
+        self.assertNotIn("```", harness["input"])
+        self.assertNotIn("Promise.all", harness["input"])
+        self.assertEqual(harness["calls"], 2)
+        self.assertIn("exec_command", harness["input"])
+        self.assertEqual(harness["batch"][1]["input"], "wiki gate 13659")
+
+    def test_harness_fallback_hides_malformed_javascript_and_is_bounded(self) -> None:
+        """Malformed wrappers keep a bounded semantic note, never raw JS."""
+        raw = 'const r = await tools.exec_command({cmd: "' + ("x" * 20_000)
+        self.assertIsNone(transcripts._codex_harness_tool("exec", raw))
+        fallback = transcripts._codex_harness_fallback_input(raw)
+        self.assertLessEqual(len(fallback), transcripts.MAX_TOOL_IO)
+        self.assertNotIn("const r =", fallback)
+        self.assertNotIn("await tools.", fallback)
+        self.assertIn("exec_command", fallback)
+
+        oversized = "tools.exec_command({cmd: \"echo hi\"});" + (" " * transcripts.MAX_CODEX_HARNESS_SOURCE)
+        self.assertIsNone(transcripts._codex_harness_tool("exec", oversized))
+
+        cycle = 'const args = args; tools.exec_command(args);'
+        self.assertIsNone(transcripts._codex_harness_tool("exec", cycle))
+
+    def test_harness_batch_children_are_bounded(self) -> None:
+        command = "echo " + ("x" * (transcripts.MAX_CODEX_BATCH_CHILD_INPUT * 4))
+        source = (
+            "const rs = await Promise.all(["
+            f"tools.exec_command({{cmd:{json.dumps(command)}}}),"
+            'tools.exec_command({cmd:"pwd"})]); text(rs);'
+        )
+        harness = transcripts._codex_harness_tool("exec", source)
+        self.assertIsNotNone(harness)
+        self.assertLessEqual(len(harness["input"]), transcripts.MAX_TOOL_IO)
+        self.assertLessEqual(
+            len(harness["batch"][0]["input"]),
+            transcripts.MAX_CODEX_BATCH_CHILD_INPUT + 64,
+        )
 
 
 def _write_rollout(day_dir: Path, name: str, cwd: str, session_id: str,

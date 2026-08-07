@@ -58,6 +58,9 @@ MAX_TOOL_IO = 3_000
 MAX_CHANGE_LOG = 4_096
 TRANSCRIPT_CACHE_VERSION = 2
 MAX_EDIT_PAYLOAD = 10_000
+MAX_CODEX_HARNESS_SOURCE = 100_000
+MAX_CODEX_HARNESS_CALLS = 32
+MAX_CODEX_BATCH_CHILD_INPUT = 600
 
 try:
     TAIL_WINDOW_EVENTS = max(1, int(os.environ.get("WIKI_TRANSCRIPT_TAIL_WINDOW", "500")))
@@ -631,6 +634,8 @@ def _balanced_js_call_end(source: str, opening: int) -> int | None:
 
 def _codex_harness_calls(source: str) -> list[tuple[str, str]] | None:
     """Find tools calls without matching text inside strings or comments."""
+    if len(source) > MAX_CODEX_HARNESS_SOURCE:
+        return None
     calls: list[tuple[str, str]] = []
     index = 0
     while index < len(source):
@@ -663,6 +668,8 @@ def _codex_harness_calls(source: str) -> list[tuple[str, str]] | None:
                     if end is None:
                         return None
                     calls.append((name_match.group(0), source[opening + 1:end].strip()))
+                    if len(calls) > MAX_CODEX_HARNESS_CALLS:
+                        return None
                     index = end + 1
                     continue
         index += 1
@@ -685,9 +692,19 @@ def _decode_js_string(source: str, opening: int) -> tuple[str, int] | None:
 
 
 class _CodexJsArgumentParser:
-    def __init__(self, source: str):
+    def __init__(
+        self,
+        source: str,
+        variables: dict[str, str] | None = None,
+        resolving: frozenset[str] | None = None,
+    ):
         self.source = source
         self.index = 0
+        # Bare identifiers get resolved against locally-declared string/object
+        # literals (`const patch = "..."; tools.apply_patch(patch)`) so the
+        # arg list survives the trivial variable indirection Codex loves.
+        self.variables = variables or {}
+        self.resolving = resolving or frozenset()
 
     def _space(self) -> None:
         self.index = _skip_js_space(self.source, self.index)
@@ -725,6 +742,15 @@ class _CodexJsArgumentParser:
                 return False
             if token == "null":
                 return None
+            resolved = self.variables.get(token)
+            if resolved is not None and token not in self.resolving:
+                # Re-parse the referenced literal in its own parser so nested
+                # object/array literals resolve too — no shared cursor state.
+                return _CodexJsArgumentParser(
+                    resolved,
+                    self.variables,
+                    self.resolving | {token},
+                ).parse()
             return None
         return None
 
@@ -823,35 +849,194 @@ class _CodexJsArgumentParser:
         return value
 
 
-def _codex_js_arguments(source: str) -> dict | str | None:
-    return _CodexJsArgumentParser(source).parse()
+def _codex_js_arguments(source: str, variables: dict[str, str] | None = None) -> dict | str | None:
+    return _CodexJsArgumentParser(source, variables).parse()
+
+
+# Trivial variable indirection Codex generates alongside `tools.*` calls:
+#
+#   const patch = "*** Begin Patch ... *** End Patch";
+#   text(await tools.apply_patch(patch));
+#
+# The parser needs to see the literal to synthesize a semantic apply_patch
+# call. We collect the source text of each assigned literal (not the parsed
+# value) so the argument parser can re-scan it under its usual grammar rules.
+_JS_ASSIGNMENT_HEAD = re.compile(
+    r"(?:^|[;\n{])\s*(?:const|let|var)\s+([A-Za-z_$][\w$]*)\s*=\s*",
+)
+
+
+def _js_literal_end(source: str, start: int) -> int | None:
+    if start >= len(source):
+        return None
+    char = source[start]
+    if char in ("'", '"'):
+        return _js_string_end(source, start)
+    if char in "([{":
+        pairs = {"(": ")", "[": "]", "{": "}"}
+        stack = [pairs[char]]
+        index = start + 1
+        while index < len(source):
+            ch = source[index]
+            if ch in ("'", '"'):
+                end = _js_string_end(source, index)
+                if end is None:
+                    return None
+                index = end
+                continue
+            if ch == "`":
+                return None
+            if source.startswith("//", index):
+                newline = source.find("\n", index + 2)
+                index = len(source) if newline == -1 else newline + 1
+                continue
+            if source.startswith("/*", index):
+                end = source.find("*/", index + 2)
+                if end == -1:
+                    return None
+                index = end + 2
+                continue
+            if ch in pairs:
+                stack.append(pairs[ch])
+            elif ch in ")]}":
+                if not stack or ch != stack.pop():
+                    return None
+                if not stack:
+                    return index + 1
+            index += 1
+        return None
+    return None
+
+
+def _codex_extract_variables(source: str) -> dict[str, str]:
+    """Map identifier -> raw literal source for locally-declared consts."""
+    variables: dict[str, str] = {}
+    for match in _JS_ASSIGNMENT_HEAD.finditer(source):
+        name = match.group(1)
+        start = match.end()
+        end = _js_literal_end(source, start)
+        if end is None or name in variables:
+            continue
+        # Only first declaration wins; later reassignments could shadow but the
+        # tools.* call inline usually happens right after the first `const`.
+        variables[name] = source[start:end]
+    return variables
+
+
+def _resolve_call_argument(source: str, variables: dict[str, str]) -> object | None:
+    """Parse an arg source, resolving trailing/whole-token identifiers."""
+    stripped = source.strip()
+    # Bare identifier: use the variable table directly so the literal parses in
+    # its own top-level scope (the argument parser only accepts dict/string).
+    identifier_match = _JS_IDENTIFIER.fullmatch(stripped)
+    if identifier_match:
+        resolved = variables.get(stripped)
+        if resolved is None:
+            return None
+        return _codex_js_arguments(resolved, variables)
+    return _codex_js_arguments(source, variables)
+
+
+def _codex_synthesized_bash(call_arguments: list[dict]) -> str | None:
+    """Fold a Promise.all of exec_command calls into a shell-flavoured summary.
+
+    All calls must be ``exec_command`` with a string ``cmd``/``command``. The
+    commands join with newlines so the shared bash renderer can highlight and
+    truncate the composite the same way it does any multi-line shell command.
+    """
+    commands: list[str] = []
+    for arguments in call_arguments:
+        if not isinstance(arguments, dict):
+            return None
+        command = arguments.get("cmd", arguments.get("command"))
+        if not isinstance(command, str) or not command.strip():
+            return None
+        commands.append(command)
+    if not commands:
+        return None
+    return "\n".join(commands)
+
+
+def _codex_harness_fallback_input(raw_input: str) -> str:
+    """Describe an undecodable wrapper without exposing its JavaScript body."""
+    names: list[str] = []
+    for match in re.finditer(r"\btools\.([A-Za-z_$][\w$]*)", raw_input[:MAX_CODEX_HARNESS_SOURCE]):
+        name = match.group(1)
+        if name not in names:
+            names.append(name)
+        if len(names) == 8:
+            break
+    if names:
+        label = ", ".join(names)
+        if len(names) == 8:
+            label += ", …"
+        return _clip(f"Codex tool wrapper could not be decoded: {label}", MAX_TOOL_IO)
+    return "Codex tool wrapper could not be decoded"
 
 
 def _codex_harness_tool(name: object, raw_input: object) -> dict | None:
-    """Unwrap the new Codex runtime's ``const r = await tools.*(...)`` input."""
+    """Unwrap the new Codex runtime's ``const r = await tools.*(...)`` input.
+
+    The wrapper is transport, not user intent: pull each ``tools.<name>(...)``
+    call up as if the model had invoked the underlying tool directly, so the
+    shared inline/block renderer gets clean bash / edit / mcp semantics rather
+    than a fenced JavaScript blob to display.
+    """
     if name != "exec" or not isinstance(raw_input, str):
         return None
     calls = _codex_harness_calls(raw_input)
-    if not calls or any(_codex_js_arguments(arguments) is None for _, arguments in calls):
+    if not calls:
         return None
-    function_name, argument_source = calls[0]
-    arguments = _codex_js_arguments(argument_source)
-    if arguments is None:
+    variables = _codex_extract_variables(raw_input)
+    parsed_arguments = [_resolve_call_argument(arg, variables) for _, arg in calls]
+    if any(arg is None for arg in parsed_arguments):
         return None
-    classified_input = _codex_tool_input(function_name, arguments)
-    if function_name == "exec_command" and isinstance(arguments, dict):
-        command = arguments.get("cmd", arguments.get("command"))
-        if isinstance(command, str):
-            classified_input = _clip(command, MAX_TOOL_IO)
-    if len(calls) == 1:
-        display_input = classified_input
-    else:
-        display_input = _clip(f"```js\n{raw_input.strip()}\n```", MAX_TOOL_IO)
+    children: list[dict[str, str]] = []
+    semantic_inputs: list[str] = []
+    for (child_name, _), child_arguments in zip(calls, parsed_arguments):
+        child_input = _codex_tool_input(child_name, child_arguments)
+        if child_name == "exec_command" and isinstance(child_arguments, dict):
+            command = child_arguments.get("cmd", child_arguments.get("command"))
+            if isinstance(command, str):
+                child_input = _clip(command, MAX_TOOL_IO)
+        semantic_inputs.append(child_input)
+        child_archetype, child_summary = classify_tool(child_name, child_input)
+        children.append(
+            {
+                "name": _clip(child_name, 120),
+                "input": _clip(child_input, MAX_CODEX_BATCH_CHILD_INPUT),
+                "archetype": child_archetype,
+                "summary": child_summary,
+            }
+        )
+
+    function_name = _clip(calls[0][0], 120)
+    primary_arguments = parsed_arguments[0]
+    classified_input = semantic_inputs[0]
+    display_input = classified_input
+    if len(calls) > 1:
+        # Homogeneous Promise.all batches of shell commands keep bash grammar
+        # so the shared inline/block renderer stays compact and useful.
+        if all(fname == "exec_command" for fname, _ in calls):
+            combined = _codex_synthesized_bash(
+                [args for args in parsed_arguments if isinstance(args, dict)]
+            )
+            if combined is not None:
+                classified_input = _clip(combined, MAX_TOOL_IO)
+                display_input = classified_input
+        else:
+            # Mixed batches keep every semantic sibling in the bounded parent
+            # input. The child list lets the OpenCode-style row show hierarchy.
+            display_input = _clip(
+                "\n".join(f"{child['name']}: {child['input']}" for child in children),
+                MAX_TOOL_IO,
+            )
     return {
         "name": function_name,
         "input": display_input,
         "classify_input": classified_input,
-        "arguments": arguments,
+        "arguments": primary_arguments,
+        "batch": children if len(children) > 1 else None,
         "calls": len(calls),
     }
 
@@ -1137,7 +1322,10 @@ def _codex_add_tool_event(
         classify_input = harness["classify_input"]
         structured_input = harness["arguments"]
     else:
-        tool_input = _codex_tool_input(str(name or ""), raw_input)
+        if name == "exec" and isinstance(raw_input, str):
+            tool_input = _codex_harness_fallback_input(raw_input)
+        else:
+            tool_input = _codex_tool_input(str(name or ""), raw_input)
         classify_input = tool_input
         structured_input = raw_input
     name = str(name or "")
@@ -1168,6 +1356,8 @@ def _codex_add_tool_event(
     edit_payload = _structured_edit_payload(name, structured_input)
     if edit_payload is not None:
         event["tool"]["edit"] = edit_payload
+    if harness and harness.get("batch"):
+        event["tool"]["batch"] = harness["batch"]
     _append_event(state, event)
     if call_id:
         pending[call_id] = event

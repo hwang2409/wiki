@@ -527,6 +527,7 @@ export type SessionTool = {
   summary: string;
   completed_at?: string | null;
   agent_id?: string;
+  batch?: SessionToolBatchChild[];
   edit?: {
     file_path?: string;
     old_string?: string;
@@ -537,6 +538,13 @@ export type SessionTool = {
     new_string_truncated?: boolean;
     patch_truncated?: boolean;
   };
+};
+
+export type SessionToolBatchChild = {
+  name: string;
+  input: string;
+  archetype: string;
+  summary: string;
 };
 
 export type SessionBash = {
