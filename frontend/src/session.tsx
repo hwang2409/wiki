@@ -1583,9 +1583,9 @@ function SubagentTrace({
 
 // OpenCode reasoning anatomy (session/index.tsx:1635-1677): one warning-hued
 // line `+ Thought: <title> · <duration>`, `-` when open, body as muted
-// markdown at reduced strength. Codex supplies only summaries here; its
-// encrypted marker is the provider capability signal for opening them by
-// default. Wiki cannot decrypt the private reasoning payload.
+// markdown at reduced strength. Codex supplies only summaries here; Wiki
+// cannot decrypt the private reasoning payload. Rows always mount collapsed
+// so a transcript full of thoughts stays scannable; click to open a body.
 function normalizeCodexThinkingSummary(text: string): string {
   const lines = text.split("\n");
   const first = lines[0].trim();
@@ -1594,12 +1594,12 @@ function normalizeCodexThinkingSummary(text: string): string {
   return lines.join("\n");
 }
 
-function ThinkingRow({ event, durationMs = null }: { event: SessionEvent; durationMs?: number | null }) {
+export function ThinkingRow({ event, durationMs = null }: { event: SessionEvent; durationMs?: number | null }) {
   // Provider capability markers can arrive as truthy wire values after an
   // app-server round trip. Do not require a strict boolean identity.
   const codexSummary = Boolean(event.encrypted);
   const summary = codexSummary ? normalizeCodexThinkingSummary(event.text) : event.text;
-  const [expanded, setExpanded] = useState(() => codexSummary);
+  const [expanded, setExpanded] = useState(false);
   const title = summary.split("\n")[0].trim().slice(0, 120);
   const duration = durationMs !== null ? formatEventDuration(durationMs) : null;
   return (
