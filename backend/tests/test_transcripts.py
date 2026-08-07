@@ -2480,6 +2480,31 @@ class CodexModernTranscriptParityTests(unittest.TestCase):
             path = Path(tmp) / "incremental-batch-artifact.jsonl"
             path.write_text(json.dumps(wrapper) + "\n")
             transcripts.read_session_events("codex", path)
+            path.write_text(json.dumps(wrapper) + "\n" + json.dumps(native_rows[0]) + "\n")
+            parsed = transcripts.read_session_events("codex", path)
+            child_ids = {
+                "__codex_batch_child__:batch-artifact-wrapper:0",
+                "__codex_batch_child__:batch-artifact-wrapper:1",
+            }
+            visible_child_ids = {
+                tool.get("call_id")
+                for event in parsed["events"]
+                if event["kind"] == "tool"
+                for tool in [event["tool"]]
+                if tool.get("call_id") in child_ids
+            }
+            self.assertEqual(
+                visible_child_ids,
+                {"__codex_batch_child__:batch-artifact-wrapper:1"},
+            )
+            self.assertNotIn(
+                "__codex_batch_child__:batch-artifact-wrapper:0",
+                transcripts._cache[str(path)]["pending_artifacts"],
+            )
+            self.assertIn(
+                "__codex_batch_child__:batch-artifact-wrapper:1",
+                transcripts._cache[str(path)]["pending_artifacts"],
+            )
             path.write_text(
                 "\n".join(json.dumps(row) for row in [wrapper, *native_rows, turn_completed])
                 + "\n"
@@ -2769,9 +2794,17 @@ class CodexModernTranscriptParityTests(unittest.TestCase):
                 "input": source,
             },
         }
+        turn_completed = {
+            "type": "event_msg",
+            "timestamp": "2026-08-07T12:00:02Z",
+            "payload": {
+                "type": "turn_completed",
+                "turn": {"status": "completed"},
+            },
+        }
         with TemporaryDirectory() as tmp:
             path = Path(tmp) / "batch-pending-artifact.jsonl"
-            path.write_text(json.dumps(row) + "\n")
+            path.write_text(json.dumps(row) + "\n" + json.dumps(turn_completed) + "\n")
             parsed = transcripts.read_session_events("codex", path)
             state = transcripts._cache[str(path)]
 
@@ -2781,13 +2814,13 @@ class CodexModernTranscriptParityTests(unittest.TestCase):
             if event["kind"] == "tool"
             and event["tool"]["name"] == "mcp__wiki_artifacts__render_artifact"
         )
-        self.assertIsNone(tool["ok"])
+        self.assertFalse(tool["ok"])
         self.assertIsNone(tool["output"])
-        self.assertEqual(tool["status"], "inProgress")
+        self.assertEqual(tool["status"], "failed")
         self.assertEqual(tool["summary"], "render_artifact pending")
         self.assertEqual(
             state["codex_item_lifecycle"]["__codex_batch_child__:batch-pending-artifact:0"]["state"],
-            "open",
+            "terminal",
         )
 
     def test_round4_h2_interrupt_only_marks_open_current_items_after_trim(self) -> None:

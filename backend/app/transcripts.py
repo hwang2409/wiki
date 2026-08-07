@@ -1868,7 +1868,7 @@ def _codex_add_semantic_tool_event(
         pending[call_id] = event
         if wrapper and name.startswith("mcp__"):
             state.setdefault("pending_wrappers", {})[str(call_id)] = {
-                "expected": {native_key},
+                "expected": [{"key": native_key, "event": event, "call_id": call_id}],
                 "events": [event],
             }
     return event, False
@@ -1937,10 +1937,17 @@ def _codex_add_tool_event(
             if child_call_id is not None:
                 state.setdefault("pending_wrappers", {}).pop(str(child_call_id), None)
         state.setdefault("pending_wrappers", {})[str(call_id)] = {
-            "expected": {
-                (str(item["name"]), _codex_tool_input(str(item["name"]), item["arguments"]))
+            "expected": [
+                {
+                    "key": (
+                        str(item["name"]),
+                        _codex_tool_input(str(item["name"]), item["arguments"]),
+                    ),
+                    "event": item["event"],
+                    "call_id": item["call_id"],
+                }
                 for item in references
-            },
+            ],
             "events": [
                 event
                 for event in [outer, *(item["event"] for item in references)]
@@ -2027,7 +2034,11 @@ def _codex_resolve_pending_wrappers(
     candidates = [
         (wrapper_id, record)
         for wrapper_id, record in pending.items()
-        if native_key in record.get("expected", set())
+        if any(
+            entry.get("key") == native_key
+            for entry in record.get("expected", [])
+            if isinstance(entry, dict)
+        )
     ]
     if not candidates:
         return
@@ -2038,7 +2049,31 @@ def _codex_resolve_pending_wrappers(
         # Matching by a shared tool name is unsafe when two wrappers are live.
         return
     wrapper_id, record = candidates[0]
-    remaining = record.get("expected", set()) - {native_key}
+    expected = record.get("expected", [])
+    if not isinstance(expected, list):
+        return
+    entry_index = next(
+        (
+            index
+            for index, entry in enumerate(expected)
+            if isinstance(entry, dict) and entry.get("key") == native_key
+        ),
+        None,
+    )
+    if entry_index is None:
+        return
+    entry = expected.pop(entry_index)
+    consumed_event = entry.get("event")
+    consumed_call_id = entry.get("call_id")
+    if isinstance(consumed_event, dict):
+        _codex_remove_event(state, consumed_event)
+        for call_id, event in list(state.get("pending", {}).items()):
+            if event is consumed_event:
+                state["pending"].pop(call_id, None)
+    if consumed_call_id is not None:
+        state.get("pending_artifacts", {}).pop(consumed_call_id, None)
+        _codex_drop_unrendered_lifecycle(state, consumed_call_id)
+    remaining = expected
     if remaining:
         record["expected"] = remaining
         return
@@ -2052,6 +2087,8 @@ def _codex_resolve_pending_wrappers(
         if any(reference.get("event") in events for reference in references):
             state["pending_batches"].pop(batch_id, None)
             state.get("pending_results", {}).pop(batch_id, None)
+    state.get("pending_batches", {}).pop(wrapper_id, None)
+    state.get("pending_results", {}).pop(wrapper_id, None)
     for call_id in list(state.get("pending_artifacts", {})):
         if str(call_id) == wrapper_id or str(call_id).startswith(
             f"__codex_batch_child__:{wrapper_id}:"
@@ -4059,8 +4096,13 @@ def _codex_close_turn(state: dict, turn: dict, ts: str | None) -> dict | None:
         for event in events:
             if event.get("kind") == "tool":
                 tool = event.get("tool") or {}
-                tool["ok"] = not (failed or terminal_status != "completed")
-                tool["status"] = terminal_status
+                unresolved_artifact = kind == "artifact"
+                tool["ok"] = (
+                    False
+                    if unresolved_artifact
+                    else not (failed or terminal_status != "completed")
+                )
+                tool["status"] = "failed" if unresolved_artifact else terminal_status
                 tool["completed_at"] = ts
                 tool["partial"] = True
                 _record_tool_patch(state, event)
