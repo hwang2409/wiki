@@ -64,6 +64,7 @@ MAX_CODEX_BATCH_CHILD_INPUT = 600
 MAX_CODEX_BATCH_RESULT_BYTES = MAX_TOOL_IO * MAX_CODEX_HARNESS_CALLS
 MAX_CODEX_PENDING_RESULTS = 128
 MAX_CODEX_DELTA_CACHE = 512
+CODEX_EVENT_WINDOW = 2_000
 
 try:
     TAIL_WINDOW_EVENTS = max(1, int(os.environ.get("WIKI_TRANSCRIPT_TAIL_WINDOW", "500")))
@@ -1814,10 +1815,11 @@ def _codex_add_semantic_tool_event(
     ):
         return None, True
     if _is_artifact_tool(name) and call_id:
-        state.setdefault("pending_artifacts", {})[call_id] = {
-            "name": name,
-            "input": _tool_arguments(raw_input) or {},
-        }
+        _codex_register_pending_artifact(
+            state,
+            call_id,
+            {"name": name, "input": _tool_arguments(raw_input) or {}},
+        )
         return None, True
     archetype, summary = classify_tool(name, classify_input)
     event = {
@@ -2095,10 +2097,14 @@ def _codex_finish_batch_child(
     if isinstance(event, dict):
         event["tool"]["call_id"] = str(call_id)
     if _is_artifact_tool(name):
-        state.setdefault("pending_artifacts", {})[call_id] = {
-            "name": name,
-            "input": _tool_arguments(reference.get("arguments")) or {},
-        }
+        _codex_register_pending_artifact(
+            state,
+            call_id,
+            {
+                "name": name,
+                "input": _tool_arguments(reference.get("arguments")) or {},
+            },
+        )
     _codex_finish_tool_event(state, event, call_id, output, ts)
 
 
@@ -2267,7 +2273,44 @@ def _codex_append_streaming_event(
 
 def _codex_mark_authoritative_item(state: dict, item_id: object) -> None:
     if isinstance(item_id, (str, int)) and str(item_id):
-        state.setdefault("codex_authoritative_items", set()).add(str(item_id))
+        authoritative = state.setdefault("codex_authoritative_items", set())
+        authoritative.add(str(item_id))
+        if len(authoritative) > CODEX_EVENT_WINDOW:
+            authoritative.difference_update(
+                list(authoritative)[:-CODEX_EVENT_WINDOW]
+            )
+
+
+def _codex_bound_lifecycle_map(mapping: dict) -> None:
+    if len(mapping) > CODEX_EVENT_WINDOW:
+        for key in list(mapping)[:-CODEX_EVENT_WINDOW]:
+            mapping.pop(key, None)
+
+
+def _codex_register_pending_artifact(
+    state: dict, call_id: object, meta: dict
+) -> None:
+    pending = state.setdefault("pending_artifacts", {})
+    pending[call_id] = meta
+    _codex_bound_lifecycle_map(pending)
+
+
+def _codex_mark_terminal_item(
+    state: dict, item_id: object, event: dict | None = None
+) -> None:
+    if isinstance(item_id, (str, int)) and str(item_id):
+        terminal = state.setdefault("codex_terminal_items", {})
+        key = str(item_id)
+        if event is not None or key not in terminal:
+            terminal[key] = event
+        _codex_bound_lifecycle_map(terminal)
+
+
+def _codex_is_terminal_item(state: dict, item_id: object) -> bool:
+    return (
+        isinstance(item_id, (str, int))
+        and str(item_id) in state.setdefault("codex_terminal_items", {})
+    )
 
 
 _CODEX_MODERN_TOOL_TYPES = {
@@ -2537,6 +2580,7 @@ def _codex_modern_item_apply(
     if completed and event is not None:
         _codex_patch_modern_tool(state, event, item, ts, completed=True)
         state["pending"].pop(item_id, None)
+        _codex_mark_terminal_item(state, item_id, event)
     return True
 
 
@@ -2626,14 +2670,13 @@ def _append_artifact_event(
     state: dict,
     protocol_event: dict,
     ts: str | None,
-) -> bool:
+) -> dict | None:
     artifact_id = protocol_event.get("id")
     artifact_ids: set[str] = state.setdefault("artifact_ids", set())
     if artifact_id in artifact_ids:
-        return False
+        return None
     artifact_ids.add(artifact_id)
-    _append_event(state, _artifact_event(protocol_event, ts))
-    return True
+    return _append_event(state, _artifact_event(protocol_event, ts))
 
 
 def _artifact_tool_status(
@@ -2789,14 +2832,15 @@ def _complete_artifact(
     if protocol_event is not None and not _is_artifact_tool(meta.get("name")):
         protocol_event = None
     if protocol_event is not None:
-        _append_artifact_event(state, protocol_event, ts)
+        event = _append_artifact_event(state, protocol_event, ts)
     else:
-        _append_event(
+        event = _append_event(
             state,
             _failed_artifact_tool(meta, output, ts)
             if failed
             else _unparseable_artifact_tool(meta, output, ts),
         )
+    _codex_mark_terminal_item(state, call_id, event)
     return True
 
 
@@ -2989,12 +3033,13 @@ def _codex_apply_delta(
     if item_key and item_key in state.setdefault("codex_authoritative_items", set()):
         return True, current
     if current is None:
-        if not buffer_missing or not item_key:
-            return False, current
-        pending = state.setdefault("pending_modern_deltas", {}).setdefault(item_key, [])
-        if len(pending) < MAX_CODEX_DELTA_CACHE:
-            pending.append({"identity": identity, "text": delta})
-        return True, None
+            if not buffer_missing or not item_key:
+                return False, current
+            pending = state.setdefault("pending_modern_deltas", {}).setdefault(item_key, [])
+            if len(pending) < MAX_CODEX_DELTA_CACHE:
+                pending.append({"identity": identity, "text": delta})
+            _codex_bound_lifecycle_map(state["pending_modern_deltas"])
+            return True, None
     seen = state.setdefault("codex_delta_cache", set())
     signature = (item_key, identity)
     if identity is not None and signature in seen:
@@ -3153,8 +3198,23 @@ def _codex_apply(state: dict, row: dict) -> None:
                     if isinstance(text_field, str) and text_field:
                         parts.append(text_field)
             text = "\n".join(parts).strip()
+            message_id = payload.get("id")
+            message_key = (
+                str(message_id)
+                if isinstance(message_id, (str, int)) and str(message_id)
+                else None
+            )
+            modern_messages = state.setdefault("codex_modern_messages", {})
+            if role == "assistant" and message_key in modern_messages:
+                _record_row_disposition(state, EVENT_DISPOSITION_RENDERED)
+                return
+            event = None
             if text and not _dedupe_pair(state, "response_item", role, text):
-                _append_event(state, {"kind": role, "ts": ts, "text": _clip(text, MAX_TEXT)})
+                event = _append_event(
+                    state, {"kind": role, "ts": ts, "text": _clip(text, MAX_TEXT)}
+                )
+            if role == "assistant" and message_key and event is not None:
+                modern_messages[message_key] = event
             _record_row_disposition(state, EVENT_DISPOSITION_RENDERED)
         elif ptype == "reasoning":
             summary = payload.get("summary") or []
@@ -3327,6 +3387,7 @@ def _codex_modern_message_apply(
         _record_change(state, {"kind": "tail", "from": int(event["id"])})
     if event is not None and completed:
         _codex_track_turn_event(state, event, open=False)
+        _codex_mark_terminal_item(state, item_id, event)
     return True
 
 
@@ -3495,6 +3556,8 @@ def _codex_close_turn(state: dict, turn: dict, ts: str | None) -> dict | None:
     state["pending_results"].clear()
     for call_id, meta in list(state.get("pending_artifacts", {}).items()):
         state["pending_artifacts"].pop(call_id, None)
+        if _codex_is_terminal_item(state, call_id):
+            continue
         _append_event(
             state,
             _failed_artifact_tool(meta, f"turn {terminal_status}", ts),
@@ -3594,8 +3657,12 @@ def _codex_normalized_apply(state: dict, row: dict) -> None:
     }:
         item = params.get("item")
         if isinstance(item, dict):
+            item_id = _codex_modern_item_id(item)
+            if method == "item/started" and _codex_is_terminal_item(state, item_id):
+                _record_row_disposition(state, _normalized_disposition(row))
+                return
             if method != "item/started":
-                _codex_mark_authoritative_item(state, _codex_modern_item_id(item))
+                _codex_mark_authoritative_item(state, item_id)
             item_status = item.get("status")
             item_result = item.get("result")
             item_failed = (
@@ -3609,10 +3676,11 @@ def _codex_normalized_apply(state: dict, row: dict) -> None:
             )
             artifact = None if item_failed else artifact_from_codex_mcp_tool_result(item)
             if artifact is not None:
-                item_id = _codex_modern_item_id(item)
                 if item_id:
                     state.get("pending_artifacts", {}).pop(item_id, None)
-                _append_artifact_event(state, artifact, ts)
+                event = _append_artifact_event(state, artifact, ts)
+                if method != "item/started":
+                    _codex_mark_terminal_item(state, item_id, event)
                 _record_row_disposition(state, _normalized_disposition(row))
                 return
             if item.get("type") == "reasoning":
@@ -3688,7 +3756,8 @@ def _codex_normalized_apply(state: dict, row: dict) -> None:
             item_id = _codex_modern_item_id(item)
             if item_id:
                 state.get("pending_artifacts", {}).pop(item_id, None)
-            _append_artifact_event(state, artifact, ts)
+            event = _append_artifact_event(state, artifact, ts)
+            _codex_mark_terminal_item(state, item_id, event)
             _record_row_disposition(state, _normalized_disposition(row))
             return
         if _is_codex_render_artifact_call(item):
@@ -4597,10 +4666,14 @@ def _claude_apply(state: dict, row: dict) -> None:
                 _emit_question_events(state, ts, raw_input.get("questions") or [], block_id)
                 rendered = True
             elif _is_artifact_tool(name) and block_id:
-                state.setdefault("pending_artifacts", {})[block_id] = {
-                    "name": name,
-                    "input": _tool_arguments(raw_input) or {},
-                }
+                _codex_register_pending_artifact(
+                    state,
+                    block_id,
+                    {
+                        "name": name,
+                        "input": _tool_arguments(raw_input) or {},
+                    },
+                )
                 rendered = True
             else:
                 tool_input = _codex_tool_input(name, raw_input)
@@ -4850,7 +4923,10 @@ def _new_parse_state(fmt: str) -> dict:
         "codex_modern_items": {},
         "codex_modern_messages": {},
         "codex_authoritative_items": set(),
+        "codex_terminal_items": {},
         "codex_turn_open_events": {},
+        "codex_reasoning_text": {},
+        "codex_reasoning_events": {},
         "pending_modern_deltas": {},
         "codex_delta_cache": set(),
         "pending_questions": {},
@@ -4897,6 +4973,102 @@ def _prune_change_log(state: dict) -> None:
             and int(change.get("index", base)) >= base
         )
     ]
+
+
+def _codex_prune_lifecycle_maps(state: dict, kept: set[int]) -> None:
+    """Drop Codex lifecycle entries whose rendered events left the window."""
+
+    terminal: dict = state.setdefault("codex_terminal_items", {})
+    for item_id, event in list(terminal.items()):
+        if isinstance(event, dict) and id(event) not in kept:
+            terminal.pop(item_id, None)
+
+    pending_artifacts = state.setdefault("pending_artifacts", {})
+    modern_items: dict = state.setdefault("codex_modern_items", {})
+    for item_id, event in list(modern_items.items()):
+        if isinstance(event, dict):
+            if id(event) not in kept:
+                modern_items.pop(item_id, None)
+        elif item_id not in pending_artifacts and item_id not in terminal:
+            modern_items.pop(item_id, None)
+
+    modern_messages: dict = state.setdefault("codex_modern_messages", {})
+    for item_id, event in list(modern_messages.items()):
+        if not isinstance(event, dict) or id(event) not in kept:
+            modern_messages.pop(item_id, None)
+
+    reasoning_events: dict = state.setdefault("codex_reasoning_events", {})
+    for key, event in list(reasoning_events.items()):
+        if not isinstance(event, dict) or id(event) not in kept:
+            reasoning_events.pop(key, None)
+    reasoning_text: dict = state.setdefault("codex_reasoning_text", {})
+    reasoning_text = {
+        item_id: text
+        for item_id, text in reasoning_text.items()
+        if any(key.startswith(f"{item_id}:") for key in reasoning_events)
+    }
+    state["codex_reasoning_text"] = reasoning_text
+
+    open_events: dict = state.setdefault("codex_turn_open_events", {})
+    for key, event in list(open_events.items()):
+        if not isinstance(event, dict) or id(event) not in kept:
+            open_events.pop(key, None)
+
+    visible_item_ids = set(modern_items) | set(modern_messages)
+    visible_item_ids.update(
+        item_id for item_id, event in terminal.items() if isinstance(event, dict)
+    )
+    state["codex_authoritative_items"] = {
+        item_id
+        for item_id in state.setdefault("codex_authoritative_items", set())
+        if item_id in visible_item_ids
+    }
+    state["pending_modern_deltas"] = {
+        item_id: deltas
+        for item_id, deltas in state.setdefault("pending_modern_deltas", {}).items()
+        if item_id in visible_item_ids
+    }
+
+    for item_id in list(pending_artifacts):
+        if item_id in terminal:
+            pending_artifacts.pop(item_id, None)
+    if len(pending_artifacts) > CODEX_EVENT_WINDOW:
+        for item_id in list(pending_artifacts)[:-CODEX_EVENT_WINDOW]:
+            pending_artifacts.pop(item_id, None)
+
+    pending_batches: dict = state.setdefault("pending_batches", {})
+    if len(pending_batches) > CODEX_EVENT_WINDOW:
+        for call_id in list(pending_batches)[:-CODEX_EVENT_WINDOW]:
+            pending_batches.pop(call_id, None)
+
+    for mapping_name in ("codex_modern_items", "codex_modern_messages", "codex_terminal_items"):
+        mapping = state.setdefault(mapping_name, {})
+        if len(mapping) > CODEX_EVENT_WINDOW:
+            for item_id in list(mapping)[:-CODEX_EVENT_WINDOW]:
+                mapping.pop(item_id, None)
+
+    visible_item_ids = set(state.setdefault("codex_modern_items", {}))
+    visible_item_ids.update(state.setdefault("codex_modern_messages", {}))
+    visible_item_ids.update(
+        item_id
+        for item_id, event in state.setdefault("codex_terminal_items", {}).items()
+        if isinstance(event, dict)
+    )
+    state["codex_authoritative_items"] = {
+        item_id
+        for item_id in state.get("codex_authoritative_items", set())
+        if item_id in visible_item_ids
+    }
+    state["pending_modern_deltas"] = {
+        item_id: deltas
+        for item_id, deltas in state.get("pending_modern_deltas", {}).items()
+        if item_id in visible_item_ids
+    }
+    state["artifact_ids"] = {
+        event.get("artifact_id")
+        for event in state.get("events", [])
+        if event.get("kind") == "artifact" and event.get("artifact_id")
+    }
 
 
 def _read_cached_state(fmt: str, path: Path, key: str) -> dict:
@@ -4981,10 +5153,10 @@ def _read_cached_state(fmt: str, path: Path, key: str) -> dict:
                 apply(state, row)
             except (KeyError, TypeError, AttributeError):
                 continue
-        if len(state["events"]) > 2000:
-            trim = len(state["events"]) - 2000
+        if len(state["events"]) > CODEX_EVENT_WINDOW:
+            trim = len(state["events"]) - CODEX_EVENT_WINDOW
             state["base"] += trim
-            state["events"] = state["events"][-2000:]
+            state["events"] = state["events"][-CODEX_EVENT_WINDOW:]
             kept = set(map(id, state["events"]))
             state["pending"] = {
                 call_id: event for call_id, event in state["pending"].items() if id(event) in kept
@@ -4998,6 +5170,7 @@ def _read_cached_state(fmt: str, path: Path, key: str) -> dict:
                     for reference in references
                 )
             }
+            _codex_prune_lifecycle_maps(state, kept)
             _prune_change_log(state)
             state["last_bash"] = None
     return state

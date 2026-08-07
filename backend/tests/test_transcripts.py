@@ -1445,6 +1445,205 @@ class CodexModernTranscriptParityTests(unittest.TestCase):
             ],
         )
 
+    def test_round6_j1_modern_agent_completion_pairs_raw_assistant_twin_by_id(self) -> None:
+        rows = [
+            self._row(
+                "item/completed",
+                {
+                    "item": {
+                        "type": "agentMessage",
+                        "id": "assistant-twin",
+                        "text": "modern answer",
+                    }
+                },
+                1,
+            ),
+            self._row(
+                "rawResponseItem/completed",
+                {
+                    "item": {
+                        "type": "message",
+                        "id": "assistant-twin",
+                        "role": "assistant",
+                        "content": [{"type": "output_text", "text": "modern answer"}],
+                    }
+                },
+                2,
+            ),
+            self._row(
+                "rawResponseItem/completed",
+                {
+                    "item": {
+                        "type": "message",
+                        "id": "raw-only",
+                        "role": "assistant",
+                        "content": [{"type": "output_text", "text": "raw answer"}],
+                    }
+                },
+                3,
+            ),
+            self._row(
+                "rawResponseItem/completed",
+                {
+                    "item": {
+                        "type": "message",
+                        "id": "raw-first",
+                        "role": "assistant",
+                        "content": [{"type": "output_text", "text": "raw first"}],
+                    }
+                },
+                4,
+            ),
+            self._row(
+                "item/completed",
+                {
+                    "item": {
+                        "type": "agentMessage",
+                        "id": "raw-first",
+                        "text": "raw first",
+                    }
+                },
+                5,
+            ),
+        ]
+        with TemporaryDirectory() as tmp:
+            path = Path(tmp) / "raw-message-twins.jsonl"
+            path.write_text("".join(json.dumps(row) + "\n" for row in rows))
+            parsed = transcripts.read_session_events("codex-normalized", path)
+
+        self.assertEqual(
+            [(event["kind"], event["text"]) for event in parsed["events"]],
+            [
+                ("assistant", "modern answer"),
+                ("assistant", "raw answer"),
+                ("assistant", "raw first"),
+            ],
+        )
+
+    def test_round6_j2_completed_artifact_ignores_replayed_start(self) -> None:
+        artifact = _artifact_protocol_event("mermaid", 269)
+        item = {
+            "type": "mcpToolCall",
+            "id": "artifact-terminal",
+            "server": "wiki_artifacts",
+            "tool": "render_artifact",
+            "arguments": {"kind": "mermaid", "payload": {"source": "graph TD; A-->B"}},
+            "status": "inProgress",
+        }
+        completed = {
+            **item,
+            "status": "completed",
+            "result": {"content": [{"type": "text", "text": sentinel_text(artifact)}]},
+        }
+        rows = [
+            self._row("item/started", {"item": item}, 1),
+            self._row("item/completed", {"item": completed}, 2),
+            self._row("item/started", {"item": item}, 3),
+            self._row("turn/completed", {"turn": {"status": "completed"}}, 4),
+        ]
+        with TemporaryDirectory() as tmp:
+            path = Path(tmp) / "artifact-replay.jsonl"
+            path.write_text("".join(json.dumps(row) + "\n" for row in rows))
+            parsed = transcripts.read_session_events("codex-normalized", path)
+            state = transcripts._cache[str(path)]
+
+        self.assertEqual([event["kind"] for event in parsed["events"]], ["artifact"])
+        self.assertIn("artifact-terminal", state["codex_terminal_items"])
+        self.assertNotIn("artifact-terminal", state["pending_artifacts"])
+
+    def test_round6_j3_trim_evicts_old_maps_and_preserves_visible_lifecycle(self) -> None:
+        rows = []
+        for index in range(2200):
+            item_id = f"filler-{index}"
+            rows.extend(
+                [
+                    self._row(
+                        "item/started",
+                        {"item": {"type": "agentMessage", "id": item_id, "text": item_id}},
+                        index * 2 + 1,
+                    ),
+                    self._row(
+                        "item/completed",
+                        {"item": {"type": "agentMessage", "id": item_id, "text": item_id}},
+                        index * 2 + 2,
+                    ),
+                ]
+            )
+        rows.extend(
+            [
+                self._row(
+                    "item/started",
+                    {
+                        "item": {
+                            "type": "commandExecution",
+                            "id": "visible-tool",
+                            "command": "printf final",
+                            "status": "inProgress",
+                        }
+                    },
+                    3000,
+                ),
+                self._row(
+                    "item/commandExecution/outputDelta",
+                    {"itemId": "visible-tool", "delta": "old"},
+                    3001,
+                ),
+                self._row(
+                    "item/completed",
+                    {
+                        "item": {
+                            "type": "commandExecution",
+                            "id": "visible-tool",
+                            "command": "printf final",
+                            "status": "completed",
+                            "aggregatedOutput": "final",
+                            "exitCode": 0,
+                        }
+                    },
+                    3002,
+                ),
+                self._row(
+                    "item/commandExecution/outputDelta",
+                    {"itemId": "visible-tool", "delta": " late"},
+                    3003,
+                ),
+                self._row(
+                    "item/started",
+                    {
+                        "item": {
+                            "type": "agentMessage",
+                            "id": "visible-open",
+                            "text": "unfinished",
+                        }
+                    },
+                    3004,
+                ),
+                self._row("turn/completed", {"turn": {"status": "interrupted"}}, 3005),
+            ]
+        )
+        with TemporaryDirectory() as tmp:
+            path = Path(tmp) / "lifecycle-trim.jsonl"
+            path.write_text("".join(json.dumps(row) + "\n" for row in rows))
+            transcripts.read_session_events("codex-normalized", path)
+            state = transcripts._cache[str(path)]
+
+        for mapping_name in (
+            "codex_modern_items",
+            "codex_modern_messages",
+            "codex_reasoning_events",
+            "codex_turn_open_events",
+            "codex_terminal_items",
+            "codex_authoritative_items",
+            "pending_modern_deltas",
+            "artifact_ids",
+        ):
+            self.assertLessEqual(len(state[mapping_name]), transcripts.CODEX_EVENT_WINDOW)
+        self.assertNotIn("filler-0", state["codex_modern_messages"])
+        self.assertEqual(
+            state["codex_modern_items"]["visible-tool"]["tool"]["output"], "final"
+        )
+        self.assertTrue(state["codex_modern_messages"]["visible-open"]["partial"])
+
     def test_round2_f1_wrapper_incremental_replay_matches_full_and_keeps_unmatched(self) -> None:
         wrapper = {
             "type": "response_item",
@@ -1848,17 +2047,6 @@ class CodexModernTranscriptParityTests(unittest.TestCase):
                 },
                 7,
             ),
-            self._row(
-                "item/started",
-                {
-                    "item": {
-                        "type": "agentMessage",
-                        "id": "current-open",
-                        "text": "current open",
-                    }
-                },
-                8,
-            ),
         ]
         for index in range(2000):
             item_id = f"filler-{index}"
@@ -1876,6 +2064,19 @@ class CodexModernTranscriptParityTests(unittest.TestCase):
                     ),
                 ]
             )
+        rows.append(
+            self._row(
+                "item/started",
+                {
+                    "item": {
+                        "type": "agentMessage",
+                        "id": "current-open",
+                        "text": "current open",
+                    }
+                },
+                5000,
+            )
+        )
         with TemporaryDirectory() as tmp:
             path = Path(tmp) / "interrupt-trimmed.jsonl"
             path.write_text("".join(json.dumps(row) + "\n" for row in rows))
@@ -1886,7 +2087,7 @@ class CodexModernTranscriptParityTests(unittest.TestCase):
                     self._row(
                         "turn/completed",
                         {"turn": {"status": "interrupted"}},
-                        5000,
+                        5001,
                     )
                 )
                 + "\n"
@@ -1894,8 +2095,9 @@ class CodexModernTranscriptParityTests(unittest.TestCase):
             transcripts.read_session_events("codex-normalized", path)
             state = transcripts._cache[str(path)]
 
-        self.assertNotIn("partial", state["codex_modern_messages"]["prior"])
-        self.assertNotIn("partial", state["codex_modern_messages"]["current-complete"])
+        self.assertNotIn("prior", state["codex_modern_messages"])
+        self.assertNotIn("current-complete", state["codex_modern_messages"])
+        self.assertIn("current-open", state["codex_modern_messages"])
         self.assertTrue(state["codex_modern_messages"]["current-open"]["partial"])
 
     def test_round4_h3_successful_native_artifact_has_no_rejected_row(self) -> None:
