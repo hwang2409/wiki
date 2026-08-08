@@ -2477,6 +2477,33 @@ class CodexModernTranscriptParityTests(unittest.TestCase):
             "payload": {"type": "turn_completed", "turn": {"status": "completed"}},
         }
         with TemporaryDirectory() as tmp:
+            cold_path = Path(tmp) / "cold-batch-artifact.jsonl"
+            cold_path.write_text(json.dumps(wrapper) + "\n" + json.dumps(native_rows[0]) + "\n")
+            cold_parsed = transcripts.read_session_events("codex", cold_path)
+            cold_state = transcripts._cache[str(cold_path)]
+            cold_child_ids = {
+                tool.get("call_id")
+                for event in cold_parsed["events"]
+                if event["kind"] == "tool"
+                for tool in [event["tool"]]
+                if tool.get("call_id") in {
+                    "__codex_batch_child__:batch-artifact-wrapper:0",
+                    "__codex_batch_child__:batch-artifact-wrapper:1",
+                }
+            }
+            self.assertEqual(
+                cold_child_ids,
+                {"__codex_batch_child__:batch-artifact-wrapper:1"},
+            )
+            self.assertNotIn(
+                "__codex_batch_child__:batch-artifact-wrapper:0",
+                cold_state["pending_artifacts"],
+            )
+            self.assertIn(
+                "__codex_batch_child__:batch-artifact-wrapper:1",
+                cold_state["pending_artifacts"],
+            )
+
             path = Path(tmp) / "incremental-batch-artifact.jsonl"
             path.write_text(json.dumps(wrapper) + "\n")
             transcripts.read_session_events("codex", path)
@@ -2804,6 +2831,26 @@ class CodexModernTranscriptParityTests(unittest.TestCase):
         }
         with TemporaryDirectory() as tmp:
             path = Path(tmp) / "batch-pending-artifact.jsonl"
+            path.write_text(json.dumps(row) + "\n")
+            parsed = transcripts.read_session_events("codex", path)
+            state = transcripts._cache[str(path)]
+
+            pending_tool = next(
+                event["tool"]
+                for event in parsed["events"]
+                if event["kind"] == "tool"
+                and event["tool"]["name"] == "mcp__wiki_artifacts__render_artifact"
+            )
+            self.assertIsNone(pending_tool["ok"])
+            self.assertIsNone(pending_tool["output"])
+            self.assertEqual(pending_tool["status"], "inProgress")
+            self.assertEqual(
+                state["codex_item_lifecycle"][
+                    "__codex_batch_child__:batch-pending-artifact:0"
+                ]["state"],
+                "open",
+            )
+
             path.write_text(json.dumps(row) + "\n" + json.dumps(turn_completed) + "\n")
             parsed = transcripts.read_session_events("codex", path)
             state = transcripts._cache[str(path)]

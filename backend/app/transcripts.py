@@ -1345,6 +1345,30 @@ def _codex_harness_fallback_input(raw_input: str) -> str:
     return "dynamic tool program"
 
 
+def _codex_native_tool_counts(state: dict) -> dict[tuple[str, str], int]:
+    """Return the current turn's counted native MCP identities."""
+    counts = state.setdefault("codex_native_tools", {})
+    if not isinstance(counts, dict):
+        counts = {}
+        state["codex_native_tools"] = counts
+    return counts
+
+
+def _codex_consume_native_tool(
+    state: dict, native_key: tuple[str, str]
+) -> bool:
+    """Consume one native MCP identity from the wrapper suppression scope."""
+    counts = _codex_native_tool_counts(state)
+    count = counts.get(native_key, 0)
+    if not isinstance(count, int) or count <= 0:
+        return False
+    if count == 1:
+        counts.pop(native_key, None)
+    else:
+        counts[native_key] = count - 1
+    return True
+
+
 def _codex_wrapper_has_native_mcp(
     state: dict, raw_input: object, call_id: object = None
 ) -> bool:
@@ -1366,9 +1390,12 @@ def _codex_wrapper_has_native_mcp(
         if str(name).startswith("mcp__")
     }
     all_names = {str(name) for name, _, _, _ in calls}
-    native_names = {name for name, _ in state.get("codex_native_tools", set())}
+    native_tools = _codex_native_tool_counts(state)
+    native_names = {
+        name for (name, _), count in native_tools.items() if count > 0
+    }
     return bool(expected) and all(name.startswith("mcp__") for name in all_names) and all(
-        key in state.get("codex_native_tools", set()) for key in expected
+        native_tools.get(key, 0) > 0 for key in expected
     ) and all(name in native_names for name in all_names if name.startswith("mcp__"))
 
 
@@ -1813,8 +1840,8 @@ def _codex_add_semantic_tool_event(
     if name == "exec" and _codex_wrapper_has_native_mcp(state, raw_input, call_id):
         return None, True
     native_key = (name, tool_input)
-    if wrapper and name.startswith("mcp__") and native_key in state.get(
-        "codex_native_tools", set()
+    if wrapper and name.startswith("mcp__") and _codex_consume_native_tool(
+        state, native_key
     ):
         return None, True
     if _is_artifact_tool(name) and call_id:
@@ -2295,7 +2322,8 @@ def _codex_apply_mcp_tool_item(state: dict, item: dict, ts: str | None) -> bool:
     if _codex_is_terminal_item(state, call_id):
         return True
     native_key = (name, _codex_tool_input(name, raw_input))
-    state.setdefault("codex_native_tools", set()).add(native_key)
+    native_tools = _codex_native_tool_counts(state)
+    native_tools[native_key] = max(native_tools.get(native_key, 0), 1)
     if call_id:
         state.setdefault("codex_native_call_ids", set()).add(str(call_id))
     _codex_resolve_pending_wrappers(state, native_key, call_id)
@@ -2366,7 +2394,7 @@ def _codex_native_call_id(row: dict) -> str | None:
 
 
 def _codex_reset_turn_scope(state: dict) -> None:
-    state.setdefault("codex_native_tools", set()).clear()
+    state.setdefault("codex_native_tools", {}).clear()
     state.setdefault("codex_native_call_ids", set()).clear()
     state.setdefault("pending_wrappers", {}).clear()
     # Item lifecycle belongs to the registry.  Turn reset only clears the
@@ -5502,7 +5530,7 @@ def _new_parse_state(fmt: str) -> dict:
         "thinking_tokens": 0,
         "artifact_ids": set(),
         "dedupe_credits": {},
-        "codex_native_tools": set(),
+        "codex_native_tools": {},
         "codex_native_call_ids": set(),
         "pending_wrappers": {},
         "dispositions": {"rendered": 0, "summarized": 0, "ignored": 0, "unknown": 0},
@@ -5674,23 +5702,24 @@ def _read_cached_state(fmt: str, path: Path, key: str) -> dict:
                 continue
             if isinstance(row, dict):
                 parsed_rows.append(row)
-        native_scopes: list[tuple[set[tuple[str, str]], set[str]]] = []
+        native_scopes: list[tuple[dict[tuple[str, str], int], set[str]]] = []
         if fmt.startswith("codex"):
-            base_tools = set(state.setdefault("codex_native_tools", set()))
+            base_tools = dict(_codex_native_tool_counts(state))
             base_call_ids = set(state.setdefault("codex_native_call_ids", set()))
 
             def prime_scope(start: int, end: int) -> None:
-                scope_tools = set(base_tools)
+                scope_tools = dict(base_tools)
                 scope_call_ids = set(base_call_ids)
                 for scoped_row in parsed_rows[start:end]:
                     native_key = _codex_native_tool_key(scoped_row)
                     if native_key is not None:
-                        scope_tools.add(native_key)
+                        scope_tools[native_key] = scope_tools.get(native_key, 0) + 1
                     native_call_id = _codex_native_call_id(scoped_row)
                     if native_call_id is not None:
                         scope_call_ids.add(native_call_id)
                 native_scopes.extend(
-                    (set(scope_tools), set(scope_call_ids)) for _ in range(end - start)
+                    (dict(scope_tools), set(scope_call_ids))
+                    for _ in range(end - start)
                 )
 
             segment_start = 0
@@ -5700,12 +5729,12 @@ def _read_cached_state(fmt: str, path: Path, key: str) -> dict:
                     if index > segment_start:
                         prime_scope(segment_start, index)
                     segment_start = index
-                    base_tools = set()
+                    base_tools = {}
                     base_call_ids = set()
                 if method == "turn/completed":
                     prime_scope(segment_start, index + 1)
                     segment_start = index + 1
-                    base_tools = set()
+                    base_tools = {}
                     base_call_ids = set()
             if segment_start < len(parsed_rows):
                 prime_scope(segment_start, len(parsed_rows))
