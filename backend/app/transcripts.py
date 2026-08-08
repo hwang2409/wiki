@@ -2637,6 +2637,7 @@ def _codex_prime_native_scope(
     scope_batches = dict(base_batches)
     specs: list[dict] = []
     seen_batches: set[str] = set()
+    seen_native_ids: set[str] = set(scope_batches)
 
     for batch_id, record in state.get("pending_wrappers", {}).items():
         expected = record.get("expected", []) if isinstance(record, dict) else []
@@ -2687,6 +2688,10 @@ def _codex_prime_native_scope(
         if native_key is None:
             continue
         native_id = _codex_native_call_id(rows[index])
+        if native_id is not None and native_id in seen_native_ids:
+            # A native MCP item and its raw twin are one occurrence.  Do not
+            # attribute the twin to a later batch.
+            continue
         candidates = [
             spec
             for spec in specs
@@ -2703,6 +2708,7 @@ def _codex_prime_native_scope(
             scope_tools[credit_key] = scope_tools.get(credit_key, 0) + 1
         if native_id is not None:
             scope_batches[native_id] = selected["id"]
+            seen_native_ids.add(native_id)
         assignments[index] = selected["id"]
     return scope_tools, scope_batches, assignments
 
