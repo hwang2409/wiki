@@ -1346,7 +1346,7 @@ def _codex_harness_fallback_input(raw_input: str) -> str:
 
 
 def _codex_native_tool_counts(state: dict) -> dict[tuple[str, str], int]:
-    """Return the current turn's counted native MCP identities."""
+    """Return the current batch-pairing window's counted native MCP identities."""
     counts = state.setdefault("codex_native_tools", {})
     if not isinstance(counts, dict):
         counts = {}
@@ -2396,18 +2396,18 @@ def _codex_native_call_id(row: dict) -> str | None:
     return None
 
 
-def _codex_reset_turn_scope(state: dict) -> None:
-    state.setdefault("codex_native_tools", {}).clear()
-    state.setdefault("codex_native_call_ids", set()).clear()
-    state.setdefault("pending_wrappers", {}).clear()
-    # Item lifecycle belongs to the registry.  Turn reset only clears the
-    # provider-specific suppression scope; open items remain registered so a
-    # later sweep can scope itself to the interrupted turn.
+def _codex_reset_turn_scope(state: dict, *, preserve_pairing: bool = False) -> None:
+    if not preserve_pairing:
+        state.setdefault("codex_native_tools", {}).clear()
+        state.setdefault("codex_native_call_ids", set()).clear()
+        state.setdefault("pending_wrappers", {}).clear()
+    # Item lifecycle belongs to the registry. Pairing state survives starts but
+    # clears at turn completion; open items remain registered for later sweeps.
 
 
 def _codex_start_turn(state: dict, turn: object = None) -> None:
     """Start a new turn without changing any existing item lifecycle."""
-    _codex_reset_turn_scope(state)
+    _codex_reset_turn_scope(state, preserve_pairing=True)
     counter = int(state.get("codex_turn_counter", 0)) + 1
     state["codex_turn_counter"] = counter
     turn_id = None
@@ -5727,14 +5727,7 @@ def _read_cached_state(fmt: str, path: Path, key: str) -> dict:
 
             segment_start = 0
             for index, row in enumerate(parsed_rows):
-                method = _codex_turn_method(row)
-                if method == "turn/started":
-                    if index > segment_start:
-                        prime_scope(segment_start, index)
-                    segment_start = index
-                    base_tools = {}
-                    base_call_ids = set()
-                if method == "turn/completed":
+                if _codex_turn_method(row) == "turn/completed":
                     prime_scope(segment_start, index + 1)
                     segment_start = index + 1
                     base_tools = {}
