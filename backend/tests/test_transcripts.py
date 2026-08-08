@@ -2620,6 +2620,198 @@ class CodexModernTranscriptParityTests(unittest.TestCase):
         with self.subTest("two native occurrences"):
             self.assertEqual(visible_wrapper_count(two_native), 0)
 
+    def test_round14_native_credits_are_batch_scoped_and_registry_bounded(self) -> None:
+        duplicate_batch = (
+            'const rs = await Promise.all(['
+            'tools.mcp__fixture__lookup({value:"wanted"}),'
+            'tools.mcp__fixture__lookup({value:"wanted"})'
+            ']); text(rs);'
+        )
+        sequential_batch = (
+            'const first = await tools.mcp__fixture__lookup({value:"wanted"}); '
+            'text(first); '
+            'const second = await tools.mcp__fixture__lookup({value:"wanted"}); '
+            'text(second);'
+        )
+
+        def wrapper(call_id: str, source: str) -> dict:
+            return {
+                "type": "response_item",
+                "timestamp": "2026-08-08T12:00:00Z",
+                "payload": {
+                    "type": "custom_tool_call",
+                    "call_id": call_id,
+                    "name": "exec",
+                    "input": source,
+                },
+            }
+
+        def native(call_id: str) -> dict:
+            return {
+                "type": "response_item",
+                "timestamp": "2026-08-08T12:00:01Z",
+                "payload": {
+                    "type": "mcpToolCall",
+                    "id": call_id,
+                    "server": "fixture",
+                    "tool": "lookup",
+                    "arguments": {"value": "wanted"},
+                    "status": "completed",
+                    "result": {"content": [{"type": "text", "text": "native"}]},
+                },
+            }
+
+        turn_started = {
+            "type": "event_msg",
+            "timestamp": "2026-08-08T12:00:00Z",
+            "payload": {"type": "turn_started"},
+        }
+
+        def visible_child_count(parsed: dict) -> int:
+            return sum(
+                1
+                for event in parsed["events"]
+                if event["kind"] == "tool"
+                and event["tool"]["name"] == "mcp__fixture__lookup"
+                and event["tool"]["output"] is None
+            )
+
+        def parse_rows(tmp: str, name: str, rows: list[dict]) -> tuple[dict, dict]:
+            path = Path(tmp) / name
+            path.write_text("\n".join(json.dumps(row) for row in rows) + "\n")
+            transcripts._cache.clear()
+            parsed = transcripts.read_session_events("codex", path)
+            return parsed, transcripts._cache[str(path)]
+
+        with TemporaryDirectory() as tmp:
+            one_native, _ = parse_rows(
+                tmp,
+                "one-native.jsonl",
+                [wrapper("batch-one", duplicate_batch), native("native-one")],
+            )
+            two_native, _ = parse_rows(
+                tmp,
+                "two-native.jsonl",
+                [
+                    wrapper("batch-two", duplicate_batch),
+                    native("native-two-a"),
+                    native("native-two-b"),
+                ],
+            )
+            interleaved_one, _ = parse_rows(
+                tmp,
+                "interleaved-one.jsonl",
+                [
+                    wrapper("batch-interleaved-one", duplicate_batch),
+                    turn_started,
+                    native("native-interleaved-one"),
+                ],
+            )
+            interleaved_two, _ = parse_rows(
+                tmp,
+                "interleaved-two.jsonl",
+                [
+                    wrapper("batch-interleaved-two", duplicate_batch),
+                    turn_started,
+                    native("native-interleaved-two-a"),
+                    native("native-interleaved-two-b"),
+                ],
+            )
+
+            cross_batch, _ = parse_rows(
+                tmp,
+                "cross-batch.jsonl",
+                [
+                    native("native-cross"),
+                    wrapper("batch-cross-a", sequential_batch),
+                    wrapper("batch-cross-b", sequential_batch),
+                ],
+            )
+
+            incremental_path = Path(tmp) / "incremental-cross-batch.jsonl"
+            incremental_path.write_text(
+                json.dumps(wrapper("batch-incremental-a", sequential_batch)) + "\n"
+            )
+            transcripts._cache.clear()
+            transcripts.read_session_events("codex", incremental_path)
+            incremental_path.write_text(
+                "\n".join(
+                    json.dumps(row)
+                    for row in [
+                        wrapper("batch-incremental-a", sequential_batch),
+                        native("native-incremental"),
+                    ]
+                )
+                + "\n"
+            )
+            transcripts.read_session_events("codex", incremental_path)
+            incremental_path.write_text(
+                "\n".join(
+                    json.dumps(row)
+                    for row in [
+                        wrapper("batch-incremental-a", sequential_batch),
+                        native("native-incremental"),
+                        wrapper("batch-incremental-b", sequential_batch),
+                        {
+                            "type": "event_msg",
+                            "timestamp": "2026-08-08T12:00:02Z",
+                            "payload": {
+                                "type": "turn_completed",
+                                "turn": {"status": "completed"},
+                            },
+                        },
+                    ]
+                )
+                + "\n"
+            )
+            incremental_cross = transcripts.read_session_events("codex", incremental_path)
+            incremental_state = transcripts._cache[str(incremental_path)]
+
+        with self.subTest("one native occurrence"):
+            self.assertEqual(
+                visible_child_count(one_native),
+                1,
+            )
+        with self.subTest("two native occurrences"):
+            self.assertEqual(visible_child_count(two_native), 0)
+        with self.subTest("turn started keeps one native pairing"):
+            self.assertEqual(
+                visible_child_count(interleaved_one),
+                1,
+            )
+        with self.subTest("turn started keeps two native pairings"):
+            self.assertEqual(visible_child_count(interleaved_two), 0)
+        with self.subTest("cold cross-batch isolation"):
+            self.assertEqual(
+                len(
+                    [
+                        event
+                        for event in cross_batch["events"]
+                        if event["kind"] == "tool"
+                        and event["tool"]["name"] == "exec"
+                    ]
+                ),
+                2,
+            )
+        with self.subTest("incremental cross-batch isolation"):
+            self.assertEqual(
+                len(
+                    [
+                        event
+                        for event in incremental_cross["events"]
+                        if event["kind"] == "tool"
+                        and event["tool"]["name"] == "exec"
+                    ]
+                ),
+                2,
+            )
+        with self.subTest("registry closes the incremental pairing window"):
+            self.assertEqual(incremental_state["codex_native_tools"], {})
+            self.assertEqual(
+                incremental_state["codex_item_lifecycle"]["batch-incremental-a"]["state"],
+                "terminal",
+            )
+
     def test_round2_f2_statusless_completed_items_are_done(self) -> None:
         parsed = transcripts.read_session_events(
             "codex-normalized", FIXTURES_DIR / "codex_wiki266_round2_lifecycle.jsonl"

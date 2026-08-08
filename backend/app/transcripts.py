@@ -1345,8 +1345,8 @@ def _codex_harness_fallback_input(raw_input: str) -> str:
     return "dynamic tool program"
 
 
-def _codex_native_tool_counts(state: dict) -> dict[tuple[str, str], int]:
-    """Return the current batch-pairing window's counted native MCP identities."""
+def _codex_native_tool_counts(state: dict) -> dict[tuple[str, tuple[str, str]], int]:
+    """Return native MCP credits keyed by batch identity and semantic key."""
     counts = state.setdefault("codex_native_tools", {})
     if not isinstance(counts, dict):
         counts = {}
@@ -1354,18 +1354,30 @@ def _codex_native_tool_counts(state: dict) -> dict[tuple[str, str], int]:
     return counts
 
 
+def _codex_native_credit_key(
+    batch_id: object, native_key: tuple[str, str]
+) -> tuple[str, tuple[str, str]] | None:
+    batch_key = _codex_item_key(batch_id)
+    if batch_key is None:
+        return None
+    return batch_key, native_key
+
+
 def _codex_consume_native_tool(
-    state: dict, native_key: tuple[str, str]
+    state: dict, batch_id: object, native_key: tuple[str, str]
 ) -> bool:
-    """Consume one native MCP identity from the wrapper suppression scope."""
+    """Consume one native MCP credit from its wrapper batch only."""
     counts = _codex_native_tool_counts(state)
-    count = counts.get(native_key, 0)
+    credit_key = _codex_native_credit_key(batch_id, native_key)
+    if credit_key is None:
+        return False
+    count = counts.get(credit_key, 0)
     if not isinstance(count, int) or count <= 0:
         return False
     if count == 1:
-        counts[native_key] = 0
+        counts[credit_key] = 0
     else:
-        counts[native_key] = count - 1
+        counts[credit_key] = count - 1
     return True
 
 
@@ -1373,8 +1385,9 @@ def _codex_wrapper_has_native_mcp(
     state: dict, raw_input: object, call_id: object = None
 ) -> bool:
     """Check whether native MCP rows replace an outer wrapper's MCP work."""
-    if call_id and str(call_id) in state.get("codex_native_call_ids", set()):
-        return True
+    batch_id = _codex_item_key(call_id)
+    if batch_id is None:
+        return False
     if not isinstance(raw_input, str):
         return False
     calls = _codex_harness_calls(raw_input)
@@ -1384,19 +1397,30 @@ def _codex_wrapper_has_native_mcp(
     parsed = [_resolve_call_argument(arg, variables) for _, arg, _, _ in calls]
     if any(value is None for value in parsed):
         return False
-    expected = {
+    expected = [
         (str(name), _codex_tool_input(str(name), value))
         for (name, _, _, _), value in zip(calls, parsed)
         if str(name).startswith("mcp__")
-    }
+    ]
     all_names = {str(name) for name, _, _, _ in calls}
     native_tools = _codex_native_tool_counts(state)
+    expected_counts: dict[tuple[str, str], int] = {}
+    for key in expected:
+        expected_counts[key] = expected_counts.get(key, 0) + 1
     native_names = {
-        name for (name, _), count in native_tools.items() if count > 0
+        name
+        for (credit_batch, (name, _)), count in native_tools.items()
+        if credit_batch == batch_id and count > 0
     }
-    return bool(expected) and all(name.startswith("mcp__") for name in all_names) and all(
-        native_tools.get(key, 0) > 0 for key in expected
-    ) and all(name in native_names for name in all_names if name.startswith("mcp__"))
+    return (
+        bool(expected)
+        and all(name.startswith("mcp__") for name in all_names)
+        and all(
+            native_tools.get((batch_id, key), 0) >= count
+            for key, count in expected_counts.items()
+        )
+        and all(name in native_names for name in all_names if name.startswith("mcp__"))
+    )
 
 
 def _codex_harness_tool(name: object, raw_input: object) -> dict | None:
@@ -1824,6 +1848,7 @@ def _codex_add_semantic_tool_event(
     call_id: object,
     *,
     wrapper: bool = False,
+    batch_id: object = None,
 ) -> tuple[dict | None, bool]:
     """Add one already-normalized Codex call."""
     existing = _codex_lifecycle_record(state, call_id)
@@ -1837,11 +1862,18 @@ def _codex_add_semantic_tool_event(
     classify_input = tool_input
     structured_input = raw_input
     name = str(name or "")
-    if name == "exec" and _codex_wrapper_has_native_mcp(state, raw_input, call_id):
+    pairing_batch_id = batch_id if batch_id is not None else call_id
+    wrapper_native_keys = _codex_wrapper_native_keys(name, raw_input)
+    if wrapper_native_keys:
+        _codex_record_batch_keys(state, pairing_batch_id, wrapper_native_keys)
+    if name == "exec" and _codex_wrapper_has_native_mcp(
+        state, raw_input, pairing_batch_id
+    ):
+        _codex_close_native_batch_pairing(state, pairing_batch_id)
         return None, True
     native_key = (name, tool_input)
     if wrapper and name.startswith("mcp__") and _codex_consume_native_tool(
-        state, native_key
+        state, pairing_batch_id, native_key
     ):
         return None, True
     if _is_artifact_tool(name) and call_id:
@@ -1891,6 +1923,8 @@ def _codex_add_semantic_tool_event(
         item_id=call_id,
         kind="tool",
     )
+    if wrapper_native_keys:
+        _codex_record_batch_keys(state, pairing_batch_id, wrapper_native_keys)
     if call_id:
         pending[call_id] = event
         if wrapper and name.startswith("mcp__"):
@@ -1921,14 +1955,18 @@ def _codex_add_tool_event(
         return None, False
     if len(children) == 1:
         child = children[0]
-        return _codex_add_semantic_tool_event(
+        event, handled = _codex_add_semantic_tool_event(
             state,
             child["name"],
             child["arguments"],
             ts,
             call_id,
             wrapper=True,
+            batch_id=call_id,
         )
+        if event is None and handled:
+            _codex_close_native_batch_pairing(state, call_id)
+        return event, handled
 
     outer = _codex_add_batch_outer_event(state, harness, ts, call_id)
     references: list[dict] = []
@@ -1948,6 +1986,7 @@ def _codex_add_tool_event(
             ts,
             child_call_id,
             wrapper=True,
+            batch_id=call_id,
         )
         references.append(
             {
@@ -1972,6 +2011,7 @@ def _codex_add_tool_event(
                     ),
                     "event": item["event"],
                     "call_id": item["call_id"],
+                    "consumed": item["handled"] and item["event"] is None,
                 }
                 for item in references
             ],
@@ -1998,6 +2038,7 @@ def _codex_add_tool_event(
                 state["pending"].pop(call_id, None)
             state.get("pending_batches", {}).pop(call_id, None)
             state.get("pending_wrappers", {}).pop(str(call_id), None)
+        _codex_close_native_batch_pairing(state, call_id)
         return None, True
     return outer, False
 
@@ -2053,13 +2094,32 @@ def _codex_remove_event(state: dict, event: dict) -> None:
     _record_change(state, {"kind": "tail", "from": first_id})
 
 
-def _codex_resolve_pending_wrappers(
+def _codex_native_batch_id(
     state: dict, native_key: tuple[str, str], native_call_id: object
-) -> None:
-    """Remove only a wrapper proven to have native replacements."""
+) -> str | None:
+    native_id = _codex_item_key(native_call_id)
+    native_batches = state.get("codex_native_batch_ids", {})
+    if native_id is not None:
+        batch_id = native_batches.get(native_id)
+        if isinstance(batch_id, str):
+            return batch_id
+
     pending = state.get("pending_wrappers", {})
+    exact = [
+        wrapper_id
+        for wrapper_id, record in pending.items()
+        if native_id is not None
+        and native_id == str(wrapper_id)
+        and any(
+            entry.get("key") == native_key
+            for entry in record.get("expected", [])
+            if isinstance(entry, dict)
+        )
+    ]
+    if exact:
+        return str(exact[0])
     candidates = [
-        (wrapper_id, record)
+        str(wrapper_id)
         for wrapper_id, record in pending.items()
         if any(
             entry.get("key") == native_key
@@ -2067,15 +2127,99 @@ def _codex_resolve_pending_wrappers(
             if isinstance(entry, dict)
         )
     ]
-    if not candidates:
+    return candidates[0] if candidates else None
+
+
+def _codex_expire_native_batch(state: dict, batch_id: object) -> None:
+    batch_key = _codex_item_key(batch_id)
+    if batch_key is None:
         return
-    exact = [item for item in candidates if str(native_call_id) == item[0]]
-    if exact:
-        candidates = exact
-    elif len(candidates) != 1:
-        # Matching by a shared tool name is unsafe when two wrappers are live.
+    counts = _codex_native_tool_counts(state)
+    for credit_key in list(counts):
+        if isinstance(credit_key, tuple) and credit_key[:1] == (batch_key,):
+            counts.pop(credit_key, None)
+    native_batches = state.setdefault("codex_native_batch_ids", {})
+    for native_id, native_batch in list(native_batches.items()):
+        if native_batch == batch_key:
+            native_batches.pop(native_id, None)
+
+
+def _codex_native_batch_is_closed(state: dict, batch_id: object) -> bool:
+    batch_key = _codex_item_key(batch_id)
+    if batch_key is None:
+        return False
+    record = _codex_lifecycle_record(state, batch_key)
+    return bool(
+        record is not None
+        and (
+            record.get("pairing_closed")
+            or record.get("state") in {"partial", "terminal"}
+        )
+    )
+
+
+def _codex_expire_closed_native_batches(state: dict) -> None:
+    """Expire credits only after the lifecycle registry closes their batch."""
+    registry = _codex_lifecycle_registry(state)
+    batch_ids = {
+        credit_key[0]
+        for credit_key in _codex_native_tool_counts(state)
+        if isinstance(credit_key, tuple) and len(credit_key) == 2
+    }
+    batch_ids.update(state.get("pending_wrappers", {}))
+    for batch_id in batch_ids:
+        record = registry.get(batch_id)
+        if record is None or record.get("state") not in {"partial", "terminal"}:
+            continue
+        _codex_expire_native_batch(state, batch_id)
+        state.get("pending_wrappers", {}).pop(batch_id, None)
+
+
+def _codex_close_native_batch_pairing(state: dict, batch_id: object) -> None:
+    """Close a batch once every expected native occurrence was paired."""
+    _codex_expire_native_batch(state, batch_id)
+    batch_key = _codex_item_key(batch_id)
+    if batch_key is None:
         return
-    wrapper_id, record = candidates[0]
+    record = _codex_lifecycle_record(state, batch_key)
+    if record is None:
+        record = _codex_lifecycle_transition(state, batch_key, "open", kind="batch")
+    if record is not None:
+        record["pairing_closed"] = True
+    state.get("pending_wrappers", {}).pop(batch_key, None)
+    state.get("pending_batches", {}).pop(batch_id, None)
+    state.get("pending_results", {}).pop(batch_id, None)
+
+
+def _codex_record_batch_keys(
+    state: dict, batch_id: object, native_keys: list[tuple[str, str]]
+) -> None:
+    batch_key = _codex_item_key(batch_id)
+    if batch_key is None or not native_keys:
+        return
+    record = _codex_lifecycle_record(state, batch_key)
+    if record is None:
+        record = _codex_lifecycle_transition(state, batch_key, "open", kind="batch")
+    if record is not None:
+        record["batch_keys"] = list(native_keys)
+
+
+def _codex_resolve_pending_wrappers(
+    state: dict,
+    native_key: tuple[str, str],
+    native_call_id: object,
+    batch_id: object = None,
+) -> None:
+    """Remove only the wrapper in the native occurrence's own batch."""
+    pending = state.get("pending_wrappers", {})
+    wrapper_id = _codex_item_key(batch_id) or _codex_native_batch_id(
+        state, native_key, native_call_id
+    )
+    if wrapper_id is None:
+        return
+    record = pending.get(wrapper_id)
+    if not isinstance(record, dict):
+        return
     expected = record.get("expected", [])
     if not isinstance(expected, list):
         return
@@ -2093,11 +2237,19 @@ def _codex_resolve_pending_wrappers(
     consumed_event = entry.get("event")
     consumed_call_id = entry.get("call_id")
     if isinstance(consumed_event, dict):
-        _codex_consume_native_tool(state, native_key)
+        if not entry.get("consumed") and not _codex_consume_native_tool(
+            state, wrapper_id, native_key
+        ):
+            expected.insert(entry_index, entry)
+            return
+        entry["consumed"] = True
         _codex_remove_event(state, consumed_event)
         for call_id, event in list(state.get("pending", {}).items()):
             if event is consumed_event:
                 state["pending"].pop(call_id, None)
+    elif not entry.get("consumed"):
+        expected.insert(entry_index, entry)
+        return
     if consumed_call_id is not None:
         state.get("pending_artifacts", {}).pop(consumed_call_id, None)
         _codex_drop_unrendered_lifecycle(state, consumed_call_id)
@@ -2123,7 +2275,7 @@ def _codex_resolve_pending_wrappers(
         ):
             state["pending_artifacts"].pop(call_id, None)
             _codex_drop_unrendered_lifecycle(state, call_id)
-    pending.pop(wrapper_id, None)
+    _codex_close_native_batch_pairing(state, wrapper_id)
 
 
 def _codex_finish_tool_event(
@@ -2323,13 +2475,24 @@ def _codex_apply_mcp_tool_item(state: dict, item: dict, ts: str | None) -> bool:
     if _codex_is_terminal_item(state, call_id):
         return True
     native_key = (name, _codex_tool_input(name, raw_input))
+    native_batch_id = state.get("codex_current_native_batch")
+    if native_batch_id is None:
+        native_batch_id = _codex_native_batch_id(state, native_key, call_id)
     native_tools = _codex_native_tool_counts(state)
-    if native_key not in native_tools:
-        native_tools[native_key] = 1
-    if call_id:
-        state.setdefault("codex_native_call_ids", set()).add(str(call_id))
-    if native_tools.get(native_key, 0) > 0:
-        _codex_resolve_pending_wrappers(state, native_key, call_id)
+    credit_key = _codex_native_credit_key(native_batch_id, native_key)
+    if credit_key is not None and not _codex_native_batch_is_closed(
+        state, native_batch_id
+    ):
+        if credit_key not in native_tools:
+            native_tools[credit_key] = 1
+        native_id = _codex_item_key(call_id)
+        if native_id is not None:
+            state.setdefault("codex_native_batch_ids", {})[native_id] = str(
+                native_batch_id
+            )
+        _codex_resolve_pending_wrappers(
+            state, native_key, call_id, native_batch_id
+        )
     event, handled = _codex_add_tool_event(state, name, raw_input, ts, call_id)
     if not handled and event is None:
         return False
@@ -2358,7 +2521,8 @@ def _codex_native_tool_key(row: dict) -> tuple[str, str] | None:
     tool = item.get("tool")
     if not isinstance(server, str) or not isinstance(tool, str):
         return None
-    return (f"mcp__{server}__{tool}", _codex_tool_input(tool, item.get("arguments", item.get("input", {}))))
+    name = f"mcp__{server}__{tool}"
+    return (name, _codex_tool_input(name, item.get("arguments", item.get("input", {}))))
 
 
 def _codex_turn_method(row: dict) -> str | None:
@@ -2396,18 +2560,155 @@ def _codex_native_call_id(row: dict) -> str | None:
     return None
 
 
-def _codex_reset_turn_scope(state: dict, *, preserve_pairing: bool = False) -> None:
-    if not preserve_pairing:
-        state.setdefault("codex_native_tools", {}).clear()
-        state.setdefault("codex_native_call_ids", set()).clear()
-        state.setdefault("pending_wrappers", {}).clear()
-    # Item lifecycle belongs to the registry. Pairing state survives starts but
-    # clears at turn completion; open items remain registered for later sweeps.
+def _codex_wrapper_native_keys(
+    name: object, raw_input: object
+) -> list[tuple[str, str]]:
+    if name != "exec" or not isinstance(raw_input, str):
+        return []
+    harness = _codex_harness_tool(name, raw_input)
+    if harness:
+        return [
+            (
+                str(child["name"]),
+                _codex_tool_input(str(child["name"]), child["arguments"]),
+            )
+            for child in harness.get("children", [])
+            if str(child.get("name", "")).startswith("mcp__")
+        ]
+    calls = _codex_harness_calls(raw_input)
+    variables = _codex_extract_variables(raw_input) or {}
+    parsed = [
+        _resolve_call_argument(argument, variables)
+        for _, argument, _, _ in calls or []
+    ]
+    if not calls or any(value is None for value in parsed):
+        return []
+    return [
+        (str(name), _codex_tool_input(str(name), value))
+        for (name, _, _, _), value in zip(calls, parsed)
+        if str(name).startswith("mcp__")
+    ]
+
+
+def _codex_wrapper_batch_spec(row: dict) -> tuple[str, list[tuple[str, str]]] | None:
+    """Extract one wrapper batch identity and its native semantic children."""
+    payload = row.get("payload")
+    if not isinstance(payload, dict):
+        return None
+    item = payload
+    if row.get("type") != "response_item":
+        method = payload.get("method")
+        if method not in {"item/started", "item/completed", "rawResponseItem/completed"}:
+            return None
+        params = payload.get("params")
+        item = params.get("item") if isinstance(params, dict) else None
+        if not isinstance(item, dict):
+            return None
+    if item.get("type") not in {
+        "custom_tool_call",
+        "function_call",
+        "web_search_call",
+        "tool_search_call",
+    }:
+        return None
+    name = item.get("name") or ""
+    raw_input = item.get("arguments", item.get("input", item.get("action", "")))
+    batch_id = _codex_item_key(item.get("call_id", item.get("callId", item.get("id"))))
+    if batch_id is None:
+        return None
+    keys = _codex_wrapper_native_keys(name, raw_input)
+    return (batch_id, keys) if keys else None
+
+
+def _codex_prime_native_scope(
+    state: dict,
+    rows: list[dict],
+    start: int,
+    end: int,
+    base_tools: dict[tuple[str, tuple[str, str]], int],
+    base_batches: dict[str, str],
+) -> tuple[
+    dict[tuple[str, tuple[str, str]], int],
+    dict[str, str],
+    dict[int, str],
+]:
+    """Prime one read scope while assigning each native row to one batch."""
+    scope_tools = dict(base_tools)
+    scope_batches = dict(base_batches)
+    specs: list[dict] = []
+    seen_batches: set[str] = set()
+
+    for batch_id, record in state.get("pending_wrappers", {}).items():
+        expected = record.get("expected", []) if isinstance(record, dict) else []
+        remaining: dict[tuple[str, str], int] = {}
+        for entry in expected:
+            if not isinstance(entry, dict):
+                continue
+            native_key = entry.get("key")
+            if isinstance(native_key, tuple) and len(native_key) == 2:
+                remaining[native_key] = remaining.get(native_key, 0) + 1
+        specs.append({"id": str(batch_id), "order": -1, "remaining": remaining})
+        seen_batches.add(str(batch_id))
+
+    for batch_id, record in _codex_lifecycle_registry(state).items():
+        if str(batch_id) in seen_batches or not isinstance(record, dict):
+            continue
+        if record.get("state") in {"partial", "terminal"} or record.get(
+            "pairing_closed"
+        ):
+            continue
+        keys = record.get("batch_keys")
+        if not isinstance(keys, list):
+            continue
+        remaining: dict[tuple[str, str], int] = {}
+        for native_key in keys:
+            if isinstance(native_key, tuple) and len(native_key) == 2:
+                remaining[native_key] = remaining.get(native_key, 0) + 1
+        if remaining:
+            specs.append({"id": str(batch_id), "order": -1, "remaining": remaining})
+            seen_batches.add(str(batch_id))
+
+    for index in range(start, end):
+        spec = _codex_wrapper_batch_spec(rows[index])
+        if spec is None:
+            continue
+        batch_id, keys = spec
+        if batch_id in seen_batches:
+            continue
+        remaining: dict[tuple[str, str], int] = {}
+        for native_key in keys:
+            remaining[native_key] = remaining.get(native_key, 0) + 1
+        specs.append({"id": batch_id, "order": index, "remaining": remaining})
+        seen_batches.add(batch_id)
+
+    assignments: dict[int, str] = {}
+    for index in range(start, end):
+        native_key = _codex_native_tool_key(rows[index])
+        if native_key is None:
+            continue
+        native_id = _codex_native_call_id(rows[index])
+        candidates = [
+            spec
+            for spec in specs
+            if spec["remaining"].get(native_key, 0) > 0
+        ]
+        if not candidates:
+            continue
+        exact = [spec for spec in candidates if native_id == spec["id"]]
+        prior = [spec for spec in candidates if spec["order"] <= index]
+        selected = (exact or prior or candidates)[0]
+        selected["remaining"][native_key] -= 1
+        credit_key = _codex_native_credit_key(selected["id"], native_key)
+        if credit_key is not None:
+            scope_tools[credit_key] = scope_tools.get(credit_key, 0) + 1
+        if native_id is not None:
+            scope_batches[native_id] = selected["id"]
+        assignments[index] = selected["id"]
+    return scope_tools, scope_batches, assignments
 
 
 def _codex_start_turn(state: dict, turn: object = None) -> None:
-    """Start a new turn without changing any existing item lifecycle."""
-    _codex_reset_turn_scope(state, preserve_pairing=True)
+    """Start a new turn without changing pairing or item lifecycle state."""
     counter = int(state.get("codex_turn_counter", 0)) + 1
     state["codex_turn_counter"] = counter
     turn_id = None
@@ -2512,6 +2813,7 @@ def _codex_lifecycle_transition(
         }
         registry[key] = record
         _codex_bound_lifecycle_registry(state, protected_item_id=key)
+        _codex_expire_closed_native_batches(state)
         return record
 
     if authoritative:
@@ -2527,20 +2829,25 @@ def _codex_lifecycle_transition(
 
     current = record.get("state")
     if lifecycle is None or lifecycle == current:
+        _codex_expire_closed_native_batches(state)
         return record
     # Partial is a terminal outcome for interruption.  A late completion must
     # not reopen or rewrite an item from the interrupted turn.
     if current in {"partial", "terminal"}:
+        _codex_expire_closed_native_batches(state)
         return record
     if lifecycle == "open":
+        _codex_expire_closed_native_batches(state)
         return record
     if lifecycle not in {"partial", "terminal"}:
+        _codex_expire_closed_native_batches(state)
         return record
     record["state"] = lifecycle
     if lifecycle == "terminal":
         record["authoritative"] = True
     if turn is not None:
         record["turn"] = turn
+    _codex_expire_closed_native_batches(state)
     return record
 
 
@@ -4172,7 +4479,7 @@ def _codex_close_turn(state: dict, turn: dict, ts: str | None) -> dict | None:
             event=event,
             kind="artifact",
         )
-    _codex_reset_turn_scope(state)
+    _codex_expire_closed_native_batches(state)
     if not failed:
         return None
     reason = turn.get("error") or turn.get("reason") or status
@@ -5534,7 +5841,8 @@ def _new_parse_state(fmt: str) -> dict:
         "artifact_ids": set(),
         "dedupe_credits": {},
         "codex_native_tools": {},
-        "codex_native_call_ids": set(),
+        "codex_native_batch_ids": {},
+        "codex_current_native_batch": None,
         "pending_wrappers": {},
         "dispositions": {"rendered": 0, "summarized": 0, "ignored": 0, "unknown": 0},
         # parent event id → child agent id (claude only); dies with the state
@@ -5705,23 +6013,28 @@ def _read_cached_state(fmt: str, path: Path, key: str) -> dict:
                 continue
             if isinstance(row, dict):
                 parsed_rows.append(row)
-        native_scopes: list[tuple[dict[tuple[str, str], int], set[str]]] = []
+        native_scopes: list[
+            tuple[
+                dict[tuple[str, tuple[str, str]], int],
+                dict[str, str],
+                dict[int, str],
+            ]
+        ] = []
         if fmt.startswith("codex"):
             base_tools = dict(_codex_native_tool_counts(state))
-            base_call_ids = set(state.setdefault("codex_native_call_ids", set()))
+            base_batches = dict(state.setdefault("codex_native_batch_ids", {}))
 
             def prime_scope(start: int, end: int) -> None:
-                scope_tools = dict(base_tools)
-                scope_call_ids = set(base_call_ids)
-                for scoped_row in parsed_rows[start:end]:
-                    native_key = _codex_native_tool_key(scoped_row)
-                    if native_key is not None:
-                        scope_tools[native_key] = scope_tools.get(native_key, 0) + 1
-                    native_call_id = _codex_native_call_id(scoped_row)
-                    if native_call_id is not None:
-                        scope_call_ids.add(native_call_id)
+                scope_tools, scope_batches, assignments = _codex_prime_native_scope(
+                    state,
+                    parsed_rows,
+                    start,
+                    end,
+                    base_tools,
+                    base_batches,
+                )
                 native_scopes.extend(
-                    (scope_tools, scope_call_ids)
+                    (scope_tools, scope_batches, assignments)
                     for _ in range(end - start)
                 )
 
@@ -5731,18 +6044,22 @@ def _read_cached_state(fmt: str, path: Path, key: str) -> dict:
                     prime_scope(segment_start, index + 1)
                     segment_start = index + 1
                     base_tools = {}
-                    base_call_ids = set()
+                    base_batches = {}
             if segment_start < len(parsed_rows):
                 prime_scope(segment_start, len(parsed_rows))
         for index, row in enumerate(parsed_rows):
             try:
                 if fmt.startswith("codex") and index < len(native_scopes):
-                    tools, call_ids = native_scopes[index]
+                    tools, batches, assignments = native_scopes[index]
                     state["codex_native_tools"] = tools
-                    state["codex_native_call_ids"] = call_ids
+                    state["codex_native_batch_ids"] = batches
+                    state["codex_current_native_batch"] = assignments.get(index)
                 apply(state, row)
             except (KeyError, TypeError, AttributeError):
                 continue
+            finally:
+                if fmt.startswith("codex"):
+                    state["codex_current_native_batch"] = None
         if len(state["events"]) > CODEX_EVENT_WINDOW:
             trim = len(state["events"]) - CODEX_EVENT_WINDOW
             state["base"] += trim
