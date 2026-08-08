@@ -3066,7 +3066,7 @@ class CodexModernTranscriptParityTests(unittest.TestCase):
             )
         )
 
-    def test_round19_native_attribution_fails_closed_within_trim_scope(self) -> None:
+    def test_round20_native_attribution_fails_closed_within_one_parse_scope(self) -> None:
         single_batch = 'tools.mcp__fixture__lookup({value:"wanted"});'
 
         def wrapper(call_id: str) -> dict:
@@ -3108,14 +3108,7 @@ class CodexModernTranscriptParityTests(unittest.TestCase):
 
         with TemporaryDirectory() as tmp:
             path = Path(tmp) / "same-scope-native-twin.jsonl"
-            rows = [wrapper("native-scope-a")]
-            path.write_text(json.dumps(rows[0]) + "\n")
-            transcripts.read_session_events("codex", path)
-
-            rows.append(native("native-scope-a"))
-            path.write_text("\n".join(json.dumps(row) for row in rows) + "\n")
-            transcripts.read_session_events("codex", path)
-
+            rows = [wrapper("native-scope-a"), native("native-scope-a")]
             newer_native_ids = [f"native-scope-newer-{index}" for index in range(2001)]
             for native_id in newer_native_ids:
                 rows.extend([wrapper(native_id), native(native_id)])
