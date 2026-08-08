@@ -1354,6 +1354,25 @@ def _codex_native_tool_counts(state: dict) -> dict[tuple[str, tuple[str, str]], 
     return counts
 
 
+def _codex_spent_native_ids(state: dict) -> dict[str, None]:
+    """Return the bounded, insertion-ordered set of spent native ids."""
+    spent = state.setdefault("codex_spent_native_ids", {})
+    if not isinstance(spent, dict):
+        spent = {}
+        state["codex_spent_native_ids"] = spent
+    return spent
+
+
+def _codex_mark_native_id_spent(state: dict, native_id: object) -> None:
+    key = _codex_item_key(native_id)
+    if key is None:
+        return
+    spent = _codex_spent_native_ids(state)
+    spent[key] = None
+    while len(spent) > CODEX_EVENT_WINDOW:
+        spent.pop(next(iter(spent)))
+
+
 def _codex_native_credit_key(
     batch_id: object, native_key: tuple[str, str]
 ) -> tuple[str, tuple[str, str]] | None:
@@ -2637,7 +2656,9 @@ def _codex_prime_native_scope(
     scope_batches = dict(base_batches)
     specs: list[dict] = []
     seen_batches: set[str] = set()
-    seen_native_ids: set[str] = set(scope_batches)
+    seen_native_ids: set[str] = set(scope_batches) | set(
+        _codex_spent_native_ids(state)
+    )
 
     for batch_id, record in state.get("pending_wrappers", {}).items():
         expected = record.get("expected", []) if isinstance(record, dict) else []
@@ -2709,6 +2730,7 @@ def _codex_prime_native_scope(
         if native_id is not None:
             scope_batches[native_id] = selected["id"]
             seen_native_ids.add(native_id)
+            _codex_mark_native_id_spent(state, native_id)
         assignments[index] = selected["id"]
     return scope_tools, scope_batches, assignments
 
@@ -5848,6 +5870,9 @@ def _new_parse_state(fmt: str) -> dict:
         "dedupe_credits": {},
         "codex_native_tools": {},
         "codex_native_batch_ids": {},
+        # Dict order provides a bounded insertion-ordered set.  Unlike the
+        # batch map, spent ids survive batch-window close for this session.
+        "codex_spent_native_ids": {},
         "codex_current_native_batch": None,
         "pending_wrappers": {},
         "dispositions": {"rendered": 0, "summarized": 0, "ignored": 0, "unknown": 0},

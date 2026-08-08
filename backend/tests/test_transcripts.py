@@ -2861,6 +2861,33 @@ class CodexModernTranscriptParityTests(unittest.TestCase):
             incremental_cross = transcripts.read_session_events("codex", incremental_path)
             incremental_state = transcripts._cache[str(incremental_path)]
 
+            incremental_twin_path = Path(tmp) / "incremental-native-twin.jsonl"
+            incremental_twin_rows = [
+                normalized_wrapper("batch-incremental-twin-a", "rawResponseItem/completed"),
+                normalized_native("native-incremental-twin", "item/completed", 2),
+            ]
+            incremental_twin_path.write_text(
+                "\n".join(json.dumps(row) for row in incremental_twin_rows) + "\n"
+            )
+            transcripts.read_session_events("codex-normalized", incremental_twin_path)
+            incremental_twin_rows.extend(
+                [
+                    normalized_native(
+                        "native-incremental-twin", "rawResponseItem/completed", 3
+                    ),
+                    normalized_wrapper(
+                        "batch-incremental-twin-b", "rawResponseItem/completed"
+                    ),
+                ]
+            )
+            incremental_twin_path.write_text(
+                "\n".join(json.dumps(row) for row in incremental_twin_rows) + "\n"
+            )
+            incremental_twin = transcripts.read_session_events(
+                "codex-normalized", incremental_twin_path
+            )
+            incremental_twin_state = transcripts._cache[str(incremental_twin_path)]
+
         with self.subTest("one native occurrence"):
             self.assertEqual(
                 visible_child_count(one_native),
@@ -2913,6 +2940,12 @@ class CodexModernTranscriptParityTests(unittest.TestCase):
                     ]
                 ),
                 2,
+            )
+        with self.subTest("incremental native twin cannot consume batch B"):
+            self.assertEqual(visible_child_count(incremental_twin), 1)
+            self.assertIn(
+                "batch-incremental-twin-b",
+                incremental_twin_state["pending_wrappers"],
             )
         with self.subTest("registry closes the incremental pairing window"):
             self.assertEqual(incremental_state["codex_native_tools"], {})
