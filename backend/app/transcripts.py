@@ -1363,7 +1363,7 @@ def _codex_consume_native_tool(
     if not isinstance(count, int) or count <= 0:
         return False
     if count == 1:
-        counts.pop(native_key, None)
+        counts[native_key] = 0
     else:
         counts[native_key] = count - 1
     return True
@@ -2093,6 +2093,7 @@ def _codex_resolve_pending_wrappers(
     consumed_event = entry.get("event")
     consumed_call_id = entry.get("call_id")
     if isinstance(consumed_event, dict):
+        _codex_consume_native_tool(state, native_key)
         _codex_remove_event(state, consumed_event)
         for call_id, event in list(state.get("pending", {}).items()):
             if event is consumed_event:
@@ -2323,10 +2324,12 @@ def _codex_apply_mcp_tool_item(state: dict, item: dict, ts: str | None) -> bool:
         return True
     native_key = (name, _codex_tool_input(name, raw_input))
     native_tools = _codex_native_tool_counts(state)
-    native_tools[native_key] = max(native_tools.get(native_key, 0), 1)
+    if native_key not in native_tools:
+        native_tools[native_key] = 1
     if call_id:
         state.setdefault("codex_native_call_ids", set()).add(str(call_id))
-    _codex_resolve_pending_wrappers(state, native_key, call_id)
+    if native_tools.get(native_key, 0) > 0:
+        _codex_resolve_pending_wrappers(state, native_key, call_id)
     event, handled = _codex_add_tool_event(state, name, raw_input, ts, call_id)
     if not handled and event is None:
         return False
@@ -5718,7 +5721,7 @@ def _read_cached_state(fmt: str, path: Path, key: str) -> dict:
                     if native_call_id is not None:
                         scope_call_ids.add(native_call_id)
                 native_scopes.extend(
-                    (dict(scope_tools), set(scope_call_ids))
+                    (scope_tools, scope_call_ids)
                     for _ in range(end - start)
                 )
 

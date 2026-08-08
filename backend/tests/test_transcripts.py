@@ -2547,6 +2547,61 @@ class CodexModernTranscriptParityTests(unittest.TestCase):
             [event["tool"]["summary"] for event in parsed["events"] if event["kind"] == "tool"],
         )
 
+    def test_round12_cold_batch_rows_share_native_occurrence_multiset(self) -> None:
+        source = 'tools.mcp__fixture__lookup({value:"wanted"});'
+
+        def wrapper(call_id: str) -> dict:
+            return {
+                "type": "response_item",
+                "timestamp": f"2026-08-07T12:00:0{call_id[-1]}Z",
+                "payload": {
+                    "type": "custom_tool_call",
+                    "call_id": call_id,
+                    "name": "exec",
+                    "input": source,
+                },
+            }
+
+        def native(call_id: str, second: bool = False) -> dict:
+            return {
+                "type": "response_item",
+                "timestamp": f"2026-08-07T12:00:0{3 if second else 2}Z",
+                "payload": {
+                    "type": "mcpToolCall",
+                    "id": call_id,
+                    "server": "fixture",
+                    "tool": "lookup",
+                    "arguments": {"value": "wanted"},
+                    "status": "completed",
+                    "result": {"content": [{"type": "text", "text": "native"}]},
+                },
+            }
+
+        def visible_wrapper_count(parsed: dict) -> int:
+            return sum(
+                1
+                for event in parsed["events"]
+                if event["kind"] == "tool"
+                and event["tool"]["name"] == "mcp__fixture__lookup"
+                and event["tool"]["output"] is None
+            )
+
+        rows = [wrapper("wrapper-1"), wrapper("wrapper-2"), native("native-1")]
+        with TemporaryDirectory() as tmp:
+            one_native_path = Path(tmp) / "one-native.jsonl"
+            one_native_path.write_text("\n".join(json.dumps(row) for row in rows) + "\n")
+            one_native = transcripts.read_session_events("codex", one_native_path)
+
+            two_native_path = Path(tmp) / "two-native.jsonl"
+            two_native_rows = [*rows[:2], native("native-1"), native("native-2", second=True)]
+            two_native_path.write_text(
+                "\n".join(json.dumps(row) for row in two_native_rows) + "\n"
+            )
+            two_native = transcripts.read_session_events("codex", two_native_path)
+
+        self.assertEqual(visible_wrapper_count(one_native), 1)
+        self.assertEqual(visible_wrapper_count(two_native), 0)
+
     def test_round2_f2_statusless_completed_items_are_done(self) -> None:
         parsed = transcripts.read_session_events(
             "codex-normalized", FIXTURES_DIR / "codex_wiki266_round2_lifecycle.jsonl"
