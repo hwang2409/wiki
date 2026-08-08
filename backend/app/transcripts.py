@@ -1371,9 +1371,6 @@ def _codex_mark_native_id_spent(state: dict, native_id: object) -> None:
     spent[key] = None
     while len(spent) > CODEX_EVENT_WINDOW:
         spent.pop(next(iter(spent)))
-        # Future scopes cannot distinguish an evicted twin from a new call.
-        # They must use an exact expectation instead of semantic pairing.
-        state["codex_spent_native_ids_evicted"] = True
 
 
 def _codex_native_credit_key(
@@ -2153,11 +2150,28 @@ def _codex_native_batch_id(
             return True
         return any(
             isinstance(entry, dict)
-            and _codex_item_key(entry.get("native_id")) == native_id
+            and (
+                _codex_item_key(entry.get("native_id")) == native_id
+                or _codex_item_key(entry.get("call_id")) == native_id
+            )
             for entry in record.get("expected", [])
         )
 
     if candidate_specs is not None:
+        exact = next(
+            (
+                str(spec.get("id"))
+                for spec in candidate_specs
+                if (
+                    isinstance(spec, dict)
+                    and str(spec.get("id")) == native_id
+                    and spec.get("remaining", {}).get(native_key, 0) > 0
+                )
+            ),
+            None,
+        )
+        if exact is not None:
+            return exact
         return next(
             (
                 str(spec.get("id"))
@@ -2186,70 +2200,6 @@ def _codex_native_batch_id(
         ),
         None,
     )
-
-
-def _codex_register_native_expectation(
-    state: dict,
-    native_key: tuple[str, str],
-    native_id: object,
-    candidate_specs: list[dict],
-    current_index: int,
-) -> str | None:
-    """Record a new exact ID after scoped semantic pairing selects its batch."""
-    native_key_id = _codex_item_key(native_id)
-    if native_key_id is None:
-        return None
-
-    for spec in candidate_specs:
-        if not isinstance(spec, dict):
-            continue
-        expected_ids = spec.get("expected_ids")
-        record = spec.get("record")
-        expected_native_ids = (
-            record.get("expected_native_ids") if isinstance(record, dict) else None
-        )
-        if (
-            isinstance(expected_ids, dict)
-            and native_key_id in expected_ids
-        ) or (
-            isinstance(expected_native_ids, dict)
-            and native_key_id in expected_native_ids
-        ):
-            return str(spec.get("id"))
-
-    def has_key(spec: dict) -> bool:
-        remaining = spec.get("remaining")
-        return isinstance(remaining, dict) and remaining.get(native_key, 0) > 0
-
-    candidates = [
-        spec
-        for spec in candidate_specs
-        if isinstance(spec, dict) and has_key(spec)
-    ]
-    prior = [
-        spec
-        for spec in candidates
-        if isinstance(spec.get("order"), int) and spec["order"] <= current_index
-    ]
-    selected = (prior or candidates)[0] if (prior or candidates) else None
-    if selected is None:
-        return None
-
-    selected.setdefault("expected_ids", {})[native_key_id] = None
-    record = selected.get("record")
-    if isinstance(record, dict):
-        record.setdefault("expected_native_ids", {})[native_key_id] = None
-        for entry in record.get("expected", []):
-            if (
-                isinstance(entry, dict)
-                and entry.get("key") == native_key
-                and entry.get("native_id") is None
-            ):
-                entry["native_id"] = native_key_id
-                break
-    return str(selected.get("id"))
-
-
 def _codex_batch_window_is_live(
     state: dict, batch_id: object, candidate_specs: list[dict] | None = None
 ) -> bool:
@@ -2837,6 +2787,45 @@ def _codex_wrapper_batch_spec(row: dict) -> tuple[str, list[tuple[str, str]]] | 
     return (batch_id, keys) if keys else None
 
 
+def _codex_wrapper_expected_native_ids(
+    row: dict, batch_id: str, count: int
+) -> list[str]:
+    """Extract child identities that make native pairing explicit."""
+    payload = row.get("payload")
+    if not isinstance(payload, dict):
+        return []
+    item = payload
+    if row.get("type") != "response_item":
+        params = payload.get("params")
+        item = params.get("item") if isinstance(params, dict) else None
+        if not isinstance(item, dict):
+            return []
+    name = item.get("name") or ""
+    raw_input = item.get("arguments", item.get("input", item.get("action", "")))
+    harness = _codex_harness_tool(name, raw_input)
+    if not harness:
+        return []
+    children = harness.get("children") or []
+    if len(children) == 1:
+        return [batch_id] if count == 1 else []
+    native_ids: list[str] = []
+    for child_index, child in enumerate(children):
+        if not str(child.get("name", "")).startswith("mcp__"):
+            continue
+        child_arguments = child.get("arguments")
+        child_call_id = (
+            child_arguments.get("call_id", child_arguments.get("callId"))
+            if isinstance(child_arguments, dict)
+            else None
+        )
+        native_ids.append(
+            str(child_call_id)
+            if child_call_id is not None
+            else f"__codex_batch_child__:{batch_id}:{child_index}"
+        )
+    return native_ids if len(native_ids) == count else []
+
+
 def _codex_prime_native_scope(
     state: dict,
     rows: list[dict],
@@ -2854,11 +2843,6 @@ def _codex_prime_native_scope(
     scope_batches = dict(base_batches)
     specs: list[dict] = []
     seen_batches: set[str] = set()
-    # Before the first eviction, this scope can turn ordered semantic matches
-    # into exact expectations. Later scopes must fail closed on unknown IDs.
-    allow_scoped_expectations = not state.get(
-        "codex_spent_native_ids_evicted", False
-    )
 
     for batch_id, record in state.get("pending_wrappers", {}).items():
         expected = record.get("expected", []) if isinstance(record, dict) else []
@@ -2916,7 +2900,28 @@ def _codex_prime_native_scope(
         remaining: dict[tuple[str, str], int] = {}
         for native_key in keys:
             remaining[native_key] = remaining.get(native_key, 0) + 1
-        specs.append({"id": batch_id, "order": index, "remaining": remaining})
+        expected_ids = _codex_wrapper_expected_native_ids(
+            rows[index], batch_id, len(keys)
+        )
+        spec_record = (
+            {
+                "expected": [
+                    {"key": key, "call_id": native_id}
+                    for key, native_id in zip(keys, expected_ids)
+                ]
+            }
+            if expected_ids
+            else None
+        )
+        specs.append(
+            {
+                "id": batch_id,
+                "order": index,
+                "remaining": remaining,
+                "record": spec_record or {},
+                "expected_ids": {native_id: None for native_id in expected_ids},
+            }
+        )
         seen_batches.add(batch_id)
 
     assignments: dict[int, str] = {}
@@ -2925,21 +2930,6 @@ def _codex_prime_native_scope(
         if native_key is None:
             continue
         native_id = _codex_native_call_id(rows[index])
-        if (
-            allow_scoped_expectations
-            and native_id is not None
-            and _codex_item_key(native_id) not in _codex_spent_native_ids(state)
-            and _codex_item_key(native_id) not in scope_batches
-            and _codex_item_key(native_id)
-            not in state.get("codex_native_batch_ids", {})
-        ):
-            _codex_register_native_expectation(
-                state,
-                native_key,
-                native_id,
-                specs,
-                index,
-            )
         batch_id = _codex_attribute_native_batch(
             state,
             native_key,
@@ -6093,7 +6083,6 @@ def _new_parse_state(fmt: str) -> dict:
         # Dict order provides a bounded insertion-ordered set.  Unlike the
         # batch map, spent ids survive batch-window close for this session.
         "codex_spent_native_ids": {},
-        "codex_spent_native_ids_evicted": False,
         "codex_current_native_batch": None,
         "pending_wrappers": {},
         "dispositions": {"rendered": 0, "summarized": 0, "ignored": 0, "unknown": 0},

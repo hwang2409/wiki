@@ -935,9 +935,16 @@ class CodexNewRuntimeTranscriptTests(unittest.TestCase):
         self.assertTrue(thinking[0]["encrypted"])
         self.assertEqual(
             [tool["name"] for tool in tools],
-            ["mcp__wiki_artifacts__read_agent", "mcp__wiki_artifacts__read_agent_events"],
+            [
+                "exec",
+                "mcp__wiki_artifacts__read_agent",
+                "mcp__wiki_artifacts__read_agent_events",
+            ],
         )
-        self.assertEqual([tool["output"] for tool in tools], ["agent details", "event details"])
+        self.assertEqual(
+            [tool["output"] for tool in tools],
+            [None, "agent details", "event details"],
+        )
         self.assertTrue(all("const" not in tool["input"] and "await tools" not in tool["input"] for tool in tools))
 
     def test_codex_runtime_preamble_is_metadata_not_output(self) -> None:
@@ -2298,7 +2305,7 @@ class CodexModernTranscriptParityTests(unittest.TestCase):
             "timestamp": "2026-08-07T12:00:01Z",
             "payload": {
                 "type": "mcpToolCall",
-                "id": "native-1",
+                "id": "wrapper-1",
                 "server": "fixture",
                 "tool": "lookup",
                 "arguments": {"value": "wanted"},
@@ -2361,7 +2368,7 @@ class CodexModernTranscriptParityTests(unittest.TestCase):
             }),
             raw(3, "response_item", {
                 "type": "mcpToolCall",
-                "id": "native-1",
+                "id": "wrapper-1",
                 "server": "fixture",
                 "tool": "lookup",
                 "arguments": {"value": "wanted"},
@@ -2451,7 +2458,7 @@ class CodexModernTranscriptParityTests(unittest.TestCase):
                 "timestamp": f"2026-08-07T12:00:0{index + 1}Z",
                 "payload": {
                     "type": "mcpToolCall",
-                    "id": f"native-batch-artifact-{index}",
+                    "id": f"__codex_batch_child__:batch-artifact-wrapper:{index}",
                     "server": "wiki_artifacts",
                     "tool": "render_artifact",
                     "arguments": {
@@ -2493,7 +2500,10 @@ class CodexModernTranscriptParityTests(unittest.TestCase):
             }
             self.assertEqual(
                 cold_child_ids,
-                {"__codex_batch_child__:batch-artifact-wrapper:1"},
+                {
+                    "__codex_batch_child__:batch-artifact-wrapper:0",
+                    "__codex_batch_child__:batch-artifact-wrapper:1",
+                },
             )
             self.assertNotIn(
                 "__codex_batch_child__:batch-artifact-wrapper:0",
@@ -2522,7 +2532,10 @@ class CodexModernTranscriptParityTests(unittest.TestCase):
             }
             self.assertEqual(
                 visible_child_ids,
-                {"__codex_batch_child__:batch-artifact-wrapper:1"},
+                {
+                    "__codex_batch_child__:batch-artifact-wrapper:0",
+                    "__codex_batch_child__:batch-artifact-wrapper:1",
+                },
             )
             self.assertNotIn(
                 "__codex_batch_child__:batch-artifact-wrapper:0",
@@ -2540,7 +2553,7 @@ class CodexModernTranscriptParityTests(unittest.TestCase):
 
         self.assertEqual(
             [event["kind"] for event in parsed["events"]],
-            ["artifact", "artifact"],
+            ["tool", "artifact", "tool", "artifact"],
         )
         self.assertNotIn(
             "render_artifact rejected",
@@ -2596,7 +2609,7 @@ class CodexModernTranscriptParityTests(unittest.TestCase):
             wrapper("wrapper-1"),
             wrapper("wrapper-2"),
             turn_started,
-            native("native-1"),
+            native("wrapper-1"),
         ]
         with TemporaryDirectory() as tmp:
             one_native_path = Path(tmp) / "one-native.jsonl"
@@ -2607,8 +2620,8 @@ class CodexModernTranscriptParityTests(unittest.TestCase):
             two_native_rows = [
                 *rows[:2],
                 turn_started,
-                native("native-1"),
-                native("native-2", second=True),
+                native("wrapper-1"),
+                native("wrapper-2", second=True),
             ]
             two_native_path.write_text(
                 "\n".join(json.dumps(row) for row in two_native_rows) + "\n"
@@ -2722,15 +2735,18 @@ class CodexModernTranscriptParityTests(unittest.TestCase):
             one_native, _ = parse_rows(
                 tmp,
                 "one-native.jsonl",
-                [wrapper("batch-one", duplicate_batch), native("native-one")],
+                [
+                    wrapper("batch-one", duplicate_batch),
+                    native("__codex_batch_child__:batch-one:0"),
+                ],
             )
             two_native, _ = parse_rows(
                 tmp,
                 "two-native.jsonl",
                 [
                     wrapper("batch-two", duplicate_batch),
-                    native("native-two-a"),
-                    native("native-two-b"),
+                    native("__codex_batch_child__:batch-two:0"),
+                    native("__codex_batch_child__:batch-two:1"),
                 ],
             )
             interleaved_one, _ = parse_rows(
@@ -2739,7 +2755,7 @@ class CodexModernTranscriptParityTests(unittest.TestCase):
                 [
                     turn_started,
                     wrapper("batch-interleaved-one", duplicate_batch),
-                    native("native-interleaved-one"),
+                    native("__codex_batch_child__:batch-interleaved-one:0"),
                 ],
             )
             interleaved_two, _ = parse_rows(
@@ -2748,8 +2764,8 @@ class CodexModernTranscriptParityTests(unittest.TestCase):
                 [
                     turn_started,
                     wrapper("batch-interleaved-two", duplicate_batch),
-                    native("native-interleaved-two-a"),
-                    native("native-interleaved-two-b"),
+                    native("__codex_batch_child__:batch-interleaved-two:0"),
+                    native("__codex_batch_child__:batch-interleaved-two:1"),
                 ],
             )
 
@@ -2768,8 +2784,8 @@ class CodexModernTranscriptParityTests(unittest.TestCase):
                 "native-raw-twin-cross-batch.jsonl",
                 [
                     normalized_wrapper("batch-twin-a", "rawResponseItem/completed"),
-                    normalized_native("native-twin", "item/completed", 2),
-                    normalized_native("native-twin", "rawResponseItem/completed", 3),
+                    normalized_native("batch-twin-a", "item/completed", 2),
+                    normalized_native("batch-twin-a", "rawResponseItem/completed", 3),
                     normalized_wrapper("batch-twin-b", "rawResponseItem/completed"),
                 ],
                 fmt="codex-normalized",
@@ -2833,7 +2849,7 @@ class CodexModernTranscriptParityTests(unittest.TestCase):
                     json.dumps(row)
                     for row in [
                         wrapper("batch-incremental-a", sequential_batch),
-                        native("native-incremental"),
+                        native("__codex_batch_child__:batch-incremental-a:0"),
                     ]
                 )
                 + "\n"
@@ -2844,7 +2860,7 @@ class CodexModernTranscriptParityTests(unittest.TestCase):
                     json.dumps(row)
                     for row in [
                         wrapper("batch-incremental-a", sequential_batch),
-                        native("native-incremental"),
+                        native("__codex_batch_child__:batch-incremental-a:0"),
                         wrapper("batch-incremental-b", sequential_batch),
                         {
                             "type": "event_msg",
@@ -2864,7 +2880,7 @@ class CodexModernTranscriptParityTests(unittest.TestCase):
             incremental_twin_path = Path(tmp) / "incremental-native-twin.jsonl"
             incremental_twin_rows = [
                 normalized_wrapper("batch-incremental-twin-a", "rawResponseItem/completed"),
-                normalized_native("native-incremental-twin", "item/completed", 2),
+                normalized_native("batch-incremental-twin-a", "item/completed", 2),
             ]
             incremental_twin_path.write_text(
                 "\n".join(json.dumps(row) for row in incremental_twin_rows) + "\n"
@@ -2873,7 +2889,7 @@ class CodexModernTranscriptParityTests(unittest.TestCase):
             incremental_twin_rows.extend(
                 [
                     normalized_native(
-                        "native-incremental-twin", "rawResponseItem/completed", 3
+                        "batch-incremental-twin-a", "rawResponseItem/completed", 3
                     ),
                     normalized_wrapper(
                         "batch-incremental-twin-b", "rawResponseItem/completed"
@@ -2902,18 +2918,12 @@ class CodexModernTranscriptParityTests(unittest.TestCase):
             )
         with self.subTest("turn started keeps two native pairings"):
             self.assertEqual(visible_child_count(interleaved_two), 0)
-        with self.subTest("surplus credits stay in batch A"):
-            self.assertIsNone(surplus_a_event)
-            self.assertTrue(surplus_a_handled)
+        with self.subTest("unknown native ids create no credits"):
+            self.assertIsNotNone(surplus_a_event)
+            self.assertFalse(surplus_a_handled)
             self.assertIsNotNone(surplus_b_event)
             self.assertFalse(surplus_b_handled)
-            self.assertEqual(
-                surplus_state["codex_native_tools"][(
-                    "batch-surplus-a",
-                    ("mcp__fixture__lookup", '{"value": "wanted"}'),
-                )],
-                1,
-            )
+            self.assertEqual(surplus_state["codex_native_tools"], {})
         with self.subTest("native raw twin is one credited occurrence"):
             self.assertEqual(visible_child_count(native_raw_twin), 1)
             self.assertIn("batch-twin-b", native_raw_twin_state["pending_wrappers"])
@@ -2996,7 +3006,7 @@ class CodexModernTranscriptParityTests(unittest.TestCase):
 
         with TemporaryDirectory() as tmp:
             path = Path(tmp) / "trimmed-native-twin.jsonl"
-            rows = [wrapper("batch-trim-a")]
+            rows = [wrapper("native-trim-a")]
             path.write_text("\n".join(json.dumps(row) for row in rows) + "\n")
             transcripts.read_session_events("codex", path)
 
@@ -3008,7 +3018,7 @@ class CodexModernTranscriptParityTests(unittest.TestCase):
             for index, native_id in enumerate(newer_native_ids):
                 rows.extend(
                     [
-                        wrapper(f"batch-trim-newer-{index}"),
+                        wrapper(native_id),
                         native(native_id),
                     ]
                 )
@@ -3020,7 +3030,6 @@ class CodexModernTranscriptParityTests(unittest.TestCase):
             self.assertEqual(len(spent), transcripts.CODEX_EVENT_WINDOW)
             self.assertNotIn("native-trim-a", spent)
             self.assertEqual(next(iter(spent)), newer_native_ids[1])
-            self.assertTrue(state["codex_spent_native_ids_evicted"])
             self.assertEqual(len(state["events"]), transcripts.CODEX_EVENT_WINDOW)
 
             rows.append(wrapper("batch-trim-b"))
@@ -3054,6 +3063,77 @@ class CodexModernTranscriptParityTests(unittest.TestCase):
                 state,
                 ("mcp__fixture__lookup", '{"value": "wanted"}'),
                 "native-trim-a",
+            )
+        )
+
+    def test_round19_native_attribution_fails_closed_within_trim_scope(self) -> None:
+        single_batch = 'tools.mcp__fixture__lookup({value:"wanted"});'
+
+        def wrapper(call_id: str) -> dict:
+            return {
+                "type": "response_item",
+                "timestamp": "2026-08-07T12:00:01Z",
+                "payload": {
+                    "type": "custom_tool_call",
+                    "id": call_id,
+                    "call_id": call_id,
+                    "name": "exec",
+                    "input": single_batch,
+                },
+            }
+
+        def native(call_id: str) -> dict:
+            return {
+                "type": "response_item",
+                "timestamp": "2026-08-07T12:00:02Z",
+                "payload": {
+                    "type": "mcpToolCall",
+                    "id": call_id,
+                    "server": "fixture",
+                    "tool": "lookup",
+                    "arguments": {"value": "wanted"},
+                    "status": "completed",
+                    "result": {"content": [{"type": "text", "text": "native"}]},
+                },
+            }
+
+        def visible_wrapper_count(parsed: dict) -> int:
+            return sum(
+                1
+                for event in parsed["events"]
+                if event["kind"] == "tool"
+                and event["tool"]["name"] == "mcp__fixture__lookup"
+                and event["tool"]["output"] is None
+            )
+
+        with TemporaryDirectory() as tmp:
+            path = Path(tmp) / "same-scope-native-twin.jsonl"
+            rows = [wrapper("native-scope-a")]
+            path.write_text(json.dumps(rows[0]) + "\n")
+            transcripts.read_session_events("codex", path)
+
+            rows.append(native("native-scope-a"))
+            path.write_text("\n".join(json.dumps(row) for row in rows) + "\n")
+            transcripts.read_session_events("codex", path)
+
+            newer_native_ids = [f"native-scope-newer-{index}" for index in range(2001)]
+            for native_id in newer_native_ids:
+                rows.extend([wrapper(native_id), native(native_id)])
+            rows.extend([wrapper("batch-scope-b"), native("native-scope-a")])
+            path.write_text("\n".join(json.dumps(row) for row in rows) + "\n")
+            parsed = transcripts.read_session_events("codex", path)
+            state = transcripts._cache[str(path)]
+
+        spent = state["codex_spent_native_ids"]
+        self.assertEqual(len(spent), transcripts.CODEX_EVENT_WINDOW)
+        self.assertNotIn("native-scope-a", spent)
+        self.assertEqual(visible_wrapper_count(parsed), 1)
+        self.assertIn("batch-scope-b", state["pending_wrappers"])
+        self.assertIsNone(
+            transcripts._codex_attribute_native_batch(
+                state,
+                ("mcp__fixture__lookup", '{"value": "wanted"}'),
+                "native-scope-a",
             )
         )
 
