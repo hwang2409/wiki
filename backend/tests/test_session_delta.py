@@ -834,9 +834,16 @@ class SessionDeltaTests(unittest.TestCase):
                 [
                     {
                         "id": initial["events"][0]["id"],
+                        "call_id": None,
                         "output": "done\nexited with code 0",
                         "ok": True,
                         "completed_at": "2026-07-09T01:00:02Z",
+                        "duration_ms": None,
+                        "status": None,
+                        "partial": None,
+                        "terminal_input": None,
+                        "metadata": None,
+                        "edit": None,
                     }
                 ],
             )

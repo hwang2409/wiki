@@ -525,6 +525,58 @@ class ArtifactTranscriptTests(unittest.TestCase):
             "render_artifact completed without a parseable artifact",
         )
 
+    def test_round8_l2_artifact_failures_and_unparseable_twins_are_terminal_once(self) -> None:
+        for item_id, item_updates in (
+            (
+                "artifact-failed-round8",
+                {"status": "failed", "error": "render rejected", "result": {}},
+            ),
+            (
+                "artifact-unparseable-round8",
+                {
+                    "status": "completed",
+                    "result": {"content": [{"type": "text", "text": "not a sentinel"}]},
+                },
+            ),
+        ):
+            item = {
+                "type": "mcpToolCall",
+                "id": item_id,
+                "server": "wiki_artifacts",
+                "tool": "render_artifact",
+                "arguments": {
+                    "kind": "mermaid",
+                    "payload": {"source": "graph TD; A-->B"},
+                },
+                **item_updates,
+            }
+            rows = [
+                {
+                    "kind": "item_completed",
+                    "disposition": "rendered",
+                    "payload": {"method": "item/completed", "params": {"item": item}},
+                    "normalized_at": "2026-08-07T12:00:01Z",
+                },
+                {
+                    "kind": "rawResponseItem_completed",
+                    "disposition": "rendered",
+                    "payload": {
+                        "method": "rawResponseItem/completed",
+                        "params": {"item": item},
+                    },
+                    "normalized_at": "2026-08-07T12:00:02Z",
+                },
+            ]
+            with self.subTest(item_id=item_id), TemporaryDirectory() as tmp:
+                path = Path(tmp) / "artifact-twins.jsonl"
+                path.write_text("".join(json.dumps(row) + "\n" for row in rows))
+                parsed = transcripts.read_session_events("codex-normalized", path)
+                state = transcripts._cache[str(path)]
+
+            tools = [event["tool"] for event in parsed["events"] if event["kind"] == "tool"]
+            self.assertEqual(len(tools), 1)
+            self.assertEqual(state["codex_item_lifecycle"][item_id]["state"], "terminal")
+
     def test_structured_image_result_reconstructs_artifact_reference(self) -> None:
         artifact_id = "33b1c159-9d1e-4804-9b14-3d880ac2e3c7"
 
@@ -713,7 +765,7 @@ class CodexNewRuntimeTranscriptTests(unittest.TestCase):
         parsed = transcripts.read_session_events("codex", path)
 
         tools = [event["tool"] for event in parsed["events"] if event["kind"] == "tool"]
-        self.assertEqual(len(tools), 5)
+        self.assertEqual(len(tools), 6)
 
         read_tool = tools[0]
         self.assertEqual(read_tool["name"], "exec_command")
@@ -729,16 +781,15 @@ class CodexNewRuntimeTranscriptTests(unittest.TestCase):
 
         # Homogeneous Promise.all children keep their own canonical identity
         # and input, so each actual call reaches the shared tool renderer.
-        multi_tools = tools[2:4]
+        multi_outer = tools[2]
+        multi_tools = tools[3:5]
         self.assertEqual([tool["name"] for tool in multi_tools], ["exec_command", "exec_command"])
         self.assertEqual([tool["input"] for tool in multi_tools], [
             'git status --short --branch',
             'rg -n "custom_tool_call" backend/app/transcripts.py',
         ])
-        self.assertEqual([tool["output"] for tool in multi_tools], [
-            "## git\n## wiki-main\n## rg\n1034: custom_tool_call\n",
-            "## git\n## wiki-main\n## rg\n1034: custom_tool_call\n",
-        ])
+        self.assertEqual(multi_outer["output"], "## git\n## wiki-main\n## rg\n1034: custom_tool_call\n")
+        self.assertEqual([tool["output"] for tool in multi_tools], [None, None])
 
         # The wrapper exposes one aggregate result for this batch. Preserve it
         # on both children, but do not invent child status.
@@ -748,7 +799,7 @@ class CodexNewRuntimeTranscriptTests(unittest.TestCase):
         self.assertEqual(multi_tool["summary"], "git status")
         self.assertEqual([tool["ok"] for tool in multi_tools], [None, None])
 
-        failed_tool = tools[4]
+        failed_tool = tools[5]
         self.assertEqual(failed_tool["archetype"], "validate")
         self.assertFalse(failed_tool["ok"])
         self.assertEqual(failed_tool["output"], "test command failed\n")
@@ -827,7 +878,7 @@ class CodexNewRuntimeTranscriptTests(unittest.TestCase):
         parsed = transcripts.read_session_events("codex", path)
         tools = [event["tool"] for event in parsed["events"] if event["kind"] == "tool"]
 
-        self.assertEqual(len(tools), 6)
+        self.assertEqual(len(tools), 8)
         for tool in tools:
             self.assertNotIn("```js", tool["input"])
             self.assertNotIn("await tools.", tool["input"])
@@ -847,15 +898,18 @@ class CodexNewRuntimeTranscriptTests(unittest.TestCase):
         # apply_patch preserves the structured edit payload for the diff view.
         self.assertIn("patch", patch["edit"])
 
-        parallel = tools[2:4]
+        parallel_outer = tools[2]
+        parallel = tools[3:5]
         self.assertEqual([tool["name"] for tool in parallel], ["exec_command", "exec_command"])
         self.assertEqual([tool["input"] for tool in parallel], [
             "/tmp/agent-status/pr_watch_summary.sh 13657",
             "gh pr view 13657 --json state,mergeable,mergeStateStatus",
         ])
         self.assertEqual([tool["archetype"] for tool in parallel], ["run", "github"])
+        self.assertIsNotNone(parallel_outer["output"])
 
-        mixed = tools[4:6]
+        mixed_outer = tools[5]
+        mixed = tools[6:8]
         self.assertEqual(
             [tool["name"] for tool in mixed],
             ["mcp__wiki_artifacts__read_agent_pr", "exec_command"],
@@ -863,11 +917,12 @@ class CodexNewRuntimeTranscriptTests(unittest.TestCase):
         self.assertEqual([tool["archetype"] for tool in mixed], ["tool", "run"])
         self.assertEqual(
             [tool["output"] for tool in mixed],
-            ["pr context\ngate result: green\n"] * 2,
+            [None, None],
         )
         # This fixture has one aggregate result block, not one result per
         # child. Keep sibling output evidence without claiming both passed.
         self.assertEqual([tool["ok"] for tool in mixed], [None, None])
+        self.assertEqual(mixed_outer["output"], "pr context\ngate result: green\n")
 
     def test_wiki267_live_order_prefers_reasoning_and_native_mcp_rows(self) -> None:
         path = FIXTURES_DIR / "codex_wiki267_live_order.jsonl"
@@ -880,9 +935,16 @@ class CodexNewRuntimeTranscriptTests(unittest.TestCase):
         self.assertTrue(thinking[0]["encrypted"])
         self.assertEqual(
             [tool["name"] for tool in tools],
-            ["mcp__wiki_artifacts__read_agent", "mcp__wiki_artifacts__read_agent_events"],
+            [
+                "exec",
+                "mcp__wiki_artifacts__read_agent",
+                "mcp__wiki_artifacts__read_agent_events",
+            ],
         )
-        self.assertEqual([tool["output"] for tool in tools], ["agent details", "event details"])
+        self.assertEqual(
+            [tool["output"] for tool in tools],
+            [None, "agent details", "event details"],
+        )
         self.assertTrue(all("const" not in tool["input"] and "await tools" not in tool["input"] for tool in tools))
 
     def test_codex_runtime_preamble_is_metadata_not_output(self) -> None:
@@ -1121,12 +1183,9 @@ class CodexNewRuntimeTranscriptTests(unittest.TestCase):
                 if event["kind"] == "tool"
             ]
 
-        self.assertEqual([tool["input"] for tool in tools], ["first", "second"])
-        self.assertEqual([tool["output"] for tool in tools], [
-            "first output\n",
-            "second output\n",
-        ])
-        self.assertEqual([tool["ok"] for tool in tools], [True, False])
+        self.assertEqual([tool["input"] for tool in tools], ["first\nsecond", "first", "second"])
+        self.assertEqual([tool["output"] for tool in tools], ["first output\n\nsecond output\n", None, None])
+        self.assertEqual([tool["ok"] for tool in tools], [None, None, None])
 
     def test_harness_batch_results_normalize_runtime_input_text_envelope(self) -> None:
         rows = [
@@ -1175,11 +1234,8 @@ class CodexNewRuntimeTranscriptTests(unittest.TestCase):
                 if event["kind"] == "tool"
             ]
 
-        self.assertEqual([tool["output"] for tool in tools], [
-            "first output\n",
-            "second output\n",
-        ])
-        self.assertEqual([tool["ok"] for tool in tools], [True, False])
+        self.assertEqual([tool["output"] for tool in tools], ["first output\n\nsecond output\n", None, None])
+        self.assertEqual([tool["ok"] for tool in tools], [None, None, None])
 
     def test_harness_batch_child_references_cannot_collide_with_provider_ids(self) -> None:
         rows = [
@@ -1238,7 +1294,7 @@ class CodexNewRuntimeTranscriptTests(unittest.TestCase):
                 if event["kind"] == "tool"
             ]
 
-        self.assertEqual([tool["output"] for tool in tools], ["first\n", "second\n", "waited\n"])
+        self.assertEqual([tool["output"] for tool in tools], ["first\n\nsecond\n", None, None, "waited\n"])
 
     def test_harness_deep_output_is_bounded_and_replay_is_deterministic(self) -> None:
         nested = '{"value":' * (transcripts.MAX_CODEX_OUTPUT_DEPTH + 10)
@@ -1278,7 +1334,7 @@ class CodexNewRuntimeTranscriptTests(unittest.TestCase):
         self.assertEqual(cold["events"], replay["events"])
         self.assertEqual(
             [event["tool"]["ok"] for event in cold["events"] if event["kind"] == "tool"],
-            [None, None],
+            [None, None, None],
         )
         oversized = [
             {
@@ -1331,6 +1387,2514 @@ class CodexNewRuntimeTranscriptTests(unittest.TestCase):
         harness = transcripts._codex_harness_tool("exec", source)
         self.assertIsNotNone(harness)
         self.assertEqual(harness["input"], "line\nhexAunicodeB")
+
+
+class CodexModernTranscriptParityTests(unittest.TestCase):
+    def setUp(self) -> None:
+        transcripts._cache.clear()
+
+    @staticmethod
+    def _row(method: str, params: dict, seq: int) -> dict:
+        return {
+            "seq": seq,
+            "raw_seq": seq,
+            "normalized_at": f"2026-08-07T12:00:{seq:02d}Z",
+            "disposition": "rendered",
+            "kind": method.replace("/", "_"),
+            "payload": {"method": method, "params": params},
+        }
+
+    def test_modern_item_lifecycle_deltas_and_replay_share_one_tool(self) -> None:
+        item = {
+            "type": "commandExecution",
+            "id": "cmd-1",
+            "command": "printf hi",
+            "cwd": "/workspace",
+            "status": "inProgress",
+        }
+        completed = {
+            **item,
+            "status": "completed",
+            "aggregatedOutput": "hi\n",
+            "exitCode": 0,
+            "durationMs": 12,
+        }
+        rows = [
+            self._row("item/started", {"item": item}, 1),
+            self._row("item/commandExecution/outputDelta", {"itemId": "cmd-1", "delta": "hi\n"}, 2),
+            self._row("item/commandExecution/terminalInteraction", {"itemId": "cmd-1", "input": "y\n"}, 3),
+            self._row("item/completed", {"item": completed}, 4),
+            self._row("rawResponseItem/completed", {"item": completed}, 5),
+        ]
+        with TemporaryDirectory() as tmp:
+            path = Path(tmp) / "events.jsonl"
+            path.write_text("".join(json.dumps(row) + "\n" for row in rows))
+            parsed = transcripts.read_session_events("codex-normalized", path)
+
+        tools = [event["tool"] for event in parsed["events"] if event["kind"] == "tool"]
+        self.assertEqual(len(tools), 1)
+        self.assertEqual(tools[0]["name"], "exec_command")
+        self.assertEqual(tools[0]["output"], "hi\n")
+        self.assertTrue(tools[0]["ok"])
+        self.assertEqual(tools[0]["duration_ms"], 12)
+        self.assertEqual(tools[0]["terminal_input"], "y\n")
+        self.assertEqual(tools[0]["call_id"], "cmd-1")
+
+    def test_result_first_modern_item_is_linked_when_start_replays_later(self) -> None:
+        completed = {
+            "type": "mcpToolCall",
+            "id": "mcp-1",
+            "server": "filesystem",
+            "tool": "read_file",
+            "arguments": {"path": "README.md"},
+            "result": {"content": [{"type": "text", "text": "hello"}]},
+            "status": "completed",
+        }
+        rows = [
+            self._row("item/completed", {"item": completed}, 1),
+            self._row("item/started", {"item": {**completed, "status": "inProgress", "result": None}}, 2),
+        ]
+        with TemporaryDirectory() as tmp:
+            path = Path(tmp) / "events.jsonl"
+            path.write_text("".join(json.dumps(row) + "\n" for row in rows))
+            parsed = transcripts.read_session_events("codex-normalized", path)
+
+        tools = [event["tool"] for event in parsed["events"] if event["kind"] == "tool"]
+        self.assertEqual(len(tools), 1)
+        self.assertEqual(tools[0]["name"], "mcp__filesystem__read_file")
+        self.assertEqual(tools[0]["output"], "hello")
+        self.assertTrue(tools[0]["ok"])
+
+    def test_modern_agent_message_delta_and_approval_are_visible_once(self) -> None:
+        rows = [
+            self._row(
+                "item/started",
+                {"item": {"type": "agentMessage", "id": "msg-1", "text": ""}},
+                1,
+            ),
+            self._row("item/agentMessage/delta", {"itemId": "msg-1", "delta": "hello"}, 2),
+            self._row("item/agentMessage/delta", {"itemId": "msg-1", "delta": " world"}, 3),
+            self._row(
+                "item/completed",
+                {"item": {"type": "agentMessage", "id": "msg-1", "text": "hello world"}},
+                4,
+            ),
+            self._row(
+                "item/commandExecution/requestApproval",
+                {"itemId": "cmd-2", "reason": "needs terminal access"},
+                5,
+            ),
+            self._row(
+                "serverRequest/resolved",
+                {"requestId": "cmd-2", "response": {"approved": False}},
+                6,
+            ),
+        ]
+        with TemporaryDirectory() as tmp:
+            path = Path(tmp) / "events.jsonl"
+            path.write_text("".join(json.dumps(row) + "\n" for row in rows))
+            parsed = transcripts.read_session_events("codex-normalized", path)
+
+        self.assertEqual(
+            [(event["kind"], event["text"]) for event in parsed["events"]],
+            [
+                ("assistant", "hello world"),
+                ("marker", "approval requested"),
+                ("marker", "approval resolved"),
+            ],
+        )
+
+    def test_round6_j1_modern_agent_completion_pairs_raw_assistant_twin_by_id(self) -> None:
+        rows = [
+            self._row(
+                "item/completed",
+                {
+                    "item": {
+                        "type": "agentMessage",
+                        "id": "assistant-twin",
+                        "text": "modern answer",
+                    }
+                },
+                1,
+            ),
+            self._row(
+                "rawResponseItem/completed",
+                {
+                    "item": {
+                        "type": "message",
+                        "id": "assistant-twin",
+                        "role": "assistant",
+                        "content": [{"type": "output_text", "text": "modern answer"}],
+                    }
+                },
+                2,
+            ),
+            self._row(
+                "rawResponseItem/completed",
+                {
+                    "item": {
+                        "type": "message",
+                        "id": "raw-only",
+                        "role": "assistant",
+                        "content": [{"type": "output_text", "text": "raw answer"}],
+                    }
+                },
+                3,
+            ),
+            self._row(
+                "rawResponseItem/completed",
+                {
+                    "item": {
+                        "type": "message",
+                        "id": "raw-first",
+                        "role": "assistant",
+                        "content": [{"type": "output_text", "text": "raw first"}],
+                    }
+                },
+                4,
+            ),
+            self._row(
+                "item/completed",
+                {
+                    "item": {
+                        "type": "agentMessage",
+                        "id": "raw-first",
+                        "text": "raw first",
+                    }
+                },
+                5,
+            ),
+        ]
+        with TemporaryDirectory() as tmp:
+            path = Path(tmp) / "raw-message-twins.jsonl"
+            path.write_text("".join(json.dumps(row) + "\n" for row in rows))
+            parsed = transcripts.read_session_events("codex-normalized", path)
+
+        self.assertEqual(
+            [(event["kind"], event["text"]) for event in parsed["events"]],
+            [
+                ("assistant", "modern answer"),
+                ("assistant", "raw answer"),
+                ("assistant", "raw first"),
+            ],
+        )
+
+    def test_round6_j2_completed_artifact_ignores_replayed_start(self) -> None:
+        artifact = _artifact_protocol_event("mermaid", 269)
+        item = {
+            "type": "mcpToolCall",
+            "id": "artifact-terminal",
+            "server": "wiki_artifacts",
+            "tool": "render_artifact",
+            "arguments": {"kind": "mermaid", "payload": {"source": "graph TD; A-->B"}},
+            "status": "inProgress",
+        }
+        completed = {
+            **item,
+            "status": "completed",
+            "result": {"content": [{"type": "text", "text": sentinel_text(artifact)}]},
+        }
+        rows = [
+            self._row("item/started", {"item": item}, 1),
+            self._row("item/completed", {"item": completed}, 2),
+            self._row("item/started", {"item": item}, 3),
+            self._row("turn/completed", {"turn": {"status": "completed"}}, 4),
+        ]
+        with TemporaryDirectory() as tmp:
+            path = Path(tmp) / "artifact-replay.jsonl"
+            path.write_text("".join(json.dumps(row) + "\n" for row in rows))
+            parsed = transcripts.read_session_events("codex-normalized", path)
+            state = transcripts._cache[str(path)]
+
+        self.assertEqual([event["kind"] for event in parsed["events"]], ["artifact"])
+        self.assertIn("artifact-terminal", state["codex_terminal_items"])
+        self.assertNotIn("artifact-terminal", state["pending_artifacts"])
+
+    def test_round9_m1_interrupted_artifact_suppresses_late_completion(self) -> None:
+        artifact = _artifact_protocol_event("mermaid", 270)
+        item = {
+            "type": "mcpToolCall",
+            "id": "artifact-partial-replay",
+            "server": "wiki_artifacts",
+            "tool": "render_artifact",
+            "arguments": {"kind": "mermaid", "payload": {"source": "graph TD; A-->B"}},
+            "status": "inProgress",
+        }
+        completed = {
+            **item,
+            "status": "completed",
+            "result": {"content": [{"type": "text", "text": sentinel_text(artifact)}]},
+        }
+        rows = [
+            self._row("turn/started", {"turn": {"id": "partial-artifact-turn"}}, 1),
+            self._row("item/started", {"item": item}, 2),
+            self._row("turn/completed", {"turn": {"status": "interrupted"}}, 3),
+            self._row("item/completed", {"item": completed}, 4),
+        ]
+        with TemporaryDirectory() as tmp:
+            path = Path(tmp) / "partial-artifact-replay.jsonl"
+            path.write_text("".join(json.dumps(row) + "\n" for row in rows))
+            parsed = transcripts.read_session_events("codex-normalized", path)
+            state = transcripts._cache[str(path)]
+
+        outcomes = [
+            event for event in parsed["events"] if event["kind"] in {"tool", "artifact"}
+        ]
+        self.assertEqual(len(outcomes), 1)
+        self.assertEqual(outcomes[0]["kind"], "tool")
+        self.assertEqual(
+            state["codex_item_lifecycle"]["artifact-partial-replay"]["state"],
+            "partial",
+        )
+
+    def test_round6_j3_trim_evicts_old_maps_and_preserves_visible_lifecycle(self) -> None:
+        rows = []
+        for index in range(2200):
+            item_id = f"filler-{index}"
+            rows.extend(
+                [
+                    self._row(
+                        "item/started",
+                        {"item": {"type": "agentMessage", "id": item_id, "text": item_id}},
+                        index * 2 + 1,
+                    ),
+                    self._row(
+                        "item/completed",
+                        {"item": {"type": "agentMessage", "id": item_id, "text": item_id}},
+                        index * 2 + 2,
+                    ),
+                ]
+            )
+        rows.extend(
+            [
+                self._row(
+                    "item/started",
+                    {
+                        "item": {
+                            "type": "commandExecution",
+                            "id": "visible-tool",
+                            "command": "printf final",
+                            "status": "inProgress",
+                        }
+                    },
+                    3000,
+                ),
+                self._row(
+                    "item/commandExecution/outputDelta",
+                    {"itemId": "visible-tool", "delta": "old"},
+                    3001,
+                ),
+                self._row(
+                    "item/completed",
+                    {
+                        "item": {
+                            "type": "commandExecution",
+                            "id": "visible-tool",
+                            "command": "printf final",
+                            "status": "completed",
+                            "aggregatedOutput": "final",
+                            "exitCode": 0,
+                        }
+                    },
+                    3002,
+                ),
+                self._row(
+                    "item/commandExecution/outputDelta",
+                    {"itemId": "visible-tool", "delta": " late"},
+                    3003,
+                ),
+                self._row(
+                    "item/started",
+                    {
+                        "item": {
+                            "type": "agentMessage",
+                            "id": "visible-open",
+                            "text": "unfinished",
+                        }
+                    },
+                    3004,
+                ),
+                self._row("turn/completed", {"turn": {"status": "interrupted"}}, 3005),
+            ]
+        )
+        with TemporaryDirectory() as tmp:
+            path = Path(tmp) / "lifecycle-trim.jsonl"
+            path.write_text("".join(json.dumps(row) + "\n" for row in rows))
+            transcripts.read_session_events("codex-normalized", path)
+            state = transcripts._cache[str(path)]
+
+        for mapping_name in (
+            "codex_modern_items",
+            "codex_modern_messages",
+            "codex_reasoning_events",
+            "codex_turn_open_events",
+            "codex_terminal_items",
+            "codex_authoritative_items",
+            "pending_modern_deltas",
+            "artifact_ids",
+        ):
+            self.assertLessEqual(len(state[mapping_name]), transcripts.CODEX_EVENT_WINDOW)
+        self.assertNotIn("filler-0", state["codex_modern_messages"])
+        self.assertEqual(
+            state["codex_modern_items"]["visible-tool"]["tool"]["output"], "final"
+        )
+        self.assertTrue(state["codex_modern_messages"]["visible-open"]["partial"])
+
+    def test_round7_item_lifecycle_matrix_covers_kind_and_path(self) -> None:
+        """Every item kind uses one registry across creation and completion paths."""
+
+        def artifact_item(item_id: str, status: str = "inProgress") -> dict:
+            item = {
+                "type": "mcpToolCall",
+                "id": item_id,
+                "server": "wiki_artifacts",
+                "tool": "render_artifact",
+                "arguments": {
+                    "kind": "mermaid",
+                    "payload": {"source": "graph TD; A-->B"},
+                },
+                "status": status,
+            }
+            if status == "completed":
+                item["result"] = {
+                    "content": [{"type": "text", "text": sentinel_text(_artifact_protocol_event("mermaid", 270))}]
+                }
+            return item
+
+        def modern(kind: str, item_id: str, complete: bool = True) -> list[dict]:
+            if kind == "agentMessage":
+                item = {"type": "agentMessage", "id": item_id, "text": "answer"}
+                started = {**item, "text": ""}
+            elif kind == "reasoning":
+                item = {"type": "reasoning", "id": item_id, "summary": [{"text": "thought"}]}
+                started = {**item, "summary": []}
+            elif kind == "tool":
+                item = {
+                    "type": "commandExecution",
+                    "id": item_id,
+                    "command": "printf child",
+                    "status": "completed",
+                    "aggregatedOutput": "child",
+                }
+                started = {**item, "status": "inProgress", "aggregatedOutput": None}
+            else:
+                item = artifact_item(item_id, "completed")
+                started = artifact_item(item_id)
+            rows = [self._row("item/started", {"item": started}, 1)]
+            if complete:
+                rows.append(self._row("item/completed", {"item": item}, 2))
+            return rows
+
+        def legacy(kind: str, item_id: str, complete: bool = True) -> list[dict]:
+            if kind == "agentMessage":
+                return [
+                    {
+                        "type": "response_item",
+                        "timestamp": "2026-08-07T12:00:01Z",
+                        "payload": {
+                            "type": "message",
+                            "id": item_id,
+                            "role": "assistant",
+                            "content": [{"type": "output_text", "text": "answer"}],
+                        },
+                    }
+                ]
+            if kind == "reasoning":
+                return [
+                    {
+                        "type": "response_item",
+                        "timestamp": "2026-08-07T12:00:01Z",
+                        "payload": {
+                            "type": "reasoning",
+                            "id": item_id,
+                            "summary": [{"text": "thought"}],
+                        },
+                    }
+                ]
+            if kind == "tool":
+                rows = [
+                    {
+                        "type": "response_item",
+                        "timestamp": "2026-08-07T12:00:01Z",
+                        "payload": {
+                            "type": "function_call",
+                            "call_id": item_id,
+                            "name": "exec_command",
+                            "arguments": json.dumps({"cmd": "printf child"}),
+                        },
+                    }
+                ]
+                if complete:
+                    rows.append(
+                        {
+                            "type": "response_item",
+                            "timestamp": "2026-08-07T12:00:02Z",
+                            "payload": {
+                                "type": "function_call_output",
+                                "call_id": item_id,
+                                "output": "child",
+                            },
+                        }
+                    )
+                return rows
+            if kind == "artifact":
+                rows = [
+                    {
+                        "type": "response_item",
+                        "timestamp": "2026-08-07T12:00:01Z",
+                        "payload": {
+                            "type": "function_call",
+                            "call_id": item_id,
+                            "name": "render_artifact",
+                            "arguments": {"kind": "mermaid", "payload": {"source": "graph TD; A-->B"}},
+                        },
+                    }
+                ]
+                if complete:
+                    rows.append(
+                        {
+                            "type": "response_item",
+                            "timestamp": "2026-08-07T12:00:02Z",
+                            "payload": {
+                                "type": "function_call_output",
+                                "call_id": item_id,
+                                "output": sentinel_text(_artifact_protocol_event("mermaid", 270)),
+                            },
+                        }
+                    )
+                return rows
+            harness = (
+                'const rs = await Promise.all(['
+                'tools.mcp__wiki_artifacts__render_artifact({kind:"mermaid",payload:{source:"graph TD; A-->B"}}),'
+                'tools.exec_command({cmd:"printf child"})]); text(rs);'
+            )
+            rows = [
+                {
+                    "type": "response_item",
+                    "timestamp": "2026-08-07T12:00:01Z",
+                    "payload": {
+                        "type": "custom_tool_call",
+                        "call_id": "batch-outer",
+                        "name": "exec",
+                        "input": harness,
+                    },
+                }
+            ]
+            if complete:
+                rows.append(
+                    {
+                        "type": "response_item",
+                        "timestamp": "2026-08-07T12:00:02Z",
+                        "payload": {
+                            "type": "custom_tool_call_output",
+                            "call_id": "batch-outer",
+                            "output": [
+                                {"call_id": "batch-tool", "output": "child"},
+                                {
+                                    "call_id": "batch-artifact",
+                                    "output": sentinel_text(_artifact_protocol_event("mermaid", 270)),
+                                },
+                            ],
+                        },
+                    }
+                )
+            return rows
+
+        def raw_twin(kind: str, item_id: str) -> dict:
+            if kind == "agentMessage":
+                item = {
+                    "type": "message",
+                    "id": item_id,
+                    "role": "assistant",
+                    "content": [{"type": "output_text", "text": "answer"}],
+                }
+            elif kind == "reasoning":
+                item = {
+                    "type": "reasoning",
+                    "id": item_id,
+                    "summary": [{"text": "thought"}],
+                }
+            elif kind == "tool":
+                item = {
+                    "type": "commandExecution",
+                    "id": item_id,
+                    "command": "printf child",
+                    "status": "completed",
+                    "aggregatedOutput": "child",
+                }
+            else:
+                item = artifact_item(item_id, "completed")
+            return self._row("rawResponseItem/completed", {"item": item}, 3)
+
+        def trim_prefix(path_kind: str) -> list[dict]:
+            rows: list[dict] = []
+            for index in range(transcripts.CODEX_EVENT_WINDOW + 1):
+                filler_id = f"matrix-trim-{path_kind}-{index}"
+                if path_kind == "modern":
+                    rows.append(
+                        self._row(
+                            "item/completed",
+                            {
+                                "item": {
+                                    "type": "agentMessage",
+                                    "id": filler_id,
+                                    "text": filler_id,
+                                }
+                            },
+                            index + 1,
+                        )
+                    )
+                else:
+                    rows.append(
+                        {
+                            "type": "response_item",
+                            "timestamp": "2026-08-07T12:00:01Z",
+                            "payload": {
+                                "type": "message",
+                                "id": filler_id,
+                                "role": "assistant",
+                                "content": [{"type": "output_text", "text": filler_id}],
+                            },
+                        }
+                    )
+            return rows
+
+        def case_rows(
+            kind: str,
+            path_kind: str,
+            item_id: str,
+            include_raw_twin: bool,
+            trim: bool,
+        ) -> list[dict]:
+            builder = modern if path_kind == "modern" else legacy
+            rows = builder(kind, item_id)
+            if include_raw_twin:
+                rows.append(raw_twin(kind, item_id))
+            return (trim_prefix(path_kind) if trim else []) + rows
+
+        matrix = [
+            ("agentMessage", "modern", True, True),
+            ("reasoning", "modern", True, True),
+            ("tool", "modern", True, True),
+            ("artifact", "modern", True, True),
+            ("agentMessage", "legacy", False, True),
+            ("reasoning", "legacy", False, True),
+            ("tool", "legacy", False, True),
+            ("artifact", "legacy", False, True),
+            ("batch child", "legacy", False, False),
+        ]
+        for kind, path_kind, include_raw_twin, trim in matrix:
+            item_id = f"matrix-{kind.replace(' ', '-')}-{path_kind}"
+            with self.subTest(kind=kind, path=path_kind), TemporaryDirectory() as tmp:
+                path = Path(tmp) / "matrix.jsonl"
+                rows = case_rows(kind, path_kind, item_id, include_raw_twin, trim)
+                path.write_text("".join(json.dumps(row) + "\n" for row in rows))
+                parsed = transcripts.read_session_events(
+                    "codex-normalized" if path_kind == "modern" else "codex", path
+                )
+                state = transcripts._cache[str(path)]
+            expected_ids = (
+                {"batch-tool", "batch-artifact"}
+                if kind == "batch child"
+                else {item_id}
+            )
+            target_ids = (
+                [
+                    key
+                    for key, record in state["codex_item_lifecycle"].items()
+                    if key != "batch-outer"
+                    and record.get("kind") in {"tool", "artifact"}
+                ]
+                if kind == "batch child"
+                else [item_id]
+            )
+            self.assertEqual(set(target_ids), expected_ids)
+            self.assertEqual(len(target_ids), len(expected_ids))
+            for target_id in target_ids:
+                self.assertEqual(state["codex_item_lifecycle"][target_id]["state"], "terminal")
+            baseline_events = len(parsed["events"])
+            with TemporaryDirectory() as tmp:
+                path = Path(tmp) / "matrix-replay.jsonl"
+                replay_case = case_rows(
+                    kind, path_kind, item_id, include_raw_twin, trim
+                )
+                replay_rows = replay_case + replay_case
+                path.write_text("".join(json.dumps(row) + "\n" for row in replay_rows))
+                replayed = transcripts.read_session_events(
+                    "codex-normalized" if path_kind == "modern" else "codex", path
+                )
+            self.assertEqual(len(replayed["events"]), baseline_events, (kind, path_kind))
+
+        interrupt_matrix = [
+            ("agentMessage", "modern"),
+            ("reasoning", "modern"),
+            ("tool", "modern"),
+            ("artifact", "modern"),
+            ("tool", "legacy"),
+            ("artifact", "legacy"),
+            ("batch child", "legacy"),
+        ]
+        for kind, path_kind in interrupt_matrix:
+            item_id = f"partial-{kind.replace(' ', '-')}-{path_kind}"
+            builder = modern if path_kind == "modern" else legacy
+            rows = builder(kind, item_id, complete=False)
+            if path_kind == "modern":
+                turn_started = self._row("turn/started", {"turn": {"id": item_id}}, 0)
+                turn_completed = self._row(
+                    "turn/completed", {"turn": {"status": "interrupted"}}, 99
+                )
+            else:
+                turn_started = {
+                    "type": "event_msg",
+                    "timestamp": "2026-08-07T12:00:00Z",
+                    "payload": {"type": "turn_started", "turn": {"id": item_id}},
+                }
+                turn_completed = {
+                    "type": "event_msg",
+                    "timestamp": "2026-08-07T12:00:99Z",
+                    "payload": {
+                        "type": "turn_completed",
+                        "turn": {"status": "interrupted"},
+                    },
+                }
+            rows.insert(0, turn_started)
+            rows.append(turn_completed)
+            with self.subTest(kind=kind, path=f"{path_kind}-interrupt"), TemporaryDirectory() as tmp:
+                path = Path(tmp) / "matrix-interrupt.jsonl"
+                path.write_text("".join(json.dumps(row) + "\n" for row in rows))
+                transcripts.read_session_events(
+                    "codex-normalized" if path_kind == "modern" else "codex", path
+                )
+                state = transcripts._cache[str(path)]
+            target_ids = (
+                [
+                    key
+                    for key, record in state["codex_item_lifecycle"].items()
+                    if key != "batch-outer"
+                    and record.get("kind") in {"tool", "artifact"}
+                ]
+                if kind == "batch child"
+                else [item_id]
+            )
+            for target_id in target_ids:
+                self.assertEqual(state["codex_item_lifecycle"][target_id]["state"], "partial")
+
+    def test_round7_k1_trim_keeps_buffered_unrendered_deltas(self) -> None:
+        rows = [
+            self._row(
+                "item/commandExecution/outputDelta",
+                {"itemId": "buffered-after-trim", "delta": "before-start"},
+                1,
+            )
+        ]
+        for index in range(2200):
+            item_id = f"trim-{index}"
+            rows.extend(
+                [
+                    self._row(
+                        "item/started",
+                        {"item": {"type": "agentMessage", "id": item_id, "text": item_id}},
+                        index * 2 + 2,
+                    ),
+                    self._row(
+                        "item/completed",
+                        {"item": {"type": "agentMessage", "id": item_id, "text": item_id}},
+                        index * 2 + 3,
+                    ),
+                ]
+            )
+        rows.append(
+            self._row(
+                "item/started",
+                {"item": {"type": "commandExecution", "id": "buffered-after-trim", "command": "echo"}},
+                5000,
+            )
+        )
+        with TemporaryDirectory() as tmp:
+            path = Path(tmp) / "buffered-trim.jsonl"
+            path.write_text("".join(json.dumps(row) + "\n" for row in rows))
+            transcripts.read_session_events("codex-normalized", path)
+            state = transcripts._cache[str(path)]
+        self.assertEqual(
+            state["codex_modern_items"]["buffered-after-trim"]["tool"]["output"],
+            "before-start",
+        )
+        self.assertNotIn("buffered-after-trim", state["pending_modern_deltas"])
+
+    def test_round7_k2_post_eviction_replay_does_not_reuse_trimmed_authority(self) -> None:
+        target = self._row(
+            "item/completed",
+            {"item": {"type": "agentMessage", "id": "evicted-authority", "text": "final"}},
+            1,
+        )
+        rows = [target]
+        for index in range(transcripts.CODEX_EVENT_WINDOW - 1):
+            filler_id = f"authority-filler-{index}"
+            rows.append(
+                self._row(
+                    "item/completed",
+                    {"item": {"type": "agentMessage", "id": filler_id, "text": filler_id}},
+                    index + 2,
+                )
+            )
+        with TemporaryDirectory() as tmp:
+            path = Path(tmp) / "authority-eviction.jsonl"
+            path.write_text("".join(json.dumps(row) + "\n" for row in rows))
+            transcripts.read_session_events("codex-normalized", path)
+
+            path.write_text(
+                path.read_text()
+                + json.dumps(
+                    self._row(
+                        "item/agentMessage/delta",
+                        {"itemId": "evicted-authority", "delta": " replay"},
+                        3000,
+                    )
+                )
+                + "\n"
+            )
+            transcripts.read_session_events("codex-normalized", path)
+            state = transcripts._cache[str(path)]
+            self.assertEqual(
+                state["codex_modern_messages"]["evicted-authority"]["text"],
+                "final",
+            )
+            self.assertNotIn("evicted-authority", state["pending_modern_deltas"])
+
+            path.write_text(
+                path.read_text()
+                + json.dumps(
+                    self._row(
+                        "item/completed",
+                        {"item": {"type": "agentMessage", "id": "last-filler", "text": "last"}},
+                        3001,
+                    )
+                )
+                + "\n"
+            )
+            transcripts.read_session_events("codex-normalized", path)
+            self.assertNotIn("evicted-authority", state["codex_item_lifecycle"])
+
+            path.write_text(
+                path.read_text()
+                + json.dumps(
+                    self._row(
+                        "item/agentMessage/delta",
+                        {"itemId": "evicted-authority", "delta": " after-eviction"},
+                        3002,
+                    )
+                )
+                + "\n"
+            )
+            transcripts.read_session_events("codex-normalized", path)
+
+        self.assertEqual(
+            state["pending_modern_deltas"]["evicted-authority"][0]["text"],
+            " after-eviction",
+        )
+
+    def test_round8_l3_reasoning_registry_tracks_every_split_event(self) -> None:
+        rows = [
+            self._row(
+                "item/started",
+                {"item": {"type": "reasoning", "id": "split-reasoning", "summary": []}},
+                1,
+            ),
+            self._row(
+                "item/reasoning/summaryTextDelta",
+                {"itemId": "split-reasoning", "delta": "**first** **second**"},
+                2,
+            ),
+            self._row(
+                "turn/completed",
+                {"turn": {"status": "interrupted"}},
+                3,
+            ),
+        ]
+        with TemporaryDirectory() as tmp:
+            path = Path(tmp) / "reasoning-split.jsonl"
+            path.write_text("".join(json.dumps(row) + "\n" for row in rows))
+            transcripts.read_session_events("codex-normalized", path)
+            state = transcripts._cache[str(path)]
+
+        record = state["codex_item_lifecycle"]["split-reasoning"]
+        self.assertEqual(record["state"], "partial")
+        self.assertEqual(len(record["events"]), 2)
+        self.assertTrue(all(event.get("partial") for event in record["events"]))
+
+    def test_round8_l4_never_rendered_registry_entries_evict_with_pending_maps(self) -> None:
+        cases = {
+            "delta": lambda index: self._row(
+                "item/commandExecution/outputDelta",
+                {"itemId": f"delta-only-{index}", "delta": "buffered"},
+                index,
+            ),
+            "artifact": lambda index: self._row(
+                "item/started",
+                {
+                    "item": {
+                        "type": "mcpToolCall",
+                        "id": f"artifact-start-only-{index}",
+                        "server": "wiki_artifacts",
+                        "tool": "render_artifact",
+                        "arguments": {
+                            "kind": "mermaid",
+                            "payload": {"source": "graph TD; A-->B"},
+                        },
+                        "status": "inProgress",
+                    }
+                },
+                index,
+            ),
+        }
+        for kind, build in cases.items():
+            rows = [build(index) for index in range(transcripts.CODEX_EVENT_WINDOW + 1)]
+            with self.subTest(kind=kind), TemporaryDirectory() as tmp:
+                path = Path(tmp) / f"{kind}-only.jsonl"
+                path.write_text("".join(json.dumps(row) + "\n" for row in rows))
+                transcripts.read_session_events("codex-normalized", path)
+                state = transcripts._cache[str(path)]
+
+            prefix = "delta-only" if kind == "delta" else "artifact-start-only"
+            first_id = f"{prefix}-0"
+            last_id = f"{prefix}-{transcripts.CODEX_EVENT_WINDOW}"
+            pending_key = "pending_modern_deltas" if kind == "delta" else "pending_artifacts"
+            self.assertNotIn(first_id, state["codex_item_lifecycle"])
+            self.assertNotIn(first_id, state[pending_key])
+            self.assertIn(last_id, state["codex_item_lifecycle"])
+            self.assertIn(last_id, state[pending_key])
+            self.assertLessEqual(len(state["codex_item_lifecycle"]), transcripts.CODEX_EVENT_WINDOW)
+
+    def test_round9_m4_empty_reasoning_lifecycle_records_are_bounded(self) -> None:
+        rows = [
+            self._row(
+                "item/completed",
+                {"item": {"type": "reasoning", "id": f"empty-{index}", "summary": []}},
+                index,
+            )
+            for index in range(transcripts.CODEX_EVENT_WINDOW + 1)
+        ]
+        with TemporaryDirectory() as tmp:
+            path = Path(tmp) / "empty-reasoning.jsonl"
+            path.write_text("".join(json.dumps(row) + "\n" for row in rows))
+            transcripts.read_session_events("codex-normalized", path)
+            state = transcripts._cache[str(path)]
+
+        self.assertLessEqual(
+            len(state["codex_item_lifecycle"]), transcripts.CODEX_EVENT_WINDOW
+        )
+        self.assertNotIn("empty-0", state["codex_item_lifecycle"])
+        self.assertEqual(
+            state["codex_item_lifecycle"][f"empty-{transcripts.CODEX_EVENT_WINDOW}"]["state"],
+            "terminal",
+        )
+
+    def test_round2_f1_wrapper_incremental_replay_matches_full_and_keeps_unmatched(self) -> None:
+        wrapper = {
+            "type": "response_item",
+            "timestamp": "2026-08-07T12:00:00Z",
+            "payload": {
+                "type": "custom_tool_call",
+                "call_id": "wrapper-1",
+                "name": "exec",
+                "input": 'tools.mcp__fixture__lookup({value:"wanted"});',
+            },
+        }
+        native = {
+            "type": "response_item",
+            "timestamp": "2026-08-07T12:00:01Z",
+            "payload": {
+                "type": "mcpToolCall",
+                "id": "wrapper-1",
+                "server": "fixture",
+                "tool": "lookup",
+                "arguments": {"value": "wanted"},
+                "status": "completed",
+                "result": {"content": [{"type": "text", "text": "native"}]},
+            },
+        }
+        unmatched = {
+            **wrapper,
+            "payload": {
+                **wrapper["payload"],
+                "call_id": "wrapper-2",
+                "input": 'tools.mcp__fixture__lookup({value:"other"});',
+            },
+        }
+        with TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            incremental = root / "incremental.jsonl"
+            incremental.write_text(json.dumps(wrapper) + "\n")
+            transcripts._cache.clear()
+            transcripts.read_session_events("codex", incremental)
+            incremental.write_text(
+                "\n".join(json.dumps(row) for row in (wrapper, native, unmatched)) + "\n"
+            )
+            incremental_result = transcripts.read_session_events("codex", incremental)
+            full = root / "full.jsonl"
+            full.write_text(
+                "\n".join(json.dumps(row) for row in (wrapper, native, unmatched)) + "\n"
+            )
+            transcripts._cache.clear()
+            full_result = transcripts.read_session_events("codex", full)
+
+        self.assertEqual(incremental_result["events"], full_result["events"])
+        tools = [event["tool"] for event in full_result["events"] if event["kind"] == "tool"]
+        self.assertEqual([tool["name"] for tool in tools], [
+            "mcp__fixture__lookup",
+            "mcp__fixture__lookup",
+        ])
+        self.assertEqual([tool["input"] for tool in tools], [
+            '{"value": "wanted"}',
+            '{"value": "other"}',
+        ])
+
+    def test_round3_g1_wrapper_suppression_is_scoped_to_one_turn(self) -> None:
+        def raw(seq: int, row_type: str, payload: dict) -> dict:
+            return {
+                "type": row_type,
+                "timestamp": f"2026-08-07T12:00:{seq:02d}Z",
+                "payload": payload,
+            }
+
+        wrapper_input = 'tools.mcp__fixture__lookup({value:"wanted"});'
+        rows = [
+            raw(1, "event_msg", {"type": "turn_started"}),
+            raw(2, "response_item", {
+                "type": "custom_tool_call",
+                "call_id": "wrapper-1",
+                "name": "exec",
+                "input": wrapper_input,
+            }),
+            raw(3, "response_item", {
+                "type": "mcpToolCall",
+                "id": "wrapper-1",
+                "server": "fixture",
+                "tool": "lookup",
+                "arguments": {"value": "wanted"},
+                "status": "completed",
+                "result": {"content": [{"type": "text", "text": "native"}]},
+            }),
+            raw(4, "event_msg", {"type": "turn_completed", "turn": {"status": "completed"}}),
+            raw(5, "event_msg", {"type": "turn_started"}),
+            raw(6, "response_item", {
+                "type": "custom_tool_call",
+                "call_id": "wrapper-2",
+                "name": "exec",
+                "input": wrapper_input,
+            }),
+        ]
+        with TemporaryDirectory() as tmp:
+            path = Path(tmp) / "turn-scoped-wrapper.jsonl"
+            path.write_text("\n".join(json.dumps(row) for row in rows) + "\n")
+            parsed = transcripts.read_session_events("codex", path)
+
+        tools = [event["tool"] for event in parsed["events"] if event["kind"] == "tool"]
+        self.assertEqual([tool["name"] for tool in tools], [
+            "mcp__fixture__lookup",
+            "mcp__fixture__lookup",
+        ])
+        self.assertEqual(tools[0]["output"], "native")
+        self.assertIsNone(tools[1]["output"])
+        self.assertIsNone(tools[1]["ok"])
+
+    def test_round8_l1_wrapper_suppression_keeps_shared_native_lifecycle_open(self) -> None:
+        wrapper = {
+            "type": "response_item",
+            "timestamp": "2026-08-07T12:00:00Z",
+            "payload": {
+                "type": "custom_tool_call",
+                "call_id": "shared-native-id",
+                "name": "exec",
+                "input": 'tools.mcp__fixture__lookup({value:"wanted"});',
+            },
+        }
+        native = {
+            "type": "response_item",
+            "timestamp": "2026-08-07T12:00:01Z",
+            "payload": {
+                "type": "mcpToolCall",
+                "id": "shared-native-id",
+                "server": "fixture",
+                "tool": "lookup",
+                "arguments": {"value": "wanted"},
+                "status": "completed",
+                "result": {"content": [{"type": "text", "text": "native"}]},
+            },
+        }
+        with TemporaryDirectory() as tmp:
+            path = Path(tmp) / "shared-native.jsonl"
+            path.write_text(json.dumps(wrapper) + "\n")
+            transcripts.read_session_events("codex", path)
+            path.write_text(json.dumps(wrapper) + "\n" + json.dumps(native) + "\n")
+            parsed = transcripts.read_session_events("codex", path)
+            state = transcripts._cache[str(path)]
+
+        tools = [event["tool"] for event in parsed["events"] if event["kind"] == "tool"]
+        self.assertEqual(len(tools), 1)
+        self.assertEqual(tools[0]["output"], "native")
+        self.assertEqual(state["codex_item_lifecycle"]["shared-native-id"]["state"], "terminal")
+
+    def test_round9_m2_incremental_batch_native_rows_clear_provisional_artifacts(self) -> None:
+        source = (
+            "const rs = await Promise.all(["
+            "tools.mcp__wiki_artifacts__render_artifact({kind:\"mermaid\",payload:{source:\"graph TD; A-->B\"}}),"
+            "tools.mcp__wiki_artifacts__render_artifact({kind:\"mermaid\",payload:{source:\"graph TD; A-->B\"}})"
+            "]); text(rs);"
+        )
+        wrapper = {
+            "type": "response_item",
+            "timestamp": "2026-08-07T12:00:00Z",
+            "payload": {
+                "type": "custom_tool_call",
+                "call_id": "batch-artifact-wrapper",
+                "name": "exec",
+                "input": source,
+            },
+        }
+        native_rows = [
+            {
+                "type": "response_item",
+                "timestamp": f"2026-08-07T12:00:0{index + 1}Z",
+                "payload": {
+                    "type": "mcpToolCall",
+                    "id": f"__codex_batch_child__:batch-artifact-wrapper:{index}",
+                    "server": "wiki_artifacts",
+                    "tool": "render_artifact",
+                    "arguments": {
+                        "kind": "mermaid",
+                        "payload": {"source": "graph TD; A-->B"},
+                    },
+                    "status": "completed",
+                    "result": {
+                        "content": [
+                            {
+                                "type": "text",
+                                "text": sentinel_text(_artifact_protocol_event("mermaid", 271 + index)),
+                            }
+                        ]
+                    },
+                },
+            }
+            for index in range(2)
+        ]
+        turn_completed = {
+            "type": "event_msg",
+            "timestamp": "2026-08-07T12:00:03Z",
+            "payload": {"type": "turn_completed", "turn": {"status": "completed"}},
+        }
+        with TemporaryDirectory() as tmp:
+            cold_path = Path(tmp) / "cold-batch-artifact.jsonl"
+            cold_path.write_text(json.dumps(wrapper) + "\n" + json.dumps(native_rows[0]) + "\n")
+            cold_parsed = transcripts.read_session_events("codex", cold_path)
+            cold_state = transcripts._cache[str(cold_path)]
+            cold_child_ids = {
+                tool.get("call_id")
+                for event in cold_parsed["events"]
+                if event["kind"] == "tool"
+                for tool in [event["tool"]]
+                if tool.get("call_id") in {
+                    "__codex_batch_child__:batch-artifact-wrapper:0",
+                    "__codex_batch_child__:batch-artifact-wrapper:1",
+                }
+            }
+            self.assertEqual(
+                cold_child_ids,
+                {
+                    "__codex_batch_child__:batch-artifact-wrapper:0",
+                    "__codex_batch_child__:batch-artifact-wrapper:1",
+                },
+            )
+            self.assertNotIn(
+                "__codex_batch_child__:batch-artifact-wrapper:0",
+                cold_state["pending_artifacts"],
+            )
+            self.assertIn(
+                "__codex_batch_child__:batch-artifact-wrapper:1",
+                cold_state["pending_artifacts"],
+            )
+
+            path = Path(tmp) / "incremental-batch-artifact.jsonl"
+            path.write_text(json.dumps(wrapper) + "\n")
+            transcripts.read_session_events("codex", path)
+            path.write_text(json.dumps(wrapper) + "\n" + json.dumps(native_rows[0]) + "\n")
+            parsed = transcripts.read_session_events("codex", path)
+            child_ids = {
+                "__codex_batch_child__:batch-artifact-wrapper:0",
+                "__codex_batch_child__:batch-artifact-wrapper:1",
+            }
+            visible_child_ids = {
+                tool.get("call_id")
+                for event in parsed["events"]
+                if event["kind"] == "tool"
+                for tool in [event["tool"]]
+                if tool.get("call_id") in child_ids
+            }
+            self.assertEqual(
+                visible_child_ids,
+                {
+                    "__codex_batch_child__:batch-artifact-wrapper:0",
+                    "__codex_batch_child__:batch-artifact-wrapper:1",
+                },
+            )
+            self.assertNotIn(
+                "__codex_batch_child__:batch-artifact-wrapper:0",
+                transcripts._cache[str(path)]["pending_artifacts"],
+            )
+            self.assertIn(
+                "__codex_batch_child__:batch-artifact-wrapper:1",
+                transcripts._cache[str(path)]["pending_artifacts"],
+            )
+            path.write_text(
+                "\n".join(json.dumps(row) for row in [wrapper, *native_rows, turn_completed])
+                + "\n"
+            )
+            parsed = transcripts.read_session_events("codex", path)
+
+        self.assertEqual(
+            [event["kind"] for event in parsed["events"]],
+            ["tool", "artifact", "tool", "artifact"],
+        )
+        self.assertNotIn(
+            "render_artifact rejected",
+            [event["tool"]["summary"] for event in parsed["events"] if event["kind"] == "tool"],
+        )
+
+    def test_round12_cold_batch_rows_share_native_occurrence_multiset(self) -> None:
+        source = 'tools.mcp__fixture__lookup({value:"wanted"});'
+
+        def wrapper(call_id: str) -> dict:
+            return {
+                "type": "response_item",
+                "timestamp": f"2026-08-07T12:00:0{call_id[-1]}Z",
+                "payload": {
+                    "type": "custom_tool_call",
+                    "call_id": call_id,
+                    "name": "exec",
+                    "input": source,
+                },
+            }
+
+        def native(call_id: str, second: bool = False) -> dict:
+            return {
+                "type": "response_item",
+                "timestamp": f"2026-08-07T12:00:0{3 if second else 2}Z",
+                "payload": {
+                    "type": "mcpToolCall",
+                    "id": call_id,
+                    "server": "fixture",
+                    "tool": "lookup",
+                    "arguments": {"value": "wanted"},
+                    "status": "completed",
+                    "result": {"content": [{"type": "text", "text": "native"}]},
+                },
+            }
+
+        turn_started = {
+            "type": "event_msg",
+            "timestamp": "2026-08-07T12:00:01Z",
+            "payload": {"type": "turn_started"},
+        }
+
+        def visible_wrapper_count(parsed: dict) -> int:
+            return sum(
+                1
+                for event in parsed["events"]
+                if event["kind"] == "tool"
+                and event["tool"]["name"] == "mcp__fixture__lookup"
+                and event["tool"]["output"] is None
+            )
+
+        rows = [
+            wrapper("wrapper-1"),
+            wrapper("wrapper-2"),
+            turn_started,
+            native("wrapper-1"),
+        ]
+        with TemporaryDirectory() as tmp:
+            one_native_path = Path(tmp) / "one-native.jsonl"
+            one_native_path.write_text("\n".join(json.dumps(row) for row in rows) + "\n")
+            one_native = transcripts.read_session_events("codex", one_native_path)
+
+            two_native_path = Path(tmp) / "two-native.jsonl"
+            two_native_rows = [
+                *rows[:2],
+                turn_started,
+                native("wrapper-1"),
+                native("wrapper-2", second=True),
+            ]
+            two_native_path.write_text(
+                "\n".join(json.dumps(row) for row in two_native_rows) + "\n"
+            )
+            two_native = transcripts.read_session_events("codex", two_native_path)
+
+        with self.subTest("one native occurrence"):
+            self.assertEqual(visible_wrapper_count(one_native), 1)
+        with self.subTest("two native occurrences"):
+            self.assertEqual(visible_wrapper_count(two_native), 0)
+
+    def test_round14_native_credits_are_batch_scoped_and_registry_bounded(self) -> None:
+        duplicate_batch = (
+            'const rs = await Promise.all(['
+            'tools.mcp__fixture__lookup({value:"wanted"}),'
+            'tools.mcp__fixture__lookup({value:"wanted"})'
+            ']); text(rs);'
+        )
+        sequential_batch = (
+            'const first = await tools.mcp__fixture__lookup({value:"wanted"}); '
+            'text(first); '
+            'const second = await tools.mcp__fixture__lookup({value:"wanted"}); '
+            'text(second);'
+        )
+        single_batch = 'tools.mcp__fixture__lookup({value:"wanted"});'
+
+        def wrapper(call_id: str, source: str) -> dict:
+            return {
+                "type": "response_item",
+                "timestamp": "2026-08-08T12:00:00Z",
+                "payload": {
+                    "type": "custom_tool_call",
+                    "call_id": call_id,
+                    "name": "exec",
+                    "input": source,
+                },
+            }
+
+        def native(call_id: str) -> dict:
+            return {
+                "type": "response_item",
+                "timestamp": "2026-08-08T12:00:01Z",
+                "payload": {
+                    "type": "mcpToolCall",
+                    "id": call_id,
+                    "server": "fixture",
+                    "tool": "lookup",
+                    "arguments": {"value": "wanted"},
+                    "status": "completed",
+                    "result": {"content": [{"type": "text", "text": "native"}]},
+                },
+            }
+
+        def normalized_wrapper(call_id: str, method: str) -> dict:
+            return self._row(
+                method,
+                {
+                    "item": {
+                        "type": "custom_tool_call",
+                        "id": call_id,
+                        "call_id": call_id,
+                        "name": "exec",
+                        "input": single_batch,
+                    }
+                },
+                1,
+            )
+
+        def normalized_native(call_id: str, method: str, seq: int) -> dict:
+            return self._row(
+                method,
+                {
+                    "item": {
+                        "type": "mcpToolCall",
+                        "id": call_id,
+                        "server": "fixture",
+                        "tool": "lookup",
+                        "arguments": {"value": "wanted"},
+                        "status": "completed",
+                        "result": {"content": [{"type": "text", "text": "native"}]},
+                    }
+                },
+                seq,
+            )
+
+        turn_started = {
+            "type": "event_msg",
+            "timestamp": "2026-08-08T12:00:00Z",
+            "payload": {"type": "turn_started"},
+        }
+
+        def visible_child_count(parsed: dict) -> int:
+            return sum(
+                1
+                for event in parsed["events"]
+                if event["kind"] == "tool"
+                and event["tool"]["name"] == "mcp__fixture__lookup"
+                and event["tool"]["output"] is None
+            )
+
+        def parse_rows(
+            tmp: str, name: str, rows: list[dict], fmt: str = "codex"
+        ) -> tuple[dict, dict]:
+            path = Path(tmp) / name
+            path.write_text("\n".join(json.dumps(row) for row in rows) + "\n")
+            transcripts._cache.clear()
+            parsed = transcripts.read_session_events(fmt, path)
+            return parsed, transcripts._cache[str(path)]
+
+        with TemporaryDirectory() as tmp:
+            one_native, _ = parse_rows(
+                tmp,
+                "one-native.jsonl",
+                [
+                    wrapper("batch-one", duplicate_batch),
+                    native("__codex_batch_child__:batch-one:0"),
+                ],
+            )
+            two_native, _ = parse_rows(
+                tmp,
+                "two-native.jsonl",
+                [
+                    wrapper("batch-two", duplicate_batch),
+                    native("__codex_batch_child__:batch-two:0"),
+                    native("__codex_batch_child__:batch-two:1"),
+                ],
+            )
+            interleaved_one, _ = parse_rows(
+                tmp,
+                "interleaved-one.jsonl",
+                [
+                    turn_started,
+                    wrapper("batch-interleaved-one", duplicate_batch),
+                    native("__codex_batch_child__:batch-interleaved-one:0"),
+                ],
+            )
+            interleaved_two, _ = parse_rows(
+                tmp,
+                "interleaved-two.jsonl",
+                [
+                    turn_started,
+                    wrapper("batch-interleaved-two", duplicate_batch),
+                    native("__codex_batch_child__:batch-interleaved-two:0"),
+                    native("__codex_batch_child__:batch-interleaved-two:1"),
+                ],
+            )
+
+            cross_batch, _ = parse_rows(
+                tmp,
+                "cross-batch.jsonl",
+                [
+                    native("native-cross"),
+                    wrapper("batch-cross-a", sequential_batch),
+                    wrapper("batch-cross-b", sequential_batch),
+                ],
+            )
+
+            native_raw_twin, native_raw_twin_state = parse_rows(
+                tmp,
+                "native-raw-twin-cross-batch.jsonl",
+                [
+                    normalized_wrapper("batch-twin-a", "rawResponseItem/completed"),
+                    normalized_native("batch-twin-a", "item/completed", 2),
+                    normalized_native("batch-twin-a", "rawResponseItem/completed", 3),
+                    normalized_wrapper("batch-twin-b", "rawResponseItem/completed"),
+                ],
+                fmt="codex-normalized",
+            )
+
+            surplus_state = transcripts._new_parse_state("codex")
+            surplus_wrapper = wrapper("batch-surplus-a", single_batch)
+            surplus_batch_id, surplus_keys = transcripts._codex_wrapper_batch_spec(
+                surplus_wrapper
+            )
+            transcripts._codex_record_batch_keys(
+                surplus_state, surplus_batch_id, surplus_keys
+            )
+            # Two native rows arrive in separate scopes. One wrapper consumes
+            # one credit, leaving an A-only surplus before batch B arrives.
+            surplus_tools, surplus_batches, _ = transcripts._codex_prime_native_scope(
+                surplus_state,
+                [native("native-surplus-a")],
+                0,
+                1,
+                {},
+                {},
+            )
+            surplus_tools, surplus_batches, _ = transcripts._codex_prime_native_scope(
+                surplus_state,
+                [native("native-surplus-b")],
+                0,
+                1,
+                surplus_tools,
+                surplus_batches,
+            )
+            surplus_state["codex_native_tools"] = surplus_tools
+            surplus_state["codex_native_batch_ids"] = surplus_batches
+            surplus_a_event, surplus_a_handled = transcripts._codex_add_semantic_tool_event(
+                surplus_state,
+                "mcp__fixture__lookup",
+                {"value": "wanted"},
+                None,
+                "batch-surplus-a",
+                wrapper=True,
+                batch_id="batch-surplus-a",
+            )
+            surplus_b_event, surplus_b_handled = transcripts._codex_add_semantic_tool_event(
+                surplus_state,
+                "mcp__fixture__lookup",
+                {"value": "wanted"},
+                None,
+                "batch-surplus-b",
+                wrapper=True,
+                batch_id="batch-surplus-b",
+            )
+
+            incremental_path = Path(tmp) / "incremental-cross-batch.jsonl"
+            incremental_path.write_text(
+                json.dumps(wrapper("batch-incremental-a", sequential_batch)) + "\n"
+            )
+            transcripts._cache.clear()
+            transcripts.read_session_events("codex", incremental_path)
+            incremental_path.write_text(
+                "\n".join(
+                    json.dumps(row)
+                    for row in [
+                        wrapper("batch-incremental-a", sequential_batch),
+                        native("__codex_batch_child__:batch-incremental-a:0"),
+                    ]
+                )
+                + "\n"
+            )
+            transcripts.read_session_events("codex", incremental_path)
+            incremental_path.write_text(
+                "\n".join(
+                    json.dumps(row)
+                    for row in [
+                        wrapper("batch-incremental-a", sequential_batch),
+                        native("__codex_batch_child__:batch-incremental-a:0"),
+                        wrapper("batch-incremental-b", sequential_batch),
+                        {
+                            "type": "event_msg",
+                            "timestamp": "2026-08-08T12:00:02Z",
+                            "payload": {
+                                "type": "turn_completed",
+                                "turn": {"status": "completed"},
+                            },
+                        },
+                    ]
+                )
+                + "\n"
+            )
+            incremental_cross = transcripts.read_session_events("codex", incremental_path)
+            incremental_state = transcripts._cache[str(incremental_path)]
+
+            incremental_twin_path = Path(tmp) / "incremental-native-twin.jsonl"
+            incremental_twin_rows = [
+                normalized_wrapper("batch-incremental-twin-a", "rawResponseItem/completed"),
+                normalized_native("batch-incremental-twin-a", "item/completed", 2),
+            ]
+            incremental_twin_path.write_text(
+                "\n".join(json.dumps(row) for row in incremental_twin_rows) + "\n"
+            )
+            transcripts.read_session_events("codex-normalized", incremental_twin_path)
+            incremental_twin_rows.extend(
+                [
+                    normalized_native(
+                        "batch-incremental-twin-a", "rawResponseItem/completed", 3
+                    ),
+                    normalized_wrapper(
+                        "batch-incremental-twin-b", "rawResponseItem/completed"
+                    ),
+                ]
+            )
+            incremental_twin_path.write_text(
+                "\n".join(json.dumps(row) for row in incremental_twin_rows) + "\n"
+            )
+            incremental_twin = transcripts.read_session_events(
+                "codex-normalized", incremental_twin_path
+            )
+            incremental_twin_state = transcripts._cache[str(incremental_twin_path)]
+
+        with self.subTest("one native occurrence"):
+            self.assertEqual(
+                visible_child_count(one_native),
+                1,
+            )
+        with self.subTest("two native occurrences"):
+            self.assertEqual(visible_child_count(two_native), 0)
+        with self.subTest("turn started keeps one native pairing"):
+            self.assertEqual(
+                visible_child_count(interleaved_one),
+                1,
+            )
+        with self.subTest("turn started keeps two native pairings"):
+            self.assertEqual(visible_child_count(interleaved_two), 0)
+        with self.subTest("unknown native ids create no credits"):
+            self.assertIsNotNone(surplus_a_event)
+            self.assertFalse(surplus_a_handled)
+            self.assertIsNotNone(surplus_b_event)
+            self.assertFalse(surplus_b_handled)
+            self.assertEqual(surplus_state["codex_native_tools"], {})
+        with self.subTest("native raw twin is one credited occurrence"):
+            self.assertEqual(visible_child_count(native_raw_twin), 1)
+            self.assertIn("batch-twin-b", native_raw_twin_state["pending_wrappers"])
+        with self.subTest("cold cross-batch isolation"):
+            self.assertEqual(
+                len(
+                    [
+                        event
+                        for event in cross_batch["events"]
+                        if event["kind"] == "tool"
+                        and event["tool"]["name"] == "exec"
+                    ]
+                ),
+                2,
+            )
+        with self.subTest("incremental cross-batch isolation"):
+            self.assertEqual(
+                len(
+                    [
+                        event
+                        for event in incremental_cross["events"]
+                        if event["kind"] == "tool"
+                        and event["tool"]["name"] == "exec"
+                    ]
+                ),
+                2,
+            )
+        with self.subTest("incremental native twin cannot consume batch B"):
+            self.assertEqual(visible_child_count(incremental_twin), 1)
+            self.assertIn(
+                "batch-incremental-twin-b",
+                incremental_twin_state["pending_wrappers"],
+            )
+        with self.subTest("registry closes the incremental pairing window"):
+            self.assertEqual(incremental_state["codex_native_tools"], {})
+            self.assertEqual(
+                incremental_state["codex_item_lifecycle"]["batch-incremental-a"]["state"],
+                "terminal",
+            )
+
+    def test_round16_native_attribution_fails_closed_after_trim(self) -> None:
+        single_batch = 'tools.mcp__fixture__lookup({value:"wanted"});'
+
+        def wrapper(call_id: str) -> dict:
+            return {
+                "type": "response_item",
+                "timestamp": "2026-08-07T12:00:01Z",
+                "payload": {
+                    "type": "custom_tool_call",
+                    "id": call_id,
+                    "call_id": call_id,
+                    "name": "exec",
+                    "input": single_batch,
+                },
+            }
+
+        def native(call_id: str) -> dict:
+            return {
+                "type": "response_item",
+                "timestamp": "2026-08-07T12:00:02Z",
+                "payload": {
+                    "type": "mcpToolCall",
+                    "id": call_id,
+                    "server": "fixture",
+                    "tool": "lookup",
+                    "arguments": {"value": "wanted"},
+                    "status": "completed",
+                    "result": {"content": [{"type": "text", "text": "native"}]},
+                },
+            }
+
+        def visible_wrapper_count(parsed: dict) -> int:
+            return sum(
+                1
+                for event in parsed["events"]
+                if event["kind"] == "tool"
+                and event["tool"]["name"] == "mcp__fixture__lookup"
+                and event["tool"]["output"] is None
+            )
+
+        with TemporaryDirectory() as tmp:
+            path = Path(tmp) / "trimmed-native-twin.jsonl"
+            rows = [wrapper("native-trim-a")]
+            path.write_text("\n".join(json.dumps(row) for row in rows) + "\n")
+            transcripts.read_session_events("codex", path)
+
+            rows.append(native("native-trim-a"))
+            path.write_text("\n".join(json.dumps(row) for row in rows) + "\n")
+            transcripts.read_session_events("codex", path)
+
+            newer_native_ids = [f"native-trim-newer-{index}" for index in range(2001)]
+            for index, native_id in enumerate(newer_native_ids):
+                rows.extend(
+                    [
+                        wrapper(native_id),
+                        native(native_id),
+                    ]
+                )
+            path.write_text("\n".join(json.dumps(row) for row in rows) + "\n")
+            transcripts.read_session_events("codex", path)
+            state = transcripts._cache[str(path)]
+            spent = state["codex_spent_native_ids"]
+            self.assertEqual(len(newer_native_ids), transcripts.CODEX_EVENT_WINDOW + 1)
+            self.assertEqual(len(spent), transcripts.CODEX_EVENT_WINDOW)
+            self.assertNotIn("native-trim-a", spent)
+            self.assertEqual(next(iter(spent)), newer_native_ids[1])
+            self.assertEqual(len(state["events"]), transcripts.CODEX_EVENT_WINDOW)
+
+            rows.append(wrapper("batch-trim-b"))
+            path.write_text("\n".join(json.dumps(row) for row in rows) + "\n")
+            before_twin = transcripts.read_session_events("codex", path)
+            self.assertEqual(visible_wrapper_count(before_twin), 1)
+
+            rows.append(
+                {
+                    "type": "response_item",
+                    "timestamp": "2026-08-07T12:00:04Z",
+                    "payload": {
+                        "type": "mcpToolCall",
+                        "id": "native-trim-a",
+                        "server": "fixture",
+                        "tool": "lookup",
+                        "arguments": {"value": "wanted"},
+                        "status": "completed",
+                        "result": {"content": [{"type": "text", "text": "twin"}]},
+                    },
+                }
+            )
+            path.write_text("\n".join(json.dumps(row) for row in rows) + "\n")
+            parsed = transcripts.read_session_events("codex", path)
+            state = transcripts._cache[str(path)]
+
+        self.assertEqual(visible_wrapper_count(parsed), 1)
+        self.assertIn("batch-trim-b", state["pending_wrappers"])
+        self.assertIsNone(
+            transcripts._codex_attribute_native_batch(
+                state,
+                ("mcp__fixture__lookup", '{"value": "wanted"}'),
+                "native-trim-a",
+            )
+        )
+
+    def test_round20_native_attribution_fails_closed_within_one_parse_scope(self) -> None:
+        single_batch = 'tools.mcp__fixture__lookup({value:"wanted"});'
+
+        def wrapper(call_id: str) -> dict:
+            return {
+                "type": "response_item",
+                "timestamp": "2026-08-07T12:00:01Z",
+                "payload": {
+                    "type": "custom_tool_call",
+                    "id": call_id,
+                    "call_id": call_id,
+                    "name": "exec",
+                    "input": single_batch,
+                },
+            }
+
+        def native(call_id: str) -> dict:
+            return {
+                "type": "response_item",
+                "timestamp": "2026-08-07T12:00:02Z",
+                "payload": {
+                    "type": "mcpToolCall",
+                    "id": call_id,
+                    "server": "fixture",
+                    "tool": "lookup",
+                    "arguments": {"value": "wanted"},
+                    "status": "completed",
+                    "result": {"content": [{"type": "text", "text": "native"}]},
+                },
+            }
+
+        def visible_wrapper_count(parsed: dict) -> int:
+            return sum(
+                1
+                for event in parsed["events"]
+                if event["kind"] == "tool"
+                and event["tool"]["name"] == "mcp__fixture__lookup"
+                and event["tool"]["output"] is None
+            )
+
+        with TemporaryDirectory() as tmp:
+            path = Path(tmp) / "same-scope-native-twin.jsonl"
+            rows = [wrapper("native-scope-a"), native("native-scope-a")]
+            newer_native_ids = [f"native-scope-newer-{index}" for index in range(2001)]
+            for native_id in newer_native_ids:
+                rows.extend([wrapper(native_id), native(native_id)])
+            rows.extend([wrapper("batch-scope-b"), native("native-scope-a")])
+            path.write_text("\n".join(json.dumps(row) for row in rows) + "\n")
+            parsed = transcripts.read_session_events("codex", path)
+            state = transcripts._cache[str(path)]
+
+        spent = state["codex_spent_native_ids"]
+        self.assertEqual(len(spent), transcripts.CODEX_EVENT_WINDOW)
+        self.assertNotIn("native-scope-a", spent)
+        self.assertEqual(visible_wrapper_count(parsed), 1)
+        self.assertIn("batch-scope-b", state["pending_wrappers"])
+        self.assertIsNone(
+            transcripts._codex_attribute_native_batch(
+                state,
+                ("mcp__fixture__lookup", '{"value": "wanted"}'),
+                "native-scope-a",
+            )
+        )
+
+    def test_round16_native_attribution_has_one_chokepoint(self) -> None:
+        single_batch = 'tools.mcp__fixture__lookup({value:"wanted"});'
+
+        def wrapper(call_id: str) -> dict:
+            return {
+                "type": "response_item",
+                "timestamp": "2026-08-07T12:00:01Z",
+                "payload": {
+                    "type": "custom_tool_call",
+                    "id": call_id,
+                    "call_id": call_id,
+                    "name": "exec",
+                    "input": single_batch,
+                },
+            }
+
+        def native(call_id: str) -> dict:
+            return {
+                "type": "response_item",
+                "timestamp": "2026-08-07T12:00:02Z",
+                "payload": {
+                    "type": "mcpToolCall",
+                    "id": call_id,
+                    "server": "fixture",
+                    "tool": "lookup",
+                    "arguments": {"value": "wanted"},
+                    "status": "completed",
+                    "result": {"content": [{"type": "text", "text": "native"}]},
+                },
+            }
+
+        def visible_wrapper_count(parsed: dict) -> int:
+            return sum(
+                1
+                for event in parsed["events"]
+                if event["kind"] == "tool"
+                and event["tool"]["name"] == "mcp__fixture__lookup"
+                and event["tool"]["output"] is None
+            )
+
+        with mock.patch.object(
+            transcripts, "_codex_attribute_native_batch", return_value=None
+        ):
+            with TemporaryDirectory() as tmp:
+                cold_path = Path(tmp) / "chokepoint-cold.jsonl"
+                cold_path.write_text(
+                    "\n".join(json.dumps(row) for row in [wrapper("cold"), native("cold-native")])
+                    + "\n"
+                )
+                cold = transcripts.read_session_events("codex", cold_path)
+
+                incremental_path = Path(tmp) / "chokepoint-incremental.jsonl"
+                incremental_rows = [wrapper("incremental")]
+                incremental_path.write_text(json.dumps(incremental_rows[0]) + "\n")
+                transcripts.read_session_events("codex", incremental_path)
+                incremental_rows.append(native("incremental-native"))
+                incremental_path.write_text(
+                    "\n".join(json.dumps(row) for row in incremental_rows) + "\n"
+                )
+                incremental = transcripts.read_session_events("codex", incremental_path)
+
+        self.assertEqual(visible_wrapper_count(cold), 1)
+        self.assertEqual(visible_wrapper_count(incremental), 1)
+
+    def test_round2_f2_statusless_completed_items_are_done(self) -> None:
+        parsed = transcripts.read_session_events(
+            "codex-normalized", FIXTURES_DIR / "codex_wiki266_round2_lifecycle.jsonl"
+        )
+        tools = [event["tool"] for event in parsed["events"] if event["kind"] == "tool"]
+        by_call_id = {tool["call_id"]: tool for tool in tools}
+        for call_id in ("search-1", "image-1"):
+            self.assertIsNone(by_call_id[call_id]["output"])
+            self.assertTrue(by_call_id[call_id]["ok"])
+            self.assertEqual(by_call_id[call_id]["status"], "completed")
+
+    def test_round2_f3_real_collab_type_and_dynamic_content_items_render(self) -> None:
+        parsed = transcripts.read_session_events(
+            "codex-normalized", FIXTURES_DIR / "codex_wiki266_round2_lifecycle.jsonl"
+        )
+        tools = [event["tool"] for event in parsed["events"] if event["kind"] == "tool"]
+        by_call_id = {tool["call_id"]: tool for tool in tools}
+        self.assertEqual(by_call_id["collab-1"]["name"], "collabAgentToolCall")
+        self.assertNotIn("contentItems", by_call_id["dynamic-1"]["input"])
+        self.assertEqual(by_call_id["dynamic-1"]["output"], "needle")
+
+    def test_round3_g2_dynamic_content_items_are_output_and_success_is_authoritative(self) -> None:
+        item = {
+            "type": "dynamicToolCall",
+            "id": "dynamic-failed",
+            "tool": "lookup",
+            "arguments": {"query": "needle"},
+        }
+        completed = {
+            **item,
+            "contentItems": [{"type": "text", "text": "not found"}],
+            "success": False,
+        }
+        rows = [
+            self._row("item/started", {"item": item}, 1),
+            self._row("item/completed", {"item": completed}, 2),
+        ]
+        with TemporaryDirectory() as tmp:
+            path = Path(tmp) / "dynamic-output.jsonl"
+            path.write_text("".join(json.dumps(row) + "\n" for row in rows))
+            parsed = transcripts.read_session_events("codex-normalized", path)
+
+        tool = next(event["tool"] for event in parsed["events"] if event["kind"] == "tool")
+        self.assertEqual(tool["input"], "needle")
+        self.assertEqual(tool["output"], "not found")
+        self.assertFalse(tool["ok"])
+
+    def test_round2_f4_failed_turn_closes_pending_tool_and_marks_turn(self) -> None:
+        parsed = transcripts.read_session_events(
+            "codex-normalized", FIXTURES_DIR / "codex_wiki266_round2_lifecycle.jsonl"
+        )
+        pending = next(
+            event["tool"]
+            for event in parsed["events"]
+            if event["kind"] == "tool" and event["tool"]["call_id"] == "pending-1"
+        )
+        self.assertFalse(pending["ok"])
+        self.assertEqual(pending["status"], "failed")
+        self.assertTrue(pending["partial"])
+        self.assertTrue(any(
+            event["kind"] == "interrupt" and event["text"].startswith("turn failed")
+            for event in parsed["events"]
+        ))
+
+    def test_round2_f5_delta_identity_keeps_repeated_content_and_marks_interrupt(self) -> None:
+        rows = [
+            self._row("item/started", {"item": {"type": "commandExecution", "id": "delta-1", "command": "x"}}, 1),
+            self._row("item/commandExecution/outputDelta", {"itemId": "delta-1", "delta": "same"}, 2),
+            self._row("item/commandExecution/outputDelta", {"itemId": "delta-1", "delta": "same"}, 3),
+            self._row("item/commandExecution/outputDelta", {"itemId": "delta-1", "delta": "same"}, 3),
+            self._row("turn/completed", {"turn": {"status": "interrupted"}}, 4),
+        ]
+        with TemporaryDirectory() as tmp:
+            path = Path(tmp) / "delta.jsonl"
+            path.write_text("".join(json.dumps(row) + "\n" for row in rows))
+            parsed = transcripts.read_session_events("codex-normalized", path)
+        tool = next(event["tool"] for event in parsed["events"] if event["kind"] == "tool")
+        self.assertEqual(tool["output"], "samesame")
+        self.assertTrue(tool["partial"])
+
+    def test_round3_g3_interrupted_assistant_and_reasoning_are_partial(self) -> None:
+        rows = [
+            self._row(
+                "item/started",
+                {"item": {"type": "agentMessage", "id": "assistant-partial", "text": "unfinished"}},
+                1,
+            ),
+            self._row(
+                "item/started",
+                {
+                    "item": {
+                        "type": "reasoning",
+                        "id": "reasoning-partial",
+                        "summary": [{"text": "unfinished thought"}],
+                        "encrypted_content": "opaque",
+                    }
+                },
+                2,
+            ),
+            self._row("turn/completed", {"turn": {"status": "interrupted"}}, 3),
+        ]
+        with TemporaryDirectory() as tmp:
+            path = Path(tmp) / "partial-messages.jsonl"
+            path.write_text("".join(json.dumps(row) + "\n" for row in rows))
+            parsed = transcripts.read_session_events("codex-normalized", path)
+
+        events = {
+            event["text"]: event
+            for event in parsed["events"]
+            if event["kind"] in {"assistant", "thinking"}
+        }
+        self.assertTrue(events["unfinished"]["partial"])
+        self.assertTrue(events["unfinished thought"]["partial"])
+
+    def test_round3_g4_live_patch_carries_call_id_and_partial(self) -> None:
+        started = self._row(
+            "item/started",
+            {"item": {"type": "commandExecution", "id": "live-command", "command": "echo hi"}},
+            1,
+        )
+        completed = self._row(
+            "turn/completed",
+            {"turn": {"status": "interrupted"}},
+            2,
+        )
+        with TemporaryDirectory() as tmp:
+            path = Path(tmp) / "live-patch.jsonl"
+            path.write_text(json.dumps(started) + "\n")
+            initial = transcripts.read_session_delta("codex-normalized", path, 0)
+            with path.open("a") as handle:
+                handle.write(json.dumps(completed) + "\n")
+            delta = transcripts.read_session_delta("codex-normalized", path, initial["cursor"])
+
+        self.assertEqual(len(delta["patches"]), 1)
+        patch = delta["patches"][0]
+        self.assertEqual(patch["call_id"], "live-command")
+        self.assertTrue(patch["partial"])
+
+    def test_round2_f6_blank_agent_message_registers_before_delta(self) -> None:
+        rows = [
+            self._row("item/started", {"item": {"type": "agentMessage", "id": "live-1", "text": ""}}, 1),
+        ]
+        with TemporaryDirectory() as tmp:
+            path = Path(tmp) / "live.jsonl"
+            path.write_text(json.dumps(rows[0]) + "\n")
+            first = transcripts.read_session_events("codex-normalized", path)
+            path.write_text(
+                "\n".join(
+                    json.dumps(row)
+                    for row in rows + [
+                        self._row("item/agentMessage/delta", {"itemId": "live-1", "delta": "live"}, 2)
+                    ]
+                )
+                + "\n"
+            )
+            second = transcripts.read_session_events("codex-normalized", path)
+        self.assertEqual([(event["kind"], event["text"]) for event in first["events"]], [("assistant", "")])
+        self.assertEqual(second["events"][0]["text"], "live")
+
+    def test_round2_f7_aggregate_batch_output_stays_on_outer_envelope(self) -> None:
+        parsed = transcripts.read_session_events(
+            "codex", FIXTURES_DIR / "codex_wiki266_round2_batch.jsonl"
+        )
+        tools = [event["tool"] for event in parsed["events"] if event["kind"] == "tool"]
+        self.assertEqual(tools[0]["name"], "exec")
+        self.assertEqual(tools[0]["output"], "one aggregate result")
+        self.assertEqual([tool["output"] for tool in tools[1:]], [None, None])
+
+    def test_round2_f8_explicit_child_call_ids_complete_artifact_and_tool(self) -> None:
+        artifact = {
+            "kind": "artifact",
+            "id": "00000000-0000-4000-8000-000000000266",
+            "title": "round 2",
+            "caption": "fixture",
+            "artifact": {"kind": "mermaid", "source": "graph TD; A-->B"},
+            "ts": "2026-08-07T12:00:01Z",
+        }
+        source = (
+            'const rs = await Promise.all(['
+            'tools.mcp__wiki_artifacts__render_artifact({kind:"mermaid",payload:{source:"graph TD; A-->B"}}),'
+            'tools.exec_command({cmd:"echo hi"})]); text(rs);'
+        )
+        rows = [
+            {"type": "response_item", "timestamp": "2026-08-07T12:00:00Z", "payload": {"type": "custom_tool_call", "call_id": "outer-266", "name": "exec", "input": source}},
+            {"type": "response_item", "timestamp": "2026-08-07T12:00:01Z", "payload": {"type": "custom_tool_call_output", "call_id": "outer-266", "output": [
+                {"call_id": "artifact-266", "output": sentinel_text(artifact)},
+                {"call_id": "command-266", "output": "hi\n", "exit_code": 0},
+            ]}},
+        ]
+        with TemporaryDirectory() as tmp:
+            path = Path(tmp) / "batch-artifact.jsonl"
+            path.write_text("\n".join(json.dumps(row) for row in rows) + "\n")
+            parsed = transcripts.read_session_events("codex", path)
+        tools = [event["tool"] for event in parsed["events"] if event["kind"] == "tool"]
+        self.assertEqual(tools[1]["call_id"], "artifact-266")
+        self.assertEqual(tools[2]["call_id"], "command-266")
+        self.assertEqual(tools[2]["output"], "hi\n")
+        self.assertEqual(
+            [event["artifact_id"] for event in parsed["events"] if event["kind"] == "artifact"],
+            [artifact["id"]],
+        )
+
+    def test_round4_h1_batch_artifact_child_emits_live_completion_patch(self) -> None:
+        artifact = {
+            "kind": "artifact",
+            "id": "00000000-0000-4000-8000-000000000267",
+            "title": "round 4",
+            "caption": "fixture",
+            "artifact": {"kind": "mermaid", "source": "graph TD; A-->B"},
+            "ts": "2026-08-07T12:00:01Z",
+        }
+        source = (
+            'const rs = await Promise.all(['
+            'tools.mcp__wiki_artifacts__render_artifact({kind:"mermaid",payload:{source:"graph TD; A-->B"}}),'
+            'tools.exec_command({cmd:"echo hi"})]); text(rs);'
+        )
+        started = {
+            "type": "response_item",
+            "timestamp": "2026-08-07T12:00:00Z",
+            "payload": {
+                "type": "custom_tool_call",
+                "call_id": "outer-267",
+                "name": "exec",
+                "input": source,
+            },
+        }
+        completed = {
+            "type": "response_item",
+            "timestamp": "2026-08-07T12:00:01Z",
+            "payload": {
+                "type": "custom_tool_call_output",
+                "call_id": "outer-267",
+                "output": [
+                    {"call_id": "artifact-267", "output": sentinel_text(artifact)},
+                    {"call_id": "command-267", "output": "hi\n", "exit_code": 0},
+                ],
+            },
+        }
+        with TemporaryDirectory() as tmp:
+            path = Path(tmp) / "batch-artifact-live.jsonl"
+            path.write_text(json.dumps(started) + "\n")
+            initial = transcripts.read_session_delta("codex", path, 0)
+            path.write_text(
+                json.dumps(started) + "\n" + json.dumps(completed) + "\n"
+            )
+            delta = transcripts.read_session_delta("codex", path, initial["cursor"])
+
+        artifact_patch = next(
+            patch for patch in delta["patches"] if patch["call_id"] == "artifact-267"
+        )
+        self.assertEqual(artifact_patch["output"], sentinel_text(artifact))
+        self.assertTrue(artifact_patch["ok"])
+        self.assertEqual(
+            [event["artifact_id"] for event in delta["events"] if event["kind"] == "artifact"],
+            [artifact["id"]],
+        )
+
+    def test_round9_m3_batch_artifact_child_starts_pending(self) -> None:
+        source = (
+            "const rs = await Promise.all(["
+            "tools.mcp__wiki_artifacts__render_artifact({kind:\"mermaid\",payload:{source:\"graph TD; A-->B\"}}),"
+            "tools.exec_command({cmd:\"echo hi\"})"
+            "]); text(rs);"
+        )
+        row = {
+            "type": "response_item",
+            "timestamp": "2026-08-07T12:00:00Z",
+            "payload": {
+                "type": "custom_tool_call",
+                "call_id": "batch-pending-artifact",
+                "name": "exec",
+                "input": source,
+            },
+        }
+        turn_completed = {
+            "type": "event_msg",
+            "timestamp": "2026-08-07T12:00:02Z",
+            "payload": {
+                "type": "turn_completed",
+                "turn": {"status": "completed"},
+            },
+        }
+        with TemporaryDirectory() as tmp:
+            path = Path(tmp) / "batch-pending-artifact.jsonl"
+            path.write_text(json.dumps(row) + "\n")
+            parsed = transcripts.read_session_events("codex", path)
+            state = transcripts._cache[str(path)]
+
+            pending_tool = next(
+                event["tool"]
+                for event in parsed["events"]
+                if event["kind"] == "tool"
+                and event["tool"]["name"] == "mcp__wiki_artifacts__render_artifact"
+            )
+            self.assertIsNone(pending_tool["ok"])
+            self.assertIsNone(pending_tool["output"])
+            self.assertEqual(pending_tool["status"], "inProgress")
+            self.assertEqual(
+                state["codex_item_lifecycle"][
+                    "__codex_batch_child__:batch-pending-artifact:0"
+                ]["state"],
+                "open",
+            )
+
+            path.write_text(json.dumps(row) + "\n" + json.dumps(turn_completed) + "\n")
+            parsed = transcripts.read_session_events("codex", path)
+            state = transcripts._cache[str(path)]
+
+        tool = next(
+            event["tool"]
+            for event in parsed["events"]
+            if event["kind"] == "tool"
+            and event["tool"]["name"] == "mcp__wiki_artifacts__render_artifact"
+        )
+        self.assertFalse(tool["ok"])
+        self.assertIsNone(tool["output"])
+        self.assertEqual(tool["status"], "failed")
+        self.assertEqual(tool["summary"], "render_artifact pending")
+        self.assertEqual(
+            state["codex_item_lifecycle"]["__codex_batch_child__:batch-pending-artifact:0"]["state"],
+            "terminal",
+        )
+
+    def test_round4_h2_interrupt_only_marks_open_current_items_after_trim(self) -> None:
+        rows = [
+            self._row("turn/started", {"turn": {"id": "prior-turn"}}, 1),
+            self._row(
+                "item/started",
+                {"item": {"type": "agentMessage", "id": "prior", "text": "prior"}},
+                2,
+            ),
+            self._row(
+                "item/completed",
+                {"item": {"type": "agentMessage", "id": "prior", "text": "prior"}},
+                3,
+            ),
+            self._row("turn/completed", {"turn": {"status": "completed"}}, 4),
+            self._row("turn/started", {"turn": {"id": "current-turn"}}, 5),
+            self._row(
+                "item/started",
+                {
+                    "item": {
+                        "type": "agentMessage",
+                        "id": "current-complete",
+                        "text": "current complete",
+                    }
+                },
+                6,
+            ),
+            self._row(
+                "item/completed",
+                {
+                    "item": {
+                        "type": "agentMessage",
+                        "id": "current-complete",
+                        "text": "current complete",
+                    }
+                },
+                7,
+            ),
+        ]
+        for index in range(2000):
+            item_id = f"filler-{index}"
+            rows.extend(
+                [
+                    self._row(
+                        "item/started",
+                        {"item": {"type": "agentMessage", "id": item_id, "text": item_id}},
+                        9 + index * 2,
+                    ),
+                    self._row(
+                        "item/completed",
+                        {"item": {"type": "agentMessage", "id": item_id, "text": item_id}},
+                        10 + index * 2,
+                    ),
+                ]
+            )
+        rows.append(
+            self._row(
+                "item/started",
+                {
+                    "item": {
+                        "type": "agentMessage",
+                        "id": "current-open",
+                        "text": "current open",
+                    }
+                },
+                5000,
+            )
+        )
+        with TemporaryDirectory() as tmp:
+            path = Path(tmp) / "interrupt-trimmed.jsonl"
+            path.write_text("".join(json.dumps(row) + "\n" for row in rows))
+            transcripts.read_session_events("codex-normalized", path)
+            path.write_text(
+                path.read_text()
+                + json.dumps(
+                    self._row(
+                        "turn/completed",
+                        {"turn": {"status": "interrupted"}},
+                        5001,
+                    )
+                )
+                + "\n"
+            )
+            transcripts.read_session_events("codex-normalized", path)
+            state = transcripts._cache[str(path)]
+
+        self.assertNotIn("prior", state["codex_modern_messages"])
+        self.assertNotIn("current-complete", state["codex_modern_messages"])
+        self.assertIn("current-open", state["codex_modern_messages"])
+        self.assertTrue(state["codex_modern_messages"]["current-open"]["partial"])
+
+    def test_round4_h3_successful_native_artifact_has_no_rejected_row(self) -> None:
+        artifact = _artifact_protocol_event("mermaid", 268)
+        item = {
+            "type": "mcpToolCall",
+            "id": "native-artifact-268",
+            "server": "wiki_artifacts",
+            "tool": "render_artifact",
+            "arguments": {
+                "kind": "mermaid",
+                "payload": {"source": "graph TD; A-->B"},
+            },
+            "status": "inProgress",
+        }
+        completed = {
+            **item,
+            "status": "completed",
+            "result": {"content": [{"type": "text", "text": sentinel_text(artifact)}]},
+        }
+        rows = [
+            self._row("turn/started", {"turn": {"id": "artifact-turn"}}, 1),
+            self._row("item/started", {"item": item}, 2),
+            self._row("item/completed", {"item": completed}, 3),
+            self._row("turn/completed", {"turn": {"status": "completed"}}, 4),
+        ]
+        with TemporaryDirectory() as tmp:
+            path = Path(tmp) / "native-artifact-success.jsonl"
+            path.write_text("".join(json.dumps(row) + "\n" for row in rows))
+            parsed = transcripts.read_session_events("codex-normalized", path)
+
+        self.assertEqual([event["kind"] for event in parsed["events"]], ["artifact"])
+        self.assertEqual(
+            [event for event in parsed["events"] if event["kind"] == "tool"], []
+        )
+
+    def test_round4_h4_authoritative_item_output_replaces_buffered_delta(self) -> None:
+        rows = [
+            self._row(
+                "item/commandExecution/outputDelta",
+                {"itemId": "authoritative-269", "delta": "stale "},
+                1,
+            ),
+            self._row(
+                "item/completed",
+                {
+                    "item": {
+                        "type": "commandExecution",
+                        "id": "authoritative-269",
+                        "command": "echo final",
+                        "status": "completed",
+                        "aggregatedOutput": "final",
+                        "exitCode": 0,
+                    }
+                },
+                2,
+            ),
+        ]
+        with TemporaryDirectory() as tmp:
+            path = Path(tmp) / "authoritative-output.jsonl"
+            path.write_text("".join(json.dumps(row) + "\n" for row in rows))
+            parsed = transcripts.read_session_events("codex-normalized", path)
+
+        tools = [event["tool"] for event in parsed["events"] if event["kind"] == "tool"]
+        self.assertEqual(len(tools), 1)
+        self.assertEqual(tools[0]["output"], "final")
+
+    def test_round5_i1_interrupt_marks_every_delta_stream_kind_partial(self) -> None:
+        cases = {
+            "agentMessage": [
+                self._row(
+                    "item/started",
+                    {"item": {"type": "agentMessage", "id": "agent-live", "text": ""}},
+                    1,
+                ),
+                self._row(
+                    "item/agentMessage/delta",
+                    {"itemId": "agent-live", "delta": "unfinished answer"},
+                    2,
+                ),
+            ],
+            "reasoning": [
+                self._row(
+                    "item/started",
+                    {"item": {"type": "reasoning", "id": "reasoning-live", "summary": []}},
+                    1,
+                ),
+                self._row(
+                    "item/reasoning/summaryTextDelta",
+                    {"itemId": "reasoning-live", "delta": "unfinished thought"},
+                    2,
+                ),
+            ],
+            "tool output": [
+                self._row(
+                    "item/started",
+                    {
+                        "item": {
+                            "type": "commandExecution",
+                            "id": "tool-live",
+                            "command": "echo live",
+                        }
+                    },
+                    1,
+                ),
+                self._row(
+                    "item/commandExecution/outputDelta",
+                    {"itemId": "tool-live", "delta": "unfinished output"},
+                    2,
+                ),
+            ],
+        }
+        for kind, rows in cases.items():
+            with self.subTest(kind=kind), TemporaryDirectory() as tmp:
+                rows.append(
+                    self._row(
+                        "turn/completed",
+                        {"turn": {"status": "interrupted"}},
+                        3,
+                    )
+                )
+                path = Path(tmp) / "interrupt.jsonl"
+                path.write_text("".join(json.dumps(row) + "\n" for row in rows))
+                parsed = transcripts.read_session_events("codex-normalized", path)
+
+            event = next(event for event in parsed["events"] if event["kind"] != "interrupt")
+            if event["kind"] == "tool":
+                self.assertTrue(event["tool"].get("partial"), kind)
+            else:
+                self.assertTrue(event.get("partial"), kind)
+
+    def test_round5_i2_authoritative_completion_drops_every_late_delta_path(self) -> None:
+        cases = {
+            "agentMessage": [
+                self._row(
+                    "item/started",
+                    {"item": {"type": "agentMessage", "id": "agent-authoritative", "text": ""}},
+                    1,
+                ),
+                self._row(
+                    "item/agentMessage/delta",
+                    {"itemId": "agent-authoritative", "delta": "before "},
+                    2,
+                ),
+                self._row(
+                    "item/completed",
+                    {"item": {"type": "agentMessage", "id": "agent-authoritative", "text": "final"}},
+                    3,
+                ),
+                self._row(
+                    "item/agentMessage/delta",
+                    {"itemId": "agent-authoritative", "delta": "after"},
+                    4,
+                ),
+            ],
+            "reasoning": [
+                self._row(
+                    "item/started",
+                    {"item": {"type": "reasoning", "id": "reasoning-authoritative", "summary": []}},
+                    1,
+                ),
+                self._row(
+                    "item/reasoning/summaryTextDelta",
+                    {"itemId": "reasoning-authoritative", "delta": "before "},
+                    2,
+                ),
+                self._row(
+                    "item/completed",
+                    {
+                        "item": {
+                            "type": "reasoning",
+                            "id": "reasoning-authoritative",
+                            "summary": [{"text": "final"}],
+                        }
+                    },
+                    3,
+                ),
+                self._row(
+                    "item/reasoning/summaryTextDelta",
+                    {"itemId": "reasoning-authoritative", "delta": "after"},
+                    4,
+                ),
+            ],
+            "tool output": [
+                self._row(
+                    "item/started",
+                    {
+                        "item": {
+                            "type": "commandExecution",
+                            "id": "tool-authoritative",
+                            "command": "echo final",
+                        }
+                    },
+                    1,
+                ),
+                self._row(
+                    "item/commandExecution/outputDelta",
+                    {"itemId": "tool-authoritative", "delta": "before "},
+                    2,
+                ),
+                self._row(
+                    "item/completed",
+                    {
+                        "item": {
+                            "type": "commandExecution",
+                            "id": "tool-authoritative",
+                            "command": "echo final",
+                            "status": "completed",
+                            "aggregatedOutput": "final",
+                        }
+                    },
+                    3,
+                ),
+                self._row(
+                    "item/commandExecution/outputDelta",
+                    {"itemId": "tool-authoritative", "delta": "after"},
+                    4,
+                ),
+            ],
+        }
+        for kind, rows in cases.items():
+            with self.subTest(kind=kind), TemporaryDirectory() as tmp:
+                rows.append(
+                    self._row(
+                        "turn/completed",
+                        {"turn": {"status": "completed"}},
+                        5,
+                    )
+                )
+                path = Path(tmp) / "authoritative.jsonl"
+                path.write_text("".join(json.dumps(row) + "\n" for row in rows))
+                parsed = transcripts.read_session_events("codex-normalized", path)
+
+            events = [event for event in parsed["events"] if event["kind"] != "interrupt"]
+            self.assertEqual(len(events), 1, kind)
+            event = events[0]
+            value = event["tool"]["output"] if event["kind"] == "tool" else event["text"]
+            self.assertEqual(value, "final", kind)
+            self.assertNotIn("after", value, kind)
+
+    def test_round3_g5_successful_turn_closes_pending_tools(self) -> None:
+        rows = [
+            self._row(
+                "item/started",
+                {"item": {"type": "commandExecution", "id": "successful-pending", "command": "echo hi"}},
+                1,
+            ),
+            self._row("turn/completed", {"turn": {"status": "completed"}}, 2),
+        ]
+        with TemporaryDirectory() as tmp:
+            path = Path(tmp) / "successful-turn.jsonl"
+            path.write_text("".join(json.dumps(row) + "\n" for row in rows))
+            parsed = transcripts.read_session_events("codex-normalized", path)
+
+        tool = next(event["tool"] for event in parsed["events"] if event["kind"] == "tool")
+        self.assertTrue(tool["ok"])
+        self.assertEqual(tool["status"], "completed")
+        self.assertIsNotNone(tool["completed_at"])
+
+    def test_legacy_result_first_is_buffered_until_call_identity_arrives(self) -> None:
+        rows = [
+            {
+                "type": "response_item",
+                "timestamp": "2026-08-07T12:00:00Z",
+                "payload": {
+                    "type": "function_call_output",
+                    "call_id": "call-first",
+                    "output": "done\n",
+                },
+            },
+            {
+                "type": "response_item",
+                "timestamp": "2026-08-07T12:00:01Z",
+                "payload": {
+                    "type": "function_call",
+                    "call_id": "call-first",
+                    "name": "exec_command",
+                    "arguments": json.dumps({"cmd": "printf done"}),
+                },
+            },
+        ]
+        with TemporaryDirectory() as tmp:
+            path = Path(tmp) / "codex.jsonl"
+            path.write_text("".join(json.dumps(row) + "\n" for row in rows))
+            parsed = transcripts.read_session_events("codex", path)
+
+        tools = [event["tool"] for event in parsed["events"] if event["kind"] == "tool"]
+        self.assertEqual(len(tools), 1)
+        self.assertEqual(tools[0]["output"], "done\n")
+        self.assertTrue(tools[0]["ok"])
 
 
 def _write_rollout(day_dir: Path, name: str, cwd: str, session_id: str,

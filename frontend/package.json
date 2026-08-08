@@ -52,6 +52,7 @@
     "test:wiki-147-coalesce": "node tests/wiki-147-coalesce-followup.playwright.mjs",
     "test:wiki-149": "node tests/wiki-149-copy-diff.playwright.mjs",
     "test:wiki-151": "node tests/wiki-151-nav-ia.playwright.mjs",
+    "typecheck": "tsc -p tsconfig.json --noEmit && tsc -p tsconfig.node.json --noEmit && echo 'typecheck passed'",
     "build": "tsc -p tsconfig.json --noEmit && tsc -p tsconfig.node.json --noEmit && vite build",
     "preview": "vite preview",
     "test:wiki-244": "node tests/wiki-244-opencode-transcript.playwright.mjs && node tests/wiki-244-runner-regression.mjs && node tests/wiki-105-font-weights.playwright.mjs"

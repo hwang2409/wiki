@@ -1475,15 +1475,23 @@ function applyChildPatches(events: SessionEvent[], patches: SessionPatch[]): Ses
   const next = events.map((event) => {
     const patch = byId.get(event.id);
     if (!patch || !event.tool) return event;
-    if (event.tool.output === patch.output && event.tool.ok === patch.ok) return event;
+    if (
+      event.tool.output === patch.output
+      && event.tool.ok === patch.ok
+      && event.tool.call_id === patch.call_id
+      && event.tool.partial === patch.partial
+      && event.tool.completed_at === patch.completed_at
+    ) return event;
     changed = true;
     return {
       ...event,
       tool: {
         ...event.tool,
+        call_id: patch.call_id ?? event.tool.call_id,
         output: patch.output,
         ok: patch.ok,
         completed_at: patch.completed_at ?? event.tool.completed_at,
+        partial: patch.partial ?? event.tool.partial,
       },
     };
   });
@@ -1618,6 +1626,7 @@ export function ThinkingRow({ event, durationMs = null }: { event: SessionEvent;
           Thought
           {title || duration ? ": " : ""}
           {title ? <span className="session-thinking-title">{title}</span> : null}
+          {event.partial ? <span className="session-partial-marker">partial</span> : null}
           {duration ? (
             <span className="session-thinking-duration tabular-nums">
               {title ? " · " : ""}
@@ -2532,6 +2541,7 @@ const MessageBlock = memo(function MessageBlock({
       >
         {prepareTranscriptMarkdown(event.text)}
       </ReactMarkdown>
+      {event.partial ? <div className="session-partial-marker">partial response</div> : null}
     </div>
   );
 }, (prev, next) =>

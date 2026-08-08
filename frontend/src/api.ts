@@ -525,9 +525,16 @@ export type SessionTool = {
   ok: boolean | null;
   archetype: string;
   summary: string;
+  call_id?: string | null;
+  status?: string | null;
+  partial?: boolean;
+  duration_ms?: number | null;
+  terminal_input?: string | null;
+  metadata?: Record<string, unknown>;
   completed_at?: string | null;
   agent_id?: string;
   edit?: {
+    changes?: unknown;
     file_path?: string;
     old_string?: string;
     new_string?: string;
@@ -762,6 +769,7 @@ export type SessionEvent = {
   ts: string | null;
   text: string;
   disposition: SessionDisposition;
+  partial?: boolean;
   tool?: SessionTool;
   bash?: SessionBash;
   tasks?: SessionTask[];
@@ -789,9 +797,16 @@ export type SubagentInfo = {
 
 export type SessionPatch = {
   id: number;
+  call_id?: string | null;
   output: string | null;
   ok: boolean | null;
   completed_at?: string | null;
+  duration_ms?: number | null;
+  status?: string | null;
+  partial?: boolean | null;
+  terminal_input?: string | null;
+  metadata?: Record<string, unknown>;
+  edit?: SessionTool["edit"];
 };
 
 export type AgentSessionData = {

@@ -175,10 +175,19 @@ function applyPatches(
     if (index === undefined) continue;
     const event = next[index];
     if (!event?.tool) continue;
+    const callId = patch.call_id ?? event.tool.call_id;
+    const partial = patch.partial ?? event.tool.partial;
     if (
       event.tool.output === patch.output
       && event.tool.ok === patch.ok
+      && event.tool.call_id === callId
       && event.tool.completed_at === patch.completed_at
+      && event.tool.duration_ms === patch.duration_ms
+      && event.tool.status === patch.status
+      && event.tool.partial === partial
+      && event.tool.terminal_input === patch.terminal_input
+      && sameJsonValue(event.tool.metadata, patch.metadata)
+      && sameJsonValue(event.tool.edit, patch.edit)
     ) continue;
     if (next === events) next = events.slice();
     changedFrom = Math.min(changedFrom, index);
@@ -186,9 +195,16 @@ function applyPatches(
       ...event,
       tool: {
         ...event.tool,
+        call_id: callId,
         output: patch.output,
         ok: patch.ok,
         completed_at: patch.completed_at,
+        duration_ms: patch.duration_ms,
+        status: patch.status,
+        partial,
+        terminal_input: patch.terminal_input,
+        metadata: patch.metadata,
+        edit: patch.edit,
       },
     };
   }
