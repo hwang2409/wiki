@@ -2954,6 +2954,172 @@ class CodexModernTranscriptParityTests(unittest.TestCase):
                 "terminal",
             )
 
+    def test_round16_native_attribution_fails_closed_after_trim(self) -> None:
+        single_batch = 'tools.mcp__fixture__lookup({value:"wanted"});'
+
+        def wrapper(call_id: str) -> dict:
+            return {
+                "type": "response_item",
+                "timestamp": "2026-08-07T12:00:01Z",
+                "payload": {
+                    "type": "custom_tool_call",
+                    "id": call_id,
+                    "call_id": call_id,
+                    "name": "exec",
+                    "input": single_batch,
+                },
+            }
+
+        def native(call_id: str) -> dict:
+            return {
+                "type": "response_item",
+                "timestamp": "2026-08-07T12:00:02Z",
+                "payload": {
+                    "type": "mcpToolCall",
+                    "id": call_id,
+                    "server": "fixture",
+                    "tool": "lookup",
+                    "arguments": {"value": "wanted"},
+                    "status": "completed",
+                    "result": {"content": [{"type": "text", "text": "native"}]},
+                },
+            }
+
+        def filler(index: int) -> dict:
+            return {
+                "type": "response_item",
+                "timestamp": "2026-08-07T12:00:03Z",
+                "payload": {
+                    "type": "message",
+                    "id": f"trim-filler-{index}",
+                    "role": "assistant",
+                    "content": [{"type": "output_text", "text": f"trim filler {index}"}],
+                },
+            }
+
+        def visible_wrapper_count(parsed: dict) -> int:
+            return sum(
+                1
+                for event in parsed["events"]
+                if event["kind"] == "tool"
+                and event["tool"]["name"] == "mcp__fixture__lookup"
+                and event["tool"]["output"] is None
+            )
+
+        with TemporaryDirectory() as tmp:
+            path = Path(tmp) / "trimmed-native-twin.jsonl"
+            rows = [wrapper("batch-trim-a")]
+            path.write_text("\n".join(json.dumps(row) for row in rows) + "\n")
+            transcripts.read_session_events("codex", path)
+
+            rows.append(native("native-trim-a"))
+            path.write_text("\n".join(json.dumps(row) for row in rows) + "\n")
+            transcripts.read_session_events("codex", path)
+
+            rows.extend(filler(index) for index in range(2001))
+            path.write_text("\n".join(json.dumps(row) for row in rows) + "\n")
+            transcripts.read_session_events("codex", path)
+            state = transcripts._cache[str(path)]
+            self.assertEqual(len(state["events"]), transcripts.CODEX_EVENT_WINDOW)
+
+            rows.append(wrapper("batch-trim-b"))
+            path.write_text("\n".join(json.dumps(row) for row in rows) + "\n")
+            before_twin = transcripts.read_session_events("codex", path)
+            self.assertEqual(visible_wrapper_count(before_twin), 1)
+
+            rows.append(
+                {
+                    "type": "response_item",
+                    "timestamp": "2026-08-07T12:00:04Z",
+                    "payload": {
+                        "type": "mcpToolCall",
+                        "id": "native-trim-a",
+                        "server": "fixture",
+                        "tool": "lookup",
+                        "arguments": {"value": "wanted"},
+                        "status": "completed",
+                        "result": {"content": [{"type": "text", "text": "twin"}]},
+                    },
+                }
+            )
+            path.write_text("\n".join(json.dumps(row) for row in rows) + "\n")
+            parsed = transcripts.read_session_events("codex", path)
+            state = transcripts._cache[str(path)]
+
+        self.assertEqual(visible_wrapper_count(parsed), 1)
+        self.assertIn("batch-trim-b", state["pending_wrappers"])
+        self.assertIsNone(
+            transcripts._codex_attribute_native_batch(
+                state,
+                ("mcp__fixture__lookup", '{"value": "wanted"}'),
+                "native-trim-a",
+            )
+        )
+
+    def test_round16_native_attribution_has_one_chokepoint(self) -> None:
+        single_batch = 'tools.mcp__fixture__lookup({value:"wanted"});'
+
+        def wrapper(call_id: str) -> dict:
+            return {
+                "type": "response_item",
+                "timestamp": "2026-08-07T12:00:01Z",
+                "payload": {
+                    "type": "custom_tool_call",
+                    "id": call_id,
+                    "call_id": call_id,
+                    "name": "exec",
+                    "input": single_batch,
+                },
+            }
+
+        def native(call_id: str) -> dict:
+            return {
+                "type": "response_item",
+                "timestamp": "2026-08-07T12:00:02Z",
+                "payload": {
+                    "type": "mcpToolCall",
+                    "id": call_id,
+                    "server": "fixture",
+                    "tool": "lookup",
+                    "arguments": {"value": "wanted"},
+                    "status": "completed",
+                    "result": {"content": [{"type": "text", "text": "native"}]},
+                },
+            }
+
+        def visible_wrapper_count(parsed: dict) -> int:
+            return sum(
+                1
+                for event in parsed["events"]
+                if event["kind"] == "tool"
+                and event["tool"]["name"] == "mcp__fixture__lookup"
+                and event["tool"]["output"] is None
+            )
+
+        with mock.patch.object(
+            transcripts, "_codex_attribute_native_batch", return_value=None
+        ):
+            with TemporaryDirectory() as tmp:
+                cold_path = Path(tmp) / "chokepoint-cold.jsonl"
+                cold_path.write_text(
+                    "\n".join(json.dumps(row) for row in [wrapper("cold"), native("cold-native")])
+                    + "\n"
+                )
+                cold = transcripts.read_session_events("codex", cold_path)
+
+                incremental_path = Path(tmp) / "chokepoint-incremental.jsonl"
+                incremental_rows = [wrapper("incremental")]
+                incremental_path.write_text(json.dumps(incremental_rows[0]) + "\n")
+                transcripts.read_session_events("codex", incremental_path)
+                incremental_rows.append(native("incremental-native"))
+                incremental_path.write_text(
+                    "\n".join(json.dumps(row) for row in incremental_rows) + "\n"
+                )
+                incremental = transcripts.read_session_events("codex", incremental_path)
+
+        self.assertEqual(visible_wrapper_count(cold), 1)
+        self.assertEqual(visible_wrapper_count(incremental), 1)
+
     def test_round2_f2_statusless_completed_items_are_done(self) -> None:
         parsed = transcripts.read_session_events(
             "codex-normalized", FIXTURES_DIR / "codex_wiki266_round2_lifecycle.jsonl"
