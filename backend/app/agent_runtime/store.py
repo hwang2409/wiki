@@ -18,6 +18,7 @@ from typing import Any
 from uuid import UUID
 
 from .. import knowledge
+from .archive_protocol import archive_is_committed, commit_archive
 from .command_log import CommandLog
 from .process import (
     provider_process_group_members_sync,
@@ -42,7 +43,6 @@ from .types import (
 MAX_START_STATUS_BYTES = 64 * 1024
 DEFAULT_RUN_RETENTION_DAYS = 30
 logger = logging.getLogger(__name__)
-ARCHIVE_MANIFEST_NAME = "archive-manifest.json"
 
 
 def _run_retention_cutoff() -> datetime:
@@ -487,178 +487,6 @@ def _archive_tree_expected_paths(source: Path, destination: Path) -> list[Path]:
     return expected
 
 
-def _archive_file_manifest(
-    session_dir: Path, expected_paths: list[Path]
-) -> dict[str, int]:
-    manifest: dict[str, int] = {}
-    for path in expected_paths:
-        try:
-            relative = path.relative_to(session_dir)
-            stat_result = path.lstat()
-        except (OSError, ValueError) as exc:
-            raise StoreError(f"archive file is missing: {path}") from exc
-        if stat.S_ISDIR(stat_result.st_mode):
-            raise StoreError(f"archive file is a directory: {path}")
-        manifest[str(relative)] = stat_result.st_size
-    return manifest
-
-
-def _archive_manifest_files(session_dir: Path) -> dict[str, int] | None:
-    """Return all archive files except the manifest and completion marker."""
-
-    actual: dict[str, int] = {}
-    try:
-        for path in session_dir.rglob("*"):
-            relative = path.relative_to(session_dir)
-            if relative in {
-                Path(ARCHIVE_MANIFEST_NAME),
-                Path("archive-complete.json"),
-            }:
-                continue
-            stat_result = path.lstat()
-            if stat.S_ISDIR(stat_result.st_mode):
-                continue
-            if not (stat.S_ISREG(stat_result.st_mode) or stat.S_ISLNK(stat_result.st_mode)):
-                return None
-            actual[str(relative)] = stat_result.st_size
-    except OSError:
-        return None
-    return actual
-
-
-def _archive_manifest_is_complete(
-    session_dir: Path, manifest: dict[str, Any], *, require_meta: bool
-) -> bool:
-    files = manifest.get("files")
-    if not isinstance(files, dict) or not files:
-        return False
-    required_files = {"run.json", "raw.jsonl", "events.jsonl"}
-    if require_meta:
-        required_files.add("meta.json")
-    if not required_files.issubset(files):
-        return False
-    for relative, expected_size in files.items():
-        if (
-            not isinstance(relative, str)
-            or not isinstance(expected_size, int)
-            or isinstance(expected_size, bool)
-        ):
-            return False
-        relative_path = Path(relative)
-        if relative_path.is_absolute() or ".." in relative_path.parts:
-            return False
-    return _archive_manifest_files(session_dir) == files
-
-
-def _archive_marker_is_complete(marker_path: Path, marker: dict[str, Any]) -> bool:
-    if marker_path.is_symlink() or not marker_path.is_file():
-        return False
-    if marker.get("manifest") == ARCHIVE_MANIFEST_NAME:
-        if marker.get("committed") is not True:
-            return False
-        try:
-            manifest = _read_json(marker_path.parent / ARCHIVE_MANIFEST_NAME)
-        except (OSError, StoreError, TypeError, ValueError):
-            return False
-        return (
-            isinstance(manifest, dict)
-            and manifest.get("run_id") == marker.get("run_id")
-            and manifest.get("completed_at") == marker.get("completed_at")
-            and _archive_manifest_is_complete(
-                marker_path.parent, manifest, require_meta=True
-            )
-        )
-    files = marker.get("files")
-    required_files = {"run.json", "raw.jsonl", "events.jsonl"}
-    if not isinstance(files, dict):
-        for name in required_files:
-            try:
-                if not stat.S_ISREG((marker_path.parent / name).lstat().st_mode):
-                    return False
-            except OSError:
-                return False
-        return True
-    required_files.add("meta.json")
-    if not files or not required_files.issubset(files):
-        return False
-    session_dir = marker_path.parent
-    for relative, expected_size in files.items():
-        if (
-            not isinstance(relative, str)
-            or not isinstance(expected_size, int)
-            or isinstance(expected_size, bool)
-        ):
-            return False
-        relative_path = Path(relative)
-        if relative_path.is_absolute() or ".." in relative_path.parts:
-            return False
-        path = session_dir / relative_path
-        try:
-            stat_result = path.lstat()
-        except OSError:
-            return False
-        if stat.S_ISDIR(stat_result.st_mode) or stat_result.st_size != expected_size:
-            return False
-    return True
-
-
-def _publish_archive_marker(
-    session_dir: Path,
-    *,
-    run_id: str,
-    completed_at: str,
-    expected_paths: list[Path],
-) -> None:
-    """Publish a marker only after its file and directory are durable."""
-
-    marker_path = session_dir / "archive-complete.json"
-    marker_fd, marker_raw_tmp = tempfile.mkstemp(
-        prefix=f".{marker_path.name}.", dir=session_dir
-    )
-    os.close(marker_fd)
-    marker_tmp = Path(marker_raw_tmp)
-    marker_published = False
-    try:
-        manifest = _archive_file_manifest(session_dir, expected_paths)
-        _atomic_write_json(
-            session_dir / ARCHIVE_MANIFEST_NAME,
-            {"run_id": run_id, "completed_at": completed_at, "files": manifest},
-        )
-        _atomic_write_json(
-            marker_tmp,
-            {
-                "run_id": run_id,
-                "completed_at": completed_at,
-                "manifest": ARCHIVE_MANIFEST_NAME,
-                "committed": False,
-            },
-        )
-        os.replace(marker_tmp, marker_path)
-        marker_published = True
-        _fsync_directory(session_dir)
-        _atomic_write_json(
-            marker_path,
-            {
-                "run_id": run_id,
-                "completed_at": completed_at,
-                "manifest": ARCHIVE_MANIFEST_NAME,
-                "committed": True,
-            },
-        )
-    except BaseException:
-        marker_tmp.unlink(missing_ok=True)
-        if marker_published:
-            try:
-                marker_path.unlink(missing_ok=True)
-            except OSError:
-                pass
-            try:
-                _fsync_directory(session_dir)
-            except OSError:
-                pass
-        raise
-
-
 def _atomic_write_json(path: Path, value: Any) -> None:
     _ensure_parent_dir(path.parent)
     if path.is_symlink():
@@ -868,18 +696,13 @@ class RunStore:
     ) -> tuple[RunRecord, Path] | None:
         """Return one archive record and its session directory."""
 
-        for path in self.paths.archive_dir.glob("*/*/archive-complete.json"):
+        for session_dir in self.paths.archive_dir.glob("*/*"):
             try:
-                marker = _read_json(path)
-                if (
-                    not isinstance(marker, dict)
-                    or marker.get("run_id") != run_id
-                    or not _archive_marker_is_complete(path, marker)
-                ):
+                if not archive_is_committed(session_dir):
                     continue
-                value = _read_json(path.parent / "run.json")
-                if isinstance(value, dict):
-                    return RunRecord.from_dict(value), path.parent
+                value = _read_json(session_dir / "run.json")
+                if isinstance(value, dict) and value.get("run_id") == run_id:
+                    return RunRecord.from_dict(value), session_dir
             except (OSError, StoreError, TypeError, ValueError):
                 continue
         return None
@@ -899,6 +722,8 @@ class RunStore:
             if archived_entry is None:
                 return None
             archived, session_dir = archived_entry
+            if not archive_is_committed(session_dir):
+                raise StoreConflict("archive is no longer committed")
 
             live_path = self.run_path(run_id)
             if live_path.is_file():
@@ -1389,6 +1214,7 @@ class RunStore:
         if (
             archived_entry is not None
             and archived_entry[0].created_at == record.created_at
+            and archive_is_committed(archived_entry[1])
         ):
             # A prior boot published a complete archive before cleanup. Finish
             # only the redundant hot-store removal and keep the archive intact.
@@ -1448,12 +1274,14 @@ class RunStore:
                 _archive_tree_expected_paths(artifact_dir, session_dir / "artifacts")
             )
             self._copy_archive_tree(artifact_dir, session_dir / "artifacts")
-        _publish_archive_marker(
+        commit_archive(
             session_dir,
             run_id=record.run_id,
             completed_at=ended_at,
             expected_paths=expected_paths,
         )
+        if not archive_is_committed(session_dir):
+            raise StoreError("archive commit failed verification")
         knowledge.enqueue_refresh(runtime_dir=self.paths.runtime_dir)
         if isinstance(entry, dict):
             row = dict(archive_worker)
@@ -1645,17 +1473,18 @@ class RunStore:
         for record in self.list_runs():
             records_by_agent.setdefault(record.agent_id, []).append(record)
         archived_run_ids: set[str] = set()
-        for marker_path in self.paths.archive_dir.glob("*/*/archive-complete.json"):
+        for session_dir in self.paths.archive_dir.glob("*/*"):
             try:
-                marker = _read_json(marker_path)
+                if not archive_is_committed(session_dir):
+                    continue
+                value = _read_json(session_dir / "run.json")
             except (OSError, StoreError, TypeError, ValueError):
                 continue
             if (
-                isinstance(marker, dict)
-                and _archive_marker_is_complete(marker_path, marker)
-                and isinstance(marker.get("run_id"), str)
+                isinstance(value, dict)
+                and isinstance(value.get("run_id"), str)
             ):
-                archived_run_ids.add(marker["run_id"])
+                archived_run_ids.add(value["run_id"])
         if not records_by_agent:
             if changed:
                 self._write_registry(registry)
@@ -1859,6 +1688,11 @@ class RunStore:
                 raise StoreConflict(
                     "older archive marker cannot remove a newer live run"
                 )
+            if archived_entry is not None:
+                archived = self.finalize_archived_run(run_id)
+                if archived is None:
+                    raise StoreConflict("committed archive could not be finalized")
+                return archived, archived_entry[1]
             registry = self._read_registry()
             entry = registry.get(record.agent_id)
             current = entry.get("current") if isinstance(entry, dict) else None
@@ -1944,12 +1778,14 @@ class RunStore:
             # Publish the archive only after every file is complete. Telemetry
             # scans sessions with this marker and never observes a copy in
             # progress.
-            _publish_archive_marker(
+            commit_archive(
                 session_dir,
                 run_id=run_id,
                 completed_at=ended_at,
                 expected_paths=expected_paths,
             )
+            if not archive_is_committed(session_dir):
+                raise StoreError("archive commit failed verification")
 
             if record.start_request_id and record.implicit_start_request:
                 self.command_log.archive_start_request(

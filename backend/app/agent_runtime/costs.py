@@ -16,7 +16,7 @@ from typing import Any
 from urllib.parse import quote
 
 from ..pathwalk import open_relative_directory, open_relative_file
-from .store import _archive_marker_is_complete
+from .archive_protocol import archive_is_committed
 from .ticket import base_ticket
 
 
@@ -641,15 +641,15 @@ def _archived_run_ids() -> set[str]:
     ).expanduser()
     run_ids: set[str] = set()
     try:
-        markers = archive_root.glob("*/*/archive-complete.json")
-        for marker in markers:
+        for session_dir in archive_root.glob("*/*"):
+            if not archive_is_committed(session_dir):
+                continue
             try:
-                value = json.loads(marker.read_text(encoding="utf-8"))
+                value = json.loads((session_dir / "run.json").read_text(encoding="utf-8"))
             except (OSError, ValueError):
                 continue
             if (
                 isinstance(value, dict)
-                and _archive_marker_is_complete(marker, value)
                 and isinstance(value.get("run_id"), str)
             ):
                 run_ids.add(value["run_id"])

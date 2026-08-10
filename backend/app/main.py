@@ -67,7 +67,8 @@ from .agent_runtime.command_log import AgentCommand
 from .agent_runtime import costs
 from .agent_runtime import graph_health
 from .agent_runtime.loop_state import derive_loop_state
-from .agent_runtime.store import RuntimePaths, _archive_marker_is_complete
+from .agent_runtime.archive_protocol import archive_is_committed
+from .agent_runtime.store import RuntimePaths
 from .agent_runtime.ticket import (
     base_ticket,
     parse_reviewer_id,
@@ -3353,17 +3354,12 @@ def _validate_run_id_or_400(run_id: str) -> None:
 def _archive_session_for_run_id(run_id: str) -> Path | None:
     """Find the committed archive session for one exact run id."""
 
-    for marker in AGENT_ARCHIVE_DIR.glob("*/*/archive-complete.json"):
-        if marker.is_symlink() or not marker.is_file():
+    for session_dir in AGENT_ARCHIVE_DIR.glob("*/*"):
+        if not archive_is_committed(session_dir):
             continue
-        marker_value = _read_json_object(marker)
-        if not _archive_marker_is_complete(marker, marker_value):
-            continue
-        if marker_value.get("run_id") != run_id:
-            continue
-        run = _read_json_object(marker.parent / "run.json")
+        run = _read_json_object(session_dir / "run.json")
         if run.get("run_id") == run_id:
-            return marker.parent
+            return session_dir
     return None
 
 
@@ -3382,19 +3378,14 @@ def _archived_replay_runs(ticket: str) -> list[replay.RunSummary]:
     if not ticket_dir.is_dir():
         return []
     summaries: list[replay.RunSummary] = []
-    for marker in sorted(
-        ticket_dir.glob("*/archive-complete.json"), reverse=True
-    ):
-        if marker.is_symlink() or not marker.is_file():
+    for session_dir in sorted(ticket_dir.glob("*"), reverse=True):
+        if not archive_is_committed(session_dir):
             continue
-        marker_value = _read_json_object(marker)
-        if not _archive_marker_is_complete(marker, marker_value):
-            continue
-        run_id = marker_value.get("run_id")
+        run_id = _read_json_object(session_dir / "run.json").get("run_id")
         if not isinstance(run_id, str) or not replay.valid_run_id(run_id):
             continue
         try:
-            run_fd = replay.open_run_dir_fd(marker.parent)
+            run_fd = replay.open_run_dir_fd(session_dir)
             try:
                 summary = replay.build_run_summary_from_run_fd(run_fd, run_id)
             finally:

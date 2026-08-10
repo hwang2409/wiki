@@ -29,6 +29,7 @@ import pytest
 from fastapi import HTTPException
 
 from backend.app import main, replay
+from backend.app.agent_runtime.archive_protocol import commit_archive
 
 
 RUN_ID = "11111111-2222-3333-4444-555555555555"
@@ -64,9 +65,15 @@ def _write_archive_session(archive_root: Path, run_id: str = RUN_ID) -> Path:
             for i in range(1, 5)
         ],
     )
-    (session_dir / "archive-complete.json").write_text(
-        json.dumps({"run_id": run_id, "completed_at": "2026-07-30T00:06:00Z"}),
-        encoding="utf-8",
+    commit_archive(
+        session_dir,
+        run_id=run_id,
+        completed_at="2026-07-30T00:06:00Z",
+        expected_paths=[
+            session_dir / "run.json",
+            session_dir / "events.jsonl",
+            session_dir / "raw.jsonl",
+        ],
     )
     return session_dir
 

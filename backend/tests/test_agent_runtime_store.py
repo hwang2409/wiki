@@ -16,6 +16,10 @@ from unittest import mock
 from uuid import uuid4
 
 from backend.app import transcripts
+from backend.app.agent_runtime.archive_protocol import (
+    ARCHIVE_COMPLETION_MARKER,
+    archive_is_committed,
+)
 from backend.app.agent_runtime import store as store_module
 from backend.app.agent_runtime.fake import WireFixture
 from backend.app.agent_runtime.normalizer import normalize_provider_event
@@ -2630,7 +2634,7 @@ class RunStoreTests(unittest.TestCase):
             real_replace = store_module.os.replace
 
             def replace(source: Path, destination: Path) -> None:
-                if Path(destination).name == "archive-complete.json":
+                if Path(destination).name == ARCHIVE_COMPLETION_MARKER:
                     events.append("marker")
                 real_replace(source, destination)
 
@@ -2709,7 +2713,9 @@ class RunStoreTests(unittest.TestCase):
 
             self.assertTrue(store.run_dir(record.run_id).is_dir())
             self.assertIsNotNone(store.get(record.run_id))
-            self.assertEqual(list(paths.archive_dir.glob("*/*/archive-complete.json")), [])
+            self.assertEqual(
+                list(paths.archive_dir.glob(f"*/*/{ARCHIVE_COMPLETION_MARKER}")), []
+            )
 
     def test_archive_marker_fsync_failure_is_not_trusted_on_retry(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -2727,7 +2733,7 @@ class RunStoreTests(unittest.TestCase):
             def replace(source: Path, destination: Path) -> None:
                 nonlocal marker_renamed, failed_session
                 real_replace(source, destination)
-                if Path(destination).name == "archive-complete.json":
+                if Path(destination).name == ARCHIVE_COMPLETION_MARKER:
                     marker_renamed = True
                     failed_session = Path(destination).parent
 
@@ -2746,11 +2752,13 @@ class RunStoreTests(unittest.TestCase):
                 store.archive_current(record.run_id)
 
             self.assertTrue(store.run_dir(record.run_id).is_dir())
-            self.assertEqual(list(paths.archive_dir.glob("*/*/archive-complete.json")), [])
+            self.assertEqual(
+                list(paths.archive_dir.glob(f"*/*/{ARCHIVE_COMPLETION_MARKER}")), []
+            )
             assert failed_session is not None
 
             _atomic_write_json(
-                failed_session / "archive-complete.json",
+                failed_session / ARCHIVE_COMPLETION_MARKER,
                 {
                     "run_id": record.run_id,
                     "completed_at": record.updated_at,
@@ -2781,7 +2789,7 @@ class RunStoreTests(unittest.TestCase):
             def replace(source: Path, destination: Path) -> None:
                 nonlocal marker_renamed
                 real_replace(source, destination)
-                if Path(destination).name == "archive-complete.json":
+                if Path(destination).name == ARCHIVE_COMPLETION_MARKER:
                     marker_renamed = True
 
             def fsync_directory(path: Path) -> None:
@@ -2795,7 +2803,7 @@ class RunStoreTests(unittest.TestCase):
                 real_fsync_directory(path)
 
             def unlink(path: Path, missing_ok: bool = False) -> None:
-                if marker_renamed and path.name == "archive-complete.json":
+                if marker_renamed and path.name == ARCHIVE_COMPLETION_MARKER:
                     raise OSError("archive marker unlink failed")
                 real_unlink(path, missing_ok=missing_ok)
 
@@ -2810,15 +2818,16 @@ class RunStoreTests(unittest.TestCase):
                 store.archive_current(record.run_id)
 
             self.assertTrue(final_fsync_failed)
-            self.assertTrue(cleanup_fsync_failed)
+            self.assertFalse(cleanup_fsync_failed)
             self.assertTrue(store.run_dir(record.run_id).is_dir())
-            marker = next(paths.archive_dir.glob("*/*/archive-complete.json"))
-            marker_value = json.loads(marker.read_text(encoding="utf-8"))
-            self.assertFalse(store_module._archive_marker_is_complete(marker, marker_value))
+            marker = next(
+                paths.archive_dir.glob(f"*/*/{ARCHIVE_COMPLETION_MARKER}")
+            )
+            self.assertTrue(archive_is_committed(marker.parent))
 
             restarted = RunStore(paths)
             self.assertTrue(restarted.run_dir(record.run_id).is_dir())
-            self.assertIsNone(restarted.find_archived_run(record.run_id))
+            self.assertIsNotNone(restarted.find_archived_run(record.run_id))
 
             restarted.archive_current(record.run_id)
             self.assertFalse(restarted.run_dir(record.run_id).exists())
@@ -2937,7 +2946,7 @@ class RunStoreTests(unittest.TestCase):
 
             def replace(source: Path, destination: Path) -> None:
                 nonlocal archive_session
-                if Path(destination).name == "archive-complete.json":
+                if Path(destination).name == ARCHIVE_COMPLETION_MARKER:
                     archive_session = Path(destination).parent
                 real_replace(source, destination)
 
@@ -2986,7 +2995,7 @@ class RunStoreTests(unittest.TestCase):
             self.assertTrue(
                 any(
                     path.parent == archive_session
-                    and path.name.startswith(".archive-complete.json.")
+                    and path.name.startswith(f".{ARCHIVE_COMPLETION_MARKER}.")
                     for kind, path in durability_events
                     if kind == "file"
                 )
@@ -3024,7 +3033,7 @@ class RunStoreTests(unittest.TestCase):
                 def wrapped_replace(source: Path, destination: Path) -> None:
                     nonlocal marker_committed
                     real_replace(source, destination)
-                    if Path(destination).name == "archive-complete.json":
+                    if Path(destination).name == ARCHIVE_COMPLETION_MARKER:
                         marker_committed = True
 
                 with (
@@ -3050,7 +3059,7 @@ class RunStoreTests(unittest.TestCase):
                     archive_files = [
                         path
                         for path in archive_root.glob("*/*")
-                        if path.is_file() and path.name != "archive-complete.json"
+                        if path.is_file() and path.name != ARCHIVE_COMPLETION_MARKER
                     ]
                     self.assertGreaterEqual(len(archive_files), 8)
                 else:
