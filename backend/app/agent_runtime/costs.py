@@ -174,10 +174,7 @@ def _load_state() -> dict[str, Any]:
             and (generation == 0 or generation <= state.checkpoint_generation)
         ):
             value["runs"][run_id] = run_state
-            if (
-                generation < state.checkpoint_generation
-                and run_id in state["active_runs"]
-            ):
+            if generation < state.checkpoint_generation:
                 state.checkpoint_recovery_run_ids.add(run_id)
     return state
 

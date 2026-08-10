@@ -709,12 +709,17 @@ def collect_artifact_items(
             except OSError:
                 continue
             session_dirs.sort(key=lambda entry: entry.name, reverse=True)
-            for session_entry in session_dirs[:3]:
-                if not session_entry.is_dir() or session_entry.is_symlink():
-                    continue
+            committed_session_dirs = [
+                entry
+                for entry in session_dirs
+                if (
+                    entry.is_dir()
+                    and not entry.is_symlink()
+                    and archive_is_committed(Path(entry.path))
+                )
+            ]
+            for session_entry in committed_session_dirs[:3]:
                 session_dir = Path(session_entry.path)
-                if not archive_is_committed(session_dir):
-                    continue
                 found = _collect_from_run_dir(session_dir, ticket_entry.name)
                 if found:
                     dirs_seen += 1

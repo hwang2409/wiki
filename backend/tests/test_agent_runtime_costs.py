@@ -396,6 +396,79 @@ class CostAggregatorTests(unittest.TestCase):
             sum(record["input"] for record in recovered["records"].values()), 30
         )
 
+    def test_terminal_run_checkpoint_recovers_after_aggregate_crash(self) -> None:
+        raw = self._run("run-terminal-recovery")
+        raw.write_text(
+            json.dumps(_envelope("2026-07-30T10:00:00Z", _usage(10, 2))) + "\n",
+            encoding="utf-8",
+        )
+        first = costs.refresh()
+        old_offset = first["runs"]["run-terminal-recovery"]["offset"]
+        with raw.open("a", encoding="utf-8") as handle:
+            handle.write(
+                json.dumps(_envelope("2026-07-30T10:01:00Z", _usage(30, 6)))
+                + "\n"
+            )
+        (raw.parent / "run.json").write_text(
+            json.dumps(
+                {
+                    "run_id": "run-terminal-recovery",
+                    "agent_id": "WIKI-178",
+                    "provider": "codex",
+                    "model": "gpt-5.4",
+                    "orchestrator_id": "wiki",
+                    "state": "completed",
+                }
+            ),
+            encoding="utf-8",
+        )
+
+        state = costs._load_state()
+        root_fd = costs._open_root()
+        self.assertIsNotNone(root_fd)
+        assert root_fd is not None
+        try:
+            costs._scan_run(state, "run-terminal-recovery", root_fd)
+        finally:
+            os.close(root_fd)
+        self.assertEqual(
+            sum(record["input"] for record in state["records"].values()), 30
+        )
+        (self.runs / ".root-change").write_text("", encoding="utf-8")
+
+        real_save_json = costs._save_json
+        pid = os.fork()
+        if pid == 0:
+            def save_json_then_crash(path, value):
+                saved = real_save_json(path, value)
+                if Path(path) == costs.cost_state_path():
+                    os._exit(73)
+                return saved
+
+            costs._save_json = save_json_then_crash
+            try:
+                costs._save_state(state)
+            finally:
+                os._exit(1)
+
+        _pid, status = os.waitpid(pid, 0)
+        self.assertEqual(_pid, pid)
+        self.assertTrue(os.WIFEXITED(status))
+        self.assertEqual(os.WEXITSTATUS(status), 73)
+
+        reloaded = costs._load_state()
+        with mock.patch.object(costs, "_scan_run", wraps=costs._scan_run) as scan_run:
+            recovered = costs.refresh(reloaded)
+        self.assertEqual(
+            sum(record["input"] for record in recovered["records"].values()), 30
+        )
+        self.assertEqual(
+            recovered["runs"]["run-terminal-recovery"]["offset"], raw.stat().st_size
+        )
+        scanned_run_ids = [call.args[1] for call in scan_run.call_args_list]
+        self.assertEqual(scanned_run_ids, ["run-terminal-recovery"])
+        self.assertNotEqual(old_offset, raw.stat().st_size)
+
     def test_save_checkpoints_unchanged_runs_with_cursors(self) -> None:
         first_raw = self._run("run-first")
         second_raw = self._run("run-second")

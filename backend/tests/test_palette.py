@@ -350,6 +350,43 @@ class PaletteSearchTests(unittest.TestCase):
             self.assertIn(f"focus={artifact_id}", url)
             self.assertIn(f"tab={artifact_id}", url)
 
+    def test_committed_archive_survives_partial_directory_window(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            archive = root / "archive"
+            ticket_dir = archive / "WIKI-99"
+            partial_ids = [
+                "20260721-partial",
+                "20260720-partial",
+                "20260719-partial",
+            ]
+            for index, session_id in enumerate(partial_ids):
+                session_dir = ticket_dir / session_id
+                session_dir.mkdir(parents=True)
+                (session_dir / "events.jsonl").write_text(
+                    json.dumps(
+                        _artifact_event(
+                            "code", f"partial-{index}", f"partial {index}"
+                        )
+                    )
+                    + "\n",
+                    encoding="utf-8",
+                )
+                (session_dir / "raw.jsonl").write_text("", encoding="utf-8")
+                (session_dir / "run.json").write_text("{}", encoding="utf-8")
+
+            committed_id = "20260718-committed"
+            _write_events_jsonl(
+                ticket_dir / committed_id / "events.jsonl",
+                [_artifact_event("code", "older-committed", "older committed")],
+            )
+
+            items = palette.collect_artifact_items(
+                root / "no-runs", archive, max_dirs=1
+            )
+
+            self.assertEqual([item.artifact_id for item in items], ["older-committed"])
+
     def test_artifact_kinds_all_indexed(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
