@@ -483,6 +483,7 @@ def _atomic_write_json(path: Path, value: Any) -> None:
             os.fsync(handle.fileno())
         os.replace(tmp, path)
         path.chmod(0o600)
+        _fsync_file(path)
         _fsync_directory(path.parent)
     except Exception:
         try:
@@ -507,6 +508,7 @@ def _atomic_write_bytes(path: Path, value: bytes) -> None:
             os.fsync(handle.fileno())
         os.replace(tmp, path)
         path.chmod(0o600)
+        _fsync_file(path)
         _fsync_directory(path.parent)
     except Exception:
         try:
@@ -637,7 +639,6 @@ class RunStore:
         # terminal current run move to the durable archive safely after a
         # crash between the run and registry writes.
         self._reconcile_registry_from_runs()
-        self._prune_terminal_runs()
         self._reconcile_existing_runs()
         self._reconcile_registry_from_runs()
 
@@ -1240,13 +1241,12 @@ class RunStore:
         )
         if record.initial_prompt:
             prompt_path = session_dir / f"{record.provider.legacy_kind}-{record.agent_id}-prompt.md"
-            prompt_path.write_text(record.initial_prompt, encoding="utf-8")
-            prompt_path.chmod(0o600)
+            _atomic_write_bytes(prompt_path, record.initial_prompt.encode("utf-8"))
         artifact_dir = self.run_dir(record.run_id) / "artifacts"
         if artifact_dir.is_symlink():
             raise StoreError(f"refusing symlink artifact directory: {artifact_dir}")
         if artifact_dir.is_dir():
-            shutil.copytree(artifact_dir, session_dir / "artifacts", symlinks=True)
+            self._copy_archive_tree(artifact_dir, session_dir / "artifacts")
         _atomic_write_json(
             session_dir / "archive-complete.json",
             {"run_id": record.run_id, "completed_at": ended_at},
@@ -1569,14 +1569,23 @@ class RunStore:
             self._write_registry(registry)
 
     def _next_archive_session_dir(self, agent_id: str) -> Path:
+        archive_dir = self.paths.archive_dir
+        archive_dir_existed = archive_dir.exists()
+        _ensure_parent_dir(archive_dir)
+        if not archive_dir_existed:
+            _fsync_directory(archive_dir.parent)
         ticket_dir = self.archive_ticket_dir(agent_id)
+        ticket_dir_existed = ticket_dir.exists()
         _ensure_parent_dir(ticket_dir)
+        if not ticket_dir_existed:
+            _fsync_directory(ticket_dir.parent)
         stamp = datetime.now().astimezone().replace(microsecond=0)
         while True:
             session_dir = ticket_dir / stamp.strftime("%Y%m%d-%H%M%S")
             if not session_dir.exists():
                 session_dir.mkdir(mode=0o700, parents=True)
                 session_dir.chmod(0o700)
+                _fsync_directory(session_dir.parent)
                 return session_dir
             stamp += timedelta(seconds=1)
 
@@ -1588,6 +1597,37 @@ class RunStore:
         destination.chmod(0o600)
         _fsync_file(destination)
         _fsync_directory(destination.parent)
+
+    def _copy_archive_tree(self, source: Path, destination: Path) -> None:
+        """Copy an artifact tree while making every entry durable."""
+
+        _ensure_parent_dir(destination.parent)
+        if destination.exists() or destination.is_symlink():
+            raise StoreConflict(f"archive destination already exists: {destination}")
+        destination.mkdir(mode=0o700)
+        destination.chmod(0o700)
+        _fsync_directory(destination.parent)
+        try:
+            with os.scandir(source) as entries:
+                for entry in entries:
+                    source_entry = Path(entry.path)
+                    destination_entry = destination / entry.name
+                    if entry.is_symlink():
+                        destination_entry.symlink_to(
+                            os.readlink(source_entry),
+                            target_is_directory=entry.is_dir(follow_symlinks=True),
+                        )
+                        _fsync_directory(destination)
+                    elif entry.is_dir(follow_symlinks=False):
+                        self._copy_archive_tree(source_entry, destination_entry)
+                    elif entry.is_file(follow_symlinks=False):
+                        self._copy_archive_file(source_entry, destination_entry)
+                    else:
+                        raise StoreError(f"refusing special artifact: {source_entry}")
+            _fsync_directory(destination)
+        except BaseException:
+            shutil.rmtree(destination, ignore_errors=True)
+            raise
 
     def archive_current(
         self,
@@ -1664,29 +1704,25 @@ class RunStore:
                 self.provider_log_path(run_id),
                 session_dir / "provider.log",
             )
+            status_path_to_remove: Path | None = None
             if record.initial_prompt:
                 prompt_path = session_dir / prompt_name
-                prompt_path.write_text(record.initial_prompt, encoding="utf-8")
-                prompt_path.chmod(0o600)
+                _atomic_write_bytes(prompt_path, record.initial_prompt.encode("utf-8"))
             status_path = self.status_path(record.agent_id)
             if status_path.is_file():
+                status_path_to_remove = status_path
                 try:
                     status = json.loads(status_path.read_text(encoding="utf-8"))
                 except (OSError, ValueError):
                     status = None
                 if isinstance(status, dict):
                     _atomic_write_json(session_dir / "final-status.json", status)
-                status_path.unlink(missing_ok=True)
 
             artifact_dir = self.run_dir(run_id) / "artifacts"
             if artifact_dir.is_symlink():
                 raise StoreError(f"refusing symlink artifact directory: {artifact_dir}")
             if artifact_dir.is_dir():
-                shutil.copytree(
-                    artifact_dir,
-                    session_dir / "artifacts",
-                    symlinks=True,
-                )
+                self._copy_archive_tree(artifact_dir, session_dir / "artifacts")
 
             # Publish the archive only after every file is complete. Telemetry
             # scans sessions with this marker and never observes a copy in
@@ -1702,6 +1738,10 @@ class RunStore:
                     run_id,
                     str(session_dir),
                 )
+            # The marker is the durable commit point. Remove every live
+            # source only after it is durable.
+            if status_path_to_remove is not None:
+                status_path_to_remove.unlink(missing_ok=True)
             shutil.rmtree(self.run_dir(run_id))
             self.command_log.forget_implicit_for_run(run_id)
             registry.pop(record.agent_id, None)

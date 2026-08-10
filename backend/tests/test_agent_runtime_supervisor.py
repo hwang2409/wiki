@@ -403,6 +403,49 @@ class SupervisorTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertTrue(self.store.run_dir(record.run_id).exists())
 
+    async def test_restart_normalizes_terminal_orphan_before_pruning(self) -> None:
+        record = self.store.create(
+            RunRecord.new(
+                agent_id="WIKI-TERMINAL-ORPHAN",
+                provider=ProviderKind.CODEX,
+                role="implement",
+                model="fixture-codex",
+                worktree=str(self.worktree),
+                prompt="terminal orphan fixture",
+            )
+        )
+        self.store.append_raw(
+            record.run_id,
+            provider="codex",
+            direction="provider",
+            payload={"method": "item/completed", "params": {}},
+        )
+        record = self.store.transition(record.run_id, LifecycleState.COMPLETED)
+        record.updated_at = "2020-01-01T00:00:00+00:00"
+        store_module._atomic_write_json(  # noqa: SLF001 - retention fixture
+            self.store.run_path(record.run_id), record.to_dict()
+        )
+
+        await self.supervisor.close()
+        restarted_store = RunStore(self.paths)
+        restarted = Supervisor(
+            restarted_store,
+            FixtureAdapterFactory(FIXTURES, pid=os.getpid()),
+        )
+        self.supervisor = restarted
+        with mock.patch.dict(os.environ, {"WIKI_AGENT_RUN_RETENTION_DAYS": "1"}):
+            await restarted.recover_on_start()
+
+        self.assertTrue(restarted_store.run_dir(record.run_id).exists())
+        self.assertIsNone(restarted_store.find_archived_run(record.run_id))
+        normalized = [
+            json.loads(line)
+            for line in restarted_store.normalized_events_path(
+                record.run_id
+            ).read_text().splitlines()
+        ]
+        self.assertEqual([item["raw_seq"] for item in normalized], [1])
+
     async def _spawn_orphan_process(self, *, ignore_sigterm: bool = False) -> int:
         child_code = (
             "import os, signal, sys, time\n"

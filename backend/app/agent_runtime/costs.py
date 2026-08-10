@@ -67,6 +67,20 @@ class _CostState(dict[str, Any]):
     checkpoint_generation: int
 
 
+def _fsync_directory(path: Path) -> bool:
+    try:
+        dir_fd = os.open(path, os.O_RDONLY)
+    except OSError:
+        return False
+    try:
+        os.fsync(dir_fd)
+    except OSError:
+        return False
+    finally:
+        os.close(dir_fd)
+    return True
+
+
 def runtime_runs_dir() -> Path:
     runtime = Path(os.environ.get("WIKI_AGENT_RUNTIME_DIR") or Path.home() / ".wiki" / "agent-runtime")
     return Path(os.environ.get("WIKI_AGENT_RUNS_DIR") or runtime / "runs").expanduser()
@@ -189,14 +203,8 @@ def _save_json(path: Path, value: dict[str, Any]) -> bool:
                 handle.flush()
                 os.fsync(handle.fileno())
             os.replace(tmp, path)
-            try:
-                dir_fd = os.open(path.parent, os.O_RDONLY)
-            except OSError:
+            if not _fsync_directory(path.parent):
                 return False
-            try:
-                os.fsync(dir_fd)
-            finally:
-                os.close(dir_fd)
             return True
         finally:
             tmp.unlink(missing_ok=True)
@@ -241,6 +249,8 @@ def _save_state(state: dict[str, Any]) -> bool:
                 _run_checkpoint_path(run_id).unlink(missing_ok=True)
             except OSError:
                 deleted_checkpoints_removed = False
+        if deleted_checkpoints_removed and deleted_run_ids:
+            deleted_checkpoints_removed = _fsync_directory(checkpoint_dir)
         if hasattr(state, "dirty_run_ids"):
             state.dirty_run_ids.clear()
         if deleted_checkpoints_removed and hasattr(state, "deleted_run_ids"):

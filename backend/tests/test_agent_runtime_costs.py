@@ -401,6 +401,27 @@ class CostAggregatorTests(unittest.TestCase):
         self.assertEqual(reloaded.deleted_run_ids, {run_id})
         self.assertNotIn(run_id, reloaded["runs"])
 
+    def test_checkpoint_tombstone_waits_for_checkpoint_directory_fsync(self) -> None:
+        run_id = "run-deleted-after-fsync"
+        checkpoint_dir = costs.cost_run_checkpoints_dir()
+        checkpoint_dir.mkdir(parents=True)
+        costs._run_checkpoint_path(run_id).write_text(
+            json.dumps({"generation": 1, "run_id": run_id, "state": {}}),
+            encoding="utf-8",
+        )
+        state = costs._empty_state()
+        state.deleted_run_ids.add(run_id)
+        fsync_results = iter((True, False))
+        with mock.patch.object(
+            costs,
+            "_fsync_directory",
+            side_effect=lambda _path: next(fsync_results),
+        ):
+            self.assertTrue(costs._save_state(state))
+
+        self.assertEqual(state.deleted_run_ids, {run_id})
+        self.assertFalse(costs._run_checkpoint_path(run_id).exists())
+
     def test_background_refresh_loads_state_once_across_ticks(self) -> None:
         costs.invalidate_background_state()
         with mock.patch.object(costs, "_load_state", wraps=costs._load_state) as load_state:
