@@ -2653,6 +2653,64 @@ class RunStoreTests(unittest.TestCase):
             self.assertLess(events.index("file"), events.index("marker"))
             self.assertLess(events.index("marker"), events.index("delete"))
 
+    def test_fsync_helpers_surface_os_failures(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            file_path = root / "file"
+            file_path.write_bytes(b"durable")
+
+            with mock.patch.object(
+                store_module.os, "open", side_effect=OSError("open failed")
+            ):
+                with self.assertRaisesRegex(OSError, "open failed"):
+                    store_module._fsync_directory(root)
+                with self.assertRaisesRegex(OSError, "open failed"):
+                    store_module._fsync_file(file_path)
+
+            with mock.patch.object(
+                store_module.os, "fsync", side_effect=OSError("fsync failed")
+            ):
+                with self.assertRaisesRegex(OSError, "fsync failed"):
+                    store_module._fsync_directory(root)
+                with self.assertRaisesRegex(OSError, "fsync failed"):
+                    store_module._fsync_file(file_path)
+
+    def test_archive_directory_fsync_failure_keeps_live_run_hot(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            paths = _paths(root)
+            store = RunStore(paths)
+            record = store.create(_record(root))
+            store.transition(record.run_id, LifecycleState.COMPLETED)
+            real_open = store_module.os.open
+            archive_root = paths.archive_dir.absolute()
+
+            def fail_archive_directory_open(
+                path: str | os.PathLike[str],
+                flags: int,
+                mode: int = 0o777,
+                *,
+                dir_fd: int | None = None,
+            ) -> int:
+                candidate = Path(path).absolute()
+                if candidate.is_dir() and (
+                    candidate == archive_root or archive_root in candidate.parents
+                ):
+                    raise OSError("archive directory open failed")
+                if dir_fd is None:
+                    return real_open(path, flags, mode)
+                return real_open(path, flags, mode, dir_fd=dir_fd)
+
+            with mock.patch.object(
+                store_module.os, "open", side_effect=fail_archive_directory_open
+            ):
+                with self.assertRaisesRegex(OSError, "archive directory open failed"):
+                    store.archive_current(record.run_id)
+
+            self.assertTrue(store.run_dir(record.run_id).is_dir())
+            self.assertIsNotNone(store.get(record.run_id))
+            self.assertEqual(list(paths.archive_dir.glob("*/*/archive-complete.json")), [])
+
     def test_archive_crash_points_keep_one_durable_copy_of_every_artifact(self) -> None:
         def prepare(root: Path) -> tuple[RunStore, RunRecord, list[Path]]:
             store = RunStore(_paths(root))
