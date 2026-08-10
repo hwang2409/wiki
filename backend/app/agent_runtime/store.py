@@ -11,7 +11,7 @@ import base64
 from collections.abc import Iterator
 from copy import deepcopy
 from dataclasses import dataclass
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
 from uuid import UUID
@@ -39,6 +39,27 @@ from .types import (
 
 
 MAX_START_STATUS_BYTES = 64 * 1024
+DEFAULT_RUN_RETENTION_DAYS = 30
+
+
+def _run_retention_cutoff() -> datetime:
+    raw_days = os.environ.get("WIKI_AGENT_RUN_RETENTION_DAYS")
+    try:
+        days = float(raw_days) if raw_days is not None else DEFAULT_RUN_RETENTION_DAYS
+    except ValueError:
+        days = DEFAULT_RUN_RETENTION_DAYS
+    days = max(0.0, days)
+    return datetime.now(timezone.utc) - timedelta(days=days)
+
+
+def _run_is_older_than(value: str, cutoff: datetime) -> bool:
+    try:
+        timestamp = datetime.fromisoformat(value.replace("Z", "+00:00"))
+    except (AttributeError, TypeError, ValueError):
+        return False
+    if timestamp.tzinfo is None:
+        timestamp = timestamp.replace(tzinfo=timezone.utc)
+    return timestamp.astimezone(timezone.utc) < cutoff
 
 
 class StoreError(RuntimeError):
@@ -603,6 +624,11 @@ class RunStore:
                 shutil.rmtree(temp_dir, ignore_errors=True)
         self.command_log = CommandLog(paths.command_log_path)
         self._abort_uncommitted_starts()
+        # Repair the small registry projection before pruning. This lets a
+        # terminal current run move to the durable archive safely after a
+        # crash between the run and registry writes.
+        self._reconcile_registry_from_runs()
+        self._prune_terminal_runs()
         self._reconcile_existing_runs()
         self._reconcile_registry_from_runs()
 
@@ -1136,6 +1162,119 @@ class RunStore:
             shutil.rmtree(temp_dir, ignore_errors=True)
             raise
 
+    def _archive_terminal_run(self, record: RunRecord) -> None:
+        """Move one non-current terminal run out of the boot hot path."""
+
+        registry = self._read_registry()
+        entry = registry.get(record.agent_id)
+        current = entry.get("current") if isinstance(entry, dict) else None
+        if isinstance(current, dict) and current.get("run_id") == record.run_id:
+            self.archive_current(record.run_id, outcome=record.outcome)
+            return
+        archived_entry = self._find_archived_run_entry(record.run_id)
+        if (
+            archived_entry is not None
+            and archived_entry[0].created_at == record.created_at
+        ):
+            # A prior boot published the archive marker before cleanup. The
+            # marker is the durable commit point; finish only the redundant
+            # hot-store removal and keep the archived transcript untouched.
+            shutil.rmtree(self.run_dir(record.run_id))
+            return
+        session_dir = self._next_archive_session_dir(record.agent_id)
+        ended_at = record.updated_at
+        history = [
+            dict(item)
+            for item in (entry.get("history") if isinstance(entry, dict) else []) or []
+            if isinstance(item, dict) and item.get("run_id") != record.run_id
+        ]
+        archive_worker = self._registry_current(record)
+        archive_worker["ended_at"] = ended_at
+        if record.outcome is not None:
+            archive_worker["outcome"] = record.outcome
+        _atomic_write_json(session_dir / "run.json", record.to_dict())
+        _atomic_write_json(
+            session_dir / "meta.json",
+            {
+                "outcome": record.outcome,
+                "ended_at": ended_at,
+                "worker": archive_worker,
+                "history": history,
+                "source": "headless-supervisor",
+            },
+        )
+        self._copy_archive_file(
+            self.raw_events_path(record.run_id),
+            session_dir / f"{record.provider.legacy_kind}-{record.agent_id}.log",
+        )
+        self._copy_archive_file(
+            self.raw_events_path(record.run_id), session_dir / "raw.jsonl"
+        )
+        self._copy_archive_file(
+            self.normalized_events_path(record.run_id), session_dir / "events.jsonl"
+        )
+        self._copy_archive_file(
+            self.current_turn_diff_path(record.run_id),
+            session_dir / "current-turn-diff.json",
+        )
+        self._copy_archive_file(
+            self.provider_log_path(record.run_id), session_dir / "provider.log"
+        )
+        if record.initial_prompt:
+            prompt_path = session_dir / f"{record.provider.legacy_kind}-{record.agent_id}-prompt.md"
+            prompt_path.write_text(record.initial_prompt, encoding="utf-8")
+            prompt_path.chmod(0o600)
+        artifact_dir = self.run_dir(record.run_id) / "artifacts"
+        if artifact_dir.is_symlink():
+            raise StoreError(f"refusing symlink artifact directory: {artifact_dir}")
+        if artifact_dir.is_dir():
+            shutil.copytree(artifact_dir, session_dir / "artifacts", symlinks=True)
+        _atomic_write_json(
+            session_dir / "archive-complete.json",
+            {"run_id": record.run_id, "completed_at": ended_at},
+        )
+        knowledge.enqueue_refresh(runtime_dir=self.paths.runtime_dir)
+        if isinstance(entry, dict):
+            row = dict(archive_worker)
+            row.update(
+                {
+                    "outcome": record.outcome,
+                    "ended_at": ended_at,
+                    "replaced_by_run_id": record.replaced_by_run_id,
+                }
+            )
+            history.append(row)
+            registry[record.agent_id] = {
+                "history": history,
+                "current": current,
+            }
+            self._write_registry(registry)
+            self.command_log.replace_projection(
+                record.agent_id,
+                {record.agent_id: registry[record.agent_id]},
+            )
+        shutil.rmtree(self.run_dir(record.run_id))
+        if self.run_dir(record.run_id).exists():
+            raise StoreConflict("pruned terminal run remains in the hot store")
+
+    def _prune_terminal_runs(self) -> None:
+        """Archive terminal runs older than the configured hot-store window."""
+
+        cutoff = _run_retention_cutoff()
+        for snapshot in self.list_runs():
+            if snapshot.state not in TERMINAL_STATES or not _run_is_older_than(
+                snapshot.updated_at, cutoff
+            ):
+                continue
+            try:
+                record = self.get(snapshot.run_id)
+                if record.state not in TERMINAL_STATES:
+                    continue
+                self._archive_terminal_run(record)
+            except (OSError, StoreError, TypeError, ValueError):
+                # Keep a terminal run intact if archive preparation fails.
+                continue
+
     def _reconcile_existing_runs(self) -> None:
         """Repair event counters after a crash between JSONL fsync and run.json.
 
@@ -1151,6 +1290,11 @@ class RunStore:
                 if not isinstance(value, dict):
                     continue
                 record = RunRecord.from_dict(value)
+                if (
+                    record.state in TERMINAL_STATES
+                    and _run_is_older_than(record.updated_at, _run_retention_cutoff())
+                ):
+                    continue
                 if record.start_request_id and record.start_transaction is None:
                     self.command_log.register_start_request(
                         record.start_request_id,

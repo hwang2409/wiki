@@ -2579,6 +2579,8 @@ Preserve the same identity, role, worktree, orchestrator grouping, PR gates, and
         if self._orphan_raw_events_normalized:
             return
         for record in self.store.list_runs():
+            if record.state in TERMINAL_STATES:
+                continue
             run_id = record.run_id
             # WIKI-243: stream both logs to detect orphans instead of
             # materializing full raw + normalized dict lists per run.
@@ -2814,6 +2816,8 @@ Preserve the same identity, role, worktree, orchestrator grouping, PR gates, and
                 self.store.command_log.update_steer_effect(
                     method, request_id, "acknowledged", missing
                 )
+                continue
+            if record.state in TERMINAL_STATES:
                 continue
             async with self._agent_lock(record.agent_id):
                 try:

@@ -2612,6 +2612,54 @@ class RunStoreTests(unittest.TestCase):
             )
             self.assertEqual(final_status["state"], "merge-ready")
 
+    def test_restart_prunes_old_terminal_run_without_losing_archive_reads(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            paths = _paths(root)
+            with mock.patch.dict(os.environ, {"WIKI_AGENT_RUN_RETENTION_DAYS": "1"}):
+                store = RunStore(paths)
+                record = store.create(_record(root))
+                store.append_raw(
+                    record.run_id,
+                    provider="codex",
+                    direction="provider",
+                    payload={"method": "item/completed", "params": {}},
+                )
+                record = store.transition(record.run_id, LifecycleState.COMPLETED)
+                record.updated_at = "2020-01-01T00:00:00+00:00"
+                _atomic_write_json(
+                    store.run_path(record.run_id), record.to_dict()
+                )  # noqa: SLF001 - retention fixture
+
+                restarted = RunStore(paths)
+
+            self.assertFalse(restarted.run_dir(record.run_id).exists())
+            archived = restarted.find_archived_run(record.run_id)
+            self.assertIsNotNone(archived)
+            sessions = list((paths.archive_dir / record.agent_id).glob("*/events.jsonl"))
+            self.assertEqual(len(sessions), 1)
+            self.assertEqual(restarted.list_runs(), [])
+
+    def test_restart_prunes_old_replaced_run_and_keeps_current_projection(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            paths = _paths(root)
+            with mock.patch.dict(os.environ, {"WIKI_AGENT_RUN_RETENTION_DAYS": "1"}):
+                store = RunStore(paths)
+                old = store.create(_record(root, agent_id="WIKI-REPLACED"))
+                store.transition(old.run_id, LifecycleState.COMPLETED)
+                replacement = _record(root, agent_id="WIKI-REPLACED")
+                _, current = store.replace(old.run_id, replacement)
+                old_record = store.get(old.run_id)
+                old_record.updated_at = "2020-01-01T00:00:00+00:00"
+                _atomic_write_json(store.run_path(old.run_id), old_record.to_dict())
+
+                restarted = RunStore(paths)
+
+            self.assertFalse(restarted.run_dir(old.run_id).exists())
+            self.assertEqual(restarted.current_run_id("WIKI-REPLACED"), current.run_id)
+            self.assertIsNotNone(restarted.find_archived_run(old.run_id))
+
     def test_archive_marker_wins_when_cleanup_fails_and_retry_removes_remnant(
         self,
     ) -> None:

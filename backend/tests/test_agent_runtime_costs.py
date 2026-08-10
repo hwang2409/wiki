@@ -59,7 +59,16 @@ class CostAggregatorTests(unittest.TestCase):
         self.env.stop()
         self.tmp.cleanup()
 
-    def _run(self, run_id: str, *, model: str = "gpt-5.4", agent_id: str = "WIKI-178", orch: str = "wiki", provider: str = "codex") -> Path:
+    def _run(
+        self,
+        run_id: str,
+        *,
+        model: str = "gpt-5.4",
+        agent_id: str = "WIKI-178",
+        orch: str = "wiki",
+        provider: str = "codex",
+        state: str | None = None,
+    ) -> Path:
         run = self.runs / run_id
         run.mkdir()
         (run / "run.json").write_text(
@@ -72,6 +81,7 @@ class CostAggregatorTests(unittest.TestCase):
                     "orchestrator_id": orch,
                     "initial_prompt": "x" * 8000,
                     "created_at": "2026-07-30T12:00:00Z",
+                    **({"state": state} if state is not None else {}),
                 }
             ),
             encoding="utf-8",
@@ -293,6 +303,44 @@ class CostAggregatorTests(unittest.TestCase):
         self.assertEqual(save_state.call_count, 0)
         self.assertEqual(save_heartbeat.call_count, 1)
         self.assertEqual(refreshed["runs"]["run-cache"]["offset"], raw.stat().st_size)
+
+    def test_terminal_runs_are_skipped_by_cost_sweep(self) -> None:
+        raw = self._run("run-terminal", state="completed")
+        raw.write_text(
+            json.dumps(_envelope("2026-07-30T10:00:00Z", _usage(10, 2))) + "\n",
+            encoding="utf-8",
+        )
+        with mock.patch.object(costs, "_scan_run", wraps=costs._scan_run) as scan_run:
+            result = costs.refresh()
+
+        scan_run.assert_not_called()
+        self.assertEqual(result["runs"], {})
+        self.assertEqual(result["records"], {})
+
+    def test_per_run_checkpoint_round_trips_incremental_state(self) -> None:
+        raw = self._run("run-checkpoint")
+        raw.write_text(
+            json.dumps(_envelope("2026-07-30T10:00:00Z", _usage(10, 2))) + "\n",
+            encoding="utf-8",
+        )
+        first = costs.refresh()
+        checkpoint = costs.cost_run_checkpoints_dir() / "run-checkpoint.json"
+        self.assertTrue(checkpoint.is_file())
+        persisted = json.loads(costs.cost_state_path().read_text(encoding="utf-8"))
+        self.assertEqual(persisted["runs"], {})
+
+        reloaded = costs._load_state()
+        second = costs.refresh(reloaded)
+        self.assertEqual(second["runs"], first["runs"])
+        self.assertEqual(second["records"], first["records"])
+
+        with raw.open("a", encoding="utf-8") as handle:
+            handle.write(
+                json.dumps(_envelope("2026-07-30T10:01:00Z", _usage(20, 4))) + "\n"
+            )
+        third = costs.refresh(costs._load_state())
+        self.assertEqual(sum(item["input"] for item in third["records"].values()), 20)
+        self.assertEqual(third["runs"]["run-checkpoint"]["offset"], raw.stat().st_size)
 
     def test_background_refresh_loads_state_once_across_ticks(self) -> None:
         costs.invalidate_background_state()

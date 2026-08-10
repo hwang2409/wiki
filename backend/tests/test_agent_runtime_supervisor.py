@@ -380,6 +380,32 @@ class SupervisorTests(unittest.IsolatedAsyncioTestCase):
         await self.supervisor.close()
         self.tmp.cleanup()
 
+    async def test_orphan_sweep_skips_terminal_runs(self) -> None:
+        record = self.store.create(
+            RunRecord.new(
+                agent_id="WIKI-TERMINAL",
+                provider=ProviderKind.CODEX,
+                role="implement",
+                model="fixture-codex",
+                worktree=str(self.worktree),
+                prompt="terminal sweep fixture",
+            )
+        )
+        self.store.transition(record.run_id, LifecycleState.COMPLETED)
+        with (
+            mock.patch.object(
+                self.store,
+                "iter_raw_events",
+                side_effect=AssertionError("terminal raw log was scanned"),
+            ),
+            mock.patch.object(
+                self.store,
+                "iter_normalized_events",
+                side_effect=AssertionError("terminal normalized log was scanned"),
+            ),
+        ):
+            await self.supervisor._normalize_orphan_raw_events()  # noqa: SLF001
+
     async def _spawn_orphan_process(self, *, ignore_sigterm: bool = False) -> int:
         child_code = (
             "import os, signal, sys, time\n"

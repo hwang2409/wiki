@@ -9,10 +9,11 @@ import os
 import stat
 import tempfile
 import threading
-from collections.abc import Iterator
+from collections.abc import Callable, Iterator
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Callable
+from typing import Any
+from urllib.parse import quote
 
 from ..pathwalk import open_relative_directory, open_relative_file
 from .ticket import base_ticket
@@ -61,6 +62,9 @@ class _CostState(dict[str, Any]):
     """In-memory state with a save-pending marker outside the JSON payload."""
 
     dirty: bool
+    dirty_run_ids: set[str]
+    deleted_run_ids: set[str]
+    checkpoint_generation: int
 
 
 def runtime_runs_dir() -> Path:
@@ -89,6 +93,9 @@ def _empty_state() -> _CostState:
         }
     )
     state.dirty = False
+    state.dirty_run_ids = set()
+    state.deleted_run_ids = set()
+    state.checkpoint_generation = 0
     return state
 
 
@@ -118,7 +125,56 @@ def _load_state() -> dict[str, Any]:
         value["updated_at"] = heartbeat["updated_at"]
     state = _CostState(value)
     state.dirty = False
+    state.dirty_run_ids = set()
+    state.deleted_run_ids = set()
+    state.checkpoint_generation = _number(value.get("checkpoint_generation"))
+    raw_deleted_run_ids = value.get("deleted_run_ids")
+    deleted_run_ids = {
+        run_id
+        for run_id in (raw_deleted_run_ids if isinstance(raw_deleted_run_ids, list) else [])
+        if isinstance(run_id, str)
+    }
+    for checkpoint in cost_run_checkpoints_dir().glob("*.json"):
+        try:
+            checkpoint_value = json.loads(checkpoint.read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            continue
+        run_id = checkpoint_value.get("run_id") if isinstance(checkpoint_value, dict) else None
+        run_state = checkpoint_value.get("state") if isinstance(checkpoint_value, dict) else None
+        generation = (
+            _number(checkpoint_value.get("generation"))
+            if isinstance(checkpoint_value, dict)
+            else 0
+        )
+        if (
+            isinstance(run_id, str)
+            and run_id not in deleted_run_ids
+            and isinstance(run_state, dict)
+            and (generation == 0 or generation <= state.checkpoint_generation)
+        ):
+            value["runs"][run_id] = run_state
     return state
+
+
+def cost_run_checkpoints_dir() -> Path:
+    path = cost_state_path()
+    return path.parent / f"{path.name}.runs"
+
+
+def _run_checkpoint_path(run_id: str) -> Path:
+    return cost_run_checkpoints_dir() / f"{quote(run_id, safe='')}.json"
+
+
+def _state_with_bounded_runs(state: dict[str, Any]) -> dict[str, Any]:
+    """Keep the aggregate checkpoint small; run cursors live in per-run files."""
+
+    payload = dict(state)
+    payload.pop("dirty", None)
+    payload.pop("dirty_run_ids", None)
+    payload.pop("deleted_run_ids", None)
+    payload["runs"] = {}
+    payload["run_checkpoint_version"] = 1
+    return payload
 
 
 def _save_json(path: Path, value: dict[str, Any]) -> bool:
@@ -148,7 +204,42 @@ def _save_json(path: Path, value: dict[str, Any]) -> bool:
 
 
 def _save_state(state: dict[str, Any]) -> bool:
-    return _save_json(cost_state_path(), state)
+    dirty_run_ids = getattr(state, "dirty_run_ids", set())
+    deleted_run_ids = getattr(state, "deleted_run_ids", set())
+    generation = getattr(state, "checkpoint_generation", 0) + 1
+    try:
+        checkpoint_dir = cost_run_checkpoints_dir()
+        checkpoint_dir.mkdir(parents=True, exist_ok=True)
+        for run_id in sorted(dirty_run_ids):
+            checkpoint = _run_checkpoint_path(run_id)
+            if not _save_json(
+                checkpoint,
+                {
+                    "generation": generation,
+                    "run_id": run_id,
+                    "state": state["runs"].get(run_id, {}),
+                },
+            ):
+                return False
+    except OSError:
+        return False
+    payload = _state_with_bounded_runs(state)
+    payload["checkpoint_generation"] = generation
+    payload["deleted_run_ids"] = sorted(deleted_run_ids)
+    saved = _save_json(cost_state_path(), payload)
+    if saved:
+        for run_id in sorted(deleted_run_ids):
+            try:
+                _run_checkpoint_path(run_id).unlink(missing_ok=True)
+            except OSError:
+                pass
+        if hasattr(state, "dirty_run_ids"):
+            state.dirty_run_ids.clear()
+        if hasattr(state, "deleted_run_ids"):
+            state.deleted_run_ids.clear()
+        if hasattr(state, "checkpoint_generation"):
+            state.checkpoint_generation = generation
+    return saved
 
 
 def _save_heartbeat(state: dict[str, Any]) -> bool:
@@ -404,6 +495,9 @@ def _discard_run(state: dict[str, Any], run_id: str) -> None:
     old_run = state["runs"].pop(run_id, None)
     if isinstance(old_run, dict):
         _remove_run_contributions(state, old_run)
+        deleted_run_ids = getattr(state, "deleted_run_ids", None)
+        if isinstance(deleted_run_ids, set):
+            deleted_run_ids.add(run_id)
     active_runs = state.get("active_runs")
     if isinstance(active_runs, list):
         state["active_runs"] = [item for item in active_runs if item != run_id]
@@ -458,6 +552,56 @@ def _run_signature(root_fd: int, run_id: str) -> dict[str, list[int] | None] | N
         if raw_fd is not None:
             os.close(raw_fd)
         os.close(run_fd)
+
+
+def _run_is_terminal(root_fd: int, run_id: str) -> bool:
+    """Read only run metadata before deciding whether to scan its JSONL."""
+
+    run_fd: int | None = None
+    metadata_fd: int | None = None
+    try:
+        run_fd = open_relative_directory(root_fd, (run_id,))
+    except OSError:
+        return False
+    try:
+        metadata_fd = open_relative_file(
+            run_fd,
+            ("run.json",),
+            extra_final_flags=getattr(os, "O_NONBLOCK", 0),
+        )
+    except OSError:
+        os.close(run_fd)
+        return False
+    try:
+        metadata = _read_json_fd(metadata_fd)
+    finally:
+        if metadata_fd is not None:
+            os.close(metadata_fd)
+        if run_fd is not None:
+            os.close(run_fd)
+    return metadata.get("state") in {"dead", "completed"} or bool(
+        metadata.get("ended_at")
+    )
+
+
+def _archived_run_ids() -> set[str]:
+    archive_root = Path(
+        os.environ.get("WIKI_AGENT_ARCHIVE_DIR")
+        or Path.home() / "me" / "fun" / "agent-archive"
+    ).expanduser()
+    run_ids: set[str] = set()
+    try:
+        markers = archive_root.glob("*/*/archive-complete.json")
+        for marker in markers:
+            try:
+                value = json.loads(marker.read_text(encoding="utf-8"))
+            except (OSError, ValueError):
+                continue
+            if isinstance(value, dict) and isinstance(value.get("run_id"), str):
+                run_ids.add(value["run_id"])
+    except OSError:
+        pass
+    return run_ids
 
 
 def _scan_run(state: dict[str, Any], run_id: str, root_fd: int) -> bool:
@@ -575,6 +719,9 @@ def _scan_run(state: dict[str, Any], run_id: str, root_fd: int) -> bool:
         }
     )
     _set_run_active(state, run_id, bool(run_state["active"]))
+    dirty_run_ids = getattr(state, "dirty_run_ids", None)
+    if isinstance(dirty_run_ids, set):
+        dirty_run_ids.add(run_id)
     os.close(raw_fd)
     return True
 
@@ -585,11 +732,17 @@ def refresh(state: dict[str, Any] | None = None) -> dict[str, Any]:
     elif not isinstance(state, _CostState):
         cached_state = _CostState(state)
         cached_state.dirty = False
+        cached_state.dirty_run_ids = set()
+        cached_state.deleted_run_ids = set()
+        cached_state.checkpoint_generation = _number(
+            state.get("checkpoint_generation")
+        )
         state = cached_state
     root_fd = _open_root()
     seen_runs: set[str] = set()
     runs_dir_signature: list[int] | None = None
     state_changed = False
+    archived_run_ids: set[str] = set()
     if root_fd is not None:
         try:
             runs_dir_signature = _stat_signature(os.fstat(root_fd))
@@ -611,6 +764,8 @@ def refresh(state: dict[str, Any] | None = None) -> dict[str, Any]:
                     ]
                 for run_id in run_ids:
                     seen_runs.add(run_id)
+                    if _run_is_terminal(root_fd, run_id):
+                        continue
                     _scan_run(state, run_id, root_fd)
                 state_changed = True
             else:
@@ -631,8 +786,16 @@ def refresh(state: dict[str, Any] | None = None) -> dict[str, Any]:
         root_changed = True
         state_changed = True
     if root_changed:
+        archived_run_ids = _archived_run_ids()
         for run_id in list(state["runs"]):
             if run_id not in seen_runs:
+                run_state = state["runs"].get(run_id)
+                if (
+                    isinstance(run_state, dict)
+                    and not run_state.get("active", True)
+                    and run_id in archived_run_ids
+                ):
+                    continue
                 _discard_run(state, run_id)
         state["active_runs"] = [
             run_id
