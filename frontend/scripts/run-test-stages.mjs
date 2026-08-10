@@ -95,30 +95,16 @@ const PLAYWRIGHT_SUITES = [
   "wiki-253-collapse",
 ];
 
-// Accepted-red baseline: union of the pre-existing red list enumerated in
-// PR #168 and the environment-dependent reds observed in full runs on this
-// machine. A failure here is XFAIL (recorded, does not gate); a failure
+// Accepted-red baseline: environment-dependent reds observed in full runs on
+// this machine. A failure here is XFAIL (recorded, does not gate); a failure
 // anywhere else fails the run.
 const ACCEPTED_FAILURES = new Set([
-  "dead-archive",
-  "replace-agent-modal",
   "wiki-85-artifacts",
   "wiki-89-artifact-callability",
   "wiki-92-artifact-panel",
-  "wiki-93-optimistic-send",
-  "wiki-108-sidebar-pages",
-  "wiki-109-palette-sessions",
   "wiki-116-render-feedback",
   "wiki-124-large-svg",
-  "wiki-143-tokens",
   "wiki-144-badges",
-  "wiki-148-slash-menu",
-  "wiki-154-agents-cold-start",
-  "wiki-154-workspace-readiness",
-  "wiki-157-utility-pages",
-  "wiki-194-plot-interaction",
-  "wiki-195-inspector",
-  "wiki-218-terminal-chrome",
   "injected-accepted-failure",
 ]);
 
