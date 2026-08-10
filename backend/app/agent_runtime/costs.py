@@ -176,6 +176,10 @@ def _load_state() -> dict[str, Any]:
             if isinstance(checkpoint_value, dict)
             else 0
         )
+        pending_replay = (
+            isinstance(checkpoint_value, dict)
+            and checkpoint_value.get("pending_replay") is True
+        )
         if (
             isinstance(run_id, str)
             and run_id not in deleted_run_ids
@@ -183,7 +187,7 @@ def _load_state() -> dict[str, Any]:
             and (generation == 0 or generation <= state.checkpoint_generation)
         ):
             value["runs"][run_id] = run_state
-            if generation < state.checkpoint_generation:
+            if generation < state.checkpoint_generation or pending_replay:
                 state.checkpoint_recovery_run_ids.add(run_id)
     return state
 
@@ -257,6 +261,7 @@ def _save_json(path: Path, value: dict[str, Any]) -> bool:
 
 def _save_state(state: dict[str, Any]) -> bool:
     deleted_run_ids = getattr(state, "deleted_run_ids", set())
+    pending_run_ids = getattr(state, "checkpoint_recovery_run_ids", set())
     generation = getattr(state, "checkpoint_generation", 0) + 1
     payload = _state_with_bounded_runs(state)
     payload["checkpoint_generation"] = generation
@@ -278,11 +283,17 @@ def _save_state(state: dict[str, Any]) -> bool:
         )
         for run_id in checkpoint_run_ids:
             checkpoint = _run_checkpoint_path(run_id)
+            pending_replay = run_id in pending_run_ids
             if not _save_json(
                 checkpoint,
                 {
-                    "generation": generation,
+                    "generation": (
+                        state.checkpoint_generation
+                        if pending_replay
+                        else generation
+                    ),
                     "run_id": run_id,
+                    "pending_replay": pending_replay,
                     "state": state["runs"].get(run_id, {}),
                 },
             ):

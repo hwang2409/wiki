@@ -487,6 +487,76 @@ class CostAggregatorTests(unittest.TestCase):
         self.assertEqual(deleted["records"], {})
         self.assertEqual(deleted["runs"], {})
 
+    def test_pending_archived_recovery_survives_restart_and_deletion(self) -> None:
+        run_id = "run-pending-recovery"
+        raw = self._run(run_id)
+        raw.write_text(
+            json.dumps(_envelope("2026-07-30T10:00:00Z", _usage(10, 2))) + "\n",
+            encoding="utf-8",
+        )
+        first = costs.refresh()
+        with raw.open("a", encoding="utf-8") as handle:
+            handle.write(
+                json.dumps(_envelope("2026-07-30T10:01:00Z", _usage(30, 6)))
+                + "\n"
+            )
+
+        state = costs._load_state()
+        root_fd = costs._open_root()
+        self.assertIsNotNone(root_fd)
+        assert root_fd is not None
+        try:
+            self.assertTrue(costs._scan_run(state, run_id, root_fd))
+        finally:
+            os.close(root_fd)
+        self.assertEqual(
+            sum(record["input"] for record in state["records"].values()),
+            30,
+        )
+
+        aggregate = costs._state_with_bounded_runs(state)
+        aggregate["checkpoint_generation"] = first.checkpoint_generation + 1
+        aggregate["deleted_run_ids"] = []
+        self.assertTrue(costs._save_json(costs.cost_state_path(), aggregate))
+
+        archive_dir = self.archive / "WIKI-178" / "20260730-140000"
+        (raw.parent / "events.jsonl").write_text("", encoding="utf-8")
+        archive_dir.parent.mkdir(parents=True)
+        shutil.move(str(raw.parent), archive_dir)
+        commit_archive(archive_dir)
+        archived_raw = archive_dir / "raw.jsonl"
+
+        failed = costs._load_state()
+        self.assertIn(run_id, failed.checkpoint_recovery_run_ids)
+        with mock.patch.object(costs, "_open_archived_run_source", return_value=None):
+            costs.refresh(failed)
+
+        persisted = json.loads(costs.cost_state_path().read_text(encoding="utf-8"))
+        checkpoint = json.loads(
+            costs._run_checkpoint_path(run_id).read_text(encoding="utf-8")
+        )
+        self.assertLess(
+            checkpoint["generation"], persisted["checkpoint_generation"]
+        )
+
+        restarted = costs._load_state()
+        self.assertIn(run_id, restarted.checkpoint_recovery_run_ids)
+        recovered = costs.refresh(restarted)
+        self.assertEqual(
+            sum(record["input"] for record in recovered["records"].values()),
+            30,
+        )
+        self.assertEqual(
+            recovered["runs"][run_id]["offset"], archived_raw.stat().st_size
+        )
+
+        shutil.rmtree(self.archive)
+        (self.runs / ".root-change-after-replay").write_text("", encoding="utf-8")
+        restarted["runs_dir_signature"] = None
+        deleted = costs.refresh(restarted)
+        self.assertEqual(deleted["records"], {})
+        self.assertEqual(deleted["runs"], {})
+
     def test_recovery_resolves_archive_after_hot_source_moves_mid_pass(self) -> None:
         raw = self._run("run-source-race")
         raw.write_text(
