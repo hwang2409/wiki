@@ -296,10 +296,20 @@ def _manifest_is_verified(directory: Path, marker: dict[str, Any]) -> bool:
 
 
 def archive_is_committed(directory: Path) -> bool:
-    """Return true only for a marker with a complete verified manifest."""
+    """Return true only for a durable marker with a complete manifest."""
 
     directory = Path(directory)
-    if not directory.is_dir() or directory.is_symlink():
+    try:
+        usable = directory.is_dir() and not directory.is_symlink()
+    except OSError:
+        return False
+    if not usable:
+        return False
+    try:
+        # A marker rename is not committed until this read proves its parent
+        # directory can be flushed. Every consumer shares this durability gate.
+        _fsync_directory(directory)
+    except OSError:
         return False
     marker = _read_object(directory / ARCHIVE_COMPLETION_MARKER)
     if marker is None:

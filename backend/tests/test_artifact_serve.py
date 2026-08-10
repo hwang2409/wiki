@@ -10,6 +10,7 @@ from unittest import mock
 from fastapi import HTTPException
 
 from backend.app import main
+from backend.app.agent_runtime.archive_protocol import commit_archive
 
 
 RUN_ID = "00000000-0000-4000-8000-000000000085"
@@ -60,6 +61,14 @@ class ArtifactServeTests(unittest.TestCase):
         target.write_bytes(b"live-png")
         return target
 
+    def _commit_archive(self, session_dir: Path, run_id: str) -> None:
+        (session_dir / "run.json").write_text(
+            json.dumps({"run_id": run_id, "provider": "codex"}), encoding="utf-8"
+        )
+        (session_dir / "raw.jsonl").write_text("raw\n", encoding="utf-8")
+        (session_dir / "events.jsonl").write_text("events\n", encoding="utf-8")
+        commit_archive(session_dir, run_id=run_id, completed_at="2026-08-01T00:00:00Z")
+
     def test_live_artifact_is_served_with_headers(self) -> None:
         target = self._write_live("WIKI-85")
         response = main.get_agent_artifact("WIKI-85", ARTIFACT_ID)
@@ -75,6 +84,8 @@ class ArtifactServeTests(unittest.TestCase):
         (older / f"{ARTIFACT_ID}.png").write_bytes(b"old")
         target = newest / f"{ARTIFACT_ID}.webp"
         target.write_bytes(b"new")
+        self._commit_archive(older.parent, "old-archive")
+        self._commit_archive(newest.parent, "new-archive")
 
         response = main.get_agent_artifact("WIKI-85", ARTIFACT_ID)
         self.assertEqual(Path(response.path), target)

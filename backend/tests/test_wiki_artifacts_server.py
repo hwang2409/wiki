@@ -16,6 +16,7 @@ from unittest import mock
 from PIL import Image
 
 from backend.app import binary_artifacts, main, media_scrub, wiki_agent_tools, wiki_artifacts
+from backend.app.agent_runtime.archive_protocol import commit_archive
 from backend.app.agent_runtime import next_review as next_review_runtime
 from backend.app.agent_runtime.autopilot import AutopilotController, AutopilotStore
 from backend.app.agent_runtime.diversity_orchestration import collect_diversity_verdict
@@ -572,6 +573,18 @@ class WikiArtifactsTests(unittest.TestCase):
         )
         target.parent.mkdir(parents=True)
         target.write_bytes(live_target.read_bytes())
+        session_dir = target.parent.parent
+        (session_dir / "run.json").write_text(
+            json.dumps({"run_id": "WIKI-225-run", "provider": "codex"}),
+            encoding="utf-8",
+        )
+        (session_dir / "raw.jsonl").write_text("raw\n", encoding="utf-8")
+        (session_dir / "events.jsonl").write_text("events\n", encoding="utf-8")
+        commit_archive(
+            session_dir,
+            run_id="WIKI-225-run",
+            completed_at="2026-08-02T12:00:00Z",
+        )
         registry = self.root / "registry.json"
         registry.write_text("{}", encoding="utf-8")
         with (

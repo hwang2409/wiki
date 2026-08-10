@@ -25,6 +25,7 @@ from backend.app.agent_runtime.client import (
     SupervisorRemoteError,
     SupervisorUnavailable,
 )
+from backend.app.agent_runtime.archive_protocol import commit_archive
 from backend.app.agent_runtime.fake import FixtureAdapterFactory
 from backend.app.agent_runtime.protocol import UnixSupervisorServer
 from backend.app.agent_runtime.store import RunStore, RuntimePaths
@@ -406,6 +407,39 @@ class HeadlessMainRouteTests(unittest.IsolatedAsyncioTestCase):
             registry = json.loads(self.registry.read_text(encoding="utf-8"))
             registry["WIKI-42"]["current"]["transcript"] = str(transcript)
             self.registry.write_text(json.dumps(registry), encoding="utf-8")
+
+    def _commit_archive_fixture(
+        self,
+        session_dir: Path,
+        *,
+        run_id: str,
+        kind: str,
+    ) -> None:
+        session_dir.mkdir(parents=True)
+        (session_dir / "run.json").write_text(
+            json.dumps(
+                {
+                    "run_id": run_id,
+                    "agent_id": "WIKI-42",
+                    "provider": "codex" if kind == "cdx" else "claude",
+                    "model": "gpt-5.4" if kind == "cdx" else "sonnet",
+                }
+            ),
+            encoding="utf-8",
+        )
+        (session_dir / "raw.jsonl").write_text("raw\n", encoding="utf-8")
+        (session_dir / "events.jsonl").write_text("events\n", encoding="utf-8")
+        (session_dir / "meta.json").write_text(
+            json.dumps({"worker": {"kind": kind}}), encoding="utf-8"
+        )
+        (session_dir / f"{kind}-fixture.log").write_text(
+            "fixture\n", encoding="utf-8"
+        )
+        commit_archive(
+            session_dir,
+            run_id=run_id,
+            completed_at="2026-08-01T00:00:00Z",
+        )
 
     def _seed_replacement_composer(
         self,
@@ -889,10 +923,11 @@ class HeadlessMainRouteTests(unittest.IsolatedAsyncioTestCase):
         archive_dir = self.archive_dir / "WIKI-42"
         older = archive_dir / "20260601-100000"
         newer = archive_dir / "20260731-100000"
-        older.mkdir(parents=True)
-        newer.mkdir(parents=True)
-        (older / "cdx-old.log").write_text("old", encoding="utf-8")
-        (newer / "cc-new.log").write_text("new", encoding="utf-8")
+        self._commit_archive_fixture(older, run_id="old-run", kind="cdx")
+        self._commit_archive_fixture(newer, run_id="new-run", kind="cc")
+        partial = archive_dir / "20260801-100000"
+        partial.mkdir(parents=True)
+        (partial / "events.jsonl").write_text("partial\n", encoding="utf-8")
 
         newest = main._archive_hint("WIKI-42")
         self.assertEqual(newest[2], newer)
@@ -903,6 +938,10 @@ class HeadlessMainRouteTests(unittest.IsolatedAsyncioTestCase):
         older_at = min(entry["archived_at"] for entry in wiki_entries)
         selected = main._archive_hint("WIKI-42", archived_at=older_at)
         self.assertEqual(selected[2], older)
+        self.assertNotIn(
+            partial,
+            [session_dir for _archived_at, session_dir in main._archive_sessions(archive_dir)],
+        )
         # A stale archived_at returns nothing so the endpoint 404s instead
         # of silently loading the wrong session.
         missing = main._archive_hint("WIKI-42", archived_at="1999-01-01T00:00:00+00:00")
@@ -942,6 +981,12 @@ class HeadlessMainRouteTests(unittest.IsolatedAsyncioTestCase):
             )
             + "\n",
             encoding="utf-8",
+        )
+        (session_dir / "raw.jsonl").write_text("raw\n", encoding="utf-8")
+        commit_archive(
+            session_dir,
+            run_id=archived_run_id,
+            completed_at="2026-07-30T00:05:00+00:00",
         )
         archived_at = main._archive_hint("WIKI-42")[1]
 

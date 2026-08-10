@@ -14,6 +14,7 @@ from fastapi import HTTPException
 from starlette.requests import Request
 
 from backend.app import palette
+from backend.app.agent_runtime.archive_protocol import commit_archive
 
 
 def _agents_payload(**overrides):
@@ -89,6 +90,12 @@ def _write_events_jsonl(path: Path, entries: list[dict]) -> None:
         row = {"seq": seq, **entry}
         lines.append(json.dumps(row))
     path.write_text("\n".join(lines) + "\n", encoding="utf-8")
+    (path.parent / "raw.jsonl").write_text("", encoding="utf-8")
+    (path.parent / "run.json").write_text(
+        json.dumps({"run_id": path.parent.name, "agent_id": path.parent.parent.name}),
+        encoding="utf-8",
+    )
+    commit_archive(path.parent)
 
 
 def _artifact_event(kind: str, artifact_id: str, title: str) -> dict:

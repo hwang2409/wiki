@@ -15,6 +15,7 @@ from pathlib import Path
 from unittest import mock
 
 from backend.app import knowledge, knowledge_runs, wiki_artifacts
+from backend.app.agent_runtime.archive_protocol import commit_archive
 from backend.app.agent_runtime.store import RunStore, RuntimePaths
 from backend.app.agent_runtime.types import (
     EventDisposition,
@@ -73,6 +74,8 @@ def _write_run(
         + "\n",
         encoding="utf-8",
     )
+    (run_dir / "raw.jsonl").write_text("", encoding="utf-8")
+    commit_archive(run_dir)
     return events_path
 
 
@@ -249,6 +252,8 @@ class KnowledgeIndexTests(unittest.TestCase):
             + "\n",
             encoding="utf-8",
         )
+        (run_dir / "raw.jsonl").write_text("", encoding="utf-8")
+        commit_archive(run_dir)
         self.index.rebuild()
         first = self._table_snapshot()
         first_counts = self.index.row_counts()

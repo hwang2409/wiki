@@ -68,6 +68,7 @@ class _CostState(dict[str, Any]):
     dirty_run_ids: set[str]
     deleted_run_ids: set[str]
     checkpoint_generation: int
+    checkpoint_recovery_run_ids: set[str]
 
 
 def _fsync_directory(path: Path) -> bool:
@@ -113,6 +114,7 @@ def _empty_state() -> _CostState:
     state.dirty_run_ids = set()
     state.deleted_run_ids = set()
     state.checkpoint_generation = 0
+    state.checkpoint_recovery_run_ids = set()
     return state
 
 
@@ -152,6 +154,7 @@ def _load_state() -> dict[str, Any]:
         if isinstance(run_id, str)
     }
     state.deleted_run_ids = deleted_run_ids
+    state.checkpoint_recovery_run_ids = set()
     for checkpoint in _checkpoint_paths():
         try:
             checkpoint_value = json.loads(checkpoint.read_text(encoding="utf-8"))
@@ -171,6 +174,11 @@ def _load_state() -> dict[str, Any]:
             and (generation == 0 or generation <= state.checkpoint_generation)
         ):
             value["runs"][run_id] = run_state
+            if (
+                generation < state.checkpoint_generation
+                and run_id in state["active_runs"]
+            ):
+                state.checkpoint_recovery_run_ids.add(run_id)
     return state
 
 
@@ -244,6 +252,14 @@ def _save_json(path: Path, value: dict[str, Any]) -> bool:
 def _save_state(state: dict[str, Any]) -> bool:
     deleted_run_ids = getattr(state, "deleted_run_ids", set())
     generation = getattr(state, "checkpoint_generation", 0) + 1
+    payload = _state_with_bounded_runs(state)
+    payload["checkpoint_generation"] = generation
+    payload["deleted_run_ids"] = sorted(deleted_run_ids)
+    # Publish the aggregate first. If a crash happens before checkpoints,
+    # loading accepts the older checkpoint and advances its cursor without
+    # adding those already-published totals again.
+    if not _save_json(cost_state_path(), payload):
+        return False
     try:
         checkpoint_dir = cost_run_checkpoints_dir()
         checkpoint_dir.mkdir(parents=True, exist_ok=True)
@@ -267,29 +283,24 @@ def _save_state(state: dict[str, Any]) -> bool:
                 return False
     except OSError:
         return False
-    payload = _state_with_bounded_runs(state)
-    payload["checkpoint_generation"] = generation
-    payload["deleted_run_ids"] = sorted(deleted_run_ids)
-    saved = _save_json(cost_state_path(), payload)
-    if saved:
-        deleted_checkpoints_removed = True
-        for run_id in sorted(deleted_run_ids):
-            try:
-                _run_checkpoint_path(run_id).unlink(missing_ok=True)
-            except OSError:
-                deleted_checkpoints_removed = False
-        if deleted_checkpoints_removed and deleted_run_ids:
-            deleted_checkpoints_removed = _fsync_directory(checkpoint_dir)
-        _remember_checkpoint_paths(
-            checkpoint_dir, checkpoint_run_ids, set(deleted_run_ids)
-        )
-        if hasattr(state, "dirty_run_ids"):
-            state.dirty_run_ids.clear()
-        if deleted_checkpoints_removed and hasattr(state, "deleted_run_ids"):
-            state.deleted_run_ids.clear()
-        if hasattr(state, "checkpoint_generation"):
-            state.checkpoint_generation = generation
-    return saved
+    deleted_checkpoints_removed = True
+    for run_id in sorted(deleted_run_ids):
+        try:
+            _run_checkpoint_path(run_id).unlink(missing_ok=True)
+        except OSError:
+            deleted_checkpoints_removed = False
+    if deleted_checkpoints_removed and deleted_run_ids:
+        deleted_checkpoints_removed = _fsync_directory(checkpoint_dir)
+    _remember_checkpoint_paths(
+        checkpoint_dir, checkpoint_run_ids, set(deleted_run_ids)
+    )
+    if hasattr(state, "dirty_run_ids"):
+        state.dirty_run_ids.clear()
+    if deleted_checkpoints_removed and hasattr(state, "deleted_run_ids"):
+        state.deleted_run_ids.clear()
+    if hasattr(state, "checkpoint_generation"):
+        state.checkpoint_generation = generation
+    return True
 
 
 def _save_heartbeat(state: dict[str, Any]) -> bool:
@@ -658,7 +669,9 @@ def _archived_run_ids() -> set[str]:
     return run_ids
 
 
-def _scan_run(state: dict[str, Any], run_id: str, root_fd: int) -> bool:
+def _scan_run(
+    state: dict[str, Any], run_id: str, root_fd: int, *, account: bool = True
+) -> bool:
     raw_fd: int | None = None
     metadata_signature: list[int] | None = None
     try:
@@ -725,7 +738,8 @@ def _scan_run(state: dict[str, Any], run_id: str, root_fd: int) -> bool:
         or raw_stat.st_ino != _number(run_state.get("inode"))
         or (offset and run_state.get("cursor_tail_fingerprint") != tail_fingerprint)
     ):
-        _remove_run_contributions(state, run_state)
+        if account:
+            _remove_run_contributions(state, run_state)
         run_state = {"offset": 0, "cumulative": None, "seen_message_ids": {}, "records": {}}
         state["runs"][run_id] = run_state
         offset = 0
@@ -749,7 +763,15 @@ def _scan_run(state: dict[str, Any], run_id: str, root_fd: int) -> bool:
             run_state["event_tokens"] = _number(run_state.get("event_tokens")) + sum(usage.values())
         day = _event_day(timestamp)
         if day is not None and any(usage.values()):
-            _add_contribution(state, run_state, _record_key(day, metadata, model), metadata, model, day, usage)
+            key = _record_key(day, metadata, model)
+            if account:
+                _add_contribution(state, run_state, key, metadata, model, day, usage)
+            else:
+                local = run_state.setdefault("records", {}).setdefault(
+                    key, {field: 0 for field in ACCOUNTING_FIELDS}
+                )
+                for field in ACCOUNTING_FIELDS:
+                    local[field] += int(usage[field])
     final_stat = os.fstat(raw_fd)
     run_state.update(
         {
@@ -788,6 +810,7 @@ def refresh(state: dict[str, Any] | None = None) -> dict[str, Any]:
         cached_state.dirty = False
         cached_state.dirty_run_ids = set()
         cached_state.deleted_run_ids = set()
+        cached_state.checkpoint_recovery_run_ids = set()
         cached_state.checkpoint_generation = _number(
             state.get("checkpoint_generation")
         )
@@ -801,6 +824,12 @@ def refresh(state: dict[str, Any] | None = None) -> dict[str, Any]:
         try:
             runs_dir_signature = _stat_signature(os.fstat(root_fd))
             root_changed = state.get("runs_dir_signature") != runs_dir_signature
+            recovery_run_ids = getattr(state, "checkpoint_recovery_run_ids", set())
+            for run_id in list(recovery_run_ids):
+                if run_id in state.get("runs", {}):
+                    _scan_run(state, run_id, root_fd, account=False)
+                    state_changed = True
+            recovery_run_ids.clear()
             if root_changed:
                 # os.scandir(fd) dups the fd internally and closes only its own
                 # dup — an explicit os.dup() here is owned by nobody and leaks

@@ -1589,7 +1589,11 @@ def _archive_sessions(ticket_dir: Path) -> list[tuple[datetime, Path]]:
     sessions = []
     for session_dir in ticket_dir.iterdir():
         match = ARCHIVE_TS_PATTERN.fullmatch(session_dir.name)
-        if not session_dir.is_dir() or not match:
+        if (
+            not session_dir.is_dir()
+            or not match
+            or not archive_is_committed(session_dir)
+        ):
             continue
         y, mo, d, h, mi, s = map(int, match.groups())
         sessions.append((datetime(y, mo, d, h, mi, s).astimezone(), session_dir))

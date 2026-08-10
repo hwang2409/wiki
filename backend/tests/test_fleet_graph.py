@@ -8,6 +8,7 @@ from tempfile import TemporaryDirectory
 from unittest import mock
 
 from backend.app import main
+from backend.app.agent_runtime.archive_protocol import commit_archive
 
 
 GRAPH = {
@@ -29,6 +30,15 @@ GRAPH = {
         {"kind": "archive", "from": "orch:wiki", "to": "N-2", "created_at": "2026-07-29T12:02:00Z"},
     ],
 }
+
+
+def _commit_archive_fixture(session: Path, run_id: str) -> None:
+    (session / "run.json").write_text(
+        f'{{"run_id":"{run_id}","provider":"codex"}}', encoding="utf-8"
+    )
+    (session / "raw.jsonl").write_text("raw\n", encoding="utf-8")
+    (session / "events.jsonl").write_text("events\n", encoding="utf-8")
+    commit_archive(session, run_id=run_id, completed_at="2026-08-01T00:00:00Z")
 
 
 class FleetGraphTests(unittest.TestCase):
@@ -97,6 +107,7 @@ class FleetGraphTests(unittest.TestCase):
                     (session / "final-status.json").write_text(
                         '{"state":"closed"}', encoding="utf-8"
                     )
+                    _commit_archive_fixture(session, f"{prefix.lower()}-{index}")
 
             loaded_paths: list[Path] = []
             original_read = main._read_json_object  # noqa: SLF001
@@ -144,6 +155,7 @@ class FleetGraphTests(unittest.TestCase):
                     (session / "final-status.json").write_text(
                         '{"state":"closed"}', encoding="utf-8"
                     )
+                    _commit_archive_fixture(session, f"{prefix.lower()}-{index}")
 
             with (
                 mock.patch.object(main, "AGENT_ARCHIVE_DIR", archive_root),

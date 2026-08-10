@@ -2846,7 +2846,12 @@ class RunStoreTests(unittest.TestCase):
             marker = next(
                 paths.archive_dir.glob(f"*/*/{ARCHIVE_COMPLETION_MARKER}")
             )
-            self.assertTrue(archive_is_committed(marker.parent))
+            # The marker is visible, but this read cannot prove its rename was
+            # durable while the directory fsync failure is still injected.
+            with mock.patch.object(
+                store_module, "_fsync_directory", side_effect=fsync_directory
+            ):
+                self.assertFalse(archive_is_committed(marker.parent))
 
             restarted = RunStore(paths)
             self.assertTrue(restarted.run_dir(record.run_id).is_dir())
