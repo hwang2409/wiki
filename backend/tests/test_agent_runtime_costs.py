@@ -11,6 +11,7 @@ from pathlib import Path
 from unittest import mock
 
 from backend.app.agent_runtime import costs
+from backend.app.agent_runtime.archive_protocol import commit_archive
 
 
 FIXTURE_ROOT = Path(__file__).parent / "fixtures" / "agent_runtime"
@@ -43,6 +44,7 @@ class CostAggregatorTests(unittest.TestCase):
         root = Path(self.tmp.name)
         self.runs = root / "runs"
         self.state = root / "cost.json"
+        self.archive = root / "archive"
         self.runs.mkdir()
         self.env = mock.patch.dict(
             os.environ,
@@ -50,6 +52,7 @@ class CostAggregatorTests(unittest.TestCase):
                 "WIKI_AGENT_RUNS_DIR": str(self.runs),
                 "WIKI_COST_STATE_PATH": str(self.state),
                 "WIKI_COST_REFRESH_MAX_AGE_SECONDS": "0",
+                "WIKI_AGENT_ARCHIVE_DIR": str(self.archive),
             },
         )
         self.env.start()
@@ -456,6 +459,13 @@ class CostAggregatorTests(unittest.TestCase):
         self.assertTrue(os.WIFEXITED(status))
         self.assertEqual(os.WEXITSTATUS(status), 73)
 
+        archive_dir = self.archive / "WIKI-178" / "20260730-120000"
+        (raw.parent / "events.jsonl").write_text("", encoding="utf-8")
+        archive_dir.parent.mkdir(parents=True)
+        shutil.move(str(raw.parent), archive_dir)
+        commit_archive(archive_dir)
+        archived_raw = archive_dir / "raw.jsonl"
+
         reloaded = costs._load_state()
         with mock.patch.object(costs, "_scan_run", wraps=costs._scan_run) as scan_run:
             recovered = costs.refresh(reloaded)
@@ -463,11 +473,12 @@ class CostAggregatorTests(unittest.TestCase):
             sum(record["input"] for record in recovered["records"].values()), 30
         )
         self.assertEqual(
-            recovered["runs"]["run-terminal-recovery"]["offset"], raw.stat().st_size
+            recovered["runs"]["run-terminal-recovery"]["offset"],
+            old_offset,
         )
         scanned_run_ids = [call.args[1] for call in scan_run.call_args_list]
         self.assertEqual(scanned_run_ids, ["run-terminal-recovery"])
-        self.assertNotEqual(old_offset, raw.stat().st_size)
+        self.assertNotEqual(old_offset, archived_raw.stat().st_size)
 
     def test_save_checkpoints_unchanged_runs_with_cursors(self) -> None:
         first_raw = self._run("run-first")

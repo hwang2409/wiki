@@ -667,32 +667,49 @@ def _archived_run_ids() -> set[str]:
 
 
 def _scan_run(
-    state: dict[str, Any], run_id: str, root_fd: int, *, account: bool = True
+    state: dict[str, Any],
+    run_id: str,
+    root_fd: int,
+    *,
+    account: bool = True,
+    archived_run_ids: set[str] | None = None,
 ) -> bool:
     raw_fd: int | None = None
     metadata_signature: list[int] | None = None
+
+    archive_checked = archived_run_ids is not None
+    run_is_archived = run_id in archived_run_ids if archived_run_ids else False
+
+    def discard_if_unarchived() -> None:
+        nonlocal archive_checked, run_is_archived
+        if not archive_checked:
+            run_is_archived = run_id in _archived_run_ids()
+            archive_checked = True
+        if not run_is_archived:
+            _discard_run(state, run_id)
+
     try:
         run_fd = open_relative_directory(root_fd, (run_id,))
     except OSError:
-        _discard_run(state, run_id)
+        discard_if_unarchived()
         return True
     try:
         if not stat.S_ISDIR(os.fstat(run_fd).st_mode):
-            _discard_run(state, run_id)
+            discard_if_unarchived()
             return True
         try:
             raw_fd = open_relative_file(run_fd, ("raw.jsonl",), extra_final_flags=getattr(os, "O_NONBLOCK", 0))
         except FileNotFoundError:
-            _discard_run(state, run_id)
+            discard_if_unarchived()
             return False
         except OSError:
-            _discard_run(state, run_id)
+            discard_if_unarchived()
             return True
         raw_stat = os.fstat(raw_fd)
         if not stat.S_ISREG(raw_stat.st_mode):
             os.close(raw_fd)
             raw_fd = None
-            _discard_run(state, run_id)
+            discard_if_unarchived()
             return True
         try:
             metadata_fd = open_relative_file(run_fd, ("run.json",), extra_final_flags=getattr(os, "O_NONBLOCK", 0))
@@ -701,7 +718,7 @@ def _scan_run(
         except OSError:
             os.close(raw_fd)
             raw_fd = None
-            _discard_run(state, run_id)
+            discard_if_unarchived()
             return True
         else:
             try:
@@ -709,7 +726,7 @@ def _scan_run(
                 if not stat.S_ISREG(metadata_stat.st_mode):
                     os.close(raw_fd)
                     raw_fd = None
-                    _discard_run(state, run_id)
+                    discard_if_unarchived()
                     return True
                 metadata_signature = _stat_signature(metadata_stat)
                 metadata = _read_json_fd(metadata_fd)
@@ -718,7 +735,7 @@ def _scan_run(
     except OSError:
         if raw_fd is not None:
             os.close(raw_fd)
-        _discard_run(state, run_id)
+        discard_if_unarchived()
         return True
     finally:
         os.close(run_fd)
@@ -816,15 +833,23 @@ def refresh(state: dict[str, Any] | None = None) -> dict[str, Any]:
     seen_runs: set[str] = set()
     runs_dir_signature: list[int] | None = None
     state_changed = False
-    archived_run_ids: set[str] = set()
+    archived_run_ids: set[str] | None = None
     if root_fd is not None:
         try:
             runs_dir_signature = _stat_signature(os.fstat(root_fd))
             root_changed = state.get("runs_dir_signature") != runs_dir_signature
             recovery_run_ids = getattr(state, "checkpoint_recovery_run_ids", set())
+            if root_changed or recovery_run_ids:
+                archived_run_ids = _archived_run_ids()
             for run_id in list(recovery_run_ids):
                 if run_id in state.get("runs", {}):
-                    _scan_run(state, run_id, root_fd, account=False)
+                    _scan_run(
+                        state,
+                        run_id,
+                        root_fd,
+                        account=False,
+                        archived_run_ids=archived_run_ids,
+                    )
                     state_changed = True
             recovery_run_ids.clear()
             if root_changed:
@@ -846,7 +871,12 @@ def refresh(state: dict[str, Any] | None = None) -> dict[str, Any]:
                     seen_runs.add(run_id)
                     if _run_is_terminal(root_fd, run_id):
                         continue
-                    _scan_run(state, run_id, root_fd)
+                    _scan_run(
+                        state,
+                        run_id,
+                        root_fd,
+                        archived_run_ids=archived_run_ids,
+                    )
                 state_changed = True
             else:
                 # A run directory's mtime does not change when raw.jsonl grows.
@@ -858,7 +888,12 @@ def refresh(state: dict[str, Any] | None = None) -> dict[str, Any]:
                     if not isinstance(run_state, dict) or not run_state.get("active", True):
                         continue
                     if _run_signature(root_fd, run_id) != run_state.get("scan_signature"):
-                        _scan_run(state, run_id, root_fd)
+                        _scan_run(
+                            state,
+                            run_id,
+                            root_fd,
+                            archived_run_ids=archived_run_ids,
+                        )
                         state_changed = True
         finally:
             os.close(root_fd)
@@ -866,13 +901,13 @@ def refresh(state: dict[str, Any] | None = None) -> dict[str, Any]:
         root_changed = True
         state_changed = True
     if root_changed:
-        archived_run_ids = _archived_run_ids()
+        if archived_run_ids is None:
+            archived_run_ids = _archived_run_ids()
         for run_id in list(state["runs"]):
             if run_id not in seen_runs:
                 run_state = state["runs"].get(run_id)
                 if (
                     isinstance(run_state, dict)
-                    and not run_state.get("active", True)
                     and run_id in archived_run_ids
                 ):
                     continue
