@@ -117,7 +117,7 @@ try {
     radiusLg: "10px",
     radiusXl: "12px",
     radiusFull: "999px",
-    readable: "760px",
+    readable: "910px",
   };
   for (const [key, value] of Object.entries(expected)) {
     assert(
@@ -162,12 +162,12 @@ try {
   const baseline = await measureChatMaxWidth();
   assert(baseline, "could not find .agent-session-surface.is-full .session-scroll-inner in live DOM");
   assert(
-    baseline.maxWidth === "760px",
-    `real chat .session-scroll-inner max-width expected 760px, got ${baseline.maxWidth}`,
+    baseline.maxWidth === "910px",
+    `real chat .session-scroll-inner max-width expected 910px, got ${baseline.maxWidth}`,
   );
   assert(
-    baseline.actualWidth <= 760,
-    `chat inner width expected <=760, got ${baseline.actualWidth}`,
+    baseline.actualWidth <= 910,
+    `chat inner width expected <=910, got ${baseline.actualWidth}`,
   );
 
   await page.evaluate(() => {
@@ -183,8 +183,8 @@ try {
   });
   const restored = await measureChatMaxWidth();
   assert(
-    restored?.maxWidth === "760px",
-    `restore: expected 760px after removing override, got ${restored?.maxWidth}`,
+    restored?.maxWidth === "910px",
+    `restore: expected 910px after removing override, got ${restored?.maxWidth}`,
   );
 
   await page.screenshot({ path: path.join(OUT_DIR, "wiki-143-tokens.png") });

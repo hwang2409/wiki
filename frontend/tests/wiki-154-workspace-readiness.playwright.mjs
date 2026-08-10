@@ -331,7 +331,7 @@ async function runProductionNoticeRefreshScenario() {
   let eventEmitted = false;
   let agentRequests = 0;
 
-  await page.route("**/api/agents", async (route) => {
+  await page.route("**/api/agents**", async (route) => {
     agentRequests += 1;
     const accountNotices = eventEmitted
       ? []
@@ -395,7 +395,7 @@ async function runProductionNoticeRefreshScenario() {
   await page.getByText(/Sign in to Codex again/).waitFor();
   const requestsBeforeEvent = agentRequests;
   eventEmitted = true;
-  const refetch = page.waitForResponse("**/api/agents");
+  const refetch = page.waitForResponse("**/api/agents**");
   await page.evaluate(() =>
     window.__wikiEmitAgentEvent({
       type: "codex_auth_verified",

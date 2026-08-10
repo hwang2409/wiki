@@ -218,7 +218,8 @@ async function main() {
     await page.goto(`${backend.baseUrl}/#/agent/${WORKER}`, { waitUntil: "domcontentloaded" });
     await page.locator("[data-pane-key='pane-worker']").waitFor();
 
-    const deadPalette = await openSwitcher(page, "dead");
+    const deadPalette = await openSwitcher(page, "dead-session");
+    await deadPalette.locator(".quick-switcher-loading").waitFor({ state: "detached" });
     await deadPalette.getByText("No matches", { exact: true }).waitFor();
     await page.keyboard.press("Escape");
 

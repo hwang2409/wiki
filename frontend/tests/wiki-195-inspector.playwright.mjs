@@ -12,7 +12,7 @@ import {
 } from "../scripts/wiki32-harness.mjs";
 
 const ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..", "..");
-const PYTHON = path.join(ROOT, ".venv", "bin", "python");
+const PYTHON = process.env.WIKI_PYTHON || path.join(ROOT, ".venv", "bin", "python");
 const RUN_ID = "00000000-0000-4000-8000-000000000195";
 const TICKET = "WIKI-195";
 const SCREENSHOTS = Object.fromEntries(

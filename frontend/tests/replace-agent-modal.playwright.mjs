@@ -157,7 +157,7 @@ async function main() {
     // Provider/model/effort now live inside Advanced; open it to interact
     // with them (WIKI-154 finding 4 redesign).
     await dialog.getByRole("button", { name: /Advanced/ }).click();
-    await dialog.getByRole("button", { name: "Codex" }).waitFor();
+    await dialog.getByRole("button", { name: "Codex", exact: true }).waitFor();
     if ((await dialog.getByLabel("Model").inputValue()) !== "gpt-5.4") {
       throw new Error("Replace modal did not preserve the current model");
     }
@@ -184,7 +184,7 @@ async function main() {
     await page.getByRole("button", { name: "Replace" }).click();
     const sessionDialog = page.getByRole("dialog", { name: `Replace ${ORCH}` });
     await sessionDialog.getByRole("button", { name: /Advanced/ }).click();
-    await sessionDialog.getByRole("button", { name: "Codex" }).click();
+    await sessionDialog.getByRole("button", { name: "Codex", exact: true }).click();
     await sessionDialog.getByLabel("Reasoning effort").waitFor();
     await sessionDialog.getByLabel("Model").selectOption("gpt-5.4");
     await sessionDialog.getByLabel("Reasoning effort").selectOption("xhigh");
