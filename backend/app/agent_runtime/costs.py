@@ -134,6 +134,7 @@ def _load_state() -> dict[str, Any]:
         for run_id in (raw_deleted_run_ids if isinstance(raw_deleted_run_ids, list) else [])
         if isinstance(run_id, str)
     }
+    state.deleted_run_ids = deleted_run_ids
     for checkpoint in cost_run_checkpoints_dir().glob("*.json"):
         try:
             checkpoint_value = json.loads(checkpoint.read_text(encoding="utf-8"))
@@ -204,13 +205,19 @@ def _save_json(path: Path, value: dict[str, Any]) -> bool:
 
 
 def _save_state(state: dict[str, Any]) -> bool:
-    dirty_run_ids = getattr(state, "dirty_run_ids", set())
     deleted_run_ids = getattr(state, "deleted_run_ids", set())
     generation = getattr(state, "checkpoint_generation", 0) + 1
     try:
         checkpoint_dir = cost_run_checkpoints_dir()
         checkpoint_dir.mkdir(parents=True, exist_ok=True)
-        for run_id in sorted(dirty_run_ids):
+        checkpoint_run_ids = sorted(
+            run_id
+            for run_id, run_state in state.get("runs", {}).items()
+            if isinstance(run_id, str)
+            and isinstance(run_state, dict)
+            and isinstance(run_state.get("offset"), int)
+        )
+        for run_id in checkpoint_run_ids:
             checkpoint = _run_checkpoint_path(run_id)
             if not _save_json(
                 checkpoint,
@@ -228,14 +235,15 @@ def _save_state(state: dict[str, Any]) -> bool:
     payload["deleted_run_ids"] = sorted(deleted_run_ids)
     saved = _save_json(cost_state_path(), payload)
     if saved:
+        deleted_checkpoints_removed = True
         for run_id in sorted(deleted_run_ids):
             try:
                 _run_checkpoint_path(run_id).unlink(missing_ok=True)
             except OSError:
-                pass
+                deleted_checkpoints_removed = False
         if hasattr(state, "dirty_run_ids"):
             state.dirty_run_ids.clear()
-        if hasattr(state, "deleted_run_ids"):
+        if deleted_checkpoints_removed and hasattr(state, "deleted_run_ids"):
             state.deleted_run_ids.clear()
         if hasattr(state, "checkpoint_generation"):
             state.checkpoint_generation = generation

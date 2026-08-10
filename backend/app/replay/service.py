@@ -10,13 +10,18 @@ import json
 import os
 from typing import Any
 
+from ..pathwalk import open_relative_directory
 from . import errors as e
 from .classification import timeline_event_from
 from .cursor import decode_cursor, encode_cursor
 from .errors import ReplayError
-from .metadata import build_run_summary
+from .metadata import build_run_summary, build_run_summary_from_run_fd
 from .models import ScanStats, TimelinePage
-from .reader import SnapshotReader, _open_run_child_fd
+from .reader import (
+    SnapshotReader,
+    _open_run_child_fd,
+    _open_run_file_fd,
+)
 
 
 def _build_timeline_page(
@@ -152,8 +157,8 @@ def _warnings_from(*stats: ScanStats) -> list[str]:
     return warnings
 
 
-def build_timeline_response(
-    runs_root_fd: int,
+def _build_timeline_response_from_run_fd(
+    run_fd: int,
     run_id: str,
     *,
     cursor: str | None = None,
@@ -166,12 +171,12 @@ def build_timeline_response(
     ``snapshot_size`` also 400s in ``SnapshotReader.__init__``.
     """
 
-    summary = build_run_summary(runs_root_fd, run_id)
+    summary = build_run_summary_from_run_fd(run_fd, run_id)
     start_offset, start_skipping = decode_cursor(cursor, run_id=run_id)
     window_stats = ScanStats()
     bookmark_stats = ScanStats()
 
-    events_fd = _open_run_child_fd(runs_root_fd, run_id, "events.jsonl")
+    events_fd = _open_run_file_fd(run_fd, "events.jsonl")
     try:
         page = _build_timeline_page(
             events_fd,
@@ -186,7 +191,7 @@ def build_timeline_response(
     # Bookmarks only on the first page.
     bookmarks: list[dict[str, Any]]
     if start_offset == 0 and not start_skipping:
-        events_fd = _open_run_child_fd(runs_root_fd, run_id, "events.jsonl")
+        events_fd = _open_run_file_fd(run_fd, "events.jsonl")
         try:
             bookmarks = _build_bookmarks(
                 events_fd, cap=e.MAX_BOOKMARKS, stats=bookmark_stats
@@ -212,7 +217,37 @@ def build_timeline_response(
     }
 
 
-def load_raw_event(runs_root_fd: int, run_id: str, seq: int) -> dict[str, Any] | None:
+def build_timeline_response(
+    runs_root_fd: int,
+    run_id: str,
+    *,
+    cursor: str | None = None,
+    limit: int = e.DEFAULT_LIMIT,
+) -> dict[str, Any]:
+    run_fd = open_relative_directory(runs_root_fd, (run_id,))
+    try:
+        return _build_timeline_response_from_run_fd(
+            run_fd, run_id, cursor=cursor, limit=limit
+        )
+    finally:
+        os.close(run_fd)
+
+
+def build_timeline_response_from_run_fd(
+    run_fd: int,
+    run_id: str,
+    *,
+    cursor: str | None = None,
+    limit: int = e.DEFAULT_LIMIT,
+) -> dict[str, Any]:
+    return _build_timeline_response_from_run_fd(
+        run_fd, run_id, cursor=cursor, limit=limit
+    )
+
+
+def _load_raw_event_from_run_fd(
+    run_fd: int, run_id: str, seq: int
+) -> dict[str, Any] | None:
     """Return the raw.jsonl entry for ``seq`` — fd-based, byte-bounded, resumable."""
 
     if seq <= 0:
@@ -222,7 +257,7 @@ def load_raw_event(runs_root_fd: int, run_id: str, seq: int) -> dict[str, Any] |
     while True:
         stats = ScanStats()
         try:
-            raw_fd = _open_run_child_fd(runs_root_fd, run_id, "raw.jsonl")
+            raw_fd = _open_run_file_fd(run_fd, "raw.jsonl")
         except ReplayError:
             return None
         found: dict[str, Any] | None = None
@@ -268,3 +303,20 @@ def load_raw_event(runs_root_fd: int, run_id: str, seq: int) -> dict[str, Any] |
             return None
         start_offset = resume_offset
         start_skipping = resume_skipping
+
+
+def load_raw_event(runs_root_fd: int, run_id: str, seq: int) -> dict[str, Any] | None:
+    try:
+        run_fd = open_relative_directory(runs_root_fd, (run_id,))
+    except OSError:
+        return None
+    try:
+        return _load_raw_event_from_run_fd(run_fd, run_id, seq)
+    finally:
+        os.close(run_fd)
+
+
+def load_raw_event_from_run_fd(
+    run_fd: int, run_id: str, seq: int
+) -> dict[str, Any] | None:
+    return _load_raw_event_from_run_fd(run_fd, run_id, seq)

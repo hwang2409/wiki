@@ -40,6 +40,7 @@ from .metadata import (
     _read_bounded_metadata,
     _run_summary_from_meta,
     build_run_summary,
+    build_run_summary_from_run_fd,
     resolve_ticket_runs,
 )
 from .models import (
@@ -52,6 +53,8 @@ from .models import (
 from .reader import (
     SnapshotReader,
     _open_run_child_fd,
+    _open_run_file_fd,
+    open_run_dir_fd,
     open_runs_root_fd,
     verify_run_dir_exists,
 )
@@ -60,7 +63,9 @@ from .service import (
     _build_timeline_page,
     _warnings_from,
     build_timeline_response,
+    build_timeline_response_from_run_fd,
     load_raw_event,
+    load_raw_event_from_run_fd,
 )
 
 # Legacy alias — the round-3 code referred to ``_ScanStats``; the class was
@@ -86,10 +91,14 @@ __all__ = [
     "TimelineEvent",
     "TimelinePage",
     "build_run_summary",
+    "build_run_summary_from_run_fd",
     "build_timeline_response",
+    "build_timeline_response_from_run_fd",
     "decode_cursor",
     "encode_cursor",
     "load_raw_event",
+    "load_raw_event_from_run_fd",
+    "open_run_dir_fd",
     "open_runs_root_fd",
     "resolve_ticket_runs",
     "valid_run_id",

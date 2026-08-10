@@ -2612,6 +2612,47 @@ class RunStoreTests(unittest.TestCase):
             )
             self.assertEqual(final_status["state"], "merge-ready")
 
+    def test_archive_copy_is_synced_before_archive_marker_and_source_delete(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            store = RunStore(_paths(root))
+            record = store.create(_record(root))
+            store.append_raw(
+                record.run_id,
+                provider="codex",
+                direction="provider",
+                payload={"method": "item/completed"},
+            )
+            store.transition(record.run_id, LifecycleState.COMPLETED)
+            events: list[str] = []
+            real_atomic_write = store_module._atomic_write_json
+            real_fsync_file = store_module._fsync_file
+            real_rmtree = store_module.shutil.rmtree
+
+            def atomic_write(path: Path, value: object) -> None:
+                real_atomic_write(path, value)
+                if path.name == "archive-complete.json":
+                    events.append("marker")
+
+            def rmtree(path: str | os.PathLike[str], *args: object, **kwargs: object) -> None:
+                if Path(path) == store.run_dir(record.run_id):
+                    events.append("delete")
+                real_rmtree(path, *args, **kwargs)
+
+            def fsync_file(path: Path) -> None:
+                events.append("file")
+                real_fsync_file(path)
+
+            with (
+                mock.patch.object(store_module, "_atomic_write_json", side_effect=atomic_write),
+                mock.patch.object(store_module, "_fsync_file", side_effect=fsync_file),
+                mock.patch.object(store_module.shutil, "rmtree", side_effect=rmtree),
+            ):
+                store.archive_current(record.run_id)
+
+            self.assertLess(events.index("file"), events.index("marker"))
+            self.assertLess(events.index("marker"), events.index("delete"))
+
     def test_restart_prunes_old_terminal_run_without_losing_archive_reads(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)

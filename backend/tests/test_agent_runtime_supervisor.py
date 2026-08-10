@@ -29,6 +29,7 @@ from backend.app.agent_runtime.client import (
 )
 from backend.app.agent_runtime.command_log import AgentCommand, CommandRetryable
 from backend.app.agent_runtime import daemon as agent_daemon
+from backend.app.agent_runtime import store as store_module
 from backend.app.agent_runtime import supervisor as supervisor_module
 from backend.app.agent_runtime.claude import ClaudeStreamAdapter
 from backend.app.agent_runtime.codex import CodexAppServerAdapter
@@ -380,7 +381,7 @@ class SupervisorTests(unittest.IsolatedAsyncioTestCase):
         await self.supervisor.close()
         self.tmp.cleanup()
 
-    async def test_orphan_sweep_skips_terminal_runs(self) -> None:
+    async def test_terminal_run_with_pending_deferred_events_survives_prune(self) -> None:
         record = self.store.create(
             RunRecord.new(
                 agent_id="WIKI-TERMINAL",
@@ -391,20 +392,16 @@ class SupervisorTests(unittest.IsolatedAsyncioTestCase):
                 prompt="terminal sweep fixture",
             )
         )
-        self.store.transition(record.run_id, LifecycleState.COMPLETED)
-        with (
-            mock.patch.object(
-                self.store,
-                "iter_raw_events",
-                side_effect=AssertionError("terminal raw log was scanned"),
-            ),
-            mock.patch.object(
-                self.store,
-                "iter_normalized_events",
-                side_effect=AssertionError("terminal normalized log was scanned"),
-            ),
-        ):
-            await self.supervisor._normalize_orphan_raw_events()  # noqa: SLF001
+        record = self.store.transition(record.run_id, LifecycleState.COMPLETED)
+        record.updated_at = "2020-01-01T00:00:00+00:00"
+        store_module._atomic_write_json(  # noqa: SLF001
+            self.store.run_path(record.run_id), record.to_dict()
+        )
+        self.supervisor._deferred_provider_events[record.run_id] = [None]  # type: ignore[list-item]
+
+        self.store.prune_terminal_runs()
+
+        self.assertTrue(self.store.run_dir(record.run_id).exists())
 
     async def _spawn_orphan_process(self, *, ignore_sigterm: bool = False) -> int:
         child_code = (

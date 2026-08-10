@@ -433,6 +433,7 @@ class Supervisor:
         # and the sweep streams every run's full raw + normalized JSONL on
         # the event loop (multi-GB stores block it for minutes per tick).
         self._orphan_raw_events_normalized = False
+        self.store.set_terminal_run_prune_guard(self._terminal_run_can_prune)
         self.pipeline_failures: dict[str, str] = {}
         self.expected_stream_ends: set[int] = set()
         self.subscribers: set[asyncio.Queue[dict[str, Any]]] = set()
@@ -2531,6 +2532,17 @@ Preserve the same identity, role, worktree, orchestrator grouping, PR gates, and
         await self._publish_agent_change(record.agent_id)
         return record
 
+    def _terminal_run_can_prune(self, record: RunRecord) -> bool:
+        if self._deferred_provider_events.get(record.run_id):
+            return False
+        barrier = self._deferred_provider_event_barriers.get(record.run_id)
+        if barrier is not None and not barrier.done():
+            return False
+        return not any(
+            effect.get("run_id") == record.run_id
+            for effect in self.store.command_log.sending_steer_effects()
+        )
+
     async def recover_on_start(self) -> list[dict[str, str]]:
         async with self._run_mutation_admission():
             async with self.recovery_scan_lock:
@@ -2542,6 +2554,7 @@ Preserve the same identity, role, worktree, orchestrator grouping, PR gates, and
                 await self._normalize_orphan_raw_events()
                 results = await self._recover_once()
                 await self._reconcile_sending_steer_effects()
+                self.store.prune_terminal_runs()
                 await self.command_queue.recover_pending()
                 if self._reaper_due():
                     by_run_id = {
@@ -2579,8 +2592,6 @@ Preserve the same identity, role, worktree, orchestrator grouping, PR gates, and
         if self._orphan_raw_events_normalized:
             return
         for record in self.store.list_runs():
-            if record.state in TERMINAL_STATES:
-                continue
             run_id = record.run_id
             # WIKI-243: stream both logs to detect orphans instead of
             # materializing full raw + normalized dict lists per run.
@@ -2816,8 +2827,6 @@ Preserve the same identity, role, worktree, orchestrator grouping, PR gates, and
                 self.store.command_log.update_steer_effect(
                     method, request_id, "acknowledged", missing
                 )
-                continue
-            if record.state in TERMINAL_STATES:
                 continue
             async with self._agent_lock(record.agent_id):
                 try:

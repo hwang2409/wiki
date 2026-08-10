@@ -46,6 +46,31 @@ def _write_events(events_path: Path, entries: list[dict]) -> None:
     )
 
 
+def _write_archive_session(archive_root: Path, run_id: str = RUN_ID) -> Path:
+    session_dir = archive_root / "WIKI-174" / "20260730-000000"
+    session_dir.mkdir(parents=True)
+    (session_dir / "run.json").write_text(
+        json.dumps(_base_run_json(run_id=run_id)), encoding="utf-8"
+    )
+    _write_events(session_dir / "events.jsonl", _fixture_events())
+    _write_events(
+        session_dir / "raw.jsonl",
+        [
+            {
+                "seq": i,
+                "direction": "stdout",
+                "payload": {"type": f"raw-{i}"},
+            }
+            for i in range(1, 5)
+        ],
+    )
+    (session_dir / "archive-complete.json").write_text(
+        json.dumps({"run_id": run_id, "completed_at": "2026-07-30T00:06:00Z"}),
+        encoding="utf-8",
+    )
+    return session_dir
+
+
 def _base_run_json(run_id: str = RUN_ID, agent_id: str = "WIKI-174") -> dict:
     return {
         "run_id": run_id,
@@ -824,6 +849,25 @@ def test_timeline_endpoint_happy_path(run_dir: Path, runs_root: Path) -> None:
     assert payload["run"]["run_id"] == RUN_ID
     assert len(payload["events"]) == 4
     assert payload["has_more"] is False
+
+
+def test_replay_endpoints_fall_back_to_exact_archive(
+    tmp_path: Path, runs_root: Path
+) -> None:
+    archive_root = tmp_path / "archive"
+    _write_archive_session(archive_root)
+    with (
+        mock.patch.object(main, "AGENT_RUNS_DIR", runs_root),
+        mock.patch.object(main, "AGENT_ARCHIVE_DIR", archive_root),
+    ):
+        listing = main.agent_replay_runs("WIKI-174")
+        timeline = main.agent_run_replay_timeline(RUN_ID)
+        event = main.agent_run_replay_event(RUN_ID, 2)
+
+    assert [item["run_id"] for item in listing["runs"]] == [RUN_ID]
+    assert timeline["run"]["run_id"] == RUN_ID
+    assert [item["seq"] for item in timeline["events"]] == [1, 2, 3, 4]
+    assert event["raw"]["payload"] == {"type": "raw-2"}
 
 
 def test_endpoint_paginates_over_file_crossing_64mib(

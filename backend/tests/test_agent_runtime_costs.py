@@ -342,6 +342,65 @@ class CostAggregatorTests(unittest.TestCase):
         self.assertEqual(sum(item["input"] for item in third["records"].values()), 20)
         self.assertEqual(third["runs"]["run-checkpoint"]["offset"], raw.stat().st_size)
 
+    def test_save_checkpoints_unchanged_runs_with_cursors(self) -> None:
+        first_raw = self._run("run-first")
+        second_raw = self._run("run-second")
+        payload = json.dumps(_envelope("2026-07-30T10:00:00Z", _usage(10, 2))) + "\n"
+        first_raw.write_text(payload, encoding="utf-8")
+        second_raw.write_text(payload, encoding="utf-8")
+        state = costs.refresh()
+        state.dirty_run_ids = {"run-first"}
+        costs._run_checkpoint_path("run-second").unlink()
+        costs._save_state(state)
+
+        self.assertTrue(costs._run_checkpoint_path("run-first").is_file())
+        self.assertTrue(costs._run_checkpoint_path("run-second").is_file())
+
+    def test_loaded_tombstones_survive_failed_checkpoint_unlink(self) -> None:
+        run_id = "run-deleted"
+        checkpoint_dir = costs.cost_run_checkpoints_dir()
+        checkpoint_dir.mkdir(parents=True)
+        costs.cost_state_path().write_text(
+            json.dumps(
+                {
+                    "version": costs.STATE_VERSION,
+                    "runs": {},
+                    "records": {},
+                    "active_runs": [],
+                    "updated_at": None,
+                    "checkpoint_generation": 1,
+                    "deleted_run_ids": [run_id],
+                }
+            ),
+            encoding="utf-8",
+        )
+        costs._run_checkpoint_path(run_id).write_text(
+            json.dumps(
+                {
+                    "generation": 1,
+                    "run_id": run_id,
+                    "state": {"offset": 10, "records": {}},
+                }
+            ),
+            encoding="utf-8",
+        )
+
+        state = costs._load_state()
+        self.assertEqual(state.deleted_run_ids, {run_id})
+        self.assertNotIn(run_id, state["runs"])
+        failed_checkpoint = mock.Mock()
+        failed_checkpoint.unlink.side_effect = OSError(
+            "checkpoint cleanup interrupted"
+        )
+        with mock.patch.object(
+            costs, "_run_checkpoint_path", return_value=failed_checkpoint
+        ):
+            self.assertTrue(costs._save_state(state))
+
+        reloaded = costs._load_state()
+        self.assertEqual(reloaded.deleted_run_ids, {run_id})
+        self.assertNotIn(run_id, reloaded["runs"])
+
     def test_background_refresh_loads_state_once_across_ticks(self) -> None:
         costs.invalidate_background_state()
         with mock.patch.object(costs, "_load_state", wraps=costs._load_state) as load_state:

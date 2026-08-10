@@ -908,6 +908,48 @@ class HeadlessMainRouteTests(unittest.IsolatedAsyncioTestCase):
         missing = main._archive_hint("WIKI-42", archived_at="1999-01-01T00:00:00+00:00")
         self.assertEqual(missing, (None, None, None))
 
+    async def test_session_archived_at_selects_replaced_archive_with_current_run(self) -> None:
+        self._seed_headless()
+        session_dir = self.archive_dir / "WIKI-42" / "20260730-000000"
+        session_dir.mkdir(parents=True)
+        archived_run_id = "00000000-0000-4000-8000-000000000099"
+        (session_dir / "run.json").write_text(
+            json.dumps(
+                {
+                    "run_id": archived_run_id,
+                    "agent_id": "WIKI-42",
+                    "provider": "codex",
+                    "model": "gpt-5.4",
+                    "created_at": "2026-07-30T00:00:00+00:00",
+                    "updated_at": "2026-07-30T00:05:00+00:00",
+                    "state": "completed",
+                }
+            ),
+            encoding="utf-8",
+        )
+        (session_dir / "meta.json").write_text(
+            json.dumps({"worker": {"provider": "codex", "model": "gpt-5.4"}}),
+            encoding="utf-8",
+        )
+        (session_dir / "events.jsonl").write_text(
+            json.dumps(
+                {
+                    "seq": 1,
+                    "kind": "assistant",
+                    "disposition": "rendered",
+                    "payload": {"message": "archived"},
+                }
+            )
+            + "\n",
+            encoding="utf-8",
+        )
+        archived_at = main._archive_hint("WIKI-42")[1]
+
+        session = main.agent_session("WIKI-42", archived_at=archived_at)
+
+        self.assertEqual(session["path"], str(session_dir / "events.jsonl"))
+        self.assertEqual(session["provider"], "codex")
+
     async def test_agents_reconciles_leaves_matching_run_id_alone(self) -> None:
         # Notice recorded the live run_id; nothing to reconcile away.
         self._seed_headless()

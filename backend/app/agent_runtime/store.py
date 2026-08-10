@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import base64
 import errno
 import json
 import os
@@ -7,8 +8,7 @@ import shutil
 import stat
 import tempfile
 import threading
-import base64
-from collections.abc import Iterator
+from collections.abc import Callable, Iterator
 from copy import deepcopy
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
@@ -460,6 +460,14 @@ def _fsync_directory(path: Path) -> None:
         os.close(fd)
 
 
+def _fsync_file(path: Path) -> None:
+    fd = os.open(path, os.O_RDONLY)
+    try:
+        os.fsync(fd)
+    finally:
+        os.close(fd)
+
+
 def _atomic_write_json(path: Path, value: Any) -> None:
     _ensure_parent_dir(path.parent)
     if path.is_symlink():
@@ -612,6 +620,7 @@ class RunStore:
         # project every retained PID as detached until it reattaches control.
         self._control_attached_run_ids: set[str] = set()
         self._start_registry_snapshots: dict[str, dict[str, Any]] = {}
+        self._terminal_run_prune_guard: Callable[[RunRecord], bool] | None = None
         _ensure_private_dir(paths.runtime_dir)
         _ensure_private_dir(paths.runs_dir)
         staging_dir = paths.runs_dir / ".staging"
@@ -643,6 +652,15 @@ class RunStore:
 
     def normalized_events_path(self, run_id: str) -> Path:
         return self.run_dir(run_id) / "events.jsonl"
+
+    def set_terminal_run_prune_guard(
+        self, guard: Callable[[RunRecord], bool] | None
+    ) -> None:
+        self._terminal_run_prune_guard = guard
+
+    def prune_terminal_runs(self) -> None:
+        with self._lock:
+            self._prune_terminal_runs()
 
     def current_turn_diff_path(self, run_id: str) -> Path:
         return self.run_dir(run_id) / "current-turn-diff.json"
@@ -1270,6 +1288,16 @@ class RunStore:
                 record = self.get(snapshot.run_id)
                 if record.state not in TERMINAL_STATES:
                     continue
+                if (
+                    self._terminal_run_prune_guard is not None
+                    and not self._terminal_run_prune_guard(record)
+                ):
+                    continue
+                if any(
+                    effect.get("run_id") == record.run_id
+                    for effect in self.command_log.sending_steer_effects()
+                ):
+                    continue
                 self._archive_terminal_run(record)
             except (OSError, StoreError, TypeError, ValueError):
                 # Keep a terminal run intact if archive preparation fails.
@@ -1558,6 +1586,8 @@ class RunStore:
         _ensure_parent_dir(destination.parent)
         shutil.copy2(source, destination)
         destination.chmod(0o600)
+        _fsync_file(destination)
+        _fsync_directory(destination.parent)
 
     def archive_current(
         self,
