@@ -2763,6 +2763,67 @@ class RunStoreTests(unittest.TestCase):
             self.assertFalse(store.run_dir(record.run_id).exists())
             self.assertIsNotNone(store.find_archived_run(record.run_id))
 
+    def test_incomplete_marker_survives_triple_failure_and_crash_retry(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            paths = _paths(root)
+            store = RunStore(paths)
+            record = store.create(_record(root))
+            store.transition(record.run_id, LifecycleState.COMPLETED)
+
+            marker_renamed = False
+            final_fsync_failed = False
+            cleanup_fsync_failed = False
+            real_fsync_directory = store_module._fsync_directory
+            real_replace = store_module.os.replace
+            real_unlink = Path.unlink
+
+            def replace(source: Path, destination: Path) -> None:
+                nonlocal marker_renamed
+                real_replace(source, destination)
+                if Path(destination).name == "archive-complete.json":
+                    marker_renamed = True
+
+            def fsync_directory(path: Path) -> None:
+                nonlocal final_fsync_failed, cleanup_fsync_failed
+                if marker_renamed and not final_fsync_failed:
+                    final_fsync_failed = True
+                    raise OSError("final archive fsync failed")
+                if marker_renamed and not cleanup_fsync_failed:
+                    cleanup_fsync_failed = True
+                    raise OSError("cleanup archive fsync failed")
+                real_fsync_directory(path)
+
+            def unlink(path: Path, missing_ok: bool = False) -> None:
+                if marker_renamed and path.name == "archive-complete.json":
+                    raise OSError("archive marker unlink failed")
+                real_unlink(path, missing_ok=missing_ok)
+
+            with (
+                mock.patch.object(store_module.os, "replace", side_effect=replace),
+                mock.patch.object(
+                    store_module, "_fsync_directory", side_effect=fsync_directory
+                ),
+                mock.patch.object(Path, "unlink", new=unlink),
+                self.assertRaisesRegex(OSError, "final archive fsync failed"),
+            ):
+                store.archive_current(record.run_id)
+
+            self.assertTrue(final_fsync_failed)
+            self.assertTrue(cleanup_fsync_failed)
+            self.assertTrue(store.run_dir(record.run_id).is_dir())
+            marker = next(paths.archive_dir.glob("*/*/archive-complete.json"))
+            marker_value = json.loads(marker.read_text(encoding="utf-8"))
+            self.assertFalse(store_module._archive_marker_is_complete(marker, marker_value))
+
+            restarted = RunStore(paths)
+            self.assertTrue(restarted.run_dir(record.run_id).is_dir())
+            self.assertIsNone(restarted.find_archived_run(record.run_id))
+
+            restarted.archive_current(record.run_id)
+            self.assertFalse(restarted.run_dir(record.run_id).exists())
+            self.assertIsNotNone(restarted.find_archived_run(record.run_id))
+
     def test_prune_failure_is_logged_and_returned_in_sweep_result(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)

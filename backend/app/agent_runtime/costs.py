@@ -16,6 +16,7 @@ from typing import Any
 from urllib.parse import quote
 
 from ..pathwalk import open_relative_directory, open_relative_file
+from .store import _archive_marker_is_complete
 from .ticket import base_ticket
 
 
@@ -53,6 +54,8 @@ CURSOR_TAIL_BYTES = 256
 REFRESH_INTERVAL_SECONDS = float(os.environ.get("WIKI_COST_REFRESH_INTERVAL_SECONDS", "5"))
 _REFRESH_LOCK = threading.Lock()
 _BACKGROUND_STATE: dict[str, Any] | None = None
+_CHECKPOINT_INDEX_LOCK = threading.Lock()
+_CHECKPOINT_INDEX: dict[Path, tuple[Path, ...]] = {}
 
 
 ACCOUNTING_FIELDS = ("input", "cache_read", "cache_write_5m", "cache_write_1h", "output")
@@ -149,7 +152,7 @@ def _load_state() -> dict[str, Any]:
         if isinstance(run_id, str)
     }
     state.deleted_run_ids = deleted_run_ids
-    for checkpoint in cost_run_checkpoints_dir().glob("*.json"):
+    for checkpoint in _checkpoint_paths():
         try:
             checkpoint_value = json.loads(checkpoint.read_text(encoding="utf-8"))
         except (OSError, ValueError):
@@ -169,6 +172,32 @@ def _load_state() -> dict[str, Any]:
         ):
             value["runs"][run_id] = run_state
     return state
+
+
+def _checkpoint_paths() -> tuple[Path, ...]:
+    checkpoint_dir = cost_run_checkpoints_dir()
+    with _CHECKPOINT_INDEX_LOCK:
+        cached = _CHECKPOINT_INDEX.get(checkpoint_dir)
+        if cached is not None:
+            return cached
+        try:
+            paths = tuple(checkpoint_dir.glob("*.json"))
+        except OSError:
+            paths = ()
+        _CHECKPOINT_INDEX[checkpoint_dir] = paths
+        return paths
+
+
+def _remember_checkpoint_paths(
+    checkpoint_dir: Path, run_ids: list[str], deleted_run_ids: set[str]
+) -> None:
+    with _CHECKPOINT_INDEX_LOCK:
+        paths = set(_CHECKPOINT_INDEX.get(checkpoint_dir, ()))
+        paths.update(_run_checkpoint_path(run_id) for run_id in run_ids)
+        paths.difference_update(
+            _run_checkpoint_path(run_id) for run_id in deleted_run_ids
+        )
+        _CHECKPOINT_INDEX[checkpoint_dir] = tuple(sorted(paths, key=str))
 
 
 def cost_run_checkpoints_dir() -> Path:
@@ -251,6 +280,9 @@ def _save_state(state: dict[str, Any]) -> bool:
                 deleted_checkpoints_removed = False
         if deleted_checkpoints_removed and deleted_run_ids:
             deleted_checkpoints_removed = _fsync_directory(checkpoint_dir)
+        _remember_checkpoint_paths(
+            checkpoint_dir, checkpoint_run_ids, set(deleted_run_ids)
+        )
         if hasattr(state, "dirty_run_ids"):
             state.dirty_run_ids.clear()
         if deleted_checkpoints_removed and hasattr(state, "deleted_run_ids"):
@@ -615,7 +647,11 @@ def _archived_run_ids() -> set[str]:
                 value = json.loads(marker.read_text(encoding="utf-8"))
             except (OSError, ValueError):
                 continue
-            if isinstance(value, dict) and isinstance(value.get("run_id"), str):
+            if (
+                isinstance(value, dict)
+                and _archive_marker_is_complete(marker, value)
+                and isinstance(value.get("run_id"), str)
+            ):
                 run_ids.add(value["run_id"])
     except OSError:
         pass

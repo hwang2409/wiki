@@ -16,7 +16,7 @@ from pathlib import Path
 from typing import Any
 
 from .normalizer import NormalizedProviderEvent, normalize_provider_event
-from .store import RuntimePaths
+from .store import ARCHIVE_MANIFEST_NAME, RuntimePaths, _archive_marker_is_complete
 from .types import EventDisposition, ProviderKind
 
 
@@ -276,7 +276,28 @@ class UnknownKindTelemetry:
         return {
             self._archive_run_name(marker.parent / "raw.jsonl", archive_dir)
             for marker in archive_dir.rglob(ARCHIVE_COMPLETION_MARKER)
+            if self._is_published_marker(marker)
         }
+
+    @staticmethod
+    def _is_published_marker(marker: Path) -> bool:
+        try:
+            value = json.loads(marker.read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            return False
+        if not isinstance(value, dict) or not isinstance(value.get("run_id"), str):
+            return False
+        if value.get("manifest") == ARCHIVE_MANIFEST_NAME:
+            return _archive_marker_is_complete(marker, value)
+        # Legacy telemetry archives only contain run.json and raw.jsonl.
+        return (
+            not marker.is_symlink()
+            and marker.is_file()
+            and (marker.parent / "run.json").is_file()
+            and not (marker.parent / "run.json").is_symlink()
+            and (marker.parent / "raw.jsonl").is_file()
+            and not (marker.parent / "raw.jsonl").is_symlink()
+        )
 
     def _iter_sources(self, state: dict[str, Any]):
         completed = set(state["completed_runs"])
@@ -297,7 +318,8 @@ class UnknownKindTelemetry:
         if not archive_dir.is_dir():
             return
         for raw_path in archive_dir.rglob("raw.jsonl"):
-            if not (raw_path.parent / ARCHIVE_COMPLETION_MARKER).is_file():
+            marker = raw_path.parent / ARCHIVE_COMPLETION_MARKER
+            if not self._is_published_marker(marker):
                 continue
             run_name = self._archive_run_name(raw_path, archive_dir)
             if run_name not in completed:

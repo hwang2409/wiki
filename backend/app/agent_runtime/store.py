@@ -42,6 +42,7 @@ from .types import (
 MAX_START_STATUS_BYTES = 64 * 1024
 DEFAULT_RUN_RETENTION_DAYS = 30
 logger = logging.getLogger(__name__)
+ARCHIVE_MANIFEST_NAME = "archive-manifest.json"
 
 
 def _run_retention_cutoff() -> datetime:
@@ -502,9 +503,71 @@ def _archive_file_manifest(
     return manifest
 
 
+def _archive_manifest_files(session_dir: Path) -> dict[str, int] | None:
+    """Return all archive files except the manifest and completion marker."""
+
+    actual: dict[str, int] = {}
+    try:
+        for path in session_dir.rglob("*"):
+            relative = path.relative_to(session_dir)
+            if relative in {
+                Path(ARCHIVE_MANIFEST_NAME),
+                Path("archive-complete.json"),
+            }:
+                continue
+            stat_result = path.lstat()
+            if stat.S_ISDIR(stat_result.st_mode):
+                continue
+            if not (stat.S_ISREG(stat_result.st_mode) or stat.S_ISLNK(stat_result.st_mode)):
+                return None
+            actual[str(relative)] = stat_result.st_size
+    except OSError:
+        return None
+    return actual
+
+
+def _archive_manifest_is_complete(
+    session_dir: Path, manifest: dict[str, Any], *, require_meta: bool
+) -> bool:
+    files = manifest.get("files")
+    if not isinstance(files, dict) or not files:
+        return False
+    required_files = {"run.json", "raw.jsonl", "events.jsonl"}
+    if require_meta:
+        required_files.add("meta.json")
+    if not required_files.issubset(files):
+        return False
+    for relative, expected_size in files.items():
+        if (
+            not isinstance(relative, str)
+            or not isinstance(expected_size, int)
+            or isinstance(expected_size, bool)
+        ):
+            return False
+        relative_path = Path(relative)
+        if relative_path.is_absolute() or ".." in relative_path.parts:
+            return False
+    return _archive_manifest_files(session_dir) == files
+
+
 def _archive_marker_is_complete(marker_path: Path, marker: dict[str, Any]) -> bool:
     if marker_path.is_symlink() or not marker_path.is_file():
         return False
+    if marker.get("manifest") == ARCHIVE_MANIFEST_NAME:
+        if marker.get("committed") is not True:
+            return False
+        try:
+            manifest = _read_json(marker_path.parent / ARCHIVE_MANIFEST_NAME)
+        except (OSError, StoreError, TypeError, ValueError):
+            return False
+        return (
+            isinstance(manifest, dict)
+            and manifest.get("run_id") == marker.get("run_id")
+            and manifest.get("completed_at") == marker.get("completed_at")
+            and _archive_manifest_is_complete(
+                marker_path.parent, manifest, require_meta=True
+            )
+        )
     files = marker.get("files")
     required_files = {"run.json", "raw.jsonl", "events.jsonl"}
     if not isinstance(files, dict):
@@ -558,12 +621,30 @@ def _publish_archive_marker(
     try:
         manifest = _archive_file_manifest(session_dir, expected_paths)
         _atomic_write_json(
-            marker_tmp,
+            session_dir / ARCHIVE_MANIFEST_NAME,
             {"run_id": run_id, "completed_at": completed_at, "files": manifest},
+        )
+        _atomic_write_json(
+            marker_tmp,
+            {
+                "run_id": run_id,
+                "completed_at": completed_at,
+                "manifest": ARCHIVE_MANIFEST_NAME,
+                "committed": False,
+            },
         )
         os.replace(marker_tmp, marker_path)
         marker_published = True
         _fsync_directory(session_dir)
+        _atomic_write_json(
+            marker_path,
+            {
+                "run_id": run_id,
+                "completed_at": completed_at,
+                "manifest": ARCHIVE_MANIFEST_NAME,
+                "committed": True,
+            },
+        )
     except BaseException:
         marker_tmp.unlink(missing_ok=True)
         if marker_published:
