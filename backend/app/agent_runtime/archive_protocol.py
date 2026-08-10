@@ -14,6 +14,7 @@ from typing import Any
 
 ARCHIVE_COMPLETION_MARKER = "archive-complete.json"
 ARCHIVE_MANIFEST_NAME = "archive-manifest.json"
+REQUIRED_ARCHIVE_FILES = ("raw.jsonl", "events.jsonl", "run.json")
 
 
 def _fsync_directory(path: Path) -> None:
@@ -50,6 +51,10 @@ def _relative_file_sizes(directory: Path) -> dict[str, int] | None:
                 Path(ARCHIVE_MANIFEST_NAME),
             }:
                 continue
+            if path.name.startswith(
+                (f".{ARCHIVE_COMPLETION_MARKER}.", f".{ARCHIVE_MANIFEST_NAME}.")
+            ):
+                continue
             path_stat = path.lstat()
             if stat.S_ISDIR(path_stat.st_mode):
                 continue
@@ -69,26 +74,34 @@ def _manifest_for(
         manifest = _relative_file_sizes(directory)
         if manifest is None or not manifest:
             raise OSError(f"could not enumerate archive files: {directory}")
-        return manifest
-
-    manifest: dict[str, int] = {}
-    excluded = {
-        Path(ARCHIVE_COMPLETION_MARKER),
-        Path(ARCHIVE_MANIFEST_NAME),
-    }
-    for path in expected_paths:
+    else:
+        manifest = {}
+        excluded = {
+            Path(ARCHIVE_COMPLETION_MARKER),
+            Path(ARCHIVE_MANIFEST_NAME),
+        }
+        for path in expected_paths:
+            try:
+                relative = path.relative_to(directory)
+                path_stat = path.lstat()
+            except (OSError, ValueError) as exc:
+                raise OSError(f"archive file is missing: {path}") from exc
+            if relative in excluded:
+                raise ValueError(f"archive protocol file cannot be listed: {path}")
+            if not _is_regular_or_symlink(path) or stat.S_ISDIR(path_stat.st_mode):
+                raise ValueError(f"archive file is not regular: {path}")
+            manifest[str(relative)] = path_stat.st_size
+        if not manifest:
+            raise ValueError("archive must contain at least one file")
+    for name in REQUIRED_ARCHIVE_FILES:
+        path = directory / name
         try:
-            relative = path.relative_to(directory)
             path_stat = path.lstat()
-        except (OSError, ValueError) as exc:
+        except OSError as exc:
             raise OSError(f"archive file is missing: {path}") from exc
-        if relative in excluded:
-            raise ValueError(f"archive protocol file cannot be listed: {path}")
-        if not _is_regular_or_symlink(path) or stat.S_ISDIR(path_stat.st_mode):
-            raise ValueError(f"archive file is not regular: {path}")
-        manifest[str(relative)] = path_stat.st_size
-    if not manifest:
-        raise ValueError("archive must contain at least one file")
+        if not stat.S_ISREG(path_stat.st_mode):
+            raise OSError(f"archive file is not regular: {path}")
+        manifest[name] = path_stat.st_size
     return manifest
 
 
@@ -184,7 +197,15 @@ def commit_archive(
     try:
         _atomic_write_json(
             directory / ARCHIVE_MANIFEST_NAME,
-            {"run_id": run_id, "completed_at": completed_at, "files": manifest},
+            {
+                "run_id": run_id,
+                "completed_at": completed_at,
+                "required_files": list(REQUIRED_ARCHIVE_FILES),
+                "optional_files": sorted(
+                    set(manifest).difference(REQUIRED_ARCHIVE_FILES)
+                ),
+                "files": manifest,
+            },
         )
         marker_fd, marker_raw_tmp = tempfile.mkstemp(
             prefix=f".{ARCHIVE_COMPLETION_MARKER}.", dir=directory
@@ -226,8 +247,22 @@ def _manifest_is_verified(directory: Path, marker: dict[str, Any]) -> bool:
         or manifest.get("completed_at") != marker.get("completed_at")
     ):
         return False
+    if manifest.get("required_files") != list(REQUIRED_ARCHIVE_FILES):
+        return False
     files = manifest.get("files")
     if not isinstance(files, dict) or not files:
+        return False
+    optional_files = manifest.get("optional_files")
+    if not isinstance(optional_files, list):
+        return False
+    if any(
+        not isinstance(path, str) or path in REQUIRED_ARCHIVE_FILES
+        for path in optional_files
+    ):
+        return False
+    if len(set(optional_files)) != len(optional_files):
+        return False
+    if set(files) != set(REQUIRED_ARCHIVE_FILES).union(optional_files):
         return False
     for relative, expected_size in files.items():
         if (
@@ -248,6 +283,14 @@ def _manifest_is_verified(directory: Path, marker: dict[str, Any]) -> bool:
             not (stat.S_ISREG(path_stat.st_mode) or stat.S_ISLNK(path_stat.st_mode))
             or path_stat.st_size != expected_size
         ):
+            return False
+    for name in REQUIRED_ARCHIVE_FILES:
+        path = directory / name
+        try:
+            path_stat = path.lstat()
+        except OSError:
+            return False
+        if not stat.S_ISREG(path_stat.st_mode) or path_stat.st_size != files[name]:
             return False
     return _relative_file_sizes(directory) == files
 

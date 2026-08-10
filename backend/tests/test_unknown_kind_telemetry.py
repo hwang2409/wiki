@@ -94,11 +94,17 @@ class UnknownKindTelemetryTests(unittest.TestCase):
 
     @staticmethod
     def _commit_archive(session_dir: Path, run_id: str) -> None:
+        events_path = session_dir / "events.jsonl"
+        events_path.touch()
         commit_archive(
             session_dir,
             run_id=run_id,
             completed_at="2026-08-01T00:00:00Z",
-            expected_paths=[session_dir / "run.json", session_dir / "raw.jsonl"],
+            expected_paths=[
+                session_dir / "run.json",
+                session_dir / "raw.jsonl",
+                events_path,
+            ],
         )
 
     def test_aggregates_threshold_and_deduplicates_across_restart(self) -> None:

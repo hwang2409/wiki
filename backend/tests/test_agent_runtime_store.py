@@ -2717,6 +2717,29 @@ class RunStoreTests(unittest.TestCase):
                 list(paths.archive_dir.glob(f"*/*/{ARCHIVE_COMPLETION_MARKER}")), []
             )
 
+    def test_missing_required_events_keeps_live_run_until_restored(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            paths = _paths(root)
+            store = RunStore(paths)
+            record = store.create(_record(root))
+            store.transition(record.run_id, LifecycleState.COMPLETED)
+            events_path = store.normalized_events_path(record.run_id)
+            events_path.unlink()
+
+            with self.assertRaisesRegex(OSError, "archive file is missing"):
+                store.archive_current(record.run_id)
+
+            self.assertTrue(store.run_dir(record.run_id).is_dir())
+            self.assertEqual(
+                list(paths.archive_dir.glob(f"*/*/{ARCHIVE_COMPLETION_MARKER}")), []
+            )
+
+            events_path.write_text("", encoding="utf-8")
+            store.archive_current(record.run_id)
+            self.assertFalse(store.run_dir(record.run_id).exists())
+            self.assertIsNotNone(store.find_archived_run(record.run_id))
+
     def test_archive_marker_fsync_failure_is_not_trusted_on_retry(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
