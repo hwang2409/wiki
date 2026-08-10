@@ -67,6 +67,7 @@ from .agent_runtime.command_log import AgentCommand
 from .agent_runtime import costs
 from .agent_runtime import graph_health
 from .agent_runtime.loop_state import derive_loop_state
+from .agent_runtime.archive_protocol import archive_is_committed
 from .agent_runtime.store import RuntimePaths
 from .agent_runtime.ticket import (
     base_ticket,
@@ -1588,7 +1589,11 @@ def _archive_sessions(ticket_dir: Path) -> list[tuple[datetime, Path]]:
     sessions = []
     for session_dir in ticket_dir.iterdir():
         match = ARCHIVE_TS_PATTERN.fullmatch(session_dir.name)
-        if not session_dir.is_dir() or not match:
+        if (
+            not session_dir.is_dir()
+            or not match
+            or not archive_is_committed(session_dir)
+        ):
             continue
         y, mo, d, h, mi, s = map(int, match.groups())
         sessions.append((datetime(y, mo, d, h, mi, s).astimezone(), session_dir))
@@ -3350,19 +3355,80 @@ def _validate_run_id_or_400(run_id: str) -> None:
         raise HTTPException(status_code=400, detail="Bad run id")
 
 
+def _archive_session_for_run_id(run_id: str) -> Path | None:
+    """Find the committed archive session for one exact run id."""
+
+    for session_dir in AGENT_ARCHIVE_DIR.glob("*/*"):
+        if not archive_is_committed(session_dir):
+            continue
+        run = _read_json_object(session_dir / "run.json")
+        if run.get("run_id") == run_id:
+            return session_dir
+    return None
+
+
+def _open_archived_replay_run(run_id: str) -> int:
+    archive_dir = _archive_session_for_run_id(run_id)
+    if archive_dir is None:
+        raise HTTPException(status_code=404, detail="Run not found")
+    try:
+        return replay.open_run_dir_fd(archive_dir)
+    except replay.ReplayError as exc:
+        raise HTTPException(status_code=exc.status_code, detail=str(exc)) from exc
+
+
+def _archived_replay_runs(ticket: str) -> list[replay.RunSummary]:
+    ticket_dir = AGENT_ARCHIVE_DIR / ticket
+    if not ticket_dir.is_dir():
+        return []
+    summaries: list[replay.RunSummary] = []
+    for session_dir in sorted(ticket_dir.glob("*"), reverse=True):
+        if not archive_is_committed(session_dir):
+            continue
+        run_id = _read_json_object(session_dir / "run.json").get("run_id")
+        if not isinstance(run_id, str) or not replay.valid_run_id(run_id):
+            continue
+        try:
+            run_fd = replay.open_run_dir_fd(session_dir)
+            try:
+                summary = replay.build_run_summary_from_run_fd(run_fd, run_id)
+            finally:
+                os.close(run_fd)
+        except replay.ReplayError:
+            continue
+        if summary.agent_id == ticket:
+            summaries.append(summary)
+    return summaries
+
+
 @app.get("/api/agents/{ticket}/replay/runs")
 def agent_replay_runs(ticket: str) -> dict[str, object]:
     if not TICKET_PATTERN.fullmatch(ticket):
         raise HTTPException(status_code=400, detail="Bad ticket")
-    runs_root_fd = _open_runs_root_fd_or_404()
     try:
-        listing = replay.resolve_ticket_runs(runs_root_fd, ticket)
-    finally:
-        os.close(runs_root_fd)
+        runs_root_fd = _open_runs_root_fd_or_404()
+    except HTTPException:
+        listing = None
+    else:
+        try:
+            listing = replay.resolve_ticket_runs(runs_root_fd, ticket)
+        finally:
+            os.close(runs_root_fd)
+    runs = list(listing.runs) if listing is not None else []
+    seen_run_ids = {run.run_id for run in runs}
+    for archived in _archived_replay_runs(ticket):
+        if archived.run_id not in seen_run_ids:
+            runs.append(archived)
+            seen_run_ids.add(archived.run_id)
+    runs_truncated = (
+        (listing.truncated if listing is not None else False)
+        or len(runs) > replay.MAX_RUN_LIST_ENTRIES
+    )
+    runs = runs[: replay.MAX_RUN_LIST_ENTRIES]
     return {
         "ticket": ticket,
-        "runs": [run.as_dict() for run in listing.runs],
-        "runs_truncated": listing.truncated,
+        "runs": [run.as_dict() for run in runs],
+        "runs_truncated": runs_truncated,
     }
 
 
@@ -3378,19 +3444,36 @@ def agent_run_replay_timeline(
             status_code=400,
             detail=f"limit must be between 1 and {replay.MAX_LIMIT}",
         )
-    runs_root_fd = _open_runs_root_fd_or_404()
     try:
-        replay.verify_run_dir_exists(runs_root_fd, run_id)
+        runs_root_fd = _open_runs_root_fd_or_404()
+    except HTTPException:
+        archived_fd = _open_archived_replay_run(run_id)
+        try:
+            return replay.build_timeline_response_from_run_fd(
+                archived_fd, run_id, cursor=cursor, limit=limit
+            )
+        except replay.ReplayError as exc:
+            raise HTTPException(status_code=exc.status_code, detail=str(exc)) from exc
+        finally:
+            os.close(archived_fd)
+    try:
+        try:
+            replay.verify_run_dir_exists(runs_root_fd, run_id)
+        except replay.ReplayError:
+            os.close(runs_root_fd)
+            runs_root_fd = -1
+            runs_root_fd = _open_archived_replay_run(run_id)
+            return replay.build_timeline_response_from_run_fd(
+                runs_root_fd, run_id, cursor=cursor, limit=limit
+            )
         return replay.build_timeline_response(
-            runs_root_fd,
-            run_id,
-            cursor=cursor,
-            limit=limit,
+            runs_root_fd, run_id, cursor=cursor, limit=limit
         )
     except replay.ReplayError as exc:
         raise HTTPException(status_code=exc.status_code, detail=str(exc)) from exc
     finally:
-        os.close(runs_root_fd)
+        if runs_root_fd >= 0:
+            os.close(runs_root_fd)
 
 
 @app.get("/api/agent-runs/{run_id}/replay/events/{seq}")
@@ -3398,14 +3481,30 @@ def agent_run_replay_event(run_id: str, seq: int) -> dict[str, object]:
     if seq <= 0:
         raise HTTPException(status_code=400, detail="Seq must be positive")
     _validate_run_id_or_400(run_id)
-    runs_root_fd = _open_runs_root_fd_or_404()
     try:
-        replay.verify_run_dir_exists(runs_root_fd, run_id)
-        entry = replay.load_raw_event(runs_root_fd, run_id, seq)
-    except replay.ReplayError as exc:
-        raise HTTPException(status_code=exc.status_code, detail=str(exc)) from exc
-    finally:
-        os.close(runs_root_fd)
+        runs_root_fd = _open_runs_root_fd_or_404()
+    except HTTPException:
+        archived_fd = _open_archived_replay_run(run_id)
+        try:
+            entry = replay.load_raw_event_from_run_fd(archived_fd, run_id, seq)
+        finally:
+            os.close(archived_fd)
+    else:
+        try:
+            try:
+                replay.verify_run_dir_exists(runs_root_fd, run_id)
+            except replay.ReplayError:
+                os.close(runs_root_fd)
+                runs_root_fd = -1
+                runs_root_fd = _open_archived_replay_run(run_id)
+                entry = replay.load_raw_event_from_run_fd(runs_root_fd, run_id, seq)
+            else:
+                entry = replay.load_raw_event(runs_root_fd, run_id, seq)
+        except replay.ReplayError as exc:
+            raise HTTPException(status_code=exc.status_code, detail=str(exc)) from exc
+        finally:
+            if runs_root_fd >= 0:
+                os.close(runs_root_fd)
     if entry is None:
         raise HTTPException(status_code=404, detail="Event not found")
     return {"run_id": run_id, "seq": seq, "raw": entry}
@@ -3586,20 +3685,32 @@ def agent_session(
     spawned_at = current.get("spawned_at")
     registry_session_id = current.get("session_id") if isinstance(current.get("session_id"), str) else None
     archive_dir: Path | None = None
-    if not current:
+    requested_archive = archived_at is not None
+    if requested_archive:
+        archive_kind, spawned_at, archive_dir = _archive_hint(ticket, archived_at)
+        if archive_dir is None:
+            raise HTTPException(status_code=404, detail="Archived session not found")
+        _archive_entry, archive_model, archive_kind, archive_provider = (
+            _archive_runtime_identity(archive_dir, fallback_kind=archive_kind)
+        )
+        current = {}
+        current_model = archive_model
+        current_kind = archive_kind
+        current_provider = archive_provider
+    elif not current:
         archive_kind, spawned_at, archive_dir = _archive_hint(ticket, archived_at)
         current_kind = current_kind or archive_kind
 
     found = None
-    if isinstance(current, dict) and _is_headless(current):
+    if not requested_archive and isinstance(current, dict) and _is_headless(current):
         transcript_hint = current.get("transcript")
         if isinstance(transcript_hint, str):
             found = _direct_transcript_session(Path(transcript_hint))
             if found is not None:
                 _session_paths[ticket] = found
-    if found is None:
+    if not requested_archive and found is None:
         found = _session_paths.get(ticket)
-    if found is None or not found[1].is_file():
+    if not requested_archive and (found is None or not found[1].is_file()):
         found = transcripts.find_session(
             current_kind,
             ticket,
@@ -3610,6 +3721,10 @@ def agent_session(
         if found:
             _session_paths[ticket] = found
     if found is None:
+        if archive_dir is None and isinstance(current, dict):
+            current_run_id = current.get("run_id")
+            if isinstance(current_run_id, str):
+                archive_dir = _archive_session_for_run_id(current_run_id)
         if isinstance(current, dict) and _is_headless(current):
             provider_inspector = _provider_events(ticket, limit=50)
             if provider_inspector is None:

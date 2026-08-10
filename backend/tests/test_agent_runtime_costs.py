@@ -11,7 +11,7 @@ from pathlib import Path
 from unittest import mock
 
 from backend.app.agent_runtime import costs
-
+from backend.app.agent_runtime.archive_protocol import commit_archive
 
 FIXTURE_ROOT = Path(__file__).parent / "fixtures" / "agent_runtime"
 
@@ -43,6 +43,7 @@ class CostAggregatorTests(unittest.TestCase):
         root = Path(self.tmp.name)
         self.runs = root / "runs"
         self.state = root / "cost.json"
+        self.archive = root / "archive"
         self.runs.mkdir()
         self.env = mock.patch.dict(
             os.environ,
@@ -50,6 +51,7 @@ class CostAggregatorTests(unittest.TestCase):
                 "WIKI_AGENT_RUNS_DIR": str(self.runs),
                 "WIKI_COST_STATE_PATH": str(self.state),
                 "WIKI_COST_REFRESH_MAX_AGE_SECONDS": "0",
+                "WIKI_AGENT_ARCHIVE_DIR": str(self.archive),
             },
         )
         self.env.start()
@@ -59,7 +61,16 @@ class CostAggregatorTests(unittest.TestCase):
         self.env.stop()
         self.tmp.cleanup()
 
-    def _run(self, run_id: str, *, model: str = "gpt-5.4", agent_id: str = "WIKI-178", orch: str = "wiki", provider: str = "codex") -> Path:
+    def _run(
+        self,
+        run_id: str,
+        *,
+        model: str = "gpt-5.4",
+        agent_id: str = "WIKI-178",
+        orch: str = "wiki",
+        provider: str = "codex",
+        state: str | None = None,
+    ) -> Path:
         run = self.runs / run_id
         run.mkdir()
         (run / "run.json").write_text(
@@ -72,6 +83,7 @@ class CostAggregatorTests(unittest.TestCase):
                     "orchestrator_id": orch,
                     "initial_prompt": "x" * 8000,
                     "created_at": "2026-07-30T12:00:00Z",
+                    **({"state": state} if state is not None else {}),
                 }
             ),
             encoding="utf-8",
@@ -293,6 +305,382 @@ class CostAggregatorTests(unittest.TestCase):
         self.assertEqual(save_state.call_count, 0)
         self.assertEqual(save_heartbeat.call_count, 1)
         self.assertEqual(refreshed["runs"]["run-cache"]["offset"], raw.stat().st_size)
+
+    def test_terminal_runs_are_skipped_by_cost_sweep(self) -> None:
+        raw = self._run("run-terminal", state="completed")
+        raw.write_text(
+            json.dumps(_envelope("2026-07-30T10:00:00Z", _usage(10, 2))) + "\n",
+            encoding="utf-8",
+        )
+        with mock.patch.object(costs, "_scan_run", wraps=costs._scan_run) as scan_run:
+            result = costs.refresh()
+
+        scan_run.assert_not_called()
+        self.assertEqual(result["runs"], {})
+        self.assertEqual(result["records"], {})
+
+    def test_per_run_checkpoint_round_trips_incremental_state(self) -> None:
+        raw = self._run("run-checkpoint")
+        raw.write_text(
+            json.dumps(_envelope("2026-07-30T10:00:00Z", _usage(10, 2))) + "\n",
+            encoding="utf-8",
+        )
+        first = costs.refresh()
+        checkpoint = costs.cost_run_checkpoints_dir() / "run-checkpoint.json"
+        self.assertTrue(checkpoint.is_file())
+        persisted = json.loads(costs.cost_state_path().read_text(encoding="utf-8"))
+        self.assertEqual(persisted["runs"], {})
+
+        reloaded = costs._load_state()
+        second = costs.refresh(reloaded)
+        self.assertEqual(second["runs"], first["runs"])
+        self.assertEqual(second["records"], first["records"])
+
+        with raw.open("a", encoding="utf-8") as handle:
+            handle.write(
+                json.dumps(_envelope("2026-07-30T10:01:00Z", _usage(20, 4))) + "\n"
+            )
+        third = costs.refresh(costs._load_state())
+        self.assertEqual(sum(item["input"] for item in third["records"].values()), 20)
+        self.assertEqual(third["runs"]["run-checkpoint"]["offset"], raw.stat().st_size)
+
+    def test_aggregate_first_recovers_old_cursor_after_hard_crash(self) -> None:
+        raw = self._run("run-commit-order")
+        raw.write_text(
+            json.dumps(_envelope("2026-07-30T10:00:00Z", _usage(10, 2))) + "\n",
+            encoding="utf-8",
+        )
+        first = costs.refresh()
+        old_offset = first["runs"]["run-commit-order"]["offset"]
+        with raw.open("a", encoding="utf-8") as handle:
+            handle.write(
+                json.dumps(_envelope("2026-07-30T10:01:00Z", _usage(30, 6)))
+                + "\n"
+            )
+
+        state = costs._load_state()
+        root_fd = costs._open_root()
+        self.assertIsNotNone(root_fd)
+        assert root_fd is not None
+        try:
+            costs._scan_run(state, "run-commit-order", root_fd)
+        finally:
+            os.close(root_fd)
+
+        real_save_json = costs._save_json
+        pid = os.fork()
+        if pid == 0:
+            def save_json_then_crash(path, value):
+                saved = real_save_json(path, value)
+                if Path(path) == costs.cost_state_path():
+                    os._exit(73)
+                return saved
+
+            costs._save_json = save_json_then_crash
+            try:
+                costs._save_state(state)
+            finally:
+                os._exit(1)
+
+        _pid, status = os.waitpid(pid, 0)
+        self.assertEqual(_pid, pid)
+        self.assertTrue(os.WIFEXITED(status))
+        self.assertEqual(os.WEXITSTATUS(status), 73)
+
+        reloaded = costs._load_state()
+        self.assertEqual(
+            reloaded["runs"]["run-commit-order"]["offset"], old_offset
+        )
+        with mock.patch.object(costs, "_scan_run", wraps=costs._scan_run) as scan_run:
+            recovered = costs.refresh(reloaded)
+        self.assertEqual(scan_run.call_count, 1)
+        self.assertEqual(
+            sum(record["input"] for record in recovered["records"].values()), 30
+        )
+
+    def test_terminal_run_checkpoint_recovers_after_aggregate_crash(self) -> None:
+        raw = self._run("run-terminal-recovery")
+        raw.write_text(
+            json.dumps(_envelope("2026-07-30T10:00:00Z", _usage(10, 2))) + "\n",
+            encoding="utf-8",
+        )
+        first = costs.refresh()
+        old_offset = first["runs"]["run-terminal-recovery"]["offset"]
+        with raw.open("a", encoding="utf-8") as handle:
+            handle.write(
+                json.dumps(_envelope("2026-07-30T10:01:00Z", _usage(30, 6)))
+                + "\n"
+            )
+        (raw.parent / "run.json").write_text(
+            json.dumps(
+                {
+                    "run_id": "run-terminal-recovery",
+                    "agent_id": "WIKI-178",
+                    "provider": "codex",
+                    "model": "gpt-5.4",
+                    "orchestrator_id": "wiki",
+                    "state": "completed",
+                }
+            ),
+            encoding="utf-8",
+        )
+
+        state = costs._load_state()
+        root_fd = costs._open_root()
+        self.assertIsNotNone(root_fd)
+        assert root_fd is not None
+        try:
+            costs._scan_run(state, "run-terminal-recovery", root_fd)
+        finally:
+            os.close(root_fd)
+        self.assertEqual(
+            sum(record["input"] for record in state["records"].values()), 30
+        )
+        (self.runs / ".root-change").write_text("", encoding="utf-8")
+
+        real_save_json = costs._save_json
+        pid = os.fork()
+        if pid == 0:
+            def save_json_then_crash(path, value):
+                saved = real_save_json(path, value)
+                if Path(path) == costs.cost_state_path():
+                    os._exit(73)
+                return saved
+
+            costs._save_json = save_json_then_crash
+            try:
+                costs._save_state(state)
+            finally:
+                os._exit(1)
+
+        _pid, status = os.waitpid(pid, 0)
+        self.assertEqual(_pid, pid)
+        self.assertTrue(os.WIFEXITED(status))
+        self.assertEqual(os.WEXITSTATUS(status), 73)
+
+        archive_dir = self.archive / "WIKI-178" / "20260730-120000"
+        (raw.parent / "events.jsonl").write_text("", encoding="utf-8")
+        archive_dir.parent.mkdir(parents=True)
+        shutil.move(str(raw.parent), archive_dir)
+        commit_archive(archive_dir)
+        archived_raw = archive_dir / "raw.jsonl"
+
+        reloaded = costs._load_state()
+        with mock.patch.object(costs, "_scan_run", wraps=costs._scan_run) as scan_run:
+            recovered = costs.refresh(reloaded)
+        self.assertEqual(
+            sum(record["input"] for record in recovered["records"].values()), 30
+        )
+        self.assertEqual(
+            recovered["runs"]["run-terminal-recovery"]["offset"],
+            archived_raw.stat().st_size,
+        )
+        scanned_run_ids = [call.args[1] for call in scan_run.call_args_list]
+        self.assertEqual(scanned_run_ids, ["run-terminal-recovery"])
+        self.assertNotEqual(old_offset, archived_raw.stat().st_size)
+
+        shutil.rmtree(self.archive)
+        (self.runs / ".root-change").write_text("", encoding="utf-8")
+        deleted_state = costs._load_state()
+        deleted_state["runs_dir_signature"] = None
+        deleted = costs.refresh(deleted_state)
+        self.assertEqual(deleted["records"], {})
+        self.assertEqual(deleted["runs"], {})
+
+    def test_pending_archived_recovery_survives_restart_and_deletion(self) -> None:
+        run_id = "run-pending-recovery"
+        raw = self._run(run_id)
+        raw.write_text(
+            json.dumps(_envelope("2026-07-30T10:00:00Z", _usage(10, 2))) + "\n",
+            encoding="utf-8",
+        )
+        first = costs.refresh()
+        with raw.open("a", encoding="utf-8") as handle:
+            handle.write(
+                json.dumps(_envelope("2026-07-30T10:01:00Z", _usage(30, 6)))
+                + "\n"
+            )
+
+        state = costs._load_state()
+        root_fd = costs._open_root()
+        self.assertIsNotNone(root_fd)
+        assert root_fd is not None
+        try:
+            self.assertTrue(costs._scan_run(state, run_id, root_fd))
+        finally:
+            os.close(root_fd)
+        self.assertEqual(
+            sum(record["input"] for record in state["records"].values()),
+            30,
+        )
+
+        aggregate = costs._state_with_bounded_runs(state)
+        aggregate["checkpoint_generation"] = first.checkpoint_generation + 1
+        aggregate["deleted_run_ids"] = []
+        self.assertTrue(costs._save_json(costs.cost_state_path(), aggregate))
+
+        archive_dir = self.archive / "WIKI-178" / "20260730-140000"
+        (raw.parent / "events.jsonl").write_text("", encoding="utf-8")
+        archive_dir.parent.mkdir(parents=True)
+        shutil.move(str(raw.parent), archive_dir)
+        commit_archive(archive_dir)
+        archived_raw = archive_dir / "raw.jsonl"
+
+        failed = costs._load_state()
+        self.assertIn(run_id, failed.checkpoint_recovery_run_ids)
+        with mock.patch.object(costs, "_open_archived_run_source", return_value=None):
+            costs.refresh(failed)
+
+        persisted = json.loads(costs.cost_state_path().read_text(encoding="utf-8"))
+        checkpoint = json.loads(
+            costs._run_checkpoint_path(run_id).read_text(encoding="utf-8")
+        )
+        self.assertLess(
+            checkpoint["generation"], persisted["checkpoint_generation"]
+        )
+
+        restarted = costs._load_state()
+        self.assertIn(run_id, restarted.checkpoint_recovery_run_ids)
+        recovered = costs.refresh(restarted)
+        self.assertEqual(
+            sum(record["input"] for record in recovered["records"].values()),
+            30,
+        )
+        self.assertEqual(
+            recovered["runs"][run_id]["offset"], archived_raw.stat().st_size
+        )
+
+        shutil.rmtree(self.archive)
+        (self.runs / ".root-change-after-replay").write_text("", encoding="utf-8")
+        restarted["runs_dir_signature"] = None
+        deleted = costs.refresh(restarted)
+        self.assertEqual(deleted["records"], {})
+        self.assertEqual(deleted["runs"], {})
+
+    def test_recovery_resolves_archive_after_hot_source_moves_mid_pass(self) -> None:
+        raw = self._run("run-source-race")
+        raw.write_text(
+            json.dumps(_envelope("2026-07-30T10:00:00Z", _usage(10, 2))) + "\n",
+            encoding="utf-8",
+        )
+        state = costs.refresh()
+        root_fd = costs._open_root()
+        self.assertIsNotNone(root_fd)
+        assert root_fd is not None
+        archive_dir = self.archive / "WIKI-178" / "20260730-130000"
+        resolved_kinds: list[str] = []
+        moved = False
+        real_resolve = costs.resolve_run_source
+
+        def resolve_with_archive_race(run_id: str) -> costs.RunSource:
+            nonlocal moved
+            source = real_resolve(run_id)
+            resolved_kinds.append(source.kind)
+            if not moved and source.kind == "HOT":
+                moved = True
+                (raw.parent / "events.jsonl").write_text("", encoding="utf-8")
+                archive_dir.parent.mkdir(parents=True)
+                shutil.move(str(raw.parent), archive_dir)
+                commit_archive(archive_dir)
+            return source
+
+        try:
+            with mock.patch.object(
+                costs, "resolve_run_source", side_effect=resolve_with_archive_race
+            ):
+                self.assertTrue(
+                    costs._scan_run(state, "run-source-race", root_fd)
+                )
+        finally:
+            os.close(root_fd)
+
+        self.assertEqual(
+            sum(record["input"] for record in state["records"].values()),
+            10,
+        )
+        self.assertIn("HOT", resolved_kinds)
+        self.assertIn("ARCHIVED", resolved_kinds)
+        self.assertNotIn("GONE", resolved_kinds)
+
+    def test_save_checkpoints_unchanged_runs_with_cursors(self) -> None:
+        first_raw = self._run("run-first")
+        second_raw = self._run("run-second")
+        payload = json.dumps(_envelope("2026-07-30T10:00:00Z", _usage(10, 2))) + "\n"
+        first_raw.write_text(payload, encoding="utf-8")
+        second_raw.write_text(payload, encoding="utf-8")
+        state = costs.refresh()
+        state.dirty_run_ids = {"run-first"}
+        costs._run_checkpoint_path("run-second").unlink()
+        costs._save_state(state)
+
+        self.assertTrue(costs._run_checkpoint_path("run-first").is_file())
+        self.assertTrue(costs._run_checkpoint_path("run-second").is_file())
+
+    def test_loaded_tombstones_survive_failed_checkpoint_unlink(self) -> None:
+        run_id = "run-deleted"
+        checkpoint_dir = costs.cost_run_checkpoints_dir()
+        checkpoint_dir.mkdir(parents=True)
+        costs.cost_state_path().write_text(
+            json.dumps(
+                {
+                    "version": costs.STATE_VERSION,
+                    "runs": {},
+                    "records": {},
+                    "active_runs": [],
+                    "updated_at": None,
+                    "checkpoint_generation": 1,
+                    "deleted_run_ids": [run_id],
+                }
+            ),
+            encoding="utf-8",
+        )
+        costs._run_checkpoint_path(run_id).write_text(
+            json.dumps(
+                {
+                    "generation": 1,
+                    "run_id": run_id,
+                    "state": {"offset": 10, "records": {}},
+                }
+            ),
+            encoding="utf-8",
+        )
+
+        state = costs._load_state()
+        self.assertEqual(state.deleted_run_ids, {run_id})
+        self.assertNotIn(run_id, state["runs"])
+        failed_checkpoint = mock.Mock()
+        failed_checkpoint.unlink.side_effect = OSError(
+            "checkpoint cleanup interrupted"
+        )
+        with mock.patch.object(
+            costs, "_run_checkpoint_path", return_value=failed_checkpoint
+        ):
+            self.assertTrue(costs._save_state(state))
+
+        reloaded = costs._load_state()
+        self.assertEqual(reloaded.deleted_run_ids, {run_id})
+        self.assertNotIn(run_id, reloaded["runs"])
+
+    def test_checkpoint_tombstone_waits_for_checkpoint_directory_fsync(self) -> None:
+        run_id = "run-deleted-after-fsync"
+        checkpoint_dir = costs.cost_run_checkpoints_dir()
+        checkpoint_dir.mkdir(parents=True)
+        costs._run_checkpoint_path(run_id).write_text(
+            json.dumps({"generation": 1, "run_id": run_id, "state": {}}),
+            encoding="utf-8",
+        )
+        state = costs._empty_state()
+        state.deleted_run_ids.add(run_id)
+        fsync_results = iter((True, False))
+        with mock.patch.object(
+            costs,
+            "_fsync_directory",
+            side_effect=lambda _path: next(fsync_results),
+        ):
+            self.assertTrue(costs._save_state(state))
+
+        self.assertEqual(state.deleted_run_ids, {run_id})
+        self.assertFalse(costs._run_checkpoint_path(run_id).exists())
 
     def test_background_refresh_loads_state_once_across_ticks(self) -> None:
         costs.invalidate_background_state()

@@ -10,12 +10,47 @@ from typing import Any
 from . import errors as e
 from .errors import ReplayError, valid_run_id
 from .models import RunSummary, TicketRunsListing
-from .reader import _open_run_child_fd
+from .reader import _open_run_child_fd, _open_run_file_fd
 
 
 def _read_bounded_metadata(runs_root_fd: int, run_id: str) -> dict[str, Any]:
     cap = e.MAX_RUN_JSON_BYTES
     fd = _open_run_child_fd(runs_root_fd, run_id, "run.json")
+    try:
+        info = os.fstat(fd)
+        if info.st_size > cap:
+            raise ReplayError(
+                f"run.json exceeds {cap}-byte ceiling", status_code=413
+            )
+        chunks: list[bytes] = []
+        remaining = cap + 1
+        while remaining > 0:
+            chunk = os.read(fd, min(e.STREAM_CHUNK, remaining))
+            if not chunk:
+                break
+            chunks.append(chunk)
+            remaining -= len(chunk)
+        raw = b"".join(chunks)
+        if len(raw) > cap:
+            raise ReplayError(
+                f"run.json exceeds {cap}-byte ceiling", status_code=413
+            )
+    finally:
+        os.close(fd)
+    try:
+        value = json.loads(raw)
+    except ValueError as exc:
+        raise ReplayError(
+            f"run.json is not valid JSON: {exc}", status_code=500
+        ) from exc
+    if not isinstance(value, dict):
+        raise ReplayError("run.json must contain an object", status_code=500)
+    return value
+
+
+def _read_bounded_metadata_from_run_fd(run_fd: int) -> dict[str, Any]:
+    cap = e.MAX_RUN_JSON_BYTES
+    fd = _open_run_file_fd(run_fd, "run.json")
     try:
         info = os.fstat(fd)
         if info.st_size > cap:
@@ -83,6 +118,11 @@ def _run_summary_from_meta(meta: dict[str, Any], fallback_run_id: str) -> RunSum
 
 def build_run_summary(runs_root_fd: int, run_id: str) -> RunSummary:
     meta = _read_bounded_metadata(runs_root_fd, run_id)
+    return _run_summary_from_meta(meta, run_id)
+
+
+def build_run_summary_from_run_fd(run_fd: int, run_id: str) -> RunSummary:
+    meta = _read_bounded_metadata_from_run_fd(run_fd)
     return _run_summary_from_meta(meta, run_id)
 
 

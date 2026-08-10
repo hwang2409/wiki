@@ -10,6 +10,7 @@ from pathlib import Path
 from unittest import mock
 
 from backend.app import dashboard, main
+from backend.app.agent_runtime.archive_protocol import commit_archive
 
 
 class InlineExecutor:
@@ -714,6 +715,15 @@ class DashboardEndpointTests(unittest.TestCase):
             patcher.stop()
         self.tmp.cleanup()
 
+    @staticmethod
+    def _commit_archive(session: Path, run_id: str) -> None:
+        (session / "run.json").write_text(
+            json.dumps({"run_id": run_id, "provider": "claude"}), encoding="utf-8"
+        )
+        (session / "raw.jsonl").write_text("raw\n", encoding="utf-8")
+        (session / "events.jsonl").write_text("events\n", encoding="utf-8")
+        commit_archive(session, run_id=run_id, completed_at="2026-08-01T00:00:00Z")
+
     def test_endpoint_merges_registry_status_and_archive(self) -> None:
         self.registry.write_text(
             json.dumps(
@@ -743,6 +753,7 @@ class DashboardEndpointTests(unittest.TestCase):
             json.dumps({"outcome": "merged", "worker": {"kind": "cc", "role": "implement"}}),
             encoding="utf-8",
         )
+        self._commit_archive(session, "gau-1")
         payload = main.dashboard_tickets()
         by_ticket = {row["ticket"]: row for row in payload["tickets"]}
         self.assertEqual(set(by_ticket), {"WIKI-50", "GAU-1"})
@@ -801,6 +812,7 @@ class DashboardEndpointTests(unittest.TestCase):
                 json.dumps({"worker": {"kind": "cc", "role": "implement"}}),
                 encoding="utf-8",
             )
+            self._commit_archive(session, f"{ticket}-run")
 
         payload = main.dashboard_tickets()
 
@@ -833,6 +845,7 @@ class DashboardEndpointTests(unittest.TestCase):
                 json.dumps({"worker": {"kind": "cc", "role": "implement"}}),
                 encoding="utf-8",
             )
+            self._commit_archive(session, f"crowd-{idx}")
         older_ts = base - timedelta(days=30)
         older = self.archive / "PHO-OLD" / older_ts.strftime("%Y%m%d-%H%M%S")
         older.mkdir(parents=True)
@@ -840,6 +853,7 @@ class DashboardEndpointTests(unittest.TestCase):
             json.dumps({"worker": {"kind": "cc", "role": "implement"}, "outcome": "merged"}),
             encoding="utf-8",
         )
+        self._commit_archive(older, "pho-old")
         payload = main.dashboard_tickets()
         tickets = {row["ticket"] for row in payload["tickets"]}
         self.assertIn("PHO-CROWD", tickets)

@@ -59,6 +59,38 @@ def _open_run_child_fd(runs_root_fd: int, run_id: str, filename: str) -> int:
     return fd
 
 
+def _open_run_file_fd(run_fd: int, filename: str) -> int:
+    """Open one regular file below an already-open run directory."""
+
+    o_nonblock = getattr(os, "O_NONBLOCK", 0)
+    try:
+        fd = open_relative_file(run_fd, (filename,), extra_final_flags=o_nonblock)
+    except OSError as exc:
+        raise ReplayError(
+            f"{filename} not accessible: {exc}", status_code=404
+        ) from exc
+    try:
+        info = os.fstat(fd)
+    except OSError as exc:
+        os.close(fd)
+        raise ReplayError(f"could not stat {filename}: {exc}", status_code=404) from exc
+    if not stat.S_ISREG(info.st_mode):
+        os.close(fd)
+        raise ReplayError(f"{filename} is not a regular file", status_code=404)
+    return fd
+
+
+def open_run_dir_fd(run_dir: str | os.PathLike[str]) -> int:
+    """Open a trusted archive run directory without following its final symlink."""
+
+    flags = os.O_RDONLY | getattr(os, "O_DIRECTORY", 0)
+    flags |= getattr(os, "O_NOFOLLOW", 0)
+    try:
+        return os.open(run_dir, flags)
+    except OSError as exc:
+        raise ReplayError(f"run not readable: {exc}", status_code=404) from exc
+
+
 def open_runs_root_fd(runs_root_path: str | os.PathLike[str]) -> int:
     no_follow = getattr(os, "O_NOFOLLOW", 0)
     directory_flag = getattr(os, "O_DIRECTORY", 0)

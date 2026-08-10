@@ -66,6 +66,14 @@ class KnowledgeSourceError(KnowledgeError):
     """One source file could not be ingested while the database remains usable."""
 
 
+def _archive_is_committed(path: Path) -> bool:
+    # Keep the archive protocol import lazy. knowledge loads during the agent
+    # runtime package bootstrap, so a top-level import would create a cycle.
+    from .agent_runtime.archive_protocol import archive_is_committed
+
+    return archive_is_committed(path)
+
+
 @dataclass
 class IngestStats:
     notes_scanned: int = 0
@@ -696,7 +704,7 @@ class KnowledgeIndex:
         )
         if self.paths.archive_dir.is_dir():
             for events_path in sorted(self.paths.archive_dir.rglob("events.jsonl")):
-                if events_path.is_file():
+                if events_path.is_file() and _archive_is_committed(events_path.parent):
                     if not include_legacy and not is_supervisor_archive(events_path.parent):
                         stats.legacy_runs_skipped += 1
                         continue

@@ -15,12 +15,17 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
+from .archive_protocol import (
+    ARCHIVE_COMPLETION_MARKER as _ARCHIVE_COMPLETION_MARKER,
+    archive_is_committed,
+)
 from .normalizer import NormalizedProviderEvent, normalize_provider_event
 from .store import RuntimePaths
 from .types import EventDisposition, ProviderKind
 
 
 logger = logging.getLogger(__name__)
+ARCHIVE_COMPLETION_MARKER = _ARCHIVE_COMPLETION_MARKER
 
 DEFAULT_INTERVAL_SECONDS = 7 * 24 * 60 * 60
 DEFAULT_UNKNOWN_KIND_THRESHOLD = 100
@@ -30,7 +35,6 @@ MAX_EVENT_LINE_BYTES = 1024 * 1024
 CHECKPOINT_EVENT_COUNT = 256
 MAX_CURSOR_ENTRIES = 4096
 STATE_VERSION = 2
-ARCHIVE_COMPLETION_MARKER = "archive-complete.json"
 
 
 @dataclass(frozen=True)
@@ -274,9 +278,14 @@ class UnknownKindTelemetry:
         if not archive_dir.is_dir():
             return set()
         return {
-            self._archive_run_name(marker.parent / "raw.jsonl", archive_dir)
-            for marker in archive_dir.rglob(ARCHIVE_COMPLETION_MARKER)
+            self._archive_run_name(session_dir / "raw.jsonl", archive_dir)
+            for session_dir in archive_dir.glob("*/*")
+            if archive_is_committed(session_dir)
         }
+
+    @staticmethod
+    def _is_published_archive(session_dir: Path) -> bool:
+        return archive_is_committed(session_dir)
 
     def _iter_sources(self, state: dict[str, Any]):
         completed = set(state["completed_runs"])
@@ -297,7 +306,7 @@ class UnknownKindTelemetry:
         if not archive_dir.is_dir():
             return
         for raw_path in archive_dir.rglob("raw.jsonl"):
-            if not (raw_path.parent / ARCHIVE_COMPLETION_MARKER).is_file():
+            if not self._is_published_archive(raw_path.parent):
                 continue
             run_name = self._archive_run_name(raw_path, archive_dir)
             if run_name not in completed:

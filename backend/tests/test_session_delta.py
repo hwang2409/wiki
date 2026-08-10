@@ -12,6 +12,7 @@ from unittest import mock
 from fastapi import HTTPException
 
 from backend.app import main, transcripts
+from backend.app.agent_runtime.archive_protocol import commit_archive
 
 
 def _write_rows(path: Path, rows: list[dict], mode: str = "a") -> None:
@@ -1207,6 +1208,12 @@ class SessionDeltaTests(unittest.TestCase):
                 json.dumps({"worker": {"kind": "cdx"}}),
                 encoding="utf-8",
             )
+            (session_dir / "raw.jsonl").write_text("raw\n", encoding="utf-8")
+            commit_archive(
+                session_dir,
+                run_id="WIKI-99-run",
+                completed_at="2026-07-13T01:02:03Z",
+            )
 
             with (
                 mock.patch.object(main, "AGENT_REGISTRY_PATH", registry),
@@ -1510,6 +1517,17 @@ class SessionDeltaTests(unittest.TestCase):
                 ),
                 encoding="utf-8",
             )
+            (session_dir / "run.json").write_text(
+                json.dumps({"run_id": "WIKI-55-run", "provider": "claude"}),
+                encoding="utf-8",
+            )
+            (session_dir / "raw.jsonl").write_text("raw\n", encoding="utf-8")
+            (session_dir / "events.jsonl").write_text("events\n", encoding="utf-8")
+            commit_archive(
+                session_dir,
+                run_id="WIKI-55-run",
+                completed_at="2026-07-10T01:02:03Z",
+            )
             registry = root / "agent-registry.json"
             queue = root / "queue.json"
             status_dir = root / "status"
@@ -1528,7 +1546,7 @@ class SessionDeltaTests(unittest.TestCase):
             ):
                 body = main.agent_session("WIKI-55", cursor=0)
 
-            self.assertEqual(body["format"], "pane-log")
+            self.assertEqual(body["format"], "provider-events")
             self.assertEqual(body["model"], "opus-4.7")
             self.assertEqual(body["kind"], "cc")
             self.assertEqual(body["provider"], "claude")

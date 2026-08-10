@@ -9,6 +9,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from unittest import mock
 
+from backend.app.agent_runtime.archive_protocol import commit_archive
 from backend.app.agent_runtime.store import RuntimePaths
 from backend.app.agent_runtime import unknown_kind_telemetry as telemetry_module
 from backend.app.agent_runtime.unknown_kind_telemetry import (
@@ -89,6 +90,21 @@ class UnknownKindTelemetryTests(unittest.TestCase):
             threshold=100,
             todo_runner=self.calls.append,
             clock=lambda: 1_759_000_000,
+        )
+
+    @staticmethod
+    def _commit_archive(session_dir: Path, run_id: str) -> None:
+        events_path = session_dir / "events.jsonl"
+        events_path.touch()
+        commit_archive(
+            session_dir,
+            run_id=run_id,
+            completed_at="2026-08-01T00:00:00Z",
+            expected_paths=[
+                session_dir / "run.json",
+                session_dir / "raw.jsonl",
+                events_path,
+            ],
         )
 
     def test_aggregates_threshold_and_deduplicates_across_restart(self) -> None:
@@ -222,9 +238,7 @@ class UnknownKindTelemetryTests(unittest.TestCase):
         (archive_raw.parent / "run.json").write_text(
             json.dumps({"run_id": "run-1"}), encoding="utf-8"
         )
-        (archive_raw.parent / telemetry_module.ARCHIVE_COMPLETION_MARKER).write_text(
-            json.dumps({"run_id": "run-1"}), encoding="utf-8"
-        )
+        self._commit_archive(archive_raw.parent, "run-1")
         shutil.rmtree(self.raw.parent)
 
         result = service.run_once()
@@ -252,9 +266,7 @@ class UnknownKindTelemetryTests(unittest.TestCase):
 
         with archive_raw.open("a", encoding="utf-8") as handle:
             self._write_events(handle, 31)
-        (archive_dir / telemetry_module.ARCHIVE_COMPLETION_MARKER).write_text(
-            json.dumps({"run_id": "archived-1"}), encoding="utf-8"
-        )
+        self._commit_archive(archive_dir, "archived-1")
 
         published = service.run_once()
 
@@ -280,9 +292,7 @@ class UnknownKindTelemetryTests(unittest.TestCase):
                 (archive_raw.parent / "run.json").write_text(
                     json.dumps({"run_id": "run-1"}), encoding="utf-8"
                 )
-                (
-                    archive_raw.parent / telemetry_module.ARCHIVE_COMPLETION_MARKER
-                ).write_text(json.dumps({"run_id": "run-1"}), encoding="utf-8")
+                self._commit_archive(archive_raw.parent, "run-1")
                 shutil.rmtree(self.raw.parent)
             return scanned
 
@@ -303,9 +313,7 @@ class UnknownKindTelemetryTests(unittest.TestCase):
         (archive_raw.parent / "run.json").write_text(
             json.dumps({"run_id": "run-1"}), encoding="utf-8"
         )
-        (archive_raw.parent / telemetry_module.ARCHIVE_COMPLETION_MARKER).write_text(
-            json.dumps({"run_id": "run-1"}), encoding="utf-8"
-        )
+        self._commit_archive(archive_raw.parent, "run-1")
         service = self._service()
 
         first = service.run_once()
