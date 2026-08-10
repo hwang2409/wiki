@@ -13,7 +13,6 @@ from unittest import mock
 from backend.app.agent_runtime import costs
 from backend.app.agent_runtime.archive_protocol import commit_archive
 
-
 FIXTURE_ROOT = Path(__file__).parent / "fixtures" / "agent_runtime"
 
 
@@ -474,11 +473,64 @@ class CostAggregatorTests(unittest.TestCase):
         )
         self.assertEqual(
             recovered["runs"]["run-terminal-recovery"]["offset"],
-            old_offset,
+            archived_raw.stat().st_size,
         )
         scanned_run_ids = [call.args[1] for call in scan_run.call_args_list]
         self.assertEqual(scanned_run_ids, ["run-terminal-recovery"])
         self.assertNotEqual(old_offset, archived_raw.stat().st_size)
+
+        shutil.rmtree(self.archive)
+        (self.runs / ".root-change").write_text("", encoding="utf-8")
+        deleted_state = costs._load_state()
+        deleted_state["runs_dir_signature"] = None
+        deleted = costs.refresh(deleted_state)
+        self.assertEqual(deleted["records"], {})
+        self.assertEqual(deleted["runs"], {})
+
+    def test_recovery_resolves_archive_after_hot_source_moves_mid_pass(self) -> None:
+        raw = self._run("run-source-race")
+        raw.write_text(
+            json.dumps(_envelope("2026-07-30T10:00:00Z", _usage(10, 2))) + "\n",
+            encoding="utf-8",
+        )
+        state = costs.refresh()
+        root_fd = costs._open_root()
+        self.assertIsNotNone(root_fd)
+        assert root_fd is not None
+        archive_dir = self.archive / "WIKI-178" / "20260730-130000"
+        resolved_kinds: list[str] = []
+        moved = False
+        real_resolve = costs.resolve_run_source
+
+        def resolve_with_archive_race(run_id: str) -> costs.RunSource:
+            nonlocal moved
+            source = real_resolve(run_id)
+            resolved_kinds.append(source.kind)
+            if not moved and source.kind == "HOT":
+                moved = True
+                (raw.parent / "events.jsonl").write_text("", encoding="utf-8")
+                archive_dir.parent.mkdir(parents=True)
+                shutil.move(str(raw.parent), archive_dir)
+                commit_archive(archive_dir)
+            return source
+
+        try:
+            with mock.patch.object(
+                costs, "resolve_run_source", side_effect=resolve_with_archive_race
+            ):
+                self.assertTrue(
+                    costs._scan_run(state, "run-source-race", root_fd)
+                )
+        finally:
+            os.close(root_fd)
+
+        self.assertEqual(
+            sum(record["input"] for record in state["records"].values()),
+            10,
+        )
+        self.assertIn("HOT", resolved_kinds)
+        self.assertIn("ARCHIVED", resolved_kinds)
+        self.assertNotIn("GONE", resolved_kinds)
 
     def test_save_checkpoints_unchanged_runs_with_cursors(self) -> None:
         first_raw = self._run("run-first")
