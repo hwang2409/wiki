@@ -2625,14 +2625,14 @@ class RunStoreTests(unittest.TestCase):
             )
             store.transition(record.run_id, LifecycleState.COMPLETED)
             events: list[str] = []
-            real_atomic_write = store_module._atomic_write_json
             real_fsync_file = store_module._fsync_file
             real_rmtree = store_module.shutil.rmtree
+            real_replace = store_module.os.replace
 
-            def atomic_write(path: Path, value: object) -> None:
-                real_atomic_write(path, value)
-                if path.name == "archive-complete.json":
+            def replace(source: Path, destination: Path) -> None:
+                if Path(destination).name == "archive-complete.json":
                     events.append("marker")
+                real_replace(source, destination)
 
             def rmtree(path: str | os.PathLike[str], *args: object, **kwargs: object) -> None:
                 if Path(path) == store.run_dir(record.run_id):
@@ -2644,8 +2644,8 @@ class RunStoreTests(unittest.TestCase):
                 real_fsync_file(path)
 
             with (
-                mock.patch.object(store_module, "_atomic_write_json", side_effect=atomic_write),
                 mock.patch.object(store_module, "_fsync_file", side_effect=fsync_file),
+                mock.patch.object(store_module.os, "replace", side_effect=replace),
                 mock.patch.object(store_module.shutil, "rmtree", side_effect=rmtree),
             ):
                 store.archive_current(record.run_id)
@@ -2711,6 +2711,102 @@ class RunStoreTests(unittest.TestCase):
             self.assertIsNotNone(store.get(record.run_id))
             self.assertEqual(list(paths.archive_dir.glob("*/*/archive-complete.json")), [])
 
+    def test_archive_marker_fsync_failure_is_not_trusted_on_retry(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            paths = _paths(root)
+            store = RunStore(paths)
+            record = store.create(_record(root))
+            store.transition(record.run_id, LifecycleState.COMPLETED)
+            marker_renamed = False
+            marker_fsync_failed = False
+            failed_session: Path | None = None
+            real_replace = store_module.os.replace
+            real_fsync = store_module.os.fsync
+
+            def replace(source: Path, destination: Path) -> None:
+                nonlocal marker_renamed, failed_session
+                real_replace(source, destination)
+                if Path(destination).name == "archive-complete.json":
+                    marker_renamed = True
+                    failed_session = Path(destination).parent
+
+            def fsync(fd: int) -> None:
+                nonlocal marker_fsync_failed
+                if marker_renamed and not marker_fsync_failed:
+                    marker_fsync_failed = True
+                    raise OSError("marker directory fsync failed")
+                real_fsync(fd)
+
+            with (
+                mock.patch.object(store_module.os, "replace", side_effect=replace),
+                mock.patch.object(store_module.os, "fsync", side_effect=fsync),
+                self.assertRaisesRegex(OSError, "marker directory fsync failed"),
+            ):
+                store.archive_current(record.run_id)
+
+            self.assertTrue(store.run_dir(record.run_id).is_dir())
+            self.assertEqual(list(paths.archive_dir.glob("*/*/archive-complete.json")), [])
+            assert failed_session is not None
+
+            _atomic_write_json(
+                failed_session / "archive-complete.json",
+                {
+                    "run_id": record.run_id,
+                    "completed_at": record.updated_at,
+                    "files": {"events.jsonl": 0},
+                },
+            )
+            self.assertIsNone(store.find_archived_run(record.run_id))
+
+            store.archive_current(record.run_id)
+            self.assertFalse(store.run_dir(record.run_id).exists())
+            self.assertIsNotNone(store.find_archived_run(record.run_id))
+
+    def test_prune_failure_is_logged_and_returned_in_sweep_result(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            paths = _paths(root)
+            with mock.patch.dict(os.environ, {"WIKI_AGENT_RUN_RETENTION_DAYS": "1"}):
+                store = RunStore(paths)
+                record = store.create(_record(root))
+                store.transition(record.run_id, LifecycleState.COMPLETED)
+                old = store.get(record.run_id)
+                old.updated_at = "2020-01-01T00:00:00+00:00"
+                _atomic_write_json(store.run_path(record.run_id), old.to_dict())
+
+                real_open = store_module.os.open
+                archive_root = paths.archive_dir.absolute()
+
+                def fail_archive_directory_open(
+                    path: str | os.PathLike[str],
+                    flags: int,
+                    mode: int = 0o777,
+                    *,
+                    dir_fd: int | None = None,
+                ) -> int:
+                    candidate = Path(path).absolute()
+                    if candidate.is_dir() and (
+                        candidate == archive_root or archive_root in candidate.parents
+                    ):
+                        raise OSError("archive directory open failed")
+                    if dir_fd is None:
+                        return real_open(path, flags, mode)
+                    return real_open(path, flags, mode, dir_fd=dir_fd)
+
+                with (
+                    mock.patch.object(
+                        store_module.os, "open", side_effect=fail_archive_directory_open
+                    ),
+                    self.assertLogs(store_module.logger, level="ERROR") as logs,
+                ):
+                    result = store.prune_terminal_runs()
+
+            self.assertEqual(result["failed_prunes"], 1)
+            self.assertEqual(result["pruned"], 0)
+            self.assertTrue(store.run_dir(record.run_id).is_dir())
+            self.assertTrue(any(record.run_id in line for line in logs.output))
+
     def test_archive_crash_points_keep_one_durable_copy_of_every_artifact(self) -> None:
         def prepare(root: Path) -> tuple[RunStore, RunRecord, list[Path]]:
             store = RunStore(_paths(root))
@@ -2772,12 +2868,17 @@ class RunStoreTests(unittest.TestCase):
                 durability_events.append(("directory", path))
 
             real_atomic = store_module._atomic_write_json
+            real_replace = store_module.os.replace
 
             def record_marker(path: Path, value: object) -> None:
                 nonlocal archive_session
                 real_atomic(path, value)
-                if path.name == "archive-complete.json":
-                    archive_session = path.parent
+
+            def replace(source: Path, destination: Path) -> None:
+                nonlocal archive_session
+                if Path(destination).name == "archive-complete.json":
+                    archive_session = Path(destination).parent
+                real_replace(source, destination)
 
             with (
                 mock.patch.object(store_module, "_fsync_file", side_effect=count_file),
@@ -2787,6 +2888,7 @@ class RunStoreTests(unittest.TestCase):
                 mock.patch.object(
                     store_module, "_atomic_write_json", side_effect=record_marker
                 ),
+                mock.patch.object(store_module.os, "replace", side_effect=replace),
                 mock.patch.object(
                     store_module.knowledge, "enqueue_refresh", return_value=None
                 ),
@@ -2817,8 +2919,15 @@ class RunStoreTests(unittest.TestCase):
                         "cdx-WIKI-CRASH-ARCHIVE-prompt.md",
                         "final-status.json",
                         "artifacts/artifact.bin",
-                        "archive-complete.json",
                     )
+                )
+            )
+            self.assertTrue(
+                any(
+                    path.parent == archive_session
+                    and path.name.startswith(".archive-complete.json.")
+                    for kind, path in durability_events
+                    if kind == "file"
                 )
             )
 
@@ -2850,7 +2959,11 @@ class RunStoreTests(unittest.TestCase):
                 def wrapped_atomic(path: Path, value: object) -> None:
                     nonlocal marker_committed
                     real_atomic(path, value)
-                    if path.name == "archive-complete.json":
+
+                def wrapped_replace(source: Path, destination: Path) -> None:
+                    nonlocal marker_committed
+                    real_replace(source, destination)
+                    if Path(destination).name == "archive-complete.json":
                         marker_committed = True
 
                 with (
@@ -2860,6 +2973,9 @@ class RunStoreTests(unittest.TestCase):
                     ),
                     mock.patch.object(
                         store_module, "_atomic_write_json", side_effect=wrapped_atomic
+                    ),
+                    mock.patch.object(
+                        store_module.os, "replace", side_effect=wrapped_replace
                     ),
                     mock.patch.object(
                         store_module.knowledge, "enqueue_refresh", return_value=None

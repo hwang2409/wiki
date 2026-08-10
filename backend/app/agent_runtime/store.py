@@ -3,6 +3,7 @@ from __future__ import annotations
 import base64
 import errno
 import json
+import logging
 import os
 import shutil
 import stat
@@ -40,6 +41,7 @@ from .types import (
 
 MAX_START_STATUS_BYTES = 64 * 1024
 DEFAULT_RUN_RETENTION_DAYS = 30
+logger = logging.getLogger(__name__)
 
 
 def _run_retention_cutoff() -> datetime:
@@ -465,6 +467,117 @@ def _fsync_file(path: Path) -> None:
         os.close(fd)
 
 
+def _archive_tree_expected_paths(source: Path, destination: Path) -> list[Path]:
+    """Return every archive file or symlink expected from an artifact tree."""
+
+    expected: list[Path] = []
+    with os.scandir(source) as entries:
+        for entry in entries:
+            source_entry = Path(entry.path)
+            destination_entry = destination / entry.name
+            if entry.is_dir(follow_symlinks=False):
+                expected.extend(
+                    _archive_tree_expected_paths(source_entry, destination_entry)
+                )
+            elif entry.is_symlink() or entry.is_file(follow_symlinks=False):
+                expected.append(destination_entry)
+            else:
+                raise StoreError(f"refusing special artifact: {source_entry}")
+    return expected
+
+
+def _archive_file_manifest(
+    session_dir: Path, expected_paths: list[Path]
+) -> dict[str, int]:
+    manifest: dict[str, int] = {}
+    for path in expected_paths:
+        try:
+            relative = path.relative_to(session_dir)
+            stat_result = path.lstat()
+        except (OSError, ValueError) as exc:
+            raise StoreError(f"archive file is missing: {path}") from exc
+        if stat.S_ISDIR(stat_result.st_mode):
+            raise StoreError(f"archive file is a directory: {path}")
+        manifest[str(relative)] = stat_result.st_size
+    return manifest
+
+
+def _archive_marker_is_complete(marker_path: Path, marker: dict[str, Any]) -> bool:
+    if marker_path.is_symlink() or not marker_path.is_file():
+        return False
+    files = marker.get("files")
+    required_files = {"run.json", "raw.jsonl", "events.jsonl"}
+    if not isinstance(files, dict):
+        for name in required_files:
+            try:
+                if not stat.S_ISREG((marker_path.parent / name).lstat().st_mode):
+                    return False
+            except OSError:
+                return False
+        return True
+    required_files.add("meta.json")
+    if not files or not required_files.issubset(files):
+        return False
+    session_dir = marker_path.parent
+    for relative, expected_size in files.items():
+        if (
+            not isinstance(relative, str)
+            or not isinstance(expected_size, int)
+            or isinstance(expected_size, bool)
+        ):
+            return False
+        relative_path = Path(relative)
+        if relative_path.is_absolute() or ".." in relative_path.parts:
+            return False
+        path = session_dir / relative_path
+        try:
+            stat_result = path.lstat()
+        except OSError:
+            return False
+        if stat.S_ISDIR(stat_result.st_mode) or stat_result.st_size != expected_size:
+            return False
+    return True
+
+
+def _publish_archive_marker(
+    session_dir: Path,
+    *,
+    run_id: str,
+    completed_at: str,
+    expected_paths: list[Path],
+) -> None:
+    """Publish a marker only after its file and directory are durable."""
+
+    marker_path = session_dir / "archive-complete.json"
+    marker_fd, marker_raw_tmp = tempfile.mkstemp(
+        prefix=f".{marker_path.name}.", dir=session_dir
+    )
+    os.close(marker_fd)
+    marker_tmp = Path(marker_raw_tmp)
+    marker_published = False
+    try:
+        manifest = _archive_file_manifest(session_dir, expected_paths)
+        _atomic_write_json(
+            marker_tmp,
+            {"run_id": run_id, "completed_at": completed_at, "files": manifest},
+        )
+        os.replace(marker_tmp, marker_path)
+        marker_published = True
+        _fsync_directory(session_dir)
+    except BaseException:
+        marker_tmp.unlink(missing_ok=True)
+        if marker_published:
+            try:
+                marker_path.unlink(missing_ok=True)
+            except OSError:
+                pass
+            try:
+                _fsync_directory(session_dir)
+            except OSError:
+                pass
+        raise
+
+
 def _atomic_write_json(path: Path, value: Any) -> None:
     _ensure_parent_dir(path.parent)
     if path.is_symlink():
@@ -656,9 +769,9 @@ class RunStore:
     ) -> None:
         self._terminal_run_prune_guard = guard
 
-    def prune_terminal_runs(self) -> None:
+    def prune_terminal_runs(self) -> dict[str, int]:
         with self._lock:
-            self._prune_terminal_runs()
+            return self._prune_terminal_runs()
 
     def current_turn_diff_path(self, run_id: str) -> Path:
         return self.run_dir(run_id) / "current-turn-diff.json"
@@ -677,7 +790,11 @@ class RunStore:
         for path in self.paths.archive_dir.glob("*/*/archive-complete.json"):
             try:
                 marker = _read_json(path)
-                if not isinstance(marker, dict) or marker.get("run_id") != run_id:
+                if (
+                    not isinstance(marker, dict)
+                    or marker.get("run_id") != run_id
+                    or not _archive_marker_is_complete(path, marker)
+                ):
                     continue
                 value = _read_json(path.parent / "run.json")
                 if isinstance(value, dict):
@@ -1192,9 +1309,8 @@ class RunStore:
             archived_entry is not None
             and archived_entry[0].created_at == record.created_at
         ):
-            # A prior boot published the archive marker before cleanup. The
-            # marker is the durable commit point; finish only the redundant
-            # hot-store removal and keep the archived transcript untouched.
+            # A prior boot published a complete archive before cleanup. Finish
+            # only the redundant hot-store removal and keep the archive intact.
             shutil.rmtree(self.run_dir(record.run_id))
             return
         session_dir = self._next_archive_session_dir(record.agent_id)
@@ -1208,6 +1324,7 @@ class RunStore:
         archive_worker["ended_at"] = ended_at
         if record.outcome is not None:
             archive_worker["outcome"] = record.outcome
+        expected_paths = [session_dir / "run.json", session_dir / "meta.json"]
         _atomic_write_json(session_dir / "run.json", record.to_dict())
         _atomic_write_json(
             session_dir / "meta.json",
@@ -1219,34 +1336,42 @@ class RunStore:
                 "source": "headless-supervisor",
             },
         )
-        self._copy_archive_file(
-            self.raw_events_path(record.run_id),
-            session_dir / f"{record.provider.legacy_kind}-{record.agent_id}.log",
-        )
-        self._copy_archive_file(
-            self.raw_events_path(record.run_id), session_dir / "raw.jsonl"
-        )
-        self._copy_archive_file(
-            self.normalized_events_path(record.run_id), session_dir / "events.jsonl"
-        )
-        self._copy_archive_file(
-            self.current_turn_diff_path(record.run_id),
-            session_dir / "current-turn-diff.json",
-        )
-        self._copy_archive_file(
-            self.provider_log_path(record.run_id), session_dir / "provider.log"
-        )
+        for source, destination in (
+            (
+                self.raw_events_path(record.run_id),
+                session_dir / f"{record.provider.legacy_kind}-{record.agent_id}.log",
+            ),
+            (self.raw_events_path(record.run_id), session_dir / "raw.jsonl"),
+            (
+                self.normalized_events_path(record.run_id),
+                session_dir / "events.jsonl",
+            ),
+            (
+                self.current_turn_diff_path(record.run_id),
+                session_dir / "current-turn-diff.json",
+            ),
+            (self.provider_log_path(record.run_id), session_dir / "provider.log"),
+        ):
+            if source.is_file():
+                expected_paths.append(destination)
+            self._copy_archive_file(source, destination)
         if record.initial_prompt:
             prompt_path = session_dir / f"{record.provider.legacy_kind}-{record.agent_id}-prompt.md"
+            expected_paths.append(prompt_path)
             _atomic_write_bytes(prompt_path, record.initial_prompt.encode("utf-8"))
         artifact_dir = self.run_dir(record.run_id) / "artifacts"
         if artifact_dir.is_symlink():
             raise StoreError(f"refusing symlink artifact directory: {artifact_dir}")
         if artifact_dir.is_dir():
+            expected_paths.extend(
+                _archive_tree_expected_paths(artifact_dir, session_dir / "artifacts")
+            )
             self._copy_archive_tree(artifact_dir, session_dir / "artifacts")
-        _atomic_write_json(
-            session_dir / "archive-complete.json",
-            {"run_id": record.run_id, "completed_at": ended_at},
+        _publish_archive_marker(
+            session_dir,
+            run_id=record.run_id,
+            completed_at=ended_at,
+            expected_paths=expected_paths,
         )
         knowledge.enqueue_refresh(runtime_dir=self.paths.runtime_dir)
         if isinstance(entry, dict):
@@ -1272,10 +1397,12 @@ class RunStore:
         if self.run_dir(record.run_id).exists():
             raise StoreConflict("pruned terminal run remains in the hot store")
 
-    def _prune_terminal_runs(self) -> None:
+    def _prune_terminal_runs(self) -> dict[str, int]:
         """Archive terminal runs older than the configured hot-store window."""
 
         cutoff = _run_retention_cutoff()
+        pruned = 0
+        failed_prunes = 0
         for snapshot in self.list_runs():
             if snapshot.state not in TERMINAL_STATES or not _run_is_older_than(
                 snapshot.updated_at, cutoff
@@ -1296,9 +1423,14 @@ class RunStore:
                 ):
                     continue
                 self._archive_terminal_run(record)
+                pruned += 1
             except (OSError, StoreError, TypeError, ValueError):
                 # Keep a terminal run intact if archive preparation fails.
-                continue
+                failed_prunes += 1
+                logger.exception(
+                    "terminal run prune failed: run_id=%s", snapshot.run_id
+                )
+        return {"pruned": pruned, "failed_prunes": failed_prunes}
 
     def _reconcile_existing_runs(self) -> None:
         """Repair event counters after a crash between JSONL fsync and run.json.
@@ -1437,7 +1569,11 @@ class RunStore:
                 marker = _read_json(marker_path)
             except (OSError, StoreError, TypeError, ValueError):
                 continue
-            if isinstance(marker, dict) and isinstance(marker.get("run_id"), str):
+            if (
+                isinstance(marker, dict)
+                and _archive_marker_is_complete(marker_path, marker)
+                and isinstance(marker.get("run_id"), str)
+            ):
                 archived_run_ids.add(marker["run_id"])
         if not records_by_agent:
             if changed:
@@ -1666,6 +1802,7 @@ class RunStore:
             archive_worker = {**current, "ended_at": ended_at}
             if record.outcome is not None:
                 archive_worker["outcome"] = record.outcome
+            expected_paths = [session_dir / "run.json", session_dir / "meta.json"]
             _atomic_write_json(session_dir / "run.json", record.to_dict())
             _atomic_write_json(
                 session_dir / "meta.json",
@@ -1677,33 +1814,30 @@ class RunStore:
                     "source": "headless-supervisor",
                 },
             )
-            self._copy_archive_file(
-                self.raw_events_path(run_id),
-                session_dir / log_name,
-            )
-            self._copy_archive_file(
-                self.raw_events_path(run_id),
-                session_dir / "raw.jsonl",
-            )
-            self._copy_archive_file(
-                self.normalized_events_path(run_id),
-                session_dir / "events.jsonl",
-            )
-            self._copy_archive_file(
-                self.current_turn_diff_path(run_id),
-                session_dir / "current-turn-diff.json",
-            )
+            for source, destination in (
+                (self.raw_events_path(run_id), session_dir / log_name),
+                (self.raw_events_path(run_id), session_dir / "raw.jsonl"),
+                (self.normalized_events_path(run_id), session_dir / "events.jsonl"),
+                (
+                    self.current_turn_diff_path(run_id),
+                    session_dir / "current-turn-diff.json",
+                ),
+            ):
+                if source.is_file():
+                    expected_paths.append(destination)
+                self._copy_archive_file(source, destination)
             # The normalized transcript is durable before the background index
             # hook is enqueued. A cache failure can never block archive
             # finalization or provider cleanup.
             knowledge.enqueue_refresh(runtime_dir=self.paths.runtime_dir)
-            self._copy_archive_file(
-                self.provider_log_path(run_id),
-                session_dir / "provider.log",
-            )
+            provider_log = self.provider_log_path(run_id)
+            if provider_log.is_file():
+                expected_paths.append(session_dir / "provider.log")
+            self._copy_archive_file(provider_log, session_dir / "provider.log")
             status_path_to_remove: Path | None = None
             if record.initial_prompt:
                 prompt_path = session_dir / prompt_name
+                expected_paths.append(prompt_path)
                 _atomic_write_bytes(prompt_path, record.initial_prompt.encode("utf-8"))
             status_path = self.status_path(record.agent_id)
             if status_path.is_file():
@@ -1713,20 +1847,27 @@ class RunStore:
                 except (OSError, ValueError):
                     status = None
                 if isinstance(status, dict):
-                    _atomic_write_json(session_dir / "final-status.json", status)
+                    final_status_path = session_dir / "final-status.json"
+                    expected_paths.append(final_status_path)
+                    _atomic_write_json(final_status_path, status)
 
             artifact_dir = self.run_dir(run_id) / "artifacts"
             if artifact_dir.is_symlink():
                 raise StoreError(f"refusing symlink artifact directory: {artifact_dir}")
             if artifact_dir.is_dir():
+                expected_paths.extend(
+                    _archive_tree_expected_paths(artifact_dir, session_dir / "artifacts")
+                )
                 self._copy_archive_tree(artifact_dir, session_dir / "artifacts")
 
             # Publish the archive only after every file is complete. Telemetry
             # scans sessions with this marker and never observes a copy in
             # progress.
-            _atomic_write_json(
-                session_dir / "archive-complete.json",
-                {"run_id": run_id, "completed_at": ended_at},
+            _publish_archive_marker(
+                session_dir,
+                run_id=run_id,
+                completed_at=ended_at,
+                expected_paths=expected_paths,
             )
 
             if record.start_request_id and record.implicit_start_request:

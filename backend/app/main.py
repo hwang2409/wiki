@@ -67,7 +67,7 @@ from .agent_runtime.command_log import AgentCommand
 from .agent_runtime import costs
 from .agent_runtime import graph_health
 from .agent_runtime.loop_state import derive_loop_state
-from .agent_runtime.store import RuntimePaths
+from .agent_runtime.store import RuntimePaths, _archive_marker_is_complete
 from .agent_runtime.ticket import (
     base_ticket,
     parse_reviewer_id,
@@ -3356,7 +3356,10 @@ def _archive_session_for_run_id(run_id: str) -> Path | None:
     for marker in AGENT_ARCHIVE_DIR.glob("*/*/archive-complete.json"):
         if marker.is_symlink() or not marker.is_file():
             continue
-        if _read_json_object(marker).get("run_id") != run_id:
+        marker_value = _read_json_object(marker)
+        if not _archive_marker_is_complete(marker, marker_value):
+            continue
+        if marker_value.get("run_id") != run_id:
             continue
         run = _read_json_object(marker.parent / "run.json")
         if run.get("run_id") == run_id:
@@ -3385,6 +3388,8 @@ def _archived_replay_runs(ticket: str) -> list[replay.RunSummary]:
         if marker.is_symlink() or not marker.is_file():
             continue
         marker_value = _read_json_object(marker)
+        if not _archive_marker_is_complete(marker, marker_value):
+            continue
         run_id = marker_value.get("run_id")
         if not isinstance(run_id, str) or not replay.valid_run_id(run_id):
             continue
