@@ -1,6 +1,7 @@
 import { useEffect, useMemo, useRef, useState } from "react";
 import { ChevronDown, X } from "lucide-react";
 import { THEMES, type ThemeId } from "./themes";
+import { applyLowercase, getStoredLowercase } from "./lowercase-mode";
 import {
   classifyEnumerated,
   fetchInstalledFamilies,
@@ -775,6 +776,7 @@ export function SettingsModal({
   const [bodySize, setBodySize] = useState(() => storedSize(BODY_SIZE_KEY, BODY_SIZE_DEFAULT));
   const [uiSize, setUiSize] = useState(() => storedSize(UI_SIZE_KEY, UI_SIZE_DEFAULT));
   const [monoSize, setMonoSize] = useState(() => storedSize(MONO_SIZE_KEY, MONO_SIZE_DEFAULT));
+  const [lowercase, setLowercase] = useState(() => getStoredLowercase());
   const fontPools = useInstalledFontPools();
 
   function updateSizes(body: number, ui: number, mono: number) {
@@ -836,6 +838,28 @@ export function SettingsModal({
                 </button>
               ))}
             </div>
+          </div>
+          <div className="settings-row">
+            <div className="settings-row-info">
+              <div className="settings-row-name">Lowercase mode</div>
+              <div className="settings-row-desc">
+                Render every label, note, and transcript in lowercase. Code, diffs, and terminal output keep their original case.
+              </div>
+            </div>
+            <button
+              aria-checked={lowercase}
+              aria-label="Lowercase mode"
+              className={`settings-toggle${lowercase ? " is-on" : ""}`}
+              role="switch"
+              type="button"
+              onClick={() => {
+                const next = !lowercase;
+                setLowercase(next);
+                applyLowercase(next);
+              }}
+            >
+              <span aria-hidden className="settings-toggle-thumb" />
+            </button>
           </div>
           <FontRoleRow fonts={fontPools.ui} role={FONT_ROLES.ui} />
           <FontRoleRow fonts={fontPools.text} role={FONT_ROLES.text} />

@@ -1721,6 +1721,76 @@ body.is-resizing-panes .pane-cell {
   text-align: right;
 }
 
+.settings-toggle {
+  position: relative;
+  flex-shrink: 0;
+  width: 36px;
+  height: 20px;
+  padding: 0;
+  border: 1px solid var(--background-modifier-border);
+  border-radius: 999px;
+  background-color: var(--background-secondary);
+  cursor: pointer;
+  transition: background-color 120ms ease, border-color 120ms ease;
+}
+
+.settings-toggle:hover {
+  background-color: var(--background-modifier-hover);
+}
+
+.settings-toggle:focus-visible {
+  outline: 2px solid var(--text-muted);
+  outline-offset: 2px;
+}
+
+.settings-toggle.is-on {
+  background-color: var(--text-normal);
+  border-color: var(--text-normal);
+}
+
+.settings-toggle-thumb {
+  position: absolute;
+  top: 50%;
+  left: 2px;
+  width: 14px;
+  height: 14px;
+  border-radius: 50%;
+  background-color: var(--text-normal);
+  transform: translateY(-50%);
+  transition: left 140ms ease, background-color 140ms ease;
+}
+
+.settings-toggle.is-on .settings-toggle-thumb {
+  left: 18px;
+  background-color: var(--background-primary);
+}
+
+.lowercase-mode,
+.lowercase-mode input,
+.lowercase-mode textarea,
+.lowercase-mode button,
+.lowercase-mode select {
+  text-transform: lowercase;
+}
+
+.lowercase-mode code,
+.lowercase-mode pre,
+.lowercase-mode pre *,
+.lowercase-mode .shiki-block,
+.lowercase-mode .shiki-block *,
+.lowercase-mode .cm-editor,
+.lowercase-mode .cm-editor *,
+.lowercase-mode .diff-view,
+.lowercase-mode .diff-view *,
+.lowercase-mode .wiki-diff,
+.lowercase-mode .wiki-diff *,
+.lowercase-mode .terminal-pane,
+.lowercase-mode .terminal-pane *,
+.lowercase-mode [data-preserve-case],
+.lowercase-mode [data-preserve-case] * {
+  text-transform: none;
+}
+
 .settings-reset {
   align-self: flex-start;
   padding: 4px 10px;
