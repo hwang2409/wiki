@@ -317,6 +317,48 @@
   .pill.is-implementing { background: color-mix(in oklab, var(--info) 14%, transparent); color: var(--info); }
   .pill.is-pr-open { background: color-mix(in oklab, var(--info) 14%, transparent); color: var(--info); }
   .pill.is-idle { color: var(--ink-3); }
+  .pill.is-waiting-approval { background: color-mix(in oklab, var(--accent) 22%, transparent); color: var(--accent); }
+  .pill.is-unrouted-verdict { background: color-mix(in oklab, var(--accent) 22%, transparent); color: var(--accent); }
+  .pill.is-review-gap { background: color-mix(in oklab, var(--warn) 22%, transparent); color: var(--warn); }
+  .pill.is-round {
+    background: transparent;
+    color: var(--ink-3);
+    border: 1px solid var(--rule-strong);
+  }
+  .pill.is-stalled-or-failed { background: color-mix(in oklab, var(--err) 14%, transparent); color: var(--err); }
+
+  .next-action {
+    display: inline-block;
+    margin-left: 6px;
+    padding: 1px 6px;
+    font-size: 10.5px;
+    font-family: ui-monospace, "SF Mono", Menlo, monospace;
+    color: var(--ink-2);
+    background: color-mix(in oklab, var(--rule) 55%, transparent);
+    border-radius: 3px;
+    letter-spacing: 0.02em;
+  }
+  .next-action.is-urgent {
+    color: var(--err);
+    background: color-mix(in oklab, var(--err) 12%, transparent);
+  }
+  .next-action.is-ready {
+    color: var(--ok);
+    background: color-mix(in oklab, var(--ok) 14%, transparent);
+  }
+  .next-action.is-review {
+    color: var(--accent);
+    background: color-mix(in oklab, var(--accent) 14%, transparent);
+  }
+
+  .pr-extra {
+    display: block;
+    font-size: 11px;
+    color: var(--ink-3);
+    margin-top: 2px;
+  }
+  .pr-extra a { border-bottom: none; }
+  .pr-stale { color: var(--warn); font-size: 10.5px; margin-left: 4px; }
 
   /* ---------- ticket description ---------- */
   .desc-cell {
@@ -485,7 +527,7 @@
   "use strict";
 
   const $ = (id) => document.getElementById(id);
-  const state = { data: null, lastFetch: 0, refetching: false };
+  const state = { data: null, lastFetch: 0, refetching: false, liveKind: null, eventSource: null };
   const REFRESH_MS = 60_000;      // ambient refresh even if SSE quiet
   const STALE_UI_MS = 120_000;    // no updates in 2 min → indicator warns
   let currentHighlight = null;
@@ -553,17 +595,21 @@
     el.hidden = false;
     const html = orchestrators.map((o) => {
       const cell = (label, num, cls) => {
-        const clsFinal = num === 0 ? "is-zero" : (cls || "");
-        return '<span><span class="num ' + clsFinal + '">' + num + '</span>' + escape(label) + '</span>';
+        const clsFinal = (num || 0) === 0 ? "is-zero" : (cls || "");
+        return '<span><span class="num ' + clsFinal + '">' + (num || 0) + '</span>' + escape(label) + '</span>';
       };
+      const stalled = o.stalled_or_failed || 0;
+      const waiting = o.waiting_approval || 0;
       return (
         '<div class="rollup" data-orch="' + escape(o.orch) + '">' +
           '<div class="rollup-name">' + escape(o.orch) + '</div>' +
           '<div class="rollup-counts">' +
             cell("working", o.working) +
+            cell("idle", o.idle) +
             cell("merge-ready", o.merge_ready, "is-ready") +
-            cell("blocked", o.blocked, o.blocked > 0 ? "is-alarm" : "") +
-            cell("stalled", o.stalled, o.stalled > 0 ? "is-stale" : "") +
+            cell("blocked", o.blocked, (o.blocked || 0) > 0 ? "is-alarm" : "") +
+            cell("stalled/failed", stalled, stalled > 0 ? "is-alarm" : "") +
+            (waiting > 0 ? cell("waiting-approval", waiting, "is-stale") : "") +
           '</div>' +
         '</div>'
       );
@@ -575,10 +621,14 @@
     const state = w.state || "unknown";
     const cls = state.replace(/[^a-z0-9-]/gi, "-");
     let out = pill(state, cls);
+    if (w.review_round) out += pill("r" + w.review_round, "round");
     (w.alarms || []).forEach((alarm) => {
       if (alarm === "stale") out += pill("stale " + agePhrase(w.status_age_s), "stale");
       else if (alarm === "attention") out += pill("attention", "warn");
-      // merge-ready/blocked already shown by state pill
+      else if (alarm === "waiting-approval" && state !== "waiting-approval") out += pill("waiting-approval", "waiting-approval");
+      else if (alarm === "unrouted-verdict") out += pill("unrouted verdict", "unrouted-verdict");
+      else if (alarm === "review-gap") out += pill("review-gap", "review-gap");
+      // merge-ready / blocked / waiting-approval-when-state=already-shown skipped
     });
     return out;
   }
@@ -654,8 +704,19 @@
       '</table>';
   }
 
-  function ticketWorkerLinks(ticket, workers) {
-    return (workers || []).filter((w) => w.ticket === ticket);
+  function ticketBaseLive(ticket, workers) {
+    // Live workers under the SAME base ticket — the aggregation folds
+    // reviewer siblings by base, so a ticket row like WIKI-266 must find
+    // WIKI-266-REVIEW3 workers too.
+    return (workers || []).filter((w) => (w.base_ticket || w.ticket) === ticket);
+  }
+
+  function nextActionClass(hint) {
+    if (!hint) return "";
+    if (/CI red|blocked|stalled|stall|unrouted|waiting/i.test(hint)) return "is-urgent";
+    if (/ready to merge|awaiting Henry/i.test(hint)) return "is-ready";
+    if (/review/i.test(hint)) return "is-review";
+    return "";
   }
 
   function renderTickets(tickets, workers) {
@@ -669,14 +730,31 @@
     count.textContent = tickets.length + " tracked";
 
     const rows = tickets.map((t) => {
-      const pr = prLabel(t.pr);
+      const primaryPr = prLabel(t.pr);
       const statusCls = (t.status || "unknown").replace(/[^a-z0-9-]/gi, "-");
       const age = agePhrase(ageFromIso(t.date));
-      const linkedWorkers = ticketWorkerLinks(t.ticket, workers);
+      const linkedWorkers = ticketBaseLive(t.ticket, workers);
       const linkPill = linkedWorkers.length > 0
-        ? '<a class="worker-link" data-target="worker-' + escape(t.ticket) + '">' + linkedWorkers.length + ' live worker' + (linkedWorkers.length === 1 ? '' : 's') + '</a>'
+        ? '<a class="worker-link" data-target="worker-' + escape(linkedWorkers[0].ticket) + '">' + linkedWorkers.length + ' live worker' + (linkedWorkers.length === 1 ? '' : 's') + '</a>'
         : '';
       const detail = t.detail ? '<span class="detail">' + escape(t.detail) + '</span>' : '';
+      const roundPill = t.review_round ? ' ' + pill("r" + t.review_round, "round") : '';
+      const hint = t.next_action
+        ? ' <span class="next-action ' + nextActionClass(t.next_action) + '">' + escape(t.next_action) + '</span>'
+        : '';
+      // Extra PRs beyond the primary — list newest-first per aggregator.
+      const extraPrs = (t.prs || []).filter((p) => p.pr && p.pr !== t.pr);
+      const extraHtml = extraPrs.length > 0
+        ? extraPrs.map((p) => {
+            const lbl = prLabel(p.pr);
+            const staleTag = p.stale ? '<span class="pr-stale">stale</span>' : '';
+            return '<span class="pr-extra">' +
+              (lbl ? '<a href="' + escape(p.pr) + '" target="_blank" rel="noopener">' + escape(lbl.num) + ' ' + escape(lbl.repo || "") + '</a>' : escape(p.pr)) +
+              staleTag +
+              '</span>';
+          }).join("")
+        : "";
+      const primaryStale = (t.prs || []).some((p) => p.pr === t.pr && p.stale);
       return (
         '<tr id="ticket-' + escape(t.ticket) + '">' +
           '<td class="ticket-id">' + escape(t.ticket) + '</td>' +
@@ -685,12 +763,12 @@
             detail +
             (linkPill ? '<br>' + linkPill : '') +
           '</td>' +
-          '<td class="pr-cell' + (pr ? '' : ' empty') + '">' +
-            (pr
-              ? '<a href="' + escape(t.pr) + '" target="_blank" rel="noopener"><span class="pr-num">' + escape(pr.num) + '</span><br><span class="pr-repo">' + escape(pr.repo || "") + '</span></a>'
+          '<td class="pr-cell' + (primaryPr ? '' : ' empty') + '">' +
+            (primaryPr
+              ? '<a href="' + escape(t.pr) + '" target="_blank" rel="noopener"><span class="pr-num">' + escape(primaryPr.num) + '</span><br><span class="pr-repo">' + escape(primaryPr.repo || "") + '</span></a>' + (primaryStale ? '<span class="pr-stale">stale</span>' : '') + extraHtml
               : '—') +
           '</td>' +
-          '<td>' + pill(t.status || "unknown", statusCls) + '</td>' +
+          '<td>' + pill(t.status || "unknown", statusCls) + roundPill + hint + '</td>' +
           '<td class="age-cell">' + escape(age) + '</td>' +
         '</tr>'
       );
@@ -756,12 +834,16 @@
     renderFleet(data.workers || []);
     renderTickets(data.tickets || [], data.workers || []);
     renderArchived(data.archived_today || []);
-    setLiveState("live");
+    // Q7: DO NOT set live here — render fires on the timer tick too, and
+    // resetting to "live" on tick would mask a real stale/offline state.
+    // The live indicator is owned by fetchData success/failure only.
   }
 
   function setLiveState(kind) {
     const el = $("live-indicator");
     const text = $("live-text");
+    if (kind === state.liveKind) return;
+    state.liveKind = kind;
     el.classList.remove("is-stale", "is-offline");
     if (kind === "stale") { el.classList.add("is-stale"); text.textContent = "stale"; }
     else if (kind === "offline") { el.classList.add("is-offline"); text.textContent = "offline"; }
@@ -779,6 +861,9 @@
       $("error").hidden = true;
       $("error").textContent = "";
       render(data);
+      // Q7: only a SUCCESSFUL refresh clears stale/offline. Timer ticks
+      // and error paths never elevate the indicator.
+      setLiveState("live");
     } catch (err) {
       const banner = $("error");
       banner.hidden = false;
@@ -793,6 +878,7 @@
     if (typeof EventSource === "undefined") return;
     let src;
     try { src = new EventSource("/api/events"); } catch (e) { return; }
+    state.eventSource = src;
     src.addEventListener("message", (evt) => {
       try {
         const parsed = JSON.parse(evt.data);
@@ -803,13 +889,23 @@
       // Browser auto-reconnects. Don't clobber the live indicator on a
       // transient blip — the periodic fetchData is our real health signal.
     });
+    // Clean up on unload so the browser doesn't keep the SSE socket
+    // pinned after the page closes (Q9 SSE lifecycle).
+    window.addEventListener("beforeunload", () => {
+      try { src.close(); } catch (_) { /* ignore */ }
+    });
   }
 
   function tickStaleness() {
-    if (state.lastFetch && Date.now() - state.lastFetch > STALE_UI_MS) {
+    // Downgrade only: if no successful fetch in the staleness window,
+    // mark stale. NEVER upgrade to live from a timer tick — that reset
+    // masked real outages in round 1.
+    if (state.liveKind !== "offline"
+        && state.lastFetch
+        && Date.now() - state.lastFetch > STALE_UI_MS) {
       setLiveState("stale");
     }
-    // Update age columns without a refetch to keep counters ticking.
+    // Re-render so the age counters keep ticking without a refetch.
     if (state.data) render(state.data);
   }
 
