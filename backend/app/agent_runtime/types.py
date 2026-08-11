@@ -162,6 +162,7 @@ class RunRecord:
     role: str
     model: str
     worktree: str
+    auto_archive: bool = False
     backend_base_url: str | None = None
     desired_model: str | None = None
     state: LifecycleState = LifecycleState.STARTING
@@ -192,6 +193,10 @@ class RunRecord:
     replaced_by_run_id: str | None = None
     replaced_legacy_provider: str | None = None
     outcome: str | None = None
+    last_viewed_at: str | None = None
+    last_viewed_seq: int | None = None
+    auto_archive_terminal_at: str | None = None
+    auto_archive_verdict_seq: int | None = None
     start_request_id: str | None = None
     implicit_start_request: bool = False
     # Set before a fresh start is published. It contains the exact registry
@@ -246,6 +251,7 @@ class RunRecord:
         agent_id: str,
         provider: ProviderKind,
         role: str,
+        auto_archive: bool = False,
         model: str,
         worktree: str,
         prompt: str,
@@ -262,6 +268,7 @@ class RunRecord:
             agent_id=agent_id,
             provider=provider,
             role=role,
+            auto_archive=auto_archive,
             model=model,
             worktree=worktree,
             backend_base_url=backend_base_url,
@@ -280,6 +287,7 @@ class RunRecord:
             "agent_id": self.agent_id,
             "provider": self.provider.value,
             "role": self.role,
+            "auto_archive": self.auto_archive,
             "model": self.model,
             "desired_model": self.desired_model,
             "effort": self.effort,
@@ -316,6 +324,10 @@ class RunRecord:
             "replaced_by_run_id": self.replaced_by_run_id,
             "replaced_legacy_provider": self.replaced_legacy_provider,
             "outcome": self.outcome,
+            "last_viewed_at": self.last_viewed_at,
+            "last_viewed_seq": self.last_viewed_seq,
+            "auto_archive_terminal_at": self.auto_archive_terminal_at,
+            "auto_archive_verdict_seq": self.auto_archive_verdict_seq,
             "start_request_id": self.start_request_id,
             "implicit_start_request": self.implicit_start_request,
             "start_transaction": self.start_transaction,
@@ -345,6 +357,7 @@ class RunRecord:
             agent_id=str(value["agent_id"]),
             provider=ProviderKind(value["provider"]),
             role=str(value["role"]),
+            auto_archive=bool(value.get("auto_archive", False)),
             model=str(value["model"]),
             desired_model=value.get("desired_model"),
             effort=value.get("effort"),
@@ -391,6 +404,18 @@ class RunRecord:
             replaced_by_run_id=value.get("replaced_by_run_id"),
             replaced_legacy_provider=value.get("replaced_legacy_provider"),
             outcome=value.get("outcome"),
+            last_viewed_at=value.get("last_viewed_at"),
+            last_viewed_seq=(
+                int(value["last_viewed_seq"])
+                if isinstance(value.get("last_viewed_seq"), int)
+                else None
+            ),
+            auto_archive_terminal_at=value.get("auto_archive_terminal_at"),
+            auto_archive_verdict_seq=(
+                int(value["auto_archive_verdict_seq"])
+                if isinstance(value.get("auto_archive_verdict_seq"), int)
+                else None
+            ),
             start_request_id=value.get("start_request_id"),
             implicit_start_request=bool(value.get("implicit_start_request", False)),
             start_transaction=(

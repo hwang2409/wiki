@@ -1542,23 +1542,30 @@ def _snapshot_startup_baselines() -> None:
 def _resolve_viewed_fields(
     run_id: str | None,
     viewed_map: dict[str, ViewedEntry],
+    current: dict[str, Any] | None = None,
 ) -> tuple[str | None, int | None, str | None, int | None]:
     """Return ``(latest_event_at, latest_event_seq, last_viewed_at, last_viewed_seq)``.
 
     Order of precedence for the viewed pair:
-      1. Explicit entry in ``viewed_map`` (user marked the row viewed).
-      2. Pre-deploy classification: the run was created before this supervisor's
+      1. Supervisor-owned entry in ``current`` (user marked the row viewed).
+      2. Legacy entry in ``viewed_map`` (user marked the row viewed).
+      3. Pre-deploy classification: the run was created before this supervisor's
          deploy cutoff (or the run predates the ``created_at`` schema) — freeze
          a per-run baseline at the first-observed durable seq so legacy sessions
          don't show a dot after upgrade AND future events land as unread.
          WIKI-147 R4 B1.
-      3. Post-deploy new session (created_at >= deploy cutoff) — leave ``None``
+      4. Post-deploy new session (created_at >= deploy cutoff) — leave ``None``
          so any recorded event renders as unread.
     """
 
     latest_at, latest_seq = _load_run_freshness(run_id)
     if not run_id or latest_at is None or latest_seq is None:
         return latest_at, latest_seq, None, None
+    if isinstance(current, dict):
+        stored_seq = current.get("last_viewed_seq")
+        stored_at = current.get("last_viewed_at")
+        if isinstance(stored_seq, int) and stored_seq >= 0 and isinstance(stored_at, str):
+            return latest_at, latest_seq, stored_at, stored_seq
     entry = viewed_map.get(run_id)
     if entry is not None:
         return latest_at, latest_seq, entry.get("at"), entry.get("seq")
@@ -2102,7 +2109,7 @@ def agents(include_history: bool = False) -> dict[str, object]:
             latest_event_seq,
             last_viewed_at,
             last_viewed_seq,
-        ) = _resolve_viewed_fields(current.get("run_id"), viewed_map)
+        ) = _resolve_viewed_fields(current.get("run_id"), viewed_map, current)
         workers.append(
             {
                 "ticket": ticket,
@@ -2117,6 +2124,7 @@ def agents(include_history: bool = False) -> dict[str, object]:
                 "provider_pid": runtime.get("provider_pid") if headless else None,
                 "kind": current.get("kind"),
                 "role": current.get("role"),
+                "auto_archive": current.get("auto_archive"),
                 "model": current.get("model"),
                 "desired_model": current.get("desired_model"),
                 "effort": current.get("effort"),
@@ -2264,6 +2272,22 @@ def mark_run_viewed(run_id: str, body: MarkViewedBody | None = None) -> dict[str
         raise HTTPException(status_code=400, detail="seq must be non-negative")
     # Client cannot claim to have seen events the server has not observed.
     accepted_seq = min(requested_seq, current_seq)
+
+    # Headless runs persist viewed state in the supervisor-owned run record.
+    # The file-backed path below remains for legacy and isolated test runs.
+    if AGENT_RUNS_DIR.resolve() == SUPERVISOR_CLIENT.paths.runs_dir.resolve():
+        result = _supervisor_request(
+            "run/mark_viewed",
+            {"run_id": run_id, "seq": accepted_seq},
+        )
+        if isinstance(result, dict):
+            return {
+                "run_id": run_id,
+                "last_viewed_at": result.get("last_viewed_at"),
+                "last_viewed_seq": result.get("last_viewed_seq"),
+                "latest_event_at": result.get("updated_at", current_at),
+                "latest_event_seq": result.get("unread_event_seq", current_seq),
+            }
 
     with _viewed_lock(exclusive=True):
         viewed_map = _read_viewed_map_locked()
@@ -4265,6 +4289,7 @@ class SpawnWorkerIn(BaseModel):
     ticket: str = Field(..., min_length=1, max_length=80)
     kind: str = Field(..., min_length=2, max_length=8)
     role: str = Field(..., min_length=4, max_length=16)
+    auto_archive: bool | None = None
     model: str = Field(..., min_length=2, max_length=64)
     effort: str | None = Field(default=None, max_length=16)
     workdir: str = Field(..., min_length=1, max_length=4096)
@@ -4559,6 +4584,14 @@ def _control_headless_agent(
             return dict(prior_result)
     resolved = _registry_agent(_read_agent_registry(), raw_id)
     if resolved is None:
+        if action == "archive":
+            params: dict[str, object] = {"agent_id": raw_id, "outcome": outcome}
+            if request_id is not None:
+                params["request_id"] = request_id
+                params["command_hash_payload"] = {"outcome": outcome}
+            result = _supervisor_request("run/archive", params)
+            if isinstance(result, dict):
+                return dict(result)
         raise HTTPException(status_code=404, detail="No registered agent")
     resolved_id, _, current = resolved
     if not _is_headless(current):
@@ -5029,6 +5062,7 @@ def spawn_agent(
             "agent_id": ticket,
             "provider": "codex" if kind == "cdx" else "claude",
             "role": role,
+            "auto_archive": body.auto_archive,
             "model": model,
             "effort": effort,
             "worktree": str(workdir_path),
@@ -5091,6 +5125,7 @@ def spawn_agent(
             "agent_id": ticket,
             "provider": "codex" if kind == "cdx" else "claude",
             "role": role,
+            "auto_archive": body.auto_archive,
             "model": model,
             "effort": effort,
             "worktree": str(workdir_path),
@@ -5103,6 +5138,7 @@ def spawn_agent(
                 "agent_id": ticket,
                 "provider": "codex" if kind == "cdx" else "claude",
                 "role": role,
+                "auto_archive": body.auto_archive,
                 "model": model,
                 "effort": effort,
                 "worktree": str(workdir_path),
