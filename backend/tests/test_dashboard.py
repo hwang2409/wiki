@@ -1634,5 +1634,229 @@ class DashboardPageRouterTests(unittest.TestCase):
             self.assertEqual(body["orchestrators"], [])
 
 
+class SameTicketPrHistoryTests(unittest.TestCase):
+    """WIKI-276 R1: a task row carries ALL its PRs, newest first.
+
+    Mutation gate: restoring the ``by_ticket[row["ticket"]] = row``
+    overwrite in :func:`dashboard.merge_rows` (or the ``ticket in seen``
+    dedup in :func:`dashboard.archived_rows`) drops the older PR from
+    the payload and both assertions below fail.
+    """
+
+    def test_merged_and_open_pr_on_same_ticket_both_present(self) -> None:
+        anchor = datetime(2026, 8, 11, 14, 0, tzinfo=timezone.utc)
+        pr_old = "https://github.com/phoebe-health/phoebe/pull/100"
+        pr_new = "https://github.com/phoebe-health/phoebe/pull/200"
+        spawned = datetime(2026, 8, 10, 0, 0, tzinfo=timezone.utc)
+        registry = {
+            "PHO-1": {
+                "current": {
+                    "role": "implement",
+                    "kind": "cc",
+                    "orch": "phoebe-dev",
+                    "spawned_at": spawned.isoformat(),
+                    "pr": pr_new,
+                }
+            }
+        }
+        statuses = {
+            "PHO-1": {
+                "state": "working",
+                "pr": pr_new,
+                "step": "editing",
+                "_mtime": datetime(2026, 8, 11, 0, 0, tzinfo=timezone.utc).timestamp(),
+            }
+        }
+        archived = [
+            {
+                "ticket": "PHO-1",
+                "archived_at": "2026-08-05T00:00:00+00:00",
+                "outcome": "merged",
+                "role": "implement",
+                "kind": "cc",
+                "state": "merge-ready",
+                "step": "shipped",
+                "pr": pr_old,
+            }
+        ]
+        cache = StubCache(
+            {
+                pr_new: _enrich(state="OPEN", title="new work", updated_at="2026-08-11T00:00:00Z"),
+                pr_old: _enrich(state="MERGED", deployed=True, title="old work",
+                                 updated_at="2026-08-05T00:00:00Z"),
+            }
+        )
+        payload = dashboard.build_payload(registry, statuses, archived, cache=cache, now=anchor)
+        rows = [row for row in payload["tickets"] if row["ticket"] == "PHO-1"]
+        self.assertEqual(len(rows), 1, "one row per base ticket")
+        row = rows[0]
+        pr_urls = [entry["pr"] for entry in row["prs"]]
+        self.assertEqual(
+            len(pr_urls), 2,
+            f"both PRs on PHO-1 must survive (newest + old merged), got {pr_urls}",
+        )
+        # Newest first — the open PR outranks the older merged one.
+        self.assertEqual(pr_urls[0], pr_new)
+        self.assertEqual(pr_urls[1], pr_old)
+        # Each PR carries its own CI/state chip.
+        pr_status = {entry["pr"]: entry["status"] for entry in row["prs"]}
+        self.assertEqual(pr_status[pr_new], "passing")
+        self.assertEqual(pr_status[pr_old], "prod")
+
+    def test_archived_rows_keep_distinct_prs_for_same_ticket(self) -> None:
+        pr_old = "https://github.com/phoebe-health/phoebe/pull/1"
+        pr_new = "https://github.com/phoebe-health/phoebe/pull/2"
+        archived = [
+            {
+                "ticket": "PHO-9",
+                "archived_at": "2026-07-16T10:00:00+00:00",
+                "outcome": "merged",
+                "role": "implement",
+                "pr": pr_new,
+            },
+            {
+                "ticket": "PHO-9",
+                "archived_at": "2026-07-15T10:00:00+00:00",
+                "outcome": "merged",
+                "role": "implement",
+                "pr": pr_old,
+            },
+        ]
+        rows = dashboard.archived_rows(archived)
+        pr_urls = {row["pr"] for row in rows if row["ticket"] == "PHO-9"}
+        self.assertEqual(pr_urls, {pr_old, pr_new})
+
+    def test_merge_rows_preserves_archived_pr_when_live_carries_new_pr(self) -> None:
+        pr_old = "https://github.com/phoebe-health/phoebe/pull/50"
+        pr_new = "https://github.com/phoebe-health/phoebe/pull/60"
+        live = [_row(ticket="PHO-42", live=True, state="working", pr=pr_new)]
+        archived = [_row(ticket="PHO-42", outcome="merged", pr=pr_old)]
+        merged = dashboard.merge_rows(live, archived)
+        pr_urls = sorted(row["pr"] for row in merged if row["ticket"] == "PHO-42")
+        self.assertEqual(pr_urls, sorted([pr_old, pr_new]))
+
+
+class RoundRobinRefreshQueueTests(unittest.TestCase):
+    """WIKI-276 R2: pace-gate-closed refreshes are DEFERRED, not dropped.
+
+    Mutation gate: restoring the early ``return`` in
+    :func:`dashboard.PrCache.request_refresh` when the per-repo pace
+    gate is closed (drop-on-closed-gate) causes the deferred PR to
+    never enrich — the assertion on ``fetched`` below fails.
+    """
+
+    def test_deferred_request_survives_without_re_request(self) -> None:
+        fetched: list[str] = []
+
+        def fetch(url: str, repo: str) -> dict:
+            fetched.append(url)
+            return _enrich(title=url)
+
+        cache = dashboard.PrCache(fetch)
+        cache._executor = InlineExecutor()
+        repo = "phoebe-health/phoebe"
+        pr_a = "https://github.com/phoebe-health/phoebe/pull/1"
+        pr_b = "https://github.com/phoebe-health/phoebe/pull/2"
+
+        base = 1_000_000.0
+        with mock.patch.object(dashboard.time, "time", return_value=base):
+            cache.request_refresh(pr_a, repo)
+            cache.request_refresh(pr_b, repo)  # gate closed -> deferred
+        self.assertEqual(fetched, [pr_a], "only pr_a fetched under closed gate")
+        # R2: pr_b must be queued, not dropped.
+        self.assertIn(
+            pr_b, cache._repo_queue.get(repo, []),
+            "deferred pr_b must sit in the round-robin queue",
+        )
+
+        # Later tick: pr_b is NOT re-requested by the payload. The
+        # queue must still drain it on the next same-repo touch.
+        with mock.patch.object(
+            dashboard.time,
+            "time",
+            return_value=base + dashboard.REPO_MIN_INTERVAL_SECONDS + 0.1,
+        ):
+            cache.request_refresh(pr_a, repo)
+        self.assertEqual(
+            fetched, [pr_a, pr_b],
+            "deferred pr_b must be served on the next same-repo tick even "
+            f"without re-request; got {fetched}",
+        )
+
+    def test_six_prs_all_enrich_within_six_intervals(self) -> None:
+        fetched: list[str] = []
+
+        def fetch(url: str, repo: str) -> dict:
+            fetched.append(url)
+            return _enrich(title=url)
+
+        cache = dashboard.PrCache(fetch)
+        cache._executor = InlineExecutor()
+        repo = "phoebe-health/phoebe"
+        prs = [f"https://github.com/{repo}/pull/{idx}" for idx in range(1, 7)]
+
+        base = 1_000_000.0
+        clock = {"t": base}
+        with mock.patch.object(dashboard.time, "time", side_effect=lambda: clock["t"]):
+            for pr in prs:
+                cache.request_refresh(pr, repo)
+            self.assertEqual(fetched, [prs[0]], "only one PR per interval")
+
+            # Advance the clock through five more intervals — payload
+            # re-requests the full list each tick.
+            for tick in range(1, 6):
+                clock["t"] = base + tick * dashboard.REPO_MIN_INTERVAL_SECONDS + 0.1
+                for pr in prs:
+                    cache.request_refresh(pr, repo)
+
+        self.assertEqual(
+            sorted(fetched), sorted(prs),
+            "all six PRs must enrich within six intervals; "
+            f"got {fetched}",
+        )
+        # Round-robin FIFO order — deferred PRs served oldest-first.
+        self.assertEqual(
+            fetched, prs,
+            f"queue must serve deferred PRs oldest-unrefreshed-first; got {fetched}",
+        )
+
+    def test_terminal_pr_pruned_from_queue(self) -> None:
+        fetched: list[str] = []
+
+        def fetch(url: str, repo: str) -> dict:
+            fetched.append(url)
+            return _enrich(state="MERGED", deployed=True, title=url)
+
+        cache = dashboard.PrCache(fetch)
+        cache._executor = InlineExecutor()
+        repo = "phoebe-health/phoebe"
+        pr_a = "https://github.com/phoebe-health/phoebe/pull/1"
+        pr_b = "https://github.com/phoebe-health/phoebe/pull/2"
+
+        base = 1_000_000.0
+        with mock.patch.object(dashboard.time, "time", return_value=base):
+            cache.request_refresh(pr_a, repo)  # submits and merges
+            cache.request_refresh(pr_b, repo)  # deferred
+
+        # Simulate pr_b turning terminal via an out-of-band path before
+        # its slot arrives.
+        with cache._lock:
+            cache._entries[pr_b] = {
+                "checked_at": base,
+                "data": {"state": "CLOSED"},
+                "last_success_at": base,
+                "failure_at": None,
+            }
+
+        with mock.patch.object(
+            dashboard.time,
+            "time",
+            return_value=base + dashboard.REPO_MIN_INTERVAL_SECONDS + 0.1,
+        ):
+            cache.request_refresh(pr_a, repo)  # drain attempt
+        self.assertEqual(fetched, [pr_a], "terminal deferred PR is pruned, not fetched")
+        self.assertNotIn(pr_b, cache._repo_queue.get(repo, []))
+
+
 if __name__ == "__main__":
     unittest.main()

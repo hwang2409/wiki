@@ -250,16 +250,23 @@ def _merge_deployed(repo: str, merge_sha: str) -> bool | None:
 class PrCache:
     """TTL cache over fetch_pr_summary with per-repository pacing.
 
-    Two guarantees the reviewer asked for (Q6):
+    Guarantees:
 
     * ``request_refresh`` never enqueues a fetch for a repository within
       ``REPO_MIN_INTERVAL_SECONDS`` of the previous fetch for that same
       repo — a burst of task rows on the same repo pays one round-trip,
-      not one per PR.
+      not one per PR (Q6).
     * A fetch that raises records ``failure_at`` on the cache entry and
       leaves the previous payload untouched; ``lookup`` surfaces the
       failure alongside the last known-good timestamp so the page can
-      render a stale marker instead of quietly showing pre-outage data.
+      render a stale marker instead of quietly showing pre-outage data
+      (Q6).
+    * When the per-repo pace gate is closed, refresh requests are
+      DEFERRED to a per-repo round-robin queue instead of dropped. Every
+      PR is served on a subsequent tick in oldest-unrefreshed-first
+      order, so N PRs on the same repo all enrich within roughly
+      ``N * REPO_MIN_INTERVAL_SECONDS`` worst case even when the
+      browser payload never re-lists a deferred PR (R2).
     """
 
     def __init__(self, fetch: Callable[[str, str], dict[str, Any]] = fetch_pr_summary) -> None:
@@ -268,6 +275,10 @@ class PrCache:
         self._entries: dict[str, dict[str, Any]] = {}
         self._inflight: set[str] = set()
         self._repo_last_call_at: dict[str, float] = {}
+        # R2: per-repo FIFO of PRs deferred because the pace gate was
+        # closed when they were requested. Drained oldest-first every
+        # time any request_refresh touches the same repo.
+        self._repo_queue: dict[str, list[str]] = {}
         self._executor: ThreadPoolExecutor | None = None
 
     def lookup(self, pr_url: str) -> dict[str, Any] | None:
@@ -289,31 +300,89 @@ class PrCache:
             }
 
     def request_refresh(self, pr_url: str, repo: str) -> None:
+        # Collect submissions inside the lock, submit outside — an
+        # InlineExecutor (used by tests) would reacquire the lock
+        # synchronously during ``submit`` otherwise.
+        to_submit: list[str] = []
         with self._lock:
-            entry = self._entries.get(pr_url)
-            if entry:
-                if time.time() - entry["checked_at"] < CACHE_TTL_SECONDS:
-                    return
-                data = entry.get("data")
-                if data and _is_terminal(data):
-                    return
-            if pr_url in self._inflight:
-                return
-            last_repo_call = self._repo_last_call_at.get(repo)
-            if (
-                last_repo_call is not None
-                and time.time() - last_repo_call < REPO_MIN_INTERVAL_SECONDS
-            ):
-                return
-            self._inflight.add(pr_url)
-            self._repo_last_call_at[repo] = time.time()
-            if self._executor is None:
+            self._prune_queue_locked(repo)
+            # Every same-repo touch first serves the oldest deferred PR
+            # for that repo, so a deferred request keeps its turn even
+            # if the payload never re-lists it.
+            drained = self._drain_queue_locked(repo)
+            if drained is not None:
+                to_submit.append(drained)
+            current = self._enqueue_or_submit_locked(pr_url, repo)
+            if current is not None:
+                to_submit.append(current)
+            if to_submit and self._executor is None:
                 self._executor = ThreadPoolExecutor(
                     max_workers=GH_MAX_WORKERS,
                     thread_name_prefix="dashboard-gh",
                 )
             executor = self._executor
-        executor.submit(self._refresh, pr_url, repo)
+        if executor is None:
+            return
+        for submitted in to_submit:
+            executor.submit(self._refresh, submitted, repo)
+
+    def _is_fresh_or_terminal_locked(self, pr_url: str) -> bool:
+        entry = self._entries.get(pr_url)
+        if not entry:
+            return False
+        if time.time() - entry["checked_at"] < CACHE_TTL_SECONDS:
+            return True
+        data = entry.get("data")
+        return bool(data and _is_terminal(data))
+
+    def _pace_gate_open_locked(self, repo: str) -> bool:
+        last = self._repo_last_call_at.get(repo)
+        return last is None or time.time() - last >= REPO_MIN_INTERVAL_SECONDS
+
+    def _prune_queue_locked(self, repo: str) -> None:
+        queue = self._repo_queue.get(repo)
+        if not queue:
+            return
+        keep = [
+            pr_url
+            for pr_url in queue
+            if pr_url not in self._inflight
+            and not self._is_fresh_or_terminal_locked(pr_url)
+        ]
+        if keep:
+            self._repo_queue[repo] = keep
+        else:
+            self._repo_queue.pop(repo, None)
+
+    def _drain_queue_locked(self, repo: str) -> str | None:
+        queue = self._repo_queue.get(repo)
+        if not queue or not self._pace_gate_open_locked(repo):
+            return None
+        pr_url = queue.pop(0)
+        if not queue:
+            self._repo_queue.pop(repo, None)
+        if pr_url in self._inflight or self._is_fresh_or_terminal_locked(pr_url):
+            return None
+        self._mark_submitted_locked(pr_url, repo)
+        return pr_url
+
+    def _enqueue_or_submit_locked(self, pr_url: str, repo: str) -> str | None:
+        if self._is_fresh_or_terminal_locked(pr_url):
+            return None
+        if pr_url in self._inflight:
+            return None
+        queue = self._repo_queue.get(repo)
+        if queue and pr_url in queue:
+            return None
+        if not self._pace_gate_open_locked(repo):
+            self._repo_queue.setdefault(repo, []).append(pr_url)
+            return None
+        self._mark_submitted_locked(pr_url, repo)
+        return pr_url
+
+    def _mark_submitted_locked(self, pr_url: str, repo: str) -> None:
+        self._inflight.add(pr_url)
+        self._repo_last_call_at[repo] = time.time()
 
     def _refresh(self, pr_url: str, repo: str) -> None:
         data: dict[str, Any] | None = None
@@ -450,19 +519,28 @@ def _status_mtime_iso(status: dict[str, Any]) -> str | None:
 
 
 def archived_rows(archived: list[dict[str, Any]]) -> list[dict[str, Any]]:
-    """One row per sibling archive session (newest per ticket, sorted input).
+    """One row per unique (ticket, PR) archive session.
+
+    R1: same-ticket PR history is preserved — a ticket that ran across
+    multiple PRs (e.g. an old merged one + a new open one) surfaces every
+    distinct PR. Only exact (ticket, PR) duplicates collapse to the
+    newest occurrence (input is expected newest-first).
 
     Reviewer/sim/demo siblings are kept — they still fold under their
     base ticket in :func:`merge_rows` so a ticket row can display its
     full PR history.
     """
     rows: list[dict[str, Any]] = []
-    seen: set[str] = set()
+    seen: set[tuple[str, str | None]] = set()
     for entry in archived:
         ticket = entry.get("ticket")
-        if not isinstance(ticket, str) or ticket in seen:
+        if not isinstance(ticket, str):
             continue
-        seen.add(ticket)
+        pr = _normalize_pr_url(entry.get("pr"))
+        key = (ticket, pr)
+        if key in seen:
+            continue
+        seen.add(key)
         role = entry.get("role")
         if not _is_dashboard_worker(ticket, role):
             continue
@@ -477,7 +555,7 @@ def archived_rows(archived: list[dict[str, Any]]) -> list[dict[str, Any]]:
                 "runtime_state": None,
                 "step": entry.get("step"),
                 "blocker": None,
-                "pr": _normalize_pr_url(entry.get("pr")),
+                "pr": pr,
                 "outcome": entry.get("outcome"),
                 "updated_at": entry.get("archived_at"),
                 "mtime": None,
@@ -490,16 +568,28 @@ def merge_rows(
     live: list[dict[str, Any]],
     archived: list[dict[str, Any]],
 ) -> list[dict[str, Any]]:
-    """Combine live + archived rows, preferring live per exact ticket.
+    """Concat live + archived rows, deduping only exact (ticket, PR) pairs.
+
+    R1: an archived merged PR must survive alongside a live worker on the
+    same ticket that is opening a new PR — the row can carry both. Only
+    when a live worker and an archive share the same (ticket, PR) pair
+    do we collapse (prefer live).
 
     Deliberately does NOT collapse siblings — grouping by base ticket
     happens in :func:`build_payload` so we still know which sibling
     contributed each PR.
     """
-    by_ticket: dict[str, dict[str, Any]] = {row["ticket"]: row for row in archived}
-    for row in live:
-        by_ticket[row["ticket"]] = row
-    return list(by_ticket.values())
+    combined: list[dict[str, Any]] = list(live)
+    seen: set[tuple[str, str | None]] = {
+        (row["ticket"], row.get("pr")) for row in live
+    }
+    for row in archived:
+        key = (row["ticket"], row.get("pr"))
+        if key in seen:
+            continue
+        seen.add(key)
+        combined.append(row)
+    return combined
 
 
 def derive_status(
@@ -673,16 +763,18 @@ def build_payload(
 
     tickets: list[dict[str, Any]] = []
     for base_ticket, siblings in groups.items():
-        enrichments = {row["ticket"]: _pr_enrichment(row, cache) for row in siblings}
+        # Key by row identity so two siblings sharing a ticket but
+        # carrying distinct PRs (R1) each get their own enrichment.
+        enrichments = {id(row): _pr_enrichment(row, cache) for row in siblings}
         siblings.sort(
             key=lambda r: (
-                (_pr_entry_payload(r, enrichments.get(r["ticket"])).get("date") or ""),
+                (_pr_entry_payload(r, enrichments.get(id(r))).get("date") or ""),
                 1 if r.get("live") else 0,
             ),
             reverse=True,
         )
         pr_entries = [
-            _pr_entry_payload(r, enrichments.get(r["ticket"]))
+            _pr_entry_payload(r, enrichments.get(id(r)))
             for r in siblings
             if r.get("pr")
         ]
@@ -696,7 +788,7 @@ def build_payload(
             seen_prs.add(key)
             deduped_prs.append(entry)
         primary_row = siblings[0]
-        primary_enrich = enrichments.get(primary_row["ticket"])
+        primary_enrich = enrichments.get(id(primary_row))
         primary_data = (primary_enrich or {}).get("data")
         primary_status, primary_detail = derive_status(primary_row, primary_data)
         latest_date = max(
