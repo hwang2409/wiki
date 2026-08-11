@@ -1392,6 +1392,19 @@ class HeadlessMainRouteTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(self.client.calls[-1][0], "run/respond")
         self.assertEqual(self.client.calls[-1][1]["response"], mixed_answers)
 
+    def test_spawn_api_rejects_one_shot_plan_and_implement_roles(self) -> None:
+        for role in ("plan", "implement"):
+            with self.assertRaises(ValueError):
+                main.SpawnWorkerIn(
+                    ticket=f"WIKI-HTTP-{role.upper()}",
+                    kind="cc",
+                    role=role,
+                    auto_archive=True,
+                    model="claude-opus-4-6",
+                    workdir=str(self.worktree),
+                    prompt=role,
+                )
+
     async def test_live_provider_events_session_rejects_older_pagination(self) -> None:
         self._seed_headless()
 

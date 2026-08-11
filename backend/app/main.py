@@ -1338,7 +1338,7 @@ def _isoformat_utc(ts: float) -> str:
 
 
 def _load_run_freshness(run_id: str | None) -> tuple[str | None, int | None]:
-    """Read the durable ``updated_at`` + normalized event count for a run.
+    """Read the durable ``updated_at`` + unread event count for a run.
 
     Returns ``(None, None)`` when the run has no supervisor record — legacy
     tmux workers, drift entries, or archived runs whose ``runs/<id>/run.json``
@@ -1355,18 +1355,34 @@ def _load_run_freshness(run_id: str | None) -> tuple[str | None, int | None]:
     if not isinstance(payload, dict):
         return None, None
     updated_at = payload.get("updated_at")
-    # ``unread_event_seq`` skips synthetic supervisor/fleet user echoes so an
-    # orchestrator wake doesn't light the worker's unread dot before the
-    # worker has produced any response. Legacy run.json files that predate
-    # WIKI-161 fall back to ``normalized_event_count``.
+    # The unread-dot cursor skips synthetic supervisor events. Viewed cursors
+    # use the normalized event sequence loaded separately below.
     seq = payload.get("unread_event_seq")
     if not isinstance(seq, int):
         seq = payload.get("normalized_event_count")
+    if not isinstance(seq, int):
+        seq = 0
     if not isinstance(updated_at, str):
         updated_at = None
     if not isinstance(seq, int):
         seq = None
     return updated_at, seq
+
+
+def _load_run_normalized_seq(run_id: str | None) -> int | None:
+    """Read the normalized event sequence used by viewed cursors."""
+
+    if not run_id or not RUN_ID_PATTERN.fullmatch(run_id):
+        return None
+    run_path = AGENT_RUNS_DIR / run_id / "run.json"
+    try:
+        payload = json.loads(run_path.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return None
+    if not isinstance(payload, dict):
+        return None
+    seq = payload.get("normalized_event_count")
+    return seq if isinstance(seq, int) else None
 
 
 def _run_exists(run_id: str) -> bool:
@@ -1542,23 +1558,30 @@ def _snapshot_startup_baselines() -> None:
 def _resolve_viewed_fields(
     run_id: str | None,
     viewed_map: dict[str, ViewedEntry],
+    current: dict[str, Any] | None = None,
 ) -> tuple[str | None, int | None, str | None, int | None]:
     """Return ``(latest_event_at, latest_event_seq, last_viewed_at, last_viewed_seq)``.
 
     Order of precedence for the viewed pair:
-      1. Explicit entry in ``viewed_map`` (user marked the row viewed).
-      2. Pre-deploy classification: the run was created before this supervisor's
+      1. Supervisor-owned entry in ``current`` (user marked the row viewed).
+      2. Legacy entry in ``viewed_map`` (user marked the row viewed).
+      3. Pre-deploy classification: the run was created before this supervisor's
          deploy cutoff (or the run predates the ``created_at`` schema) — freeze
          a per-run baseline at the first-observed durable seq so legacy sessions
          don't show a dot after upgrade AND future events land as unread.
          WIKI-147 R4 B1.
-      3. Post-deploy new session (created_at >= deploy cutoff) — leave ``None``
+      4. Post-deploy new session (created_at >= deploy cutoff) — leave ``None``
          so any recorded event renders as unread.
     """
 
     latest_at, latest_seq = _load_run_freshness(run_id)
     if not run_id or latest_at is None or latest_seq is None:
         return latest_at, latest_seq, None, None
+    if isinstance(current, dict):
+        stored_seq = current.get("last_viewed_seq")
+        stored_at = current.get("last_viewed_at")
+        if isinstance(stored_seq, int) and stored_seq >= 0 and isinstance(stored_at, str):
+            return latest_at, latest_seq, stored_at, stored_seq
     entry = viewed_map.get(run_id)
     if entry is not None:
         return latest_at, latest_seq, entry.get("at"), entry.get("seq")
@@ -2102,7 +2125,7 @@ def agents(include_history: bool = False) -> dict[str, object]:
             latest_event_seq,
             last_viewed_at,
             last_viewed_seq,
-        ) = _resolve_viewed_fields(current.get("run_id"), viewed_map)
+        ) = _resolve_viewed_fields(current.get("run_id"), viewed_map, current)
         workers.append(
             {
                 "ticket": ticket,
@@ -2117,6 +2140,7 @@ def agents(include_history: bool = False) -> dict[str, object]:
                 "provider_pid": runtime.get("provider_pid") if headless else None,
                 "kind": current.get("kind"),
                 "role": current.get("role"),
+                "auto_archive": current.get("auto_archive"),
                 "model": current.get("model"),
                 "desired_model": current.get("desired_model"),
                 "effort": current.get("effort"),
@@ -2255,8 +2279,9 @@ def mark_run_viewed(run_id: str, body: MarkViewedBody | None = None) -> dict[str
     if not _run_exists(run_id):
         raise HTTPException(status_code=404, detail="Unknown run id")
 
-    current_at, current_seq = _load_run_freshness(run_id)
-    if current_seq is None or current_at is None:
+    current_at, current_unread_seq = _load_run_freshness(run_id)
+    current_seq = _load_run_normalized_seq(run_id)
+    if current_at is None or current_seq is None:
         raise HTTPException(status_code=404, detail="Run has no durable state")
 
     requested_seq = body.seq if body and body.seq is not None else current_seq
@@ -2264,6 +2289,24 @@ def mark_run_viewed(run_id: str, body: MarkViewedBody | None = None) -> dict[str
         raise HTTPException(status_code=400, detail="seq must be non-negative")
     # Client cannot claim to have seen events the server has not observed.
     accepted_seq = min(requested_seq, current_seq)
+
+    # Headless runs persist viewed state in the supervisor-owned run record.
+    # The file-backed path below remains for legacy and isolated test runs.
+    if AGENT_RUNS_DIR.resolve() == SUPERVISOR_CLIENT.paths.runs_dir.resolve():
+        result = _supervisor_request(
+            "run/mark_viewed",
+            {"run_id": run_id, "seq": accepted_seq},
+        )
+        if isinstance(result, dict):
+            return {
+                "run_id": run_id,
+                "last_viewed_at": result.get("last_viewed_at"),
+                "last_viewed_seq": result.get("last_viewed_seq"),
+                "latest_event_at": result.get("updated_at", current_at),
+                "latest_event_seq": result.get(
+                    "unread_event_seq", current_unread_seq
+                ),
+            }
 
     with _viewed_lock(exclusive=True):
         viewed_map = _read_viewed_map_locked()
@@ -2275,7 +2318,7 @@ def mark_run_viewed(run_id: str, body: MarkViewedBody | None = None) -> dict[str
                 "last_viewed_at": prior["at"],
                 "last_viewed_seq": prior["seq"],
                 "latest_event_at": current_at,
-                "latest_event_seq": current_seq,
+                "latest_event_seq": current_unread_seq,
             }
         now_iso = datetime.now(tz=timezone.utc).isoformat()
         viewed_map[run_id] = {"seq": accepted_seq, "at": now_iso}
@@ -2297,7 +2340,7 @@ def mark_run_viewed(run_id: str, body: MarkViewedBody | None = None) -> dict[str
         "last_viewed_at": now_iso,
         "last_viewed_seq": accepted_seq,
         "latest_event_at": current_at,
-        "latest_event_seq": current_seq,
+        "latest_event_seq": current_unread_seq,
     }
 
 
@@ -4265,6 +4308,7 @@ class SpawnWorkerIn(BaseModel):
     ticket: str = Field(..., min_length=1, max_length=80)
     kind: str = Field(..., min_length=2, max_length=8)
     role: str = Field(..., min_length=4, max_length=16)
+    auto_archive: bool | None = None
     model: str = Field(..., min_length=2, max_length=64)
     effort: str | None = Field(default=None, max_length=16)
     workdir: str = Field(..., min_length=1, max_length=4096)
@@ -4280,7 +4324,12 @@ class SpawnWorkerIn(BaseModel):
     @model_validator(mode="after")
     def validate_model_and_effort(self) -> SpawnWorkerIn:
         kind = self.kind.strip()
+        role = self.role.strip().casefold()
         effort = (self.effort or "").strip() or None
+        if self.auto_archive is True and role in {"implement", "plan"}:
+            raise ValueError(
+                f"auto_archive=one-shot is not allowed for role={self.role!r}"
+            )
         if kind == "cdx" and effort not in REASONING_EFFORTS:
             raise ValueError("Reasoning effort is required for Codex workers")
         if kind == "cc" and effort is not None:
@@ -4547,7 +4596,10 @@ def _control_headless_agent(
                 prior_agent_id = raw_id
             prior_role = prior_result.get("role")
             prior_orch = prior_result.get("orchestrator_id")
-            if prior_role in WORKER_ROLES:
+            if (
+                prior_role in WORKER_ROLES
+                and prior_result.get("_workgraph_archive_recorded") is not True
+            ):
                 workgraph_service.record_archive(
                     agent_id=prior_agent_id,
                     orch=prior_orch if isinstance(prior_orch, str) else None,
@@ -4559,6 +4611,14 @@ def _control_headless_agent(
             return dict(prior_result)
     resolved = _registry_agent(_read_agent_registry(), raw_id)
     if resolved is None:
+        if action == "archive":
+            params: dict[str, object] = {"agent_id": raw_id, "outcome": outcome}
+            if request_id is not None:
+                params["request_id"] = request_id
+                params["command_hash_payload"] = {"outcome": outcome}
+            result = _supervisor_request("run/archive", params)
+            if isinstance(result, dict):
+                return dict(result)
         raise HTTPException(status_code=404, detail="No registered agent")
     resolved_id, _, current = resolved
     if not _is_headless(current):
@@ -4579,7 +4639,11 @@ def _control_headless_agent(
             status_code=502,
             detail="Agent supervisor returned a bad lifecycle response",
         )
-    if action == "archive" and current.get("role") in WORKER_ROLES:
+    if (
+        action == "archive"
+        and current.get("role") in WORKER_ROLES
+        and result.get("_workgraph_archive_recorded") is not True
+    ):
         workgraph_service.record_archive(
             agent_id=resolved_id,
             orch=(
@@ -5029,6 +5093,7 @@ def spawn_agent(
             "agent_id": ticket,
             "provider": "codex" if kind == "cdx" else "claude",
             "role": role,
+            "auto_archive": body.auto_archive,
             "model": model,
             "effort": effort,
             "worktree": str(workdir_path),
@@ -5091,6 +5156,7 @@ def spawn_agent(
             "agent_id": ticket,
             "provider": "codex" if kind == "cdx" else "claude",
             "role": role,
+            "auto_archive": body.auto_archive,
             "model": model,
             "effort": effort,
             "worktree": str(workdir_path),
@@ -5103,6 +5169,7 @@ def spawn_agent(
                 "agent_id": ticket,
                 "provider": "codex" if kind == "cdx" else "claude",
                 "role": role,
+                "auto_archive": body.auto_archive,
                 "model": model,
                 "effort": effort,
                 "worktree": str(workdir_path),

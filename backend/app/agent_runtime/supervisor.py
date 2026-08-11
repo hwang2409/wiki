@@ -52,6 +52,7 @@ from .version import RUNTIME_FINGERPRINT
 AdapterFactory = Callable[[RunRecord], ProviderAdapter]
 DEFAULT_REAPER_INTERVAL_SECONDS = 30.0
 DEFAULT_REAPER_GRACE_SECONDS = 60.0
+DEFAULT_AUTO_ARCHIVE_GRACE_SECONDS = 10 * 60.0
 DEFAULT_ADAPTER_DETACH_GRACE_SECONDS = 1.0
 DEFAULT_IDEMPOTENCY_CACHE_SIZE = 256
 DEFAULT_WORKER_SOFT_CAP = 5
@@ -61,6 +62,11 @@ _COMMAND_METHODS = frozenset(
 )
 DEFAULT_APPROVAL_RECOVERY_TIMEOUT_SECONDS = 30.0
 AMBIGUOUS_SEND_ECHO_GRACE_SECONDS = 0.05
+_AUTO_ARCHIVE_FORBIDDEN_ROLES = frozenset({"implement", "plan"})
+_VERDICT_STEP_RE = re.compile(
+    r"^[ \t]*(?:MERGE-READY|NOT-MERGE-READY|NEEDS-FIXES)\b",
+    re.IGNORECASE | re.MULTILINE,
+)
 logger = logging.getLogger(__name__)
 
 
@@ -324,6 +330,13 @@ def _public_run(record: RunRecord) -> dict[str, Any]:
     return value
 
 
+def _validate_auto_archive_policy(role: str, auto_archive: bool | None) -> None:
+    if auto_archive is True and role.casefold() in _AUTO_ARCHIVE_FORBIDDEN_ROLES:
+        raise ValueError(
+            f"auto_archive=one-shot is not allowed for role={role!r}"
+        )
+
+
 class Supervisor:
     def __init__(
         self,
@@ -335,6 +348,7 @@ class Supervisor:
         approval_recovery_timeout_seconds: float | None = None,
         reaper_interval_seconds: float | None = None,
         reaper_grace_seconds: float | None = None,
+        auto_archive_grace_seconds: float | None = None,
         adapter_detach_grace_seconds: float = DEFAULT_ADAPTER_DETACH_GRACE_SECONDS,
         orphan_archive_grace_seconds: float = 0.5,
         idempotency_cache_size: int = DEFAULT_IDEMPOTENCY_CACHE_SIZE,
@@ -376,6 +390,17 @@ class Supervisor:
                 else _env_seconds(
                     "WIKI_REAPER_GRACE_SECONDS",
                     DEFAULT_REAPER_GRACE_SECONDS,
+                )
+            ),
+        )
+        self.auto_archive_grace_seconds = _validated_seconds(
+            "auto_archive_grace_seconds",
+            (
+                auto_archive_grace_seconds
+                if auto_archive_grace_seconds is not None
+                else _env_seconds(
+                    "WIKI_AUTO_ARCHIVE_GRACE_SECONDS",
+                    DEFAULT_AUTO_ARCHIVE_GRACE_SECONDS,
                 )
             ),
         )
@@ -472,6 +497,15 @@ class Supervisor:
         )
         if self.worker_soft_cap < 1:
             raise ValueError("worker_soft_cap must be positive")
+        try:
+            from .. import workgraph_service
+
+            workgraph_service.reconcile_archive_edges(
+                self.store.paths.archive_dir,
+                status_dir=self.store.paths.status_dir,
+            )
+        except Exception:
+            logger.exception("could not reconcile archived workgraph edges")
 
     def _runtime_status(self, record: RunRecord) -> dict[str, Any]:
         value = _public_run(record)
@@ -757,6 +791,112 @@ Preserve the same identity, role, worktree, orchestrator grouping, PR gates, and
             self._mark_adapter_loss(record.run_id)
             return False
         return self._seconds_since(detached_at) >= self.reaper_grace_seconds
+
+    def _auto_archive_signal(self, record: RunRecord) -> tuple[str, int] | None:
+        if (
+            not record.auto_archive
+            or record.role.casefold() in _AUTO_ARCHIVE_FORBIDDEN_ROLES
+            or not self.store.is_current(record)
+        ):
+            return None
+        status: dict[str, Any] | None = None
+        try:
+            loaded = json.loads(
+                self.store.status_path(record.agent_id).read_text(encoding="utf-8")
+            )
+            if isinstance(loaded, dict):
+                status = loaded
+        except (OSError, ValueError):
+            pass
+        if status is not None:
+            state = status.get("state")
+            step = status.get("step")
+            normalized_state = state.casefold() if isinstance(state, str) else None
+            if normalized_state in {"merge-ready", "blocked"} and isinstance(step, str):
+                if _VERDICT_STEP_RE.search(step) or record.state is LifecycleState.COMPLETED:
+                    return (
+                        "verdict",
+                        record.last_lifecycle_event_seq or record.normalized_event_count,
+                    )
+        if record.state is LifecycleState.COMPLETED:
+            return "completed", record.last_lifecycle_event_seq or record.normalized_event_count
+        return None
+
+    async def _auto_archive_one_locked(self, run_id: str) -> dict[str, str] | None:
+        record = self.store.get(run_id)
+        signal = self._auto_archive_signal(record)
+        if signal is None:
+            return None
+        signal_kind, verdict_seq = signal
+        if record.auto_archive_terminal_at is None:
+            record = self.store.set_auto_archive_candidate(run_id, verdict_seq)
+        terminal_at = record.auto_archive_terminal_at
+        if terminal_at is None:
+            return None
+        try:
+            age = (
+                datetime.now(timezone.utc)
+                - datetime.fromisoformat(terminal_at)
+            ).total_seconds()
+        except ValueError:
+            age = self.auto_archive_grace_seconds
+        viewed = (
+            record.last_viewed_seq is not None
+            and record.last_viewed_seq >= (record.auto_archive_verdict_seq or 0)
+        )
+        if not viewed and age < self.auto_archive_grace_seconds:
+            return None
+        reason = "verdict viewed" if viewed else "grace elapsed"
+        if record.state not in TERMINAL_STATES:
+            record = self.store.transition(
+                run_id,
+                LifecycleState.COMPLETED,
+                reason="auto_archive_terminal_verdict",
+            )
+        message = f"auto-archived {record.agent_id} (one-shot, {reason})"
+        archived = await self._archive(run_id, outcome="closed")
+        await self._publish(
+            {
+                "type": "notification",
+                "ticket": archived.agent_id,
+                "run_id": run_id,
+                "message": message,
+                "reason": reason,
+                "signal": signal_kind,
+            }
+        )
+        return {"run_id": run_id, "action": "auto-archive", "reason": reason}
+
+    def _record_archive_edge(self, record: RunRecord, outcome: str | None) -> None:
+        if record.role not in {"plan", "implement", "review"}:
+            return
+        try:
+            from .. import workgraph_service
+
+            workgraph_service.record_archive_sync(
+                agent_id=record.agent_id,
+                orch=record.orchestrator_id,
+                outcome=outcome or record.outcome,
+                run_id=record.run_id,
+                ended_at=record.updated_at,
+                status_dir=self.store.paths.status_dir,
+            )
+        except Exception:
+            logger.exception("could not write archive workgraph edge for %s", record.agent_id)
+
+    async def _auto_archive_sweep(self) -> list[dict[str, str]]:
+        results: list[dict[str, str]] = []
+        for snapshot in self.store.list_runs():
+            if not snapshot.auto_archive:
+                continue
+            async with self._run_lock(snapshot.run_id):
+                try:
+                    result = await self._auto_archive_one_locked(snapshot.run_id)
+                except RunNotFound:
+                    continue
+                if result is not None:
+                    results.append(result)
+        return results
 
     async def _pump_events(self, run_id: str, adapter: ProviderAdapter) -> None:
         stream_key = id(adapter)
@@ -2265,6 +2405,7 @@ Preserve the same identity, role, worktree, orchestrator grouping, PR gates, and
         agent_id: str,
         provider: ProviderKind,
         role: str,
+        auto_archive: bool | None = None,
         model: str,
         worktree: str,
         prompt: str,
@@ -2276,15 +2417,18 @@ Preserve the same identity, role, worktree, orchestrator grouping, PR gates, and
         run_id: str | None = None,
         implicit_request_id: bool = False,
     ) -> RunRecord:
+        _validate_auto_archive_policy(role, auto_archive)
         if request_id:
             durable = self.store.find_start_request(request_id)
             if durable is not None:
                 return durable
         resolved = resolve_safe_worktree(worktree)
+        resolved_auto_archive = role == "review" if auto_archive is None else auto_archive
         record = RunRecord.new(
             agent_id=agent_id,
             provider=provider,
             role=role,
+            auto_archive=resolved_auto_archive,
             model=model,
             worktree=str(resolved),
             prompt=prompt,
@@ -2566,6 +2710,7 @@ Preserve the same identity, role, worktree, orchestrator grouping, PR gates, and
                             results.append(reaped)
                         else:
                             results[index] = reaped
+                results.extend(await self._auto_archive_sweep())
                 return results
 
     async def _normalize_orphan_raw_events(self) -> None:
@@ -4450,6 +4595,21 @@ Preserve the same identity, role, worktree, orchestrator grouping, PR gates, and
             async with self._run_lock(run_id):
                 return await self._stop(run_id)
 
+    async def mark_viewed(
+        self, run_id: str, requested_seq: int | None = None
+    ) -> RunRecord:
+        async with self._run_mutation_admission():
+            async with self._run_lock(run_id):
+                record = self.store.mark_viewed(run_id, requested_seq)
+                await self._auto_archive_one_locked(run_id)
+                try:
+                    return self.store.get(run_id)
+                except RunNotFound:
+                    archived = self.store.find_archived_run(run_id)
+                    if archived is None:
+                        raise
+                    return archived
+
     async def _stop(self, run_id: str) -> RunRecord:
         adapter = self.adapters.get(run_id)
         if adapter is None:
@@ -4561,6 +4721,7 @@ Preserve the same identity, role, worktree, orchestrator grouping, PR gates, and
                     reason="archived",
                 )
             archived, _ = self.store.archive_current(run_id, outcome=outcome)
+            self._record_archive_edge(archived, outcome)
             if effect_id is not None:
                 effect_payload = {
                     "agent_id": archived.agent_id,
@@ -4580,7 +4741,10 @@ Preserve the same identity, role, worktree, orchestrator grouping, PR gates, and
                         effect_id,
                         effect_payload,
                     ),
-                    _public_run(archived),
+                    {
+                        **_public_run(archived),
+                        "_workgraph_archive_recorded": True,
+                    },
                     command_hash=command_hash,
                 )
             self._forget_implicit_idempotency_for_run(run_id)
@@ -4606,6 +4770,7 @@ Preserve the same identity, role, worktree, orchestrator grouping, PR gates, and
             raise StoreConflict("provider archive returned no status")
         record = self.store.update_adapter_status(run_id, status)
         archived, _ = self.store.archive_current(run_id, outcome=outcome)
+        self._record_archive_edge(archived, outcome)
         if effect_id is not None:
             effect_payload = {
                 "agent_id": archived.agent_id,
@@ -4623,7 +4788,10 @@ Preserve the same identity, role, worktree, orchestrator grouping, PR gates, and
                     effect_id,
                     effect_payload,
                 ),
-                _public_run(archived),
+                {
+                    **_public_run(archived),
+                    "_workgraph_archive_recorded": True,
+                },
                 command_hash=command_hash,
             )
         self._forget_implicit_idempotency_for_run(run_id)
@@ -4779,6 +4947,7 @@ Preserve the same identity, role, worktree, orchestrator grouping, PR gates, and
             agent_id=old.agent_id,
             provider=target_provider,
             role=old.role,
+            auto_archive=old.auto_archive,
             model=target_model,
             worktree=old.worktree,
             prompt=prompt,
@@ -5073,6 +5242,13 @@ Preserve the same identity, role, worktree, orchestrator grouping, PR gates, and
                 agent_id = command_params.get("agent_id")
                 if not isinstance(agent_id, str) or not agent_id:
                     raise ValueError("agent_id is required")
+                role = command_params.get("role")
+                auto_archive = command_params.get("auto_archive")
+                if not isinstance(role, str):
+                    raise ValueError("role is required")
+                if auto_archive is not None and not isinstance(auto_archive, bool):
+                    raise ValueError("auto_archive must be a boolean or null")
+                _validate_auto_archive_policy(role, auto_archive)
             else:
                 agent_id = command_params.get("agent_id")
                 if not isinstance(agent_id, str) or not agent_id:
@@ -5104,6 +5280,12 @@ Preserve the same identity, role, worktree, orchestrator grouping, PR gates, and
                 request_id=request_id,
                 payload={**command_params, "method": method},
             )
+            if method == "run/archive" and self.store.current_run_id(agent_id) is None:
+                return await self._dispatch(
+                    method,
+                    command_params,
+                    command_hash=command.command_hash,
+                )
             # A committed start is its own durable receipt. Repair the sqlite
             # receipt before returning when the daemon died after commit_start.
             if method == "run/start":
@@ -5294,10 +5476,14 @@ Preserve the same identity, role, worktree, orchestrator grouping, PR gates, and
                         "matching run start is not durably committed"
                     )
                 return _public_run(self.store.get(current_run_id))
+            auto_archive = params.get("auto_archive")
+            if auto_archive is not None and not isinstance(auto_archive, bool):
+                raise ValueError("auto_archive must be a boolean or null")
             record = await self.start_run(
                 agent_id=str(params["agent_id"]),
                 provider=ProviderKind(params["provider"]),
                 role=str(params["role"]),
+                auto_archive=auto_archive,
                 model=str(params["model"]),
                 worktree=str(params["worktree"]),
                 prompt=str(params["prompt"]),
@@ -5335,6 +5521,18 @@ Preserve the same identity, role, worktree, orchestrator grouping, PR gates, and
             )
         if method == "run/status":
             return self._runtime_status(self.store.get(self._resolve_run_id(params)))
+        if method == "run/mark_viewed":
+            requested_seq = params.get("seq")
+            if requested_seq is not None and (
+                not isinstance(requested_seq, int) or isinstance(requested_seq, bool)
+            ):
+                raise ValueError("seq must be a non-negative integer or null")
+            if requested_seq is not None and requested_seq < 0:
+                raise ValueError("seq must be a non-negative integer or null")
+            record = await self.mark_viewed(
+                self._resolve_run_id(params), requested_seq
+            )
+            return _public_run(record)
         if method == "run/resume":
             return _public_run(await self.resume_run(self._resolve_run_id(params)))
         if method == "run/send_now":
@@ -5395,23 +5593,41 @@ Preserve the same identity, role, worktree, orchestrator grouping, PR gates, and
                 )
                 if isinstance(effect, dict):
                     return effect
-            run_id = self._resolve_run_id(params)
+            try:
+                run_id = self._resolve_run_id(params)
+            except RunNotFound:
+                agent_id = params.get("agent_id")
+                if not isinstance(agent_id, str):
+                    raise
+                archived = self.store.find_latest_archived_agent(agent_id)
+                if archived is None:
+                    raise
+                return {
+                    **_public_run(archived),
+                    "_workgraph_archive_recorded": True,
+                }
             archived = self.store.finalize_archived_run(run_id)
             if archived is not None:
-                return _public_run(archived)
-            return _public_run(
-                await self.archive(
-                    run_id,
-                    outcome=outcome,
-                    effect_id=request_id if isinstance(request_id, str) else None,
-                    command_hash=command_hash,
-                    command_hash_payload=(
-                        params.get("command_hash_payload")
-                        if isinstance(params.get("command_hash_payload"), Mapping)
-                        else None
-                    ),
-                )
-            )
+                return {
+                    **_public_run(archived),
+                    "_workgraph_archive_recorded": True,
+                }
+            return {
+                **_public_run(
+                    await self.archive(
+                        run_id,
+                        outcome=outcome,
+                        effect_id=request_id if isinstance(request_id, str) else None,
+                        command_hash=command_hash,
+                        command_hash_payload=(
+                            params.get("command_hash_payload")
+                            if isinstance(params.get("command_hash_payload"), Mapping)
+                            else None
+                        ),
+                    )
+                ),
+                "_workgraph_archive_recorded": True,
+            }
         if method == "run/replace":
             provider = params.get("provider")
             replacement_run_id = params.get("replacement_run_id")

@@ -714,6 +714,24 @@ class RunStore:
             entry = self._find_archived_run_entry(run_id)
             return entry[0] if entry is not None else None
 
+    def find_latest_archived_agent(self, agent_id: str) -> RunRecord | None:
+        """Return the newest archived run for an idempotent archive retry."""
+
+        with self._lock:
+            candidates = sorted(
+                self.archive_ticket_dir(agent_id).glob("*/archive-complete.json"),
+                key=lambda path: path.parent.name,
+                reverse=True,
+            )
+            for marker_path in candidates:
+                try:
+                    value = _read_json(marker_path.parent / "run.json")
+                    if isinstance(value, dict):
+                        return RunRecord.from_dict(value)
+                except (OSError, StoreError, TypeError, ValueError):
+                    continue
+            return None
+
     def finalize_archived_run(self, run_id: str) -> RunRecord | None:
         """Resume archive cleanup and return only after live state is gone."""
 
@@ -1118,6 +1136,7 @@ class RunStore:
             "provider": record.provider.value,
             "kind": record.provider.legacy_kind,
             "role": record.role,
+            "auto_archive": record.auto_archive,
             "model": record.model,
             "desired_model": record.desired_model,
             "effort": record.effort,
@@ -1153,6 +1172,10 @@ class RunStore:
             # Transitional compatibility only. Headless liveness never reads it.
             "window": None,
             "spawned_at": record.created_at,
+            "last_viewed_at": record.last_viewed_at,
+            "last_viewed_seq": record.last_viewed_seq,
+            "auto_archive_terminal_at": record.auto_archive_terminal_at,
+            "auto_archive_verdict_seq": record.auto_archive_verdict_seq,
             "updated_at": record.updated_at,
             "start_request_id": record.start_request_id,
             # Projected so /api/agents can clear ticket-only legacy Codex
@@ -2238,6 +2261,51 @@ class RunStore:
             adapter_status=status,
             guard_automatic_resume=guard_automatic_resume,
         )
+
+    def mark_viewed(self, run_id: str, requested_seq: int | None = None) -> RunRecord:
+        """Persist the monotonic event cursor owned by the supervisor."""
+
+        with self._lock:
+            record = self.get(run_id)
+            current_seq = record.normalized_event_count
+            accepted_seq = (
+                current_seq
+                if requested_seq is None
+                else min(requested_seq, current_seq)
+            )
+            if accepted_seq < 0:
+                raise ValueError("seq must be non-negative")
+            if (
+                record.last_viewed_seq is not None
+                and record.last_viewed_seq >= accepted_seq
+            ):
+                return record
+            record.last_viewed_seq = accepted_seq
+            record.last_viewed_at = utc_now()
+            self._write_record(record)
+            registry = self._read_registry()
+            current = (registry.get(record.agent_id) or {}).get("current") or {}
+            if current.get("run_id") == record.run_id:
+                registry[record.agent_id]["current"] = self._registry_current(record)
+                self._write_registry(registry)
+            return record
+
+    def set_auto_archive_candidate(self, run_id: str, verdict_seq: int) -> RunRecord:
+        """Record the first terminal verdict boundary for restart-safe sweeps."""
+
+        with self._lock:
+            record = self.get(run_id)
+            if record.auto_archive_terminal_at is not None:
+                return record
+            record.auto_archive_terminal_at = utc_now()
+            record.auto_archive_verdict_seq = max(0, verdict_seq)
+            self._write_record(record)
+            registry = self._read_registry()
+            current = (registry.get(record.agent_id) or {}).get("current") or {}
+            if current.get("run_id") == record.run_id:
+                registry[record.agent_id]["current"] = self._registry_current(record)
+                self._write_registry(registry)
+            return record
 
     def record_provider_process_created(self, run_id: str, pid: int) -> RunRecord:
         """Persist process identity before provider startup can do more work."""

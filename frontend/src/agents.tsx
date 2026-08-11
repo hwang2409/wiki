@@ -2732,13 +2732,15 @@ export function AgentsSidebar({
   });
 
   const hasUnread = (worker: AgentWorker): boolean => {
-    const latest = worker.latest_event_seq;
-    if (latest === null || latest === undefined) return false;
+    // ``latest_event_seq`` is the worker-output-only cursor. The server's
+    // ``last_viewed_seq`` stays in normalized-event space for auto-archive.
+    const latestUnread = worker.latest_event_seq;
+    if (latestUnread === null || latestUnread === undefined) return false;
     const override = worker.run_id ? viewedOverrides[worker.run_id] : undefined;
     const serverSeq = worker.last_viewed_seq;
     const viewed = Math.max(override ?? -1, serverSeq ?? -1);
     if (viewed < 0) return true;
-    return latest > viewed;
+    return latestUnread > viewed;
   };
 
   const hasViewedFailure = (worker: AgentWorker): boolean =>
