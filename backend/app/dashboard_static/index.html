@@ -1,0 +1,823 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>fleet dashboard</title>
+<style>
+  :root {
+    --paper: #f4efe4;
+    --paper-2: #efe8d9;
+    --ink: #171310;
+    --ink-2: #3a322c;
+    --ink-3: #6a5f56;
+    --ink-4: #9d9084;
+    --rule: #d8cdb8;
+    --rule-strong: #b8a993;
+    --accent: #7a3b2e;
+    --ok: #2f6b3a;
+    --warn: #a56412;
+    --err: #a1281c;
+    --info: #3b5b7a;
+    --shadow-card: 0 1px 0 rgba(0, 0, 0, 0.02),
+                   0 4px 16px -8px rgba(23, 19, 16, 0.06);
+    --radius-lg: 12px;
+    --radius-md: 8px;
+    --radius-sm: 4px;
+  }
+
+  @media (prefers-color-scheme: dark) {
+    :root {
+      --paper: #171310;
+      --paper-2: #1f1a15;
+      --ink: #f0e9dc;
+      --ink-2: #d5cbb9;
+      --ink-3: #a99f8f;
+      --ink-4: #756c60;
+      --rule: #362e26;
+      --rule-strong: #4c4238;
+      --accent: #c98a75;
+      --ok: #8ec18b;
+      --warn: #dbb26a;
+      --err: #e69080;
+      --info: #90b4d0;
+    }
+  }
+
+  * { box-sizing: border-box; }
+  html, body { margin: 0; padding: 0; }
+  html { background: var(--paper); }
+  body {
+    background: var(--paper);
+    color: var(--ink);
+    font-family: ui-sans-serif, -apple-system, "SF Pro Text", "Helvetica Neue",
+                 Helvetica, Arial, sans-serif;
+    font-size: 14px;
+    line-height: 1.5;
+    -webkit-font-smoothing: antialiased;
+    -moz-osx-font-smoothing: grayscale;
+    text-rendering: geometricPrecision;
+    font-variant-numeric: tabular-nums;
+  }
+
+  a { color: inherit; text-decoration: none; border-bottom: 1px solid var(--rule-strong); }
+  a:hover { color: var(--accent); border-bottom-color: var(--accent); }
+
+  main {
+    max-width: 1280px;
+    margin: 0 auto;
+    padding: 40px 40px 96px;
+  }
+
+  /* ---------- masthead ---------- */
+  .masthead { display: grid; gap: 6px; padding-bottom: 24px; border-bottom: 2px solid var(--ink); }
+  .masthead-title {
+    font-family: ui-serif, "New York", "Iowan Old Style", "Charter", Georgia, serif;
+    font-weight: 500;
+    font-size: 38px;
+    letter-spacing: -0.015em;
+    line-height: 1.05;
+    margin: 0;
+    text-wrap: balance;
+  }
+  .masthead-sub {
+    display: flex;
+    align-items: baseline;
+    gap: 14px;
+    font-size: 12px;
+    color: var(--ink-3);
+    text-transform: uppercase;
+    letter-spacing: 0.14em;
+  }
+  .masthead-sub .dot { color: var(--rule-strong); }
+  .live-indicator {
+    display: inline-flex; align-items: center; gap: 6px;
+    color: var(--ink-2);
+  }
+  .live-indicator .pip {
+    width: 6px; height: 6px; border-radius: 50%;
+    background: var(--ok);
+    box-shadow: 0 0 0 3px color-mix(in oklab, var(--ok) 20%, transparent);
+    animation: pulse 2s ease-in-out infinite;
+  }
+  .live-indicator.is-stale .pip { background: var(--warn); animation: none; }
+  .live-indicator.is-offline .pip { background: var(--err); animation: none; }
+  @keyframes pulse {
+    0%, 100% { opacity: 1; }
+    50% { opacity: 0.35; }
+  }
+
+  /* ---------- rollups strip ---------- */
+  .rollups {
+    display: grid;
+    grid-template-columns: repeat(auto-fit, minmax(220px, 1fr));
+    gap: 1px;
+    background: var(--rule);
+    border: 1px solid var(--rule);
+    margin-top: 32px;
+    border-radius: var(--radius-lg);
+    overflow: hidden;
+    box-shadow: var(--shadow-card);
+  }
+  .rollup {
+    background: var(--paper-2);
+    padding: 16px 18px;
+    display: grid;
+    gap: 8px;
+  }
+  .rollup-name {
+    font-family: ui-serif, "New York", "Iowan Old Style", Georgia, serif;
+    font-size: 18px;
+    font-weight: 500;
+    letter-spacing: -0.005em;
+    color: var(--ink);
+  }
+  .rollup-counts {
+    display: flex; flex-wrap: wrap; gap: 12px 18px;
+    font-size: 12px;
+    color: var(--ink-3);
+  }
+  .rollup-counts .num {
+    font-family: ui-monospace, "SF Mono", Menlo, monospace;
+    font-size: 13px;
+    color: var(--ink);
+    margin-right: 4px;
+  }
+  .rollup-counts .num.is-zero { color: var(--ink-4); }
+  .rollup-counts .num.is-alarm { color: var(--err); }
+  .rollup-counts .num.is-ready { color: var(--ok); }
+  .rollup-counts .num.is-stale { color: var(--warn); }
+
+  /* ---------- section headers ---------- */
+  .section { margin-top: 56px; }
+  .section-head {
+    display: flex;
+    align-items: baseline;
+    justify-content: space-between;
+    gap: 16px;
+    padding-bottom: 12px;
+    border-bottom: 1px solid var(--rule-strong);
+  }
+  .section-title {
+    font-family: ui-serif, "New York", "Iowan Old Style", Georgia, serif;
+    font-size: 24px;
+    font-weight: 500;
+    letter-spacing: -0.01em;
+    margin: 0;
+    text-wrap: balance;
+  }
+  .section-note {
+    font-size: 11px;
+    color: var(--ink-3);
+    text-transform: uppercase;
+    letter-spacing: 0.16em;
+  }
+
+  /* ---------- table shell ---------- */
+  .grid {
+    width: 100%;
+    border-collapse: collapse;
+    margin-top: 12px;
+    font-size: 13px;
+  }
+  .grid th, .grid td {
+    text-align: left;
+    padding: 12px 12px;
+    vertical-align: top;
+  }
+  .grid thead th {
+    font-size: 10px;
+    font-weight: 600;
+    text-transform: uppercase;
+    letter-spacing: 0.18em;
+    color: var(--ink-3);
+    border-bottom: 1px solid var(--rule-strong);
+    background: transparent;
+  }
+  .grid tbody tr { border-bottom: 1px solid var(--rule); }
+  .grid tbody tr:last-child { border-bottom: none; }
+  .grid tbody tr:hover { background: color-mix(in oklab, var(--paper-2) 60%, transparent); }
+
+  /* ---------- fleet-specific ---------- */
+  .orch-band td {
+    background: var(--paper-2);
+    border-top: 1px solid var(--rule-strong);
+    border-bottom: 1px solid var(--rule-strong);
+    padding: 8px 12px;
+  }
+  .orch-band-label {
+    display: flex; align-items: baseline; gap: 12px;
+    font-size: 10px;
+    text-transform: uppercase;
+    letter-spacing: 0.2em;
+    color: var(--ink-2);
+  }
+  .orch-band-label .orch-name {
+    font-family: ui-serif, "New York", "Iowan Old Style", Georgia, serif;
+    text-transform: none;
+    letter-spacing: -0.005em;
+    font-size: 14px;
+    font-weight: 500;
+    color: var(--ink);
+  }
+  .orch-band-label .count { color: var(--ink-3); }
+
+  .ticket-id {
+    font-family: ui-monospace, "SF Mono", Menlo, monospace;
+    font-size: 12px;
+    color: var(--ink);
+    font-weight: 500;
+    white-space: nowrap;
+  }
+  .ticket-id a { border-bottom: none; }
+  .ticket-id a:hover { text-decoration: underline; text-underline-offset: 3px; }
+
+  .role-model {
+    color: var(--ink-3);
+    font-size: 11px;
+    text-transform: uppercase;
+    letter-spacing: 0.1em;
+    display: flex; gap: 8px; align-items: baseline;
+    white-space: nowrap;
+  }
+  .role-model .model {
+    font-family: ui-monospace, "SF Mono", Menlo, monospace;
+    text-transform: none;
+    letter-spacing: 0;
+    color: var(--ink-2);
+    font-size: 11px;
+  }
+  .role-model .kind {
+    display: inline-block;
+    padding: 1px 5px;
+    border-radius: 2px;
+    background: color-mix(in oklab, var(--rule) 60%, transparent);
+    color: var(--ink-2);
+    font-family: ui-monospace, "SF Mono", Menlo, monospace;
+    text-transform: uppercase;
+    font-size: 10px;
+    letter-spacing: 0.08em;
+  }
+
+  .step-cell {
+    color: var(--ink-2);
+    max-width: 460px;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+    font-size: 13px;
+  }
+  .step-cell.wrap { white-space: normal; text-wrap: pretty; }
+  .blocker-line {
+    color: var(--err);
+    font-size: 12px;
+    margin-top: 4px;
+  }
+
+  .age-cell {
+    color: var(--ink-3);
+    font-family: ui-monospace, "SF Mono", Menlo, monospace;
+    font-size: 12px;
+    white-space: nowrap;
+  }
+  .age-cell.is-stale { color: var(--warn); }
+
+  .pr-cell { white-space: nowrap; font-family: ui-monospace, "SF Mono", Menlo, monospace; font-size: 12px; }
+  .pr-cell .pr-num { color: var(--ink); font-weight: 500; }
+  .pr-cell .pr-repo { color: var(--ink-3); font-size: 11px; }
+  .pr-cell.empty { color: var(--ink-4); }
+
+  /* ---------- pills ---------- */
+  .pill {
+    display: inline-flex;
+    align-items: center;
+    padding: 2px 7px;
+    border-radius: 3px;
+    font-size: 10.5px;
+    font-weight: 600;
+    text-transform: uppercase;
+    letter-spacing: 0.1em;
+    line-height: 1.5;
+    white-space: nowrap;
+    background: color-mix(in oklab, var(--rule) 70%, transparent);
+    color: var(--ink-2);
+  }
+  .pill + .pill { margin-left: 4px; }
+  .pill.is-working { background: color-mix(in oklab, var(--info) 18%, transparent); color: var(--info); }
+  .pill.is-merge-ready { background: color-mix(in oklab, var(--ok) 22%, transparent); color: var(--ok); }
+  .pill.is-blocked, .pill.is-err { background: color-mix(in oklab, var(--err) 20%, transparent); color: var(--err); }
+  .pill.is-stale, .pill.is-warn { background: color-mix(in oklab, var(--warn) 24%, transparent); color: var(--warn); }
+  .pill.is-passing { background: color-mix(in oklab, var(--ok) 18%, transparent); color: var(--ok); }
+  .pill.is-failing { background: color-mix(in oklab, var(--err) 20%, transparent); color: var(--err); }
+  .pill.is-checks-pending { background: color-mix(in oklab, var(--warn) 22%, transparent); color: var(--warn); }
+  .pill.is-has-comments { background: color-mix(in oklab, var(--accent) 18%, transparent); color: var(--accent); }
+  .pill.is-prod { background: color-mix(in oklab, var(--ok) 26%, transparent); color: var(--ok); }
+  .pill.is-merged, .pill.is-outcome-merged { background: color-mix(in oklab, var(--ok) 14%, transparent); color: var(--ok); }
+  .pill.is-closed, .pill.is-outcome-closed, .pill.is-outcome-abandoned { color: var(--ink-3); }
+  .pill.is-implementing { background: color-mix(in oklab, var(--info) 14%, transparent); color: var(--info); }
+  .pill.is-pr-open { background: color-mix(in oklab, var(--info) 14%, transparent); color: var(--info); }
+  .pill.is-idle { color: var(--ink-3); }
+
+  /* ---------- ticket description ---------- */
+  .desc-cell {
+    color: var(--ink);
+    font-size: 13.5px;
+    max-width: 520px;
+    text-wrap: pretty;
+  }
+  .desc-cell .detail {
+    display: block;
+    font-size: 12px;
+    color: var(--ink-3);
+    margin-top: 3px;
+  }
+  .desc-cell .worker-link {
+    display: inline-block;
+    margin-top: 4px;
+    padding: 1px 6px;
+    font-size: 10.5px;
+    text-transform: uppercase;
+    letter-spacing: 0.12em;
+    color: var(--ink-3);
+    border: 1px solid var(--rule-strong);
+    border-radius: 3px;
+    cursor: pointer;
+  }
+  .desc-cell .worker-link:hover { color: var(--accent); border-color: var(--accent); }
+
+  /* ---------- archived ---------- */
+  details.archived {
+    margin-top: 32px;
+    border-top: 1px solid var(--rule-strong);
+    padding-top: 20px;
+  }
+  details.archived > summary {
+    cursor: pointer;
+    list-style: none;
+    display: flex;
+    align-items: baseline;
+    justify-content: space-between;
+    gap: 16px;
+  }
+  details.archived > summary::-webkit-details-marker { display: none; }
+  details.archived > summary::after {
+    content: "expand";
+    font-size: 10px;
+    text-transform: uppercase;
+    letter-spacing: 0.18em;
+    color: var(--ink-3);
+  }
+  details.archived[open] > summary::after { content: "collapse"; }
+  .archived-list {
+    margin-top: 16px;
+    display: grid; gap: 8px;
+  }
+  .archived-row {
+    display: grid;
+    grid-template-columns: 120px 1fr auto auto;
+    gap: 16px;
+    padding: 8px 0;
+    border-bottom: 1px dashed var(--rule);
+    font-size: 13px;
+    align-items: baseline;
+  }
+  .archived-row:last-child { border-bottom: none; }
+  .archived-row .archived-ticket {
+    font-family: ui-monospace, "SF Mono", Menlo, monospace;
+    font-size: 12px;
+  }
+  .archived-row .archived-step { color: var(--ink-2); text-wrap: pretty; }
+  .archived-row .archived-orch {
+    font-size: 10.5px;
+    text-transform: uppercase;
+    letter-spacing: 0.14em;
+    color: var(--ink-3);
+  }
+  .archived-row .archived-time {
+    font-family: ui-monospace, "SF Mono", Menlo, monospace;
+    font-size: 11px;
+    color: var(--ink-3);
+  }
+
+  /* ---------- empty + loading ---------- */
+  .empty {
+    padding: 40px 0;
+    text-align: center;
+    color: var(--ink-3);
+    font-style: italic;
+    font-family: ui-serif, "New York", Georgia, serif;
+    font-size: 15px;
+  }
+  .loading {
+    display: inline-flex; align-items: center; gap: 6px;
+    color: var(--ink-3); font-size: 12px;
+    text-transform: uppercase; letter-spacing: 0.18em;
+  }
+  .loading .dot {
+    width: 4px; height: 4px; border-radius: 50%;
+    background: var(--ink-3);
+    animation: pulse 1.2s ease-in-out infinite;
+  }
+
+  .error-banner {
+    margin-top: 24px;
+    padding: 12px 16px;
+    background: color-mix(in oklab, var(--err) 8%, transparent);
+    border-left: 3px solid var(--err);
+    color: var(--err);
+    border-radius: 0 var(--radius-sm) var(--radius-sm) 0;
+    font-size: 13px;
+  }
+
+  /* ---------- responsive ---------- */
+  @media (max-width: 900px) {
+    main { padding: 24px 20px 64px; }
+    .masthead-title { font-size: 30px; }
+    .rollups { grid-template-columns: 1fr; }
+    .desc-cell, .step-cell { max-width: none; }
+    .step-cell { white-space: normal; }
+  }
+</style>
+</head>
+<body>
+<main>
+  <header class="masthead">
+    <h1 class="masthead-title">Fleet Dashboard</h1>
+    <div class="masthead-sub">
+      <span id="today"></span>
+      <span class="dot">·</span>
+      <span id="generated"></span>
+      <span class="dot">·</span>
+      <span id="live-indicator" class="live-indicator"><span class="pip"></span><span id="live-text">live</span></span>
+    </div>
+  </header>
+
+  <div id="error" class="error-banner" hidden></div>
+
+  <section id="rollups-section" class="rollups" hidden></section>
+
+  <section class="section" id="fleet-section">
+    <div class="section-head">
+      <h2 class="section-title">Workers</h2>
+      <span class="section-note" id="fleet-count"></span>
+    </div>
+    <div id="fleet-body"><p class="loading"><span class="dot"></span>loading fleet</p></div>
+  </section>
+
+  <section class="section" id="tickets-section">
+    <div class="section-head">
+      <h2 class="section-title">Tickets</h2>
+      <span class="section-note" id="tickets-count"></span>
+    </div>
+    <div id="tickets-body"><p class="loading"><span class="dot"></span>loading tickets</p></div>
+  </section>
+
+  <details class="archived" id="archived-details">
+    <summary>
+      <span class="section-title" style="font-size: 20px;">Archived today <span id="archived-count" class="section-note"></span></span>
+    </summary>
+    <div id="archived-body" class="archived-list"></div>
+  </details>
+</main>
+
+<script>
+(() => {
+  "use strict";
+
+  const $ = (id) => document.getElementById(id);
+  const state = { data: null, lastFetch: 0, refetching: false };
+  const REFRESH_MS = 60_000;      // ambient refresh even if SSE quiet
+  const STALE_UI_MS = 120_000;    // no updates in 2 min → indicator warns
+  let currentHighlight = null;
+
+  function escape(v) {
+    if (v === null || v === undefined) return "";
+    return String(v)
+      .replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;")
+      .replace(/"/g, "&quot;").replace(/'/g, "&#39;");
+  }
+
+  function prLabel(url) {
+    if (!url) return null;
+    const m = url.match(/github\.com\/([^/]+\/[^/]+)\/pull\/(\d+)/);
+    if (!m) return { num: url, repo: null };
+    return { num: "#" + m[2], repo: m[1] };
+  }
+
+  function agePhrase(seconds) {
+    if (seconds === null || seconds === undefined || !isFinite(seconds)) return "—";
+    seconds = Math.max(0, Math.floor(seconds));
+    if (seconds < 60) return seconds + "s";
+    const m = Math.floor(seconds / 60);
+    if (m < 60) return m + "m";
+    const h = Math.floor(m / 60);
+    if (h < 24) return h + "h " + (m % 60) + "m";
+    const d = Math.floor(h / 24);
+    return d + "d " + (h % 24) + "h";
+  }
+
+  function ageFromIso(iso) {
+    if (!iso) return null;
+    const t = Date.parse(iso);
+    if (isNaN(t)) return null;
+    return (Date.now() - t) / 1000;
+  }
+
+  function fmtLocalTime(iso) {
+    if (!iso) return "";
+    const d = new Date(iso);
+    if (isNaN(d.getTime())) return "";
+    return d.toLocaleTimeString([], { hour: "2-digit", minute: "2-digit", hour12: false });
+  }
+
+  function fmtDate(d) {
+    return d.toLocaleDateString([], { weekday: "long", month: "long", day: "numeric", year: "numeric" }).toLowerCase();
+  }
+
+  function pill(label, cls) {
+    return '<span class="pill is-' + cls + '">' + escape(label) + '</span>';
+  }
+
+  function renderMasthead(generatedAt) {
+    $("today").textContent = fmtDate(new Date());
+    $("generated").textContent = generatedAt ? "updated " + fmtLocalTime(generatedAt) : "";
+  }
+
+  function renderRollups(orchestrators) {
+    const el = $("rollups-section");
+    if (!orchestrators || orchestrators.length === 0) {
+      el.hidden = true;
+      el.innerHTML = "";
+      return;
+    }
+    el.hidden = false;
+    const html = orchestrators.map((o) => {
+      const cell = (label, num, cls) => {
+        const clsFinal = num === 0 ? "is-zero" : (cls || "");
+        return '<span><span class="num ' + clsFinal + '">' + num + '</span>' + escape(label) + '</span>';
+      };
+      return (
+        '<div class="rollup" data-orch="' + escape(o.orch) + '">' +
+          '<div class="rollup-name">' + escape(o.orch) + '</div>' +
+          '<div class="rollup-counts">' +
+            cell("working", o.working) +
+            cell("merge-ready", o.merge_ready, "is-ready") +
+            cell("blocked", o.blocked, o.blocked > 0 ? "is-alarm" : "") +
+            cell("stalled", o.stalled, o.stalled > 0 ? "is-stale" : "") +
+          '</div>' +
+        '</div>'
+      );
+    }).join("");
+    el.innerHTML = html;
+  }
+
+  function workerStateCell(w) {
+    const state = w.state || "unknown";
+    const cls = state.replace(/[^a-z0-9-]/gi, "-");
+    let out = pill(state, cls);
+    (w.alarms || []).forEach((alarm) => {
+      if (alarm === "stale") out += pill("stale " + agePhrase(w.status_age_s), "stale");
+      else if (alarm === "attention") out += pill("attention", "warn");
+      // merge-ready/blocked already shown by state pill
+    });
+    return out;
+  }
+
+  function renderFleet(workers) {
+    const body = $("fleet-body");
+    const count = $("fleet-count");
+    if (!workers || workers.length === 0) {
+      count.textContent = "";
+      body.innerHTML = '<p class="empty">no live workers.</p>';
+      return;
+    }
+    count.textContent = workers.length + " live";
+
+    // Group by orch (unassigned last).
+    const groups = new Map();
+    workers.forEach((w) => {
+      const key = w.orch || "(unassigned)";
+      if (!groups.has(key)) groups.set(key, []);
+      groups.get(key).push(w);
+    });
+    const orchOrder = [...groups.keys()].sort((a, b) => {
+      if (a === "(unassigned)") return 1;
+      if (b === "(unassigned)") return -1;
+      return a.localeCompare(b);
+    });
+
+    const rows = [];
+    orchOrder.forEach((orch) => {
+      const group = groups.get(orch);
+      rows.push(
+        '<tr class="orch-band"><td colspan="6">' +
+          '<div class="orch-band-label">' +
+            '<span class="orch-name">' + escape(orch) + '</span>' +
+            '<span class="count">' + group.length + ' worker' + (group.length === 1 ? '' : 's') + '</span>' +
+          '</div>' +
+        '</td></tr>'
+      );
+      group.forEach((w) => {
+        const pr = prLabel(w.pr);
+        const age = agePhrase(w.status_age_s);
+        const ageCls = (w.alarms || []).includes("stale") ? "is-stale" : "";
+        const stepHtml =
+          '<div class="step-cell" title="' + escape(w.step || "") + '">' + escape(w.step || "—") + '</div>' +
+          (w.blocker ? '<div class="blocker-line">blocker: ' + escape(w.blocker) + '</div>' : '');
+        rows.push(
+          '<tr id="worker-' + escape(w.ticket) + '">' +
+            '<td class="ticket-id">' + escape(w.ticket) + '</td>' +
+            '<td class="role-model">' +
+              (w.kind ? '<span class="kind">' + escape(w.kind) + '</span>' : '') +
+              '<span>' + escape(w.role || "") + '</span>' +
+              (w.model ? '<span class="model">' + escape(w.model) + '</span>' : '') +
+            '</td>' +
+            '<td>' + workerStateCell(w) + '</td>' +
+            '<td>' + stepHtml + '</td>' +
+            '<td class="pr-cell' + (pr ? '' : ' empty') + '">' +
+              (pr
+                ? '<a href="' + escape(w.pr) + '" target="_blank" rel="noopener"><span class="pr-num">' + escape(pr.num) + '</span> <span class="pr-repo">' + escape(pr.repo || "") + '</span></a>'
+                : '—') +
+            '</td>' +
+            '<td class="age-cell ' + ageCls + '">' + escape(age) + '</td>' +
+          '</tr>'
+        );
+      });
+    });
+
+    body.innerHTML =
+      '<table class="grid" role="table">' +
+        '<thead><tr>' +
+          '<th>ticket</th><th>role · model</th><th>state</th><th>step</th><th>pr</th><th>updated</th>' +
+        '</tr></thead>' +
+        '<tbody>' + rows.join("") + '</tbody>' +
+      '</table>';
+  }
+
+  function ticketWorkerLinks(ticket, workers) {
+    return (workers || []).filter((w) => w.ticket === ticket);
+  }
+
+  function renderTickets(tickets, workers) {
+    const body = $("tickets-body");
+    const count = $("tickets-count");
+    if (!tickets || tickets.length === 0) {
+      count.textContent = "";
+      body.innerHTML = '<p class="empty">no tickets with workers or prs yet.</p>';
+      return;
+    }
+    count.textContent = tickets.length + " tracked";
+
+    const rows = tickets.map((t) => {
+      const pr = prLabel(t.pr);
+      const statusCls = (t.status || "unknown").replace(/[^a-z0-9-]/gi, "-");
+      const age = agePhrase(ageFromIso(t.date));
+      const linkedWorkers = ticketWorkerLinks(t.ticket, workers);
+      const linkPill = linkedWorkers.length > 0
+        ? '<a class="worker-link" data-target="worker-' + escape(t.ticket) + '">' + linkedWorkers.length + ' live worker' + (linkedWorkers.length === 1 ? '' : 's') + '</a>'
+        : '';
+      const detail = t.detail ? '<span class="detail">' + escape(t.detail) + '</span>' : '';
+      return (
+        '<tr id="ticket-' + escape(t.ticket) + '">' +
+          '<td class="ticket-id">' + escape(t.ticket) + '</td>' +
+          '<td class="desc-cell">' +
+            escape(t.description || "—") +
+            detail +
+            (linkPill ? '<br>' + linkPill : '') +
+          '</td>' +
+          '<td class="pr-cell' + (pr ? '' : ' empty') + '">' +
+            (pr
+              ? '<a href="' + escape(t.pr) + '" target="_blank" rel="noopener"><span class="pr-num">' + escape(pr.num) + '</span><br><span class="pr-repo">' + escape(pr.repo || "") + '</span></a>'
+              : '—') +
+          '</td>' +
+          '<td>' + pill(t.status || "unknown", statusCls) + '</td>' +
+          '<td class="age-cell">' + escape(age) + '</td>' +
+        '</tr>'
+      );
+    }).join("");
+
+    body.innerHTML =
+      '<table class="grid" role="table">' +
+        '<thead><tr>' +
+          '<th>ticket</th><th>title</th><th>pr</th><th>status</th><th>age</th>' +
+        '</tr></thead>' +
+        '<tbody>' + rows + '</tbody>' +
+      '</table>';
+
+    body.querySelectorAll(".worker-link").forEach((el) => {
+      el.addEventListener("click", (evt) => {
+        evt.preventDefault();
+        const target = el.getAttribute("data-target");
+        const node = document.getElementById(target);
+        if (node) {
+          if (currentHighlight) currentHighlight.style.background = "";
+          node.style.background = "color-mix(in oklab, var(--warn) 12%, transparent)";
+          node.scrollIntoView({ behavior: "smooth", block: "center" });
+          currentHighlight = node;
+          setTimeout(() => { if (currentHighlight === node) { node.style.background = ""; currentHighlight = null; } }, 1800);
+        }
+      });
+    });
+  }
+
+  function renderArchived(archived) {
+    const body = $("archived-body");
+    const count = $("archived-count");
+    if (!archived || archived.length === 0) {
+      count.textContent = "(none)";
+      body.innerHTML = '<p class="empty">nothing archived today yet.</p>';
+      return;
+    }
+    count.textContent = "(" + archived.length + ")";
+    body.innerHTML = archived.map((a) => {
+      const pr = prLabel(a.pr);
+      const outcomeCls = "is-outcome-" + (a.outcome || "unknown").replace(/[^a-z0-9-]/gi, "-");
+      const orch = a.orch || "(unassigned)";
+      const time = fmtLocalTime(a.archived_at);
+      return (
+        '<div class="archived-row">' +
+          '<div class="archived-ticket">' + escape(a.ticket || "?") + '</div>' +
+          '<div class="archived-step">' +
+            (a.outcome ? pill(a.outcome, outcomeCls) + ' ' : '') +
+            escape(a.step || "—") +
+            (pr ? ' &middot; <a href="' + escape(a.pr) + '" target="_blank" rel="noopener">' + escape(pr.num) + '</a>' : '') +
+          '</div>' +
+          '<div class="archived-orch">' + escape(orch) + '</div>' +
+          '<div class="archived-time">' + escape(time) + '</div>' +
+        '</div>'
+      );
+    }).join("");
+  }
+
+  function render(data) {
+    state.data = data;
+    renderMasthead(data.generated_at);
+    renderRollups(data.orchestrators || []);
+    renderFleet(data.workers || []);
+    renderTickets(data.tickets || [], data.workers || []);
+    renderArchived(data.archived_today || []);
+    setLiveState("live");
+  }
+
+  function setLiveState(kind) {
+    const el = $("live-indicator");
+    const text = $("live-text");
+    el.classList.remove("is-stale", "is-offline");
+    if (kind === "stale") { el.classList.add("is-stale"); text.textContent = "stale"; }
+    else if (kind === "offline") { el.classList.add("is-offline"); text.textContent = "offline"; }
+    else text.textContent = "live";
+  }
+
+  async function fetchData() {
+    if (state.refetching) return;
+    state.refetching = true;
+    try {
+      const r = await fetch("/dashboard/data", { headers: { accept: "application/json" } });
+      if (!r.ok) throw new Error("status " + r.status);
+      const data = await r.json();
+      state.lastFetch = Date.now();
+      $("error").hidden = true;
+      $("error").textContent = "";
+      render(data);
+    } catch (err) {
+      const banner = $("error");
+      banner.hidden = false;
+      banner.textContent = "could not refresh: " + (err.message || err);
+      setLiveState("offline");
+    } finally {
+      state.refetching = false;
+    }
+  }
+
+  function openEventStream() {
+    if (typeof EventSource === "undefined") return;
+    let src;
+    try { src = new EventSource("/api/events"); } catch (e) { return; }
+    src.addEventListener("message", (evt) => {
+      try {
+        const parsed = JSON.parse(evt.data);
+        if (parsed && parsed.type === "agents") fetchData();
+      } catch (_) { /* ignore malformed */ }
+    });
+    src.addEventListener("error", () => {
+      // Browser auto-reconnects. Don't clobber the live indicator on a
+      // transient blip — the periodic fetchData is our real health signal.
+    });
+  }
+
+  function tickStaleness() {
+    if (state.lastFetch && Date.now() - state.lastFetch > STALE_UI_MS) {
+      setLiveState("stale");
+    }
+    // Update age columns without a refetch to keep counters ticking.
+    if (state.data) render(state.data);
+  }
+
+  fetchData();
+  openEventStream();
+  setInterval(fetchData, REFRESH_MS);
+  setInterval(tickStaleness, 30_000);
+})();
+</script>
+</body>
+</html>

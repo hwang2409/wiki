@@ -35,6 +35,7 @@ from . import (
     backend_runtime,
     context_prelude,
     dashboard,
+    dashboard_page,
     github_pr,
     github_preview,
     installed_fonts,
@@ -6650,5 +6651,26 @@ async def rotate_account(body: AccountRotateIn) -> dict[str, object]:
 
 app.include_router(terminal.router)
 app.include_router(uistate.router)
+
+
+def _dashboard_page_payload() -> dict:
+    registry: dict = {}
+    try:
+        value = json.loads(AGENT_REGISTRY_PATH.read_text(encoding="utf-8"))
+        if isinstance(value, dict):
+            registry = value
+    except (OSError, ValueError):
+        pass
+    statuses: dict[str, dict] = {}
+    for path in _agent_status_paths():
+        status = read_agent_status(path.stem)
+        if status:
+            statuses[path.stem] = status
+    archived = list_archived(limit=None, latest_per_ticket=False)
+    return dashboard.build_page_payload(registry, statuses, archived)
+
+
+dashboard_page.register_payload_builder(_dashboard_page_payload)
+app.include_router(dashboard_page.router)
 
 mount_frontend_static(app)

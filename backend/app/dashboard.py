@@ -487,3 +487,195 @@ def build_payload(
         )
     tickets.sort(key=lambda item: item["date"] or "", reverse=True)
     return {"tickets": tickets, "repo_allowlist": list(REPO_ALLOWLIST)}
+
+
+# --- Fleet + orchestrator aggregation (WIKI-276) --------------------------
+#
+# The task-first `build_payload` above hides one-shot / review workers and
+# collapses each ticket to its most recent session. The fleet view is the
+# opposite: it lists every worker the supervisor is running right now,
+# grouped by orchestrator, so Henry can see at a glance who is doing what.
+
+STALE_STATUS_SECONDS = 30 * 60
+
+
+def _worker_alarms(
+    state: Any,
+    mtime: float | None,
+    blocker: Any,
+    *,
+    now: float | None = None,
+) -> list[str]:
+    """Alarm chips derived from what the status file already exposes.
+
+    ``stale`` fires only for workers still in a working-ish state — a
+    ``merge-ready`` worker sitting on a merge request isn't broken, it's
+    waiting for Henry. ``blocker`` text without a matching ``blocked``
+    state is surfaced as ``attention`` so ambient warnings still show.
+    """
+    now_ts = time.time() if now is None else now
+    alarms: list[str] = []
+    if state == "blocked":
+        alarms.append("blocked")
+    elif state == "merge-ready":
+        alarms.append("merge-ready")
+    working_ish = state not in {"blocked", "merge-ready", "closed"}
+    if (
+        working_ish
+        and isinstance(mtime, (int, float))
+        and (now_ts - mtime) > STALE_STATUS_SECONDS
+    ):
+        alarms.append("stale")
+    if isinstance(blocker, str) and blocker.strip() and "blocked" not in alarms:
+        alarms.append("attention")
+    return alarms
+
+
+def fleet_workers(
+    registry: dict[str, Any],
+    statuses: dict[str, dict[str, Any]],
+    *,
+    now: float | None = None,
+) -> list[dict[str, Any]]:
+    """One row per live registered non-orchestrator worker.
+
+    Includes every role (implement, review, plan, ...) — the fleet pane
+    answers "what are all my agents doing right now", so reviewers count.
+    Orchestrators are excluded; they are the grouping, not the rows.
+    Status files older than ``spawned_at`` are ignored to avoid inheriting
+    a previous session's state (same guard as :func:`live_worker_rows`).
+    """
+    now_ts = time.time() if now is None else now
+    rows: list[dict[str, Any]] = []
+    for ticket, entry in sorted(registry.items()):
+        if ticket.startswith("_") or not isinstance(entry, dict):
+            continue
+        current = entry.get("current")
+        if not isinstance(current, dict):
+            continue
+        role = current.get("role")
+        if role == "orchestrator":
+            continue
+        status = _status_for_current(statuses.get(ticket), current)
+        mtime = status.get("_mtime")
+        mtime_val = mtime if isinstance(mtime, (int, float)) else None
+        state = status.get("state") or current.get("state")
+        step = status.get("step")
+        blocker = status.get("blocker")
+        pr = _normalize_pr_url(status.get("pr") or current.get("pr"))
+        alarms = _worker_alarms(state, mtime_val, blocker, now=now_ts)
+        rows.append(
+            {
+                "ticket": ticket,
+                "orch": current.get("orch"),
+                "role": role,
+                "kind": current.get("kind"),
+                "model": current.get("model"),
+                "state": state,
+                "step": step,
+                "blocker": blocker,
+                "pr": pr,
+                "run_id": current.get("run_id"),
+                "worktree": current.get("worktree"),
+                "spawned_at": current.get("spawned_at"),
+                "updated_at": _status_mtime_iso(status) or current.get("updated_at"),
+                "status_age_s": (now_ts - mtime_val) if mtime_val else None,
+                "alarms": alarms,
+            }
+        )
+    return rows
+
+
+def orch_rollups(workers: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Per-orchestrator counts glanceable in the header strip."""
+    buckets: dict[str, dict[str, Any]] = {}
+    for worker in workers:
+        orch = worker.get("orch") or "(unassigned)"
+        bucket = buckets.setdefault(
+            orch,
+            {
+                "orch": orch,
+                "total": 0,
+                "working": 0,
+                "blocked": 0,
+                "merge_ready": 0,
+                "stalled": 0,
+            },
+        )
+        bucket["total"] += 1
+        state = worker.get("state") or ""
+        alarms = worker.get("alarms") or []
+        if state == "blocked":
+            bucket["blocked"] += 1
+        elif state == "merge-ready":
+            bucket["merge_ready"] += 1
+        else:
+            bucket["working"] += 1
+        if "stale" in alarms:
+            bucket["stalled"] += 1
+    return sorted(buckets.values(), key=lambda entry: entry["orch"])
+
+
+def archived_today(
+    archived: list[dict[str, Any]],
+    *,
+    now: datetime | None = None,
+) -> list[dict[str, Any]]:
+    """Archive rows whose ``archived_at`` falls on the current UTC day.
+
+    We render this in a collapsed section so ``what did I ship today`` is
+    always one click away.
+    """
+    reference = now if now is not None else datetime.now(timezone.utc)
+    day_start = datetime.combine(
+        reference.astimezone(timezone.utc).date(),
+        datetime.min.time(),
+        tzinfo=timezone.utc,
+    )
+    rows: list[dict[str, Any]] = []
+    for entry in archived:
+        parsed = _parse_when(entry.get("archived_at"))
+        if parsed is None or parsed < day_start:
+            continue
+        rows.append(
+            {
+                "ticket": entry.get("ticket"),
+                "role": entry.get("role"),
+                "kind": entry.get("kind"),
+                "orch": entry.get("orch"),
+                "outcome": entry.get("outcome"),
+                "state": entry.get("state"),
+                "pr": _normalize_pr_url(entry.get("pr")),
+                "step": entry.get("step"),
+                "archived_at": entry.get("archived_at"),
+            }
+        )
+    rows.sort(key=lambda item: item.get("archived_at") or "", reverse=True)
+    return rows
+
+
+def build_page_payload(
+    registry: dict[str, Any],
+    statuses: dict[str, dict[str, Any]],
+    archived: list[dict[str, Any]],
+    *,
+    cache: PrCache | None = None,
+    now: datetime | None = None,
+) -> dict[str, Any]:
+    """The full JSON payload consumed by the browser dashboard page.
+
+    Everything the page needs in one round-trip: task-first tickets, the
+    fleet worker table, per-orch rollups, and today's archives.
+    """
+    reference = now if now is not None else datetime.now(timezone.utc)
+    now_ts = reference.timestamp()
+    tickets_payload = build_payload(registry, statuses, archived, cache=cache)
+    workers = fleet_workers(registry, statuses, now=now_ts)
+    return {
+        "tickets": tickets_payload["tickets"],
+        "repo_allowlist": tickets_payload["repo_allowlist"],
+        "workers": workers,
+        "orchestrators": orch_rollups(workers),
+        "archived_today": archived_today(archived, now=reference),
+        "generated_at": reference.astimezone(timezone.utc).isoformat(),
+    }

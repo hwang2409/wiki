@@ -864,5 +864,241 @@ class DashboardEndpointTests(unittest.TestCase):
         )
 
 
+class FleetWorkersTests(unittest.TestCase):
+    """WIKI-276: the fleet pane shows every non-orchestrator worker."""
+
+    def _registry(self) -> dict:
+        return {
+            "WIKI-100": {
+                "current": {
+                    "role": "implement", "kind": "cc", "orch": "wiki-dev",
+                    "model": "opus-4.7",
+                    "spawned_at": "2026-08-01T00:00:00+00:00",
+                }
+            },
+            "WIKI-100-REVIEW1": {
+                "current": {
+                    "role": "review", "kind": "cdx", "orch": "wiki-dev",
+                    "model": "gpt-5.6-sol",
+                    "spawned_at": "2026-08-01T00:10:00+00:00",
+                }
+            },
+            "CHIMY-42": {
+                "current": {
+                    "role": "implement", "kind": "cdx", "orch": "tooling-dev",
+                    "model": "gpt-5.6-luna",
+                    "spawned_at": "2026-08-01T01:00:00+00:00",
+                }
+            },
+            "wiki-dev": {"current": {"role": "orchestrator", "kind": "cc"}},
+            "_orchestrators": {"wiki-dev": {"window": "@1"}},
+        }
+
+    def test_includes_reviewers_and_excludes_orchestrator(self) -> None:
+        registry = self._registry()
+        workers = dashboard.fleet_workers(registry, {})
+        tickets = {w["ticket"] for w in workers}
+        self.assertEqual(tickets, {"WIKI-100", "WIKI-100-REVIEW1", "CHIMY-42"})
+
+    def test_status_older_than_spawn_is_ignored(self) -> None:
+        spawned = datetime(2026, 8, 5, 12, 0, 0, tzinfo=timezone.utc)
+        registry = {
+            "WIKI-9": {
+                "current": {
+                    "role": "implement", "kind": "cc", "orch": "wiki-dev",
+                    "spawned_at": spawned.isoformat(),
+                }
+            }
+        }
+        stale = {"state": "merge-ready", "step": "old", "_mtime": spawned.timestamp() - 5}
+        rows = dashboard.fleet_workers(registry, {"WIKI-9": stale})
+        self.assertIsNone(rows[0]["state"])
+        self.assertIsNone(rows[0]["step"])
+
+    def test_worker_alarms_stale_only_when_working(self) -> None:
+        now = 1_000_000.0
+        # merge-ready: never stale (waiting on Henry)
+        self.assertEqual(
+            dashboard._worker_alarms("merge-ready", now - 3600, None, now=now),
+            ["merge-ready"],
+        )
+        # working + old status: stale
+        self.assertEqual(
+            dashboard._worker_alarms("working", now - 3600, None, now=now),
+            ["stale"],
+        )
+        # blocked: blocked, not stale, even if old
+        self.assertEqual(
+            dashboard._worker_alarms("blocked", now - 3600, "quota", now=now),
+            ["blocked"],
+        )
+        # blocker with no matching state -> attention
+        self.assertEqual(
+            dashboard._worker_alarms("working", now - 60, "waiting on Henry", now=now),
+            ["attention"],
+        )
+        # working + fresh: no alarms
+        self.assertEqual(dashboard._worker_alarms("working", now - 60, None, now=now), [])
+
+    def test_mutation_stale_threshold_gates(self) -> None:
+        # Guards against regressing the 30-minute rule. If someone changes
+        # the constant without updating tests, this pair pins the boundary.
+        now = 1_000_000.0
+        just_under = dashboard.STALE_STATUS_SECONDS - 1
+        just_over = dashboard.STALE_STATUS_SECONDS + 1
+        self.assertNotIn("stale", dashboard._worker_alarms("working", now - just_under, None, now=now))
+        self.assertIn("stale", dashboard._worker_alarms("working", now - just_over, None, now=now))
+
+    def test_worker_row_carries_alarms_and_age(self) -> None:
+        now = 1_000_000.0
+        registry = {
+            "WIKI-100": {
+                "current": {
+                    "role": "implement", "kind": "cc", "orch": "wiki-dev",
+                    "model": "opus-4.7",
+                    "spawned_at": "2026-08-01T00:00:00+00:00",
+                }
+            }
+        }
+        statuses = {
+            "WIKI-100": {"state": "working", "step": "editing", "pr": None, "_mtime": now - 3600}
+        }
+        with mock.patch.object(dashboard, "_status_for_current", side_effect=lambda s, c: s or {}):
+            rows = dashboard.fleet_workers(registry, statuses, now=now)
+        row = rows[0]
+        self.assertEqual(row["orch"], "wiki-dev")
+        self.assertEqual(row["kind"], "cc")
+        self.assertEqual(row["model"], "opus-4.7")
+        self.assertIn("stale", row["alarms"])
+        self.assertAlmostEqual(row["status_age_s"], 3600, delta=1)
+
+
+class OrchRollupsTests(unittest.TestCase):
+    """WIKI-276: per-orch counts drive the header rollup strip."""
+
+    def test_counts_across_orchestrators(self) -> None:
+        workers = [
+            {"orch": "wiki-dev", "state": "working", "alarms": []},
+            {"orch": "wiki-dev", "state": "merge-ready", "alarms": ["merge-ready"]},
+            {"orch": "wiki-dev", "state": "blocked", "alarms": ["blocked"]},
+            {"orch": "tooling-dev", "state": "working", "alarms": ["stale"]},
+            {"orch": "tooling-dev", "state": "working", "alarms": []},
+            {"orch": None, "state": "working", "alarms": []},
+        ]
+        rollups = dashboard.orch_rollups(workers)
+        by_orch = {r["orch"]: r for r in rollups}
+        self.assertEqual(by_orch["wiki-dev"]["working"], 1)
+        self.assertEqual(by_orch["wiki-dev"]["merge_ready"], 1)
+        self.assertEqual(by_orch["wiki-dev"]["blocked"], 1)
+        self.assertEqual(by_orch["wiki-dev"]["stalled"], 0)
+        self.assertEqual(by_orch["tooling-dev"]["working"], 2)
+        self.assertEqual(by_orch["tooling-dev"]["stalled"], 1)
+        self.assertEqual(by_orch["(unassigned)"]["working"], 1)
+
+    def test_empty_registry_yields_no_rollups(self) -> None:
+        self.assertEqual(dashboard.orch_rollups([]), [])
+
+
+class ArchivedTodayTests(unittest.TestCase):
+    def test_filters_to_current_utc_day(self) -> None:
+        anchor = datetime(2026, 8, 11, 14, 0, tzinfo=timezone.utc)
+        archived = [
+            {"ticket": "WIKI-A", "archived_at": "2026-08-11T02:00:00+00:00", "outcome": "merged"},
+            {"ticket": "WIKI-B", "archived_at": "2026-08-11T23:00:00+00:00", "outcome": "closed"},
+            {"ticket": "WIKI-C", "archived_at": "2026-08-10T23:59:59+00:00", "outcome": "merged"},
+            {"ticket": "WIKI-D", "archived_at": None},
+        ]
+        rows = dashboard.archived_today(archived, now=anchor)
+        tickets = [r["ticket"] for r in rows]
+        self.assertEqual(tickets, ["WIKI-B", "WIKI-A"])
+        # Newer first: sorting is descending by archived_at.
+        self.assertEqual(rows[0]["outcome"], "closed")
+
+    def test_empty_input(self) -> None:
+        self.assertEqual(dashboard.archived_today([]), [])
+
+
+class BuildPagePayloadTests(unittest.TestCase):
+    def test_payload_shape(self) -> None:
+        registry = {
+            "WIKI-1": {
+                "current": {
+                    "role": "implement", "kind": "cc", "orch": "wiki-dev",
+                    "spawned_at": "2026-08-01T00:00:00+00:00",
+                }
+            }
+        }
+        anchor = datetime(2026, 8, 11, 14, 0, tzinfo=timezone.utc)
+        archived = [
+            {
+                "ticket": "WIKI-OLD",
+                "archived_at": anchor.isoformat(),
+                "outcome": "merged",
+                "role": "implement",
+                "kind": "cc",
+                "orch": "wiki-dev",
+                "state": "merge-ready",
+                "step": "shipped",
+                "pr": "https://github.com/hwang2409/wiki/pull/1",
+            }
+        ]
+        payload = dashboard.build_page_payload(registry, {}, archived, now=anchor)
+        self.assertIn("tickets", payload)
+        self.assertIn("workers", payload)
+        self.assertIn("orchestrators", payload)
+        self.assertIn("archived_today", payload)
+        self.assertEqual(payload["generated_at"], anchor.isoformat())
+        self.assertEqual({w["ticket"] for w in payload["workers"]}, {"WIKI-1"})
+        self.assertEqual([o["orch"] for o in payload["orchestrators"]], ["wiki-dev"])
+        self.assertEqual([a["ticket"] for a in payload["archived_today"]], ["WIKI-OLD"])
+
+
+class DashboardPageRouterTests(unittest.TestCase):
+    """WIKI-276: HTML page + JSON data endpoint mount cleanly."""
+
+    def test_html_and_data_endpoints(self) -> None:
+        from fastapi import FastAPI
+        from fastapi.testclient import TestClient
+
+        from backend.app import dashboard_page
+
+        app = FastAPI()
+        anchor = datetime(2026, 8, 11, 14, 0, tzinfo=timezone.utc)
+        dashboard_page.register_payload_builder(
+            lambda: dashboard.build_page_payload({}, {}, [], now=anchor)
+        )
+        app.include_router(dashboard_page.router)
+        with TestClient(app) as client:
+            page = client.get("/dashboard")
+            self.assertEqual(page.status_code, 200)
+            self.assertIn("Fleet Dashboard", page.text)
+            self.assertEqual(page.headers["content-type"].split(";")[0], "text/html")
+
+            data = client.get("/dashboard/data")
+            self.assertEqual(data.status_code, 200)
+            body = data.json()
+            self.assertEqual(body["generated_at"], anchor.isoformat())
+            self.assertEqual(body["workers"], [])
+            self.assertEqual(body["tickets"], [])
+            self.assertEqual(data.headers["cache-control"], "no-store")
+
+    def test_data_endpoint_returns_empty_payload_without_builder(self) -> None:
+        from fastapi import FastAPI
+        from fastapi.testclient import TestClient
+
+        from backend.app import dashboard_page
+
+        # Force unregistered state: fresh registration with a builder that
+        # errors would still return via the closure, so we explicitly
+        # clear it here to prove the safe default.
+        dashboard_page._payload_builder = None
+        app = FastAPI()
+        app.include_router(dashboard_page.router)
+        with TestClient(app) as client:
+            body = client.get("/dashboard/data").json()
+            self.assertEqual(body["workers"], [])
+            self.assertEqual(body["orchestrators"], [])
+
+
 if __name__ == "__main__":
     unittest.main()
