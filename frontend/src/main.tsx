@@ -8,6 +8,7 @@ import "./styles.css";
 import "./themes.css";
 import { applyStoredTheme } from "./themes";
 import { applyStoredFonts } from "./settings";
+import { applyStoredLowercase } from "./lowercase-mode";
 import { hydrateFromServer, installUiStateWriteBack } from "./ui-state-sync";
 
 async function bootstrap() {
@@ -16,6 +17,7 @@ async function bootstrap() {
   installExternalLinkInterceptors();
   applyStoredTheme();
   applyStoredFonts();
+  applyStoredLowercase();
 
   createRoot(document.getElementById("root")!).render(
     <StrictMode>
