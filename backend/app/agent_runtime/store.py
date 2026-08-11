@@ -2267,7 +2267,7 @@ class RunStore:
 
         with self._lock:
             record = self.get(run_id)
-            current_seq = record.unread_event_seq
+            current_seq = record.normalized_event_count
             accepted_seq = (
                 current_seq
                 if requested_seq is None

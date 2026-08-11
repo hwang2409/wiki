@@ -4305,7 +4305,12 @@ class SpawnWorkerIn(BaseModel):
     @model_validator(mode="after")
     def validate_model_and_effort(self) -> SpawnWorkerIn:
         kind = self.kind.strip()
+        role = self.role.strip().casefold()
         effort = (self.effort or "").strip() or None
+        if self.auto_archive is True and role in {"implement", "plan"}:
+            raise ValueError(
+                f"auto_archive=one-shot is not allowed for role={self.role!r}"
+            )
         if kind == "cdx" and effort not in REASONING_EFFORTS:
             raise ValueError("Reasoning effort is required for Codex workers")
         if kind == "cc" and effort is not None:
@@ -4572,7 +4577,10 @@ def _control_headless_agent(
                 prior_agent_id = raw_id
             prior_role = prior_result.get("role")
             prior_orch = prior_result.get("orchestrator_id")
-            if prior_role in WORKER_ROLES:
+            if (
+                prior_role in WORKER_ROLES
+                and prior_result.get("_workgraph_archive_recorded") is not True
+            ):
                 workgraph_service.record_archive(
                     agent_id=prior_agent_id,
                     orch=prior_orch if isinstance(prior_orch, str) else None,
@@ -4612,7 +4620,11 @@ def _control_headless_agent(
             status_code=502,
             detail="Agent supervisor returned a bad lifecycle response",
         )
-    if action == "archive" and current.get("role") in WORKER_ROLES:
+    if (
+        action == "archive"
+        and current.get("role") in WORKER_ROLES
+        and result.get("_workgraph_archive_recorded") is not True
+    ):
         workgraph_service.record_archive(
             agent_id=resolved_id,
             orch=(

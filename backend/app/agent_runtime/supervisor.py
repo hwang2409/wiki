@@ -62,6 +62,11 @@ _COMMAND_METHODS = frozenset(
 )
 DEFAULT_APPROVAL_RECOVERY_TIMEOUT_SECONDS = 30.0
 AMBIGUOUS_SEND_ECHO_GRACE_SECONDS = 0.05
+_AUTO_ARCHIVE_FORBIDDEN_ROLES = frozenset({"implement", "plan"})
+_VERDICT_STEP_RE = re.compile(
+    r"^[ \t]*(?:MERGE-READY|NOT-MERGE-READY|NEEDS-FIXES)\b",
+    re.IGNORECASE | re.MULTILINE,
+)
 logger = logging.getLogger(__name__)
 
 
@@ -323,6 +328,13 @@ def _public_run(record: RunRecord) -> dict[str, Any]:
     value = record.to_dict()
     value.pop("initial_prompt", None)
     return value
+
+
+def _validate_auto_archive_policy(role: str, auto_archive: bool | None) -> None:
+    if auto_archive is True and role.casefold() in _AUTO_ARCHIVE_FORBIDDEN_ROLES:
+        raise ValueError(
+            f"auto_archive=one-shot is not allowed for role={role!r}"
+        )
 
 
 class Supervisor:
@@ -772,25 +784,34 @@ Preserve the same identity, role, worktree, orchestrator grouping, PR gates, and
         return self._seconds_since(detached_at) >= self.reaper_grace_seconds
 
     def _auto_archive_signal(self, record: RunRecord) -> tuple[str, int] | None:
-        if not record.auto_archive or not self.store.is_current(record):
+        if (
+            not record.auto_archive
+            or record.role.casefold() in _AUTO_ARCHIVE_FORBIDDEN_ROLES
+            or not self.store.is_current(record)
+        ):
             return None
-        if record.state is LifecycleState.COMPLETED:
-            return "completed", record.unread_event_seq
+        status: dict[str, Any] | None = None
         try:
-            status = json.loads(
+            loaded = json.loads(
                 self.store.status_path(record.agent_id).read_text(encoding="utf-8")
             )
+            if isinstance(loaded, dict):
+                status = loaded
         except (OSError, ValueError):
-            return None
-        if not isinstance(status, dict):
-            return None
-        state = status.get("state")
-        step = status.get("step")
-        if state not in {"merge-ready", "blocked"} or not isinstance(step, str):
-            return None
-        if "verdict" not in step.casefold():
-            return None
-        return "verdict", record.unread_event_seq
+            pass
+        if status is not None:
+            state = status.get("state")
+            step = status.get("step")
+            normalized_state = state.casefold() if isinstance(state, str) else None
+            if normalized_state in {"merge-ready", "blocked"} and isinstance(step, str):
+                if _VERDICT_STEP_RE.search(step) or record.state is LifecycleState.COMPLETED:
+                    return (
+                        "verdict",
+                        record.last_lifecycle_event_seq or record.normalized_event_count,
+                    )
+        if record.state is LifecycleState.COMPLETED:
+            return "completed", record.last_lifecycle_event_seq or record.normalized_event_count
+        return None
 
     async def _auto_archive_one_locked(self, run_id: str) -> dict[str, str] | None:
         record = self.store.get(run_id)
@@ -836,6 +857,21 @@ Preserve the same identity, role, worktree, orchestrator grouping, PR gates, and
             }
         )
         return {"run_id": run_id, "action": "auto-archive", "reason": reason}
+
+    def _record_archive_edge(self, record: RunRecord, outcome: str | None) -> None:
+        if record.role not in {"plan", "implement", "review"}:
+            return
+        try:
+            from .. import workgraph_service
+
+            workgraph_service.record_archive(
+                agent_id=record.agent_id,
+                orch=record.orchestrator_id,
+                outcome=outcome or record.outcome,
+                status_dir=self.store.paths.status_dir,
+            )
+        except Exception:
+            logger.exception("could not enqueue archive workgraph edge for %s", record.agent_id)
 
     async def _auto_archive_sweep(self) -> list[dict[str, str]]:
         results: list[dict[str, str]] = []
@@ -2370,6 +2406,7 @@ Preserve the same identity, role, worktree, orchestrator grouping, PR gates, and
         run_id: str | None = None,
         implicit_request_id: bool = False,
     ) -> RunRecord:
+        _validate_auto_archive_policy(role, auto_archive)
         if request_id:
             durable = self.store.find_start_request(request_id)
             if durable is not None:
@@ -4673,6 +4710,7 @@ Preserve the same identity, role, worktree, orchestrator grouping, PR gates, and
                     reason="archived",
                 )
             archived, _ = self.store.archive_current(run_id, outcome=outcome)
+            self._record_archive_edge(archived, outcome)
             if effect_id is not None:
                 effect_payload = {
                     "agent_id": archived.agent_id,
@@ -4692,7 +4730,10 @@ Preserve the same identity, role, worktree, orchestrator grouping, PR gates, and
                         effect_id,
                         effect_payload,
                     ),
-                    _public_run(archived),
+                    {
+                        **_public_run(archived),
+                        "_workgraph_archive_recorded": True,
+                    },
                     command_hash=command_hash,
                 )
             self._forget_implicit_idempotency_for_run(run_id)
@@ -4718,6 +4759,7 @@ Preserve the same identity, role, worktree, orchestrator grouping, PR gates, and
             raise StoreConflict("provider archive returned no status")
         record = self.store.update_adapter_status(run_id, status)
         archived, _ = self.store.archive_current(run_id, outcome=outcome)
+        self._record_archive_edge(archived, outcome)
         if effect_id is not None:
             effect_payload = {
                 "agent_id": archived.agent_id,
@@ -4735,7 +4777,10 @@ Preserve the same identity, role, worktree, orchestrator grouping, PR gates, and
                     effect_id,
                     effect_payload,
                 ),
-                _public_run(archived),
+                {
+                    **_public_run(archived),
+                    "_workgraph_archive_recorded": True,
+                },
                 command_hash=command_hash,
             )
         self._forget_implicit_idempotency_for_run(run_id)
@@ -5186,6 +5231,13 @@ Preserve the same identity, role, worktree, orchestrator grouping, PR gates, and
                 agent_id = command_params.get("agent_id")
                 if not isinstance(agent_id, str) or not agent_id:
                     raise ValueError("agent_id is required")
+                role = command_params.get("role")
+                auto_archive = command_params.get("auto_archive")
+                if not isinstance(role, str):
+                    raise ValueError("role is required")
+                if auto_archive is not None and not isinstance(auto_archive, bool):
+                    raise ValueError("auto_archive must be a boolean or null")
+                _validate_auto_archive_policy(role, auto_archive)
             else:
                 agent_id = command_params.get("agent_id")
                 if not isinstance(agent_id, str) or not agent_id:
@@ -5539,23 +5591,32 @@ Preserve the same identity, role, worktree, orchestrator grouping, PR gates, and
                 archived = self.store.find_latest_archived_agent(agent_id)
                 if archived is None:
                     raise
-                return _public_run(archived)
+                return {
+                    **_public_run(archived),
+                    "_workgraph_archive_recorded": True,
+                }
             archived = self.store.finalize_archived_run(run_id)
             if archived is not None:
-                return _public_run(archived)
-            return _public_run(
-                await self.archive(
-                    run_id,
-                    outcome=outcome,
-                    effect_id=request_id if isinstance(request_id, str) else None,
-                    command_hash=command_hash,
-                    command_hash_payload=(
-                        params.get("command_hash_payload")
-                        if isinstance(params.get("command_hash_payload"), Mapping)
-                        else None
-                    ),
-                )
-            )
+                return {
+                    **_public_run(archived),
+                    "_workgraph_archive_recorded": True,
+                }
+            return {
+                **_public_run(
+                    await self.archive(
+                        run_id,
+                        outcome=outcome,
+                        effect_id=request_id if isinstance(request_id, str) else None,
+                        command_hash=command_hash,
+                        command_hash_payload=(
+                            params.get("command_hash_payload")
+                            if isinstance(params.get("command_hash_payload"), Mapping)
+                            else None
+                        ),
+                    )
+                ),
+                "_workgraph_archive_recorded": True,
+            }
         if method == "run/replace":
             provider = params.get("provider")
             replacement_run_id = params.get("replacement_run_id")

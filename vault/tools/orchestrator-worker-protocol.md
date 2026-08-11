@@ -33,7 +33,7 @@ Flow: orchestrator spawns luna implementer → worker signals merge-ready → or
 
 **Immediate-archive rule applies to ALL one-shot verification workers, not just reviewers (Henry 2026-07-17b).** Sim runners (`-SIM<n>`), eval runners (`-EVAL<n>`), auditors (`-AUDIT<n>`), canary runs (`-CANARY<n>`), thermo-nuclear reviews (`-THERMO<n>`), and any other "produce one report → done" worker follows the same rule: the moment their output is routed (steered to the implementer OR clean-pass surfaced), the very next tool call is `archive_agent` on that worker with `outcome=closed`. Leaving them idle-merge-ready burns a soft-cap slot and (for reviewers) triggers unrouted-verdict re-alarms every 5 min. Applied case 2026-07-17b: PHO-13944-SIM4 findings routed to PHO-13944-PR2 but sim worker not archived; Henry corrected — rule widened from reviewers-only to every one-shot verification worker.
 
-The supervisor now guarantees one-shot auto-archive (viewed => prompt, unviewed => ~10min grace); orchestrator archive-on-read remains best-practice hygiene, not the safety net.
+The supervisor now guarantees auto-archive for one-shot review and explicitly opted-in verification roles (viewed => prompt, unviewed => ~10min grace). Plan and implement roles can never opt in. Orchestrator archive-on-read remains best-practice hygiene, not the safety net.
 
 ## Worker lifecycle doctrine (Henry 2026-08-06e)
 
