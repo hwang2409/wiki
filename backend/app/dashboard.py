@@ -1,8 +1,10 @@
 """Ticket/PR dashboard aggregation.
 
 Read-only: merges live registry workers, archived runs, and cached GitHub PR
-lookups into one row per ticket. gh calls happen on background threads with a
-TTL cache — building the payload never blocks on the network.
+lookups into one row per BASE ticket (reviewer / sim / demo siblings and any
+number of PRs collapse under their parent). gh calls happen on background
+threads with a TTL + per-repository floor so refreshes never dogpile a single
+repo and never block the page.
 """
 
 from __future__ import annotations
@@ -35,11 +37,17 @@ DEPLOY_ENVIRONMENT_BY_REPO: dict[str, str] = {
     "phoebe-health/phoebe": "phoebe-core / production",
 }
 CACHE_TTL_SECONDS = 300
+REPO_MIN_INTERVAL_SECONDS = 60.0
 GH_MAX_WORKERS = 3
 ONE_SHOT_TICKET_TOKEN = re.compile(
     r"^(?:REVIEW|SIM|EVAL|AUDIT|CANARY|THERMO|DEMO|TEST|VERIFY)(?:[0-9]+[A-Z]*)?$",
     re.IGNORECASE,
 )
+BASE_TICKET_RE = re.compile(r"^([A-Z][A-Z0-9]*-\d+)")
+REVIEW_ROUND_RE = re.compile(r"(?:^|-)REVIEW(\d+)", re.IGNORECASE)
+REVIEW_ROUND_STEP_RE = re.compile(r"round\s+(\d+)", re.IGNORECASE)
+STALE_STATUS_SECONDS = 30 * 60
+REVIEW_GAP_SECONDS = 5 * 60
 
 REVIEW_THREAD_COUNT_QUERY = """
 query ReviewThreadCounts($url: URI!) {
@@ -79,6 +87,40 @@ def _summarize_checks(checks: list[dict[str, Any]]) -> tuple[str | None, str | N
     if any(check["state"] == "pending" for check in checks):
         return ("pending", None)
     return ("pass", None)
+
+
+def _base_ticket(ticket: str) -> str:
+    """Reduce a reviewer/sim/demo sibling to its parent ticket.
+
+    ``WIKI-266-REVIEW3-correctness`` -> ``WIKI-266`` /
+    ``PHO-13944-SIM2`` -> ``PHO-13944`` /
+    ``CHIMY-42`` -> ``CHIMY-42``. Tickets that do not start with a
+    ``PROJECT-NNN`` pair (``TEST-1``, ``REVIEW-10983``, orchestrator
+    names, ...) return themselves.
+    """
+    match = BASE_TICKET_RE.match(ticket)
+    return match.group(1) if match else ticket
+
+
+def _has_project_prefix(ticket: str) -> bool:
+    """True when the ticket follows the ``PROJECT-NNN`` (base) shape."""
+    return BASE_TICKET_RE.match(ticket) is not None and ticket == _base_ticket(ticket)
+
+
+def parse_review_round(ticket: str, step: Any) -> int | None:
+    """Highest visible review round from a reviewer suffix or step text.
+
+    Only unambiguous signals count: a ``-REVIEWn`` suffix on the ticket
+    itself or an explicit ``round N`` phrase in the step. Bare numerals
+    (``r3``, ``round-3``-hyphen-only, ...) are not accepted.
+    """
+    rounds: list[int] = []
+    for match in REVIEW_ROUND_RE.finditer(ticket):
+        rounds.append(int(match.group(1)))
+    if isinstance(step, str) and step:
+        for match in REVIEW_ROUND_STEP_RE.finditer(step):
+            rounds.append(int(match.group(1)))
+    return max(rounds) if rounds else None
 
 
 def fetch_pr_summary(pr_url: str, repo: str) -> dict[str, Any]:
@@ -206,10 +248,25 @@ def _merge_deployed(repo: str, merge_sha: str) -> bool | None:
 
 
 class PrCache:
-    """TTL cache over fetch_pr_summary; refreshes on background threads.
+    """TTL cache over fetch_pr_summary with per-repository pacing.
 
-    Lookups always return whatever is cached (stale included) — a fetch
-    failure keeps the previous payload and just re-arms the TTL.
+    Guarantees:
+
+    * ``request_refresh`` never enqueues a fetch for a repository within
+      ``REPO_MIN_INTERVAL_SECONDS`` of the previous fetch for that same
+      repo — a burst of task rows on the same repo pays one round-trip,
+      not one per PR (Q6).
+    * A fetch that raises records ``failure_at`` on the cache entry and
+      leaves the previous payload untouched; ``lookup`` surfaces the
+      failure alongside the last known-good timestamp so the page can
+      render a stale marker instead of quietly showing pre-outage data
+      (Q6).
+    * When the per-repo pace gate is closed, refresh requests are
+      DEFERRED to a per-repo round-robin queue instead of dropped. Every
+      PR is served on a subsequent tick in oldest-unrefreshed-first
+      order, so N PRs on the same repo all enrich within roughly
+      ``N * REPO_MIN_INTERVAL_SECONDS`` worst case even when the
+      browser payload never re-lists a deferred PR (R2).
     """
 
     def __init__(self, fetch: Callable[[str, str], dict[str, Any]] = fetch_pr_summary) -> None:
@@ -217,6 +274,11 @@ class PrCache:
         self._lock = threading.Lock()
         self._entries: dict[str, dict[str, Any]] = {}
         self._inflight: set[str] = set()
+        self._repo_last_call_at: dict[str, float] = {}
+        # R2: per-repo FIFO of PRs deferred because the pace gate was
+        # closed when they were requested. Drained oldest-first every
+        # time any request_refresh touches the same repo.
+        self._repo_queue: dict[str, list[str]] = {}
         self._executor: ThreadPoolExecutor | None = None
 
     def lookup(self, pr_url: str) -> dict[str, Any] | None:
@@ -224,38 +286,123 @@ class PrCache:
             entry = self._entries.get(pr_url)
             return entry["data"] if entry else None
 
-    def request_refresh(self, pr_url: str, repo: str) -> None:
+    def cache_entry(self, pr_url: str) -> dict[str, Any] | None:
+        """Full entry so callers can read staleness/last-success timestamps."""
         with self._lock:
             entry = self._entries.get(pr_url)
-            if entry:
-                if time.time() - entry["checked_at"] < CACHE_TTL_SECONDS:
-                    return
-                data = entry["data"]
-                if data and _is_terminal(data):
-                    return
-            if pr_url in self._inflight:
-                return
-            self._inflight.add(pr_url)
-            if self._executor is None:
+            if not entry:
+                return None
+            return {
+                "data": entry.get("data"),
+                "checked_at": entry.get("checked_at"),
+                "last_success_at": entry.get("last_success_at"),
+                "failure_at": entry.get("failure_at"),
+            }
+
+    def request_refresh(self, pr_url: str, repo: str) -> None:
+        # Collect submissions inside the lock, submit outside — an
+        # InlineExecutor (used by tests) would reacquire the lock
+        # synchronously during ``submit`` otherwise.
+        to_submit: list[str] = []
+        with self._lock:
+            self._prune_queue_locked(repo)
+            # Every same-repo touch first serves the oldest deferred PR
+            # for that repo, so a deferred request keeps its turn even
+            # if the payload never re-lists it.
+            drained = self._drain_queue_locked(repo)
+            if drained is not None:
+                to_submit.append(drained)
+            current = self._enqueue_or_submit_locked(pr_url, repo)
+            if current is not None:
+                to_submit.append(current)
+            if to_submit and self._executor is None:
                 self._executor = ThreadPoolExecutor(
                     max_workers=GH_MAX_WORKERS,
                     thread_name_prefix="dashboard-gh",
                 )
             executor = self._executor
-        executor.submit(self._refresh, pr_url, repo)
+        if executor is None:
+            return
+        for submitted in to_submit:
+            executor.submit(self._refresh, submitted, repo)
+
+    def _is_fresh_or_terminal_locked(self, pr_url: str) -> bool:
+        entry = self._entries.get(pr_url)
+        if not entry:
+            return False
+        if time.time() - entry["checked_at"] < CACHE_TTL_SECONDS:
+            return True
+        data = entry.get("data")
+        return bool(data and _is_terminal(data))
+
+    def _pace_gate_open_locked(self, repo: str) -> bool:
+        last = self._repo_last_call_at.get(repo)
+        return last is None or time.time() - last >= REPO_MIN_INTERVAL_SECONDS
+
+    def _prune_queue_locked(self, repo: str) -> None:
+        queue = self._repo_queue.get(repo)
+        if not queue:
+            return
+        keep = [
+            pr_url
+            for pr_url in queue
+            if pr_url not in self._inflight
+            and not self._is_fresh_or_terminal_locked(pr_url)
+        ]
+        if keep:
+            self._repo_queue[repo] = keep
+        else:
+            self._repo_queue.pop(repo, None)
+
+    def _drain_queue_locked(self, repo: str) -> str | None:
+        queue = self._repo_queue.get(repo)
+        if not queue or not self._pace_gate_open_locked(repo):
+            return None
+        pr_url = queue.pop(0)
+        if not queue:
+            self._repo_queue.pop(repo, None)
+        if pr_url in self._inflight or self._is_fresh_or_terminal_locked(pr_url):
+            return None
+        self._mark_submitted_locked(pr_url, repo)
+        return pr_url
+
+    def _enqueue_or_submit_locked(self, pr_url: str, repo: str) -> str | None:
+        if self._is_fresh_or_terminal_locked(pr_url):
+            return None
+        if pr_url in self._inflight:
+            return None
+        queue = self._repo_queue.get(repo)
+        if queue and pr_url in queue:
+            return None
+        if not self._pace_gate_open_locked(repo):
+            self._repo_queue.setdefault(repo, []).append(pr_url)
+            return None
+        self._mark_submitted_locked(pr_url, repo)
+        return pr_url
+
+    def _mark_submitted_locked(self, pr_url: str, repo: str) -> None:
+        self._inflight.add(pr_url)
+        self._repo_last_call_at[repo] = time.time()
 
     def _refresh(self, pr_url: str, repo: str) -> None:
         data: dict[str, Any] | None = None
+        failed = False
         try:
             data = self._fetch(pr_url, repo)
         except Exception:
-            pass
+            failed = True
         with self._lock:
-            previous = self._entries.get(pr_url)
-            self._entries[pr_url] = {
-                "checked_at": time.time(),
-                "data": data if data is not None else (previous or {}).get("data"),
+            previous = self._entries.get(pr_url) or {}
+            now_ts = time.time()
+            entry: dict[str, Any] = {
+                "checked_at": now_ts,
+                "data": previous.get("data") if failed or data is None else data,
+                "last_success_at": (
+                    now_ts if not failed and data is not None else previous.get("last_success_at")
+                ),
+                "failure_at": now_ts if failed else None,
             }
+            self._entries[pr_url] = entry
             self._inflight.discard(pr_url)
 
 
@@ -278,31 +425,42 @@ PR_CACHE = PrCache()
 def _is_dashboard_worker(ticket: str, role: Any) -> bool:
     """Return whether a registry/archive entry belongs on the ticket dashboard.
 
-    Role is the primary signal, but one-shot ticket names override it because
-    archived one-shot workers can be recorded with role=implement. Older
-    archive records may not have a role; retain those unless their ticket uses
-    a known one-shot worker name.
+    Standalone one-shot tickets (``TEST-1``, ``DEMO-2``, ``REVIEW-10983``,
+    ...) have no parent to fold into and stay hidden. Sibling one-shots
+    (``WIKI-266-REVIEW3``) are kept — the aggregation groups them under
+    their parent base ticket via :func:`_base_ticket`.
     """
-    if any(ONE_SHOT_TICKET_TOKEN.fullmatch(token) for token in ticket.split("-")):
+    if role == "orchestrator":
         return False
+    base = _base_ticket(ticket)
+    if base == ticket:
+        # No parent — this is either a normal ticket (PROJECT-NNN) or a
+        # standalone one-shot. Only the standalone one-shots are dropped.
+        if any(ONE_SHOT_TICKET_TOKEN.fullmatch(token) for token in ticket.split("-")):
+            return False
     if role == "implement":
         return True
-    if role not in (None, ""):
-        return False
+    if role in (None, ""):
+        return True
+    # Reviewers, planners, verify workers, ... — surface them so the
+    # ticket pane can count them as siblings.
     return True
+
+
+def _fold_ticket(ticket: str) -> str:
+    """Alias for the primary aggregation key used by ticket rows."""
+    return _base_ticket(ticket)
 
 
 def live_worker_rows(
     registry: dict[str, Any],
     statuses: dict[str, dict[str, Any]],
 ) -> list[dict[str, Any]]:
-    """One row per live registered non-orchestrator ticket.
+    """One row per live registered non-orchestrator worker.
 
-    Status files are correlated with the registry entry's `spawned_at` — an
-    older status file (from a previous session that outlived its worker)
-    is ignored so a restarted ticket doesn't inherit the previous session's
-    PR/state. Status files with no matching registry entry are never
-    surfaced as live; they belong to the archive path.
+    Reviewer siblings are included — the ticket aggregation folds them by
+    base ticket. Status files older than ``spawned_at`` are ignored so a
+    restarted session cannot inherit the previous session's PR/state.
     """
     rows: list[dict[str, Any]] = []
     for ticket, entry in sorted(registry.items()):
@@ -320,10 +478,12 @@ def live_worker_rows(
         rows.append(
             {
                 "ticket": ticket,
+                "base_ticket": _base_ticket(ticket),
                 "live": True,
                 "role": role,
                 "kind": current.get("kind"),
                 "state": status.get("state") or current.get("state"),
+                "runtime_state": current.get("state"),
                 "step": status.get("step"),
                 "blocker": status.get("blocker"),
                 "pr": _normalize_pr_url(status.get("pr") or current.get("pr")),
@@ -331,6 +491,7 @@ def live_worker_rows(
                 "updated_at": _status_mtime_iso(status)
                 or current.get("updated_at")
                 or current.get("spawned_at"),
+                "mtime": status.get("_mtime") if isinstance(status.get("_mtime"), (int, float)) else None,
             }
         )
     return rows
@@ -358,29 +519,46 @@ def _status_mtime_iso(status: dict[str, Any]) -> str | None:
 
 
 def archived_rows(archived: list[dict[str, Any]]) -> list[dict[str, Any]]:
-    """Newest archive session per ticket (input sorted archived_at desc)."""
+    """One row per unique (ticket, PR) archive session.
+
+    R1: same-ticket PR history is preserved — a ticket that ran across
+    multiple PRs (e.g. an old merged one + a new open one) surfaces every
+    distinct PR. Only exact (ticket, PR) duplicates collapse to the
+    newest occurrence (input is expected newest-first).
+
+    Reviewer/sim/demo siblings are kept — they still fold under their
+    base ticket in :func:`merge_rows` so a ticket row can display its
+    full PR history.
+    """
     rows: list[dict[str, Any]] = []
-    seen: set[str] = set()
+    seen: set[tuple[str, str | None]] = set()
     for entry in archived:
         ticket = entry.get("ticket")
-        if not isinstance(ticket, str) or ticket in seen:
+        if not isinstance(ticket, str):
             continue
-        seen.add(ticket)
+        pr = _normalize_pr_url(entry.get("pr"))
+        key = (ticket, pr)
+        if key in seen:
+            continue
+        seen.add(key)
         role = entry.get("role")
         if not _is_dashboard_worker(ticket, role):
             continue
         rows.append(
             {
                 "ticket": ticket,
+                "base_ticket": _base_ticket(ticket),
                 "live": False,
                 "role": role,
                 "kind": entry.get("kind"),
                 "state": entry.get("state"),
+                "runtime_state": None,
                 "step": entry.get("step"),
                 "blocker": None,
-                "pr": _normalize_pr_url(entry.get("pr")),
+                "pr": pr,
                 "outcome": entry.get("outcome"),
                 "updated_at": entry.get("archived_at"),
+                "mtime": None,
             }
         )
     return rows
@@ -390,11 +568,28 @@ def merge_rows(
     live: list[dict[str, Any]],
     archived: list[dict[str, Any]],
 ) -> list[dict[str, Any]]:
-    """Live wins per ticket; a live row without a PR inherits nothing else."""
-    by_ticket = {row["ticket"]: row for row in archived}
-    for row in live:
-        by_ticket[row["ticket"]] = row
-    return list(by_ticket.values())
+    """Concat live + archived rows, deduping only exact (ticket, PR) pairs.
+
+    R1: an archived merged PR must survive alongside a live worker on the
+    same ticket that is opening a new PR — the row can carry both. Only
+    when a live worker and an archive share the same (ticket, PR) pair
+    do we collapse (prefer live).
+
+    Deliberately does NOT collapse siblings — grouping by base ticket
+    happens in :func:`build_payload` so we still know which sibling
+    contributed each PR.
+    """
+    combined: list[dict[str, Any]] = list(live)
+    seen: set[tuple[str, str | None]] = {
+        (row["ticket"], row.get("pr")) for row in live
+    }
+    for row in archived:
+        key = (row["ticket"], row.get("pr"))
+        if key in seen:
+            continue
+        seen.add(key)
+        combined.append(row)
+    return combined
 
 
 def derive_status(
@@ -413,8 +608,10 @@ def derive_status(
         if state == "OPEN":
             if enrich.get("checks") == "fail":
                 return ("failing", enrich.get("failing_check"))
-            if (enrich.get("thread_total") or 0) > 0:
-                unresolved = enrich.get("thread_unresolved") or 0
+            # Q8: only unresolved threads matter — resolved ones are not
+            # "comments waiting on you", they're history.
+            unresolved = enrich.get("thread_unresolved") or 0
+            if unresolved > 0:
                 total = enrich.get("thread_total") or 0
                 return ("has-comments", f"{unresolved}/{total} threads unresolved")
             if enrich.get("checks") == "pending":
@@ -426,8 +623,6 @@ def derive_status(
     if outcome in {"closed", "abandoned"}:
         return (outcome, None)
     if row.get("pr"):
-        # PR known but not enriched (repo outside allowlist, or gh not yet
-        # fetched): the PR's existence is still the strongest signal.
         state = row.get("state")
         if row.get("live") and state in {"blocked", "merge-ready"}:
             return (state, row.get("blocker") if state == "blocked" else row.get("step"))
@@ -444,46 +639,523 @@ def derive_status(
     return ("unknown", None)
 
 
+def _pr_enrichment(row: dict[str, Any], cache: Any) -> dict[str, Any] | None:
+    """Bundle a PR's cache data + staleness metadata + repo for the payload.
+
+    Tolerates cache stubs (tests) that only implement the classic
+    ``lookup`` / ``request_refresh`` pair — falling back to a synthetic
+    entry so unit tests do not have to know about the failure marker.
+    """
+    pr_url = row.get("pr")
+    if not pr_url:
+        return None
+    repo = _github_repo_from_url(pr_url)
+    if repo not in REPO_ALLOWLIST or not repo:
+        return None
+    entry_fn = getattr(cache, "cache_entry", None)
+    entry = entry_fn(pr_url) if callable(entry_fn) else None
+    cache.request_refresh(pr_url, repo)
+    if entry is None:
+        data = cache.lookup(pr_url)
+        entry = {"data": data, "checked_at": None, "last_success_at": None, "failure_at": None}
+    return {**entry, "repo": repo}
+
+
+def _next_action_hint(
+    row: dict[str, Any],
+    enrich_data: dict[str, Any] | None,
+    live_workers: list[dict[str, Any]],
+    *,
+    now_ts: float,
+) -> str | None:
+    """Conservative next-action hint. Return None when the signal is ambiguous.
+
+    A wrong hint is worse than none, so every branch keys on a signal we
+    already surface elsewhere (alarm derivations, enrich rollup, live
+    worker state). Priority order runs from "someone is actively about
+    to fix this" downwards.
+    """
+    live_impl = [w for w in live_workers if (w.get("role") or "implement") == "implement"]
+    live_review = [w for w in live_workers if w.get("role") == "review"]
+    live_states = {w.get("state") for w in live_impl}
+    if any(w.get("blocker") for w in live_impl):
+        return "blocked — see worker"
+    if "blocked" in live_states:
+        return "blocked — see worker"
+    if any((w.get("runtime_state") == "waiting-approval") for w in live_impl + live_review):
+        return "waiting approval"
+    if live_review:
+        for reviewer in live_review:
+            step = reviewer.get("step") or ""
+            if "MERGE-READY" in step or "NOT-MERGE-READY" in step:
+                return "unrouted verdict — route it"
+        return "review running"
+    if enrich_data:
+        if enrich_data.get("checks") == "fail":
+            return "CI red"
+        if (enrich_data.get("thread_unresolved") or 0) > 0:
+            return "unresolved PR threads"
+        if enrich_data.get("state") == "OPEN" and "merge-ready" in live_states:
+            return "ready to merge"
+    if "merge-ready" in live_states:
+        # Q3 review-gap: >5m merge-ready implementer with no live reviewer.
+        for impl in live_impl:
+            if impl.get("state") != "merge-ready":
+                continue
+            mtime = impl.get("mtime")
+            if isinstance(mtime, (int, float)) and now_ts - mtime > REVIEW_GAP_SECONDS:
+                return "awaiting Henry merge word"
+        return "awaiting Henry merge word"
+    return None
+
+
+def _fmt_iso(when: datetime | None) -> str | None:
+    return when.astimezone(timezone.utc).isoformat() if when else None
+
+
+def _pr_entry_payload(
+    row: dict[str, Any],
+    enrich: dict[str, Any] | None,
+) -> dict[str, Any]:
+    data = (enrich or {}).get("data") or None
+    status, detail = derive_status(row, data)
+    dates = [
+        _parse_when(row.get("updated_at")),
+        _parse_when((data or {}).get("updated_at")),
+    ]
+    latest = max((when for when in dates if when), default=None)
+    return {
+        "sibling_ticket": row["ticket"],
+        "pr": row.get("pr"),
+        "repo": (enrich or {}).get("repo"),
+        "status": status,
+        "detail": detail,
+        "enriched": data is not None,
+        "date": _fmt_iso(latest),
+        "stale": bool(enrich and enrich.get("failure_at")),
+        "last_success_at": (
+            datetime.fromtimestamp(enrich["last_success_at"], tz=timezone.utc).isoformat()
+            if enrich and isinstance(enrich.get("last_success_at"), (int, float))
+            else None
+        ),
+    }
+
+
 def build_payload(
     registry: dict[str, Any],
     statuses: dict[str, dict[str, Any]],
     archived: list[dict[str, Any]],
     *,
     cache: PrCache | None = None,
+    now: datetime | None = None,
 ) -> dict[str, Any]:
     if cache is None:
         cache = PR_CACHE
-    rows = merge_rows(live_worker_rows(registry, statuses), archived_rows(archived))
-    tickets: list[dict[str, Any]] = []
+    now_ts = (now or datetime.now(timezone.utc)).timestamp()
+    live = live_worker_rows(registry, statuses)
+    rows = merge_rows(live, archived_rows(archived))
+
+    # Group siblings by base ticket. Sort each group's rows by date desc
+    # so the newest sibling drives the primary payload (title, status).
+    groups: dict[str, list[dict[str, Any]]] = {}
     for row in rows:
-        pr_url = row.get("pr")
-        repo = _github_repo_from_url(pr_url) if pr_url else None
-        allowlisted = repo in REPO_ALLOWLIST if repo else False
-        enrich = None
-        if pr_url and allowlisted and repo:
-            enrich = cache.lookup(pr_url)
-            cache.request_refresh(pr_url, repo)
-        status, detail = derive_status(row, enrich)
-        dates = [
-            _parse_when(row.get("updated_at")),
-            _parse_when((enrich or {}).get("updated_at")),
+        groups.setdefault(row.get("base_ticket") or row["ticket"], []).append(row)
+
+    tickets: list[dict[str, Any]] = []
+    for base_ticket, siblings in groups.items():
+        # Key by row identity so two siblings sharing a ticket but
+        # carrying distinct PRs (R1) each get their own enrichment.
+        enrichments = {id(row): _pr_enrichment(row, cache) for row in siblings}
+        siblings.sort(
+            key=lambda r: (
+                (_pr_entry_payload(r, enrichments.get(id(r))).get("date") or ""),
+                1 if r.get("live") else 0,
+            ),
+            reverse=True,
+        )
+        pr_entries = [
+            _pr_entry_payload(r, enrichments.get(id(r)))
+            for r in siblings
+            if r.get("pr")
         ]
-        latest = max((when for when in dates if when), default=None)
-        description = (enrich or {}).get("title") or row.get("step") or ""
+        # De-duplicate PR entries (a sibling live + archived for the same PR).
+        seen_prs: set[str] = set()
+        deduped_prs: list[dict[str, Any]] = []
+        for entry in pr_entries:
+            key = entry["pr"] or ""
+            if key in seen_prs:
+                continue
+            seen_prs.add(key)
+            deduped_prs.append(entry)
+        primary_row = siblings[0]
+        primary_enrich = enrichments.get(id(primary_row))
+        primary_data = (primary_enrich or {}).get("data")
+        primary_status, primary_detail = derive_status(primary_row, primary_data)
+        latest_date = max(
+            (
+                _parse_when(entry.get("date"))
+                for entry in [_pr_entry_payload(primary_row, primary_enrich)] + deduped_prs
+                if entry.get("date")
+            ),
+            default=_parse_when(primary_row.get("updated_at")),
+        )
+        live_workers = [row for row in siblings if row.get("live")]
+        # For hint derivation we only care about live workers under this
+        # base — that's the fleet-monitor semantic used for review-gap.
+        review_rounds = [
+            r for r in (parse_review_round(row["ticket"], row.get("step")) for row in siblings) if r
+        ]
+        review_round = max(review_rounds) if review_rounds else None
+        next_action = _next_action_hint(primary_row, primary_data, live_workers, now_ts=now_ts)
+        description = (primary_data or {}).get("title") or primary_row.get("step") or ""
         tickets.append(
             {
-                "ticket": row["ticket"],
+                "ticket": base_ticket,
                 "description": description,
-                "pr": pr_url,
-                "repo": repo,
-                "enriched": enrich is not None,
-                "status": status,
-                "detail": detail,
-                "date": latest.astimezone(timezone.utc).isoformat() if latest else None,
-                "live": bool(row.get("live")),
-                "role": row.get("role"),
-                "kind": row.get("kind"),
+                "pr": primary_row.get("pr") if primary_row.get("pr") else (deduped_prs[0]["pr"] if deduped_prs else None),
+                "repo": (primary_enrich or {}).get("repo"),
+                "enriched": primary_data is not None,
+                "status": primary_status,
+                "detail": primary_detail,
+                "date": _fmt_iso(latest_date),
+                "live": bool(primary_row.get("live")),
+                "role": primary_row.get("role"),
+                "kind": primary_row.get("kind"),
+                "prs": deduped_prs,
+                "workers_live": [
+                    {
+                        "ticket": row["ticket"],
+                        "role": row.get("role"),
+                        "kind": row.get("kind"),
+                        "state": row.get("state"),
+                        "step": row.get("step"),
+                    }
+                    for row in live_workers
+                ],
+                "review_round": review_round,
+                "next_action": next_action,
             }
         )
     tickets.sort(key=lambda item: item["date"] or "", reverse=True)
     return {"tickets": tickets, "repo_allowlist": list(REPO_ALLOWLIST)}
+
+
+# --- Fleet + orchestrator aggregation (WIKI-276) --------------------------
+#
+# The task-first `build_payload` above collapses siblings into one row per
+# base ticket. The fleet view is the opposite: it lists every worker the
+# supervisor is running right now, grouped by orchestrator, with all four
+# fleet-monitor alarm derivations translated for the browser.
+
+
+def _worker_alarms(
+    role: Any,
+    state: Any,
+    runtime_state: Any,
+    mtime: float | None,
+    blocker: Any,
+    step: Any,
+    *,
+    has_live_reviewer_sibling: bool,
+    is_merge_ready_gap: bool,
+    now: float | None = None,
+) -> list[str]:
+    """Alarm chips derived from what the status file and registry expose.
+
+    Mirrors the fleet-monitor semantics:
+
+    * ``waiting-approval`` fires when the registered runtime state is
+      ``waiting-approval`` and *overrides* the displayed state — even if
+      the status file still reads ``working``.
+    * ``stale`` fires on a working-ish worker whose status has not been
+      touched in :data:`STALE_STATUS_SECONDS`.
+    * ``unrouted-verdict`` fires on a live reviewer whose step text
+      carries an unrouted ``MERGE-READY`` / ``NOT-MERGE-READY`` verdict.
+    * ``review-gap`` fires on a live implementer that has been sitting on
+      ``merge-ready`` for more than :data:`REVIEW_GAP_SECONDS` with no
+      live reviewer sibling.
+    """
+    now_ts = time.time() if now is None else now
+    alarms: list[str] = []
+    if runtime_state == "waiting-approval":
+        alarms.append("waiting-approval")
+    if state == "blocked":
+        alarms.append("blocked")
+    elif state == "merge-ready":
+        alarms.append("merge-ready")
+    working_ish = state not in {"blocked", "merge-ready", "closed", "completed", "dead"}
+    if (
+        working_ish
+        and isinstance(mtime, (int, float))
+        and (now_ts - mtime) > STALE_STATUS_SECONDS
+    ):
+        alarms.append("stale")
+    if role == "review":
+        text = step or ""
+        if isinstance(text, str) and (
+            "MERGE-READY" in text or "NOT-MERGE-READY" in text
+        ):
+            alarms.append("unrouted-verdict")
+    if (
+        role in (None, "", "implement")
+        and state == "merge-ready"
+        and not has_live_reviewer_sibling
+        and is_merge_ready_gap
+    ):
+        alarms.append("review-gap")
+    if isinstance(blocker, str) and blocker.strip() and "blocked" not in alarms:
+        alarms.append("attention")
+    return alarms
+
+
+def _display_state(state: Any, runtime_state: Any) -> str | None:
+    """Effective displayed state — waiting-approval overrides working."""
+    if runtime_state == "waiting-approval":
+        return "waiting-approval"
+    if state:
+        return str(state)
+    if runtime_state:
+        return str(runtime_state)
+    return None
+
+
+def _state_bucket(display_state: str | None, alarms: list[str]) -> str:
+    """Honest bucket for the rollup counts (Q5)."""
+    if display_state == "blocked":
+        return "blocked"
+    if display_state == "merge-ready":
+        return "merge_ready"
+    if display_state == "idle":
+        return "idle"
+    if display_state in {"working", "waiting-approval"}:
+        return "working"
+    if "stale" in alarms:
+        return "stalled_or_failed"
+    # dead / completed / interrupted / starting / failed / unknown / None
+    return "stalled_or_failed"
+
+
+def fleet_workers(
+    registry: dict[str, Any],
+    statuses: dict[str, dict[str, Any]],
+    *,
+    now: float | None = None,
+) -> list[dict[str, Any]]:
+    """One row per live registered non-orchestrator worker with alarms.
+
+    Two-pass: the first pass reads registry+status into raw rows; the
+    second computes alarms with sibling context (needed for
+    ``review-gap`` which requires knowing whether a live reviewer exists
+    under the same base ticket).
+    """
+    now_ts = time.time() if now is None else now
+    raw: list[dict[str, Any]] = []
+    for ticket, entry in sorted(registry.items()):
+        if ticket.startswith("_") or not isinstance(entry, dict):
+            continue
+        current = entry.get("current")
+        if not isinstance(current, dict):
+            continue
+        role = current.get("role")
+        if role == "orchestrator":
+            continue
+        status = _status_for_current(statuses.get(ticket), current)
+        mtime = status.get("_mtime")
+        mtime_val = mtime if isinstance(mtime, (int, float)) else None
+        raw_state = status.get("state") or current.get("state")
+        runtime_state = current.get("state")
+        step = status.get("step")
+        blocker = status.get("blocker")
+        pr = _normalize_pr_url(status.get("pr") or current.get("pr"))
+        raw.append(
+            {
+                "ticket": ticket,
+                "base_ticket": _base_ticket(ticket),
+                "orch": current.get("orch"),
+                "role": role,
+                "kind": current.get("kind"),
+                "model": current.get("model"),
+                "raw_state": raw_state,
+                "runtime_state": runtime_state,
+                "step": step,
+                "blocker": blocker,
+                "pr": pr,
+                "run_id": current.get("run_id"),
+                "worktree": current.get("worktree"),
+                "spawned_at": current.get("spawned_at"),
+                "updated_at": _status_mtime_iso(status) or current.get("updated_at"),
+                "status_age_s": (now_ts - mtime_val) if mtime_val else None,
+                "mtime": mtime_val,
+            }
+        )
+    reviewers_by_base: dict[str, list[dict[str, Any]]] = {}
+    for row in raw:
+        if row["role"] == "review":
+            reviewers_by_base.setdefault(row["base_ticket"], []).append(row)
+    rows: list[dict[str, Any]] = []
+    for row in raw:
+        display_state = _display_state(row["raw_state"], row["runtime_state"])
+        base = row["base_ticket"]
+        has_reviewer = any(
+            r["ticket"] != row["ticket"] for r in reviewers_by_base.get(base, [])
+        )
+        merge_ready_gap = (
+            isinstance(row["mtime"], (int, float))
+            and (now_ts - row["mtime"]) > REVIEW_GAP_SECONDS
+        )
+        alarms = _worker_alarms(
+            row["role"],
+            display_state,
+            row["runtime_state"],
+            row["mtime"],
+            row["blocker"],
+            row["step"],
+            has_live_reviewer_sibling=has_reviewer,
+            is_merge_ready_gap=merge_ready_gap,
+            now=now_ts,
+        )
+        rows.append(
+            {
+                "ticket": row["ticket"],
+                "base_ticket": base,
+                "orch": row["orch"],
+                "role": row["role"],
+                "kind": row["kind"],
+                "model": row["model"],
+                "state": display_state,
+                "raw_state": row["raw_state"],
+                "runtime_state": row["runtime_state"],
+                "step": row["step"],
+                "blocker": row["blocker"],
+                "pr": row["pr"],
+                "run_id": row["run_id"],
+                "worktree": row["worktree"],
+                "spawned_at": row["spawned_at"],
+                "updated_at": row["updated_at"],
+                "status_age_s": row["status_age_s"],
+                "alarms": alarms,
+                "bucket": _state_bucket(display_state, alarms),
+                "review_round": parse_review_round(row["ticket"], row["step"]),
+            }
+        )
+    return rows
+
+
+def _orchestrator_ids(registry: dict[str, Any]) -> list[str]:
+    """Every orchestrator we know about — declared or discovered.
+
+    Q4: rollups must render zero-worker orchestrators too, so we start
+    from the registry's declared orchestrators (both the
+    ``_orchestrators`` book and any current record with
+    ``role == 'orchestrator'``).
+    """
+    ids: set[str] = set()
+    orch_book = registry.get("_orchestrators")
+    if isinstance(orch_book, dict):
+        for name in orch_book.keys():
+            if isinstance(name, str):
+                ids.add(name)
+    for ticket, entry in registry.items():
+        if not isinstance(entry, dict) or ticket.startswith("_"):
+            continue
+        current = entry.get("current")
+        if isinstance(current, dict) and current.get("role") == "orchestrator":
+            ids.add(ticket)
+    return sorted(ids)
+
+
+def orch_rollups(
+    workers: list[dict[str, Any]],
+    *,
+    known_orchestrators: list[str] | None = None,
+) -> list[dict[str, Any]]:
+    """Per-orchestrator counts glanceable in the header strip.
+
+    Includes every orchestrator in ``known_orchestrators`` even if it
+    has zero workers (Q4). Buckets follow :func:`_state_bucket` (Q5) so
+    ``failed`` / ``dead`` / unknown never inflate ``working``.
+    """
+    buckets: dict[str, dict[str, Any]] = {}
+
+    def _empty(orch: str) -> dict[str, Any]:
+        return {
+            "orch": orch,
+            "total": 0,
+            "working": 0,
+            "idle": 0,
+            "merge_ready": 0,
+            "blocked": 0,
+            "stalled_or_failed": 0,
+            "waiting_approval": 0,
+        }
+
+    for orch in known_orchestrators or []:
+        buckets[orch] = _empty(orch)
+    for worker in workers:
+        orch = worker.get("orch") or "(unassigned)"
+        bucket = buckets.setdefault(orch, _empty(orch))
+        bucket["total"] += 1
+        target = worker.get("bucket") or _state_bucket(worker.get("state"), worker.get("alarms") or [])
+        bucket[target] = bucket.get(target, 0) + 1
+        if "waiting-approval" in (worker.get("alarms") or []):
+            bucket["waiting_approval"] += 1
+    return sorted(buckets.values(), key=lambda entry: entry["orch"])
+
+
+def archived_today(
+    archived: list[dict[str, Any]],
+    *,
+    now: datetime | None = None,
+) -> list[dict[str, Any]]:
+    """Archive rows whose ``archived_at`` falls on the current UTC day."""
+    reference = now if now is not None else datetime.now(timezone.utc)
+    day_start = datetime.combine(
+        reference.astimezone(timezone.utc).date(),
+        datetime.min.time(),
+        tzinfo=timezone.utc,
+    )
+    rows: list[dict[str, Any]] = []
+    for entry in archived:
+        parsed = _parse_when(entry.get("archived_at"))
+        if parsed is None or parsed < day_start:
+            continue
+        rows.append(
+            {
+                "ticket": entry.get("ticket"),
+                "role": entry.get("role"),
+                "kind": entry.get("kind"),
+                "orch": entry.get("orch"),
+                "outcome": entry.get("outcome"),
+                "state": entry.get("state"),
+                "pr": _normalize_pr_url(entry.get("pr")),
+                "step": entry.get("step"),
+                "archived_at": entry.get("archived_at"),
+            }
+        )
+    rows.sort(key=lambda item: item.get("archived_at") or "", reverse=True)
+    return rows
+
+
+def build_page_payload(
+    registry: dict[str, Any],
+    statuses: dict[str, dict[str, Any]],
+    archived: list[dict[str, Any]],
+    *,
+    cache: PrCache | None = None,
+    now: datetime | None = None,
+) -> dict[str, Any]:
+    """Full JSON payload consumed by the browser dashboard page."""
+    reference = now if now is not None else datetime.now(timezone.utc)
+    now_ts = reference.timestamp()
+    tickets_payload = build_payload(registry, statuses, archived, cache=cache, now=reference)
+    workers = fleet_workers(registry, statuses, now=now_ts)
+    return {
+        "tickets": tickets_payload["tickets"],
+        "repo_allowlist": tickets_payload["repo_allowlist"],
+        "workers": workers,
+        "orchestrators": orch_rollups(
+            workers, known_orchestrators=_orchestrator_ids(registry)
+        ),
+        "archived_today": archived_today(archived, now=reference),
+        "generated_at": reference.astimezone(timezone.utc).isoformat(),
+    }
