@@ -566,7 +566,11 @@ export function toolPathHint(tool: SessionTool): string | null {
     }
   }
   const { target } = toolSummaryParts(tool);
-  const token = target.split(/\s+/)[0] ?? "";
+  const raw = target.split(/\s+/)[0] ?? "";
+  // Codex/bash read summaries surface a line-slice suffix (`foo.yaml:569-596`,
+  // `foo.py:12`). Strip it before the extension check so the trailing token
+  // still looks like a filename and languageForPath can resolve.
+  const token = raw.replace(/:\d+(?:-\d+)?$/, "");
   if (token && !token.includes("{") && /[^./]\.[A-Za-z0-9]+$/.test(token)) return token;
   return null;
 }

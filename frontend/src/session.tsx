@@ -121,7 +121,7 @@ import {
   type ToolPresentation,
   type TraceRow,
 } from "./transcript-event-utils";
-import { HighlightedCode, NumberedReadHighlight, ShikiCode, languageForPath } from "./shiki";
+import { HighlightedCode, NumberedReadHighlight, ShikiCode, languageForPath, languageFromContent } from "./shiki";
 import { parseNumberedPayload, type NumberedPayload } from "./read-gutter";
 import {
   HarnessOutput,
@@ -1213,6 +1213,11 @@ function useToolOutputExpanded(
   return [expanded, toggle];
 }
 
+// WIKI-274 size cap on the content-based language fallback: skip the shape
+// scan for anything larger than a small file's worth of code. Keeps huge log
+// dumps out of the tokenizer without changing the small-read behavior.
+const READ_CONTENT_FALLBACK_MAX_BYTES = 64 * 1024;
+
 // WIKI-253 render-layer gate: promote any tool-output block above the height
 // budget to collapsed presentation, regardless of tool kind or sub-renderer.
 // Measurement happens on completion via ResizeObserver — the block renders
@@ -1335,7 +1340,8 @@ function ToolOutputBody({
   // File-slice bash reads (sed -n over one .py file etc.) highlight their
   // OUTPUT in the target file's language; ANSI-decorated output keeps the
   // ansi path, everything ambiguous stays plain.
-  const bashReadTarget = bash && outputTone === "normal" && !hasGitHubLink && !hasAnsi(displayOutput)
+  const canHighlightOutput = outputTone === "normal" && !hasGitHubLink && !hasAnsi(displayOutput);
+  const bashReadTarget = bash && canHighlightOutput
     ? bashReadTargetPath(tool.input)
     : null;
   const bashOutputLang = bashReadTarget ? languageForPath(bashReadTarget) : null;
@@ -1346,6 +1352,19 @@ function ToolOutputBody({
   // decorated bash output and file-slice reads keep their existing renderers.
   const structured = outputTone === "normal" && !hasGitHubLink && !bashOutputLang && !(bash && hasAnsi(displayOutput))
     ? detectStructuredContent(displayOutput)
+    : null;
+  // WIKI-274: codex/claude read outputs (archetype === "read") never hit the
+  // bash file-slice path — the language falls out of the file summary
+  // (pathLang) or, when the summary carries no filename, from the content
+  // itself. Same guards as bashOutputLang so ansi output, GitHub-anchor
+  // preview text, JSON pretty-print (WIKI-270), and cat -n numbered reads
+  // (WIKI-261) all keep their existing renderers unchanged.
+  const canFallbackFromContent = canHighlightOutput && !bashOutputLang && !structured && !numberedRead;
+  const readOutputLang = canFallbackFromContent
+    ? (pathLang
+      ?? (displayOutput.length <= READ_CONTENT_FALLBACK_MAX_BYTES
+        ? languageFromContent(displayOutput)
+        : null))
     : null;
   const titleNode = bash ? (
     <div className="session-tool-block-title is-command">
@@ -1390,6 +1409,8 @@ function ToolOutputBody({
                   ? <HighlightedCode code={text} lang={structured.lang} />
                   : bashOutputLang
                   ? <HighlightedCode code={text} lang={bashOutputLang} />
+                  : readOutputLang
+                  ? <HighlightedCode code={text} lang={readOutputLang} />
                   : renderOutputSegments(segments, text, hasGitHubLink)}
               </span>
             </div>
