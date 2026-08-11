@@ -497,6 +497,15 @@ class Supervisor:
         )
         if self.worker_soft_cap < 1:
             raise ValueError("worker_soft_cap must be positive")
+        try:
+            from .. import workgraph_service
+
+            workgraph_service.reconcile_archive_edges(
+                self.store.paths.archive_dir,
+                status_dir=self.store.paths.status_dir,
+            )
+        except Exception:
+            logger.exception("could not reconcile archived workgraph edges")
 
     def _runtime_status(self, record: RunRecord) -> dict[str, Any]:
         value = _public_run(record)
@@ -864,14 +873,16 @@ Preserve the same identity, role, worktree, orchestrator grouping, PR gates, and
         try:
             from .. import workgraph_service
 
-            workgraph_service.record_archive(
+            workgraph_service.record_archive_sync(
                 agent_id=record.agent_id,
                 orch=record.orchestrator_id,
                 outcome=outcome or record.outcome,
+                run_id=record.run_id,
+                ended_at=record.updated_at,
                 status_dir=self.store.paths.status_dir,
             )
         except Exception:
-            logger.exception("could not enqueue archive workgraph edge for %s", record.agent_id)
+            logger.exception("could not write archive workgraph edge for %s", record.agent_id)
 
     async def _auto_archive_sweep(self) -> list[dict[str, str]]:
         results: list[dict[str, str]] = []

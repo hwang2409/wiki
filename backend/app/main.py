@@ -1355,13 +1355,12 @@ def _load_run_freshness(run_id: str | None) -> tuple[str | None, int | None]:
     if not isinstance(payload, dict):
         return None, None
     updated_at = payload.get("updated_at")
-    # ``unread_event_seq`` skips synthetic supervisor/fleet user echoes so an
-    # orchestrator wake doesn't light the worker's unread dot before the
-    # worker has produced any response. Legacy run.json files that predate
-    # WIKI-161 fall back to ``normalized_event_count``.
-    seq = payload.get("unread_event_seq")
+    # Viewed cursors use the normalized event sequence. The supervisor stores
+    # its verdict boundary in this same domain. The unread sequence remains a
+    # separate projection for the notification dot.
+    seq = payload.get("normalized_event_count")
     if not isinstance(seq, int):
-        seq = payload.get("normalized_event_count")
+        seq = 0
     if not isinstance(updated_at, str):
         updated_at = None
     if not isinstance(seq, int):
@@ -2286,7 +2285,9 @@ def mark_run_viewed(run_id: str, body: MarkViewedBody | None = None) -> dict[str
                 "last_viewed_at": result.get("last_viewed_at"),
                 "last_viewed_seq": result.get("last_viewed_seq"),
                 "latest_event_at": result.get("updated_at", current_at),
-                "latest_event_seq": result.get("unread_event_seq", current_seq),
+                "latest_event_seq": result.get(
+                    "normalized_event_count", current_seq
+                ),
             }
 
     with _viewed_lock(exclusive=True):

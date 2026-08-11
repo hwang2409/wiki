@@ -6,19 +6,16 @@ tools, or the app UI (they all converge on the backend endpoints). Node IDs
 are stable and derived from agent identity: ``orch:<orch-id>`` for the acting
 orchestrator, the agent id itself for workers.
 
-Agent operations are primary; the graph is telemetry. Appends are delivered
-through a bounded keyed outbox so a blocked filesystem write can never stall
-an already-successful agent action response: ``record_*`` enqueue and return
-immediately, delivery keeps exactly one append in flight per ticket (per-
-ticket order preserved) while distinct tickets deliver concurrently, and
-failures — append errors or a full outbox — are logged and swallowed. The
-FastAPI lifespan owns the outbox lifecycle: shutdown drains with a bound and
-logs every undelivered item. The CLI path (``wiki graph append``) stays
-synchronous; only the backend service path is asynchronous.
+Agent operations are primary; the graph is telemetry. Most appends are
+delivered through a bounded keyed outbox. Supervisor archive edges use the
+synchronous path and recover from committed archive sessions after restart.
+The FastAPI lifespan owns the outbox lifecycle. The CLI path (``wiki graph
+append``) stays synchronous.
 """
 
 from __future__ import annotations
 
+import json
 import logging
 import threading
 from concurrent.futures import Future
@@ -29,8 +26,9 @@ from uuid import uuid4
 
 from wiki_cli import graph_lint
 
-from . import workgraph
+from .agent_runtime.archive_protocol import archive_is_committed
 from .agent_runtime.ticket import base_ticket
+from . import workgraph
 
 log = logging.getLogger("wiki.workgraph")
 
@@ -340,6 +338,90 @@ def record_archive(
         actor,
         status_dir,
     )
+
+
+def record_archive_sync(
+    *,
+    agent_id: str,
+    orch: str | None,
+    outcome: str | None,
+    run_id: str,
+    ended_at: str | None = None,
+    status_dir: Path | None = None,
+) -> dict:
+    """Append an archive edge before the supervisor reports archive success.
+
+    This path does not use the FastAPI-owned process-local outbox. The
+    committed archive is also a durable recovery source for interrupted edge
+    writes.
+    """
+
+    actor = orch or DEFAULT_ACTOR
+    payload = {
+        "outcome": outcome or "archived",
+        "ended_at": ended_at or workgraph.now_iso(),
+    }
+    return workgraph.append_edge(
+        base_ticket(agent_id),
+        "archive",
+        orch_node_id(actor),
+        agent_id,
+        payload,
+        orch=actor,
+        status_dir=status_dir,
+        request_id=f"archive:{run_id}",
+    )
+
+
+def reconcile_archive_edges(
+    archive_dir: Path,
+    *,
+    status_dir: Path | None = None,
+) -> int:
+    """Replay archive edges missing after a supervisor exit.
+
+    Archive sessions are committed before this process can lose an edge
+    write. Replaying by run id is safe because workgraph deduplicates it.
+    """
+
+    repaired = 0
+    for session_dir in sorted(archive_dir.glob("*/*")):
+        if not archive_is_committed(session_dir):
+            continue
+        try:
+            run = json.loads((session_dir / "run.json").read_text(encoding="utf-8"))
+            meta = json.loads((session_dir / "meta.json").read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            continue
+        if not isinstance(run, dict) or not isinstance(meta, dict):
+            continue
+        role = run.get("role")
+        agent_id = run.get("agent_id")
+        run_id = run.get("run_id")
+        if role not in {"plan", "implement", "review"}:
+            continue
+        if not all(isinstance(value, str) and value for value in (agent_id, run_id)):
+            continue
+        try:
+            record_archive_sync(
+                agent_id=agent_id,
+                orch=run.get("orchestrator_id")
+                if isinstance(run.get("orchestrator_id"), str)
+                else None,
+                outcome=run.get("outcome")
+                if isinstance(run.get("outcome"), str)
+                else None,
+                run_id=run_id,
+                ended_at=meta.get("ended_at")
+                if isinstance(meta.get("ended_at"), str)
+                else None,
+                status_dir=status_dir,
+            )
+        except Exception:
+            log.exception("could not reconcile archive workgraph edge for %s", agent_id)
+        else:
+            repaired += 1
+    return repaired
 
 
 def record_escalation(

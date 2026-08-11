@@ -8,10 +8,12 @@ import unittest
 from pathlib import Path
 from unittest import mock
 
+from fastapi.testclient import TestClient
+
 from backend.app.agent_runtime.fake import FixtureAdapterFactory
 from backend.app.agent_runtime.store import RunStore, RuntimePaths
 from backend.app.agent_runtime.supervisor import Supervisor
-from backend.app import workgraph_service
+from backend.app import main, workgraph
 from backend.app.agent_runtime.types import (
     EventDisposition,
     LifecycleState,
@@ -42,15 +44,41 @@ class AutoArchiveTests(unittest.IsolatedAsyncioTestCase):
             FixtureAdapterFactory(FIXTURES, pid=os.getpid()),
             auto_archive_grace_seconds=600,
         )
-        self.archive_edge_patcher = mock.patch.object(
-            workgraph_service, "record_archive"
+        self.workgraph_patcher = mock.patch.object(
+            workgraph, "SNAPSHOT_DIR", root / "workgraphs"
         )
-        self.archive_edge_patcher.start()
+        self.workgraph_patcher.start()
 
     async def asyncTearDown(self) -> None:
         await self.supervisor.close()
-        self.archive_edge_patcher.stop()
+        self.workgraph_patcher.stop()
         self.tmp.cleanup()
+
+    def _http_view(self, record: RunRecord, seq: int) -> dict:
+        supervisor = self.supervisor
+        paths = self.paths
+
+        class LocalSupervisorClient:
+            def __init__(self) -> None:
+                self.paths = paths
+
+            def ensure_running(self) -> None:
+                return None
+
+            def request(self, method: str, params: dict) -> dict:
+                return asyncio.run(supervisor.dispatch(method, params))
+
+        with (
+            mock.patch.object(main, "AGENT_RUNS_DIR", paths.runs_dir),
+            mock.patch.object(main, "SUPERVISOR_CLIENT", LocalSupervisorClient()),
+        ):
+            response = TestClient(main.app).post(
+                f"/api/agents/runs/{record.run_id}/viewed",
+                json={"seq": seq},
+                headers={"host": "localhost"},
+            )
+        self.assertEqual(response.status_code, 200, response.text)
+        return response.json()
 
     def _run(
         self,
@@ -214,10 +242,26 @@ class AutoArchiveTests(unittest.IsolatedAsyncioTestCase):
         await self.supervisor.recover_on_start()
         self.assertTrue(self.store.run_dir(record.run_id).is_dir())
 
-        viewed = await self.supervisor.mark_viewed(record.run_id, requested_seq=2)
+        viewed = self._http_view(record, 1)
 
-        self.assertEqual(viewed.outcome, "closed")
+        self.assertEqual(viewed["last_viewed_seq"], 1)
         self.assertFalse(self.store.run_dir(record.run_id).exists())
+
+    async def test_http_view_of_earlier_event_keeps_verdict_in_grace(self) -> None:
+        record = self._run(
+            "WIKI-AUTO-VIEW-EARLIER", auto_archive=True, state=LifecycleState.IDLE
+        )
+        self._output(record.run_id)
+        self._output(record.run_id)
+        self._verdict_status(record.agent_id)
+
+        await self.supervisor.recover_on_start()
+        self.assertEqual(self.store.get(record.run_id).auto_archive_verdict_seq, 2)
+
+        viewed = self._http_view(record, 1)
+
+        self.assertEqual(viewed["last_viewed_seq"], 1)
+        self.assertTrue(self.store.run_dir(record.run_id).is_dir())
 
     async def test_implementer_never_auto_archives(self) -> None:
         record = self._run(
@@ -241,7 +285,7 @@ class AutoArchiveTests(unittest.IsolatedAsyncioTestCase):
             state=LifecycleState.IDLE,
         )
         self._output(record.run_id)
-        await self.supervisor.mark_viewed(record.run_id, requested_seq=1)
+        self._http_view(record, 1)
 
         raw = self.store.append_raw(
             record.run_id,
@@ -265,8 +309,10 @@ class AutoArchiveTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(current.last_viewed_seq, 1)
         self.assertTrue(self.store.run_dir(record.run_id).is_dir())
 
-        viewed = await self.supervisor.mark_viewed(record.run_id, requested_seq=2)
-        self.assertEqual(viewed.outcome, "closed")
+        viewed = self._http_view(record, 2)
+        self.assertEqual(viewed["last_viewed_seq"], 2)
+        self.assertEqual(viewed["latest_event_seq"], 2)
+        self.assertEqual(self.store.find_archived_run(record.run_id).outcome, "closed")
 
     async def test_verdict_prefixes_are_case_insensitive_and_log_text_is_ignored(self) -> None:
         for index, step in enumerate(
@@ -320,45 +366,105 @@ class AutoArchiveTests(unittest.IsolatedAsyncioTestCase):
                 archive_dir=root / "archive",
                 status_dir=root / "status",
             )
-            store = RunStore(paths)
-            supervisor = Supervisor(
-                store,
-                FixtureAdapterFactory(FIXTURES, pid=os.getpid()),
-                auto_archive_grace_seconds=0,
-            )
-            record = RunRecord.new(
-                agent_id="WIKI-AUTO-PARITY",
-                provider=ProviderKind.CODEX,
-                role="review",
-                auto_archive=auto_archive,
-                model="fixture",
-                worktree=str(worktree),
-                prompt="fixture",
-                run_id="00000000-0000-4000-8000-000000000275",
-            )
-            record.state = LifecycleState.COMPLETED
-            store.create(record)
-            with mock.patch.object(workgraph_service, "record_archive") as edge:
+            with mock.patch.object(workgraph, "SNAPSHOT_DIR", root / "workgraphs"):
+                store = RunStore(paths)
+                supervisor = Supervisor(
+                    store,
+                    FixtureAdapterFactory(FIXTURES, pid=os.getpid()),
+                    auto_archive_grace_seconds=0,
+                )
+                record = RunRecord.new(
+                    agent_id="WIKI-275-PARITY",
+                    provider=ProviderKind.CODEX,
+                    role="review",
+                    auto_archive=auto_archive,
+                    model="fixture",
+                    worktree=str(worktree),
+                    prompt="fixture",
+                    run_id="00000000-0000-4000-8000-000000000275",
+                )
+                record.state = LifecycleState.COMPLETED
+                store.create(record)
                 if auto_archive:
                     await supervisor.recover_on_start()
                 else:
                     await supervisor.archive(record.run_id, outcome="closed")
-                edge.assert_called_once()
-                edge_state = edge.call_args.kwargs
-            registry = json.loads(paths.registry_path.read_text(encoding="utf-8"))
-            await supervisor.close()
-            return registry, edge_state
+                registry = json.loads(paths.registry_path.read_text(encoding="utf-8"))
+                graph = workgraph.load_workgraph(
+                    "WIKI-275-PARITY", paths.status_dir
+                )
+                await supervisor.close()
+            self.assertIsNotNone(graph)
+            return registry, graph
 
-        manual_registry, manual_edge = await archive_in_mode(
+        manual_registry, manual_graph = await archive_in_mode(
             "manual", auto_archive=False
         )
-        auto_registry, auto_edge = await archive_in_mode(
+        auto_registry, auto_graph = await archive_in_mode(
             "auto", auto_archive=True
         )
         self.assertEqual(manual_registry, auto_registry)
-        manual_edge.pop("status_dir")
-        auto_edge.pop("status_dir")
-        self.assertEqual(manual_edge, auto_edge)
+
+        def comparable_edges(graph: dict) -> list[dict]:
+            return [
+                {
+                    "kind": edge["kind"],
+                    "from": edge["from"],
+                    "to": edge["to"],
+                    "request_id": edge.get("request_id"),
+                    "outcome": edge["payload"]["outcome"],
+                }
+                for edge in graph["edges"]
+            ]
+
+        self.assertEqual(comparable_edges(manual_graph), comparable_edges(auto_graph))
+
+    async def test_archive_edge_recovers_after_supervisor_exit(self) -> None:
+        root = Path(self.tmp.name) / "recovery"
+        worktree = root / "worktree"
+        worktree.mkdir(parents=True)
+        paths = RuntimePaths(
+            runtime_dir=root / "runtime",
+            socket_path=root / "runtime" / "supervisor.sock",
+            registry_path=root / "registry.json",
+            archive_dir=root / "archive",
+            status_dir=root / "status",
+        )
+        with mock.patch.object(workgraph, "SNAPSHOT_DIR", root / "workgraphs"):
+            store = RunStore(paths)
+            supervisor = Supervisor(
+                store,
+                FixtureAdapterFactory(FIXTURES, pid=os.getpid()),
+            )
+            record = RunRecord.new(
+                agent_id="WIKI-275-RECOVER",
+                provider=ProviderKind.CODEX,
+                role="review",
+                auto_archive=True,
+                model="fixture",
+                worktree=str(worktree),
+                prompt="fixture",
+            )
+            record.state = LifecycleState.COMPLETED
+            store.create(record)
+            # Model a process exit after the durable archive commit and before
+            # the synchronous edge write. No delivery path is mocked.
+            store.archive_current(record.run_id, outcome="closed")
+            self.assertIsNone(
+                workgraph.load_workgraph("WIKI-275-RECOVER", paths.status_dir)
+            )
+            await supervisor.close()
+
+            restarted_store = RunStore(paths)
+            restarted = Supervisor(
+                restarted_store,
+                FixtureAdapterFactory(FIXTURES, pid=os.getpid()),
+            )
+            graph = workgraph.load_workgraph("WIKI-275-RECOVER", paths.status_dir)
+            self.assertIsNotNone(graph)
+            self.assertEqual(graph["edges"][-1]["kind"], "archive")
+            self.assertFalse(restarted_store.run_dir(record.run_id).exists())
+            await restarted.close()
 
     async def test_manual_archive_is_idempotent_after_auto_archive(self) -> None:
         record = self._run(
