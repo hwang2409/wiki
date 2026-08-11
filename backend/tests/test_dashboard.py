@@ -1633,6 +1633,33 @@ class DashboardPageRouterTests(unittest.TestCase):
             self.assertEqual(body["workers"], [])
             self.assertEqual(body["orchestrators"], [])
 
+    def test_ticket_row_module_served_and_traversal_blocked(self) -> None:
+        """S1: index.html imports /dashboard/static/ticket-row.mjs — that
+        route must serve the module as JavaScript (so the browser can
+        actually load it) and reject anything else to keep the surface
+        area minimal.
+        """
+        from fastapi import FastAPI
+        from fastapi.testclient import TestClient
+
+        from backend.app import dashboard_page
+
+        app = FastAPI()
+        app.include_router(dashboard_page.router)
+        with TestClient(app) as client:
+            served = client.get("/dashboard/static/ticket-row.mjs")
+            self.assertEqual(served.status_code, 200)
+            self.assertIn(
+                "javascript",
+                served.headers["content-type"],
+                served.headers["content-type"],
+            )
+            self.assertIn("renderTicketRowHtml", served.text)
+            # Only the one whitelisted module — everything else 404s.
+            for path in ("index.html", "../dashboard.py", "unknown.mjs"):
+                blocked = client.get(f"/dashboard/static/{path}")
+                self.assertEqual(blocked.status_code, 404, path)
+
 
 class SameTicketPrHistoryTests(unittest.TestCase):
     """WIKI-276 R1: a task row carries ALL its PRs, newest first.

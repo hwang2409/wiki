@@ -22,8 +22,8 @@ import json
 from pathlib import Path
 from typing import Callable
 
-from fastapi import APIRouter
-from fastapi.responses import HTMLResponse, JSONResponse
+from fastapi import APIRouter, HTTPException
+from fastapi.responses import HTMLResponse, JSONResponse, Response
 
 from . import dashboard
 
@@ -55,6 +55,19 @@ def register_payload_builder(builder: PayloadBuilder) -> None:
 @router.get("/dashboard", include_in_schema=False)
 def dashboard_page() -> HTMLResponse:
     return HTMLResponse(_load_html(), headers={"Cache-Control": "no-cache"})
+
+
+@router.get("/dashboard/static/{filename}", include_in_schema=False)
+def dashboard_static(filename: str) -> Response:
+    # Only serves whitelisted ES modules that ship next to index.html —
+    # keeps the path traversal surface at zero.
+    if filename not in {"ticket-row.mjs"}:
+        raise HTTPException(status_code=404)
+    return Response(
+        (_STATIC_DIR / filename).read_text(encoding="utf-8"),
+        media_type="application/javascript",
+        headers={"Cache-Control": "no-cache"},
+    )
 
 
 @router.get("/dashboard/data")

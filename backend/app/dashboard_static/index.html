@@ -360,6 +360,58 @@
   .pr-extra a { border-bottom: none; }
   .pr-stale { color: var(--warn); font-size: 10.5px; margin-left: 4px; }
 
+  /* Per-PR state chip — same pill component as the primary status,
+     rendered next to each PR (primary + older) so a task row shows the
+     real state of every PR it has held. */
+  .pr-primary-chip { margin-top: 4px; }
+  .pr-chip { display: inline-flex; align-items: center; gap: 4px; }
+  .pr-chip-detail {
+    font-size: 10.5px;
+    color: var(--ink-3);
+    letter-spacing: 0.02em;
+  }
+
+  /* Collapsible disclosure for non-primary PRs — closed by default, so a
+     ticket that ran across five PRs shows the newest with its chip and a
+     single "4 older PRs" line the operator can click to expand. */
+  .pr-older {
+    margin-top: 6px;
+    font-size: 11.5px;
+  }
+  .pr-older-summary {
+    cursor: pointer;
+    color: var(--ink-3);
+    padding: 2px 0;
+    letter-spacing: 0.01em;
+    outline-offset: 2px;
+    user-select: none;
+  }
+  .pr-older-summary:hover { color: var(--ink-2); }
+  .pr-older[open] > .pr-older-summary { color: var(--ink-2); }
+  .pr-older-list {
+    list-style: none;
+    margin: 4px 0 0;
+    padding: 0 0 0 12px;
+    border-left: 1px solid var(--rule);
+    display: flex;
+    flex-direction: column;
+    gap: 4px;
+  }
+  .pr-older-item {
+    display: flex;
+    flex-wrap: wrap;
+    align-items: center;
+    gap: 6px;
+    line-height: 1.5;
+  }
+  .pr-older-item a { border-bottom: none; }
+  .pr-older-item .pr-num { font-weight: 500; }
+  .pr-older-item .pr-repo {
+    display: inline;
+    margin-left: 3px;
+    color: var(--ink-4);
+  }
+
   /* ---------- ticket description ---------- */
   .desc-cell {
     color: var(--ink);
@@ -522,7 +574,18 @@
   </details>
 </main>
 
-<script>
+<script type="module">
+import {
+  escape,
+  prLabel,
+  agePhrase,
+  ageFromIso,
+  pill,
+  nextActionClass,
+  ticketBaseLive,
+  renderTicketRowHtml,
+} from "/dashboard/static/ticket-row.mjs";
+
 (() => {
   "use strict";
 
@@ -531,39 +594,6 @@
   const REFRESH_MS = 60_000;      // ambient refresh even if SSE quiet
   const STALE_UI_MS = 120_000;    // no updates in 2 min → indicator warns
   let currentHighlight = null;
-
-  function escape(v) {
-    if (v === null || v === undefined) return "";
-    return String(v)
-      .replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;")
-      .replace(/"/g, "&quot;").replace(/'/g, "&#39;");
-  }
-
-  function prLabel(url) {
-    if (!url) return null;
-    const m = url.match(/github\.com\/([^/]+\/[^/]+)\/pull\/(\d+)/);
-    if (!m) return { num: url, repo: null };
-    return { num: "#" + m[2], repo: m[1] };
-  }
-
-  function agePhrase(seconds) {
-    if (seconds === null || seconds === undefined || !isFinite(seconds)) return "—";
-    seconds = Math.max(0, Math.floor(seconds));
-    if (seconds < 60) return seconds + "s";
-    const m = Math.floor(seconds / 60);
-    if (m < 60) return m + "m";
-    const h = Math.floor(m / 60);
-    if (h < 24) return h + "h " + (m % 60) + "m";
-    const d = Math.floor(h / 24);
-    return d + "d " + (h % 24) + "h";
-  }
-
-  function ageFromIso(iso) {
-    if (!iso) return null;
-    const t = Date.parse(iso);
-    if (isNaN(t)) return null;
-    return (Date.now() - t) / 1000;
-  }
 
   function fmtLocalTime(iso) {
     if (!iso) return "";
@@ -574,10 +604,6 @@
 
   function fmtDate(d) {
     return d.toLocaleDateString([], { weekday: "long", month: "long", day: "numeric", year: "numeric" }).toLowerCase();
-  }
-
-  function pill(label, cls) {
-    return '<span class="pill is-' + cls + '">' + escape(label) + '</span>';
   }
 
   function renderMasthead(generatedAt) {
@@ -704,21 +730,6 @@
       '</table>';
   }
 
-  function ticketBaseLive(ticket, workers) {
-    // Live workers under the SAME base ticket — the aggregation folds
-    // reviewer siblings by base, so a ticket row like WIKI-266 must find
-    // WIKI-266-REVIEW3 workers too.
-    return (workers || []).filter((w) => (w.base_ticket || w.ticket) === ticket);
-  }
-
-  function nextActionClass(hint) {
-    if (!hint) return "";
-    if (/CI red|blocked|stalled|stall|unrouted|waiting/i.test(hint)) return "is-urgent";
-    if (/ready to merge|awaiting Henry/i.test(hint)) return "is-ready";
-    if (/review/i.test(hint)) return "is-review";
-    return "";
-  }
-
   function renderTickets(tickets, workers) {
     const body = $("tickets-body");
     const count = $("tickets-count");
@@ -729,50 +740,9 @@
     }
     count.textContent = tickets.length + " tracked";
 
-    const rows = tickets.map((t) => {
-      const primaryPr = prLabel(t.pr);
-      const statusCls = (t.status || "unknown").replace(/[^a-z0-9-]/gi, "-");
-      const age = agePhrase(ageFromIso(t.date));
-      const linkedWorkers = ticketBaseLive(t.ticket, workers);
-      const linkPill = linkedWorkers.length > 0
-        ? '<a class="worker-link" data-target="worker-' + escape(linkedWorkers[0].ticket) + '">' + linkedWorkers.length + ' live worker' + (linkedWorkers.length === 1 ? '' : 's') + '</a>'
-        : '';
-      const detail = t.detail ? '<span class="detail">' + escape(t.detail) + '</span>' : '';
-      const roundPill = t.review_round ? ' ' + pill("r" + t.review_round, "round") : '';
-      const hint = t.next_action
-        ? ' <span class="next-action ' + nextActionClass(t.next_action) + '">' + escape(t.next_action) + '</span>'
-        : '';
-      // Extra PRs beyond the primary — list newest-first per aggregator.
-      const extraPrs = (t.prs || []).filter((p) => p.pr && p.pr !== t.pr);
-      const extraHtml = extraPrs.length > 0
-        ? extraPrs.map((p) => {
-            const lbl = prLabel(p.pr);
-            const staleTag = p.stale ? '<span class="pr-stale">stale</span>' : '';
-            return '<span class="pr-extra">' +
-              (lbl ? '<a href="' + escape(p.pr) + '" target="_blank" rel="noopener">' + escape(lbl.num) + ' ' + escape(lbl.repo || "") + '</a>' : escape(p.pr)) +
-              staleTag +
-              '</span>';
-          }).join("")
-        : "";
-      const primaryStale = (t.prs || []).some((p) => p.pr === t.pr && p.stale);
-      return (
-        '<tr id="ticket-' + escape(t.ticket) + '">' +
-          '<td class="ticket-id">' + escape(t.ticket) + '</td>' +
-          '<td class="desc-cell">' +
-            escape(t.description || "—") +
-            detail +
-            (linkPill ? '<br>' + linkPill : '') +
-          '</td>' +
-          '<td class="pr-cell' + (primaryPr ? '' : ' empty') + '">' +
-            (primaryPr
-              ? '<a href="' + escape(t.pr) + '" target="_blank" rel="noopener"><span class="pr-num">' + escape(primaryPr.num) + '</span><br><span class="pr-repo">' + escape(primaryPr.repo || "") + '</span></a>' + (primaryStale ? '<span class="pr-stale">stale</span>' : '') + extraHtml
-              : '—') +
-          '</td>' +
-          '<td>' + pill(t.status || "unknown", statusCls) + roundPill + hint + '</td>' +
-          '<td class="age-cell">' + escape(age) + '</td>' +
-        '</tr>'
-      );
-    }).join("");
+    const rows = tickets
+      .map((t) => renderTicketRowHtml(t, workers))
+      .join("");
 
     body.innerHTML =
       '<table class="grid" role="table">' +
