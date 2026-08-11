@@ -1338,7 +1338,7 @@ def _isoformat_utc(ts: float) -> str:
 
 
 def _load_run_freshness(run_id: str | None) -> tuple[str | None, int | None]:
-    """Read the durable ``updated_at`` + normalized event count for a run.
+    """Read the durable ``updated_at`` + unread event count for a run.
 
     Returns ``(None, None)`` when the run has no supervisor record — legacy
     tmux workers, drift entries, or archived runs whose ``runs/<id>/run.json``
@@ -1355,10 +1355,11 @@ def _load_run_freshness(run_id: str | None) -> tuple[str | None, int | None]:
     if not isinstance(payload, dict):
         return None, None
     updated_at = payload.get("updated_at")
-    # Viewed cursors use the normalized event sequence. The supervisor stores
-    # its verdict boundary in this same domain. The unread sequence remains a
-    # separate projection for the notification dot.
-    seq = payload.get("normalized_event_count")
+    # The unread-dot cursor skips synthetic supervisor events. Viewed cursors
+    # use the normalized event sequence loaded separately below.
+    seq = payload.get("unread_event_seq")
+    if not isinstance(seq, int):
+        seq = payload.get("normalized_event_count")
     if not isinstance(seq, int):
         seq = 0
     if not isinstance(updated_at, str):
@@ -1366,6 +1367,22 @@ def _load_run_freshness(run_id: str | None) -> tuple[str | None, int | None]:
     if not isinstance(seq, int):
         seq = None
     return updated_at, seq
+
+
+def _load_run_normalized_seq(run_id: str | None) -> int | None:
+    """Read the normalized event sequence used by viewed cursors."""
+
+    if not run_id or not RUN_ID_PATTERN.fullmatch(run_id):
+        return None
+    run_path = AGENT_RUNS_DIR / run_id / "run.json"
+    try:
+        payload = json.loads(run_path.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return None
+    if not isinstance(payload, dict):
+        return None
+    seq = payload.get("normalized_event_count")
+    return seq if isinstance(seq, int) else None
 
 
 def _run_exists(run_id: str) -> bool:
@@ -2262,8 +2279,9 @@ def mark_run_viewed(run_id: str, body: MarkViewedBody | None = None) -> dict[str
     if not _run_exists(run_id):
         raise HTTPException(status_code=404, detail="Unknown run id")
 
-    current_at, current_seq = _load_run_freshness(run_id)
-    if current_seq is None or current_at is None:
+    current_at, current_unread_seq = _load_run_freshness(run_id)
+    current_seq = _load_run_normalized_seq(run_id)
+    if current_at is None or current_seq is None:
         raise HTTPException(status_code=404, detail="Run has no durable state")
 
     requested_seq = body.seq if body and body.seq is not None else current_seq
@@ -2286,7 +2304,7 @@ def mark_run_viewed(run_id: str, body: MarkViewedBody | None = None) -> dict[str
                 "last_viewed_seq": result.get("last_viewed_seq"),
                 "latest_event_at": result.get("updated_at", current_at),
                 "latest_event_seq": result.get(
-                    "normalized_event_count", current_seq
+                    "unread_event_seq", current_unread_seq
                 ),
             }
 
@@ -2300,7 +2318,7 @@ def mark_run_viewed(run_id: str, body: MarkViewedBody | None = None) -> dict[str
                 "last_viewed_at": prior["at"],
                 "last_viewed_seq": prior["seq"],
                 "latest_event_at": current_at,
-                "latest_event_seq": current_seq,
+                "latest_event_seq": current_unread_seq,
             }
         now_iso = datetime.now(tz=timezone.utc).isoformat()
         viewed_map[run_id] = {"seq": accepted_seq, "at": now_iso}
@@ -2322,7 +2340,7 @@ def mark_run_viewed(run_id: str, body: MarkViewedBody | None = None) -> dict[str
         "last_viewed_at": now_iso,
         "last_viewed_seq": accepted_seq,
         "latest_event_at": current_at,
-        "latest_event_seq": current_seq,
+        "latest_event_seq": current_unread_seq,
     }
 
 

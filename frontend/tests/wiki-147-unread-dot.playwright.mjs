@@ -26,7 +26,7 @@ async function startFakeSupervisor(fixtures, runs) {
   const server = net.createServer((socket) => {
     let buffer = "";
     let subscribed = false;
-    socket.on("data", (chunk) => {
+    socket.on("data", async (chunk) => {
       buffer += chunk.toString();
       let newline;
       while (!subscribed && (newline = buffer.indexOf("\n")) >= 0) {
@@ -34,7 +34,7 @@ async function startFakeSupervisor(fixtures, runs) {
         buffer = buffer.slice(newline + 1);
         if (!requestLine.trim()) continue;
         const request = JSON.parse(requestLine);
-        const { id, method } = request;
+        const { id, method, params = {} } = request;
         if (method === "events/subscribe") {
           subscribed = true;
           subscribers.add(socket);
@@ -42,16 +42,44 @@ async function startFakeSupervisor(fixtures, runs) {
           socket.on("close", () => subscribers.delete(socket));
           return;
         }
-        const result =
-          method === "ping"
-            ? { status: "ok", pid: process.pid }
-            : method === "run/list"
-              ? { status: "ok", pid: process.pid, runs }
-              : method === "run/status"
-                ? runs.find((run) => run.run_id === request.params?.run_id) ?? null
-                : method === "run/queue"
-                  ? { messages: [] }
-                  : null;
+        let result;
+        if (method === "ping") {
+          result = { status: "ok", pid: process.pid };
+        } else if (method === "run/list") {
+          result = { status: "ok", pid: process.pid, runs };
+        } else if (method === "run/status") {
+          result = runs.find((run) => run.run_id === params.run_id) ?? null;
+        } else if (method === "run/mark_viewed") {
+          const run = runs.find((entry) => entry.run_id === params.run_id);
+          if (run) {
+            const seq = Number.isInteger(params.seq) ? params.seq : 0;
+            const viewedPath = path.join(fixtures.root, "agent-viewed.json");
+            let viewed = {};
+            try {
+              viewed = JSON.parse(await fs.readFile(viewedPath, "utf-8"));
+            } catch {
+              /* no viewed state yet */
+            }
+            const viewedSeq = Math.max(viewed[params.run_id]?.seq ?? -1, seq);
+            const viewedAt = new Date().toISOString();
+            viewed[params.run_id] = { seq: viewedSeq, at: viewedAt };
+            await fs.writeFile(viewedPath, JSON.stringify(viewed), "utf-8");
+            result = {
+              ...run,
+              last_viewed_seq: viewedSeq,
+              last_viewed_at: viewedAt,
+              updated_at: run.updated_at,
+              unread_event_seq: run.unread_event_seq,
+              normalized_event_count: run.normalized_event_count,
+            };
+          } else {
+            result = null;
+          }
+        } else if (method === "run/queue") {
+          result = { messages: [] };
+        } else {
+          result = null;
+        }
         if (result === null) {
           socket.write(line({ id, error: { type: "ValueError", message: `unsupported: ${method}` } }));
         } else {
@@ -104,7 +132,7 @@ async function startFakeSupervisor(fixtures, runs) {
  * from `run.json` (WIKI-147 R2 B2 contract). Tests must NOT touch the
  * status file mtime as a proxy for freshness.
  */
-async function appendDurableEvent(fixtures, runId, seq, createdAt) {
+async function appendDurableEvent(fixtures, runId, seq, createdAt, unreadSeq = seq) {
   const runDir = path.join(fixtures.runtimeDir, "runs", runId);
   await fs.mkdir(runDir, { recursive: true });
   const runPath = path.join(runDir, "run.json");
@@ -112,6 +140,7 @@ async function appendDurableEvent(fixtures, runId, seq, createdAt) {
   const payload = {
     run_id: runId,
     normalized_event_count: seq,
+    unread_event_seq: unreadSeq,
     updated_at: updatedAt,
   };
   if (createdAt) payload.created_at = createdAt;
@@ -243,7 +272,28 @@ async function main() {
       return active === null;
     });
 
-    // Scenario 3: exercise the FULL supervisor -> SSE -> UI re-fetch path,
+    // Scenario 3: a synthetic supervisor event advances normalized state but
+    // not the worker-output cursor. It must not re-show the unread dot.
+    await appendDurableEvent(fixtures, RUN_ID, 2, runCreatedAt, 1);
+    supervisor.emit({
+      type: "session",
+      ticket: WORKER,
+      surface: "agents",
+      run_id: RUN_ID,
+    });
+    await waitForUnread(
+      page,
+      WORKER,
+      0,
+      "synthetic event must not re-show the unread dot",
+      8_000,
+    );
+    const synthetic = await pokeAgents(page);
+    const rowAfterSynthetic = synthetic.workers.find((worker) => worker.ticket === WORKER);
+    assert.equal(rowAfterSynthetic.latest_event_seq, 1);
+    assert.equal(rowAfterSynthetic.last_viewed_seq, 1);
+
+    // Scenario 4: exercise the FULL supervisor -> SSE -> UI re-fetch path,
     // WITHOUT a page reload. This is the R2 H2 contract — the previous
     // rewrite mutated run.json + reloaded, so a regression that broke SSE
     // freshness (like R1 B2) could silently pass. Now:
@@ -255,7 +305,7 @@ async function main() {
     //     -> row's latest_event_seq advances past last_viewed_seq
     //     -> dot re-appears
     // The durable seq bump is written FIRST so the re-fetch has fresh data.
-    await appendDurableEvent(fixtures, RUN_ID, 2, runCreatedAt);
+    await appendDurableEvent(fixtures, RUN_ID, 3, runCreatedAt);
     supervisor.emit({
       type: "session",
       ticket: WORKER,
@@ -267,12 +317,12 @@ async function main() {
       page,
       WORKER,
       1,
-      "SSE-delivered session event must re-show the unread dot without a page reload",
+      "worker output after a synthetic event must re-show the unread dot without a page reload",
       8_000,
     );
     await page.screenshot({ path: path.join(OUT_DIR, "3-reappeared.png"), fullPage: false });
 
-    // Scenario 4: a11y — the accessible name of the row includes "unread"
+    // Scenario 5: a11y — the accessible name of the row includes "unread"
     // when the dot is present, so a screen reader announces it.
     const accessibleName = await page.evaluate((t) => {
       const rows = Array.from(document.querySelectorAll(".nav-agent"));
@@ -284,7 +334,7 @@ async function main() {
       `expected accessible text to include "unread", got: ${accessibleName}`,
     );
 
-    // Scenario 5: POST /viewed with an unknown run_id must 404.
+    // Scenario 6: POST /viewed with an unknown run_id must 404.
     const notFoundStatus = await page.evaluate(async () => {
       const res = await fetch("/api/agents/runs/00000000-0000-4000-8000-999999999999/viewed", {
         method: "POST",
@@ -307,7 +357,8 @@ async function main() {
           scenarios: [
             "post-deploy new session shows unread on first paint",
             "open clears dot optimistically + server persists",
-            "SSE session event advances seq and re-shows dot (no reload)",
+            "synthetic session event does not advance the unread dot",
+            "worker output advances seq and re-shows dot (no reload)",
             "accessible name includes 'unread'",
             "unknown run_id -> 404",
           ],

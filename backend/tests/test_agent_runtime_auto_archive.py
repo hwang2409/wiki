@@ -311,7 +311,7 @@ class AutoArchiveTests(unittest.IsolatedAsyncioTestCase):
 
         viewed = self._http_view(record, 2)
         self.assertEqual(viewed["last_viewed_seq"], 2)
-        self.assertEqual(viewed["latest_event_seq"], 2)
+        self.assertEqual(viewed["latest_event_seq"], 1)
         self.assertEqual(self.store.find_archived_run(record.run_id).outcome, "closed")
 
     async def test_verdict_prefixes_are_case_insensitive_and_log_text_is_ignored(self) -> None:
