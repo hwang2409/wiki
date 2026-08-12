@@ -1633,6 +1633,29 @@ class DashboardPageRouterTests(unittest.TestCase):
             self.assertEqual(body["workers"], [])
             self.assertEqual(body["orchestrators"], [])
 
+    def test_missing_html_asset_returns_clear_server_error(self) -> None:
+        from fastapi import FastAPI
+        from fastapi.testclient import TestClient
+
+        from backend.app import dashboard_page
+
+        app = FastAPI()
+        app.include_router(dashboard_page.router)
+        with mock.patch.object(
+            dashboard_page,
+            "_HTML_PATH",
+            Path("/missing-from-bundle/index.html"),
+        ):
+            with self.assertLogs(dashboard_page.logger, level="ERROR") as logs:
+                with TestClient(app) as client:
+                    response = client.get("/dashboard")
+
+        self.assertEqual(response.status_code, 500)
+        self.assertIn("asset missing from bundle", response.text)
+        self.assertTrue(
+            any("dashboard asset missing from bundle" in line for line in logs.output)
+        )
+
     def test_ticket_row_module_served_and_traversal_blocked(self) -> None:
         """S1: index.html imports /dashboard/static/ticket-row.mjs — that
         route must serve the module as JavaScript (so the browser can

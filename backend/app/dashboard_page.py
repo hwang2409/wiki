@@ -19,6 +19,7 @@ through to the SPA bundle.
 from __future__ import annotations
 
 import json
+import logging
 from pathlib import Path
 from typing import Callable
 
@@ -31,10 +32,18 @@ router = APIRouter()
 
 _STATIC_DIR = Path(__file__).parent / "dashboard_static"
 _HTML_PATH = _STATIC_DIR / "index.html"
+logger = logging.getLogger(__name__)
 
 
 def _load_html() -> str:
-    return _HTML_PATH.read_text(encoding="utf-8")
+    try:
+        return _HTML_PATH.read_text(encoding="utf-8")
+    except FileNotFoundError as exc:
+        logger.error("dashboard asset missing from bundle: %s", _HTML_PATH)
+        raise HTTPException(
+            status_code=500,
+            detail="dashboard asset missing from bundle: index.html",
+        ) from exc
 
 
 PayloadBuilder = Callable[[], dict[str, object]]
