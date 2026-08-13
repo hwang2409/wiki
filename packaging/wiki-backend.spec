@@ -11,6 +11,7 @@ if MODE not in {"onefile", "onedir"}:
 
 ONEDIR_NAME = "wiki-backend-sidecar"
 FRONTEND_DIST = Path(os.environ.get("WIKI_FRONTEND_DIST", ROOT / "frontend" / "dist"))
+DASHBOARD_STATIC_DIR = ROOT / "backend" / "app" / "dashboard_static"
 PYINSTALLER_DIST = Path(os.environ.get("WIKI_PYINSTALLER_DIST", ROOT / "dist"))
 LAUNCHER_PATH = PYINSTALLER_DIST / "wiki-backend"
 SCHEMA_FILES = sorted((ROOT / "schemas").glob("*.schema.json"))
@@ -76,8 +77,10 @@ hiddenimports = (
     ]
 )
 
+# Keep module-relative asset destinations covered by backend/tests/test_packaging_spec.py.
 datas = [
     (str(FRONTEND_DIST), "frontend_dist"),
+    (str(DASHBOARD_STATIC_DIR), "backend/app/dashboard_static"),
     *((str(path), "schemas") for path in SCHEMA_FILES),
     *((str(path), "templates/workgraphs") for path in WORKGRAPH_TEMPLATE_FILES),
 ]
