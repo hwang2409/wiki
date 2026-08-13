@@ -42,7 +42,13 @@ def get_json(url: str, *, timeout: float = DEFAULT_TIMEOUT) -> dict:
         raise BackendUnavailable(reason=f"invalid json: {exc}") from exc
 
 
-def iter_sse(url: str, *, timeout: float = SSE_TIMEOUT) -> Iterator[dict]:
+def iter_sse(
+    url: str,
+    *,
+    timeout: float = SSE_TIMEOUT,
+    on_open: Callable[[object], None] | None = None,
+    on_close: Callable[[object], None] | None = None,
+) -> Iterator[dict]:
     """Yield parsed JSON payloads from a text/event-stream endpoint.
 
     Yields one dict per ``data:`` frame; skips comment lines. Raises
@@ -56,39 +62,77 @@ def iter_sse(url: str, *, timeout: float = SSE_TIMEOUT) -> Iterator[dict]:
     except (URLError, TimeoutError, socket.timeout, ConnectionError, OSError) as exc:
         raise BackendUnavailable(reason=f"sse connect failed: {exc}") from exc
 
-    with resp:
-        buf: list[str] = []
-        while True:
-            try:
-                raw = resp.readline()
-            except (socket.timeout, TimeoutError):
-                # Idle heartbeat window elapsed with no bytes; server
-                # will send a ": ping" every ~15s so a real gap here
-                # means the connection died.
+    if on_open:
+        on_open(resp)
+    try:
+        with resp:
+            buf: list[str] = []
+            while True:
+                try:
+                    raw = resp.readline()
+                except (socket.timeout, TimeoutError):
+                    # Idle heartbeat window elapsed with no bytes; server
+                    # will send a ": ping" every ~15s so a real gap here
+                    # means the connection died.
+                    return
+                except (OSError, ConnectionError):
+                    return
+                if not raw:
+                    return
+                line = raw.decode("utf-8", errors="replace").rstrip("\r\n")
+                if line == "":
+                    if buf:
+                        payload = "\n".join(buf)
+                        buf = []
+                        try:
+                            yield json.loads(payload)
+                        except json.JSONDecodeError:
+                            continue
+                    continue
+                if line.startswith(":"):
+                    continue
+                if line.startswith("data:"):
+                    buf.append(line[5:].lstrip())
+    finally:
+        if on_close:
+            on_close(resp)
+
+
+class SSEThread(threading.Thread):
+    def __init__(self, target: Callable[[], None]) -> None:
+        super().__init__(target=target, name="wiki-tui-sse", daemon=True)
+        self._response: object | None = None
+        self._response_lock = threading.Lock()
+        self._closed = False
+
+    def set_response(self, response: object) -> None:
+        with self._response_lock:
+            if self._closed:
+                close = getattr(response, "close", None)
+                if close:
+                    close()
                 return
-            except (OSError, ConnectionError):
-                return
-            if not raw:
-                return
-            line = raw.decode("utf-8", errors="replace").rstrip("\r\n")
-            if line == "":
-                if buf:
-                    payload = "\n".join(buf)
-                    buf = []
-                    try:
-                        yield json.loads(payload)
-                    except json.JSONDecodeError:
-                        continue
-                continue
-            if line.startswith(":"):
-                continue
-            if line.startswith("data:"):
-                buf.append(line[5:].lstrip())
+            self._response = response
+
+    def clear_response(self, response: object) -> None:
+        with self._response_lock:
+            if self._response is response:
+                self._response = None
+
+    def close(self) -> None:
+        with self._response_lock:
+            self._closed = True
+            response = self._response
+            self._response = None
+        if response is not None:
+            close = getattr(response, "close", None)
+            if close:
+                close()
 
 
 def start_sse_thread(
     url: str, on_event: Callable[[dict], None], stop: threading.Event
-) -> threading.Thread:
+) -> SSEThread:
     """Run :func:`iter_sse` in a background thread with reconnect.
 
     Reconnects with a brief back-off; stops when ``stop`` is set.
@@ -100,7 +144,11 @@ def start_sse_thread(
         backoff = 1.0
         while not stop.is_set():
             try:
-                for event in iter_sse(url):
+                for event in iter_sse(
+                    url,
+                    on_open=t.set_response,
+                    on_close=t.clear_response,
+                ):
                     if stop.is_set():
                         return
                     on_event(event)
@@ -114,6 +162,6 @@ def start_sse_thread(
             if stop.wait(1.0):
                 return
 
-    t = threading.Thread(target=_run, name="wiki-tui-sse", daemon=True)
+    t = SSEThread(_run)
     t.start()
     return t

@@ -101,6 +101,12 @@ def _as_str(value: Any) -> str | None:
     return value if isinstance(value, str) and value else None
 
 
+def _pr_url(value: Any) -> str | None:
+    if isinstance(value, dict):
+        return _as_str(value.get("url"))
+    return _as_str(value)
+
+
 def _as_int(value: Any) -> int | None:
     return value if isinstance(value, int) else None
 
@@ -129,7 +135,7 @@ def worker_from_payload(raw: dict[str, Any]) -> WorkerRow:
         state=_as_str(raw.get("state")),
         step=_as_str(raw.get("step")),
         blocker=_as_str(raw.get("blocker")),
-        pr=_as_str(raw.get("pr")),
+        pr=_pr_url(raw.get("pr")),
         worktree=_as_str(raw.get("worktree")),
         status_age_s=_as_float(raw.get("status_age_s")),
         alarms=_as_tuple_str(raw.get("alarms")),
@@ -254,10 +260,15 @@ def _event_text(raw: dict[str, Any]) -> str:
 
 def _latest_verdict(events: list[TranscriptEvent]) -> str | None:
     for ev in reversed(events):
-        for marker in VERDICT_MARKERS:
-            if marker in ev.text:
-                snippet = ev.text.strip().splitlines()[0][:200]
-                return snippet
+        if ev.kind != "assistant":
+            continue
+        for line in reversed(ev.text.splitlines()):
+            snippet = line.strip()
+            if not snippet:
+                continue
+            for marker in ("NOT-MERGE-READY", "MERGE-READY", "GATE-GREEN"):
+                if marker in snippet:
+                    return snippet[:200]
     return None
 
 
@@ -284,7 +295,7 @@ def session_from_payload(ticket: str, payload: dict[str, Any]) -> WorkerSession:
     meta = payload.get("session_meta") if isinstance(payload.get("session_meta"), dict) else {}
     return WorkerSession(
         ticket=ticket,
-        pr=_as_str(payload.get("pr")),
+        pr=_pr_url(payload.get("pr")),
         state=_as_str(meta.get("state")),
         step=_as_str(meta.get("step")),
         blocker=_as_str(meta.get("blocker")),

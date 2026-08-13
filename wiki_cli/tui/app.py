@@ -11,6 +11,7 @@ from __future__ import annotations
 import argparse
 import curses
 import queue
+import signal
 import sys
 import threading
 import time
@@ -67,12 +68,13 @@ class DataPump:
         self.backend = backend.rstrip("/")
         self.out = out_queue
         self.stop_event = threading.Event()
-        self._sse_thread: Optional[threading.Thread] = None
+        self._sse_thread: Optional[client.SSEThread] = None
         self._poll_thread: Optional[threading.Thread] = None
         self._trigger = threading.Event()
-        self._last_sse_ts = 0.0
+        self._last_sse_ts = time.monotonic()
 
     def start(self) -> None:
+        self._last_sse_ts = time.monotonic()
         self._sse_thread = client.start_sse_thread(
             f"{self.backend}/api/events",
             self._on_sse_event,
@@ -86,6 +88,11 @@ class DataPump:
     def stop(self) -> None:
         self.stop_event.set()
         self._trigger.set()
+        if self._sse_thread:
+            self._sse_thread.close()
+            self._sse_thread.join(timeout=1.0)
+        if self._poll_thread:
+            self._poll_thread.join(timeout=1.0)
 
     def request_refresh(self) -> None:
         self._trigger.set()
@@ -104,17 +111,17 @@ class DataPump:
         # Prime immediately so the UI has data on first paint.
         self._fetch_and_publish()
         while not self.stop_event.is_set():
-            triggered = self._trigger.wait(POLL_INTERVAL_S)
+            elapsed = time.monotonic() - self._last_sse_ts
+            wait_s = min(POLL_INTERVAL_S, max(0.0, FALLBACK_POLL_S - elapsed))
+            triggered = self._trigger.wait(wait_s)
             self._trigger.clear()
             if self.stop_event.is_set():
                 return
             # If SSE has been silent for FALLBACK_POLL_S while the
             # trigger did NOT fire, still refresh so we self-heal
             # when the SSE stream is dead but the UI is idle.
-            if not triggered:
-                now = time.time()
-                if (now - self._last_sse_ts) < FALLBACK_POLL_S:
-                    continue
+            if not triggered and (time.monotonic() - self._last_sse_ts) < FALLBACK_POLL_S:
+                continue
             self._fetch_and_publish()
 
     def _fetch_and_publish(self) -> None:
@@ -194,8 +201,11 @@ def _safe_addstr(win, y: int, x: int, text: str, attr: int = 0) -> None:
     remaining = max_x - x - 1
     if remaining <= 0:
         return
+    text = fmt.truncate(text, remaining)
+    if not text:
+        return
     try:
-        win.addnstr(y, x, text, remaining, attr)
+        win.addnstr(y, x, text, len(text), attr)
     except curses.error:
         pass
 
@@ -291,7 +301,7 @@ def render_fleet(
         else:
             worker = payload
             line = "  " + fmt.format_worker_row(worker, inner_width - 4)
-            padded = fmt.pad(line, inner_width - 2) if len(line) < inner_width - 2 else line
+            padded = fmt.pad(line, inner_width - 2) if fmt.cell_width(line) < inner_width - 2 else line
             attr = curses.A_REVERSE if is_selected else curses.A_NORMAL
             _safe_addstr(win, row, left + 1, padded, attr)
 
@@ -387,10 +397,10 @@ def render_detail(
         ts_short = _format_time_only(ev.ts)
         label = fmt.pad(ev.label, 12)
         prefix = f"{ts_short}  {label}  "
-        text_room = inner_width - len(prefix) - 2
+        text_room = inner_width - fmt.cell_width(prefix) - 2
         text = fmt.truncate((ev.text or "").replace("\n", " ⏎ "), max(1, text_room))
         _safe_addstr(win, tail_top + i, left + 1, prefix, curses.A_DIM)
-        _safe_addstr(win, tail_top + i, left + 1 + len(prefix), text)
+        _safe_addstr(win, tail_top + i, left + 1 + fmt.cell_width(prefix), text)
 
 
 def render_help(win) -> None:
@@ -595,7 +605,12 @@ class App:
             self.help_open = True
             return
         if ch == ord("f"):
-            detail.follow = not detail.follow
+            if detail.follow:
+                detail.follow = False
+                if detail.session:
+                    detail.scroll = max(0, len(detail.session.events) - 1)
+            else:
+                detail.follow = True
             if detail.follow and detail.session:
                 detail.scroll = max(0, len(detail.session.events) - 1)
             return
@@ -606,16 +621,28 @@ class App:
                 pass
             return
         if ch in (curses.KEY_DOWN, ord("j")):
-            detail.follow = False
+            if detail.follow:
+                detail.follow = False
+                if detail.session:
+                    detail.scroll = max(0, len(detail.session.events) - 1)
             detail.scroll += 1
         elif ch in (curses.KEY_UP, ord("k")):
-            detail.follow = False
+            if detail.follow:
+                detail.follow = False
+                if detail.session:
+                    detail.scroll = max(0, len(detail.session.events) - 1)
             detail.scroll = max(0, detail.scroll - 1)
         elif ch == curses.KEY_NPAGE:
-            detail.follow = False
+            if detail.follow:
+                detail.follow = False
+                if detail.session:
+                    detail.scroll = max(0, len(detail.session.events) - 1)
             detail.scroll += 10
         elif ch == curses.KEY_PPAGE:
-            detail.follow = False
+            if detail.follow:
+                detail.follow = False
+                if detail.session:
+                    detail.scroll = max(0, len(detail.session.events) - 1)
             detail.scroll = max(0, detail.scroll - 10)
         elif ch == ord("g"):
             detail.follow = False
@@ -673,10 +700,22 @@ def main(argv: list[str] | None = None) -> int:
             f"          starting anyway; will connect when it comes up (ctrl-c to quit)\n"
         )
     app = App(args.backend)
+    def _handle_shutdown(_signum, _frame) -> None:
+        app._quit = True
+        raise KeyboardInterrupt
+
+    previous_handlers = {}
+    for signal_name in ("SIGTERM", "SIGHUP"):
+        signum = getattr(signal, signal_name, None)
+        if signum is not None:
+            previous_handlers[signum] = signal.signal(signum, _handle_shutdown)
     try:
         curses.wrapper(app.run)
     except KeyboardInterrupt:
         return 0
+    finally:
+        for signum, handler in previous_handlers.items():
+            signal.signal(signum, handler)
     return 0
 
 

@@ -8,6 +8,7 @@ from __future__ import annotations
 
 from datetime import datetime, timezone
 from typing import Sequence
+import unicodedata
 
 from .snapshot import FleetGroup, OrchRollup, WorkerRow, parse_iso
 
@@ -22,23 +23,58 @@ DEFAULT_COLUMNS = (
 )
 
 
+def clean_text(text: str) -> str:
+    """Remove terminal controls and render lone surrogates safely."""
+    out: list[str] = []
+    for char in text:
+        codepoint = ord(char)
+        if 0xD800 <= codepoint <= 0xDFFF:
+            out.append(f"\\u{codepoint:04x}")
+        elif unicodedata.category(char) == "Cc":
+            continue
+        else:
+            out.append(char)
+    return "".join(out)
+
+
+def cell_width(text: str) -> int:
+    """Return terminal cells using east-asian width and combining marks."""
+    width = 0
+    for char in clean_text(text):
+        if unicodedata.category(char) in {"Cf", "Mn", "Me"}:
+            continue
+        width += 2 if unicodedata.east_asian_width(char) in {"W", "F"} else 1
+    return width
+
+
 def truncate(text: str, width: int) -> str:
     """Truncate ``text`` to ``width`` cells, ellipsizing with ``…``."""
     if width <= 0:
         return ""
-    if len(text) <= width:
+    text = clean_text(text)
+    if cell_width(text) <= width:
         return text
     if width == 1:
         return "…"
-    return text[: width - 1] + "…"
+    target = width - cell_width("…")
+    out: list[str] = []
+    used = 0
+    for char in text:
+        char_width = cell_width(char)
+        if used + char_width > target:
+            break
+        out.append(char)
+        used += char_width
+    return "".join(out) + "…"
 
 
 def pad(text: str, width: int) -> str:
     if width <= 0:
         return ""
-    if len(text) >= width:
+    text = clean_text(text)
+    if cell_width(text) >= width:
         return truncate(text, width)
-    return text + " " * (width - len(text))
+    return text + " " * (width - cell_width(text))
 
 
 def format_age(seconds: float | None) -> str:

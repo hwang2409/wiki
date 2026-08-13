@@ -8,12 +8,15 @@ reducer.
 
 from __future__ import annotations
 
-import json
+import queue
+import threading
 import unittest
-from dataclasses import replace
 from datetime import datetime, timezone
 
-from wiki_cli.tui import format as fmt, keymap
+from wiki_cli.tui import app as tui_app
+from wiki_cli.tui import client
+from wiki_cli.tui import format as fmt
+from wiki_cli.tui import keymap
 from wiki_cli.tui.snapshot import (
     FleetSnapshot,
     WorkerRow,
@@ -139,7 +142,7 @@ class SnapshotParseTests(unittest.TestCase):
 class SessionParseTests(unittest.TestCase):
     def test_events_flattened_with_labels(self) -> None:
         payload = {
-            "pr": "https://github.com/x/y/pull/9",
+            "pr": {"number": 9, "url": "https://github.com/x/y/pull/9"},
             "session_meta": {"state": "working", "step": "s", "blocker": None},
             "events": [
                 {"kind": "user", "text": "hello", "ts": "2026-08-13T19:00:00Z"},
@@ -154,8 +157,36 @@ class SessionParseTests(unittest.TestCase):
         self.assertIsNotNone(s.latest_verdict)
         self.assertIn("MERGE-READY", s.latest_verdict)
 
+    def test_verdict_uses_latest_assistant_line_not_quoted_prompt(self) -> None:
+        payload = {
+            "events": [
+                {"kind": "user", "text": "kickoff: report MERGE-READY when done"},
+                {
+                    "kind": "assistant",
+                    "text": "i checked the changes\nNOT-MERGE-READY: one finding",
+                },
+            ]
+        }
+        session = session_from_payload("WIKI-290", payload)
+        self.assertEqual(session.latest_verdict, "NOT-MERGE-READY: one finding")
+
+    def test_verdict_requires_assistant_output(self) -> None:
+        session = session_from_payload(
+            "WIKI-290",
+            {"events": [{"kind": "tool", "text": "MERGE-READY: quoted command"}]},
+        )
+        self.assertIsNone(session.latest_verdict)
+
 
 class FormatterTests(unittest.TestCase):
+    def test_cell_width_and_safe_truncation(self) -> None:
+        self.assertEqual(fmt.cell_width("a界"), 3)
+        self.assertEqual(fmt.cell_width("a\u200db"), 2)
+        self.assertEqual(fmt.truncate("a界b", 3), "a…")
+        self.assertEqual(fmt.pad("界", 4), "界  ")
+        self.assertEqual(fmt.clean_text("a\n\x1b[31m"), "a[31m")
+        self.assertEqual(fmt.clean_text("bad\ud800"), "bad\\ud800")
+
     def test_truncate_pad(self) -> None:
         self.assertEqual(fmt.truncate("hello world", 5), "hell…")
         self.assertEqual(fmt.truncate("hi", 5), "hi")
@@ -269,6 +300,133 @@ class KeymapTests(unittest.TestCase):
         w = keymap.selected_worker(sel, snap)
         self.assertIsNotNone(w)
         self.assertEqual(w.ticket, "A-1")
+
+
+class AppBehaviorTests(unittest.TestCase):
+    def test_stopping_follow_seeds_scroll_at_transcript_tail(self) -> None:
+        session = session_from_payload(
+            "WIKI-290",
+            {"events": [{"kind": "assistant", "text": str(i)} for i in range(8)]},
+        )
+        app = tui_app.App("http://127.0.0.1:8213")
+        app.detail = tui_app.DetailViewState(ticket="WIKI-290", session=session)
+
+        app._handle_detail_key(ord("k"))
+        self.assertFalse(app.detail.follow)
+        self.assertEqual(app.detail.scroll, 6)
+
+        app.detail.follow = True
+        app.detail.scroll = 0
+        app._handle_detail_key(ord("f"))
+        self.assertFalse(app.detail.follow)
+        self.assertEqual(app.detail.scroll, 7)
+
+    def test_fallback_wait_reaches_five_seconds(self) -> None:
+        clock = 100.0
+        waits: list[float] = []
+
+        class FakeStop:
+            def __init__(self) -> None:
+                self.stopped = False
+
+            def is_set(self) -> bool:
+                return self.stopped
+
+            def set(self) -> None:
+                self.stopped = True
+
+        stop = FakeStop()
+        pump = tui_app.DataPump("http://127.0.0.1:8213", queue.Queue())
+        pump.stop_event = stop
+        self.assertGreater(pump._last_sse_ts, 0.0)
+
+        class FakeTrigger:
+            def wait(self, timeout: float) -> bool:
+                nonlocal clock
+                waits.append(timeout)
+                clock += timeout
+                return False
+
+            def clear(self) -> None:
+                return None
+
+        pump._trigger = FakeTrigger()
+        pump._last_sse_ts = clock
+        fetches = 0
+
+        def fetch() -> None:
+            nonlocal fetches
+            fetches += 1
+            if fetches == 2:
+                stop.set()
+
+        pump._fetch_and_publish = fetch
+        original_monotonic = tui_app.time.monotonic
+        tui_app.time.monotonic = lambda: clock
+        try:
+            pump._poll_loop()
+        finally:
+            tui_app.time.monotonic = original_monotonic
+
+        self.assertEqual(fetches, 2)
+        self.assertEqual(waits, [2.0, 2.0, 1.0])
+
+    def test_sse_thread_close_closes_active_response(self) -> None:
+        class FakeResponse:
+            closed = False
+
+            def close(self) -> None:
+                self.closed = True
+
+        response = FakeResponse()
+        thread = client.SSEThread(lambda: threading.Event().wait(0.01))
+        thread.set_response(response)
+        thread.close()
+        self.assertTrue(response.closed)
+
+    def test_data_pump_stop_closes_and_joins_sse_thread(self) -> None:
+        class FakeSSE:
+            closed = False
+            joined_with = None
+
+            def close(self) -> None:
+                self.closed = True
+
+            def join(self, *, timeout: float) -> None:
+                self.joined_with = timeout
+
+        pump = tui_app.DataPump("http://127.0.0.1:8213", queue.Queue())
+        sse = FakeSSE()
+        pump._sse_thread = sse
+        pump.stop()
+        self.assertTrue(sse.closed)
+        self.assertEqual(sse.joined_with, 1.0)
+
+    def test_shutdown_signals_install_handler_around_curses(self) -> None:
+        installed: list[tuple[int, object]] = []
+        original_signal = tui_app.signal.signal
+        original_preflight = tui_app._preflight
+        original_wrapper = tui_app.curses.wrapper
+
+        def fake_signal(signum, handler):
+            installed.append((signum, handler))
+            return "previous"
+
+        def fake_wrapper(_run):
+            handler = next(handler for signum, handler in installed if signum == tui_app.signal.SIGTERM)
+            handler(tui_app.signal.SIGTERM, None)
+
+        tui_app.signal.signal = fake_signal
+        tui_app._preflight = lambda _backend: None
+        tui_app.curses.wrapper = fake_wrapper
+        try:
+            self.assertEqual(tui_app.main([]), 0)
+        finally:
+            tui_app.signal.signal = original_signal
+            tui_app._preflight = original_preflight
+            tui_app.curses.wrapper = original_wrapper
+
+        self.assertTrue(any(signum == tui_app.signal.SIGTERM for signum, _ in installed))
 
 
 class CLIWiringTests(unittest.TestCase):
