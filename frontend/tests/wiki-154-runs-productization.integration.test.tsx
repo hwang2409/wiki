@@ -590,14 +590,20 @@ test("orchestrator Replace stays disabled with a reason without a live runtime",
   expect(vi.mocked(globalThis.fetch)).not.toHaveBeenCalled();
 });
 
-// Per-archive selection for a ticket with multiple archives is descoped
-// to WIKI-229 — the backend route currently wins on any live run and
-// consults a ticket-only transcript-path cache before the archived_at
-// hint. History rows may open the ticket's transcript view, but promising
-// a specific archive here would be a false affordance. The archived_at
-// identifier still rides through SidebarTarget → SessionTab →
-// getAgentSession → /session?archived_at=… so WIKI-229 can switch on it
-// once the route is discriminated.
+test("history targeting selects the named archive over a live ticket", () => {
+  const olderAt = "2026-07-01T00:00:00+00:00";
+  const newerAt = "2026-07-02T00:00:00+00:00";
+  const live = { ...worker, ticket: "WIKI-0", model: "live-model" };
+  const older = { ...archivedEntry, ticket: "WIKI-0", archived_at: olderAt, model: "old-model" };
+  const newer = { ...archivedEntry, ticket: "WIKI-0", archived_at: newerAt, model: "new-model" };
+  const view = renderView({
+    data: { workers: [live], orchestrators: [], archived: [newer, older], error: null },
+    openTicket: { kind: "archive", ticket: "WIKI-0", archivedAt: olderAt },
+  });
+
+  expect(view.getByText("old-model")).toBeTruthy();
+  expect(view.queryByText("live-model")).toBeNull();
+});
 
 test("history row is a quiet outcome/date summary with View transcript", async () => {
   const view = renderView({

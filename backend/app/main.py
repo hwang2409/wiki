@@ -1792,11 +1792,7 @@ def _archive_hint(
     With ``archived_at`` returns the archive whose iso timestamp matches
     exactly, or (None, None, None) for a stale identifier.
 
-    WIKI-229: this helper honors ``archived_at`` but the surrounding
-    session route currently consults it only in the no-live-run branch
-    (after the ticket-only ``_session_paths`` cache), so history-row
-    selection can be surfaced only once the route becomes discriminated.
-    The plumbing is retained here so WIKI-229 has less to add.
+    ``archived_at`` is the archive discriminator used by the session routes.
     """
 
     ticket_dir = AGENT_ARCHIVE_DIR / ticket
@@ -3690,13 +3686,27 @@ def agent_session(
     if not valid_agent_id(ticket):
         raise HTTPException(status_code=400, detail="Bad ticket")
 
+    requested_archive = archived_at is not None
+    archive_dir: Path | None = None
+    archive_kind: str | None = None
+    spawned_at: str | None = None
+    archive_model: str | None = None
+    archive_provider: str | None = None
+    if requested_archive:
+        archive_kind, spawned_at, archive_dir = _archive_hint(ticket, archived_at)
+        if archive_dir is None:
+            raise HTTPException(status_code=404, detail="Archived session not found")
+        _archive_entry, archive_model, archive_kind, archive_provider = (
+            _archive_runtime_identity(archive_dir, fallback_kind=archive_kind)
+        )
+
     registry: dict = {}
     try:
         registry = json.loads(AGENT_REGISTRY_PATH.read_text(encoding="utf-8"))
     except (OSError, ValueError):
         pass
     orch = (registry.get("_orchestrators") or {}).get(ticket)
-    if orch and orch.get("transcript"):
+    if not requested_archive and orch and orch.get("transcript"):
         found = _direct_transcript_session(Path(orch["transcript"]))
         if found is not None:
             fmt, path = found
@@ -3728,15 +3738,7 @@ def agent_session(
     )
     spawned_at = current.get("spawned_at")
     registry_session_id = current.get("session_id") if isinstance(current.get("session_id"), str) else None
-    archive_dir: Path | None = None
-    requested_archive = archived_at is not None
     if requested_archive:
-        archive_kind, spawned_at, archive_dir = _archive_hint(ticket, archived_at)
-        if archive_dir is None:
-            raise HTTPException(status_code=404, detail="Archived session not found")
-        _archive_entry, archive_model, archive_kind, archive_provider = (
-            _archive_runtime_identity(archive_dir, fallback_kind=archive_kind)
-        )
         current = {}
         current_model = archive_model
         current_kind = archive_kind
@@ -3878,8 +3880,9 @@ def agent_session_older(
     ticket: str,
     before: int = Query(..., ge=0),
     count: int = Query(500, ge=1, le=2_000),
+    archived_at: str | None = None,
 ) -> dict[str, object]:
-    session = agent_session(ticket, cursor=0, client_path=None)
+    session = agent_session(ticket, cursor=0, client_path=None, archived_at=archived_at)
     fmt = session.get("format")
     raw_path = session.get("path")
     if not isinstance(raw_path, str):

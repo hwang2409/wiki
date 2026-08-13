@@ -936,19 +936,20 @@ export function getAgentSession(
 ) {
   const params = new URLSearchParams({ cursor: String(after) });
   if (path) params.set("path", path);
-  // WIKI-229: the ``archived_at`` param is honored by the backend
-  // ``_archive_hint`` helper but ignored by the session route unless the
-  // ticket has no live run and no cached transcript. Callers do not set
-  // it in this PR; WIKI-229 delivers the discriminated session route
-  // that will select the exact archive.
   if (archivedAt) params.set("archived_at", archivedAt);
   return request<AgentSessionData>(
     `/api/agents/${encodeURIComponent(ticket)}/session?${params.toString()}`
   );
 }
 
-export function getAgentOlderSession(ticket: string, before: number, count = 500) {
+export function getAgentOlderSession(
+  ticket: string,
+  before: number,
+  count = 500,
+  archivedAt?: string,
+) {
   const params = new URLSearchParams({ before: String(before), count: String(count) });
+  if (archivedAt) params.set("archived_at", archivedAt);
   return request<AgentOlderSessionData>(
     `/api/agents/${encodeURIComponent(ticket)}/session/older?${params.toString()}`
   );
