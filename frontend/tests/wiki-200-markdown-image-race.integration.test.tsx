@@ -10,12 +10,13 @@
 import { cleanup, render, waitFor } from "@testing-library/react";
 import { afterEach, beforeEach, describe, expect, test, vi } from "vitest";
 
-import { MarkdownImage } from "../src/markdown-image";
+import { __resetAssetMetaForTests, MarkdownImage } from "../src/markdown-image";
 import * as cacheModule from "../src/thumbnail-cache";
 
 let resolveIdb: (record: cacheModule.ThumbnailRecord | null) => void;
 
 beforeEach(() => {
+  __resetAssetMetaForTests();
   cacheModule.__resetThumbnailCacheForTests();
   vi.spyOn(cacheModule, "readThumbnail").mockImplementation(
     () => new Promise((resolve) => {
@@ -65,5 +66,50 @@ describe("MarkdownImage race — U5", () => {
     const preview = container.querySelector<HTMLImageElement>(".markdown-image-preview");
     expect(preview?.src).toContain("NETWORK-FRESH");
     expect(preview?.src).not.toContain("IDB-STALE");
+  });
+
+  test("transient HTTP failure does not poison the next mount", async () => {
+    cleanup();
+    cacheModule.__resetThumbnailCacheForTests();
+    vi.mocked(cacheModule.readThumbnail).mockResolvedValue(null);
+    const responses = [
+      new Response("temporary", { status: 503 }),
+      new Response("temporary", { status: 503 }),
+      new Response("temporary", { status: 503 }),
+      new Response(JSON.stringify({ width: 800, height: 600, preview_base64: "data:image/jpeg;base64,RECOVERED" }), { status: 200 }),
+    ];
+    vi.mocked(globalThis.fetch).mockImplementation(async () => responses.shift()!);
+
+    const first = render(<MarkdownImage src="retry.png" alt="retry" />);
+    await waitFor(() => expect(vi.mocked(globalThis.fetch)).toHaveBeenCalledTimes(3));
+    first.unmount();
+
+    const second = render(<MarkdownImage src="retry.png" alt="retry" />);
+    await waitFor(() => {
+      const preview = second.container.querySelector<HTMLImageElement>(".markdown-image-preview");
+      expect(preview?.src).toContain("RECOVERED");
+    });
+    expect(vi.mocked(globalThis.fetch)).toHaveBeenCalledTimes(4);
+  });
+
+  test("network rejection removes stale hydrated metadata", async () => {
+    cleanup();
+    cacheModule.__resetThumbnailCacheForTests();
+    vi.mocked(cacheModule.readThumbnail).mockResolvedValue({
+      path: "stale.png",
+      mtimeMs: 50,
+      width: 800,
+      height: 600,
+      previewBase64: "data:image/jpeg;base64,IDB-STALE",
+      storedAt: 1_000_000,
+    });
+    vi.mocked(globalThis.fetch).mockRejectedValue(new Error("offline"));
+
+    const view = render(<MarkdownImage src="stale.png" alt="stale" />);
+    await waitFor(() => expect(vi.mocked(globalThis.fetch)).toHaveBeenCalledTimes(3));
+    await waitFor(() => {
+      expect(view.container.querySelector(".markdown-image-preview")).toBeNull();
+    });
+    expect(cacheModule.readThumbnail).toHaveBeenCalledWith("stale.png");
   });
 });

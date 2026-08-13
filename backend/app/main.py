@@ -6492,6 +6492,15 @@ def _read_vault_asset_bytes(asset_path: str) -> tuple[bytes, str, int]:
     return raw, media_type, mtime_ms
 
 
+@app.get("/api/vault/identity")
+def get_vault_identity() -> dict[str, str]:
+    """Stable identity for the currently-mounted vault. The frontend
+    thumbnail cache uses this as a namespace prefix so previews from
+    different vaults sharing the same origin cannot collide. WIKI-200."""
+    fingerprint = hashlib.sha256(str(VAULT_DIR).encode("utf-8")).hexdigest()
+    return {"identity": fingerprint[:16]}
+
+
 @app.get("/api/vault/assets/{asset_path:path}")
 def get_vault_asset(asset_path: str, w: int | None = None) -> Response:
     raw, media_type, _mtime_ms = _read_vault_asset_bytes(asset_path)

@@ -9,10 +9,28 @@ import "./themes.css";
 import { applyStoredTheme } from "./themes";
 import { applyStoredFonts } from "./settings";
 import { applyStoredLowercase } from "./lowercase-mode";
+import { setThumbnailCacheNamespace } from "./thumbnail-cache";
 import { hydrateFromServer, installUiStateWriteBack } from "./ui-state-sync";
 
+async function applyVaultNamespace() {
+  // Namespace the artifact thumbnail cache by the backend's vault
+  // identity so previews from different vaults sharing this origin
+  // cannot collide. Failure to fetch is non-fatal — the cache stays
+  // on its "default" namespace and mtime invalidation still runs.
+  try {
+    const response = await fetch("/api/vault/identity", { cache: "no-store" });
+    if (!response.ok) return;
+    const body = await response.json();
+    if (typeof body?.identity === "string" && body.identity) {
+      setThumbnailCacheNamespace(body.identity);
+    }
+  } catch {
+    // Non-fatal — leave the default namespace in place.
+  }
+}
+
 async function bootstrap() {
-  await hydrateFromServer();
+  await Promise.all([hydrateFromServer(), applyVaultNamespace()]);
   installUiStateWriteBack();
   installExternalLinkInterceptors();
   applyStoredTheme();

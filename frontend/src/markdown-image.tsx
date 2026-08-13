@@ -95,13 +95,22 @@ type AssetMeta = {
   mtimeMs: number | null;
 };
 
-// Shared cache: results are cached forever, in-flight fetches are shared, and
-// the underlying fetch is NEVER aborted from a consumer's cleanup — each
-// consumer manages its own cancellation via a cancelled flag. This avoids
-// the round-2 bug where the first consumer's unmount cancelled the request
-// for every other consumer waiting on the same asset.
-const assetMetaCache = new Map<string, AssetMeta | null>();
+// Shared cache: successful metadata is cached forever. Failed requests do
+// not write a null marker, so the next mount can retry. In-flight fetches
+// are shared, and the underlying fetch is NEVER aborted from cleanup.
+const assetMetaCache = new Map<string, AssetMeta>();
 const assetMetaPending = new Map<string, Promise<AssetMeta | null>>();
+const assetMetaHydrationGeneration = new Map<string, number>();
+
+const MAX_META_FETCH_ATTEMPTS = 3;
+
+function invalidateAssetMeta(path: string): void {
+  assetMetaCache.delete(path);
+  assetMetaHydrationGeneration.set(
+    path,
+    (assetMetaHydrationGeneration.get(path) ?? 0) + 1,
+  );
+}
 
 function fetchAssetMeta(path: string): Promise<AssetMeta | null> {
   const cached = assetMetaCache.get(path);
@@ -109,53 +118,62 @@ function fetchAssetMeta(path: string): Promise<AssetMeta | null> {
   const pending = assetMetaPending.get(path);
   if (pending) return pending;
   const encoded = path.split("/").map(encodeURIComponent).join("/");
-  const request = fetch(`/api/vault/asset-meta/${encoded}`)
-    .then(async (response) => {
-      if (response.status === 404) {
-        // Asset deleted server-side. Drop any stale IDB record so a
-        // future mount doesn't hydrate a preview for something that
-        // isn't there.
-        void deleteThumbnail(path);
-        return null;
+  const request = (async () => {
+    for (let attempt = 0; attempt < MAX_META_FETCH_ATTEMPTS; attempt += 1) {
+      try {
+        const response = await fetch(`/api/vault/asset-meta/${encoded}`);
+        if (response.status === 404) {
+          // The asset is gone. Remove stale IDB data, but do not cache a
+          // null result that would prevent a later recreated asset retry.
+          invalidateAssetMeta(path);
+          void deleteThumbnail(path);
+          return null;
+        }
+        if (!response.ok) {
+          invalidateAssetMeta(path);
+          continue;
+        }
+        const body = await response.json();
+        const meta: AssetMeta = {
+          width: Number(body.width) || 0,
+          height: Number(body.height) || 0,
+          previewBase64: typeof body.preview_base64 === "string" ? body.preview_base64 : null,
+          mtimeMs: typeof body.mtime_ms === "number" ? body.mtime_ms : null,
+        };
+        assetMetaCache.set(path, meta);
+        // Persist to IndexedDB so the next cold start paints the blur-up
+        // placeholder on the first frame. mtime_ms is the invalidation
+        // key — a stale entry is dropped on the next request. WIKI-200.
+        if (meta.mtimeMs !== null) {
+          void writeThumbnail({
+            path,
+            mtimeMs: meta.mtimeMs,
+            width: meta.width,
+            height: meta.height,
+            previewBase64: meta.previewBase64,
+            storedAt: Date.now(),
+          });
+        }
+        return meta;
+      } catch {
+        invalidateAssetMeta(path);
       }
-      if (!response.ok) return null;
-      const body = await response.json();
-      const meta: AssetMeta = {
-        width: Number(body.width) || 0,
-        height: Number(body.height) || 0,
-        previewBase64: typeof body.preview_base64 === "string" ? body.preview_base64 : null,
-        mtimeMs: typeof body.mtime_ms === "number" ? body.mtime_ms : null,
-      };
-      return meta;
-    })
-    .then((meta) => {
-      assetMetaCache.set(path, meta);
+    }
+    return null;
+  })()
+    .finally(() => {
       assetMetaPending.delete(path);
-      // Persist to IndexedDB so the next cold start paints the blur-up
-      // placeholder on the first frame. mtime_ms is the invalidation
-      // key — a stale record is dropped by readThumbnailIfFresh on the
-      // subsequent load. WIKI-200.
-      if (meta && meta.mtimeMs !== null) {
-        void writeThumbnail({
-          path,
-          mtimeMs: meta.mtimeMs,
-          width: meta.width,
-          height: meta.height,
-          previewBase64: meta.previewBase64,
-          storedAt: Date.now(),
-        });
-      }
-      return meta;
-    })
-    .catch(() => {
-      // Network failure. Do NOT cache a `null` verdict — the asset may
-      // exist and a retry might succeed. Leaving the entry unset lets
-      // the next consumer refetch. IDB record (if any) stays put.
-      assetMetaPending.delete(path);
-      return null;
     });
   assetMetaPending.set(path, request);
   return request;
+}
+
+// Test hook — reset the shared caches between tests. Never call from
+// production code.
+export function __resetAssetMetaForTests(): void {
+  assetMetaCache.clear();
+  assetMetaPending.clear();
+  assetMetaHydrationGeneration.clear();
 }
 
 // Hydrate the in-memory asset meta cache from the IndexedDB thumbnail
@@ -168,11 +186,15 @@ function fetchAssetMeta(path: string): Promise<AssetMeta | null> {
 // entry can't overwrite fresher server data.
 export async function hydrateAssetMetaFromThumbnailCache(path: string): Promise<AssetMeta | null> {
   if (assetMetaCache.get(path) !== undefined) return assetMetaCache.get(path) ?? null;
+  const generation = assetMetaHydrationGeneration.get(path) ?? 0;
   const record: ThumbnailRecord | null = await readThumbnail(path);
   if (!record) return null;
   // Re-check the cache AFTER the async IDB read — the network fetch
   // may have populated it while we were waiting.
   if (assetMetaCache.get(path) !== undefined) return assetMetaCache.get(path) ?? null;
+  // A rejected network request invalidates this hydration generation.
+  // Do not put stale IDB metadata back into the cache after that point.
+  if ((assetMetaHydrationGeneration.get(path) ?? 0) !== generation) return null;
   const meta: AssetMeta = {
     width: record.width,
     height: record.height,
@@ -282,7 +304,14 @@ export function MarkdownImage({ alt, className, "data-obsidian-width": dataWidth
     let cancelled = false;
 
     const applyMeta = (info: AssetMeta | null, source: "hydrate" | "network") => {
-      if (cancelled || !info) return;
+      if (cancelled) return;
+      if (!info) {
+        if (source === "network") {
+          metaFreshnessRef.current = Number.POSITIVE_INFINITY;
+          setMeta(null);
+        }
+        return;
+      }
       const incoming = info.mtimeMs ?? (source === "network" ? Number.POSITIVE_INFINITY : -1);
       const current = metaFreshnessRef.current;
       // Stale IDB (older mtime OR unknown mtime) never clobbers a value

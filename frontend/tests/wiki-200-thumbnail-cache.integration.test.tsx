@@ -146,6 +146,21 @@ describe("thumbnail cache (IndexedDB path)", () => {
     const hot = await cache.readThumbnail("item-599.png");
     expect(hot?.mtimeMs).toBe(599);
   });
+
+  test("U6: IDB prune bounds records and evicts the oldest row", async () => {
+    const records = Array.from({ length: 2_050 }, (_, index) =>
+      record(`bounded-${index}.png`, index),
+    );
+    await cache.writeThumbnailBatch(records);
+    cache.__resetThumbnailCacheForTests();
+
+    const rows = await cache.readThumbnailBatch(records.map((entry) => entry.path));
+    const present = [...rows.values()].filter((entry) => entry !== null);
+    expect(present).toHaveLength(2_048);
+    expect(rows.get("bounded-0.png")).toBeNull();
+    expect(rows.get("bounded-1.png")).toBeNull();
+    expect(rows.get("bounded-2049.png")?.mtimeMs).toBe(2049);
+  });
 });
 
 describe("thumbnail cache (IndexedDB denied)", () => {

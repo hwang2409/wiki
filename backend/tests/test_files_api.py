@@ -599,6 +599,22 @@ class FilesApiTests(unittest.TestCase):
         self.assertEqual(oversized.exception.status_code, 413)
         self.assertEqual(oversized.exception.detail["code"], "file_too_large")
 
+    def test_vault_identity_is_stable_hash_of_vault_dir_and_isolates_vaults(self) -> None:
+        # Same vault root → same identity across calls.
+        with mock.patch.object(main, "VAULT_DIR", self.vault):
+            a = main.get_vault_identity()
+            b = main.get_vault_identity()
+        self.assertEqual(a["identity"], b["identity"])
+        self.assertRegex(a["identity"], r"^[0-9a-f]{16}$")
+
+        # Different vault root → different identity. Guards the WIKI-200
+        # thumbnail-cache namespace against cross-vault preview collisions.
+        other_vault = self.other_repo / "vault-two"
+        other_vault.mkdir()
+        with mock.patch.object(main, "VAULT_DIR", other_vault):
+            other = main.get_vault_identity()
+        self.assertNotEqual(a["identity"], other["identity"])
+
     def test_vault_asset_route_binds_descriptor_check_to_vault_root(self) -> None:
         image = self.vault / "bound.png"
         image.write_bytes(b"image")

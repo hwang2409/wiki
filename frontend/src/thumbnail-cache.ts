@@ -171,8 +171,8 @@ async function withStore<T>(
   });
 }
 
-async function pruneIfDue(): Promise<void> {
-  writeCounterSincePrune += 1;
+async function pruneIfDue(insertedRecords: number): Promise<void> {
+  writeCounterSincePrune += insertedRecords;
   if (writeCounterSincePrune < IDB_PRUNE_INTERVAL_WRITES) return;
   writeCounterSincePrune = 0;
   if (useMemoryOnly) return;
@@ -281,7 +281,7 @@ export async function writeThumbnail(record: ThumbnailRecord): Promise<void> {
   bumpMemory(key, record);
   if (useMemoryOnly || !hasIndexedDb()) return;
   await withStore("readwrite", (store) => store.put({ ...record, path: key }));
-  void pruneIfDue();
+  await pruneIfDue(1);
 }
 
 export async function writeThumbnailBatch(records: ThumbnailRecord[]): Promise<void> {
@@ -311,7 +311,7 @@ export async function writeThumbnailBatch(records: ThumbnailRecord[]): Promise<v
     };
     for (const record of records) store.put({ ...record, path: keyFor(record.path) });
   });
-  void pruneIfDue();
+  await pruneIfDue(records.length);
 }
 
 // Returns the cached record ONLY if its mtime matches the caller's

@@ -122,12 +122,18 @@ export function artifactExceedsInlineThreshold(
 // bounded per scope so a long-running session doesn't grow the set
 // unbounded. WIKI-200.
 const SEEN_ARTIFACT_MAX_PER_SCOPE = 512;
+const SEEN_ARTIFACT_MAX_SCOPES = 64;
 const seenArtifactByScope = new Map<string, Set<string>>();
 
 function markSeen(scope: string, artifactId: string): boolean {
   let scoped = seenArtifactByScope.get(scope);
   if (!scoped) {
     scoped = new Set<string>();
+    seenArtifactByScope.set(scope, scoped);
+  } else {
+    // Bump the session scope so the LRU eviction below drops the coldest
+    // session, not the one used most recently.
+    seenArtifactByScope.delete(scope);
     seenArtifactByScope.set(scope, scoped);
   }
   if (scoped.has(artifactId)) {
@@ -143,12 +149,25 @@ function markSeen(scope: string, artifactId: string): boolean {
     if (oldest.done) break;
     scoped.delete(oldest.value);
   }
+  while (seenArtifactByScope.size > SEEN_ARTIFACT_MAX_SCOPES) {
+    const oldestScope = seenArtifactByScope.keys().next();
+    if (oldestScope.done) break;
+    seenArtifactByScope.delete(oldestScope.value);
+  }
   return true;
 }
 
 // Test hook — never call from production code.
 export function __resetSeenArtifactsForTests(): void {
   seenArtifactByScope.clear();
+}
+
+export function __markSeenArtifactForTests(scope: string, artifactId: string): boolean {
+  return markSeen(scope, artifactId);
+}
+
+export function __seenArtifactScopeCountForTests(): number {
+  return seenArtifactByScope.size;
 }
 
 function useIsFreshArtifact(scope: string, artifactId: string | undefined): boolean {
