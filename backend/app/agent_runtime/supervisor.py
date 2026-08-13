@@ -366,6 +366,13 @@ class Supervisor:
             runtime_event_db_path(store.paths.runtime_dir),
             migrate=False,
         )
+        self.store.set_archive_events_exporter(
+            lambda run_id, destination, legacy_source: self.event_store.export_events_jsonl(
+                run_id,
+                destination,
+                legacy_source=legacy_source,
+            )
+        )
         self.materializer_reducers: dict[str, EventReducerAdapter] = {}
         self.materializer_latency_seconds: deque[float] = deque(maxlen=256)
         self.materializer_queue_depth: dict[str, int] = {}
