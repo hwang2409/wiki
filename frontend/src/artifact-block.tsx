@@ -114,19 +114,47 @@ export function artifactExceedsInlineThreshold(
   }
 }
 
-// Session-scoped set of artifact IDs that have already mounted once. First
-// mount for a given ID plays the subtle enter animation; subsequent
+// Per-session-view set of artifact IDs that have already mounted once.
+// First mount for a given ID plays the subtle enter animation; subsequent
 // mounts (row virtualization scrolling back to a row, for example) do
-// not — otherwise fast scrolls would strobe. Persists for the lifetime
-// of the page. WIKI-200.
-const seenArtifactIds = new Set<string>();
+// not — otherwise fast scrolls would strobe. Scoped by session key so
+// switching sessions plays the animation again for those artifacts;
+// bounded per scope so a long-running session doesn't grow the set
+// unbounded. WIKI-200.
+const SEEN_ARTIFACT_MAX_PER_SCOPE = 512;
+const seenArtifactByScope = new Map<string, Set<string>>();
 
-function useIsFreshArtifact(artifactId: string | undefined): boolean {
+function markSeen(scope: string, artifactId: string): boolean {
+  let scoped = seenArtifactByScope.get(scope);
+  if (!scoped) {
+    scoped = new Set<string>();
+    seenArtifactByScope.set(scope, scoped);
+  }
+  if (scoped.has(artifactId)) {
+    // Bump insertion order so the LRU eviction below drops truly cold
+    // entries rather than active ones.
+    scoped.delete(artifactId);
+    scoped.add(artifactId);
+    return false;
+  }
+  scoped.add(artifactId);
+  while (scoped.size > SEEN_ARTIFACT_MAX_PER_SCOPE) {
+    const oldest = scoped.values().next();
+    if (oldest.done) break;
+    scoped.delete(oldest.value);
+  }
+  return true;
+}
+
+// Test hook — never call from production code.
+export function __resetSeenArtifactsForTests(): void {
+  seenArtifactByScope.clear();
+}
+
+function useIsFreshArtifact(scope: string, artifactId: string | undefined): boolean {
   const [fresh] = useState(() => {
     if (!artifactId) return false;
-    if (seenArtifactIds.has(artifactId)) return false;
-    seenArtifactIds.add(artifactId);
-    return true;
+    return markSeen(scope, artifactId);
   });
   return fresh;
 }
@@ -221,7 +249,7 @@ export function ArtifactBlock({
       });
   }, [artifact?.kind, event.artifact_id, ticket]);
   const [inlineExpanded, setInlineExpanded] = useInlineExpanded(inlineSessionKey, event.artifact_id);
-  const isEntering = useIsFreshArtifact(event.artifact_id);
+  const isEntering = useIsFreshArtifact(inlineSessionKey, event.artifact_id);
   const shellClass = `artifact-block-shell${inspect ? " has-inspect" : ""}${isEntering ? " is-entering" : ""}`;
   if (!artifact) {
     return (

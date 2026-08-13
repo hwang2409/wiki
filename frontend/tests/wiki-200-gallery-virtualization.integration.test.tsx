@@ -1,52 +1,94 @@
 // @vitest-environment jsdom
 // WIKI-200 — gallery virtualization + thumbnail-cache integration.
 //
-// The gallery must window its DOM once tile count > 20, so a
-// 200-file dump doesn't mount 200 <img> tags on the initial frame.
-// jsdom has no real layout, so we stub IntersectionObserver to expose
-// the observed set (all off-screen tiles start unobserved-but-mounted
-// as placeholders; the seed band of visible tiles is what we count).
+// jsdom has no layout engine, so IntersectionObserver is stubbed with a
+// driver we can pulse from the test to simulate scroll enters AND exits.
+// The gallery must:
+//   - keep every tile a real <button> for a11y (U3),
+//   - resolve replacement nodes across equal-count rerenders (U2),
+//   - bound live-<img> count as tiles leave the visible band (U1),
+//   - hydrate the blur-up preview from IDB before the network answers.
 
-import { cleanup, render, waitFor } from "@testing-library/react";
+import { cleanup, render, waitFor, act } from "@testing-library/react";
 import { afterEach, beforeEach, describe, expect, test, vi } from "vitest";
 
 import type { ArtifactFileEntry } from "../src/api";
 import { ImageGallery, GALLERY_VIRTUALIZE_THRESHOLD } from "../src/artifact-detail/gallery";
 import { __resetThumbnailCacheForTests, writeThumbnail } from "../src/thumbnail-cache";
 
-const OBSERVED = new Set<Element>();
+type Callback = IntersectionObserverCallback;
 
-class StubIntersectionObserver implements IntersectionObserver {
+interface Driver {
+  observers: Set<ProgrammableObserver>;
+  emit(target: Element, isIntersecting: boolean): void;
+  observedElements(): Set<Element>;
+}
+
+class ProgrammableObserver implements IntersectionObserver {
   root = null;
   rootMargin = "";
   thresholds = [];
-  constructor(_callback: IntersectionObserverCallback, _init?: IntersectionObserverInit) {}
+  private targets = new Set<Element>();
+  constructor(private callback: Callback) {
+    driver.observers.add(this);
+  }
   observe(target: Element) {
-    OBSERVED.add(target);
+    this.targets.add(target);
   }
   unobserve(target: Element) {
-    OBSERVED.delete(target);
+    this.targets.delete(target);
   }
   disconnect() {
-    OBSERVED.clear();
+    this.targets.clear();
+    driver.observers.delete(this);
   }
   takeRecords() {
     return [];
   }
+  fire(target: Element, isIntersecting: boolean) {
+    if (!this.targets.has(target)) return;
+    const entry = {
+      target,
+      isIntersecting,
+      intersectionRatio: isIntersecting ? 1 : 0,
+      time: 0,
+      rootBounds: null,
+      boundingClientRect: target.getBoundingClientRect(),
+      intersectionRect: target.getBoundingClientRect(),
+    } as IntersectionObserverEntry;
+    this.callback([entry], this);
+  }
+  currentTargets(): ReadonlySet<Element> {
+    return this.targets;
+  }
 }
 
-function files(count: number): ArtifactFileEntry[] {
+const driver: Driver = {
+  observers: new Set<ProgrammableObserver>(),
+  emit(target, isIntersecting) {
+    for (const observer of driver.observers) observer.fire(target, isIntersecting);
+  },
+  observedElements() {
+    const merged = new Set<Element>();
+    for (const observer of driver.observers) {
+      for (const target of observer.currentTargets()) merged.add(target);
+    }
+    return merged;
+  },
+};
+
+function files(count: number, prefix = "demo"): ArtifactFileEntry[] {
   return Array.from({ length: count }, (_, index) => ({
-    path: `demo/${index}.png`,
-    label: `demo ${index}`,
+    path: `${prefix}/${index}.png`,
+    label: `${prefix} ${index}`,
     status: null,
   }));
 }
 
 beforeEach(() => {
-  OBSERVED.clear();
+  driver.observers.clear();
   __resetThumbnailCacheForTests();
-  vi.stubGlobal("IntersectionObserver", StubIntersectionObserver);
+  vi.stubGlobal("IntersectionObserver", ProgrammableObserver);
   vi.spyOn(globalThis, "fetch").mockImplementation(async () => new Response("{}", {
     status: 200,
     headers: { "Content-Type": "application/json" },
@@ -69,36 +111,88 @@ describe("ImageGallery virtualization", () => {
     expect(grid?.dataset.artifactGalleryVirtualized).toBeUndefined();
   });
 
-  test(`virtualizes above ${GALLERY_VIRTUALIZE_THRESHOLD} tiles — off-screen tiles are placeholders, live tiles get real images`, () => {
+  test(`virtualizes above ${GALLERY_VIRTUALIZE_THRESHOLD} tiles — placeholders are still buttons; observer watches every tile`, () => {
     const total = 60;
     const list = files(total);
     const { container } = render(<ImageGallery files={list} />);
     const grid = container.querySelector<HTMLDivElement>(".artifact-gallery");
     expect(grid?.dataset.artifactGalleryVirtualized).toBe("true");
 
-    const cells = container.querySelectorAll<HTMLLIElement>(".artifact-gallery-cell");
-    expect(cells.length).toBe(total);
+    // U3: every tile is a <button> — off-screen tiles remain tabbable
+    // even though their <img> is not mounted.
+    const buttons = container.querySelectorAll<HTMLButtonElement>("button.artifact-gallery-tile");
+    expect(buttons.length).toBe(total);
 
-    const liveTiles = container.querySelectorAll<HTMLButtonElement>(".artifact-gallery-tile:not(.is-virtualized)");
-    const placeholderTiles = container.querySelectorAll<HTMLDivElement>(".artifact-gallery-tile.is-virtualized");
+    const liveImgs = container.querySelectorAll<HTMLImageElement>(".artifact-gallery-image");
+    expect(liveImgs.length).toBeGreaterThan(0);
+    expect(liveImgs.length).toBeLessThan(total);
 
-    // Seed band mounts real buttons; the rest render as sized
-    // placeholders. Numbers are asymmetric on purpose — asserting an
-    // exact count here would couple this test to the seed constant,
-    // whereas the guarantee we care about is "way fewer live tiles
-    // than total files".
-    expect(liveTiles.length).toBeGreaterThan(0);
-    expect(liveTiles.length).toBeLessThan(total);
-    expect(placeholderTiles.length).toBeGreaterThan(0);
-    expect(liveTiles.length + placeholderTiles.length).toBe(total);
-    expect(OBSERVED.size).toBe(placeholderTiles.length);
+    const placeholderButtons = container.querySelectorAll<HTMLButtonElement>("button.artifact-gallery-tile.is-virtualized");
+    expect(placeholderButtons.length).toBe(total - liveImgs.length);
+
+    // U1/U2: EVERY tile (including live seed tiles) is observed so
+    // exits can free the <img> when they scroll away.
+    expect(driver.observedElements().size).toBe(total);
+  });
+
+  test("U1: tiles that scroll out of the observer band unmount their <img>", async () => {
+    const total = 60;
+    const list = files(total);
+    const { container } = render(<ImageGallery files={list} />);
+    const initialLive = container.querySelectorAll(".artifact-gallery-image").length;
+    expect(initialLive).toBeGreaterThan(0);
+
+    // First: enter a batch of tiles below the seed band.
+    const cells = Array.from(container.querySelectorAll<HTMLLIElement>(".artifact-gallery-cell"));
+    const seed = cells.slice(0, initialLive);
+    const bottom = cells.slice(initialLive, initialLive + 20);
+    act(() => {
+      for (const cell of bottom) driver.emit(cell, true);
+    });
+    await waitFor(() => {
+      const live = container.querySelectorAll(".artifact-gallery-image").length;
+      expect(live).toBe(initialLive + bottom.length);
+    });
+
+    // Then: fire exits on the seed band as if the user scrolled past it.
+    act(() => {
+      for (const cell of seed) driver.emit(cell, false);
+    });
+    await waitFor(() => {
+      const live = container.querySelectorAll(".artifact-gallery-image").length;
+      expect(live).toBe(bottom.length);
+    });
+
+    // Mounted count stays bounded by the visible band — never grows to
+    // total after full scroll traversal.
+    expect(container.querySelectorAll(".artifact-gallery-image").length).toBeLessThan(total);
+  });
+
+  test("U2: equal-count rerenders reuse the observer and still resolve new cells", async () => {
+    const total = 60;
+    const first = files(total, "first");
+    const { container, rerender } = render(<ImageGallery files={first} />);
+    expect(driver.observedElements().size).toBe(total);
+
+    // Switch to a fresh set of the SAME length. The observer instance
+    // is reused (totalTiles unchanged), but ref callbacks fire for each
+    // replaced <li> so indexByNode must repopulate.
+    const second = files(total, "second");
+    rerender(<ImageGallery files={second} />);
+    expect(driver.observedElements().size).toBe(total);
+
+    const cells = Array.from(container.querySelectorAll<HTMLLIElement>(".artifact-gallery-cell"));
+    // Fire an intersection on a cell that started off-screen. Before
+    // the fix, the observer's index map was stale and this was a no-op.
+    const target = cells[total - 1];
+    const beforeLive = container.querySelectorAll(".artifact-gallery-image").length;
+    act(() => driver.emit(target, true));
+    await waitFor(() => {
+      expect(container.querySelectorAll(".artifact-gallery-image").length).toBe(beforeLive + 1);
+    });
   });
 
   test("cached thumbnail hydrates the tile with a blur-up preview before the network answers", async () => {
-    // Warm the IDB fallback with a cached preview. When the gallery
-    // mounts, the tile must render <img class="artifact-gallery-preview">
-    // sourced from that cached base64 without waiting for the batch
-    // POST to /api/vault/asset-meta to resolve.
     await writeThumbnail({
       path: "demo/0.png",
       mtimeMs: 42,
@@ -107,8 +201,8 @@ describe("ImageGallery virtualization", () => {
       previewBase64: "data:image/jpeg;base64,PREVIEW",
       storedAt: 1_700_000_000_000,
     });
-    // Never resolve the batch fetch — that proves the preview came from
-    // the cache, not the network.
+    // Never resolve the batch fetch — proves the preview came from the
+    // cache, not the network.
     vi.spyOn(globalThis, "fetch").mockImplementation(
       () => new Promise(() => undefined),
     );

@@ -1,7 +1,8 @@
-import { useEffect, useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import type { CSSProperties } from "react";
 import { ArtifactLightbox } from "./artifact-detail/lightbox";
 import {
+  deleteThumbnail,
   readThumbnail,
   writeThumbnail,
   type ThumbnailRecord,
@@ -110,6 +111,13 @@ function fetchAssetMeta(path: string): Promise<AssetMeta | null> {
   const encoded = path.split("/").map(encodeURIComponent).join("/");
   const request = fetch(`/api/vault/asset-meta/${encoded}`)
     .then(async (response) => {
+      if (response.status === 404) {
+        // Asset deleted server-side. Drop any stale IDB record so a
+        // future mount doesn't hydrate a preview for something that
+        // isn't there.
+        void deleteThumbnail(path);
+        return null;
+      }
       if (!response.ok) return null;
       const body = await response.json();
       const meta: AssetMeta = {
@@ -140,8 +148,10 @@ function fetchAssetMeta(path: string): Promise<AssetMeta | null> {
       return meta;
     })
     .catch(() => {
+      // Network failure. Do NOT cache a `null` verdict — the asset may
+      // exist and a retry might succeed. Leaving the entry unset lets
+      // the next consumer refetch. IDB record (if any) stays put.
       assetMetaPending.delete(path);
-      assetMetaCache.set(path, null);
       return null;
     });
   assetMetaPending.set(path, request);
@@ -152,18 +162,24 @@ function fetchAssetMeta(path: string): Promise<AssetMeta | null> {
 // cache. Callers can await this to force cache warmth; MarkdownImage
 // fires it in the background so the first frame after a cold start
 // still gets a blur-up placeholder even if the network hasn't answered.
+//
+// A network answer that lands before this resolves ALWAYS wins — the
+// hydrated record is discarded rather than written back, so a stale IDB
+// entry can't overwrite fresher server data.
 export async function hydrateAssetMetaFromThumbnailCache(path: string): Promise<AssetMeta | null> {
   if (assetMetaCache.get(path) !== undefined) return assetMetaCache.get(path) ?? null;
   const record: ThumbnailRecord | null = await readThumbnail(path);
   if (!record) return null;
+  // Re-check the cache AFTER the async IDB read — the network fetch
+  // may have populated it while we were waiting.
+  if (assetMetaCache.get(path) !== undefined) return assetMetaCache.get(path) ?? null;
   const meta: AssetMeta = {
     width: record.width,
     height: record.height,
     previewBase64: record.previewBase64,
     mtimeMs: record.mtimeMs,
   };
-  // Don't clobber a value the network already produced.
-  if (assetMetaCache.get(path) === undefined) assetMetaCache.set(path, meta);
+  assetMetaCache.set(path, meta);
   return meta;
 }
 
@@ -251,41 +267,49 @@ export function MarkdownImage({ alt, className, "data-obsidian-width": dataWidth
     return () => window.clearTimeout(timer);
   }, [state]);
 
+  // Tracks the newest source of meta already applied. Slow IDB hydration
+  // must never clobber a fresher network answer that landed first. `null`
+  // = no answer yet; number = mtimeMs; `Infinity` = definitive
+  // network verdict without an mtime (still wins over any IDB record).
+  const metaFreshnessRef = useRef<number | null>(null);
+
   useEffect(() => {
     if (!activeCandidate) return;
+    // Reset the freshness watermark for this candidate; a prior
+    // asset's watermark must not gate the new one.
+    metaFreshnessRef.current = null;
     if (assetMetaFromCache(activeCandidate) !== undefined) return;
     let cancelled = false;
+
+    const applyMeta = (info: AssetMeta | null, source: "hydrate" | "network") => {
+      if (cancelled || !info) return;
+      const incoming = info.mtimeMs ?? (source === "network" ? Number.POSITIVE_INFINITY : -1);
+      const current = metaFreshnessRef.current;
+      // Stale IDB (older mtime OR unknown mtime) never clobbers a value
+      // we've already applied. Network wins ties — a network answer with
+      // the same mtime replaces the hydrated one only if it carries a
+      // different preview payload, guarding against IDB drift.
+      if (current !== null && incoming < current) return;
+      metaFreshnessRef.current = incoming;
+      setMeta((prev) => {
+        if (prev && prev.mtimeMs === info.mtimeMs && prev.previewBase64 === info.previewBase64) return prev;
+        return info;
+      });
+      if (info.width > 0 && info.height > 0) {
+        setFrameRatio((prev) => prev ?? { w: info.width, h: info.height });
+      }
+    };
+
     // Hydrate synchronously from IndexedDB first — this puts a blur-up
     // preview on the frame BEFORE the network answers on a cold start.
     // The follow-up network fetch still runs; if the server returns a
     // fresher preview (different mtime), fetchAssetMeta writes over
     // both caches and the component re-renders with the new preview.
     void hydrateAssetMetaFromThumbnailCache(activeCandidate).then((warm) => {
-      if (cancelled) return;
-      if (warm) {
-        setMeta(warm);
-        if (warm.width > 0 && warm.height > 0) {
-          setFrameRatio((prev) => prev ?? { w: warm.width, h: warm.height });
-        }
-      }
+      applyMeta(warm, "hydrate");
     });
     fetchAssetMeta(activeCandidate).then((info) => {
-      if (cancelled) return;
-      // Skip the state update if the fetched value matches what we
-      // already have — avoids an extra reconciliation pass when the
-      // IDB hydration and the network fetch agree.
-      setMeta((prev) => {
-        if (!info) return prev;
-        if (prev && prev.mtimeMs === info.mtimeMs && prev.previewBase64 === info.previewBase64) return prev;
-        return info;
-      });
-      // Only lock the ratio from meta if we don't have one yet — otherwise
-      // the ratio was captured from the image's naturalWidth/Height at load
-      // time and we must NOT change it (that would be the CLS the race test
-      // hunts for).
-      if (info && info.width > 0 && info.height > 0) {
-        setFrameRatio((prev) => prev ?? { w: info.width, h: info.height });
-      }
+      applyMeta(info, "network");
     });
     return () => {
       cancelled = true;

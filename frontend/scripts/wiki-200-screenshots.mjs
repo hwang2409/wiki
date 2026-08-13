@@ -1,11 +1,17 @@
 // WIKI-200 — visual verify for artifact perf pass.
 //
 // Boots an isolated backend against a fixture vault with 24 tiny PNGs
-// referenced from a note. Confirms in a real browser that:
-//   - blur-up placeholders paint on the first frame after a cold start
-//   - sharp images fade in (opacity crossfade, no filter chain)
-//   - the enter animation on artifact blocks is present but restrained
-// Captures screenshots in both light and dark themes to /tmp/wiki-200-evidence.
+// referenced from a note. Captures screenshots in both light and dark
+// themes to /tmp/wiki-200-evidence, covering ONLY the markdown image
+// blur-up + fade behavior:
+//   - 01-<theme>-loading.png: sharp <img> is opacity:0, blur-up preview
+//     is on top (proves the fix — before this PR the sharp <img> wore
+//     a filter:blur while loading)
+//   - 02-<theme>-loaded.png: previews faded out (opacity < 0.05),
+//     sharp images visible.
+// The artifact-block enter animation is exercised by the vitest suite
+// (fresh-vs-repeat mount classes) and is NOT screenshotted here — no
+// artifact stream is spawned by this fixture.
 
 import fs from "node:fs/promises";
 import path from "node:path";

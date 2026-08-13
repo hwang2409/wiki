@@ -11,10 +11,15 @@ const THUMBNAIL_WIDTHS = [320, 640] as const;
 const PREVIEW_FADE_MS = 380;
 
 // Above this tile count the gallery windows the DOM — off-screen tiles
-// mount as sized placeholders and only swap in an <img> once they enter
-// the visible band. Under the threshold every tile stays mounted so tiny
-// galleries pay no observer overhead. WIKI-200.
+// mount as sized button placeholders and only swap in an <img> once they
+// enter the visible band. Under the threshold every tile stays mounted so
+// tiny galleries pay no observer overhead. WIKI-200.
 export const GALLERY_VIRTUALIZE_THRESHOLD = 20;
+
+// Initial seed of live tiles rendered before the observer resolves. Two
+// rows of the widest desktop grid; asymmetric with any single test count
+// on purpose.
+const VIRTUALIZE_SEED_SIZE = 12;
 
 type AssetMeta = {
   width: number;
@@ -72,12 +77,17 @@ function isResizable(entry: ArtifactFileEntry): boolean {
 
 type TileLoadState = "loading" | "ready" | "error";
 
-// IntersectionObserver-based windowing. Off-screen tiles render a sized
-// placeholder (no <img>, no preview <img>, no state) so a 200-file
-// gallery only pays for the ~10 tiles the user can actually see. Tiles
-// that have entered once stay resolved so scrolling back doesn't
-// re-download previews — the observer flips them permanently on first
-// intersection.
+// IntersectionObserver-based windowing.
+//
+// Every tile is a real <button> (a11y: tabbable, aria-labelled). Only the
+// expensive <img> inside is conditionally mounted based on visibility.
+// Visibility is BOUNDED: tiles that scroll out of the observer band also
+// leave `visible`, so scrolling through a huge gallery keeps the live-img
+// count near ~(viewport + rootMargin) instead of growing forever.
+//
+// Index lookup uses a WeakMap keyed by the element, populated at
+// register() time so equal-length rerenders that reuse the observer still
+// resolve entries back to the right index.
 function useVisibleTiles(
   totalTiles: number,
   virtualize: boolean,
@@ -88,14 +98,12 @@ function useVisibleTiles(
       for (let i = 0; i < totalTiles; i += 1) all.add(i);
       return all;
     }
-    // Prime the first band so the initial paint isn't empty while the
-    // observer resolves. Matches the desktop gallery grid width — ~10
-    // tiles cover a typical viewport row × 2.
     const seed = new Set<number>();
-    for (let i = 0; i < Math.min(totalTiles, 12); i += 1) seed.add(i);
+    for (let i = 0; i < Math.min(totalTiles, VIRTUALIZE_SEED_SIZE); i += 1) seed.add(i);
     return seed;
   });
   const nodesRef = useRef(new Map<number, HTMLLIElement>());
+  const indexByNodeRef = useRef(new WeakMap<Element, number>());
   const observerRef = useRef<IntersectionObserver | null>(null);
   useLayoutEffect(() => {
     if (!virtualize) {
@@ -113,25 +121,24 @@ function useVisibleTiles(
       setVisible(all);
       return;
     }
-    // Recreate the observer with a fresh index map on every totalTiles
-    // change so entries always resolve back to the correct index — we
-    // rebuild here rather than mutating a shared map.
-    const indexByNode = new Map<Element, number>();
+    const indexByNode = indexByNodeRef.current;
     const observer = new IntersectionObserver(
       (entries) => {
         setVisible((prev) => {
           let mutated = false;
           const next = new Set(prev);
           for (const entry of entries) {
-            if (!entry.isIntersecting) continue;
             const index = indexByNode.get(entry.target);
             if (index === undefined) continue;
-            if (!next.has(index)) {
-              next.add(index);
+            if (entry.isIntersecting) {
+              if (!next.has(index)) {
+                next.add(index);
+                mutated = true;
+              }
+            } else if (next.has(index)) {
+              next.delete(index);
               mutated = true;
             }
-            observer.unobserve(entry.target);
-            indexByNode.delete(entry.target);
           }
           return mutated ? next : prev;
         });
@@ -139,33 +146,41 @@ function useVisibleTiles(
       { rootMargin: "400px 0px" },
     );
     observerRef.current = observer;
-    // Observe every off-screen node captured during render. The seed
-    // band (visible on first paint) is already resolved so we skip it.
+    // Observe every registered node — both live and off-screen — so
+    // tiles that scroll away can leave `visible` and free their <img>.
     for (const [index, node] of nodesRef.current) {
-      if (visible.has(index)) continue;
       indexByNode.set(node, index);
       observer.observe(node);
     }
     return () => {
       observer.disconnect();
       observerRef.current = null;
-      indexByNode.clear();
     };
-    // We intentionally exclude `visible` from deps — reinitializing the
-    // observer every time a tile resolves would thrash. The observer
-    // itself removes resolved nodes via unobserve().
+    // We intentionally exclude `visible` from deps — the observer resolves
+    // membership itself; re-creating on every visibility change would
+    // thrash. totalTiles change already rebuilds.
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [totalTiles, virtualize]);
   const register = (index: number) => (el: HTMLLIElement | null) => {
     if (!virtualize) return;
+    const nodes = nodesRef.current;
+    const indexByNode = indexByNodeRef.current;
     if (el) {
-      nodesRef.current.set(index, el);
-      const observer = observerRef.current;
-      if (observer && !visible.has(index)) observer.observe(el);
+      const previous = nodes.get(index);
+      if (previous && previous !== el) {
+        indexByNode.delete(previous);
+        observerRef.current?.unobserve(previous);
+      }
+      nodes.set(index, el);
+      indexByNode.set(el, index);
+      observerRef.current?.observe(el);
     } else {
-      const existing = nodesRef.current.get(index);
-      if (existing && observerRef.current) observerRef.current.unobserve(existing);
-      nodesRef.current.delete(index);
+      const existing = nodes.get(index);
+      if (existing) {
+        indexByNode.delete(existing);
+        observerRef.current?.unobserve(existing);
+        nodes.delete(index);
+      }
     }
   };
   return { visible, register };
@@ -188,8 +203,9 @@ export function ImageGallery({ files }: { files: ArtifactFileEntry[] }) {
 
   // Hydrate from the IndexedDB thumbnail cache FIRST so blur-up
   // placeholders paint on the initial frame after a cold start; then
-  // refresh via one batch fetch (deduped by path). If the server
-  // returns a different mtime, replace the cached record. WIKI-200.
+  // refresh via one batch fetch (deduped by path). The cache write only
+  // runs when the server-reported mtime differs from the cached one —
+  // avoids rewriting identical records on every mount. WIKI-200.
   useEffect(() => {
     const paths = Array.from(new Set(files.map((entry) => entry.path)));
     if (paths.length === 0) return;
@@ -209,7 +225,17 @@ export function ImageGallery({ files }: { files: ArtifactFileEntry[] }) {
             }
           : null;
       }
-      setMeta((prev) => ({ ...prev, ...warm }));
+      setMeta((prev) => {
+        const next: Record<string, AssetMeta | null> = { ...prev };
+        for (const path of paths) {
+          // Don't clobber a value the network already produced for this
+          // path — the async cache read can still land after the batch
+          // fetch on a warm reload.
+          if (next[path] !== undefined && next[path] !== null) continue;
+          next[path] = warm[path];
+        }
+        return next;
+      });
 
       const fresh = await fetchAssetMetaBatch(paths);
       if (cancelled) return;
@@ -219,14 +245,19 @@ export function ImageGallery({ files }: { files: ArtifactFileEntry[] }) {
         for (const path of paths) {
           const value = fresh[path] ?? null;
           if (value && value.mtimeMs !== null) {
-            nextRecords.push({
-              path,
-              mtimeMs: value.mtimeMs,
-              width: value.width,
-              height: value.height,
-              previewBase64: value.previewBase64,
-              storedAt: Date.now(),
-            });
+            const cachedRecord = cached.get(path);
+            // Skip the write if the cached record is identical — avoids
+            // hammering IDB with a redundant put on every mount.
+            if (!cachedRecord || cachedRecord.mtimeMs !== value.mtimeMs) {
+              nextRecords.push({
+                path,
+                mtimeMs: value.mtimeMs,
+                width: value.width,
+                height: value.height,
+                previewBase64: value.previewBase64,
+                storedAt: Date.now(),
+              });
+            }
           }
           next[path] = value;
         }
@@ -305,44 +336,42 @@ export function ImageGallery({ files }: { files: ArtifactFileEntry[] }) {
               key={`${item.src}-${index}`}
               ref={register(index)}
             >
-              {isVisible ? (
-                <button
-                  aria-label={`Open ${item.alt} in fullscreen`}
-                  className={`artifact-gallery-tile${loaded ? " is-loaded" : ""}`}
-                  onClick={() => setOpenIndex(index)}
-                  type="button"
-                >
-                  {showPreview && info?.previewBase64 ? (
+              <button
+                aria-label={`Open ${item.alt} in fullscreen`}
+                className={`artifact-gallery-tile${loaded ? " is-loaded" : ""}${isVisible ? "" : " is-virtualized"}`}
+                data-gallery-tile-visible={isVisible || undefined}
+                onClick={() => setOpenIndex(index)}
+                type="button"
+              >
+                {isVisible ? (
+                  <>
+                    {showPreview && info?.previewBase64 ? (
+                      <img
+                        aria-hidden="true"
+                        alt=""
+                        className={`artifact-gallery-preview${loaded ? " is-fading" : ""}`}
+                        decoding="sync"
+                        src={info.previewBase64}
+                      />
+                    ) : null}
                     <img
-                      aria-hidden="true"
-                      alt=""
-                      className={`artifact-gallery-preview${loaded ? " is-fading" : ""}`}
-                      decoding="sync"
-                      src={info.previewBase64}
+                      alt={item.alt}
+                      className={`artifact-gallery-image${loaded ? " is-loaded" : ""}`}
+                      decoding="async"
+                      height={info?.height}
+                      loading="lazy"
+                      sizes="(min-width: 480px) 200px, 160px"
+                      src={thumbnailSrc}
+                      srcSet={srcSet}
+                      width={info?.width}
+                      onLoad={() => markLoaded(index)}
+                      onError={() =>
+                        setTileState((prev) => ({ ...prev, [index]: "error" }))
+                      }
                     />
-                  ) : null}
-                  <img
-                    alt={item.alt}
-                    className={`artifact-gallery-image${loaded ? " is-loaded" : ""}`}
-                    decoding="async"
-                    height={info?.height}
-                    loading="lazy"
-                    sizes="(min-width: 480px) 200px, 160px"
-                    src={thumbnailSrc}
-                    srcSet={srcSet}
-                    width={info?.width}
-                    onLoad={() => markLoaded(index)}
-                    onError={() =>
-                      setTileState((prev) => ({ ...prev, [index]: "error" }))
-                    }
-                  />
-                </button>
-              ) : (
-                <div
-                  aria-hidden="true"
-                  className="artifact-gallery-tile is-virtualized"
-                />
-              )}
+                  </>
+                ) : null}
+              </button>
               <span className="artifact-gallery-caption" title={item.caption ?? undefined}>
                 {friendlyName(entry)}
               </span>
