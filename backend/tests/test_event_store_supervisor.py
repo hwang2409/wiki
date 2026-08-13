@@ -137,6 +137,22 @@ class SupervisorDualWriteTests(unittest.IsolatedAsyncioTestCase):
             {int(row["seq"]) for row in raw_rows},
         )
 
+    async def test_recovery_schedules_archive_backfill(self) -> None:
+        with mock.patch(
+            "backend.app.agent_runtime.archive_parity.backfill_headless_runs",
+            return_value=[],
+        ) as backfill:
+            await self.supervisor.recover_on_start()
+            task = self.supervisor.archive_backfill_task
+            self.assertIsNotNone(task)
+            await task
+
+        backfill.assert_called_once_with(
+            self.store,
+            self.supervisor.event_store,
+            batch_size=32,
+        )
+
     async def test_legacy_append_survives_materializer_failure(self) -> None:
         adapter = self.factory(self.record)
         with mock.patch.object(

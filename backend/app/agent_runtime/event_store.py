@@ -28,7 +28,7 @@ from .types import (
     validate_transition,
 )
 
-SCHEMA_VERSION = 3
+SCHEMA_VERSION = 4
 NORMALIZER_VERSION = "wiki-282-1"
 
 
@@ -487,6 +487,9 @@ _MIGRATIONS: dict[int, str] = {
     CREATE INDEX IF NOT EXISTS parity_records_run
         ON parity_records(run_id, normalizer_version, record_id);
     """,
+    4: """
+    ALTER TABLE parity_records ADD COLUMN raw_seq INTEGER;
+    """,
 }
 
 
@@ -532,6 +535,17 @@ def migrate_event_db(path: Path | str) -> None:
                     connection.execute(
                         "ALTER TABLE run_projections "
                         "ADD COLUMN unread_event_seq INTEGER NOT NULL DEFAULT 0"
+                    )
+            elif version == 4:
+                columns = {
+                    str(row[1])
+                    for row in connection.execute(
+                        "PRAGMA table_info(parity_records)"
+                    ).fetchall()
+                }
+                if "raw_seq" not in columns:
+                    connection.execute(
+                        "ALTER TABLE parity_records ADD COLUMN raw_seq INTEGER"
                     )
             else:
                 connection.executescript(_MIGRATIONS[version])
@@ -1198,6 +1212,7 @@ class SQLiteEventStore:
         detail: dict[str, Any],
         expected: Any = None,
         actual: Any = None,
+        raw_seq: int | None = None,
     ) -> None:
         """Persist one parity or backfill decision for later inspection."""
 
@@ -1206,7 +1221,8 @@ class SQLiteEventStore:
             connection.execute(
                 "INSERT INTO parity_records "
                 "(run_id, normalizer_version, record_type, path, expected_json, "
-                "actual_json, detail_json, recorded_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+                "actual_json, detail_json, recorded_at, raw_seq) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
                 (
                     run_id,
                     normalizer_version,
@@ -1216,6 +1232,7 @@ class SQLiteEventStore:
                     _json_bytes(actual) if actual is not None else None,
                     _json_bytes(detail),
                     utc_now(),
+                    raw_seq,
                 ),
             )
 
@@ -1226,7 +1243,7 @@ class SQLiteEventStore:
         self.ensure_schema()
         query = (
             "SELECT record_id, run_id, normalizer_version, record_type, path, "
-            "expected_json, actual_json, detail_json, recorded_at "
+            "expected_json, actual_json, detail_json, recorded_at, raw_seq "
             "FROM parity_records"
         )
         parameters: tuple[Any, ...] = ()
@@ -1247,6 +1264,7 @@ class SQLiteEventStore:
                 "actual": json.loads(row[6]) if row[6] is not None else None,
                 "detail": json.loads(row[7]),
                 "recorded_at": str(row[8]),
+                "raw_seq": int(row[9]) if row[9] is not None else None,
             }
             for row in rows
         ]

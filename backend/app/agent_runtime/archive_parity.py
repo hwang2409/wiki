@@ -25,6 +25,7 @@ class ParityMismatch:
     path: str
     expected: Any
     actual: Any
+    raw_seq: int | None = None
 
 
 @dataclass(frozen=True)
@@ -33,6 +34,8 @@ class ParityReport:
     normalizer_version: str
     matched: bool
     mismatches: tuple[ParityMismatch, ...]
+    boundary: str = "final"
+    raw_seq: int | None = None
 
 
 @dataclass(frozen=True)
@@ -90,19 +93,21 @@ def _diff_paths(expected: Any, actual: Any, path: str) -> list[tuple[str, Any, A
     return []
 
 
-def _legacy_payload(store: RunStore, run_id: str) -> dict[str, Any]:
-    record = store.get(run_id)
+def _legacy_payload_at_path(
+    provider: Any,
+    normalized_path: Path,
+) -> dict[str, Any]:
     transcripts._cache.clear()
     result = transcripts.read_session_delta(
-        f"{record.provider.value}-normalized",
-        store.normalized_events_path(run_id),
+        f"{provider.value}-normalized",
+        normalized_path,
         cursor=0,
         tail_window=False,
     )
     state = transcripts._read_cached_state(  # noqa: SLF001
-        f"{record.provider.value}-normalized",
-        store.normalized_events_path(run_id),
-        str(store.normalized_events_path(run_id)),
+        f"{provider.value}-normalized",
+        normalized_path,
+        str(normalized_path),
     )
     result["patches"] = [
         {
@@ -129,6 +134,14 @@ def _legacy_payload(store: RunStore, run_id: str) -> dict[str, Any]:
     result.pop("has_older", None)
     result.pop("tail_from", None)
     return result
+
+
+def _legacy_payload(store: RunStore, run_id: str) -> dict[str, Any]:
+    record = store.get(run_id)
+    return _legacy_payload_at_path(
+        record.provider,
+        store.normalized_events_path(run_id),
+    )
 
 
 def _sqlite_payload(event_store: SQLiteEventStore, run_id: str) -> dict[str, Any]:
@@ -162,15 +175,25 @@ def compare_run_parity(
     run_id: str,
     *,
     record: bool = True,
+    boundary: str = "final",
+    raw_seq: int | None = None,
 ) -> ParityReport:
     """Compare the legacy parser and SQLite payload for one run."""
 
     cursor = event_store.cursor(run_id)
     normalizer_version = cursor.normalizer_version
+    effective_raw_seq = raw_seq if raw_seq is not None else cursor.raw_seq
     expected = _canonical(_legacy_payload(store, run_id))
     actual = _canonical(_sqlite_payload(event_store, run_id))
     mismatches = tuple(
-        ParityMismatch(run_id, normalizer_version, path, left, right)
+        ParityMismatch(
+            run_id,
+            normalizer_version,
+            path,
+            left,
+            right,
+            effective_raw_seq,
+        )
         for path, left, right in _diff_paths(expected, actual, "")
     )
     if record:
@@ -182,14 +205,260 @@ def compare_run_parity(
                 path=mismatch.path,
                 expected=mismatch.expected,
                 actual=mismatch.actual,
-                detail={"source": "legacy-parser-vs-sqlite"},
+                detail={
+                    "source": "legacy-parser-vs-sqlite",
+                    "boundary": boundary,
+                    "raw_seq": effective_raw_seq,
+                },
+                raw_seq=effective_raw_seq,
             )
     return ParityReport(
         run_id=run_id,
         normalizer_version=normalizer_version,
         matched=not mismatches,
         mismatches=mismatches,
+        boundary=boundary,
+        raw_seq=effective_raw_seq,
     )
+
+
+def _write_jsonl(path: Path, rows: list[dict[str, Any]]) -> None:
+    with path.open("w", encoding="utf-8") as handle:
+        for row in rows:
+            handle.write(json.dumps(row, ensure_ascii=False, sort_keys=True))
+            handle.write("\n")
+
+
+def compare_run_boundaries(
+    store: RunStore,
+    event_store: SQLiteEventStore,
+    run_id: str,
+    *,
+    record: bool = True,
+) -> tuple[ParityReport, ...]:
+    """Compare final state and every raw prefix against the legacy parser."""
+
+    record_data = store.get(run_id)
+    raw_rows = sorted(
+        store.read_raw_events(run_id), key=lambda row: int(row["seq"])
+    )
+    normalized_rows = list(store.iter_normalized_events(run_id))
+    reports: list[ParityReport] = []
+
+    def add_boundary(
+        expected_value: Any,
+        actual_value: Any,
+        *,
+        boundary: str,
+        raw_seq: int | None,
+    ) -> None:
+        expected_payload = _canonical(expected_value)
+        actual_payload = _canonical(actual_value)
+        normalizer_version = event_store.cursor(run_id).normalizer_version
+        mismatches = tuple(
+            ParityMismatch(
+                run_id,
+                normalizer_version,
+                path,
+                left,
+                right,
+                raw_seq,
+            )
+            for path, left, right in _diff_paths(
+                expected_payload,
+                actual_payload,
+                "",
+            )
+        )
+        report = ParityReport(
+            run_id,
+            normalizer_version,
+            not mismatches,
+            mismatches,
+            boundary=boundary,
+            raw_seq=raw_seq,
+        )
+        if record:
+            for mismatch in mismatches:
+                event_store.record_parity_record(
+                    run_id,
+                    normalizer_version=normalizer_version,
+                    record_type="mismatch",
+                    path=mismatch.path,
+                    expected=mismatch.expected,
+                    actual=mismatch.actual,
+                    detail={
+                        "source": "legacy-parser-vs-sqlite",
+                        "boundary": boundary,
+                        "raw_seq": raw_seq,
+                    },
+                    raw_seq=raw_seq,
+                )
+        reports.append(report)
+
+    with tempfile.TemporaryDirectory(prefix="wiki-282-parity-") as directory:
+        directory_path = Path(directory)
+        for raw_row in raw_rows:
+            prefix_seq = int(raw_row["seq"])
+            prefix_raw = [
+                row for row in raw_rows if int(row["seq"]) <= prefix_seq
+            ]
+            prefix_normalized = [
+                row
+                for row in normalized_rows
+                if int(row.get("raw_seq", 0)) <= prefix_seq
+            ]
+            raw_path = directory_path / f"raw-{prefix_seq}.jsonl"
+            normalized_path = directory_path / f"normalized-{prefix_seq}.jsonl"
+            database_path = directory_path / f"prefix-{prefix_seq}.sqlite3"
+            _write_jsonl(raw_path, prefix_raw)
+            _write_jsonl(normalized_path, prefix_normalized)
+            prefix_store = replay_raw_jsonl(
+                raw_path,
+                database_path,
+                run_id=run_id,
+                agent_id=record_data.agent_id,
+                provider=record_data.provider,
+                created_at=record_data.created_at,
+            )
+            expected = _canonical(
+                _legacy_payload_at_path(record_data.provider, normalized_path)
+            )
+            actual = _canonical(_sqlite_payload(prefix_store, run_id))
+            normalizer_version = prefix_store.cursor(run_id).normalizer_version
+            mismatches = tuple(
+                ParityMismatch(
+                    run_id,
+                    normalizer_version,
+                    path,
+                    left,
+                    right,
+                    prefix_seq,
+                )
+                for path, left, right in _diff_paths(expected, actual, "")
+            )
+            report = ParityReport(
+                run_id,
+                normalizer_version,
+                not mismatches,
+                mismatches,
+                boundary="raw_prefix",
+                raw_seq=prefix_seq,
+            )
+            if record:
+                for mismatch in mismatches:
+                    event_store.record_parity_record(
+                        run_id,
+                        normalizer_version=normalizer_version,
+                        record_type="mismatch",
+                        path=mismatch.path,
+                        expected=mismatch.expected,
+                        actual=mismatch.actual,
+                        detail={
+                            "source": "legacy-parser-vs-sqlite",
+                            "boundary": report.boundary,
+                            "raw_seq": prefix_seq,
+                        },
+                        raw_seq=prefix_seq,
+                    )
+            reports.append(report)
+    cursor = event_store.cursor(run_id)
+    provider_format = f"{record_data.provider.value}-normalized"
+    normalized_path = store.normalized_events_path(run_id)
+    transcripts._cache.clear()
+    stale = transcripts.read_session_delta(
+        provider_format,
+        normalized_path,
+        cursor=cursor.change_cursor + 1,
+        tail_window=False,
+    )
+    stale.pop("tail_from", None)
+    stale.pop("has_older", None)
+    stale_actual = _sqlite_payload(event_store, run_id)
+    stale_actual["patches"] = []
+    add_boundary(
+        stale,
+        stale_actual,
+        boundary="stale_cursor",
+        raw_seq=cursor.raw_seq,
+    )
+    transcripts._cache.clear()
+    older = transcripts.read_older_session(
+        provider_format,
+        normalized_path,
+        before=len(normalized_rows),
+        count=max(1, len(normalized_rows)),
+    )
+    older_actual = {
+        "events": event_store.read_events(run_id),
+        "base": cursor.event_base,
+        "has_older": False,
+    }
+    add_boundary(
+        older,
+        older_actual,
+        boundary="older_page",
+        raw_seq=cursor.raw_seq,
+    )
+    transcripts._cache.clear()
+    patch_cursor = max(0, cursor.change_cursor - 1)
+    patch_delta = transcripts.read_session_delta(
+        provider_format,
+        normalized_path,
+        cursor=patch_cursor,
+        tail_window=False,
+    )
+    patch_actual = {
+        "patches": [
+            {"id": patch.event_id, **patch.patch}
+            for patch in event_store.read_patches(
+                run_id,
+                after_cursor=patch_cursor,
+            )
+        ]
+    }
+    add_boundary(
+        {"patches": patch_delta.get("patches", [])},
+        patch_actual,
+        boundary="patch_only_delta",
+        raw_seq=cursor.raw_seq,
+    )
+    reports.append(compare_run_parity(store, event_store, run_id, record=record))
+    return tuple(reports)
+
+
+def _safe_normalizer_version(
+    event_store: SQLiteEventStore,
+    run_id: str,
+) -> str:
+    metadata = _cursor_metadata(event_store, run_id)
+    return metadata[0] if metadata is not None else NORMALIZER_VERSION
+
+
+def run_parity_batch(
+    store: RunStore,
+    event_store: SQLiteEventStore,
+    run_ids: list[str],
+) -> dict[str, tuple[ParityReport, ...]]:
+    """Run parity checks without allowing one broken run to stop the batch."""
+
+    reports: dict[str, tuple[ParityReport, ...]] = {}
+    for run_id in run_ids:
+        try:
+            reports[run_id] = compare_run_boundaries(store, event_store, run_id)
+        except Exception as exc:
+            event_store.record_parity_record(
+                run_id,
+                normalizer_version=_safe_normalizer_version(event_store, run_id),
+                record_type="harness_error",
+                path="comparison",
+                detail={
+                    "error": f"{type(exc).__name__}: {exc}",
+                    "boundary": "comparison",
+                },
+            )
+            continue
+    return reports
 
 
 def _cursor_metadata(
@@ -244,7 +513,8 @@ def backfill_headless_runs(
         record
         for record in store.list_runs()
         if record.provider_session_id is not None
-    ][:batch_size]
+    ]
+    eligible: list[tuple[Any, str]] = []
     for record in headless:
         metadata = _cursor_metadata(event_store, record.run_id)
         if metadata is not None:
@@ -283,6 +553,26 @@ def backfill_headless_runs(
                     )
                 )
                 continue
+            raw_path = store.raw_events_path(record.run_id)
+            if not raw_path.is_file():
+                _record_backfill_skip(
+                    event_store,
+                    record.run_id,
+                    normalizer_version=stored_version,
+                    reason="raw_jsonl",
+                    actual="missing",
+                )
+                results.append(
+                    BackfillResult(
+                        record.run_id,
+                        "skipped",
+                        stored_version,
+                        "raw_jsonl",
+                    )
+                )
+                continue
+            eligible.append((record, stored_version))
+            continue
         raw_path = store.raw_events_path(record.run_id)
         if not raw_path.is_file():
             _record_backfill_skip(
@@ -301,34 +591,57 @@ def backfill_headless_runs(
                 )
             )
             continue
-        with tempfile.TemporaryDirectory(prefix="wiki-282-backfill-") as directory:
-            temporary_path = Path(directory) / "events.sqlite3"
-            replay_raw_jsonl(
-                raw_path,
-                temporary_path,
-                run_id=record.run_id,
-                agent_id=record.agent_id,
-                provider=record.provider,
-                created_at=record.created_at,
+        eligible.append((record, NORMALIZER_VERSION))
+    for record, _stored_version in eligible[:batch_size]:
+        raw_path = store.raw_events_path(record.run_id)
+        try:
+            with tempfile.TemporaryDirectory(prefix="wiki-282-backfill-") as directory:
+                temporary_path = Path(directory) / "events.sqlite3"
+                replay_raw_jsonl(
+                    raw_path,
+                    temporary_path,
+                    run_id=record.run_id,
+                    agent_id=record.agent_id,
+                    provider=record.provider,
+                    created_at=record.created_at,
+                )
+                rebuilt = SQLiteEventStore(temporary_path, migrate=False)
+                if not rebuilt.run_is_healthy(record.run_id):
+                    raise RuntimeError(
+                        f"backfill replay failed validation for {record.run_id}"
+                    )
+                event_store.replace_run_from(temporary_path, record.run_id)
+            reports = compare_run_boundaries(store, event_store, record.run_id)
+        except Exception as exc:
+            version = _safe_normalizer_version(event_store, record.run_id)
+            event_store.record_parity_record(
+                record.run_id,
+                normalizer_version=version,
+                record_type="harness_error",
+                path="backfill",
+                detail={"error": f"{type(exc).__name__}: {exc}"},
             )
-            rebuilt = SQLiteEventStore(temporary_path, migrate=False)
-            if not rebuilt.run_is_healthy(record.run_id):
-                raise RuntimeError(f"backfill replay failed validation for {record.run_id}")
-            event_store.replace_run_from(temporary_path, record.run_id)
-        report = compare_run_parity(store, event_store, record.run_id)
+            results.append(
+                BackfillResult(record.run_id, "harness_error", version, str(exc))
+            )
+            continue
+        mismatches = tuple(
+            mismatch for report in reports for mismatch in report.mismatches
+        )
+        matched = not mismatches
         event_store.record_parity_record(
             record.run_id,
             normalizer_version=NORMALIZER_VERSION,
             record_type="backfill_completed",
             path="run",
-            detail={"matched": report.matched},
+            detail={"matched": matched, "boundaries": len(reports)},
         )
         results.append(
             BackfillResult(
                 record.run_id,
-                "ready" if report.matched else "ready_with_mismatches",
+                "ready" if matched else "ready_with_mismatches",
                 NORMALIZER_VERSION,
-                mismatches=report.mismatches,
+                mismatches=mismatches,
             )
         )
     return results

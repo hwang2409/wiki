@@ -350,5 +350,5 @@ def test_half_applied_migration_is_idempotent() -> None:
                     "PRAGMA table_info(run_projections)"
                 ).fetchall()
             }
-        assert versions == [(1,), (2,), (3,)]
+        assert versions == [(1,), (2,), (3,), (4,)]
         assert "unread_event_seq" in columns

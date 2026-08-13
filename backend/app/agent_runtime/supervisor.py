@@ -466,6 +466,7 @@ class Supervisor:
         self.codex_rotation_task: asyncio.Task[dict[str, Any]] | None = None
         self.codex_rotation_operation_id: str | None = None
         self.recovery_scan_lock = asyncio.Lock()
+        self.archive_backfill_task: asyncio.Task[Any] | None = None
         # A supervisor boot invalidates any provider stdin write that had not
         # completed before shutdown: even if the row is at "sending", the
         # previous transport is gone. Sweep once per boot so the on-idle
@@ -2833,7 +2834,31 @@ Preserve the same identity, role, worktree, orchestrator grouping, PR gates, and
                         else:
                             results[index] = reaped
                 results.extend(await self._auto_archive_sweep())
+                self._schedule_archive_backfill()
                 return results
+
+    def _schedule_archive_backfill(self) -> None:
+        """Run a bounded archive parity backfill off the recovery path."""
+
+        if (
+            self.archive_backfill_task is not None
+            and not self.archive_backfill_task.done()
+        ):
+            return
+        from .archive_parity import backfill_headless_runs
+
+        async def run_backfill() -> None:
+            await asyncio.to_thread(
+                backfill_headless_runs,
+                self.store,
+                self.event_store,
+                batch_size=32,
+            )
+
+        self.archive_backfill_task = self._spawn_monitor_task(
+            run_backfill(),
+            name="archive-parity-backfill",
+        )
 
     async def _normalize_orphan_raw_events(self) -> None:
         """Normalize raw provider rows whose normalization did not commit.

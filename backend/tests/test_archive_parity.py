@@ -2,10 +2,13 @@ from __future__ import annotations
 
 import json
 from pathlib import Path
+from unittest import mock
 
 from backend.app.agent_runtime.archive_parity import (
     backfill_headless_runs,
     compare_run_parity,
+    compare_run_boundaries,
+    run_parity_batch,
 )
 from backend.app.agent_runtime.archive_protocol import archive_is_committed
 from backend.app.agent_runtime.event_store import (
@@ -223,6 +226,85 @@ def test_parity_harness_records_divergent_event_with_run_and_version(tmp_path: P
         and row["run_id"] == record.run_id
         for row in records
     )
+    assert all(row["raw_seq"] is not None for row in records if row["record_type"] == "mismatch")
+
+
+def test_parity_harness_records_errors_and_continues_batch(tmp_path: Path) -> None:
+    store, event_store, first = _run_with_one_event(tmp_path)
+    second = store.create(
+        RunRecord.new(
+            agent_id="WIKI-282-PARITY-SECOND",
+            provider=ProviderKind.CODEX,
+            role="implement",
+            model="fixture",
+            worktree=str(tmp_path),
+            prompt="parity second",
+        )
+    )
+    second.provider_session_id = "session-second"
+    store._write_record(second)  # noqa: SLF001
+    payload = {"method": "warning", "params": {"message": "second"}}
+    raw = store.append_raw(
+        second.run_id,
+        provider="codex",
+        direction="provider",
+        payload=payload,
+    )
+    normalized = normalize_provider_event(ProviderKind.CODEX, payload)
+    store.append_normalized(
+        second.run_id,
+        raw_seq=int(raw["seq"]),
+        disposition=normalized.disposition,
+        kind=normalized.kind,
+        payload=normalized.payload,
+        lifecycle_state=normalized.lifecycle_state,
+    )
+    event_store.create_run(
+        second.run_id,
+        agent_id=second.agent_id,
+        provider=second.provider,
+        created_at=second.created_at,
+        state=second.state,
+    )
+    event_store.materialize(second.run_id, raw, EventReducerAdapter(second.provider), normalized=normalized)
+
+    from backend.app.agent_runtime import archive_parity
+
+    original = archive_parity.transcripts.read_session_delta
+    calls = 0
+
+    def fail_once(*args: object, **kwargs: object) -> object:
+        nonlocal calls
+        calls += 1
+        if calls == 1:
+            raise ValueError("parser fixture failure")
+        return original(*args, **kwargs)
+
+    with mock.patch.object(
+        archive_parity.transcripts,
+        "read_session_delta",
+        side_effect=fail_once,
+    ):
+        reports = run_parity_batch(store, event_store, [first.run_id, second.run_id])
+
+    records = event_store.parity_records()
+    assert any(row["run_id"] == first.run_id and row["record_type"] == "harness_error" for row in records)
+    assert second.run_id in reports
+    assert any(row["run_id"] == second.run_id for row in records)
+
+
+def test_parity_harness_compares_raw_prefix_boundaries(tmp_path: Path) -> None:
+    store, event_store, record = _run_with_one_event(tmp_path)
+    with event_store.connection() as connection:
+        connection.execute(
+            "UPDATE events SET event_json = ? WHERE run_id = ? AND event_id = 0",
+            (json.dumps({"id": 0, "kind": "divergent"}), record.run_id),
+        )
+
+    reports = compare_run_boundaries(store, event_store, record.run_id)
+
+    assert any(report.boundary == "raw_prefix" for report in reports)
+    assert any(mismatch.raw_seq == 1 for report in reports for mismatch in report.mismatches)
 
 
 def test_backfill_skips_wrong_version_and_rebuild_state_and_records_both(
@@ -304,7 +386,7 @@ def test_backfill_skips_wrong_version_and_rebuild_state_and_records_both(
             (rebuild_needed.run_id,),
         )
 
-    results = backfill_headless_runs(store, event_store)
+    results = backfill_headless_runs(store, event_store, batch_size=1)
 
     by_run = {result.run_id: result for result in results}
     assert by_run[wrong_version.run_id].status == "skipped"
