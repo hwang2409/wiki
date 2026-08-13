@@ -114,6 +114,23 @@ export function artifactExceedsInlineThreshold(
   }
 }
 
+// Session-scoped set of artifact IDs that have already mounted once. First
+// mount for a given ID plays the subtle enter animation; subsequent
+// mounts (row virtualization scrolling back to a row, for example) do
+// not — otherwise fast scrolls would strobe. Persists for the lifetime
+// of the page. WIKI-200.
+const seenArtifactIds = new Set<string>();
+
+function useIsFreshArtifact(artifactId: string | undefined): boolean {
+  const [fresh] = useState(() => {
+    if (!artifactId) return false;
+    if (seenArtifactIds.has(artifactId)) return false;
+    seenArtifactIds.add(artifactId);
+    return true;
+  });
+  return fresh;
+}
+
 function useInlineExpanded(sessionKey: string, artifactId: string | undefined): [boolean, (next: boolean) => void] {
   const id = artifactId ?? "";
   const state = useSyncExternalStore<{ expanded?: boolean }>(
@@ -204,9 +221,11 @@ export function ArtifactBlock({
       });
   }, [artifact?.kind, event.artifact_id, ticket]);
   const [inlineExpanded, setInlineExpanded] = useInlineExpanded(inlineSessionKey, event.artifact_id);
+  const isEntering = useIsFreshArtifact(event.artifact_id);
+  const shellClass = `artifact-block-shell${inspect ? " has-inspect" : ""}${isEntering ? " is-entering" : ""}`;
   if (!artifact) {
     return (
-      <div className="artifact-block-shell">
+      <div className={shellClass}>
         <ArtifactError title="Artifact payload missing." />
       </div>
     );
@@ -242,7 +261,7 @@ export function ArtifactBlock({
   }
 
   return (
-    <div className={`artifact-block-shell${inspect ? " has-inspect" : ""}`}>
+    <div className={shellClass}>
       <section
         className={`artifact-block${showCompact ? " is-compact" : ""}${inlineExpanded ? " is-expanded" : ""}`}
         data-artifact-compact={showCompact || undefined}

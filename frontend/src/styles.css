@@ -9982,6 +9982,32 @@ textarea.composer-command-input {
   background: transparent;
 }
 
+/* Subtle enter animation — 150ms fade + 4px translate. Applied only on
+   the FIRST render of an artifact_id in this session (see
+   ArtifactBlock.tsx), so scrolling a virtualized row back into view
+   never re-plays. Restrained on purpose: no bounce, tiny displacement.
+   Matches the "solid" aesthetic — deliberate, not showy. WIKI-200. */
+.artifact-block-shell.is-entering {
+  animation: artifact-block-enter 150ms cubic-bezier(0.2, 0, 0, 1) both;
+}
+
+@keyframes artifact-block-enter {
+  from {
+    opacity: 0;
+    transform: translateY(4px);
+  }
+  to {
+    opacity: 1;
+    transform: none;
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .artifact-block-shell.is-entering {
+    animation: none;
+  }
+}
+
 .artifact-block-shell.has-inspect {
   grid-template-columns: minmax(0, 1fr) minmax(240px, 38%);
 }
@@ -14203,14 +14229,17 @@ textarea.composer-command-input {
 
 .artifact-image {
   display: block;
-}
-
-.artifact-image:not(.is-loaded) {
-  filter: blur(10px) saturate(1.05);
+  /* Fade in when decode completes. Only opacity animates — the full-
+     resolution bitmap never runs through a filter chain, which used to
+     spike frame time on scroll when many images were on screen. WIKI-200. */
+  opacity: 0;
+  transition-property: opacity;
+  transition-duration: 220ms;
+  transition-timing-function: cubic-bezier(0.2, 0, 0, 1);
 }
 
 .artifact-image.is-loaded {
-  filter: none;
+  opacity: 1;
 }
 
 .artifact-image-blur {
@@ -14253,6 +14282,11 @@ textarea.composer-command-input {
   transform: scale(1.08);
   opacity: 1;
   pointer-events: none;
+  /* Match the sharp image's fade-in so the crossfade is symmetric —
+     no visible seam between "preview dim" and "sharp bright". WIKI-200. */
+  transition-property: opacity;
+  transition-duration: 220ms;
+  transition-timing-function: cubic-bezier(0.2, 0, 0, 1);
 }
 
 .artifact-image-preview.is-fading {
@@ -14281,10 +14315,36 @@ textarea.composer-command-input {
   /* Above the sharp image so the fade actually reveals the load; the tile's
      retention timer then unmounts the preview once the fade ends. */
   z-index: 2;
+  transition-property: opacity;
+  transition-duration: 220ms;
+  transition-timing-function: cubic-bezier(0.2, 0, 0, 1);
 }
 
 .artifact-gallery-preview.is-fading {
   opacity: 0;
+}
+
+.artifact-gallery-image {
+  opacity: 0;
+  transition-property: opacity;
+  transition-duration: 220ms;
+  transition-timing-function: cubic-bezier(0.2, 0, 0, 1);
+}
+
+.artifact-gallery-image.is-loaded {
+  opacity: 1;
+}
+
+/* Off-screen tiles in a virtualized gallery (>20 files). No <img>, no
+   preview — just a sized placeholder that keeps the grid layout stable
+   until the tile scrolls into the observer's rootMargin band. WIKI-200. */
+.artifact-gallery-tile.is-virtualized {
+  cursor: default;
+  background: color-mix(in srgb, var(--background-secondary) 60%, transparent);
+}
+
+.artifact-gallery-tile.is-virtualized::after {
+  content: none;
 }
 
 .artifact-gallery-image {
@@ -14489,10 +14549,22 @@ textarea.composer-command-input {
   filter: blur(18px) saturate(1.05);
   transform: scale(1.08);
   opacity: 1;
+  /* Explicit opacity transition so the fade WIKI-189 tests measure is
+     the same shape the user sees — 220ms curve matching the artifact
+     preview so callers on both surfaces read the same. WIKI-200. */
+  transition-property: opacity;
+  transition-duration: 220ms;
+  transition-timing-function: cubic-bezier(0.2, 0, 0, 1);
 }
 
 .markdown-image-frame .markdown-image-preview.is-fading {
   opacity: 0;
+}
+
+.markdown-image-frame img:not(.markdown-image-preview) {
+  transition-property: opacity;
+  transition-duration: 220ms;
+  transition-timing-function: cubic-bezier(0.2, 0, 0, 1);
 }
 
 .markdown-image-frame:focus-visible {

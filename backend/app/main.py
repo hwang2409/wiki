@@ -339,6 +339,9 @@ class AssetMeta(BaseModel):
     height: int
     media_type: str
     preview_base64: str | None = None
+    # Source file mtime in integer ms; lets the client persist the preview in
+    # an IndexedDB thumbnail cache and invalidate on file change (WIKI-200).
+    mtime_ms: int | None = None
 
 
 class Note(NoteSummary):
@@ -880,12 +883,12 @@ def _collect_note_asset_meta(content: str, note_path: str) -> dict[str, AssetMet
     result: dict[str, AssetMeta] = {}
     for candidate in _extract_note_image_paths(content, note_path):
         try:
-            raw, media_type = _read_vault_asset_bytes(candidate)
+            raw, media_type, mtime_ms = _read_vault_asset_bytes(candidate)
         except HTTPException:
             continue
         if media_type not in _VAULT_ASSET_RESIZE_MIMES:
             continue
-        payload = _asset_meta_for(raw, media_type)
+        payload = _asset_meta_for(raw, media_type, mtime_ms)
         if payload is None:
             continue
         result[candidate] = AssetMeta(**payload)
@@ -6453,7 +6456,12 @@ def get_file_content(
 _VAULT_ASSET_RESIZE_MIMES = {"image/png", "image/jpeg", "image/webp"}
 
 
-def _read_vault_asset_bytes(asset_path: str) -> tuple[bytes, str]:
+def _read_vault_asset_bytes(asset_path: str) -> tuple[bytes, str, int]:
+    """Return the file bytes, MIME type, and integer-millisecond mtime.
+
+    The mtime is captured off the SAME file descriptor used to read the
+    bytes so the thumbnail cache (WIKI-200) can't drift against a race
+    where the file is replaced between the read and a follow-up stat."""
     target, _relative_path, media_type = resolve_vault_asset_path(asset_path)
     flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0)
     try:
@@ -6463,7 +6471,9 @@ def _read_vault_asset_bytes(asset_path: str) -> tuple[bytes, str]:
     try:
         if not opened_file_is_safe(fd, target, VAULT_DIR.resolve()):
             file_not_found()
-        size = os.fstat(fd).st_size
+        stat_result = os.fstat(fd)
+        size = stat_result.st_size
+        mtime_ms = stat_result.st_mtime_ns // 1_000_000
         raw = read_open_file(fd, MAX_FILE_BYTES)
         if size > MAX_FILE_BYTES or len(raw) > MAX_FILE_BYTES:
             raise HTTPException(
@@ -6479,12 +6489,12 @@ def _read_vault_asset_bytes(asset_path: str) -> tuple[bytes, str]:
         raise HTTPException(status_code=404, detail="File not found")
     finally:
         os.close(fd)
-    return raw, media_type
+    return raw, media_type, mtime_ms
 
 
 @app.get("/api/vault/assets/{asset_path:path}")
 def get_vault_asset(asset_path: str, w: int | None = None) -> Response:
-    raw, media_type = _read_vault_asset_bytes(asset_path)
+    raw, media_type, _mtime_ms = _read_vault_asset_bytes(asset_path)
     if w is not None and media_type in _VAULT_ASSET_RESIZE_MIMES:
         from .image_scrub import ALLOWED_RESIZE_WIDTHS, ImageScrubError, resize_image_bytes
 
@@ -6510,12 +6520,17 @@ def get_vault_asset(asset_path: str, w: int | None = None) -> Response:
     return Response(content=raw, media_type=media_type, headers=headers)
 
 
-def _asset_meta_for(raw: bytes, media_type: str) -> dict[str, object] | None:
+def _asset_meta_for(
+    raw: bytes, media_type: str, mtime_ms: int | None = None
+) -> dict[str, object] | None:
     """Return canonical (orientation-normalised) dimensions + preview for an
     image asset, or None if it cannot be scrubbed. Uses scrub_image so the
     reported width/height match what the browser will actually render — a
     portrait photo tagged with EXIF orientation 6 comes out with its axes
-    already swapped, matching the pixels the vault-asset endpoint serves."""
+    already swapped, matching the pixels the vault-asset endpoint serves.
+
+    The optional `mtime_ms` is included in the payload so the client
+    thumbnail cache (WIKI-200) can invalidate on file change."""
     from .image_scrub import ImageScrubError, scrub_image
 
     try:
@@ -6529,15 +6544,17 @@ def _asset_meta_for(raw: bytes, media_type: str) -> dict[str, object] | None:
     }
     if result.preview_base64:
         payload["preview_base64"] = result.preview_base64
+    if mtime_ms is not None:
+        payload["mtime_ms"] = mtime_ms
     return payload
 
 
 @app.get("/api/vault/asset-meta/{asset_path:path}")
 def get_vault_asset_meta(asset_path: str) -> dict[str, object]:
-    raw, media_type = _read_vault_asset_bytes(asset_path)
+    raw, media_type, mtime_ms = _read_vault_asset_bytes(asset_path)
     if media_type not in _VAULT_ASSET_RESIZE_MIMES:
         raise HTTPException(status_code=415, detail="asset is not an image")
-    meta = _asset_meta_for(raw, media_type)
+    meta = _asset_meta_for(raw, media_type, mtime_ms)
     if meta is None:
         raise HTTPException(status_code=422, detail="asset could not be scrubbed")
     return meta
@@ -6563,12 +6580,12 @@ def post_vault_asset_meta_batch(payload: AssetMetaBatchRequest) -> dict[str, dic
             continue
         seen.add(candidate)
         try:
-            content, media_type = _read_vault_asset_bytes(candidate)
+            content, media_type, mtime_ms = _read_vault_asset_bytes(candidate)
         except HTTPException:
             continue
         if media_type not in _VAULT_ASSET_RESIZE_MIMES:
             continue
-        meta = _asset_meta_for(content, media_type)
+        meta = _asset_meta_for(content, media_type, mtime_ms)
         if meta is not None:
             result[candidate] = meta
     return result

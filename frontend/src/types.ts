@@ -13,6 +13,9 @@ export interface AssetMeta {
   height: number;
   media_type: string;
   preview_base64?: string | null;
+  // Source file mtime in integer ms — cache key for the IndexedDB
+  // thumbnail cache (WIKI-200).
+  mtime_ms?: number | null;
 }
 
 export interface Note extends NoteSummary {

@@ -1,6 +1,11 @@
 import { useEffect, useState } from "react";
 import type { CSSProperties } from "react";
 import { ArtifactLightbox } from "./artifact-detail/lightbox";
+import {
+  readThumbnail,
+  writeThumbnail,
+  type ThumbnailRecord,
+} from "./thumbnail-cache";
 
 const vaultImageExtension = /\.(?:png|jpe?g|gif|webp|svg)$/i;
 
@@ -86,6 +91,7 @@ type AssetMeta = {
   width: number;
   height: number;
   previewBase64: string | null;
+  mtimeMs: number | null;
 };
 
 // Shared cache: results are cached forever, in-flight fetches are shared, and
@@ -110,12 +116,27 @@ function fetchAssetMeta(path: string): Promise<AssetMeta | null> {
         width: Number(body.width) || 0,
         height: Number(body.height) || 0,
         previewBase64: typeof body.preview_base64 === "string" ? body.preview_base64 : null,
+        mtimeMs: typeof body.mtime_ms === "number" ? body.mtime_ms : null,
       };
       return meta;
     })
     .then((meta) => {
       assetMetaCache.set(path, meta);
       assetMetaPending.delete(path);
+      // Persist to IndexedDB so the next cold start paints the blur-up
+      // placeholder on the first frame. mtime_ms is the invalidation
+      // key — a stale record is dropped by readThumbnailIfFresh on the
+      // subsequent load. WIKI-200.
+      if (meta && meta.mtimeMs !== null) {
+        void writeThumbnail({
+          path,
+          mtimeMs: meta.mtimeMs,
+          width: meta.width,
+          height: meta.height,
+          previewBase64: meta.previewBase64,
+          storedAt: Date.now(),
+        });
+      }
       return meta;
     })
     .catch(() => {
@@ -127,19 +148,52 @@ function fetchAssetMeta(path: string): Promise<AssetMeta | null> {
   return request;
 }
 
+// Hydrate the in-memory asset meta cache from the IndexedDB thumbnail
+// cache. Callers can await this to force cache warmth; MarkdownImage
+// fires it in the background so the first frame after a cold start
+// still gets a blur-up placeholder even if the network hasn't answered.
+export async function hydrateAssetMetaFromThumbnailCache(path: string): Promise<AssetMeta | null> {
+  if (assetMetaCache.get(path) !== undefined) return assetMetaCache.get(path) ?? null;
+  const record: ThumbnailRecord | null = await readThumbnail(path);
+  if (!record) return null;
+  const meta: AssetMeta = {
+    width: record.width,
+    height: record.height,
+    previewBase64: record.previewBase64,
+    mtimeMs: record.mtimeMs,
+  };
+  // Don't clobber a value the network already produced.
+  if (assetMetaCache.get(path) === undefined) assetMetaCache.set(path, meta);
+  return meta;
+}
+
 export function seedAssetMetaCache(entries: Record<string, {
   width: number;
   height: number;
   preview_base64?: string | null;
+  mtime_ms?: number | null;
 }> | undefined | null): void {
   if (!entries) return;
   for (const [path, entry] of Object.entries(entries)) {
     if (!entry || typeof entry !== "object") continue;
-    assetMetaCache.set(path, {
+    const mtimeMs = typeof entry.mtime_ms === "number" ? entry.mtime_ms : null;
+    const meta = {
       width: Number(entry.width) || 0,
       height: Number(entry.height) || 0,
       previewBase64: typeof entry.preview_base64 === "string" ? entry.preview_base64 : null,
-    });
+      mtimeMs,
+    };
+    assetMetaCache.set(path, meta);
+    if (mtimeMs !== null) {
+      void writeThumbnail({
+        path,
+        mtimeMs,
+        width: meta.width,
+        height: meta.height,
+        previewBase64: meta.previewBase64,
+        storedAt: Date.now(),
+      });
+    }
   }
 }
 
@@ -201,9 +255,30 @@ export function MarkdownImage({ alt, className, "data-obsidian-width": dataWidth
     if (!activeCandidate) return;
     if (assetMetaFromCache(activeCandidate) !== undefined) return;
     let cancelled = false;
+    // Hydrate synchronously from IndexedDB first — this puts a blur-up
+    // preview on the frame BEFORE the network answers on a cold start.
+    // The follow-up network fetch still runs; if the server returns a
+    // fresher preview (different mtime), fetchAssetMeta writes over
+    // both caches and the component re-renders with the new preview.
+    void hydrateAssetMetaFromThumbnailCache(activeCandidate).then((warm) => {
+      if (cancelled) return;
+      if (warm) {
+        setMeta(warm);
+        if (warm.width > 0 && warm.height > 0) {
+          setFrameRatio((prev) => prev ?? { w: warm.width, h: warm.height });
+        }
+      }
+    });
     fetchAssetMeta(activeCandidate).then((info) => {
       if (cancelled) return;
-      setMeta(info);
+      // Skip the state update if the fetched value matches what we
+      // already have — avoids an extra reconciliation pass when the
+      // IDB hydration and the network fetch agree.
+      setMeta((prev) => {
+        if (!info) return prev;
+        if (prev && prev.mtimeMs === info.mtimeMs && prev.previewBase64 === info.previewBase64) return prev;
+        return info;
+      });
       // Only lock the ratio from meta if we don't have one yet — otherwise
       // the ratio was captured from the image's naturalWidth/Height at load
       // time and we must NOT change it (that would be the CLS the race test
