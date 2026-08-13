@@ -8,6 +8,8 @@ from __future__ import annotations
 
 import json
 import sqlite3
+import tempfile
+import threading
 from collections.abc import Iterator
 from contextlib import contextmanager
 from dataclasses import dataclass
@@ -167,11 +169,12 @@ class EventReducerAdapter:
         normalized: NormalizedProviderEvent | None = None,
     ) -> ReducerResult:
         raw_seq = int(raw["seq"])
+        normalized_seq = int(raw.get("normalized_seq", raw_seq))
         if normalized is None:
             normalized = _normalize(raw)
         received_at = str(raw.get("received_at") or "")
         row = {
-            "seq": raw_seq,
+            "seq": normalized_seq,
             "raw_seq": raw_seq,
             "normalized_at": received_at,
             "disposition": _stored_disposition(normalized.disposition),
@@ -503,9 +506,20 @@ def migrate_event_db(path: Path | str) -> None:
 class SQLiteEventStore:
     """Transactional SQLite cache for one or more materialized runs."""
 
-    def __init__(self, path: Path | str) -> None:
+    def __init__(self, path: Path | str, *, migrate: bool = True) -> None:
         self.path = Path(path)
-        migrate_event_db(self.path)
+        self._schema_ready = False
+        self._schema_lock = threading.Lock()
+        if migrate:
+            self.ensure_schema()
+
+    def ensure_schema(self) -> None:
+        if self._schema_ready:
+            return
+        with self._schema_lock:
+            if not self._schema_ready:
+                migrate_event_db(self.path)
+                self._schema_ready = True
 
     @contextmanager
     def connection(self, *, read_only: bool = False) -> Iterator[sqlite3.Connection]:
@@ -532,6 +546,7 @@ class SQLiteEventStore:
         archive_state: str = "live",
         normalizer_version: str = NORMALIZER_VERSION,
     ) -> None:
+        self.ensure_schema()
         provider_kind = _provider_kind(provider)
         state_value = state.value if isinstance(state, LifecycleState) else str(state)
         with self.connection() as connection:
@@ -586,25 +601,158 @@ class SQLiteEventStore:
     def run_is_healthy(self, run_id: str) -> bool:
         try:
             with self.connection(read_only=True) as connection:
-                run = connection.execute(
-                    "SELECT 1 FROM runs WHERE run_id = ?", (run_id,)
-                ).fetchone()
-                if run is None:
-                    return True
-                cursor = connection.execute(
-                    "SELECT raw_seq, normalized_json FROM dispositions "
-                    "WHERE run_id = ? ORDER BY raw_seq",
+                run_row = connection.execute(
+                    "SELECT provider, agent_id, created_at, state FROM runs "
+                    "WHERE run_id = ?",
                     (run_id,),
-                )
-                for raw_seq, normalized_json in cursor:
+                ).fetchone()
+                if run_row is None:
+                    return True
+                dispositions = connection.execute(
+                    "SELECT raw_seq, normalized_json, normalizer_version, created_at "
+                    "FROM dispositions WHERE run_id = ? ORDER BY raw_seq",
+                    (run_id,),
+                ).fetchall()
+                for raw_seq, normalized_json, _version, _created_at in dispositions:
                     value = json.loads(normalized_json)
-                    if not isinstance(value, dict) or int(value["raw_seq"]) != int(
-                        raw_seq
+                    if (
+                        not isinstance(value, dict)
+                        or int(value["raw_seq"]) != int(raw_seq)
+                        or int(value["seq"]) < 1
                     ):
                         return False
-        except (sqlite3.DatabaseError, KeyError, TypeError, ValueError, json.JSONDecodeError):
+                cursor = connection.execute(
+                    "SELECT raw_seq, materialized_raw_seq, next_event_id, event_base, "
+                    "event_count, change_cursor, patch_base_cursor, "
+                    "last_causal_raw_seq, normalizer_version, rebuild_state "
+                    "FROM run_cursors WHERE run_id = ?",
+                    (run_id,),
+                ).fetchone()
+                projection = connection.execute(
+                    "SELECT current_turn_json, tasks_json, pr_json, "
+                    "session_meta_json, pending_requests_json, composer_messages_json, "
+                    "disposition_counts_json, tokens_json, unread_event_seq, "
+                    "projection_revision FROM run_projections WHERE run_id = ?",
+                    (run_id,),
+                ).fetchone()
+                if cursor is None or projection is None:
+                    return False
+                for value in projection[:8]:
+                    if value is not None:
+                        json.loads(value)
+                event_rows = connection.execute(
+                    "SELECT event_id, raw_seq, event_json, revision, deleted "
+                    "FROM events WHERE run_id = ? ORDER BY event_id",
+                    (run_id,),
+                ).fetchall()
+                event_ids = {int(row[0]) for row in event_rows}
+                for event_id, raw_seq, event_json, revision, deleted in event_rows:
+                    value = json.loads(event_json)
+                    if (
+                        not isinstance(value, dict)
+                        or int(value.get("id", -1)) != int(event_id)
+                        or int(raw_seq) < 1
+                        or int(revision) < 1
+                        or int(deleted) not in {0, 1}
+                    ):
+                        return False
+                patch_rows = connection.execute(
+                    "SELECT change_cursor, event_id, raw_seq, patch_json, "
+                    "event_revision FROM patches WHERE run_id = ? "
+                    "ORDER BY change_cursor",
+                    (run_id,),
+                ).fetchall()
+                for change_cursor, event_id, raw_seq, patch_json, revision in patch_rows:
+                    if (
+                        int(event_id) not in event_ids
+                        or int(raw_seq) < 1
+                        or int(change_cursor) < 1
+                        or int(revision) < 1
+                        or not isinstance(json.loads(patch_json), dict)
+                    ):
+                        return False
+                expected_prefix = (
+                    max((int(row[0]) for row in dispositions), default=0),
+                    max((int(row[0]) for row in dispositions), default=0),
+                    max(event_ids, default=0) + 1 if event_ids else 0,
+                    min(event_ids, default=0),
+                    len(event_rows),
+                )
+                if tuple(int(value) for value in cursor[:5]) != expected_prefix:
+                    return False
+                if int(cursor[7]) < 0 or cursor[9] != "ready":
+                    return False
+                if int(projection[9]) != len(dispositions):
+                    return False
+            expected = self._expected_view_rows(
+                run_id,
+                provider=str(run_row[0]),
+                agent_id=str(run_row[1]),
+                created_at=str(run_row[2]),
+                state=str(run_row[3]),
+                dispositions=dispositions,
+            )
+            actual = self.view_rows(run_id)
+            if actual != expected:
+                return False
+        except (
+            sqlite3.DatabaseError,
+            KeyError,
+            TypeError,
+            ValueError,
+            json.JSONDecodeError,
+        ):
             return False
         return True
+
+    def _expected_view_rows(
+        self,
+        run_id: str,
+        *,
+        provider: str,
+        agent_id: str,
+        created_at: str,
+        state: str,
+        dispositions: list[tuple[Any, ...]],
+    ) -> dict[str, list[tuple[Any, ...]]]:
+        with tempfile.TemporaryDirectory(prefix="wiki-282-health-") as directory:
+            expected = SQLiteEventStore(Path(directory) / "events.sqlite3")
+            expected.create_run(
+                run_id,
+                agent_id=agent_id,
+                provider=provider,
+                created_at=created_at,
+                state=state,
+            )
+            reducer = EventReducerAdapter(provider)
+            for raw_seq, normalized_json, _version, disposition_created_at in dispositions:
+                normalized_row = json.loads(normalized_json)
+                normalized = NormalizedProviderEvent(
+                    EventDisposition.IGNORED
+                    if normalized_row["disposition"] in {
+                        "ignored",
+                        transcripts.EVENT_DISPOSITION_IGNORED,
+                    }
+                    else EventDisposition(normalized_row["disposition"]),
+                    str(normalized_row["kind"]),
+                    normalized_row["payload"],
+                    LifecycleState(normalized_row["lifecycle_state"])
+                    if normalized_row.get("lifecycle_state") is not None
+                    else None,
+                )
+                expected.materialize(
+                    run_id,
+                    {
+                        "seq": int(raw_seq),
+                        "normalized_seq": int(normalized_row["seq"]),
+                        "received_at": str(disposition_created_at),
+                        "provider": provider,
+                        "payload": {},
+                    },
+                    reducer,
+                    normalized=normalized,
+                )
+            return expected.view_rows(run_id)
 
     def read_normalized_row(
         self,
@@ -645,6 +793,7 @@ class SQLiteEventStore:
         reducer: EventReducerAdapter,
         normalized: NormalizedProviderEvent | None = None,
     ) -> ReducerResult:
+        self.ensure_schema()
         raw_seq = int(raw["seq"])
         if self.has_disposition(run_id, raw_seq):
             raise ValueError(f"raw sequence {raw_seq} is already materialized")
@@ -899,6 +1048,13 @@ class SQLiteEventStore:
 
         with self.connection(read_only=True) as connection:
             return {
+                "cursors": connection.execute(
+                    "SELECT raw_seq, materialized_raw_seq, next_event_id, "
+                    "event_base, event_count, change_cursor, patch_base_cursor, "
+                    "last_causal_raw_seq, last_lifecycle_change, normalizer_version, "
+                    "rebuild_state FROM run_cursors WHERE run_id = ?",
+                    (run_id,),
+                ).fetchall(),
                 "events": connection.execute(
                     "SELECT event_id, raw_seq, kind, event_json, created_at, "
                     "updated_at, revision, deleted FROM events WHERE run_id = ? "
