@@ -6138,8 +6138,7 @@ body.is-resizing-panes .pane-cell {
   padding: 0 8px 7px;
 }
 
-.codex-stream-command-card,
-.codex-stream-chip {
+.codex-stream-command-card {
   display: inline-flex;
   align-items: center;
   min-width: 0;
@@ -6303,27 +6302,12 @@ body.is-resizing-panes .pane-cell {
   overflow-wrap: anywhere;
 }
 
-.codex-stream-chip-row {
-  display: flex;
-  flex-wrap: wrap;
-  gap: 5px;
-}
-
-.codex-stream-chip {
-  white-space: nowrap;
-}
-
-.codex-stream-chip code,
 .codex-stream-command-card code {
   min-width: 0;
   overflow: hidden;
   color: var(--text-normal);
   text-overflow: ellipsis;
   white-space: pre;
-}
-
-.codex-stream-skills-chip {
-  align-self: flex-start;
 }
 
 .codex-stream-command-cards {

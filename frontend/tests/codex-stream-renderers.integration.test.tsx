@@ -7,7 +7,6 @@ import { afterEach, describe, expect, it } from "vitest";
 import {
   commandExecutionCards,
   CodexStreamHighlights,
-  deriveHookChips,
   groupProviderDiagnostics,
   matchedTerminalInteractions,
   parseDiffSnapshot,
@@ -47,33 +46,22 @@ function event(
 }
 
 describe("codex stream renderers", () => {
-  it("pairs hook start and complete by hook name and turn id", () => {
-    const events = [
-      event("hook_started", 1, {
-        turnId: "turn-1",
-        run: { eventName: "userPromptSubmit", id: "hook-1" },
-      }),
-      event("hook_completed", 2, {
-        turnId: "turn-1",
-        run: { eventName: "userPromptSubmit", durationMs: 52 },
-      }),
-    ];
-    expect(deriveHookChips(events)).toEqual([
-      { key: "userPromptSubmit\u0000turn-1\u00002", name: "userPromptSubmit", durationMs: 52, seq: 2 },
-    ]);
-  });
-
-  it("does not show a dangling hook chip for a started-only hook", () => {
-    const started = event("hook_started", 1, {
-      turnId: "turn-1",
-      run: { eventName: "userPromptSubmit", id: "hook-1" },
+  it("renders no transcript row for skills-changed events (WIKI-281)", () => {
+    const empty = event("skills_changed", 1, {});
+    const withDiff = event("skills_changed", 2, {
+      skills: { added: ["reader"], removed: ["writer"] },
     });
-    expect(deriveHookChips([started])).toEqual([]);
-    render(<CodexStreamHighlights events={[started]} />);
-    expect(screen.queryByTestId("codex-hook-chips")).toBeNull();
+    const { container } = render(
+      <CodexStreamHighlights events={[empty, withDiff]} />,
+    );
+    expect(container.querySelector(".codex-stream-highlights")).toBeNull();
+    expect(container.querySelector(".codex-stream-skills-chip")).toBeNull();
+    expect(container.textContent).not.toContain("skills updated");
+    expect(container.textContent).not.toContain("list refreshed");
+    expect(container.textContent).not.toContain("reader");
   });
 
-  it("renders a hook chip only after the matching completion event", () => {
+  it("renders no hook lifecycle chips for hook_started/hook_completed events (WIKI-281)", () => {
     const started = event("hook_started", 1, {
       turnId: "turn-1",
       run: { eventName: "userPromptSubmit", id: "hook-1" },
@@ -82,25 +70,13 @@ describe("codex stream renderers", () => {
       turnId: "turn-1",
       run: { eventName: "userPromptSubmit", durationMs: 52 },
     });
-    render(<CodexStreamHighlights events={[started, completed]} />);
-    expect(screen.getByTestId("codex-hook-chips")).toBeTruthy();
-    expect(screen.getByText("hook: userPromptSubmit")).toBeTruthy();
-  });
-
-  it("pairs hooks by run id without a turn id and renders completion-only hooks", () => {
-    const paired = deriveHookChips([
-      event("hook_started", 1, { run: { eventName: "sessionStart", id: "hook-1" } }),
-      event("hook_completed", 2, { run: { eventName: "sessionStart", id: "hook-1", durationMs: 18 } }),
-    ]);
-    expect(paired[0]?.name).toBe("sessionStart");
-    expect(paired[0]?.durationMs).toBe(18);
-
-    const completionOnly = deriveHookChips([
-      event("hook_completed", 3, { run: { eventName: "sessionEnd", durationMs: 24 } }),
-    ]);
-    expect(completionOnly).toEqual([
-      { key: "name:sessionEnd\u00003", name: "sessionEnd", durationMs: 24, seq: 3 },
-    ]);
+    const { container } = render(
+      <CodexStreamHighlights events={[started, completed]} />,
+    );
+    expect(container.querySelector("[data-testid='codex-hook-chips']")).toBeNull();
+    expect(container.querySelector(".codex-stream-chip-row")).toBeNull();
+    expect(container.textContent).not.toContain("hook: userPromptSubmit");
+    expect(container.querySelector(".codex-stream-highlights")).toBeNull();
   });
 
   it("attaches terminal interaction to one command card and keeps empty stdin visible", () => {
@@ -127,12 +103,6 @@ describe("codex stream renderers", () => {
     render(<CodexStreamHighlights events={[command, orphan]} />);
     expect(document.querySelectorAll(".codex-stream-command-card")).toHaveLength(1);
     expect(screen.getByText("empty stdin")).toBeTruthy();
-  });
-
-  it("renders the real empty skills-changed payload as a visible refresh chip", () => {
-    render(<CodexStreamHighlights events={[event("skills_changed", 1, {})]} />);
-    expect(screen.getByText("skills updated")).toBeTruthy();
-    expect(screen.getByText("list refreshed")).toBeTruthy();
   });
 
   it("renders nested moderation category flags on the diagnostic row", () => {
