@@ -467,6 +467,7 @@ class Supervisor:
         self.codex_rotation_operation_id: str | None = None
         self.recovery_scan_lock = asyncio.Lock()
         self.archive_backfill_task: asyncio.Task[Any] | None = None
+        self.archive_backfill_worker: asyncio.Task[Any] | None = None
         # A supervisor boot invalidates any provider stdin write that had not
         # completed before shutdown: even if the row is at "sending", the
         # previous transport is gone. Sweep once per boot so the on-idle
@@ -2848,12 +2849,17 @@ Preserve the same identity, role, worktree, orchestrator grouping, PR gates, and
         from .archive_parity import backfill_headless_runs
 
         async def run_backfill() -> None:
-            await asyncio.to_thread(
-                backfill_headless_runs,
-                self.store,
-                self.event_store,
-                batch_size=32,
+            worker = asyncio.create_task(
+                asyncio.to_thread(
+                    backfill_headless_runs,
+                    self.store,
+                    self.event_store,
+                    batch_size=32,
+                ),
+                name="archive-parity-backfill-worker",
             )
+            self.archive_backfill_worker = worker
+            await asyncio.shield(worker)
 
         self.archive_backfill_task = self._spawn_monitor_task(
             run_backfill(),
@@ -6184,6 +6190,10 @@ Preserve the same identity, role, worktree, orchestrator grouping, PR gates, and
                 task.cancel()
             await asyncio.gather(*self.monitor_tasks, return_exceptions=True)
         self.monitor_tasks.clear()
+        worker = self.archive_backfill_worker
+        if worker is not None and not worker.done():
+            await worker
+        self.archive_backfill_worker = None
         self.event_routes.clear()
         self.event_processing_locks.clear()
         self.event_inflight_counts.clear()
