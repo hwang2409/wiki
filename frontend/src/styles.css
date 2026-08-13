@@ -1774,19 +1774,9 @@ body.is-resizing-panes .pane-cell {
   text-transform: lowercase;
 }
 
-.lowercase-mode code,
-.lowercase-mode pre,
-.lowercase-mode pre *,
-.lowercase-mode .shiki-block,
-.lowercase-mode .shiki-block *,
-.lowercase-mode .cm-editor,
-.lowercase-mode .cm-editor *,
-.lowercase-mode .diff-view,
-.lowercase-mode .diff-view *,
-.lowercase-mode .wiki-diff,
-.lowercase-mode .wiki-diff *,
-.lowercase-mode .terminal-pane,
-.lowercase-mode .terminal-pane *,
+/* Escape hatch: opt an isolated subtree out of lowercase mode with
+   `data-preserve-case`. Copy still yields the original text because
+   text-transform is a render-only effect. */
 .lowercase-mode [data-preserve-case],
 .lowercase-mode [data-preserve-case] * {
   text-transform: none;
