@@ -2,12 +2,12 @@ from __future__ import annotations
 
 import argparse
 import ctypes
-from contextlib import nullcontext
 import fcntl
 import os
 import platform
 import plistlib
 import re
+import resource
 import secrets
 import signal
 import socket
@@ -15,13 +15,13 @@ import subprocess
 import sys
 import threading
 import time
+from collections.abc import Callable
+from contextlib import nullcontext
 from pathlib import Path
-from typing import Callable
 
 import uvicorn
 
 from backend.app import native_trust
-
 
 DAEMON_AUTH_SOCKET_NAME = "wiki-app-secret.sock"
 DAEMON_AUTH_LOCK_NAME = "wiki-app-secret.lock"
@@ -49,6 +49,34 @@ TAURI_BUNDLE_PATH = Path(
 DAEMON_LOG_MAX_BYTES = 10 * 1024 * 1024
 DAEMON_LOG_BACKUPS = 5
 _LOG_REDIRECT_LOCK = threading.Lock()
+
+
+def raise_nofile_limit() -> tuple[int, int]:
+    """Raise the soft file-descriptor limit and report the resulting limits."""
+
+    try:
+        soft, hard = resource.getrlimit(resource.RLIMIT_NOFILE)
+    except (OSError, ValueError) as exc:
+        sys.stderr.write(f"unable to read RLIMIT_NOFILE: {exc}\n")
+        sys.stderr.flush()
+        return (-1, -1)
+
+    if soft < hard:
+        try:
+            resource.setrlimit(resource.RLIMIT_NOFILE, (hard, hard))
+        except (OSError, ValueError) as exc:
+            sys.stderr.write(f"unable to raise RLIMIT_NOFILE: {exc}\n")
+            sys.stderr.flush()
+        try:
+            soft, hard = resource.getrlimit(resource.RLIMIT_NOFILE)
+        except (OSError, ValueError) as exc:
+            sys.stderr.write(f"unable to read resulting RLIMIT_NOFILE: {exc}\n")
+            sys.stderr.flush()
+            return (-1, -1)
+
+    sys.stderr.write(f"RLIMIT_NOFILE soft={soft} hard={hard}\n")
+    sys.stderr.flush()
+    return soft, hard
 
 
 def parse_args() -> argparse.Namespace:
@@ -698,6 +726,7 @@ def main() -> None:
     log_path = Path(args.log_path).expanduser().absolute() if args.log_path else None
     if args.daemon and log_path:
         configure_daemon_log(log_path)
+    raise_nofile_limit()
 
     from backend.app.main import app, set_wiki_app_secret, wiki_app_secret
 

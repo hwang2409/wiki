@@ -31,6 +31,9 @@ const FINDER_SAFE_PATH: &str = "/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/
 const HEALTH_WAIT_TIMEOUT: Duration = Duration::from_secs(15);
 const HEALTH_POLL_INTERVAL: Duration = Duration::from_millis(200);
 const SHUTDOWN_WAIT_TIMEOUT: Duration = Duration::from_secs(3);
+const SIDECAR_RESPAWN_MAX_ATTEMPTS: u8 = 3;
+const SIDECAR_RESPAWN_BACKOFF: Duration = Duration::from_millis(250);
+const SIDECAR_SUSTAINED_UPTIME: Duration = Duration::from_secs(30);
 const MAIN_WINDOW_LABEL: &str = "main";
 const WINDOW_TITLE: &str = "Wiki";
 const APP_LOCK_NAME: &str = "app.lock";
@@ -156,12 +159,14 @@ struct SidecarState {
     log_path: PathBuf,
     healthy_started: bool,
     restart_count: u8,
+    healthy_since: Option<Instant>,
     shutting_down: bool,
     last_termination: Option<String>,
 }
 
 enum SidecarAction {
-    Restart,
+    Restart { attempt: u8, delay: Duration },
+    Suppressed(PathBuf),
     ShowError(String, PathBuf),
 }
 
@@ -340,6 +345,7 @@ fn start_sidecar(app: &AppHandle, restart_count: u8) -> Result<String, Box<dyn E
             log_path: log_path.clone(),
             healthy_started: false,
             restart_count,
+            healthy_since: None,
             shutting_down: false,
             last_termination: None,
         });
@@ -360,6 +366,7 @@ fn start_sidecar(app: &AppHandle, restart_count: u8) -> Result<String, Box<dyn E
         if let Some(sidecar) = state.sidecar.as_mut() {
             if sidecar.pid == pid {
                 sidecar.healthy_started = true;
+                sidecar.healthy_since = Some(Instant::now());
                 sidecar.last_termination = None;
             }
         }
@@ -519,16 +526,27 @@ fn handle_sidecar_termination(app: &AppHandle, pid: u32, summary: String) {
             return;
         }
 
-        if sidecar.restart_count == 0 {
-            sidecar.restart_count = 1;
-            Some(SidecarAction::Restart)
+        if sidecar
+            .healthy_since
+            .is_some_and(|started| started.elapsed() >= SIDECAR_SUSTAINED_UPTIME)
+        {
+            sidecar.restart_count = 0;
+        }
+
+        if !native_runtime_locks_available() {
+            Some(SidecarAction::Suppressed(sidecar.log_path.clone()))
+        } else if sidecar.restart_count < SIDECAR_RESPAWN_MAX_ATTEMPTS {
+            let attempt = sidecar.restart_count + 1;
+            sidecar.restart_count = attempt;
+            let delay = SIDECAR_RESPAWN_BACKOFF * 2_u32.pow((attempt - 1) as u32);
+            Some(SidecarAction::Restart { attempt, delay })
         } else {
             Some(SidecarAction::ShowError(summary, sidecar.log_path.clone()))
         }
     };
 
     match action {
-        Some(SidecarAction::Restart) => {
+        Some(SidecarAction::Restart { attempt, delay }) => {
             if let Some(log_path) = app
                 .state::<NativeAppState>()
                 .inner
@@ -540,10 +558,30 @@ fn handle_sidecar_termination(app: &AppHandle, pid: u32, summary: String) {
             {
                 let _ = append_log(
                     &log_path,
-                    "backend exited unexpectedly; attempting one restart",
+                    &format!(
+                        "backend exited unexpectedly; attempting respawn {attempt}/{SIDECAR_RESPAWN_MAX_ATTEMPTS} after {delay:?}"
+                    ),
                 );
             }
-            match start_sidecar(app, 1) {
+            thread::sleep(delay);
+            if !native_runtime_locks_available() {
+                let log_path = app
+                    .state::<NativeAppState>()
+                    .inner
+                    .lock()
+                    .unwrap()
+                    .sidecar
+                    .as_ref()
+                    .map(|sidecar| sidecar.log_path.clone());
+                if let Some(log_path) = log_path {
+                    let _ = append_log(
+                        &log_path,
+                        "backend respawn cancelled while native swap locks became held",
+                    );
+                }
+                return;
+            }
+            match start_sidecar(app, attempt) {
                 Ok(launch_url) => {
                     if let Some(window) = app.get_webview_window(MAIN_WINDOW_LABEL) {
                         if let Ok(url) = launch_url.parse() {
@@ -558,6 +596,12 @@ fn handle_sidecar_termination(app: &AppHandle, pid: u32, summary: String) {
                 }
             }
         }
+        Some(SidecarAction::Suppressed(log_path)) => {
+            let _ = append_log(
+                &log_path,
+                "backend respawn suppressed while native swap locks are held",
+            );
+        }
         Some(SidecarAction::ShowError(summary, log_path)) => {
             show_error_dialog(
                 app,
@@ -566,6 +610,34 @@ fn handle_sidecar_termination(app: &AppHandle, pid: u32, summary: String) {
             );
         }
         None => {}
+    }
+}
+
+fn native_runtime_locks_available() -> bool {
+    // app.lock is held by this process for its lifetime. The shutdown flag
+    // gates app exit; these two locks cover the swap and handover journal.
+    ["supervisor.lock", "daemon.transaction.lock"]
+        .iter()
+        .all(|name| runtime_lock_is_free(&runtime_dir().join(name)))
+}
+
+fn runtime_lock_is_free(path: &Path) -> bool {
+    let Ok(file) = OpenOptions::new()
+        .create(true)
+        .read(true)
+        .write(true)
+        .open(path)
+    else {
+        return false;
+    };
+    let result = unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) };
+    if result == 0 {
+        unsafe {
+            libc::flock(file.as_raw_fd(), libc::LOCK_UN);
+        }
+        true
+    } else {
+        false
     }
 }
 
