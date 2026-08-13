@@ -24,6 +24,7 @@ import {
   ListTodo,
   MessageCircleQuestion,
   Radio,
+  RefreshCw,
   ScrollText,
   SendHorizontal,
   SlashSquare,
@@ -149,6 +150,7 @@ import {
   replaceTranscriptDesiredModel,
   replaceTranscriptQueue,
   retryPendingUserMessage,
+  retryTranscript,
   updatePendingUserMessage,
   useTranscriptSession,
   type PendingUserMessage,
@@ -2942,7 +2944,12 @@ export function SessionTab({
     [archivedAt, subagent, ticket]
   );
   const visible = useElementVisible(containerNode);
-  const { session, pendingUserMessages, error, loading } = useTranscriptSession(target, visible);
+  const { session, pendingUserMessages, error, refreshError, loading } = useTranscriptSession(target, visible);
+  const [retrying, setRetrying] = useState(false);
+  const retry = useCallback(() => {
+    setRetrying(true);
+    retryTranscript(target).finally(() => setRetrying(false));
+  }, [target]);
   const inlineArtifactKey = `${ticket}:${subagent ?? ""}:${session?.path ?? ""}`;
   const inlineArtifactKeyRef = useRef(inlineArtifactKey);
   if (inlineArtifactKeyRef.current !== inlineArtifactKey) {
@@ -3492,7 +3499,19 @@ export function SessionTab({
     if (error && !loading) {
       return (
         <div className="session-tab" ref={setContainerNode}>
-          <div className="session-empty">{error}</div>
+          <div className="session-empty session-empty-error" role="alert">
+            <div className="session-empty-title">Could not load transcript</div>
+            <div className="session-empty-body">{error}</div>
+            <button
+              type="button"
+              className="session-empty-retry"
+              onClick={retry}
+              disabled={retrying}
+            >
+              <RefreshCw size={12} />
+              {retrying ? "Retrying…" : "Try again"}
+            </button>
+          </div>
         </div>
       );
     }
@@ -3512,6 +3531,23 @@ export function SessionTab({
     <QuestionUiContext.Provider value={questionUi}>
       <SessionUiStateContext.Provider value={uiState}>
       <div className="session-tab" ref={setContainerNode}>
+      {refreshError ? (
+        <div className="session-stale-banner" role="status" data-testid="session-stale-banner">
+          <span className="session-stale-label">stale</span>
+          <span className="session-stale-body">
+            Refresh failed — showing last-loaded transcript.
+          </span>
+          <button
+            type="button"
+            className="session-stale-retry"
+            onClick={retry}
+            disabled={retrying}
+          >
+            <RefreshCw size={12} />
+            {retrying ? "Retrying…" : "Retry"}
+          </button>
+        </div>
+      ) : null}
       {(session.tasks.length > 0 || session.pr || session.sessionMeta.custom_title || session.sessionMeta.agent_name || (rateLimit?.status && rateLimit.status !== "allowed")) ? (
         <div className="session-state-strip">
           {session.sessionMeta.custom_title ? (
@@ -3564,6 +3600,24 @@ export function SessionTab({
                 {loadingOlder ? "Loading older events…" : "Load older events"}
               </button>
               {olderError ? <span role="alert">{olderError}</span> : null}
+            </div>
+          ) : null}
+          {displayEvents.length === 0 && pendingUserMessages.length === 0 ? (
+            <div
+              className="session-zero-events"
+              role="status"
+              data-testid="session-zero-events"
+            >
+              <div className="session-zero-events-title">
+                {session.working ? "Waiting for the first event…" : "No events yet"}
+              </div>
+              <div className="session-zero-events-body">
+                {session.working
+                  ? "The agent is running but has not produced output yet."
+                  : subagent
+                    ? "This subagent hasn't emitted any events."
+                    : "Send a message below to start the session."}
+              </div>
             </div>
           ) : null}
           <div className="session-virtual-list" style={{ height: layout.totalHeight }}>

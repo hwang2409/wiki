@@ -1,5 +1,5 @@
-import { useEffect, useId, useMemo, useRef, useState } from "react";
-import { ArrowDown, ArrowUp, ChevronDown, X } from "lucide-react";
+import { useCallback, useEffect, useId, useMemo, useRef, useState } from "react";
+import { ArrowDown, ArrowUp, ChevronDown, RefreshCw, X } from "lucide-react";
 import {
   getAutopilotFleetStatus,
   getCosts,
@@ -93,16 +93,20 @@ export function DashboardView({
 }: DashboardViewProps = {}) {
   const [tickets, setTickets] = useState<DashboardTicket[] | null>(null);
   const [error, setError] = useState<string | null>(null);
+  const [retryingTickets, setRetryingTickets] = useState(false);
   const [sortKey, setSortKey] = useState<SortKey>("date");
   const [sortAsc, setSortAsc] = useState(false);
   const [nowMs, setNowMs] = useState(() => Date.now());
   const [costs, setCosts] = useState<CostResponse | null>(null);
   const [costError, setCostError] = useState<string | null>(null);
+  const [retryingCosts, setRetryingCosts] = useState(false);
   const [filters, setFilters] = useState<DashboardFilters>(() =>
     typeof localStorage === "undefined"
       ? emptyFilters()
       : parseStoredFilters(localStorage.getItem(FILTERS_STORAGE_KEY))
   );
+  const ticketsHandleRef = useRef<{ refresh: () => Promise<void> } | null>(null);
+  const costsHandleRef = useRef<{ refresh: () => Promise<void> } | null>(null);
 
   useEffect(() => {
     const handle = startDashboardPolling({
@@ -115,7 +119,11 @@ export function DashboardView({
       onError: (message) => setError(message),
       intervalMs: pollMs,
     });
-    return () => handle.stop();
+    ticketsHandleRef.current = handle;
+    return () => {
+      ticketsHandleRef.current = null;
+      handle.stop();
+    };
   }, [fetchTickets, pollMs]);
 
   useEffect(() => {
@@ -128,8 +136,26 @@ export function DashboardView({
       onError: (message) => setCostError(message),
       intervalMs: pollMs,
     });
-    return () => handle.stop();
+    costsHandleRef.current = handle;
+    return () => {
+      costsHandleRef.current = null;
+      handle.stop();
+    };
   }, [fetchCosts, pollMs]);
+
+  const retryTickets = useCallback(() => {
+    const handle = ticketsHandleRef.current;
+    if (!handle) return;
+    setRetryingTickets(true);
+    handle.refresh().finally(() => setRetryingTickets(false));
+  }, []);
+
+  const retryCosts = useCallback(() => {
+    const handle = costsHandleRef.current;
+    if (!handle) return;
+    setRetryingCosts(true);
+    handle.refresh().finally(() => setRetryingCosts(false));
+  }, []);
 
   useEffect(() => {
     if (typeof localStorage === "undefined") return;
@@ -218,12 +244,53 @@ export function DashboardView({
         ) : null}
       </div>
       <AutopilotDashboardCard />
-      {error ? <div className="dashboard-error">{error}</div> : null}
+      {error && tickets ? (
+        <div className="dashboard-stale" role="status" data-testid="dashboard-stale-banner">
+          <span className="dashboard-stale-label">stale</span>
+          <span className="dashboard-stale-body">
+            Refresh failed — showing last-loaded tickets. {error}
+          </span>
+          <button
+            type="button"
+            className="dashboard-retry"
+            onClick={retryTickets}
+            disabled={retryingTickets}
+          >
+            <RefreshCw size={12} />
+            {retryingTickets ? "Retrying…" : "Retry"}
+          </button>
+        </div>
+      ) : null}
+      {error && !tickets ? (
+        <div className="dashboard-error" role="alert">
+          <div className="dashboard-error-body">Could not load tickets: {error}</div>
+          <button
+            type="button"
+            className="dashboard-retry"
+            onClick={retryTickets}
+            disabled={retryingTickets}
+          >
+            <RefreshCw size={12} />
+            {retryingTickets ? "Retrying…" : "Try again"}
+          </button>
+        </div>
+      ) : null}
+      {!tickets && !error ? <DashboardTableSkeleton /> : null}
       {tickets && tickets.length === 0 ? (
-        <div className="dashboard-empty">No tickets with workers or PRs yet.</div>
+        <div className="dashboard-empty" data-testid="dashboard-zero-tickets">
+          No tickets with workers or PRs yet.
+        </div>
       ) : null}
       {tickets && tickets.length > 0 && sorted.length === 0 ? (
-        <div className="dashboard-empty">No tickets match the current filters.</div>
+        <div className="dashboard-empty" data-testid="dashboard-filters-empty">
+          No tickets match the current filters. <button
+            type="button"
+            className="dashboard-empty-clear"
+            onClick={clearFilters}
+          >
+            Clear filters
+          </button>
+        </div>
       ) : null}
       {sorted.length > 0 ? (
         <div className="artifact-table-scroll dashboard-table-scroll">
@@ -269,8 +336,80 @@ export function DashboardView({
           </table>
         </div>
       ) : null}
-      {costError ? <div className="dashboard-error">cost data: {costError}</div> : null}
+      {costError && costs ? (
+        <div className="dashboard-stale" role="status">
+          <span className="dashboard-stale-label">stale</span>
+          <span className="dashboard-stale-body">Cost data: {costError}</span>
+          <button
+            type="button"
+            className="dashboard-retry"
+            onClick={retryCosts}
+            disabled={retryingCosts}
+          >
+            <RefreshCw size={12} />
+            {retryingCosts ? "Retrying…" : "Retry"}
+          </button>
+        </div>
+      ) : null}
+      {costError && !costs ? (
+        <div className="dashboard-error" role="alert">
+          <div className="dashboard-error-body">Could not load cost data: {costError}</div>
+          <button
+            type="button"
+            className="dashboard-retry"
+            onClick={retryCosts}
+            disabled={retryingCosts}
+          >
+            <RefreshCw size={12} />
+            {retryingCosts ? "Retrying…" : "Try again"}
+          </button>
+        </div>
+      ) : null}
       {costs ? <CostDashboard costs={costs} /> : null}
+    </div>
+  );
+}
+
+const SKELETON_ROW_WIDTHS: Array<[number, number, number, number, number]> = [
+  [45, 90, 32, 70, 55],
+  [40, 82, 30, 65, 48],
+  [48, 96, 34, 72, 58],
+  [42, 78, 28, 66, 50],
+  [44, 88, 30, 68, 52],
+];
+
+function DashboardTableSkeleton() {
+  return (
+    <div
+      className="artifact-table-scroll dashboard-table-scroll dashboard-skeleton"
+      aria-hidden="true"
+      data-testid="dashboard-skeleton"
+    >
+      <table className="artifact-table">
+        <thead>
+          <tr>
+            <th>Ticket</th>
+            <th>Description</th>
+            <th>PR</th>
+            <th>Status</th>
+            <th>Date</th>
+          </tr>
+        </thead>
+        <tbody>
+          {SKELETON_ROW_WIDTHS.map((row, rowIndex) => (
+            <tr key={rowIndex}>
+              {row.map((width, cellIndex) => (
+                <td key={cellIndex}>
+                  <span
+                    className="dashboard-skeleton-cell"
+                    style={{ width: `${width}%` }}
+                  />
+                </td>
+              ))}
+            </tr>
+          ))}
+        </tbody>
+      </table>
     </div>
   );
 }

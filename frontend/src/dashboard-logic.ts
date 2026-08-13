@@ -121,6 +121,12 @@ export type PollingDeps<T> = {
 export type PollingHandle = {
   stop: () => void;
   activeSignal: () => AbortSignal | null;
+  /**
+   * Trigger an immediate refetch, cancelling any in-flight request. Returns
+   * a promise that resolves when the manual refetch settles (so callers can
+   * flip a "retrying…" affordance off). Used by dashboard retry buttons.
+   */
+  refresh: () => Promise<void>;
 };
 
 /**
@@ -143,7 +149,7 @@ export function startDashboardPolling<T>(deps: PollingDeps<T>): PollingHandle {
     }, deps.intervalMs);
   };
 
-  const load = async () => {
+  const load = async (): Promise<void> => {
     if (cancelled) return;
     controller?.abort();
     const current = new AbortController();
@@ -174,5 +180,13 @@ export function startDashboardPolling<T>(deps: PollingDeps<T>): PollingHandle {
       controller = null;
     },
     activeSignal: () => controller?.signal ?? null,
+    refresh() {
+      if (cancelled) return Promise.resolve();
+      if (timer !== null) {
+        clearTimeoutFn(timer);
+        timer = null;
+      }
+      return load();
+    },
   };
 }

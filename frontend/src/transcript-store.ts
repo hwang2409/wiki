@@ -54,7 +54,12 @@ export type TranscriptSession = {
 export type TranscriptSnapshot = {
   session: TranscriptSession | null;
   pendingUserMessages: PendingUserMessage[];
+  // `error` is the initial-load failure: session is null and there is nothing
+  // to render. `refreshError` is the background-refresh failure that happens
+  // AFTER we already have a session — last-good data survives, we only
+  // surface a stale indicator. The two states get different UI.
   error: string | null;
+  refreshError: string | null;
   loading: boolean;
 };
 
@@ -182,7 +187,13 @@ function createEntry(target: TranscriptTarget): Entry {
   return {
     key: targetKey(target),
     target,
-    snapshot: { session: null, pendingUserMessages: [], error: null, loading: true },
+    snapshot: {
+      session: null,
+      pendingUserMessages: [],
+      error: null,
+      refreshError: null,
+      loading: true,
+    },
     listeners: new Set(),
     pollers: new Set(),
     inFlight: null,
@@ -290,6 +301,7 @@ export async function loadOlderEvents(ticket: string, before: number, count = 50
       ...entry.snapshot,
       session: mergeSession(null, reset),
       error: null,
+      refreshError: null,
       loading: false,
     };
     emit(entry);
@@ -325,19 +337,22 @@ function fetchEntry(entry: Entry): Promise<void> {
           result.composer_messages ?? [],
         ),
         error: null,
+        refreshError: null,
         loading: false,
       };
       entry.lastLoadedAt = Date.now();
     } catch (error) {
+      const message = error instanceof Error ? error.message : "No session transcript found.";
       if (!entry.snapshot.session) {
         entry.snapshot = {
           session: null,
           pendingUserMessages: entry.snapshot.pendingUserMessages,
-          error: error instanceof Error ? error.message : "No session transcript found.",
+          error: message,
+          refreshError: null,
           loading: false,
         };
       } else {
-        entry.snapshot = { ...entry.snapshot, loading: false };
+        entry.snapshot = { ...entry.snapshot, refreshError: message, loading: false };
       }
     } finally {
       entry.inFlight = null;
@@ -405,6 +420,23 @@ export function invalidateTranscript(ticket: string, surface: string | null = nu
     entry.dirty = true;
     if (entry.pollers.size > 0) void fetchEntry(entry);
   });
+}
+
+/**
+ * Manual retry for a specific transcript target (used by the session view's
+ * "Try again" affordances). Clears `error`/`refreshError` immediately so the
+ * caller can flip to a loading state, then triggers a fresh fetch. Works for
+ * subagent + archived targets, unlike `refreshTranscript(ticket)` which is
+ * scoped to the primary ticket surface.
+ */
+export function retryTranscript(target: TranscriptTarget): Promise<void> {
+  const entry = getEntry(target);
+  if (entry.snapshot.error || entry.snapshot.refreshError) {
+    entry.snapshot = { ...entry.snapshot, error: null, refreshError: null };
+    emit(entry);
+  }
+  entry.dirty = true;
+  return fetchEntry(entry);
 }
 
 export function refreshTranscript(ticket: string) {

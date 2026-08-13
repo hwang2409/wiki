@@ -269,6 +269,76 @@ test("parseStoredFilters roundtrips a serialized active filter", () => {
   assert.deepEqual(parseStoredFilters(JSON.stringify(original)), original);
 });
 
+test("refresh() cancels the pending timer and triggers an immediate fetch", async () => {
+  const timer = new FakeTimer();
+  const gates = [deferred<string>(), deferred<string>(), deferred<string>()];
+  let callIdx = 0;
+  const results: string[] = [];
+  const handle = startDashboardPolling<string>({
+    fetch: () => gates[callIdx++].promise,
+    onData: (v) => results.push(v),
+    onError: () => {},
+    intervalMs: 1000,
+    setTimeoutFn: timer.schedule,
+    clearTimeoutFn: timer.cancel,
+  });
+  await Promise.resolve();
+  gates[0].resolve("first");
+  await Promise.resolve();
+  await Promise.resolve();
+  assert.deepEqual(results, ["first"]);
+  assert.equal(timer.size(), 1, "next poll scheduled after settle");
+
+  const refreshPromise = handle.refresh();
+  await Promise.resolve();
+  assert.equal(timer.size(), 0, "refresh cancels the pending timer");
+  assert.equal(callIdx, 2, "refresh starts a new fetch immediately");
+  gates[1].resolve("second");
+  await refreshPromise;
+  assert.deepEqual(results, ["first", "second"]);
+  handle.stop();
+});
+
+test("refresh() surfaces errors like normal poll cycles do", async () => {
+  const timer = new FakeTimer();
+  const gates = [deferred<string>(), deferred<string>()];
+  let callIdx = 0;
+  const errors: string[] = [];
+  const handle = startDashboardPolling<string>({
+    fetch: () => gates[callIdx++].promise,
+    onData: () => {},
+    onError: (m) => errors.push(m),
+    intervalMs: 1000,
+    setTimeoutFn: timer.schedule,
+    clearTimeoutFn: timer.cancel,
+  });
+  await Promise.resolve();
+  gates[0].resolve("ok");
+  await Promise.resolve();
+  await Promise.resolve();
+  const refreshPromise = handle.refresh();
+  await Promise.resolve();
+  gates[1].reject(new Error("boom"));
+  await refreshPromise;
+  assert.deepEqual(errors, ["boom"]);
+  handle.stop();
+});
+
+test("refresh() after stop() is a safe no-op that resolves", async () => {
+  const timer = new FakeTimer();
+  const gate = deferred<string>();
+  const handle = startDashboardPolling<string>({
+    fetch: () => gate.promise,
+    onData: () => {},
+    onError: () => {},
+    intervalMs: 1000,
+    setTimeoutFn: timer.schedule,
+    clearTimeoutFn: timer.cancel,
+  });
+  handle.stop();
+  await handle.refresh();
+});
+
 test("stop() aborts the inflight signal on unmount", async () => {
   const timer = new FakeTimer();
   const gate = deferred<string>();
