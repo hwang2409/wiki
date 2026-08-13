@@ -1683,6 +1683,57 @@ class DashboardPageRouterTests(unittest.TestCase):
                 blocked = client.get(f"/dashboard/static/{path}")
                 self.assertEqual(blocked.status_code, 404, path)
 
+    def test_dashboard_hydrates_single_font_from_ui_state(self) -> None:
+        """WIKI-279: /dashboard is a separate document from the React app but
+        it still has to honor the single-font setting. Verify the shipped
+        HTML carries the hydration contract:
+          * every font-family/font-size in the stylesheet reads through the
+            --font-single / --font-single-size custom properties, with the
+            designed stack as the var() fallback for the unhydrated case;
+          * an inline <script> pulls /api/ui-state and sets both custom
+            properties from wiki-font-stack / wiki-font-size;
+          * the body is hidden until hydration completes (with a short
+            timeout backstop) so users never see a font flash.
+        """
+        from fastapi import FastAPI
+        from fastapi.testclient import TestClient
+
+        from backend.app import dashboard_page
+
+        app = FastAPI()
+        app.include_router(dashboard_page.router)
+        with TestClient(app) as client:
+            page = client.get("/dashboard")
+            self.assertEqual(page.status_code, 200)
+            html = page.text
+
+            # No bare font-family or font-size declarations remain — every
+            # one must route through the single-font vars so the boot script
+            # can flip all of them together.
+            import re
+
+            bare = [
+                match.group(0)
+                for match in re.finditer(r"font-(?:family|size)\s*:\s*[^;]+", html)
+                if "var(--font-single" not in match.group(0)
+            ]
+            self.assertEqual(
+                bare, [], f"unwrapped font declaration(s) left: {bare[:3]}"
+            )
+
+            # Boot script contract: reads both hydration keys and sets the
+            # custom properties. The exact keys matter — settings.tsx writes
+            # `wiki-font-stack` (resolved CSS stack) and `wiki-font-size`.
+            for needle in (
+                '/api/ui-state',
+                'wiki-font-stack',
+                'wiki-font-size',
+                '--font-single',
+                '--font-single-size',
+                'data-font-boot',  # hydration guard attribute
+            ):
+                self.assertIn(needle, html, needle)
+
 
 class SameTicketPrHistoryTests(unittest.TestCase):
     """WIKI-276 R1: a task row carries ALL its PRs, newest first.

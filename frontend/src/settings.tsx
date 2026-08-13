@@ -104,13 +104,6 @@ export const TEXT_FONTS: FontChoice[] = [
   { label: "Optima", family: "Optima", stack: `Optima, ${SANS_TAIL}` },
 ];
 
-const BODY_SIZE_KEY = "wiki-font-size-body";
-const UI_SIZE_KEY = "wiki-font-size-ui";
-const MONO_SIZE_KEY = "wiki-font-size-mono";
-const BODY_SIZE_DEFAULT = 16.5;
-const UI_SIZE_DEFAULT = 13.5;
-const MONO_SIZE_DEFAULT = 13.5;
-
 function dedupeByLabel(...pools: FontChoice[][]): FontChoice[] {
   const seen = new Set<string>();
   const merged: FontChoice[] = [];
@@ -124,81 +117,101 @@ function dedupeByLabel(...pools: FontChoice[][]): FontChoice[] {
   return merged;
 }
 
-export const ALL_FONTS: FontChoice[] = dedupeByLabel(MONO_FONTS, UI_FONTS, TEXT_FONTS);
-// Same pool, but System-first so the agent chat role defaults to the current
-// (system sans) transcript appearance instead of a mono face.
-export const AGENT_FONTS: FontChoice[] = dedupeByLabel(UI_FONTS, TEXT_FONTS, MONO_FONTS);
+// One unified pool: proportional families first (System, then curated prop),
+// then curated mono, so the default picker lead matches the app's historical
+// prose feel while every family (prop or mono) sits in the same list.
+export const ALL_FONTS: FontChoice[] = dedupeByLabel(UI_FONTS, TEXT_FONTS, MONO_FONTS);
+export const AGENT_FONTS: FontChoice[] = ALL_FONTS;
+
+// Single storage keys — one font, one weight, one size, applied to every
+// surface of the app (WIKI-279). Legacy per-role keys are read once for
+// migration then deleted.
+const FONT_KEY = "wiki-font";
+// Resolved CSS stack for cross-document rendering (dashboard). Persisted so
+// the dashboard doesn't need to re-import the FontChoice pool to map a label
+// like "System" back to "-apple-system, ..." or synthesize an installed
+// family's fallback tail.
+const STACK_KEY = "wiki-font-stack";
+const WEIGHT_KEY = "wiki-font-weight";
+const SIZE_KEY = "wiki-font-size";
+const SIZE_DEFAULT = 14.5;
+const SIZE_MIN = 11;
+const SIZE_MAX = 22;
+
+const LEGACY_FONT_KEYS = [
+  "wiki-ui-font",
+  "wiki-text-font",
+  "wiki-agent-font",
+  "wiki-mono-font",
+];
+const LEGACY_WEIGHT_KEYS = [
+  "wiki-ui-font-weight",
+  "wiki-text-font-weight",
+  "wiki-agent-font-weight",
+  "wiki-mono-font-weight",
+];
+const LEGACY_SIZE_KEYS = [
+  "wiki-font-size-body",
+  "wiki-font-size-ui",
+  "wiki-font-size-mono",
+];
+
+// Every legacy CSS var that read a per-role font/weight/size now points at the
+// single choice. Keeping the vars keeps the ~200 CSS callsites unchanged.
+const FAMILY_VARS = [
+  "--font-single",
+  "--font-interface",
+  "--font-text",
+  "--font-agent-prose",
+  "--font-monospace",
+  "--font-chrome",
+];
+const WEIGHT_VARS = [
+  "--font-single-weight",
+  "--font-interface-weight",
+  "--font-text-weight",
+  "--font-agent-prose-weight",
+  "--font-monospace-weight",
+];
+const SIZE_VARS = [
+  "--font-single-size",
+  "--font-text-size",
+  "--font-ui-small",
+  "--font-ui-smaller",
+  "--font-monospace-size",
+];
 
 const MONO_SAMPLE = "→ const x = 0O1lIi";
 const PROP_SAMPLE = "The quick brown fox";
 
-type FontRoleId = "ui" | "text" | "agent" | "mono";
-type FontRole = {
-  name: string;
-  desc: string;
-  curated: FontChoice[];
-  // Which bucket of enumerated OS families appends to this role's pool.
-  // Mono roles get canvas-classified monospace families; prop roles get the
-  // rest. Curated fonts always survive regardless of classification.
-  enumeratedBucket: "mono" | "prop";
-  key: string;
-  cssVar: string;
-  weightKey: string;
-  weightCssVar: string;
-  sample: string;
-  // When set and no weight is stored, the role inherits this role's weight
-  // (mirrors the CSS var fallback chain) and the control shows an explicit
-  // inherited state instead of a number that disagrees with what applies.
-  inheritsWeightFrom?: FontRoleId;
-};
+function firstStored(keys: string[]): string | null {
+  for (const key of keys) {
+    const value = localStorage.getItem(key);
+    if (value !== null && value !== "") return value;
+  }
+  return null;
+}
 
-const FONT_ROLES: Record<FontRoleId, FontRole> = {
-  ui: {
-    name: "Interface font",
-    desc: "App chrome: sidebar, tabs, buttons, status bar, dialogs.",
-    curated: ALL_FONTS,
-    enumeratedBucket: "prop",
-    key: "wiki-ui-font",
-    cssVar: "--font-interface",
-    weightKey: "wiki-ui-font-weight",
-    weightCssVar: "--font-interface-weight",
-    sample: PROP_SAMPLE,
-  },
-  text: {
-    name: "Note font",
-    desc: "Body text of rendered notes and the source editor.",
-    curated: ALL_FONTS,
-    enumeratedBucket: "prop",
-    key: "wiki-text-font",
-    cssVar: "--font-text",
-    weightKey: "wiki-text-font-weight",
-    weightCssVar: "--font-text-weight",
-    sample: PROP_SAMPLE,
-  },
-  agent: {
-    name: "Agent chat font",
-    desc: "Agent replies and thinking traces in session transcripts.",
-    curated: AGENT_FONTS,
-    enumeratedBucket: "prop",
-    key: "wiki-agent-font",
-    cssVar: "--font-agent-prose",
-    weightKey: "wiki-agent-font-weight",
-    weightCssVar: "--font-agent-prose-weight",
-    sample: PROP_SAMPLE,
-    inheritsWeightFrom: "text",
-  },
-  mono: {
-    name: "Monospace font",
-    desc: "Code blocks, agent transcripts, and mono UI chrome.",
-    curated: MONO_FONTS,
-    enumeratedBucket: "mono",
-    key: "wiki-mono-font",
-    cssVar: "--font-monospace",
-    weightKey: "wiki-mono-font-weight",
-    weightCssVar: "--font-monospace-weight",
-    sample: MONO_SAMPLE,
-  },
-};
+function migrateLegacyOnce(): void {
+  if (localStorage.getItem(FONT_KEY) === null) {
+    const legacyFont = firstStored(LEGACY_FONT_KEYS);
+    if (legacyFont !== null) localStorage.setItem(FONT_KEY, legacyFont);
+  }
+  if (localStorage.getItem(WEIGHT_KEY) === null) {
+    const legacyWeight = firstStored(LEGACY_WEIGHT_KEYS);
+    if (legacyWeight !== null) localStorage.setItem(WEIGHT_KEY, legacyWeight);
+  }
+  if (localStorage.getItem(SIZE_KEY) === null) {
+    const legacySize = firstStored(LEGACY_SIZE_KEYS);
+    if (legacySize !== null) localStorage.setItem(SIZE_KEY, legacySize);
+  }
+  // Only remove legacy keys that actually exist — a bare removeItem fires the
+  // ui-state write-back tombstone (WIKI-256 mirror) even for missing keys,
+  // which would seed the mirror with the legacy names we're trying to erase.
+  for (const key of [...LEGACY_FONT_KEYS, ...LEGACY_WEIGHT_KEYS, ...LEGACY_SIZE_KEYS]) {
+    if (localStorage.getItem(key) !== null) localStorage.removeItem(key);
+  }
+}
 
 async function loadFontFaces(choice: FontChoice): Promise<void> {
   if (!document.fonts) return;
@@ -361,90 +374,91 @@ function weightLabel(weight: number): string {
   return WEIGHT_LABELS[weight] ?? String(weight);
 }
 
-function applySizes(body: number, ui: number, mono: number) {
+function applyFamilyEverywhere(choice: FontChoice) {
   const root = document.documentElement.style;
-  root.setProperty("--font-text-size", `${body}px`);
-  root.setProperty("--font-ui-small", `${ui}px`);
-  root.setProperty("--font-ui-smaller", `${ui - 1}px`);
-  root.setProperty("--font-monospace-size", `${mono}px`);
+  for (const cssVar of FAMILY_VARS) root.setProperty(cssVar, choice.stack);
+  // Mirror the resolved stack for the dashboard document. Only write when
+  // the value changed — the ui-state mirror is idempotent but noisy writes
+  // still push bytes.
+  if (localStorage.getItem(STACK_KEY) !== choice.stack) {
+    localStorage.setItem(STACK_KEY, choice.stack);
+  }
 }
 
-function storedSize(key: string, fallback: number): number {
-  const raw = Number(localStorage.getItem(key));
-  return Number.isFinite(raw) && raw >= 10 && raw <= 24 ? raw : fallback;
+function applyWeightEverywhere(weight: number | null) {
+  const root = document.documentElement.style;
+  for (const cssVar of WEIGHT_VARS) {
+    if (weight === null) root.removeProperty(cssVar);
+    else root.setProperty(cssVar, String(weight));
+  }
 }
 
-function pickChoice(fonts: FontChoice[], stored: string | null, monoFallback = false): FontChoice {
+function applySizeEverywhere(size: number) {
+  const root = document.documentElement.style;
+  const value = `${size}px`;
+  for (const cssVar of SIZE_VARS) root.setProperty(cssVar, value);
+}
+
+function storedSize(): number {
+  const raw = Number(localStorage.getItem(SIZE_KEY));
+  return Number.isFinite(raw) && raw >= SIZE_MIN && raw <= SIZE_MAX ? raw : SIZE_DEFAULT;
+}
+
+function pickChoice(fonts: FontChoice[], stored: string | null): FontChoice {
   if (stored) {
     const hit = fonts.find((font) => font.label === stored);
     if (hit) return hit;
-    // Stored label from a wider prior pool (e.g. before mono/prop split) or
-    // from an enumerated family that has not loaded yet. Synthesize the same
-    // CSS the user had, so persistence never silently swaps the applied font.
-    // isAvailable() still filters the dropdown, so a missing family here
-    // renders via the tail fallback instead of the wrong first entry.
-    return synthesizedChoice(stored, monoFallback);
+    // Stored label from a wider prior pool (e.g. an enumerated OS family that
+    // hasn't loaded yet, or a legacy mono-only pool). Synthesize the same CSS
+    // the user had so persistence never silently swaps the applied font.
+    return synthesizedChoice(stored, false);
   }
   return fonts[0];
 }
 
-function applyFontVar(cssVar: string, choice: FontChoice) {
-  document.documentElement.style.setProperty(cssVar, choice.stack);
-}
-
 // Any CSS font-weight is legal (1–1000): variable fonts render arbitrary
-// values, static fonts round to the nearest face. Values are no longer
-// restricted to the nine canonical stops (WIKI-244).
+// values, static fonts round to the nearest face.
 function clampWeight(weight: number): number {
   return Math.min(1000, Math.max(1, Math.round(weight)));
 }
 
-function storedWeight(role: FontRole): number | null {
-  const raw = localStorage.getItem(role.weightKey);
+function storedWeight(): number | null {
+  const raw = localStorage.getItem(WEIGHT_KEY);
   if (raw === null) return null;
   const weight = Number(raw);
   return Number.isFinite(weight) && weight >= 1 && weight <= 1000 ? clampWeight(weight) : null;
 }
 
-function applyFontWeightVar(cssVar: string, weight: number | null) {
-  const root = document.documentElement.style;
-  if (weight === null) root.removeProperty(cssVar);
-  else root.setProperty(cssVar, String(weight));
-}
-
 export function applyStoredFonts() {
-  for (const role of Object.values(FONT_ROLES)) {
-    applyFontVar(
-      role.cssVar,
-      pickChoice(role.curated, localStorage.getItem(role.key), role.enumeratedBucket === "mono"),
-    );
-    applyFontWeightVar(role.weightCssVar, storedWeight(role));
-  }
-  applySizes(
-    storedSize(BODY_SIZE_KEY, BODY_SIZE_DEFAULT),
-    storedSize(UI_SIZE_KEY, UI_SIZE_DEFAULT),
-    storedSize(MONO_SIZE_KEY, MONO_SIZE_DEFAULT)
-  );
+  migrateLegacyOnce();
+  applyFamilyEverywhere(pickChoice(ALL_FONTS, localStorage.getItem(FONT_KEY)));
+  applyWeightEverywhere(storedWeight());
+  applySizeEverywhere(storedSize());
   // Warm the backend font-enumeration cache so the settings modal is
   // ready when the user opens it. Discard errors — the picker still works
   // with curated-only pools if the endpoint is missing or slow.
   void fetchInstalledFamilies({ isLocallyResolvable: isFontInstalled }).catch(() => []);
 }
 
-function currentLabel(role: FontRole): string {
-  return localStorage.getItem(role.key) ?? role.curated[0].label;
+function currentLabel(): string {
+  return localStorage.getItem(FONT_KEY) ?? ALL_FONTS[0].label;
 }
 
-function setFont(role: FontRole, label: string) {
-  const choice = pickChoice(role.curated, label, role.enumeratedBucket === "mono");
-  localStorage.setItem(role.key, choice.label);
-  applyFontVar(role.cssVar, choice);
+function persistFontLabel(label: string, fonts: FontChoice[]) {
+  const choice = pickChoice(fonts, label);
+  localStorage.setItem(FONT_KEY, choice.label);
+  applyFamilyEverywhere(choice);
 }
 
-function setFontWeight(role: FontRole, weight: number | null) {
-  if (weight === null) localStorage.removeItem(role.weightKey);
-  else localStorage.setItem(role.weightKey, String(weight));
-  applyFontWeightVar(role.weightCssVar, weight);
+function setFontWeight(weight: number | null) {
+  if (weight === null) localStorage.removeItem(WEIGHT_KEY);
+  else localStorage.setItem(WEIGHT_KEY, String(weight));
+  applyWeightEverywhere(weight);
+}
+
+function setFontSize(size: number) {
+  localStorage.setItem(SIZE_KEY, String(size));
+  applySizeEverywhere(size);
 }
 
 function FontPicker({
@@ -592,11 +606,11 @@ function FontPicker({
   );
 }
 
-// Enumerated OS families arrive from the backend once per session. Curated
-// pools always render first (with their tuned stacks + labels); enumerated
-// families are appended per-role using the canvas mono-classifier so the
-// mono picker stays focused and the prop pickers absorb the rest.
-function useInstalledFontPools(): Record<FontRoleId, FontChoice[]> {
+// Enumerated OS families arrive from the backend once per session. The
+// unified single-font pool absorbs BOTH mono and proportional buckets, each
+// synthesized with the right fallback tail so the browser picks the right
+// generic when the installed family is missing.
+function useInstalledFontPool(): FontChoice[] {
   const [installed, setInstalled] = useState<InstalledFontFamily[]>([]);
   useEffect(() => {
     let cancelled = false;
@@ -612,36 +626,36 @@ function useInstalledFontPools(): Record<FontRoleId, FontChoice[]> {
   return useMemo(() => {
     const probe = makeCanvasMonoProbe();
     const { mono, prop } = classifyEnumerated(installed.map((font) => font.family), probe);
-    const forProp = (family: string) => synthesizedChoice(family, false);
-    const forMono = (family: string) => synthesizedChoice(family, true);
-    return {
-      ui: mergePools({ curated: FONT_ROLES.ui.curated, installed: prop, synthesize: forProp }),
-      text: mergePools({ curated: FONT_ROLES.text.curated, installed: prop, synthesize: forProp }),
-      agent: mergePools({ curated: FONT_ROLES.agent.curated, installed: prop, synthesize: forProp }),
-      mono: mergePools({ curated: FONT_ROLES.mono.curated, installed: mono, synthesize: forMono }),
-    };
+    const withProp = mergePools({
+      curated: ALL_FONTS,
+      installed: prop,
+      synthesize: (family) => synthesizedChoice(family, false),
+    });
+    return mergePools({
+      curated: withProp,
+      installed: mono,
+      synthesize: (family) => synthesizedChoice(family, true),
+    });
   }, [installed]);
 }
 
-function FontRoleRow({ role, fonts }: { role: FontRole; fonts: FontChoice[] }) {
-  const [label, setLabel] = useState(() => currentLabel(role));
+function FontRow({
+  fonts,
+  label,
+  weight,
+  onFontChange,
+  onWeightChange,
+}: {
+  fonts: FontChoice[];
+  label: string;
+  weight: number;
+  onFontChange: (label: string) => void;
+  onWeightChange: (weight: number) => void;
+}) {
   const [weights, setWeights] = useState<number[]>([]);
   const [fontFaceRevision, setFontFaceRevision] = useState(0);
-  const inheritRole = role.inheritsWeightFrom ? FONT_ROLES[role.inheritsWeightFrom] : null;
-  const inheritedWeight = () => (inheritRole ? storedWeight(inheritRole) ?? 400 : 400);
-  const [weight, setWeight] = useState(() => storedWeight(role) ?? inheritedWeight());
-  const [weightText, setWeightText] = useState(() => {
-    const saved = storedWeight(role);
-    if (saved !== null) return String(saved);
-    // Inheriting roles display an explicit inherited state (empty input +
-    // placeholder) so the control never disagrees with the applied CSS.
-    return inheritRole ? "" : "400";
-  });
-  const monoFallback = role.enumeratedBucket === "mono";
-  const choice = useMemo(
-    () => pickChoice(fonts, label, monoFallback),
-    [fonts, label, monoFallback],
-  );
+  const [weightText, setWeightText] = useState(() => String(storedWeight() ?? 400));
+  const choice = useMemo(() => pickChoice(fonts, label), [fonts, label]);
 
   useEffect(() => {
     const onFaceRegistered = (event: Event) => {
@@ -661,72 +675,55 @@ function FontRoleRow({ role, fonts }: { role: FontRole; fonts: FontChoice[] }) {
       // A saved weight is respected as-is, even off the detected stops —
       // arbitrary values are the point (variable fonts). Only the unset case
       // adopts the face's preferred default.
-      const savedWeight = storedWeight(role);
-      if (savedWeight === null && inheritRole) {
-        // Stay in the inherited state — never auto-write a weight for a role
-        // whose CSS falls back to another role's weight.
-        setWeights(nextWeights);
-        setWeight(inheritedWeight());
-        setWeightText("");
-        return;
-      }
+      const savedWeight = storedWeight();
       const nextWeight = savedWeight ?? preferredWeight(nextWeights);
       if (savedWeight === null && nextWeight !== 400) {
-        setFontWeight(role, nextWeight);
+        setFontWeight(nextWeight);
       }
       setWeights(nextWeights);
-      setWeight(nextWeight);
+      onWeightChange(nextWeight);
       setWeightText(String(nextWeight));
     });
     return () => {
       cancelled = true;
     };
-  }, [choice, role, fontFaceRevision]);
+  }, [choice, fontFaceRevision, onWeightChange]);
 
   const applyWeight = (next: number) => {
-    setFontWeight(role, next);
-    setWeight(next);
+    setFontWeight(next);
+    onWeightChange(next);
   };
 
   return (
     <div className="settings-row">
       <div className="settings-row-info">
-        <div className="settings-row-name">{role.name}</div>
-        <div className="settings-row-desc">{role.desc}</div>
+        <div className="settings-row-name">Font</div>
+        <div className="settings-row-desc">
+          One family for every surface — prose, chat, code, diffs, chrome, dashboard.
+        </div>
       </div>
       <div className="font-setting-controls">
         <FontPicker
           current={label}
           fonts={fonts}
-          sample={role.sample}
+          sample={PROP_SAMPLE}
           weight={weight}
           onChange={(next) => {
-            setFont(role, next);
-            setLabel(next);
+            onFontChange(next);
             setWeights([]);
           }}
         />
         <input
-          aria-label={`${role.name} weight (1–1000)`}
+          aria-label="Font weight (1–1000)"
           className="font-weight-input"
           inputMode="numeric"
           max={1000}
           min={1}
-          placeholder={inheritRole ? "inherit" : undefined}
           step={1}
-          title={inheritRole
-            ? `Font weight 1–1000; empty inherits the ${inheritRole.name.toLowerCase()} weight`
-            : "Font weight, any value from 1 to 1000"}
+          title="Font weight, any value from 1 to 1000"
           type="number"
           value={weightText}
           onBlur={() => {
-            if (weightText.trim() === "" && inheritRole) {
-              // Explicitly return to the inherited state.
-              setFontWeight(role, null);
-              setWeight(inheritedWeight());
-              setWeightText("");
-              return;
-            }
             const parsed = Number(weightText);
             const next = Number.isFinite(parsed) && weightText.trim() !== "" ? clampWeight(parsed) : weight;
             applyWeight(next);
@@ -742,7 +739,7 @@ function FontRoleRow({ role, fonts }: { role: FontRole; fonts: FontChoice[] }) {
           }}
         />
         {weights.length > 1 ? (
-          <div aria-label={`${role.name} detected weights`} className="font-weight-stops" role="group">
+          <div aria-label="Detected font weights" className="font-weight-stops" role="group">
             {weights.map((option) => (
               <button
                 key={option}
@@ -773,20 +770,15 @@ export function SettingsModal({
   onThemeChange: (theme: ThemeId) => void;
   theme: ThemeId;
 }) {
-  const [bodySize, setBodySize] = useState(() => storedSize(BODY_SIZE_KEY, BODY_SIZE_DEFAULT));
-  const [uiSize, setUiSize] = useState(() => storedSize(UI_SIZE_KEY, UI_SIZE_DEFAULT));
-  const [monoSize, setMonoSize] = useState(() => storedSize(MONO_SIZE_KEY, MONO_SIZE_DEFAULT));
+  const [size, setSize] = useState(() => storedSize());
   const [lowercase, setLowercase] = useState(() => getStoredLowercase());
-  const fontPools = useInstalledFontPools();
+  const [fontLabel, setFontLabel] = useState(() => currentLabel());
+  const [fontWeight, setFontWeightState] = useState(() => storedWeight() ?? 400);
+  const fontPool = useInstalledFontPool();
 
-  function updateSizes(body: number, ui: number, mono: number) {
-    setBodySize(body);
-    setUiSize(ui);
-    setMonoSize(mono);
-    localStorage.setItem(BODY_SIZE_KEY, String(body));
-    localStorage.setItem(UI_SIZE_KEY, String(ui));
-    localStorage.setItem(MONO_SIZE_KEY, String(mono));
-    applySizes(body, ui, mono);
+  function updateSize(next: number) {
+    setSize(next);
+    setFontSize(next);
   }
 
   useEffect(() => {
@@ -861,95 +853,57 @@ export function SettingsModal({
               <span aria-hidden className="settings-toggle-thumb" />
             </button>
           </div>
-          <FontRoleRow fonts={fontPools.ui} role={FONT_ROLES.ui} />
-          <FontRoleRow fonts={fontPools.text} role={FONT_ROLES.text} />
-          <div
-            className="settings-preview"
-            style={{ fontFamily: "var(--font-text)", fontWeight: "var(--font-text-weight)" }}
-          >
-            The quick brown fox jumps over the lazy dog — 0123456789
-          </div>
-          <FontRoleRow fonts={fontPools.agent} role={FONT_ROLES.agent} />
-          <div
-            className="settings-preview"
-            style={{
-              fontFamily: "var(--font-agent-prose)",
-              fontWeight: "var(--font-agent-prose-weight, var(--font-text-weight))",
+          <FontRow
+            fonts={fontPool}
+            label={fontLabel}
+            weight={fontWeight}
+            onFontChange={(next) => {
+              setFontLabel(next);
+              persistFontLabel(next, fontPool);
             }}
-          >
-            I updated the composer and reran the suite — 13 passed, 0 failed.
-          </div>
-          <FontRoleRow fonts={fontPools.mono} role={FONT_ROLES.mono} />
+            onWeightChange={setFontWeightState}
+          />
           <div
             className="settings-preview"
-            style={{ fontFamily: "var(--font-monospace)", fontWeight: "var(--font-monospace-weight)" }}
+            style={{ fontFamily: "var(--font-single)", fontWeight: "var(--font-single-weight)", fontSize: "var(--font-single-size)" }}
           >
-            wiki agent register PHO-1234 --orch phoebe {"->"} 0O1lI| fi ff
+            {PROP_SAMPLE} — 0123456789
+          </div>
+          <div
+            className="settings-preview"
+            style={{ fontFamily: "var(--font-single)", fontWeight: "var(--font-single-weight)", fontSize: "var(--font-single-size)" }}
+          >
+            {MONO_SAMPLE}  wiki agent register --orch phoebe
           </div>
           <div className="settings-row">
             <div className="settings-row-info">
-              <div className="settings-row-name">Note font size</div>
-              <div className="settings-row-desc">Body text in notes and rendered transcripts.</div>
-            </div>
-            <div className="settings-slider">
-              <input
-                max={20}
-                min={13}
-                step={0.5}
-                type="range"
-                value={bodySize}
-                onChange={(event) => updateSizes(Number(event.target.value), uiSize, monoSize)}
-              />
-              <span className="settings-slider-value tabular-nums">{bodySize}px</span>
-            </div>
-          </div>
-          <div className="settings-row">
-            <div className="settings-row-info">
-              <div className="settings-row-name">UI font size</div>
+              <div className="settings-row-name">Size</div>
               <div className="settings-row-desc">
-                Chrome, chips, tool rows, sidebars (smaller variant follows at −1px).
+                One pixel size for every surface — prose, chat, code, chrome.
               </div>
             </div>
             <div className="settings-slider">
               <input
-                max={16}
-                min={11}
+                max={SIZE_MAX}
+                min={SIZE_MIN}
                 step={0.5}
                 type="range"
-                value={uiSize}
-                onChange={(event) => updateSizes(bodySize, Number(event.target.value), monoSize)}
+                value={size}
+                onChange={(event) => updateSize(Number(event.target.value))}
               />
-              <span className="settings-slider-value tabular-nums">{uiSize}px</span>
-            </div>
-          </div>
-          <div className="settings-row">
-            <div className="settings-row-info">
-              <div className="settings-row-name">Monospace font size</div>
-              <div className="settings-row-desc">
-                Code blocks, agent transcripts, tool output, bash rows.
-              </div>
-            </div>
-            <div className="settings-slider">
-              <input
-                max={20}
-                min={11}
-                step={0.5}
-                type="range"
-                value={monoSize}
-                onChange={(event) => updateSizes(bodySize, uiSize, Number(event.target.value))}
-              />
-              <span className="settings-slider-value tabular-nums">{monoSize}px</span>
+              <span className="settings-slider-value tabular-nums">{size}px</span>
             </div>
           </div>
           <button
             className="settings-reset"
             type="button"
-            onClick={() => updateSizes(BODY_SIZE_DEFAULT, UI_SIZE_DEFAULT, MONO_SIZE_DEFAULT)}
+            onClick={() => updateSize(SIZE_DEFAULT)}
           >
-            Reset sizes to default
+            Reset size to default
           </button>
         </div>
       </div>
     </>
   );
 }
+
