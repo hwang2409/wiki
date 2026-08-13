@@ -522,6 +522,33 @@
     animation: pulse 1.2s ease-in-out infinite;
   }
 
+  /* Skeleton table: matches the shape of the real grid so first paint
+     doesn't reflow when data arrives. Q7: text spinners are fine for tiny
+     lists; the fleet + tickets tables are big enough that the shape change
+     was a visible jump. */
+  .skeleton-table { border-collapse: collapse; width: 100%; }
+  .skeleton-table td {
+    padding: 12px 12px;
+    border-bottom: 1px solid var(--rule);
+  }
+  .skeleton-cell {
+    display: block;
+    height: 10px;
+    border-radius: 999px;
+    background: linear-gradient(90deg, var(--rule) 0%, var(--rule-strong) 50%, var(--rule) 100%);
+    background-size: 200% 100%;
+    animation: skeleton-shimmer 1.4s ease-in-out infinite;
+    opacity: 0.7;
+  }
+  @keyframes skeleton-shimmer {
+    0%   { background-position: 100% 0; opacity: 0.55; }
+    50%  { opacity: 0.85; }
+    100% { background-position: -100% 0; opacity: 0.55; }
+  }
+  @media (prefers-reduced-motion: reduce) {
+    .skeleton-cell, .loading .dot { animation: none; }
+  }
+
   .error-banner {
     margin-top: 24px;
     padding: 12px 16px;
@@ -530,7 +557,27 @@
     color: var(--err);
     border-radius: 0 var(--radius-sm) var(--radius-sm) 0;
     font-size: var(--font-single-size, 13px);
+    display: flex;
+    align-items: center;
+    gap: 12px;
+    flex-wrap: wrap;
   }
+  .error-banner-text { flex: 1; min-width: 200px; }
+  .error-retry {
+    display: inline-flex; align-items: center; gap: 4px;
+    padding: 4px 10px;
+    border: 1px solid var(--err);
+    border-radius: var(--radius-sm);
+    background: transparent;
+    color: var(--err);
+    font: inherit;
+    font-size: var(--font-single-size, 12px);
+    text-transform: uppercase;
+    letter-spacing: 0.1em;
+    cursor: pointer;
+  }
+  .error-retry:hover { background: color-mix(in oklab, var(--err) 10%, transparent); }
+  .error-retry:disabled { opacity: 0.5; cursor: default; }
 
   /* ---------- responsive ---------- */
   @media (max-width: 900px) {
@@ -597,7 +644,10 @@
     </div>
   </header>
 
-  <div id="error" class="error-banner" hidden></div>
+  <div id="error" class="error-banner" hidden>
+    <span class="error-banner-text" id="error-text"></span>
+    <button type="button" id="error-retry" class="error-retry">retry now</button>
+  </div>
 
   <section id="rollups-section" class="rollups" hidden></section>
 
@@ -606,7 +656,30 @@
       <h2 class="section-title">Workers</h2>
       <span class="section-note" id="fleet-count"></span>
     </div>
-    <div id="fleet-body"><p class="loading"><span class="dot"></span>loading fleet</p></div>
+    <div id="fleet-body" data-state="loading" aria-busy="true">
+      <table class="grid skeleton-table" aria-hidden="true">
+        <tbody>
+          <tr><td style="width: 12%"><span class="skeleton-cell" style="width: 60%"></span></td>
+              <td style="width: 20%"><span class="skeleton-cell" style="width: 82%"></span></td>
+              <td style="width: 12%"><span class="skeleton-cell" style="width: 44%"></span></td>
+              <td><span class="skeleton-cell" style="width: 92%"></span></td>
+              <td style="width: 10%"><span class="skeleton-cell" style="width: 52%"></span></td>
+              <td style="width: 10%"><span class="skeleton-cell" style="width: 40%"></span></td></tr>
+          <tr><td><span class="skeleton-cell" style="width: 50%"></span></td>
+              <td><span class="skeleton-cell" style="width: 74%"></span></td>
+              <td><span class="skeleton-cell" style="width: 38%"></span></td>
+              <td><span class="skeleton-cell" style="width: 80%"></span></td>
+              <td><span class="skeleton-cell" style="width: 46%"></span></td>
+              <td><span class="skeleton-cell" style="width: 34%"></span></td></tr>
+          <tr><td><span class="skeleton-cell" style="width: 58%"></span></td>
+              <td><span class="skeleton-cell" style="width: 88%"></span></td>
+              <td><span class="skeleton-cell" style="width: 40%"></span></td>
+              <td><span class="skeleton-cell" style="width: 74%"></span></td>
+              <td><span class="skeleton-cell" style="width: 48%"></span></td>
+              <td><span class="skeleton-cell" style="width: 36%"></span></td></tr>
+        </tbody>
+      </table>
+    </div>
   </section>
 
   <section class="section" id="tickets-section">
@@ -614,7 +687,27 @@
       <h2 class="section-title">Tickets</h2>
       <span class="section-note" id="tickets-count"></span>
     </div>
-    <div id="tickets-body"><p class="loading"><span class="dot"></span>loading tickets</p></div>
+    <div id="tickets-body" data-state="loading" aria-busy="true">
+      <table class="grid skeleton-table" aria-hidden="true">
+        <tbody>
+          <tr><td style="width: 12%"><span class="skeleton-cell" style="width: 60%"></span></td>
+              <td><span class="skeleton-cell" style="width: 86%"></span></td>
+              <td style="width: 10%"><span class="skeleton-cell" style="width: 46%"></span></td>
+              <td style="width: 14%"><span class="skeleton-cell" style="width: 62%"></span></td>
+              <td style="width: 10%"><span class="skeleton-cell" style="width: 44%"></span></td></tr>
+          <tr><td><span class="skeleton-cell" style="width: 54%"></span></td>
+              <td><span class="skeleton-cell" style="width: 78%"></span></td>
+              <td><span class="skeleton-cell" style="width: 40%"></span></td>
+              <td><span class="skeleton-cell" style="width: 56%"></span></td>
+              <td><span class="skeleton-cell" style="width: 38%"></span></td></tr>
+          <tr><td><span class="skeleton-cell" style="width: 62%"></span></td>
+              <td><span class="skeleton-cell" style="width: 90%"></span></td>
+              <td><span class="skeleton-cell" style="width: 48%"></span></td>
+              <td><span class="skeleton-cell" style="width: 66%"></span></td>
+              <td><span class="skeleton-cell" style="width: 42%"></span></td></tr>
+        </tbody>
+      </table>
+    </div>
   </section>
 
   <details class="archived" id="archived-details">
@@ -713,6 +806,8 @@ import {
   function renderFleet(workers) {
     const body = $("fleet-body");
     const count = $("fleet-count");
+    body.removeAttribute("aria-busy");
+    body.dataset.state = "ready";
     if (!workers || workers.length === 0) {
       count.textContent = "";
       body.innerHTML = '<p class="empty">no live workers.</p>';
@@ -784,6 +879,8 @@ import {
   function renderTickets(tickets, workers) {
     const body = $("tickets-body");
     const count = $("tickets-count");
+    body.removeAttribute("aria-busy");
+    body.dataset.state = "ready";
     if (!tickets || tickets.length === 0) {
       count.textContent = "";
       body.innerHTML = '<p class="empty">no tickets with workers or prs yet.</p>';
@@ -874,13 +971,15 @@ import {
   async function fetchData() {
     if (state.refetching) return;
     state.refetching = true;
+    const retryBtn = $("error-retry");
+    if (retryBtn) retryBtn.disabled = true;
     try {
       const r = await fetch("/dashboard/data", { headers: { accept: "application/json" } });
       if (!r.ok) throw new Error("status " + r.status);
       const data = await r.json();
       state.lastFetch = Date.now();
       $("error").hidden = true;
-      $("error").textContent = "";
+      $("error-text").textContent = "";
       render(data);
       // Q7: only a SUCCESSFUL refresh clears stale/offline. Timer ticks
       // and error paths never elevate the indicator.
@@ -888,11 +987,36 @@ import {
     } catch (err) {
       const banner = $("error");
       banner.hidden = false;
-      banner.textContent = "could not refresh: " + (err.message || err);
+      const prefix = state.data ? "could not refresh (showing last good data): " : "could not load: ";
+      $("error-text").textContent = prefix + (err.message || err);
+      // Cold failure: skeletons are still under the section bodies and
+      // aria-busy is still true — showing "loading" and "failed" at the same
+      // time would be a lie. Replace each skeleton with an explicit failure
+      // message so the surface reads correctly. Warm failure keeps last-good
+      // content and delegates the stale signal to the banner above.
+      if (!state.data) {
+        renderColdFailurePlaceholders();
+      }
       setLiveState("offline");
     } finally {
       state.refetching = false;
+      if (retryBtn) retryBtn.disabled = false;
     }
+  }
+
+  function renderColdFailurePlaceholders() {
+    ["fleet-body", "tickets-body"].forEach((id) => {
+      const el = $(id);
+      if (!el) return;
+      // Only replace while still in the loading/skeleton state — if a real
+      // render has already populated this body (warm failure path), leave it
+      // alone so the stale banner above owns the messaging.
+      if (el.dataset.state !== "loading") return;
+      el.removeAttribute("aria-busy");
+      el.dataset.state = "failed";
+      const label = id === "fleet-body" ? "fleet" : "tickets";
+      el.innerHTML = '<p class="empty">could not load ' + label + '. retry above.</p>';
+    });
   }
 
   function openEventStream() {
@@ -929,6 +1053,9 @@ import {
     // Re-render so the age counters keep ticking without a refetch.
     if (state.data) render(state.data);
   }
+
+  const retryBtn = $("error-retry");
+  if (retryBtn) retryBtn.addEventListener("click", () => { fetchData(); });
 
   fetchData();
   openEventStream();

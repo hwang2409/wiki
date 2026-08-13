@@ -121,6 +121,12 @@ export type PollingDeps<T> = {
 export type PollingHandle = {
   stop: () => void;
   activeSignal: () => AbortSignal | null;
+  /**
+   * Trigger an immediate refetch, cancelling any in-flight request. Returns
+   * a promise that resolves when the manual refetch settles (so callers can
+   * flip a "retrying…" affordance off). Used by dashboard retry buttons.
+   */
+  refresh: () => Promise<void>;
 };
 
 /**
@@ -143,7 +149,7 @@ export function startDashboardPolling<T>(deps: PollingDeps<T>): PollingHandle {
     }, deps.intervalMs);
   };
 
-  const load = async () => {
+  const load = async (): Promise<void> => {
     if (cancelled) return;
     controller?.abort();
     const current = new AbortController();
@@ -156,8 +162,16 @@ export function startDashboardPolling<T>(deps: PollingDeps<T>): PollingHandle {
       if (cancelled || current.signal.aborted) return;
       deps.onError(err instanceof Error ? err.message : String(err));
     } finally {
-      if (controller === current) controller = null;
-      scheduleNext();
+      // Only the WINNING load (the one whose controller is still current)
+      // schedules the next poll. If refresh() or a later load() superseded
+      // us mid-flight, our controller has been abandoned — that superseding
+      // load owns the follow-up, and firing scheduleNext here would leave
+      // an orphaned timer (its handle would clobber `timer`, making stop()
+      // and refresh() unable to cancel the newer one).
+      if (controller === current) {
+        controller = null;
+        scheduleNext();
+      }
     }
   };
 
@@ -174,5 +188,13 @@ export function startDashboardPolling<T>(deps: PollingDeps<T>): PollingHandle {
       controller = null;
     },
     activeSignal: () => controller?.signal ?? null,
+    refresh() {
+      if (cancelled) return Promise.resolve();
+      if (timer !== null) {
+        clearTimeoutFn(timer);
+        timer = null;
+      }
+      return load();
+    },
   };
 }
