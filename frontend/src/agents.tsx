@@ -68,7 +68,7 @@ const DEAD_RUN_COPY = "adapter detached — archive to reset";
 
 export type AgentOpenTarget =
   | string
-  | { kind: "archive"; ticket: string; archivedAt: string };
+  | { kind: "archive"; ticket: string; archivedAt: string; runId: string };
 
 type HeadlessAgentState = {
   run_id?: string | null;
@@ -1401,6 +1401,7 @@ export function AgentsView({
 
   const openTicketId = typeof openTicket === "string" ? openTicket : openTicket?.ticket ?? null;
   const openArchiveAt = openTicket && typeof openTicket === "object" ? openTicket.archivedAt : null;
+  const openArchiveRunId = openTicket && typeof openTicket === "object" ? openTicket.runId : null;
   const openOrch = typeof openTicket === "string"
     ? orchestrators.find((orch) => orch.id === openTicket)
     : undefined;
@@ -1410,7 +1411,10 @@ export function AgentsView({
     : null;
   const archivedWorker = openArchiveAt
     ? archived.find(
-        (entry) => entry.ticket === openTicketId && entry.archived_at === openArchiveAt,
+        (entry) =>
+          entry.ticket === openTicketId &&
+          entry.archived_at === openArchiveAt &&
+          entry.run_id === openArchiveRunId,
       ) ?? null
     : null;
   const openWorker: SidebarTarget | null = archivedWorker
@@ -1422,6 +1426,7 @@ export function AgentsView({
         pr: archivedWorker.pr,
         canReview: Boolean(archivedWorker.pr),
         archivedAt: archivedWorker.archived_at,
+        runId: archivedWorker.run_id ?? undefined,
       }
     : liveWorker
       ? {
@@ -1608,7 +1613,13 @@ export function AgentsView({
     // and every technical field live behind the details disclosure.
     //
     const key = `${entry.ticket}-${entry.archived_at}`;
-    const isOpen = openTicketId === entry.ticket && openArchiveAt === entry.archived_at;
+    const isOpen =
+      openTicketId === entry.ticket &&
+      openArchiveAt === entry.archived_at &&
+      openArchiveRunId === entry.run_id;
+    const archiveTarget = entry.run_id
+      ? { kind: "archive" as const, ticket: entry.ticket, archivedAt: entry.archived_at, runId: entry.run_id }
+      : null;
     const detailsOpen = expandedDetails.has(key);
     return (
       <article
@@ -1620,7 +1631,7 @@ export function AgentsView({
           onOpenTicket(
             isOpen
               ? null
-              : { kind: "archive", ticket: entry.ticket, archivedAt: entry.archived_at },
+              : archiveTarget,
           );
         }}
       >
@@ -1648,7 +1659,7 @@ export function AgentsView({
                 onOpenTicket(
                   isOpen
                     ? null
-                    : { kind: "archive", ticket: entry.ticket, archivedAt: entry.archived_at },
+                    : archiveTarget,
                 )
               }
             >

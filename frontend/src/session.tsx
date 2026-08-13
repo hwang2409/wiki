@@ -2886,6 +2886,7 @@ export function SessionTab({
   ticket,
   subagent,
   archivedAt,
+  runId,
   showComposer = true,
   onInspect,
   onArtifactsChange,
@@ -2896,6 +2897,7 @@ export function SessionTab({
   ticket: string;
   subagent?: string;
   archivedAt?: string;
+  runId?: string;
   showComposer?: boolean;
   onInspect?: (agentId: string) => void;
   onArtifactsChange?: (events: SessionEvent[]) => void;
@@ -2903,7 +2905,7 @@ export function SessionTab({
   onOpenArtifact?: (event: SessionEvent) => void;
   stateKey?: string;
 }) {
-  const resetKey = `${ticket}:${subagent ?? ""}:${archivedAt ?? ""}`;
+  const resetKey = `${ticket}:${subagent ?? ""}:${archivedAt ?? ""}:${runId ?? ""}`;
   const sessionStateKey = `${stateKey ?? resetKey}:${resetKey}`;
   const rowHeightsKeyRef = useRef(resetKey);
   const rowHeightsRef = useRef<Map<number, RowMeasurement>>(new Map());
@@ -2937,10 +2939,10 @@ export function SessionTab({
     () =>
       subagent
         ? { mode: "live" as const, ticket, subagent }
-        : archivedAt
-          ? { mode: "archive" as const, ticket, archivedAt }
+        : archivedAt && runId
+          ? { mode: "archive" as const, ticket, archivedAt, runId }
           : { mode: "live" as const, ticket },
-    [archivedAt, subagent, ticket]
+    [archivedAt, runId, subagent, ticket]
   ) satisfies TranscriptTarget;
   const visible = useElementVisible(containerNode);
   const { session, pendingUserMessages, error, loading } = useTranscriptSession(target, visible);
@@ -4888,6 +4890,7 @@ export type SidebarTarget = {
   pr?: string | null;
   canReview?: boolean;
   archivedAt?: string;
+  runId?: string;
 };
 
 export function SessionSidebar({
@@ -5000,6 +5003,7 @@ export function SessionSidebar({
           showComposer={false}
           ticket={worker.ticket}
           archivedAt={worker.archivedAt}
+          runId={worker.runId}
         />
       </div>
     </aside>

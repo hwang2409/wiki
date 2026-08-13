@@ -187,6 +187,7 @@ export type AgentWorker = AgentSession & {
 export type ArchivedWorker = {
   ticket: string;
   archived_at: string;
+  run_id: string | null;
   kind: string | null;
   role: string | null;
   model: string | null;
@@ -933,10 +934,12 @@ export function getAgentSession(
   after = 0,
   path?: string,
   archivedAt?: string,
+  runId?: string,
 ) {
   const params = new URLSearchParams({ cursor: String(after) });
   if (path) params.set("path", path);
   if (archivedAt) params.set("archived_at", archivedAt);
+  if (runId) params.set("run_id", runId);
   return request<AgentSessionData>(
     `/api/agents/${encodeURIComponent(ticket)}/session?${params.toString()}`
   );
@@ -947,9 +950,11 @@ export function getAgentOlderSession(
   before: number,
   count = 500,
   archivedAt?: string,
+  runId?: string,
 ) {
   const params = new URLSearchParams({ before: String(before), count: String(count) });
   if (archivedAt) params.set("archived_at", archivedAt);
+  if (runId) params.set("run_id", runId);
   return request<AgentOlderSessionData>(
     `/api/agents/${encodeURIComponent(ticket)}/session/older?${params.toString()}`
   );

@@ -20,7 +20,13 @@ const POLL_MS = 2500;
 
 export type TranscriptTarget =
   | { mode: "live"; ticket: string; subagent?: string; archivedAt?: never }
-  | { mode: "archive"; ticket: string; subagent?: never; archivedAt: string };
+  | {
+      mode: "archive";
+      ticket: string;
+      subagent?: never;
+      archivedAt: string;
+      runId: string;
+    };
 
 export type TranscriptSession = {
   format: AgentSessionData["format"];
@@ -268,13 +274,20 @@ function setPollerState() {
 async function loadTarget(target: TranscriptTarget, cursor: number, path?: string): Promise<AgentSessionData> {
   return target.subagent
     ? getSubagentSession(target.ticket, target.subagent, cursor, path)
-    : getAgentSession(target.ticket, cursor, path, target.archivedAt);
+    : getAgentSession(
+        target.ticket,
+        cursor,
+        path,
+        target.mode === "archive" ? target.archivedAt : undefined,
+        target.mode === "archive" ? target.runId : undefined,
+      );
 }
 
 export async function loadOlderEvents(target: TranscriptTarget, before: number, count = 500): Promise<void> {
   const entry = getEntry(target);
   const archivedAt = target.mode === "archive" ? target.archivedAt : undefined;
-  const result = await getAgentOlderSession(target.ticket, before, count, archivedAt);
+  const runId = target.mode === "archive" ? target.runId : undefined;
+  const result = await getAgentOlderSession(target.ticket, before, count, archivedAt, runId);
   const current = entry.snapshot.session;
   if (!current || current.path !== result.path || current.base !== before) return;
   const merged = prependOlderEvents(current, result, before);

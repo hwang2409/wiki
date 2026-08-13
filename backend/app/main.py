@@ -1753,6 +1753,11 @@ def list_archived(
     for ticket, archived_at, session_dir in candidates:
         status = _read_json_object(session_dir / "final-status.json")
         meta = _read_json_object(session_dir / "meta.json")
+        try:
+            run_value = json.loads((session_dir / "run.json").read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            run_value = {}
+        run = run_value if isinstance(run_value, dict) else {}
         worker = meta.get("worker") or {}
         kind = worker.get("kind")
         if not kind:
@@ -1764,6 +1769,7 @@ def list_archived(
             {
                 "ticket": ticket,
                 "archived_at": archived_at.isoformat(),
+                "run_id": run.get("run_id") if isinstance(run.get("run_id"), str) else None,
                 "kind": kind,
                 "role": worker.get("role") or _archive_role(session_dir),
                 "orch": worker.get("orch"),
@@ -1785,14 +1791,16 @@ def list_archived(
 def _archive_hint(
     ticket: str,
     archived_at: str | None = None,
+    run_id: str | None = None,
 ) -> tuple[str | None, str | None, Path | None]:
     """(kind, spawned_at iso, session dir) for a ticket's archive.
 
     Without ``archived_at`` returns the newest archive (unchanged behavior).
-    With ``archived_at`` returns the archive whose iso timestamp matches
-    exactly, or (None, None, None) for a stale identifier.
+    With ``archived_at`` and ``run_id`` returns the exact committed archive,
+    or (None, None, None) for a stale or mismatched identifier.
 
-    ``archived_at`` is the archive discriminator used by the session routes.
+    ``archived_at`` and ``run_id`` are the archive discriminators used by the
+    session routes.
     """
 
     ticket_dir = AGENT_ARCHIVE_DIR / ticket
@@ -1801,9 +1809,14 @@ def _archive_hint(
     sessions = _archive_sessions(ticket_dir)
     if not sessions:
         return (None, None, None)
-    if archived_at is not None:
+    if archived_at is not None or run_id is not None:
+        if archived_at is None or run_id is None:
+            return (None, None, None)
+        resolved = _archive_session_for_run_id(run_id)
+        if resolved is None or resolved.parent.name != ticket:
+            return (None, None, None)
         for candidate_at, session_dir in sessions:
-            if candidate_at.isoformat() == archived_at:
+            if candidate_at.isoformat() == archived_at and session_dir == resolved:
                 kind = (
                     "cdx"
                     if any(session_dir.glob("cdx-*"))
@@ -3682,18 +3695,19 @@ def agent_session(
     cursor: int = Query(0, ge=0),
     client_path: str | None = Query(None, alias="path"),
     archived_at: str | None = None,
+    run_id: str | None = None,
 ) -> dict[str, object]:
     if not valid_agent_id(ticket):
         raise HTTPException(status_code=400, detail="Bad ticket")
 
-    requested_archive = archived_at is not None
+    requested_archive = archived_at is not None or run_id is not None
     archive_dir: Path | None = None
     archive_kind: str | None = None
     spawned_at: str | None = None
     archive_model: str | None = None
     archive_provider: str | None = None
     if requested_archive:
-        archive_kind, spawned_at, archive_dir = _archive_hint(ticket, archived_at)
+        archive_kind, spawned_at, archive_dir = _archive_hint(ticket, archived_at, run_id)
         if archive_dir is None:
             raise HTTPException(status_code=404, detail="Archived session not found")
         _archive_entry, archive_model, archive_kind, archive_provider = (
@@ -3881,8 +3895,15 @@ def agent_session_older(
     before: int = Query(..., ge=0),
     count: int = Query(500, ge=1, le=2_000),
     archived_at: str | None = None,
+    run_id: str | None = None,
 ) -> dict[str, object]:
-    session = agent_session(ticket, cursor=0, client_path=None, archived_at=archived_at)
+    session = agent_session(
+        ticket,
+        cursor=0,
+        client_path=None,
+        archived_at=archived_at,
+        run_id=run_id,
+    )
     fmt = session.get("format")
     raw_path = session.get("path")
     if not isinstance(raw_path, str):

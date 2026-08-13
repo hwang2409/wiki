@@ -1,5 +1,6 @@
 // @vitest-environment jsdom
 import { cleanup, fireEvent, render, waitFor } from "@testing-library/react";
+import { useState } from "react";
 import { afterEach, beforeEach, expect, test, vi } from "vitest";
 
 import { AgentsView, SpawnOrchestratorModal, SpawnWorkerModal } from "../src/agents";
@@ -48,6 +49,7 @@ const worker = {
 const archivedEntry = {
   ticket: "WIKI-0",
   archived_at: new Date(Date.now() - 60_000).toISOString(),
+  run_id: "archive-run-0",
   kind: "cdx",
   role: "review",
   model: "gpt-5.6-sol",
@@ -590,19 +592,44 @@ test("orchestrator Replace stays disabled with a reason without a live runtime",
   expect(vi.mocked(globalThis.fetch)).not.toHaveBeenCalled();
 });
 
-test("history targeting selects the named archive over a live ticket", () => {
+test("clicking a history row selects exactly the named archive over a live ticket", () => {
   const olderAt = "2026-07-01T00:00:00+00:00";
   const newerAt = "2026-07-02T00:00:00+00:00";
   const live = { ...worker, ticket: "WIKI-0", model: "live-model" };
-  const older = { ...archivedEntry, ticket: "WIKI-0", archived_at: olderAt, model: "old-model" };
-  const newer = { ...archivedEntry, ticket: "WIKI-0", archived_at: newerAt, model: "new-model" };
-  const view = renderView({
-    data: { workers: [live], orchestrators: [], archived: [newer, older], error: null },
-    openTicket: { kind: "archive", ticket: "WIKI-0", archivedAt: olderAt },
-  });
+  const older = {
+    ...archivedEntry,
+    ticket: "WIKI-0",
+    archived_at: olderAt,
+    run_id: "old-archive-run",
+    model: "old-model",
+  };
+  const newer = {
+    ...archivedEntry,
+    ticket: "WIKI-0",
+    archived_at: newerAt,
+    run_id: "new-archive-run",
+    model: "new-model",
+  };
+  function SelectionHarness() {
+    const [openTicket, setOpenTicket] = useState<Parameters<typeof AgentsView>[0]["openTicket"]>(null);
+    return (
+      <AgentsView
+        data={{ workers: [live], orchestrators: [], archived: [newer, older], error: null }}
+        onOpenAgent={() => undefined}
+        refreshTick={0}
+        openTicket={openTicket}
+        onOpenTicket={setOpenTicket}
+      />
+    );
+  }
+  const view = render(<SelectionHarness />);
+  const historyCards = view.container.querySelectorAll(".agent-card.is-archived");
+  expect(historyCards).toHaveLength(2);
+  fireEvent.click(historyCards[1]);
 
-  expect(view.getByText("old-model")).toBeTruthy();
-  expect(view.queryByText("live-model")).toBeNull();
+  const selectedCards = view.container.querySelectorAll(".agent-card.is-selected");
+  expect(selectedCards).toHaveLength(1);
+  expect(selectedCards[0]).toBe(historyCards[1]);
 });
 
 test("history row is a quiet outcome/date summary with View transcript", async () => {
