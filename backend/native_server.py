@@ -61,9 +61,18 @@ def raise_nofile_limit() -> tuple[int, int]:
         sys.stderr.flush()
         return (-1, -1)
 
-    if soft < hard:
+    target_soft = hard
+    if sys.platform == "darwin":
         try:
-            resource.setrlimit(resource.RLIMIT_NOFILE, (hard, hard))
+            open_max = os.sysconf("SC_OPEN_MAX")
+        except (OSError, ValueError):
+            open_max = hard
+        if open_max > 0:
+            target_soft = min(hard, open_max)
+
+    if soft < target_soft:
+        try:
+            resource.setrlimit(resource.RLIMIT_NOFILE, (target_soft, hard))
         except (OSError, ValueError) as exc:
             sys.stderr.write(f"unable to raise RLIMIT_NOFILE: {exc}\n")
             sys.stderr.flush()
