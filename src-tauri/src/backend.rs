@@ -31,6 +31,11 @@ const FINDER_SAFE_PATH: &str = "/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/
 const HEALTH_WAIT_TIMEOUT: Duration = Duration::from_secs(15);
 const HEALTH_POLL_INTERVAL: Duration = Duration::from_millis(200);
 const SHUTDOWN_WAIT_TIMEOUT: Duration = Duration::from_secs(3);
+const SIDECAR_RESPAWN_MAX_ATTEMPTS: u8 = 3;
+const SIDECAR_RESPAWN_BACKOFF: Duration = Duration::from_millis(250);
+const SIDECAR_SUSTAINED_UPTIME: Duration = Duration::from_secs(30);
+const SIDECAR_SWAP_RECHECK_ATTEMPTS: u8 = 10;
+const SIDECAR_SWAP_RECHECK_DELAY: Duration = Duration::from_millis(100);
 const MAIN_WINDOW_LABEL: &str = "main";
 const WINDOW_TITLE: &str = "Wiki";
 const APP_LOCK_NAME: &str = "app.lock";
@@ -155,13 +160,53 @@ struct SidecarState {
     pid: u32,
     log_path: PathBuf,
     healthy_started: bool,
-    restart_count: u8,
+    respawn: RespawnPolicy,
     shutting_down: bool,
     last_termination: Option<String>,
 }
 
+#[derive(Default)]
+struct RespawnPolicy {
+    attempts: u8,
+    healthy_since: Option<Instant>,
+}
+
+enum RespawnDecision {
+    Restart { attempt: u8, delay: Duration },
+    Suppressed,
+    GiveUp,
+}
+
+impl RespawnPolicy {
+    fn healthy(&mut self, now: Instant) {
+        self.healthy_since = Some(now);
+    }
+
+    fn next(&mut self, now: Instant, locks_available: bool) -> RespawnDecision {
+        if self
+            .healthy_since
+            .is_some_and(|started| now.duration_since(started) >= SIDECAR_SUSTAINED_UPTIME)
+        {
+            self.attempts = 0;
+        }
+        if !locks_available {
+            return RespawnDecision::Suppressed;
+        }
+        if self.attempts >= SIDECAR_RESPAWN_MAX_ATTEMPTS {
+            return RespawnDecision::GiveUp;
+        }
+        self.attempts += 1;
+        let attempt = self.attempts;
+        RespawnDecision::Restart {
+            attempt,
+            delay: SIDECAR_RESPAWN_BACKOFF * 2_u32.pow((attempt - 1) as u32),
+        }
+    }
+}
+
 enum SidecarAction {
-    Restart,
+    Restart { attempt: u8, delay: Duration },
+    SwapSuppressed(PathBuf),
     ShowError(String, PathBuf),
 }
 
@@ -339,7 +384,10 @@ fn start_sidecar(app: &AppHandle, restart_count: u8) -> Result<String, Box<dyn E
             pid,
             log_path: log_path.clone(),
             healthy_started: false,
-            restart_count,
+            respawn: RespawnPolicy {
+                attempts: restart_count,
+                ..RespawnPolicy::default()
+            },
             shutting_down: false,
             last_termination: None,
         });
@@ -360,6 +408,7 @@ fn start_sidecar(app: &AppHandle, restart_count: u8) -> Result<String, Box<dyn E
         if let Some(sidecar) = state.sidecar.as_mut() {
             if sidecar.pid == pid {
                 sidecar.healthy_started = true;
+                sidecar.respawn.healthy(Instant::now());
                 sidecar.last_termination = None;
             }
         }
@@ -519,16 +568,22 @@ fn handle_sidecar_termination(app: &AppHandle, pid: u32, summary: String) {
             return;
         }
 
-        if sidecar.restart_count == 0 {
-            sidecar.restart_count = 1;
-            Some(SidecarAction::Restart)
-        } else {
-            Some(SidecarAction::ShowError(summary, sidecar.log_path.clone()))
+        let swap_window = wait_for_respawn_window();
+        match sidecar.respawn.next(Instant::now(), swap_window.is_some()) {
+            RespawnDecision::Restart { attempt, delay } => {
+                Some(SidecarAction::Restart { attempt, delay })
+            }
+            RespawnDecision::Suppressed => {
+                Some(SidecarAction::SwapSuppressed(sidecar.log_path.clone()))
+            }
+            RespawnDecision::GiveUp => {
+                Some(SidecarAction::ShowError(summary, sidecar.log_path.clone()))
+            }
         }
     };
 
     match action {
-        Some(SidecarAction::Restart) => {
+        Some(SidecarAction::Restart { attempt, delay }) => {
             if let Some(log_path) = app
                 .state::<NativeAppState>()
                 .inner
@@ -540,10 +595,39 @@ fn handle_sidecar_termination(app: &AppHandle, pid: u32, summary: String) {
             {
                 let _ = append_log(
                     &log_path,
-                    "backend exited unexpectedly; attempting one restart",
+                    &format!(
+                        "backend exited unexpectedly; attempting respawn {attempt}/{SIDECAR_RESPAWN_MAX_ATTEMPTS} after {delay:?}"
+                    ),
                 );
             }
-            match start_sidecar(app, 1) {
+            thread::sleep(delay);
+            let Some(_respawn_guard) = wait_for_respawn_window() else {
+                let log_path = app
+                    .state::<NativeAppState>()
+                    .inner
+                    .lock()
+                    .unwrap()
+                    .sidecar
+                    .as_ref()
+                    .map(|sidecar| sidecar.log_path.clone());
+                if let Some(log_path) = log_path {
+                    let _ = append_log(
+                        &log_path,
+                        "backend respawn cancelled; native swap remained active",
+                    );
+                    show_error_dialog(
+                        app,
+                        "Wiki backend respawn blocked",
+                        &format!(
+                            "Native swap locks remained held after {} checks. The backend was not respawned.\n\nLog: {}",
+                            SIDECAR_SWAP_RECHECK_ATTEMPTS,
+                            log_path.display()
+                        ),
+                    );
+                }
+                return;
+            };
+            match start_sidecar(app, attempt) {
                 Ok(launch_url) => {
                     if let Some(window) = app.get_webview_window(MAIN_WINDOW_LABEL) {
                         if let Ok(url) = launch_url.parse() {
@@ -558,6 +642,21 @@ fn handle_sidecar_termination(app: &AppHandle, pid: u32, summary: String) {
                 }
             }
         }
+        Some(SidecarAction::SwapSuppressed(log_path)) => {
+            let _ = append_log(
+                &log_path,
+                "backend respawn blocked; native swap remained active",
+            );
+            show_error_dialog(
+                app,
+                "Wiki backend respawn blocked",
+                &format!(
+                    "Native swap locks remained held after {} checks. The backend was not respawned.\n\nLog: {}",
+                    SIDECAR_SWAP_RECHECK_ATTEMPTS,
+                    log_path.display()
+                ),
+            );
+        }
         Some(SidecarAction::ShowError(summary, log_path)) => {
             show_error_dialog(
                 app,
@@ -567,6 +666,47 @@ fn handle_sidecar_termination(app: &AppHandle, pid: u32, summary: String) {
         }
         None => {}
     }
+}
+
+struct RespawnLockGuard {
+    _transaction_lock: File,
+}
+
+fn wait_for_respawn_window() -> Option<RespawnLockGuard> {
+    wait_for_respawn_window_in(&runtime_dir())
+}
+
+fn wait_for_respawn_window_in(runtime: &Path) -> Option<RespawnLockGuard> {
+    for _ in 0..SIDECAR_SWAP_RECHECK_ATTEMPTS {
+        if let Some(transaction_lock) =
+            try_acquire_runtime_lock(&runtime.join("daemon.transaction.lock"))
+        {
+            return Some(RespawnLockGuard {
+                _transaction_lock: transaction_lock,
+            });
+        }
+        thread::sleep(SIDECAR_SWAP_RECHECK_DELAY);
+    }
+    None
+}
+
+fn try_acquire_runtime_lock(path: &Path) -> Option<File> {
+    let file = OpenOptions::new()
+        .create(true)
+        .read(true)
+        .write(true)
+        .open(path)
+        .ok()?;
+    let result = unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) };
+    if result == 0 {
+        Some(file)
+    } else {
+        None
+    }
+}
+
+fn runtime_lock_is_free(path: &Path) -> bool {
+    try_acquire_runtime_lock(path).is_some()
 }
 
 fn shutdown_sidecar(app: &AppHandle) {
@@ -917,7 +1057,13 @@ fn request_graceful_shutdown(_pid: u32) {}
 #[cfg(test)]
 mod tests {
     use super::repo_dir_from_manifest_dir;
-    use std::path::Path;
+    use std::{
+        fs::OpenOptions,
+        os::fd::AsRawFd,
+        path::{Path, PathBuf},
+        process::{Child, Command},
+        time::Instant,
+    };
 
     #[test]
     fn sidecar_environment_excludes_origin_secret() {
@@ -934,6 +1080,123 @@ mod tests {
         assert!(super::should_use_sidecar(true, false));
         assert!(super::should_use_sidecar(false, true));
         assert!(!super::should_use_sidecar(false, false));
+    }
+
+    fn stub_child() -> Child {
+        Command::new("/bin/sleep")
+            .arg("30")
+            .spawn()
+            .expect("spawn stub sidecar")
+    }
+
+    fn kill_stub(child: &mut Child) {
+        // Child::kill sends SIGKILL on Unix, matching the wedge failure.
+        child.kill().expect("kill stub sidecar with SIGKILL");
+        child.wait().expect("wait for killed stub sidecar");
+    }
+
+    fn temporary_runtime() -> PathBuf {
+        let path = std::env::temp_dir().join(format!(
+            "wiki-283-respawn-{}-{}",
+            std::process::id(),
+            Instant::now().elapsed().as_nanos()
+        ));
+        std::fs::create_dir(&path).expect("create respawn test runtime");
+        path
+    }
+
+    #[test]
+    fn respawn_harness_kills_stub_with_backoff_and_gives_up() {
+        let mut reset_policy = super::RespawnPolicy::default();
+        assert!(matches!(
+            reset_policy.next(Instant::now(), true),
+            super::RespawnDecision::Restart { attempt: 1, .. }
+        ));
+        assert!(matches!(
+            reset_policy.next(Instant::now(), true),
+            super::RespawnDecision::Restart { attempt: 2, .. }
+        ));
+        let healthy_at = Instant::now();
+        reset_policy.healthy(healthy_at);
+        assert!(matches!(
+            reset_policy.next(healthy_at + super::SIDECAR_SUSTAINED_UPTIME, true),
+            super::RespawnDecision::Restart { attempt: 1, .. }
+        ));
+
+        let mut policy = super::RespawnPolicy::default();
+        let mut child = stub_child();
+        let mut respawns = 0;
+        let mut delays = Vec::new();
+        loop {
+            kill_stub(&mut child);
+            let delay = match policy.next(Instant::now(), true) {
+                super::RespawnDecision::Restart { delay, .. } => delay,
+                super::RespawnDecision::GiveUp => break,
+                super::RespawnDecision::Suppressed => panic!("respawn unexpectedly suppressed"),
+            };
+            delays.push(delay);
+            std::thread::sleep(delay);
+            child = stub_child();
+            respawns += 1;
+        }
+        kill_stub(&mut child);
+
+        assert_eq!(respawns, 3);
+        assert_eq!(
+            delays,
+            vec![
+                super::SIDECAR_RESPAWN_BACKOFF,
+                super::SIDECAR_RESPAWN_BACKOFF * 2,
+                super::SIDECAR_RESPAWN_BACKOFF * 4,
+            ]
+        );
+    }
+
+    #[test]
+    fn respawn_harness_suppresses_during_swap_lock_window() {
+        let runtime = temporary_runtime();
+        let supervisor_lock = OpenOptions::new()
+            .create(true)
+            .read(true)
+            .write(true)
+            .open(runtime.join("supervisor.lock"))
+            .expect("open supervisor lock");
+        assert_eq!(
+            unsafe { libc::flock(supervisor_lock.as_raw_fd(), libc::LOCK_EX) },
+            0
+        );
+
+        // A healthy supervisor holds supervisor.lock. That alone must not
+        // suppress a sidecar respawn.
+        let healthy_guard = super::wait_for_respawn_window_in(&runtime)
+            .expect("healthy supervisor must not block respawn");
+        drop(healthy_guard);
+
+        let transaction_lock = OpenOptions::new()
+            .create(true)
+            .read(true)
+            .write(true)
+            .open(runtime.join("daemon.transaction.lock"))
+            .expect("open daemon transaction lock");
+        assert_eq!(
+            unsafe { libc::flock(transaction_lock.as_raw_fd(), libc::LOCK_EX) },
+            0
+        );
+
+        let mut policy = super::RespawnPolicy::default();
+        assert!(super::wait_for_respawn_window_in(&runtime).is_none());
+        assert!(matches!(
+            policy.next(Instant::now(), false),
+            super::RespawnDecision::Suppressed
+        ));
+
+        unsafe {
+            libc::flock(transaction_lock.as_raw_fd(), libc::LOCK_UN);
+            libc::flock(supervisor_lock.as_raw_fd(), libc::LOCK_UN);
+        }
+        drop(transaction_lock);
+        drop(supervisor_lock);
+        std::fs::remove_dir_all(runtime).expect("remove respawn test runtime");
     }
 
     #[test]
