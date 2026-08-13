@@ -19,7 +19,7 @@ from . import store as runtime_store
 from .normalizer import NormalizedProviderEvent, normalize_provider_event
 from .types import EventDisposition, LifecycleState, ProviderKind, validate_transition
 
-SCHEMA_VERSION = 1
+SCHEMA_VERSION = 2
 NORMALIZER_VERSION = "wiki-282-1"
 
 
@@ -116,6 +116,8 @@ class ReducerResult:
     events: tuple[dict[str, Any], ...]
     event_raw_seqs: dict[int, int]
     state: dict[str, Any]
+    projection_changed: bool = False
+    change_cursor: int = 0
 
 
 @dataclass
@@ -124,12 +126,15 @@ class _Projection:
     unread_event_seq: int = 0
     last_causal_raw_seq: int = 0
     pending_requests: dict[str, dict[str, Any]] | None = None
+    pending_user_messages: list[dict[str, Any]] | None = None
     composer_messages: list[dict[str, Any]] | None = None
     current_turn: dict[str, Any] | None = None
 
     def __post_init__(self) -> None:
         if self.pending_requests is None:
             self.pending_requests = {}
+        if self.pending_user_messages is None:
+            self.pending_user_messages = []
         if self.composer_messages is None:
             self.composer_messages = []
 
@@ -154,6 +159,7 @@ class EventReducerAdapter:
         self.state = transcripts._new_parse_state(self.format)
         self.projection = _Projection()
         self._event_raw_seqs: dict[int, int] = {}
+        self._change_cursor = 0
 
     def apply_raw(self, raw: dict[str, Any]) -> ReducerResult:
         raw_seq = int(raw["seq"])
@@ -172,6 +178,35 @@ class EventReducerAdapter:
                 else None
             ),
         }
+        return self._apply_row(row, normalized)
+
+    def apply_normalized_row(self, row: dict[str, Any]) -> ReducerResult:
+        disposition = row.get("disposition")
+        if disposition in {"ignored", transcripts.EVENT_DISPOSITION_IGNORED}:
+            event_disposition = EventDisposition.IGNORED
+        else:
+            event_disposition = EventDisposition(str(disposition))
+        lifecycle_value = row.get("lifecycle_state")
+        lifecycle_state = (
+            LifecycleState(str(lifecycle_value))
+            if lifecycle_value is not None
+            else None
+        )
+        normalized = NormalizedProviderEvent(
+            event_disposition,
+            str(row["kind"]),
+            row.get("payload") if isinstance(row.get("payload"), dict) else {},
+            lifecycle_state,
+        )
+        return self._apply_row(row, normalized)
+
+    def _apply_row(
+        self,
+        row: dict[str, Any],
+        normalized: NormalizedProviderEvent,
+    ) -> ReducerResult:
+        raw_seq = int(row["raw_seq"])
+        before_projection = self._client_projection_key()
         before_events = {
             int(event["id"]): _json_bytes(event)
             for event in self.state.get("events", [])
@@ -207,14 +242,41 @@ class EventReducerAdapter:
                 self._event_raw_seqs[event_id] = raw_seq
 
         self._apply_projection(row, normalized)
+        projection_changed = before_projection != self._client_projection_key()
+        parser_changes = tuple(
+            {**change, "cursor": 0}
+            for change in changes
+        )
+        for change in parser_changes:
+            self._change_cursor += 1
+            change["cursor"] = self._change_cursor
+        if projection_changed:
+            self._change_cursor += 1
         return ReducerResult(
             raw_seq=raw_seq,
             normalized=row,
-            changes=changes,
+            changes=parser_changes,
             events=current_events,
             event_raw_seqs=dict(self._event_raw_seqs),
             state=self.state,
+            projection_changed=projection_changed,
+            change_cursor=self._change_cursor,
         )
+
+    def _client_projection_key(self) -> str:
+        projection = self.projection_json()
+        projection.pop("disposition_counts", None)
+        projection.pop("last_causal_raw_seq", None)
+        projection.pop("pending_user_messages", None)
+        return _json_bytes(projection)
+
+    def replace_with(self, other: EventReducerAdapter) -> None:
+        """Adopt a clean committed replay after a failed transaction."""
+
+        self.state = other.state
+        self.projection = other.projection
+        self._event_raw_seqs = other._event_raw_seqs
+        self._change_cursor = other._change_cursor
 
     def _apply_projection(
         self,
@@ -244,7 +306,10 @@ class EventReducerAdapter:
             payload,
             normalized.disposition.value,
         ):
-            self.projection.unread_event_seq = int(row["seq"])
+            self.projection.unread_event_seq = max(
+                self.projection.unread_event_seq,
+                int(row["seq"]),
+            )
         if kind == "turn_started":
             params = payload.get("params")
             turn = params.get("turn") if isinstance(params, dict) else None
@@ -260,6 +325,12 @@ class EventReducerAdapter:
             if isinstance(diff, str) and self.projection.current_turn is not None:
                 self.projection.current_turn["diff"] = diff
                 self.projection.current_turn["raw_seq"] = raw_seq
+        runtime_store._apply_composer_message_event(
+            self.projection,
+            payload=payload,
+            seq=int(row["seq"]),
+            normalized_at=str(row.get("normalized_at") or ""),
+        )
         if kind == "approval":
             request_id = runtime_store._provider_request_id(kind, payload)
             if request_id is not None and self.projection.state not in {
@@ -298,6 +369,7 @@ class EventReducerAdapter:
             "pr": state.get("pr"),
             "session_meta": state.get("session_meta") or {},
             "pending_requests": self.projection.pending_requests,
+            "pending_user_messages": self.projection.pending_user_messages,
             "composer_messages": self.projection.composer_messages,
             "disposition_counts": state.get("dispositions") or {},
             "tokens": state.get("tokens"),
@@ -380,6 +452,10 @@ _MIGRATIONS: dict[int, str] = {
         tokens_json TEXT,
         projection_revision INTEGER NOT NULL
     );
+    """,
+    2: """
+    ALTER TABLE run_projections
+        ADD COLUMN unread_event_seq INTEGER NOT NULL DEFAULT 0;
     """,
 }
 
@@ -479,8 +555,8 @@ class SQLiteEventStore:
                 "INSERT OR IGNORE INTO run_projections "
                 "(run_id, current_turn_json, tasks_json, session_meta_json, "
                 "pending_requests_json, composer_messages_json, "
-                "disposition_counts_json, projection_revision) "
-                "VALUES (?, '{}', '[]', '{}', '{}', '[]', '{}', 0)",
+                "disposition_counts_json, unread_event_seq, projection_revision) "
+                "VALUES (?, '{}', '[]', '{}', '{}', '[]', '{}', 0, 0)",
                 (run_id,),
             )
 
@@ -503,30 +579,53 @@ class SQLiteEventStore:
         raw_seq = int(raw["seq"])
         if self.has_disposition(run_id, raw_seq):
             raise ValueError(f"raw sequence {raw_seq} is already materialized")
-        result = reducer.apply_raw(raw)
-        received_at = str(raw.get("received_at") or "")
-        normalized = result.normalized
-        with self.connection() as connection:
-            connection.execute("BEGIN IMMEDIATE")
-            connection.execute(
-                "INSERT INTO dispositions "
-                "(run_id, raw_seq, disposition, normalized_kind, normalized_json, "
-                "normalizer_version, created_at) VALUES (?, ?, ?, ?, ?, ?, ?)",
-                (
-                    run_id,
-                    raw_seq,
-                    normalized["disposition"],
-                    normalized["kind"],
-                    _json_bytes(normalized),
-                    reducer.normalizer_version,
-                    received_at,
-                ),
-            )
-            self._persist_events(connection, run_id, result, received_at)
-            self._persist_patches(connection, run_id, result, received_at)
-            self._persist_projections(connection, run_id, reducer)
-            self._persist_cursor(connection, run_id, result, reducer)
+        try:
+            with self.connection() as connection:
+                connection.execute("BEGIN IMMEDIATE")
+                result = reducer.apply_raw(raw)
+                received_at = str(raw.get("received_at") or "")
+                normalized = result.normalized
+                connection.execute(
+                    "INSERT INTO dispositions "
+                    "(run_id, raw_seq, disposition, normalized_kind, normalized_json, "
+                    "normalizer_version, created_at) VALUES (?, ?, ?, ?, ?, ?, ?)",
+                    (
+                        run_id,
+                        raw_seq,
+                        normalized["disposition"],
+                        normalized["kind"],
+                        _json_bytes(normalized),
+                        reducer.normalizer_version,
+                        received_at,
+                    ),
+                )
+                self._persist_events(connection, run_id, result, received_at)
+                self._persist_patches(connection, run_id, result, received_at)
+                self._persist_projections(connection, run_id, reducer, result)
+                self._persist_cursor(connection, run_id, result, reducer)
+        except Exception:
+            self._restore_reducer_from_committed_rows(run_id, reducer)
+            raise
         return result
+
+    def _restore_reducer_from_committed_rows(
+        self,
+        run_id: str,
+        reducer: EventReducerAdapter,
+    ) -> None:
+        clean = EventReducerAdapter(
+            reducer.provider,
+            normalizer_version=reducer.normalizer_version,
+        )
+        with self.connection(read_only=True) as connection:
+            rows = connection.execute(
+                "SELECT normalized_json FROM dispositions WHERE run_id = ? "
+                "ORDER BY raw_seq",
+                (run_id,),
+            ).fetchall()
+        for (normalized_json,) in rows:
+            clean.apply_normalized_row(json.loads(normalized_json))
+        reducer.replace_with(clean)
 
     def _persist_events(
         self,
@@ -640,13 +739,15 @@ class SQLiteEventStore:
         connection: sqlite3.Connection,
         run_id: str,
         reducer: EventReducerAdapter,
+        result: ReducerResult,
     ) -> None:
         projection = reducer.projection_json()
         connection.execute(
             "UPDATE run_projections SET current_turn_json = ?, tasks_json = ?, "
             "pr_json = ?, session_meta_json = ?, pending_requests_json = ?, "
             "composer_messages_json = ?, disposition_counts_json = ?, tokens_json = ?, "
-            "projection_revision = projection_revision + 1 WHERE run_id = ?",
+            "unread_event_seq = ?, projection_revision = projection_revision + 1 "
+            "WHERE run_id = ?",
             (
                 _json_bytes(projection["current_turn"]),
                 _json_bytes(projection["tasks"]),
@@ -656,6 +757,7 @@ class SQLiteEventStore:
                 _json_bytes(projection["composer_messages"]),
                 _json_bytes(projection["disposition_counts"]),
                 _json_bytes(projection["tokens"]) if projection["tokens"] is not None else None,
+                int(projection["unread_event_seq"]),
                 run_id,
             ),
         )
@@ -676,7 +778,7 @@ class SQLiteEventStore:
             "COALESCE(MAX(event_id) + 1, 0) FROM events WHERE run_id = ?",
             (run_id,),
         ).fetchone()
-        change_cursor = int(reducer.state.get("cursor", 0))
+        change_cursor = result.change_cursor
         patch_base = connection.execute(
             "SELECT COALESCE(MIN(change_cursor), 0) FROM patches WHERE run_id = ?",
             (run_id,),
@@ -749,7 +851,8 @@ class SQLiteEventStore:
                 "projections": connection.execute(
                     "SELECT current_turn_json, tasks_json, pr_json, session_meta_json, "
                     "pending_requests_json, composer_messages_json, "
-                    "disposition_counts_json, tokens_json, projection_revision "
+                    "disposition_counts_json, tokens_json, unread_event_seq, "
+                    "projection_revision "
                     "FROM run_projections WHERE run_id = ?",
                     (run_id,),
                 ).fetchall(),
