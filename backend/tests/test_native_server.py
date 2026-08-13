@@ -40,17 +40,26 @@ class NofileLimitTests(unittest.TestCase):
         self.assertEqual(getrlimit.call_count, 2)
         self.assertIn("RLIMIT_NOFILE soft=10240 hard=10240", stderr.getvalue())
 
-    def test_raise_nofile_limit_caps_darwin_infinity_at_open_max(self) -> None:
+    def test_raise_nofile_limit_uses_darwin_maxfilesperproc(self) -> None:
+        actual_maxfiles = int(
+            native_server.subprocess.check_output(
+                ["/usr/sbin/sysctl", "-n", "kern.maxfilesperproc"],
+                text=True,
+            ).strip()
+        )
+        expected_soft = min(
+            native_server.resource.RLIM_INFINITY, actual_maxfiles
+        )
         with patch.object(
             native_server.sys, "platform", "darwin"
         ), patch.object(
-            native_server.os, "sysconf", return_value=10240
-        ), patch.object(
+            native_server.os, "sysconf", return_value=256
+        ) as sysconf, patch.object(
             native_server.resource,
             "getrlimit",
             side_effect=[
                 (256, native_server.resource.RLIM_INFINITY),
-                (10240, native_server.resource.RLIM_INFINITY),
+                (expected_soft, native_server.resource.RLIM_INFINITY),
             ],
         ), patch.object(
             native_server.resource, "setrlimit"
@@ -59,12 +68,16 @@ class NofileLimitTests(unittest.TestCase):
         ) as stderr:
             result = native_server.raise_nofile_limit()
 
-        self.assertEqual(result, (10240, native_server.resource.RLIM_INFINITY))
+        self.assertGreater(expected_soft, 256)
+        self.assertEqual(
+            result, (expected_soft, native_server.resource.RLIM_INFINITY)
+        )
         setrlimit.assert_called_once_with(
             native_server.resource.RLIMIT_NOFILE,
-            (10240, native_server.resource.RLIM_INFINITY),
+            (expected_soft, native_server.resource.RLIM_INFINITY),
         )
-        self.assertIn("RLIMIT_NOFILE soft=10240", stderr.getvalue())
+        sysconf.assert_not_called()
+        self.assertIn(f"RLIMIT_NOFILE soft={expected_soft}", stderr.getvalue())
 
     def test_raise_nofile_limit_logs_and_survives_set_failure(self) -> None:
         with patch.object(

@@ -51,6 +51,19 @@ DAEMON_LOG_BACKUPS = 5
 _LOG_REDIRECT_LOCK = threading.Lock()
 
 
+def _darwin_nofile_ceiling(hard: int) -> int:
+    try:
+        raw_limit = subprocess.check_output(
+            ["/usr/sbin/sysctl", "-n", "kern.maxfilesperproc"],
+            stderr=subprocess.DEVNULL,
+            text=True,
+        )
+        maxfiles_per_process = int(raw_limit.strip())
+    except (OSError, ValueError, subprocess.SubprocessError):
+        return hard
+    return min(hard, maxfiles_per_process)
+
+
 def raise_nofile_limit() -> tuple[int, int]:
     """Raise the soft file-descriptor limit and report the resulting limits."""
 
@@ -63,12 +76,7 @@ def raise_nofile_limit() -> tuple[int, int]:
 
     target_soft = hard
     if sys.platform == "darwin":
-        try:
-            open_max = os.sysconf("SC_OPEN_MAX")
-        except (OSError, ValueError):
-            open_max = hard
-        if open_max > 0:
-            target_soft = min(hard, open_max)
+        target_soft = _darwin_nofile_ceiling(hard)
 
     if soft < target_soft:
         try:
