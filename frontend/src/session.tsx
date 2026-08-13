@@ -154,6 +154,7 @@ import {
   updatePendingUserMessage,
   useTranscriptSession,
   type PendingUserMessage,
+  type TranscriptTarget,
   type TranscriptSession,
 } from "./transcript-store";
 import {
@@ -2887,6 +2888,7 @@ export function SessionTab({
   ticket,
   subagent,
   archivedAt,
+  runId,
   showComposer = true,
   onInspect,
   onArtifactsChange,
@@ -2897,6 +2899,7 @@ export function SessionTab({
   ticket: string;
   subagent?: string;
   archivedAt?: string;
+  runId?: string;
   showComposer?: boolean;
   onInspect?: (agentId: string) => void;
   onArtifactsChange?: (events: SessionEvent[]) => void;
@@ -2904,7 +2907,7 @@ export function SessionTab({
   onOpenArtifact?: (event: SessionEvent) => void;
   stateKey?: string;
 }) {
-  const resetKey = `${ticket}:${subagent ?? ""}:${archivedAt ?? ""}`;
+  const resetKey = `${ticket}:${subagent ?? ""}:${archivedAt ?? ""}:${runId ?? ""}`;
   const sessionStateKey = `${stateKey ?? resetKey}:${resetKey}`;
   const rowHeightsKeyRef = useRef(resetKey);
   const rowHeightsRef = useRef<Map<number, RowMeasurement>>(new Map());
@@ -2937,12 +2940,12 @@ export function SessionTab({
   const target = useMemo(
     () =>
       subagent
-        ? { ticket, subagent }
-        : archivedAt
-          ? { ticket, archivedAt }
-          : { ticket },
-    [archivedAt, subagent, ticket]
-  );
+        ? { mode: "live" as const, ticket, subagent }
+        : archivedAt && runId
+          ? { mode: "archive" as const, ticket, archivedAt, runId }
+          : { mode: "live" as const, ticket },
+    [archivedAt, runId, subagent, ticket]
+  ) satisfies TranscriptTarget;
   const visible = useElementVisible(containerNode);
   const { session, pendingUserMessages, error, refreshError, loading } = useTranscriptSession(target, visible);
   const [retrying, setRetrying] = useState(false);
@@ -3282,13 +3285,13 @@ export function SessionTab({
     setLoadingOlder(true);
     setOlderError(null);
     try {
-      await loadOlderEvents(ticket, session.base, 500);
+      await loadOlderEvents(target, session.base, 500);
     } catch (loadError) {
       setOlderError(loadError instanceof Error ? loadError.message : "Could not load older events");
     } finally {
       setLoadingOlder(false);
     }
-  }, [loadingOlder, session, ticket]);
+  }, [loadingOlder, session, target]);
 
   useLayoutEffect(() => {
     const el = ref.current;
@@ -4942,12 +4945,8 @@ export type SidebarTarget = {
   model?: string | null;
   pr?: string | null;
   canReview?: boolean;
-  // WIKI-229: reserved for per-archive selection when a ticket has
-  // multiple archives. Threaded end-to-end (SidebarTarget → SessionTab →
-  // TranscriptTarget → getAgentSession → /session?archived_at=…) but not
-  // set in this PR — the backend route currently returns the newest
-  // archive regardless, and WIKI-229 delivers the discriminated route.
   archivedAt?: string;
+  runId?: string;
 };
 
 export function SessionSidebar({
@@ -5060,6 +5059,7 @@ export function SessionSidebar({
           showComposer={false}
           ticket={worker.ticket}
           archivedAt={worker.archivedAt}
+          runId={worker.runId}
         />
       </div>
     </aside>

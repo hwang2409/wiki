@@ -18,14 +18,15 @@ import { mergeQueueSources, mergeSession, prependOlderEvents } from "./transcrip
 
 const POLL_MS = 2500;
 
-export type TranscriptTarget = {
-  ticket: string;
-  subagent?: string;
-  // When set, selects a specific archived session for this ticket. Without
-  // it the backend returns the newest archive — wrong for older history
-  // rows. See getAgentSession + agents.tsx renderHistoryRow.
-  archivedAt?: string;
-};
+export type TranscriptTarget =
+  | { mode: "live"; ticket: string; subagent?: string; archivedAt?: never }
+  | {
+      mode: "archive";
+      ticket: string;
+      subagent?: never;
+      archivedAt: string;
+      runId: string;
+    };
 
 export type TranscriptSession = {
   format: AgentSessionData["format"];
@@ -180,7 +181,7 @@ export function clearInlineArtifactStates(sessionKey: string) {
 }
 
 function targetKey(target: TranscriptTarget): string {
-  return `${target.ticket}::${target.subagent ?? ""}::${target.archivedAt ?? ""}`;
+  return `${target.ticket}::${target.subagent ?? ""}::${target.mode === "archive" ? target.archivedAt : ""}`;
 }
 
 function createEntry(target: TranscriptTarget): Entry {
@@ -284,17 +285,25 @@ function setPollerState() {
 async function loadTarget(target: TranscriptTarget, cursor: number, path?: string): Promise<AgentSessionData> {
   return target.subagent
     ? getSubagentSession(target.ticket, target.subagent, cursor, path)
-    : getAgentSession(target.ticket, cursor, path, target.archivedAt);
+    : getAgentSession(
+        target.ticket,
+        cursor,
+        path,
+        target.mode === "archive" ? target.archivedAt : undefined,
+        target.mode === "archive" ? target.runId : undefined,
+      );
 }
 
-export async function loadOlderEvents(ticket: string, before: number, count = 500): Promise<void> {
-  const entry = getEntry({ ticket });
-  const result = await getAgentOlderSession(ticket, before, count);
+export async function loadOlderEvents(target: TranscriptTarget, before: number, count = 500): Promise<void> {
+  const entry = getEntry(target);
+  const archivedAt = target.mode === "archive" ? target.archivedAt : undefined;
+  const runId = target.mode === "archive" ? target.runId : undefined;
+  const result = await getAgentOlderSession(target.ticket, before, count, archivedAt, runId);
   const current = entry.snapshot.session;
   if (!current || current.path !== result.path || current.base !== before) return;
   const merged = prependOlderEvents(current, result, before);
   if (!merged) {
-    const reset = await getAgentSession(ticket, 0);
+    const reset = await loadTarget(target, 0);
     const latest = entry.snapshot.session;
     if (!latest || latest.path !== current.path || latest.base !== before) return;
     entry.snapshot = {
@@ -504,7 +513,7 @@ export function addPendingUserMessage(
   ticket: string,
   message: Pick<PendingUserMessage, "id" | "text" | "mode">,
 ) {
-  const entry = getEntry({ ticket });
+  const entry = getEntry({ mode: "live", ticket });
   const events = entry.snapshot.session?.events ?? [];
   const eventIdFloor = events.length > 0 ? events[events.length - 1].id : -1;
   const pending: PendingUserMessage = {
@@ -525,7 +534,7 @@ export function updatePendingUserMessage(
   id: string,
   update: Partial<Pick<PendingUserMessage, "status" | "error">>,
 ) {
-  const entry = getEntry({ ticket });
+  const entry = getEntry({ mode: "live", ticket });
   let changed = false;
   const pendingUserMessages = entry.snapshot.pendingUserMessages.map((message) => {
     if (message.id !== id) return message;
@@ -538,7 +547,7 @@ export function updatePendingUserMessage(
 }
 
 export function retryPendingUserMessage(ticket: string, id: string) {
-  const entry = getEntry({ ticket });
+  const entry = getEntry({ mode: "live", ticket });
   const events = entry.snapshot.session?.events ?? [];
   const eventIdFloor = events.length > 0 ? events[events.length - 1].id : -1;
   let changed = false;
@@ -559,7 +568,7 @@ export function retryPendingUserMessage(ticket: string, id: string) {
 }
 
 export function removePendingUserMessage(ticket: string, id: string) {
-  const entry = getEntry({ ticket });
+  const entry = getEntry({ mode: "live", ticket });
   const pendingUserMessages = entry.snapshot.pendingUserMessages.filter((message) => message.id !== id);
   if (pendingUserMessages.length === entry.snapshot.pendingUserMessages.length) return;
   entry.snapshot = { ...entry.snapshot, pendingUserMessages };

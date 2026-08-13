@@ -68,6 +68,7 @@ const orchestrators = [orchestrator("wiki"), orchestrator("phoebe")];
 const archivedWorker: ArchivedWorker = {
   ticket: "WIKI-ARCHIVED",
   archived_at: "2026-08-01T00:00:00Z",
+  run_id: "run-WIKI-ARCHIVED",
   kind: "cdx",
   role: "implement",
   model: "gpt-5.6-luna",

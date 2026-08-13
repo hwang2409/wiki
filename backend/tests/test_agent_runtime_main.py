@@ -936,7 +936,8 @@ class HeadlessMainRouteTests(unittest.IsolatedAsyncioTestCase):
         wiki_entries = [entry for entry in entries if entry["ticket"] == "WIKI-42"]
         self.assertEqual(len(wiki_entries), 2)
         older_at = min(entry["archived_at"] for entry in wiki_entries)
-        selected = main._archive_hint("WIKI-42", archived_at=older_at)
+        older_run_id = next(entry["run_id"] for entry in wiki_entries if entry["archived_at"] == older_at)
+        selected = main._archive_hint("WIKI-42", archived_at=older_at, run_id=older_run_id)
         self.assertEqual(selected[2], older)
         self.assertNotIn(
             partial,
@@ -944,8 +945,14 @@ class HeadlessMainRouteTests(unittest.IsolatedAsyncioTestCase):
         )
         # A stale archived_at returns nothing so the endpoint 404s instead
         # of silently loading the wrong session.
-        missing = main._archive_hint("WIKI-42", archived_at="1999-01-01T00:00:00+00:00")
+        missing = main._archive_hint(
+            "WIKI-42",
+            archived_at="1999-01-01T00:00:00+00:00",
+            run_id=older_run_id,
+        )
         self.assertEqual(missing, (None, None, None))
+        mismatched = main._archive_hint("WIKI-42", archived_at=older_at, run_id="new-run")
+        self.assertEqual(mismatched, (None, None, None))
 
     async def test_session_archived_at_selects_replaced_archive_with_current_run(self) -> None:
         self._seed_headless()
@@ -990,10 +997,95 @@ class HeadlessMainRouteTests(unittest.IsolatedAsyncioTestCase):
         )
         archived_at = main._archive_hint("WIKI-42")[1]
 
-        session = main.agent_session("WIKI-42", archived_at=archived_at)
+        session = main.agent_session("WIKI-42", archived_at=archived_at, run_id=archived_run_id)
 
         self.assertEqual(session["path"], str(session_dir / "events.jsonl"))
         self.assertEqual(session["provider"], "codex")
+
+    async def test_archived_session_identity_survives_live_replacement_and_older_page(self) -> None:
+        self._seed_headless()
+        archive_dir = self.archive_dir / "WIKI-42"
+        older = archive_dir / "20260729-000000"
+        newer = archive_dir / "20260730-000000"
+        for session_dir, run_id, text in (
+            (older, "old-run", "older archive"),
+            (newer, "new-run", "newer archive"),
+        ):
+            session_dir.mkdir(parents=True)
+            (session_dir / "run.json").write_text(
+                json.dumps({"run_id": run_id, "provider": "codex", "model": "gpt-5.4"}),
+                encoding="utf-8",
+            )
+            (session_dir / "meta.json").write_text(
+                json.dumps({"worker": {"kind": "cdx"}}),
+                encoding="utf-8",
+            )
+            (session_dir / "events.jsonl").write_text(
+                "".join(
+                    json.dumps(
+                        {
+                            "seq": index,
+                            "kind": "item_completed",
+                            "disposition": "rendered",
+                            "payload": {
+                                "method": "item/completed",
+                                "params": {
+                                    "item": {"type": "agentMessage", "text": f"{text} {index}"}
+                                },
+                            },
+                        }
+                    )
+                    + "\n"
+                    for index in range(1, 4)
+                ),
+                encoding="utf-8",
+            )
+            (session_dir / "raw.jsonl").write_text("raw\n", encoding="utf-8")
+            commit_archive(session_dir, run_id=run_id, completed_at="2026-07-30T00:00:00Z")
+
+        wiki_entries = [
+            entry
+            for entry in main.list_archived(limit=None, latest_per_ticket=False)
+            if entry["ticket"] == "WIKI-42"
+        ]
+        older_entry = min(wiki_entries, key=lambda entry: entry["archived_at"])
+        older_at = older_entry["archived_at"]
+        older_run_id = older_entry["run_id"]
+        self.assertIsNotNone(older_at)
+        newest_transcript = self.root / "newest-live.jsonl"
+        newest_transcript.write_text("newest live transcript\n", encoding="utf-8")
+        with mock.patch.object(main.transcripts, "TAIL_WINDOW_EVENTS", 2):
+            with mock.patch.dict(
+                main._session_paths,
+                {"WIKI-42": ("codex", newest_transcript)},
+                clear=True,
+            ):
+                session = main.agent_session(
+                    "WIKI-42", archived_at=older_at, run_id=older_run_id
+                )
+                older_page = main.agent_session_older(
+                    "WIKI-42",
+                    before=session["base"],
+                    count=500,
+                    archived_at=older_at,
+                    run_id=older_run_id,
+                )
+
+        self.assertEqual(session["path"], str(older / "events.jsonl"))
+        self.assertEqual([event["text"] for event in session["events"]], ["older archive 2", "older archive 3"])
+        self.assertEqual(older_page["path"], str(older / "events.jsonl"))
+        self.assertEqual([event["text"] for event in older_page["events"]], ["older archive 1"])
+
+        with self.assertRaises(HTTPException) as missing:
+            main.agent_session(
+                "WIKI-42",
+                archived_at="2026-07-28T00:00:00+00:00",
+                run_id=older_run_id,
+            )
+        self.assertEqual(missing.exception.status_code, 404)
+        with self.assertRaises(HTTPException) as mismatch:
+            main.agent_session("WIKI-42", archived_at=older_at, run_id="wrong-run")
+        self.assertEqual(mismatch.exception.status_code, 404)
 
     async def test_agents_reconciles_leaves_matching_run_id_alone(self) -> None:
         # Notice recorded the live run_id; nothing to reconcile away.

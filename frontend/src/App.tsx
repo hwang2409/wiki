@@ -82,7 +82,7 @@ import {
 } from "./file-workspaces";
 import { SettingsModal, applyStoredFonts } from "./settings";
 import { ActivityFeed } from "./activity";
-import { AgentsSidebar, AgentsView, type AccountEvent } from "./agents";
+import { AgentsSidebar, AgentsView, type AccountEvent, type AgentOpenTarget } from "./agents";
 import { isAgentRefreshEvent, isAgentTopologyEvent } from "./agent-events";
 import {
   AgentSessionView,
@@ -1397,7 +1397,7 @@ export default function App() {
   const [isSaving, setIsSaving] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [theme, setTheme] = useState<ThemeId>(() => getStoredTheme());
-  const [agentsOpenTicket, setAgentsOpenTicket] = useState<string | null>(null);
+  const [agentsOpenTicket, setAgentsOpenTicket] = useState<AgentOpenTarget | null>(null);
   const viewContentRef = useRef<HTMLDivElement | null>(null);
   const terminalControllersRef = useRef(new Map<string, TerminalPaneController>());
   const openTerminalIdsRef = useRef<Set<string>>(new Set());

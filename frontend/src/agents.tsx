@@ -66,6 +66,10 @@ export const DEFAULT_WORKDIR = "/Users/henry/me/fun/wiki";
 const REASONING_EFFORTS: SpawnWorkerEffort[] = ["minimal", "low", "medium", "high", "xhigh"];
 const DEAD_RUN_COPY = "adapter detached — archive to reset";
 
+export type AgentOpenTarget =
+  | string
+  | { kind: "archive"; ticket: string; archivedAt: string; runId: string };
+
 type HeadlessAgentState = {
   run_id?: string | null;
   control_attached?: boolean;
@@ -1230,8 +1234,8 @@ export function AgentsView({
   workspaceRootReady?: boolean;
   onOpenAgent: (ticket: string, panel?: "review") => void;
   refreshTick: number;
-  openTicket: string | null;
-  onOpenTicket: (ticket: string | null) => void;
+  openTicket: AgentOpenTarget | null;
+  onOpenTicket: (target: AgentOpenTarget | null) => void;
 }) {
   const [fetchedWorkers, setFetchedWorkers] = useState<AgentWorker[] | null>(null);
   const [fetchedOrchestrators, setFetchedOrchestrators] = useState<Orchestrator[]>([]);
@@ -1269,15 +1273,6 @@ export function AgentsView({
   const menuButtonRefs = useRef(new Map<string, HTMLButtonElement>());
   const previousOpenMenuRef = useRef<string | null>(null);
   const closeReasonRef = useRef<"escape" | "pointer" | null>(null);
-  // Per-archive selection is WIKI-229: the backend session route currently
-  // prefers a live run for the same ticket and consults a ticket-only
-  // transcript-path cache before the archived_at hint, so promising a
-  // specific archive here would be a false affordance. The stable
-  // (ticket, archived_at) identifier still rides through SidebarTarget →
-  // SessionTab → getAgentSession → /session?archived_at=… so WIKI-229 can
-  // switch on it once the route is discriminated; until then history rows
-  // open the ticket's transcript view (as they did pre-WIKI-154).
-
   useEffect(() => {
     if (
       openMenuTicket === null &&
@@ -1404,24 +1399,45 @@ export function AgentsView({
     }
   }, [archivePending, orchestrators, workers]);
 
-  const openOrch = orchestrators.find((orch) => orch.id === openTicket);
+  const openTicketId = typeof openTicket === "string" ? openTicket : openTicket?.ticket ?? null;
+  const openArchiveAt = openTicket && typeof openTicket === "object" ? openTicket.archivedAt : null;
+  const openArchiveRunId = openTicket && typeof openTicket === "object" ? openTicket.runId : null;
+  const openOrch = typeof openTicket === "string"
+    ? orchestrators.find((orch) => orch.id === openTicket)
+    : undefined;
   const liveWorkers = workers ?? [];
-  const liveWorker = liveWorkers.find((worker) => worker.ticket === openTicket) ?? null;
-  // Per-archive selection lands with WIKI-229 (the backend route currently
-  // wins on any live run and consults a ticket-only transcript cache
-  // before archived_at). Until then a history click resolves to the first
-  // (newest) archive for the ticket — same behavior as before this PR.
-  const archivedWorker = archived.find((entry) => entry.ticket === openTicket) ?? null;
-  const openWorker: SidebarTarget | null = liveWorker
+  const liveWorker = typeof openTicket === "string"
+    ? liveWorkers.find((worker) => worker.ticket === openTicket) ?? null
+    : null;
+  const archivedWorker = openArchiveAt
+    ? archived.find(
+        (entry) =>
+          entry.ticket === openTicketId &&
+          entry.archived_at === openArchiveAt &&
+          entry.run_id === openArchiveRunId,
+      ) ?? null
+    : null;
+  const openWorker: SidebarTarget | null = archivedWorker
     ? {
-        ticket: liveWorker.ticket,
-        kind: liveWorker.kind,
-        role: liveWorker.role,
-        model: liveWorker.model,
-        pr: liveWorker.pr,
-        canReview: Boolean(liveWorker.pr),
+        ticket: archivedWorker.ticket,
+        kind: archivedWorker.kind,
+        role: archivedWorker.role,
+        model: archivedWorker.model,
+        pr: archivedWorker.pr,
+        canReview: Boolean(archivedWorker.pr),
+        archivedAt: archivedWorker.archived_at,
+        runId: archivedWorker.run_id ?? undefined,
       }
-    : openOrch
+    : liveWorker
+      ? {
+          ticket: liveWorker.ticket,
+          kind: liveWorker.kind,
+          role: liveWorker.role,
+          model: liveWorker.model,
+          pr: liveWorker.pr,
+          canReview: Boolean(liveWorker.pr),
+        }
+      : openOrch
       ? {
           ticket: openOrch.id,
           kind: openOrch.kind,
@@ -1430,15 +1446,6 @@ export function AgentsView({
           pr: null,
           canReview: false,
         }
-      : archivedWorker
-        ? {
-            ticket: archivedWorker.ticket,
-            kind: archivedWorker.kind,
-            role: archivedWorker.role,
-            model: archivedWorker.model,
-            pr: archivedWorker.pr,
-            canReview: Boolean(archivedWorker.pr),
-          }
         : null;
 
   const grouped = orchestrators.map((orch) => ({
@@ -1605,12 +1612,14 @@ export function AgentsView({
     // "View transcript" are the only default surface. Kind/role/model/step
     // and every technical field live behind the details disclosure.
     //
-    // Selecting a specific archive for a ticket with multiple entries is
-    // WIKI-229. Until the backend route is discriminated, all history rows
-    // for the same ticket open the same transcript (the newest, as this
-    // PR does), so per-row selection is deliberately not surfaced here.
     const key = `${entry.ticket}-${entry.archived_at}`;
-    const isOpen = openTicket === entry.ticket;
+    const isOpen =
+      openTicketId === entry.ticket &&
+      openArchiveAt === entry.archived_at &&
+      openArchiveRunId === entry.run_id;
+    const archiveTarget = entry.run_id
+      ? { kind: "archive" as const, ticket: entry.ticket, archivedAt: entry.archived_at, runId: entry.run_id }
+      : null;
     const detailsOpen = expandedDetails.has(key);
     return (
       <article
@@ -1619,7 +1628,11 @@ export function AgentsView({
         onClick={(event) => {
           const target = event.target as HTMLElement;
           if (target.closest("button, a, .agent-tech")) return;
-          onOpenTicket(isOpen ? null : entry.ticket);
+          onOpenTicket(
+            isOpen
+              ? null
+              : archiveTarget,
+          );
         }}
       >
         <header className="agent-card-header">
@@ -1642,7 +1655,13 @@ export function AgentsView({
             <button
               className="agent-primary-action"
               type="button"
-              onClick={() => onOpenTicket(isOpen ? null : entry.ticket)}
+              onClick={() =>
+                onOpenTicket(
+                  isOpen
+                    ? null
+                    : archiveTarget,
+                )
+              }
             >
               <ScrollText size={13} />
               View transcript
@@ -1822,9 +1841,9 @@ export function AgentsView({
           <span className="agents-orch-actions">
             {renderOrchPrimary()}
             <button
-              className={`agent-log-toggle${openTicket === orch.id ? " is-active" : ""}`}
+              className={`agent-log-toggle${openTicketId === orch.id ? " is-active" : ""}`}
               type="button"
-              onClick={() => onOpenTicket(openTicket === orch.id ? null : orch.id)}
+              onClick={() => onOpenTicket(openTicketId === orch.id ? null : orch.id)}
             >
               <ScrollText size={13} />
               session
@@ -1928,7 +1947,7 @@ export function AgentsView({
     const deadRun = isDeadRun(worker);
     const flag = healthFlag(worker);
     const state = stateLabel(worker);
-    const isOpen = openTicket === worker.ticket;
+    const isOpen = openTicketId === worker.ticket && openArchiveAt === null;
     const previewOpen = expandedScreencasts.has(worker.ticket);
     const detailsOpen = expandedDetails.has(worker.ticket);
     const menuOpen = openMenuTicket === worker.ticket;
