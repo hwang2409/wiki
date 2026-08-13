@@ -158,10 +158,48 @@ struct SidecarState {
     pid: u32,
     log_path: PathBuf,
     healthy_started: bool,
-    restart_count: u8,
-    healthy_since: Option<Instant>,
+    respawn: RespawnPolicy,
     shutting_down: bool,
     last_termination: Option<String>,
+}
+
+#[derive(Default)]
+struct RespawnPolicy {
+    attempts: u8,
+    healthy_since: Option<Instant>,
+}
+
+enum RespawnDecision {
+    Restart { attempt: u8, delay: Duration },
+    Suppressed,
+    GiveUp,
+}
+
+impl RespawnPolicy {
+    fn healthy(&mut self, now: Instant) {
+        self.healthy_since = Some(now);
+    }
+
+    fn next(&mut self, now: Instant, locks_available: bool) -> RespawnDecision {
+        if self
+            .healthy_since
+            .is_some_and(|started| now.duration_since(started) >= SIDECAR_SUSTAINED_UPTIME)
+        {
+            self.attempts = 0;
+        }
+        if !locks_available {
+            return RespawnDecision::Suppressed;
+        }
+        if self.attempts >= SIDECAR_RESPAWN_MAX_ATTEMPTS {
+            return RespawnDecision::GiveUp;
+        }
+        self.attempts += 1;
+        let attempt = self.attempts;
+        RespawnDecision::Restart {
+            attempt,
+            delay: SIDECAR_RESPAWN_BACKOFF * 2_u32.pow((attempt - 1) as u32),
+        }
+    }
 }
 
 enum SidecarAction {
@@ -344,8 +382,10 @@ fn start_sidecar(app: &AppHandle, restart_count: u8) -> Result<String, Box<dyn E
             pid,
             log_path: log_path.clone(),
             healthy_started: false,
-            restart_count,
-            healthy_since: None,
+            respawn: RespawnPolicy {
+                attempts: restart_count,
+                ..RespawnPolicy::default()
+            },
             shutting_down: false,
             last_termination: None,
         });
@@ -366,7 +406,7 @@ fn start_sidecar(app: &AppHandle, restart_count: u8) -> Result<String, Box<dyn E
         if let Some(sidecar) = state.sidecar.as_mut() {
             if sidecar.pid == pid {
                 sidecar.healthy_started = true;
-                sidecar.healthy_since = Some(Instant::now());
+                sidecar.respawn.healthy(Instant::now());
                 sidecar.last_termination = None;
             }
         }
@@ -526,22 +566,19 @@ fn handle_sidecar_termination(app: &AppHandle, pid: u32, summary: String) {
             return;
         }
 
-        if sidecar
-            .healthy_since
-            .is_some_and(|started| started.elapsed() >= SIDECAR_SUSTAINED_UPTIME)
+        match sidecar
+            .respawn
+            .next(Instant::now(), native_runtime_locks_available())
         {
-            sidecar.restart_count = 0;
-        }
-
-        if !native_runtime_locks_available() {
-            Some(SidecarAction::Suppressed(sidecar.log_path.clone()))
-        } else if sidecar.restart_count < SIDECAR_RESPAWN_MAX_ATTEMPTS {
-            let attempt = sidecar.restart_count + 1;
-            sidecar.restart_count = attempt;
-            let delay = SIDECAR_RESPAWN_BACKOFF * 2_u32.pow((attempt - 1) as u32);
-            Some(SidecarAction::Restart { attempt, delay })
-        } else {
-            Some(SidecarAction::ShowError(summary, sidecar.log_path.clone()))
+            RespawnDecision::Restart { attempt, delay } => {
+                Some(SidecarAction::Restart { attempt, delay })
+            }
+            RespawnDecision::Suppressed => {
+                Some(SidecarAction::Suppressed(sidecar.log_path.clone()))
+            }
+            RespawnDecision::GiveUp => {
+                Some(SidecarAction::ShowError(summary, sidecar.log_path.clone()))
+            }
         }
     };
 
@@ -616,9 +653,13 @@ fn handle_sidecar_termination(app: &AppHandle, pid: u32, summary: String) {
 fn native_runtime_locks_available() -> bool {
     // app.lock is held by this process for its lifetime. The shutdown flag
     // gates app exit; these two locks cover the swap and handover journal.
+    native_runtime_locks_available_in(&runtime_dir())
+}
+
+fn native_runtime_locks_available_in(runtime: &Path) -> bool {
     ["supervisor.lock", "daemon.transaction.lock"]
         .iter()
-        .all(|name| runtime_lock_is_free(&runtime_dir().join(name)))
+        .all(|name| runtime_lock_is_free(&runtime.join(name)))
 }
 
 fn runtime_lock_is_free(path: &Path) -> bool {
@@ -989,7 +1030,13 @@ fn request_graceful_shutdown(_pid: u32) {}
 #[cfg(test)]
 mod tests {
     use super::repo_dir_from_manifest_dir;
-    use std::path::Path;
+    use std::{
+        fs::OpenOptions,
+        os::fd::AsRawFd,
+        path::{Path, PathBuf},
+        process::{Child, Command},
+        time::Instant,
+    };
 
     #[test]
     fn sidecar_environment_excludes_origin_secret() {
@@ -1006,6 +1053,94 @@ mod tests {
         assert!(super::should_use_sidecar(true, false));
         assert!(super::should_use_sidecar(false, true));
         assert!(!super::should_use_sidecar(false, false));
+    }
+
+    fn stub_child() -> Child {
+        Command::new("/bin/sleep")
+            .arg("30")
+            .spawn()
+            .expect("spawn stub sidecar")
+    }
+
+    fn kill_stub(child: &mut Child) {
+        // Child::kill sends SIGKILL on Unix, matching the wedge failure.
+        child.kill().expect("kill stub sidecar with SIGKILL");
+        child.wait().expect("wait for killed stub sidecar");
+    }
+
+    fn temporary_runtime() -> PathBuf {
+        let path = std::env::temp_dir().join(format!(
+            "wiki-283-respawn-{}-{}",
+            std::process::id(),
+            Instant::now().elapsed().as_nanos()
+        ));
+        std::fs::create_dir(&path).expect("create respawn test runtime");
+        path
+    }
+
+    #[test]
+    fn respawn_harness_kills_stub_with_backoff_and_gives_up() {
+        let mut reset_policy = super::RespawnPolicy::default();
+        let healthy_at = Instant::now();
+        reset_policy.healthy(healthy_at);
+        assert!(matches!(
+            reset_policy.next(healthy_at + super::SIDECAR_SUSTAINED_UPTIME, true),
+            super::RespawnDecision::Restart { attempt: 1, .. }
+        ));
+
+        let mut policy = super::RespawnPolicy::default();
+        let mut child = stub_child();
+        let mut respawns = 0;
+        let mut delays = Vec::new();
+        loop {
+            kill_stub(&mut child);
+            let delay = match policy.next(Instant::now(), true) {
+                super::RespawnDecision::Restart { delay, .. } => delay,
+                super::RespawnDecision::GiveUp => break,
+                super::RespawnDecision::Suppressed => panic!("respawn unexpectedly suppressed"),
+            };
+            delays.push(delay);
+            std::thread::sleep(delay);
+            child = stub_child();
+            respawns += 1;
+        }
+        kill_stub(&mut child);
+
+        assert_eq!(respawns, 3);
+        assert_eq!(
+            delays,
+            vec![
+                super::SIDECAR_RESPAWN_BACKOFF,
+                super::SIDECAR_RESPAWN_BACKOFF * 2,
+                super::SIDECAR_RESPAWN_BACKOFF * 4,
+            ]
+        );
+    }
+
+    #[test]
+    fn respawn_harness_suppresses_during_swap_lock_window() {
+        let runtime = temporary_runtime();
+        let lock_path = runtime.join("supervisor.lock");
+        let lock = OpenOptions::new()
+            .create(true)
+            .read(true)
+            .write(true)
+            .open(&lock_path)
+            .expect("open supervisor lock");
+        assert_eq!(unsafe { libc::flock(lock.as_raw_fd(), libc::LOCK_EX) }, 0);
+
+        let mut policy = super::RespawnPolicy::default();
+        assert!(!super::native_runtime_locks_available_in(&runtime));
+        assert!(matches!(
+            policy.next(Instant::now(), false),
+            super::RespawnDecision::Suppressed
+        ));
+
+        unsafe {
+            libc::flock(lock.as_raw_fd(), libc::LOCK_UN);
+        }
+        drop(lock);
+        std::fs::remove_dir_all(runtime).expect("remove respawn test runtime");
     }
 
     #[test]
