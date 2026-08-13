@@ -10,7 +10,11 @@
 import { cleanup, render, waitFor } from "@testing-library/react";
 import { afterEach, beforeEach, describe, expect, test, vi } from "vitest";
 
-import { __resetAssetMetaForTests, MarkdownImage } from "../src/markdown-image";
+import {
+  __resetAssetMetaForTests,
+  assetMetaFromCache,
+  MarkdownImage,
+} from "../src/markdown-image";
 import * as cacheModule from "../src/thumbnail-cache";
 
 let resolveIdb: (record: cacheModule.ThumbnailRecord | null) => void;
@@ -95,7 +99,12 @@ describe("MarkdownImage race — U5", () => {
   test("network rejection removes stale hydrated metadata", async () => {
     cleanup();
     cacheModule.__resetThumbnailCacheForTests();
-    vi.mocked(cacheModule.readThumbnail).mockResolvedValue({
+    vi.mocked(globalThis.fetch).mockRejectedValue(new Error("offline"));
+
+    const view = render(<MarkdownImage src="stale.png" alt="stale" />);
+    // Finish every rejected network attempt before IDB hydration resolves.
+    await waitFor(() => expect(vi.mocked(globalThis.fetch)).toHaveBeenCalledTimes(3));
+    resolveIdb({
       path: "stale.png",
       mtimeMs: 50,
       width: 800,
@@ -103,13 +112,10 @@ describe("MarkdownImage race — U5", () => {
       previewBase64: "data:image/jpeg;base64,IDB-STALE",
       storedAt: 1_000_000,
     });
-    vi.mocked(globalThis.fetch).mockRejectedValue(new Error("offline"));
-
-    const view = render(<MarkdownImage src="stale.png" alt="stale" />);
-    await waitFor(() => expect(vi.mocked(globalThis.fetch)).toHaveBeenCalledTimes(3));
     await waitFor(() => {
       expect(view.container.querySelector(".markdown-image-preview")).toBeNull();
     });
+    expect(assetMetaFromCache("stale.png")).toBeUndefined();
     expect(cacheModule.readThumbnail).toHaveBeenCalledWith("stale.png");
   });
 });
