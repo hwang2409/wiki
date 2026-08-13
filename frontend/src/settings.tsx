@@ -127,6 +127,11 @@ export const AGENT_FONTS: FontChoice[] = ALL_FONTS;
 // surface of the app (WIKI-279). Legacy per-role keys are read once for
 // migration then deleted.
 const FONT_KEY = "wiki-font";
+// Resolved CSS stack for cross-document rendering (dashboard). Persisted so
+// the dashboard doesn't need to re-import the FontChoice pool to map a label
+// like "System" back to "-apple-system, ..." or synthesize an installed
+// family's fallback tail.
+const STACK_KEY = "wiki-font-stack";
 const WEIGHT_KEY = "wiki-font-weight";
 const SIZE_KEY = "wiki-font-size";
 const SIZE_DEFAULT = 14.5;
@@ -372,6 +377,12 @@ function weightLabel(weight: number): string {
 function applyFamilyEverywhere(choice: FontChoice) {
   const root = document.documentElement.style;
   for (const cssVar of FAMILY_VARS) root.setProperty(cssVar, choice.stack);
+  // Mirror the resolved stack for the dashboard document. Only write when
+  // the value changed — the ui-state mirror is idempotent but noisy writes
+  // still push bytes.
+  if (localStorage.getItem(STACK_KEY) !== choice.stack) {
+    localStorage.setItem(STACK_KEY, choice.stack);
+  }
 }
 
 function applyWeightEverywhere(weight: number | null) {

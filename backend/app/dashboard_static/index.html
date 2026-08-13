@@ -6,6 +6,15 @@
 <title>fleet dashboard</title>
 <style>
   :root {
+    /* WIKI-279: single font + single size for the whole app, dashboard
+       included. --font-single and --font-single-size are intentionally NOT
+       declared here — an undeclared custom property makes `var(--foo, X)`
+       use the fallback X (declaring it as `--foo: ;` would instead make
+       var() resolve to empty, disabling every fallback). The inline boot
+       script below hydrates them from /api/ui-state and every declaration
+       flips together; an unhydrated dashboard still renders with its
+       designed typography. */
+
     --paper: #f4efe4;
     --paper-2: #efe8d9;
     --ink: #171310;
@@ -50,9 +59,9 @@
   body {
     background: var(--paper);
     color: var(--ink);
-    font-family: ui-sans-serif, -apple-system, "SF Pro Text", "Helvetica Neue",
-                 Helvetica, Arial, sans-serif;
-    font-size: 14px;
+    font-family: var(--font-single, ui-sans-serif, -apple-system, "SF Pro Text", "Helvetica Neue",
+                 Helvetica, Arial, sans-serif);
+    font-size: var(--font-single-size, 14px);
     line-height: 1.5;
     -webkit-font-smoothing: antialiased;
     -moz-osx-font-smoothing: grayscale;
@@ -72,9 +81,9 @@
   /* ---------- masthead ---------- */
   .masthead { display: grid; gap: 6px; padding-bottom: 24px; border-bottom: 2px solid var(--ink); }
   .masthead-title {
-    font-family: ui-serif, "New York", "Iowan Old Style", "Charter", Georgia, serif;
+    font-family: var(--font-single, ui-serif, "New York", "Iowan Old Style", "Charter", Georgia, serif);
     font-weight: 500;
-    font-size: 38px;
+    font-size: var(--font-single-size, 38px);
     letter-spacing: -0.015em;
     line-height: 1.05;
     margin: 0;
@@ -84,7 +93,7 @@
     display: flex;
     align-items: baseline;
     gap: 14px;
-    font-size: 12px;
+    font-size: var(--font-single-size, 12px);
     color: var(--ink-3);
     text-transform: uppercase;
     letter-spacing: 0.14em;
@@ -126,20 +135,20 @@
     gap: 8px;
   }
   .rollup-name {
-    font-family: ui-serif, "New York", "Iowan Old Style", Georgia, serif;
-    font-size: 18px;
+    font-family: var(--font-single, ui-serif, "New York", "Iowan Old Style", Georgia, serif);
+    font-size: var(--font-single-size, 18px);
     font-weight: 500;
     letter-spacing: -0.005em;
     color: var(--ink);
   }
   .rollup-counts {
     display: flex; flex-wrap: wrap; gap: 12px 18px;
-    font-size: 12px;
+    font-size: var(--font-single-size, 12px);
     color: var(--ink-3);
   }
   .rollup-counts .num {
-    font-family: ui-monospace, "SF Mono", Menlo, monospace;
-    font-size: 13px;
+    font-family: var(--font-single, ui-monospace, "SF Mono", Menlo, monospace);
+    font-size: var(--font-single-size, 13px);
     color: var(--ink);
     margin-right: 4px;
   }
@@ -159,15 +168,15 @@
     border-bottom: 1px solid var(--rule-strong);
   }
   .section-title {
-    font-family: ui-serif, "New York", "Iowan Old Style", Georgia, serif;
-    font-size: 24px;
+    font-family: var(--font-single, ui-serif, "New York", "Iowan Old Style", Georgia, serif);
+    font-size: var(--font-single-size, 24px);
     font-weight: 500;
     letter-spacing: -0.01em;
     margin: 0;
     text-wrap: balance;
   }
   .section-note {
-    font-size: 11px;
+    font-size: var(--font-single-size, 11px);
     color: var(--ink-3);
     text-transform: uppercase;
     letter-spacing: 0.16em;
@@ -178,7 +187,7 @@
     width: 100%;
     border-collapse: collapse;
     margin-top: 12px;
-    font-size: 13px;
+    font-size: var(--font-single-size, 13px);
   }
   .grid th, .grid td {
     text-align: left;
@@ -186,7 +195,7 @@
     vertical-align: top;
   }
   .grid thead th {
-    font-size: 10px;
+    font-size: var(--font-single-size, 10px);
     font-weight: 600;
     text-transform: uppercase;
     letter-spacing: 0.18em;
@@ -207,24 +216,24 @@
   }
   .orch-band-label {
     display: flex; align-items: baseline; gap: 12px;
-    font-size: 10px;
+    font-size: var(--font-single-size, 10px);
     text-transform: uppercase;
     letter-spacing: 0.2em;
     color: var(--ink-2);
   }
   .orch-band-label .orch-name {
-    font-family: ui-serif, "New York", "Iowan Old Style", Georgia, serif;
+    font-family: var(--font-single, ui-serif, "New York", "Iowan Old Style", Georgia, serif);
     text-transform: none;
     letter-spacing: -0.005em;
-    font-size: 14px;
+    font-size: var(--font-single-size, 14px);
     font-weight: 500;
     color: var(--ink);
   }
   .orch-band-label .count { color: var(--ink-3); }
 
   .ticket-id {
-    font-family: ui-monospace, "SF Mono", Menlo, monospace;
-    font-size: 12px;
+    font-family: var(--font-single, ui-monospace, "SF Mono", Menlo, monospace);
+    font-size: var(--font-single-size, 12px);
     color: var(--ink);
     font-weight: 500;
     white-space: nowrap;
@@ -234,18 +243,18 @@
 
   .role-model {
     color: var(--ink-3);
-    font-size: 11px;
+    font-size: var(--font-single-size, 11px);
     text-transform: uppercase;
     letter-spacing: 0.1em;
     display: flex; gap: 8px; align-items: baseline;
     white-space: nowrap;
   }
   .role-model .model {
-    font-family: ui-monospace, "SF Mono", Menlo, monospace;
+    font-family: var(--font-single, ui-monospace, "SF Mono", Menlo, monospace);
     text-transform: none;
     letter-spacing: 0;
     color: var(--ink-2);
-    font-size: 11px;
+    font-size: var(--font-single-size, 11px);
   }
   .role-model .kind {
     display: inline-block;
@@ -253,9 +262,9 @@
     border-radius: 2px;
     background: color-mix(in oklab, var(--rule) 60%, transparent);
     color: var(--ink-2);
-    font-family: ui-monospace, "SF Mono", Menlo, monospace;
+    font-family: var(--font-single, ui-monospace, "SF Mono", Menlo, monospace);
     text-transform: uppercase;
-    font-size: 10px;
+    font-size: var(--font-single-size, 10px);
     letter-spacing: 0.08em;
   }
 
@@ -265,26 +274,26 @@
     overflow: hidden;
     text-overflow: ellipsis;
     white-space: nowrap;
-    font-size: 13px;
+    font-size: var(--font-single-size, 13px);
   }
   .step-cell.wrap { white-space: normal; text-wrap: pretty; }
   .blocker-line {
     color: var(--err);
-    font-size: 12px;
+    font-size: var(--font-single-size, 12px);
     margin-top: 4px;
   }
 
   .age-cell {
     color: var(--ink-3);
-    font-family: ui-monospace, "SF Mono", Menlo, monospace;
-    font-size: 12px;
+    font-family: var(--font-single, ui-monospace, "SF Mono", Menlo, monospace);
+    font-size: var(--font-single-size, 12px);
     white-space: nowrap;
   }
   .age-cell.is-stale { color: var(--warn); }
 
-  .pr-cell { white-space: nowrap; font-family: ui-monospace, "SF Mono", Menlo, monospace; font-size: 12px; }
+  .pr-cell { white-space: nowrap; font-family: var(--font-single, ui-monospace, "SF Mono", Menlo, monospace); font-size: var(--font-single-size, 12px); }
   .pr-cell .pr-num { color: var(--ink); font-weight: 500; }
-  .pr-cell .pr-repo { color: var(--ink-3); font-size: 11px; }
+  .pr-cell .pr-repo { color: var(--ink-3); font-size: var(--font-single-size, 11px); }
   .pr-cell.empty { color: var(--ink-4); }
 
   /* ---------- pills ---------- */
@@ -293,7 +302,7 @@
     align-items: center;
     padding: 2px 7px;
     border-radius: 3px;
-    font-size: 10.5px;
+    font-size: var(--font-single-size, 10.5px);
     font-weight: 600;
     text-transform: uppercase;
     letter-spacing: 0.1em;
@@ -331,8 +340,8 @@
     display: inline-block;
     margin-left: 6px;
     padding: 1px 6px;
-    font-size: 10.5px;
-    font-family: ui-monospace, "SF Mono", Menlo, monospace;
+    font-size: var(--font-single-size, 10.5px);
+    font-family: var(--font-single, ui-monospace, "SF Mono", Menlo, monospace);
     color: var(--ink-2);
     background: color-mix(in oklab, var(--rule) 55%, transparent);
     border-radius: 3px;
@@ -353,12 +362,12 @@
 
   .pr-extra {
     display: block;
-    font-size: 11px;
+    font-size: var(--font-single-size, 11px);
     color: var(--ink-3);
     margin-top: 2px;
   }
   .pr-extra a { border-bottom: none; }
-  .pr-stale { color: var(--warn); font-size: 10.5px; margin-left: 4px; }
+  .pr-stale { color: var(--warn); font-size: var(--font-single-size, 10.5px); margin-left: 4px; }
 
   /* Per-PR state chip — same pill component as the primary status,
      rendered next to each PR (primary + older) so a task row shows the
@@ -366,7 +375,7 @@
   .pr-primary-chip { margin-top: 4px; }
   .pr-chip { display: inline-flex; align-items: center; gap: 4px; }
   .pr-chip-detail {
-    font-size: 10.5px;
+    font-size: var(--font-single-size, 10.5px);
     color: var(--ink-3);
     letter-spacing: 0.02em;
   }
@@ -376,7 +385,7 @@
      single "4 older PRs" line the operator can click to expand. */
   .pr-older {
     margin-top: 6px;
-    font-size: 11.5px;
+    font-size: var(--font-single-size, 11.5px);
   }
   .pr-older-summary {
     cursor: pointer;
@@ -415,13 +424,13 @@
   /* ---------- ticket description ---------- */
   .desc-cell {
     color: var(--ink);
-    font-size: 13.5px;
+    font-size: var(--font-single-size, 13.5px);
     max-width: 520px;
     text-wrap: pretty;
   }
   .desc-cell .detail {
     display: block;
-    font-size: 12px;
+    font-size: var(--font-single-size, 12px);
     color: var(--ink-3);
     margin-top: 3px;
   }
@@ -429,7 +438,7 @@
     display: inline-block;
     margin-top: 4px;
     padding: 1px 6px;
-    font-size: 10.5px;
+    font-size: var(--font-single-size, 10.5px);
     text-transform: uppercase;
     letter-spacing: 0.12em;
     color: var(--ink-3);
@@ -456,7 +465,7 @@
   details.archived > summary::-webkit-details-marker { display: none; }
   details.archived > summary::after {
     content: "expand";
-    font-size: 10px;
+    font-size: var(--font-single-size, 10px);
     text-transform: uppercase;
     letter-spacing: 0.18em;
     color: var(--ink-3);
@@ -472,24 +481,24 @@
     gap: 16px;
     padding: 8px 0;
     border-bottom: 1px dashed var(--rule);
-    font-size: 13px;
+    font-size: var(--font-single-size, 13px);
     align-items: baseline;
   }
   .archived-row:last-child { border-bottom: none; }
   .archived-row .archived-ticket {
-    font-family: ui-monospace, "SF Mono", Menlo, monospace;
-    font-size: 12px;
+    font-family: var(--font-single, ui-monospace, "SF Mono", Menlo, monospace);
+    font-size: var(--font-single-size, 12px);
   }
   .archived-row .archived-step { color: var(--ink-2); text-wrap: pretty; }
   .archived-row .archived-orch {
-    font-size: 10.5px;
+    font-size: var(--font-single-size, 10.5px);
     text-transform: uppercase;
     letter-spacing: 0.14em;
     color: var(--ink-3);
   }
   .archived-row .archived-time {
-    font-family: ui-monospace, "SF Mono", Menlo, monospace;
-    font-size: 11px;
+    font-family: var(--font-single, ui-monospace, "SF Mono", Menlo, monospace);
+    font-size: var(--font-single-size, 11px);
     color: var(--ink-3);
   }
 
@@ -499,12 +508,12 @@
     text-align: center;
     color: var(--ink-3);
     font-style: italic;
-    font-family: ui-serif, "New York", Georgia, serif;
-    font-size: 15px;
+    font-family: var(--font-single, ui-serif, "New York", Georgia, serif);
+    font-size: var(--font-single-size, 15px);
   }
   .loading {
     display: inline-flex; align-items: center; gap: 6px;
-    color: var(--ink-3); font-size: 12px;
+    color: var(--ink-3); font-size: var(--font-single-size, 12px);
     text-transform: uppercase; letter-spacing: 0.18em;
   }
   .loading .dot {
@@ -520,18 +529,60 @@
     border-left: 3px solid var(--err);
     color: var(--err);
     border-radius: 0 var(--radius-sm) var(--radius-sm) 0;
-    font-size: 13px;
+    font-size: var(--font-single-size, 13px);
   }
 
   /* ---------- responsive ---------- */
   @media (max-width: 900px) {
     main { padding: 24px 20px 64px; }
-    .masthead-title { font-size: 30px; }
+    .masthead-title { font-size: var(--font-single-size, 30px); }
     .rollups { grid-template-columns: 1fr; }
     .desc-cell, .step-cell { max-width: none; }
     .step-cell { white-space: normal; }
   }
+
+  /* WIKI-279 boot guard: hide body until the ui-state fetch either sets the
+     single-font vars or times out. Without this the dashboard would paint
+     once in its fallback typography and once in the chosen font — the
+     flicker is loud on Georgia-picking users. The timeout (250ms) keeps a
+     backend outage from leaving the page invisible. */
+  body[data-font-boot="pending"] { visibility: hidden; }
 </style>
+<script>
+  (function () {
+    var body = null;
+    function unhide() {
+      (body || document.body || document.documentElement).removeAttribute("data-font-boot");
+    }
+    // Mark the body as pending as soon as it exists — before first paint.
+    document.addEventListener("DOMContentLoaded", function () {
+      body = document.body;
+      body.setAttribute("data-font-boot", "pending");
+    });
+    // Backstop: never keep the page hidden longer than 250ms even if
+    // /api/ui-state hangs or 500s. Bare-DOM > invisible dashboard.
+    setTimeout(unhide, 250);
+    fetch("/api/ui-state", { cache: "no-store" })
+      .then(function (r) { return r.ok ? r.json() : null; })
+      .then(function (payload) {
+        var entries = (payload && payload.entries) || {};
+        var stack = entries["wiki-font-stack"];
+        var size = entries["wiki-font-size"];
+        var style = document.documentElement.style;
+        if (typeof stack === "string" && stack.length > 0) {
+          style.setProperty("--font-single", stack);
+        }
+        if (typeof size === "string" && size.length > 0) {
+          var px = Number(size);
+          if (isFinite(px) && px >= 8 && px <= 40) {
+            style.setProperty("--font-single-size", px + "px");
+          }
+        }
+      })
+      .catch(function () { /* offline / 500 — fall back to designed stacks */ })
+      .finally(unhide);
+  })();
+</script>
 </head>
 <body>
 <main>
@@ -568,7 +619,7 @@
 
   <details class="archived" id="archived-details">
     <summary>
-      <span class="section-title" style="font-size: 20px;">Archived today <span id="archived-count" class="section-note"></span></span>
+      <span class="section-title" style="font-size: var(--font-single-size, 20px);">Archived today <span id="archived-count" class="section-note"></span></span>
     </summary>
     <div id="archived-body" class="archived-list"></div>
   </details>
