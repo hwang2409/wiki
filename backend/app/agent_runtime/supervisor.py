@@ -7,6 +7,7 @@ import logging
 import math
 import os
 import re
+import sqlite3
 import time
 import warnings
 from collections import OrderedDict
@@ -20,6 +21,7 @@ from uuid import NAMESPACE_URL, UUID, uuid4, uuid5
 
 from .. import accounts, provider_health
 from .command_log import AgentCommand, CommandConflict, CommandQueue, CommandRetryable
+from .event_store import EventReducerAdapter, SQLiteEventStore, runtime_event_db_path
 from .normalizer import NormalizedProviderEvent, normalize_provider_event
 from .process import (
     ProviderProcessStatus,
@@ -358,6 +360,11 @@ class Supervisor:
             raise ValueError("idempotency_cache_size must be positive")
         self.store = store
         self.adapter_factory = adapter_factory
+        self.event_store = SQLiteEventStore(runtime_event_db_path(store.paths.runtime_dir))
+        self.materializer_reducers: dict[str, EventReducerAdapter] = {}
+        self.materializer_latency_seconds: list[float] = []
+        self.materializer_queue_depth: dict[str, int] = {}
+        self.materializer_failures = 0
         self.pid_alive = pid_alive
         self.recovery_stability_seconds = recovery_stability_seconds
         self.approval_recovery_timeout_seconds = _validated_seconds(
@@ -506,6 +513,77 @@ class Supervisor:
             )
         except Exception:
             logger.exception("could not reconcile archived workgraph edges")
+
+    def materializer_metrics(self) -> dict[str, Any]:
+        latencies = self.materializer_latency_seconds
+        return {
+            "count": len(latencies),
+            "last_latency_seconds": latencies[-1] if latencies else 0.0,
+            "max_latency_seconds": max(latencies) if latencies else 0.0,
+            "queue_depth": dict(self.materializer_queue_depth),
+            "failures": self.materializer_failures,
+        }
+
+    def _materializer_for_record(self, record: RunRecord) -> EventReducerAdapter:
+        reducer = self.materializer_reducers.get(record.run_id)
+        if reducer is not None:
+            return reducer
+        self.event_store.create_run(
+            record.run_id,
+            agent_id=record.agent_id,
+            provider=record.provider,
+            created_at=record.created_at,
+            state=record.state,
+        )
+        reducer = EventReducerAdapter(record.provider)
+        self.event_store.restore_reducer(record.run_id, reducer)
+        self.materializer_reducers[record.run_id] = reducer
+        return reducer
+
+    def _dual_write_normalized(
+        self,
+        record: RunRecord,
+        raw: dict[str, Any],
+        normalized: NormalizedProviderEvent,
+        payload: dict[str, Any],
+        *,
+        append_legacy: bool = True,
+    ) -> None:
+        reducer = self._materializer_for_record(record)
+        raw_seq = int(raw["seq"])
+        if not self.event_store.has_disposition(record.run_id, raw_seq):
+            started = time.perf_counter()
+            self.materializer_queue_depth[record.run_id] = 0
+            try:
+                materialized = NormalizedProviderEvent(
+                    normalized.disposition,
+                    normalized.kind,
+                    payload,
+                    normalized.lifecycle_state,
+                )
+                self.event_store.materialize(
+                    record.run_id,
+                    raw,
+                    reducer,
+                    normalized=materialized,
+                )
+            except Exception:
+                self.materializer_failures += 1
+                raise
+            finally:
+                self.materializer_latency_seconds.append(
+                    time.perf_counter() - started
+                )
+                self.materializer_queue_depth[record.run_id] = 0
+        if append_legacy:
+            self.store.append_normalized(
+                record.run_id,
+                raw_seq=raw_seq,
+                disposition=normalized.disposition,
+                kind=normalized.kind,
+                payload=payload,
+                lifecycle_state=normalized.lifecycle_state,
+            )
 
     def _runtime_status(self, record: RunRecord) -> dict[str, Any]:
         value = _public_run(record)
@@ -720,13 +798,16 @@ Preserve the same identity, role, worktree, orchestrator grouping, PR gates, and
             payload=payload,
             generation=record.provider_generation,
         )
-        self.store.append_normalized(
-            record.run_id,
-            raw_seq=int(raw["seq"]),
-            disposition=EventDisposition.RENDERED,
-            kind="model_changed",
-            payload=payload,
-            lifecycle_state=record.state,
+        self._dual_write_normalized(
+            record,
+            raw,
+            NormalizedProviderEvent(
+                EventDisposition.RENDERED,
+                "model_changed",
+                payload,
+                record.state,
+            ),
+            payload,
         )
 
     def _codex_rotation_active(self) -> bool:
@@ -1058,15 +1139,19 @@ Preserve the same identity, role, worktree, orchestrator grouping, PR gates, and
             # A stopped transport cannot prove delivery for a matcher owned
             # by the resumed generation. Keep the raw event for audit, but
             # terminalize its normalization as ignored before text matching.
-            self.store.append_normalized(
-                run_id,
-                raw_seq=int(raw["seq"]),
-                disposition=EventDisposition.IGNORED,
-                kind="retired_generation_event",
-                payload={
-                    "event_generation": event.generation,
-                    "provider_generation": record_before_event.provider_generation,
-                },
+            retired_payload = {
+                "event_generation": event.generation,
+                "provider_generation": record_before_event.provider_generation,
+            }
+            self._dual_write_normalized(
+                record_before_event,
+                raw,
+                NormalizedProviderEvent(
+                    EventDisposition.IGNORED,
+                    "retired_generation_event",
+                    retired_payload,
+                ),
+                retired_payload,
             )
             await self._publish(
                 {
@@ -1130,13 +1215,11 @@ Preserve the same identity, role, worktree, orchestrator grouping, PR gates, and
                 pending_source = pending_message.get("source")
                 if isinstance(pending_source, str) and pending_source:
                     normalized_payload["source"] = pending_source
-        self.store.append_normalized(
-            run_id,
-            raw_seq=int(raw["seq"]),
-            disposition=normalized.disposition,
-            kind=normalized.kind,
-            payload=normalized_payload,
-            lifecycle_state=normalized.lifecycle_state,
+        self._dual_write_normalized(
+            record_before_event,
+            raw,
+            normalized,
+            normalized_payload,
         )
         if pending_message is not None:
             # The normalized row is the durable delivery proof. Do not make
@@ -2749,20 +2832,29 @@ Preserve the same identity, role, worktree, orchestrator grouping, PR gates, and
             # at or below the max and would be skipped forever by a
             # max-based cutoff (WIKI-232 REVIEW9 F2).
             try:
+                normalized_rows = list(self.store.iter_normalized_events(run_id))
                 normalized_seqs = {
-                    int(event.get("raw_seq", 0))
-                    for event in self.store.iter_normalized_events(run_id)
+                    int(event.get("raw_seq", 0)) for event in normalized_rows
                 }
             except RunNotFound:
+                normalized_rows = []
                 normalized_seqs = set()
             try:
-                orphans = [
-                    event
-                    for event in self.store.iter_raw_events(run_id)
-                    if int(event.get("seq", 0)) not in normalized_seqs
-                ]
+                raw_rows = list(self.store.iter_raw_events(run_id))
             except RunNotFound:
                 continue
+            try:
+                materialized_seqs = self.event_store.materialized_raw_seqs(run_id)
+            except (sqlite3.DatabaseError, ValueError):
+                materialized_seqs = set()
+            if not self.event_store.run_is_healthy(run_id):
+                materialized_seqs = set()
+            orphans = [
+                event
+                for event in raw_rows
+                if int(event.get("seq", 0)) not in normalized_seqs
+                or int(event.get("seq", 0)) not in materialized_seqs
+            ]
             if not orphans:
                 continue
             # Recover in raw order so downstream normalizers see the same
@@ -2779,22 +2871,37 @@ Preserve the same identity, role, worktree, orchestrator grouping, PR gates, and
                 # Reload after acquiring the lock so a normalize that landed
                 # while we were waiting is not double-processed here.
                 try:
+                    normalized_rows = list(self.store.iter_normalized_events(run_id))
                     normalized_seqs = {
-                        int(event.get("raw_seq", 0))
-                        for event in self.store.iter_normalized_events(run_id)
+                        int(event.get("raw_seq", 0)) for event in normalized_rows
                     }
                 except RunNotFound:
                     continue
+                try:
+                    materialized_seqs = self.event_store.materialized_raw_seqs(run_id)
+                except (sqlite3.DatabaseError, ValueError):
+                    materialized_seqs = set()
+                if not self.event_store.run_is_healthy(run_id):
+                    materialized_seqs = set()
                 for envelope in orphans:
                     orphan_seq = int(envelope.get("seq", 0))
-                    if orphan_seq in normalized_seqs:
+                    if orphan_seq in normalized_seqs and orphan_seq in materialized_seqs:
                         continue
                     appended = await self._recover_orphan_raw_event(
-                        run_id, envelope
+                        run_id,
+                        envelope,
+                        append_normalized=orphan_seq not in normalized_seqs,
+                        materialize=False,
                     )
                     if appended:
                         recovered_any = True
-                if recovered_any:
+                if recovered_any or materialized_seqs != {
+                    int(event.get("seq", 0)) for event in raw_rows
+                }:
+                    await self._rebuild_materializer_from_normalized(
+                        self.store.get(run_id),
+                        raw_rows,
+                    )
                     # Recovered orphans get appended after later normalized
                     # rows, so any projection built by walking normalized
                     # events in file order (lifecycle state,
@@ -2812,6 +2919,9 @@ Preserve the same identity, role, worktree, orchestrator grouping, PR gates, and
         self,
         run_id: str,
         envelope: dict[str, Any],
+        *,
+        append_normalized: bool = True,
+        materialize: bool = True,
     ) -> bool:
         """Replay one orphan raw event through the normalize + match path.
 
@@ -2831,16 +2941,31 @@ Preserve the same identity, role, worktree, orchestrator grouping, PR gates, and
             and raw_generation > 0
             and raw_generation < record.provider_generation
         ):
-            self.store.append_normalized(
-                run_id,
-                raw_seq=raw_seq,
-                disposition=EventDisposition.IGNORED,
-                kind="retired_generation_event",
-                payload={
+            retired_payload = {
                     "event_generation": raw_generation,
                     "provider_generation": record.provider_generation,
-                },
+            }
+            retired = NormalizedProviderEvent(
+                EventDisposition.IGNORED,
+                "retired_generation_event",
+                retired_payload,
             )
+            if materialize:
+                self._dual_write_normalized(
+                    record,
+                    envelope,
+                    retired,
+                    retired_payload,
+                    append_legacy=append_normalized,
+                )
+            elif append_normalized:
+                self.store.append_normalized(
+                    run_id,
+                    raw_seq=raw_seq,
+                    disposition=retired.disposition,
+                    kind=retired.kind,
+                    payload=retired_payload,
+                )
             return True
         direction = str(envelope.get("direction") or "provider")
         provider_value = str(envelope.get("provider") or "")
@@ -2904,14 +3029,23 @@ Preserve the same identity, role, worktree, orchestrator grouping, PR gates, and
                 pending_source = pending_message.get("source")
                 if isinstance(pending_source, str) and pending_source:
                     normalized_payload["source"] = pending_source
-        self.store.append_normalized(
-            run_id,
-            raw_seq=raw_seq,
-            disposition=normalized.disposition,
-            kind=normalized.kind,
-            payload=normalized_payload,
-            lifecycle_state=normalized.lifecycle_state,
-        )
+        if materialize:
+            self._dual_write_normalized(
+                record,
+                envelope,
+                normalized,
+                normalized_payload,
+                append_legacy=append_normalized,
+            )
+        elif append_normalized:
+            self.store.append_normalized(
+                run_id,
+                raw_seq=raw_seq,
+                disposition=normalized.disposition,
+                kind=normalized.kind,
+                payload=normalized_payload,
+                lifecycle_state=normalized.lifecycle_state,
+            )
         if matched_pending_id is not None:
             self.store.command_log.acknowledge_steer_for_pending(
                 run_id, matched_pending_id
@@ -2928,6 +3062,54 @@ Preserve the same identity, role, worktree, orchestrator grouping, PR gates, and
                 run_id, matched_pending_id
             )
         return True
+
+    async def _rebuild_materializer_from_normalized(
+        self,
+        record: RunRecord,
+        raw_rows: list[dict[str, Any]],
+    ) -> None:
+        normalized_rows = {
+            int(row["raw_seq"]): row
+            for row in self.store.iter_normalized_events(record.run_id)
+        }
+        self.event_store.reset_run(record.run_id)
+        self.event_store.create_run(
+            record.run_id,
+            agent_id=record.agent_id,
+            provider=record.provider,
+            created_at=record.created_at,
+            state=record.state,
+        )
+        reducer = EventReducerAdapter(record.provider)
+        for raw in sorted(raw_rows, key=lambda item: int(item["seq"])):
+            row = normalized_rows.get(int(raw["seq"]))
+            normalized = None
+            if row is not None:
+                disposition = row.get("disposition")
+                event_disposition = (
+                    EventDisposition.IGNORED
+                    if disposition in {"ignored", EventDisposition.IGNORED.value}
+                    else EventDisposition(str(disposition))
+                )
+                lifecycle_value = row.get("lifecycle_state")
+                lifecycle_state = (
+                    LifecycleState(str(lifecycle_value))
+                    if lifecycle_value is not None
+                    else None
+                )
+                normalized = NormalizedProviderEvent(
+                    event_disposition,
+                    str(row["kind"]),
+                    row.get("payload") if isinstance(row.get("payload"), dict) else {},
+                    lifecycle_state,
+                )
+            self.event_store.materialize(
+                record.run_id,
+                raw,
+                reducer,
+                normalized=normalized,
+            )
+        self.materializer_reducers[record.run_id] = reducer
 
     async def _reconcile_sending_steer_effects(self) -> None:
         """Resolve every steer effect left at status='sending' by a prior boot.
@@ -4600,7 +4782,7 @@ Preserve the same identity, role, worktree, orchestrator grouping, PR gates, and
     ) -> RunRecord:
         async with self._run_mutation_admission():
             async with self._run_lock(run_id):
-                record = self.store.mark_viewed(run_id, requested_seq)
+                self.store.mark_viewed(run_id, requested_seq)
                 await self._auto_archive_one_locked(run_id)
                 try:
                     return self.store.get(run_id)

@@ -161,9 +161,14 @@ class EventReducerAdapter:
         self._event_raw_seqs: dict[int, int] = {}
         self._change_cursor = 0
 
-    def apply_raw(self, raw: dict[str, Any]) -> ReducerResult:
+    def apply_raw(
+        self,
+        raw: dict[str, Any],
+        normalized: NormalizedProviderEvent | None = None,
+    ) -> ReducerResult:
         raw_seq = int(raw["seq"])
-        normalized = _normalize(raw)
+        if normalized is None:
+            normalized = _normalize(raw)
         received_at = str(raw.get("received_at") or "")
         row = {
             "seq": raw_seq,
@@ -570,11 +575,75 @@ class SQLiteEventStore:
                 is not None
             )
 
+    def materialized_raw_seqs(self, run_id: str) -> set[int]:
+        with self.connection(read_only=True) as connection:
+            rows = connection.execute(
+                "SELECT raw_seq FROM dispositions WHERE run_id = ?",
+                (run_id,),
+            ).fetchall()
+        return {int(row[0]) for row in rows}
+
+    def run_is_healthy(self, run_id: str) -> bool:
+        try:
+            with self.connection(read_only=True) as connection:
+                run = connection.execute(
+                    "SELECT 1 FROM runs WHERE run_id = ?", (run_id,)
+                ).fetchone()
+                if run is None:
+                    return True
+                cursor = connection.execute(
+                    "SELECT raw_seq, normalized_json FROM dispositions "
+                    "WHERE run_id = ? ORDER BY raw_seq",
+                    (run_id,),
+                )
+                for raw_seq, normalized_json in cursor:
+                    value = json.loads(normalized_json)
+                    if not isinstance(value, dict) or int(value["raw_seq"]) != int(
+                        raw_seq
+                    ):
+                        return False
+        except (sqlite3.DatabaseError, KeyError, TypeError, ValueError, json.JSONDecodeError):
+            return False
+        return True
+
+    def read_normalized_row(
+        self,
+        run_id: str,
+        raw_seq: int,
+    ) -> dict[str, Any] | None:
+        with self.connection(read_only=True) as connection:
+            row = connection.execute(
+                "SELECT raw_seq, disposition, normalized_kind, normalized_json, "
+                "created_at FROM dispositions WHERE run_id = ? AND raw_seq = ?",
+                (run_id, raw_seq),
+            ).fetchone()
+        if row is None:
+            return None
+        value = json.loads(row[3])
+        if not isinstance(value, dict):
+            raise ValueError(f"invalid normalized row for {run_id}:{raw_seq}")
+        return value
+
+    def restore_reducer(
+        self,
+        run_id: str,
+        reducer: EventReducerAdapter,
+    ) -> None:
+        self._restore_reducer_from_committed_rows(run_id, reducer)
+
+    def reset_run(self, run_id: str) -> None:
+        """Remove one materialized run before a deterministic rebuild."""
+
+        with self.connection() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            connection.execute("DELETE FROM runs WHERE run_id = ?", (run_id,))
+
     def materialize(
         self,
         run_id: str,
         raw: dict[str, Any],
         reducer: EventReducerAdapter,
+        normalized: NormalizedProviderEvent | None = None,
     ) -> ReducerResult:
         raw_seq = int(raw["seq"])
         if self.has_disposition(run_id, raw_seq):
@@ -582,7 +651,7 @@ class SQLiteEventStore:
         try:
             with self.connection() as connection:
                 connection.execute("BEGIN IMMEDIATE")
-                result = reducer.apply_raw(raw)
+                result = reducer.apply_raw(raw, normalized)
                 received_at = str(raw.get("received_at") or "")
                 normalized = result.normalized
                 connection.execute(
