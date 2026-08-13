@@ -1364,6 +1364,13 @@ def _gate_result(args: argparse.Namespace) -> dict:
     }
 
 
+def cmd_tui(args: argparse.Namespace) -> None:
+    # Imported here so `wiki --help` never pays the tui import cost.
+    from wiki_cli.tui import main as tui_main
+
+    raise SystemExit(tui_main(["--backend", args.backend]))
+
+
 def cmd_gate(args: argparse.Namespace) -> None:
     args.pr = normalized_pr_reference(args.pr)
     try:
@@ -2012,6 +2019,10 @@ def main() -> None:
     )
     grecover.add_argument("ticket")
     grecover.set_defaults(func=cmd_graph_recover)
+
+    tui = sub.add_parser("tui", help="launch the read-only fleet TUI against the local sidecar (WIKI-290)")
+    tui.add_argument("--backend", default="http://127.0.0.1:8213", help="sidecar base URL")
+    tui.set_defaults(func=cmd_tui)
 
     gate = sub.add_parser("gate", help="report merge-gate plumbing for one GitHub PR; never merges or reviews (gh 2.37+)")
     gate.add_argument("pr", help="PR number or URL")
