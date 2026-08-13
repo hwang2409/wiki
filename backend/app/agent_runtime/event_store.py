@@ -496,9 +496,23 @@ def migrate_event_db(path: Path | str) -> None:
             ).fetchone()[0]
         )
         for version in range(current + 1, SCHEMA_VERSION + 1):
-            connection.executescript(_MIGRATIONS[version])
+            if version == 2:
+                columns = {
+                    str(row[1])
+                    for row in connection.execute(
+                        "PRAGMA table_info(run_projections)"
+                    ).fetchall()
+                }
+                if "unread_event_seq" not in columns:
+                    connection.execute(
+                        "ALTER TABLE run_projections "
+                        "ADD COLUMN unread_event_seq INTEGER NOT NULL DEFAULT 0"
+                    )
+            else:
+                connection.executescript(_MIGRATIONS[version])
             connection.execute(
-                "INSERT INTO schema_migrations(version, applied_at) VALUES (?, ?)",
+                "INSERT OR IGNORE INTO schema_migrations(version, applied_at) "
+                "VALUES (?, ?)",
                 (version, "schema-v" + str(version)),
             )
 
@@ -601,6 +615,20 @@ class SQLiteEventStore:
     def run_is_healthy(self, run_id: str) -> bool:
         try:
             with self.connection(read_only=True) as connection:
+                migration_rows = connection.execute(
+                    "SELECT version FROM schema_migrations ORDER BY version"
+                ).fetchall()
+                migration_versions = [int(row[0]) for row in migration_rows]
+                projection_columns = {
+                    str(row[1])
+                    for row in connection.execute(
+                        "PRAGMA table_info(run_projections)"
+                    ).fetchall()
+                }
+                if migration_versions != list(range(1, SCHEMA_VERSION + 1)):
+                    return False
+                if "unread_event_seq" not in projection_columns:
+                    return False
                 run_row = connection.execute(
                     "SELECT provider, agent_id, created_at, state FROM runs "
                     "WHERE run_id = ?",
@@ -725,7 +753,10 @@ class SQLiteEventStore:
                 state=state,
             )
             reducer = EventReducerAdapter(provider)
-            for raw_seq, normalized_json, _version, disposition_created_at in dispositions:
+            for raw_seq, normalized_json, _version, disposition_created_at in sorted(
+                dispositions,
+                key=lambda row: int(row[0]),
+            ):
                 normalized_row = json.loads(normalized_json)
                 normalized = NormalizedProviderEvent(
                     EventDisposition.IGNORED

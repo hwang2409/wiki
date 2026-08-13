@@ -8,7 +8,7 @@ import unittest
 from pathlib import Path
 from unittest import mock
 
-from backend.app.agent_runtime.event_store import replay_raw_jsonl
+from backend.app.agent_runtime.event_store import NORMALIZER_VERSION, replay_raw_jsonl
 from backend.app.agent_runtime.fake import FixtureAdapterFactory
 from backend.app.agent_runtime.provider import ProviderEvent
 from backend.app.agent_runtime.store import RunStore, RuntimePaths
@@ -242,6 +242,107 @@ class SupervisorDualWriteTests(unittest.IsolatedAsyncioTestCase):
             [(2, 1), (1, 2)],
         )
         self.assertEqual(raw_one["seq"], 1)
+        sqlite_rows = self.supervisor.event_store.view_rows(self.record.run_id)
+        with self.supervisor.event_store.connection(read_only=True) as connection:
+            created_at_by_raw_seq = {
+                int(row[0]): str(row[1])
+                for row in connection.execute(
+                    "SELECT raw_seq, created_at FROM dispositions "
+                    "WHERE run_id = ?",
+                    (self.record.run_id,),
+                ).fetchall()
+            }
+        legacy_dispositions = []
+        for row in normalized:
+            normalized_json = json.dumps(
+                {
+                    "disposition": row["disposition"],
+                    "kind": row["kind"],
+                    "lifecycle_state": row["lifecycle_state"],
+                    "normalized_at": row["normalized_at"],
+                    "payload": row["payload"],
+                    "raw_seq": row["raw_seq"],
+                    "seq": row["seq"],
+                },
+                ensure_ascii=False,
+                allow_nan=False,
+                sort_keys=True,
+                separators=(",", ":"),
+            )
+            legacy_dispositions.append(
+                (
+                    row["raw_seq"],
+                    normalized_json,
+                    NORMALIZER_VERSION,
+                    created_at_by_raw_seq[int(row["raw_seq"])],
+                )
+            )
+        expected = self.supervisor.event_store._expected_view_rows(  # noqa: SLF001
+            self.record.run_id,
+            provider="codex",
+            agent_id=self.record.agent_id,
+            created_at=self.record.created_at,
+            state=self.store.get(self.record.run_id).state.value,
+            dispositions=legacy_dispositions,
+        )
+        for key in ("events", "patches", "cursors", "projections"):
+            self.assertEqual(sqlite_rows[key], expected[key])
+        legacy_record = self.store.get(self.record.run_id)
+        sqlite_composer = json.loads(sqlite_rows["projections"][0][5])
+        for message in sqlite_composer:
+            message.pop("echoed_at", None)
+        self.assertEqual(
+            sqlite_composer,
+            [
+                {
+                    key: value
+                    for key, value in message.items()
+                    if key != "echoed_at"
+                }
+                for message in legacy_record.composer_messages
+            ],
+        )
+        self.assertEqual(
+            sqlite_rows["projections"][0][8],
+            legacy_record.unread_event_seq,
+        )
+
+    async def test_half_applied_migration_health_rebuilds_cleanly(self) -> None:
+        await self._apply(
+            self._event("turn/started", {"turn": {"id": "turn-1"}})
+        )
+        with self.supervisor.event_store.connection() as connection:
+            connection.execute(
+                "DELETE FROM schema_migrations WHERE version = 2"
+            )
+        self.assertFalse(
+            self.supervisor.event_store.run_is_healthy(self.record.run_id)
+        )
+        await self.supervisor._rebuild_materializer_database()  # noqa: SLF001
+        self.assertTrue(
+            self.supervisor.event_store.run_is_healthy(self.record.run_id)
+        )
+
+    async def test_unhealthy_zero_event_database_rebuilds(self) -> None:
+        self.supervisor.event_store.ensure_schema()
+        self.supervisor.event_store.create_run(
+            self.record.run_id,
+            agent_id=self.record.agent_id,
+            provider=self.record.provider,
+            created_at=self.record.created_at,
+            state=self.record.state,
+        )
+        with self.supervisor.event_store.connection() as connection:
+            connection.execute(
+                "DELETE FROM schema_migrations WHERE version = 2"
+            )
+        self.assertFalse(
+            self.supervisor.event_store.run_is_healthy(self.record.run_id)
+        )
+        await self.supervisor._normalize_orphan_raw_events()  # noqa: SLF001
+        self.assertTrue(
+            self.supervisor.event_store.run_is_healthy(self.record.run_id)
+        )
 
     async def test_rebuild_failure_keeps_original_database_unswapped(self) -> None:
         await self._apply(

@@ -2880,11 +2880,16 @@ Preserve the same identity, role, worktree, orchestrator grouping, PR gates, and
                 raw_rows = list(self.store.iter_raw_events(run_id))
             except RunNotFound:
                 continue
+            # A new run has no SQLite file until its first dual write. There
+            # is no unhealthy database to recover in that state.
+            if not raw_rows and not self.event_store.path.exists():
+                continue
             try:
                 materialized_seqs = self.event_store.materialized_raw_seqs(run_id)
             except (sqlite3.DatabaseError, ValueError):
                 materialized_seqs = set()
-            if not self.event_store.run_is_healthy(run_id):
+            database_healthy = self.event_store.run_is_healthy(run_id)
+            if not database_healthy:
                 materialized_seqs = set()
             orphans = [
                 event
@@ -2892,7 +2897,7 @@ Preserve the same identity, role, worktree, orchestrator grouping, PR gates, and
                 if int(event.get("seq", 0)) not in normalized_seqs
                 or int(event.get("seq", 0)) not in materialized_seqs
             ]
-            if not orphans:
+            if not orphans and database_healthy:
                 continue
             # Recover in raw order so downstream normalizers see the same
             # sequence the live pump would deliver.
@@ -2924,6 +2929,7 @@ Preserve the same identity, role, worktree, orchestrator grouping, PR gates, and
                     materialized_seqs = set()
                 if not self.event_store.run_is_healthy(run_id):
                     materialized_seqs = set()
+                    database_healthy = False
                 for envelope in orphans:
                     orphan_seq = int(envelope.get("seq", 0))
                     if orphan_seq in normalized_seqs and orphan_seq in materialized_seqs:
@@ -2941,9 +2947,13 @@ Preserve the same identity, role, worktree, orchestrator grouping, PR gates, and
                     )
                     if appended:
                         recovered_any = True
-                if recovered_any or materialized_seqs != {
+                if (
+                    not database_healthy
+                    or recovered_any
+                    or materialized_seqs != {
                     int(event.get("seq", 0)) for event in raw_rows
-                }:
+                    }
+                ):
                     await self._rebuild_materializer_database()
                     # Recovered orphans get appended after later normalized
                     # rows, so any projection built by walking normalized
