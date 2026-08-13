@@ -1,6 +1,12 @@
-import { useEffect, useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import type { CSSProperties } from "react";
 import { ArtifactLightbox } from "./artifact-detail/lightbox";
+import {
+  deleteThumbnail,
+  readThumbnail,
+  writeThumbnail,
+  type ThumbnailRecord,
+} from "./thumbnail-cache";
 
 const vaultImageExtension = /\.(?:png|jpe?g|gif|webp|svg)$/i;
 
@@ -86,15 +92,25 @@ type AssetMeta = {
   width: number;
   height: number;
   previewBase64: string | null;
+  mtimeMs: number | null;
 };
 
-// Shared cache: results are cached forever, in-flight fetches are shared, and
-// the underlying fetch is NEVER aborted from a consumer's cleanup — each
-// consumer manages its own cancellation via a cancelled flag. This avoids
-// the round-2 bug where the first consumer's unmount cancelled the request
-// for every other consumer waiting on the same asset.
-const assetMetaCache = new Map<string, AssetMeta | null>();
+// Shared cache: successful metadata is cached forever. Failed requests do
+// not write a null marker, so the next mount can retry. In-flight fetches
+// are shared, and the underlying fetch is NEVER aborted from cleanup.
+const assetMetaCache = new Map<string, AssetMeta>();
 const assetMetaPending = new Map<string, Promise<AssetMeta | null>>();
+const assetMetaHydrationGeneration = new Map<string, number>();
+
+const MAX_META_FETCH_ATTEMPTS = 3;
+
+function invalidateAssetMeta(path: string): void {
+  assetMetaCache.delete(path);
+  assetMetaHydrationGeneration.set(
+    path,
+    (assetMetaHydrationGeneration.get(path) ?? 0) + 1,
+  );
+}
 
 function fetchAssetMeta(path: string): Promise<AssetMeta | null> {
   const cached = assetMetaCache.get(path);
@@ -102,44 +118,120 @@ function fetchAssetMeta(path: string): Promise<AssetMeta | null> {
   const pending = assetMetaPending.get(path);
   if (pending) return pending;
   const encoded = path.split("/").map(encodeURIComponent).join("/");
-  const request = fetch(`/api/vault/asset-meta/${encoded}`)
-    .then(async (response) => {
-      if (!response.ok) return null;
-      const body = await response.json();
-      const meta: AssetMeta = {
-        width: Number(body.width) || 0,
-        height: Number(body.height) || 0,
-        previewBase64: typeof body.preview_base64 === "string" ? body.preview_base64 : null,
-      };
-      return meta;
-    })
-    .then((meta) => {
-      assetMetaCache.set(path, meta);
+  const request = (async () => {
+    for (let attempt = 0; attempt < MAX_META_FETCH_ATTEMPTS; attempt += 1) {
+      try {
+        const response = await fetch(`/api/vault/asset-meta/${encoded}`);
+        if (response.status === 404) {
+          // The asset is gone. Remove stale IDB data, but do not cache a
+          // null result that would prevent a later recreated asset retry.
+          invalidateAssetMeta(path);
+          void deleteThumbnail(path);
+          return null;
+        }
+        if (!response.ok) {
+          invalidateAssetMeta(path);
+          continue;
+        }
+        const body = await response.json();
+        const meta: AssetMeta = {
+          width: Number(body.width) || 0,
+          height: Number(body.height) || 0,
+          previewBase64: typeof body.preview_base64 === "string" ? body.preview_base64 : null,
+          mtimeMs: typeof body.mtime_ms === "number" ? body.mtime_ms : null,
+        };
+        assetMetaCache.set(path, meta);
+        // Persist to IndexedDB so the next cold start paints the blur-up
+        // placeholder on the first frame. mtime_ms is the invalidation
+        // key — a stale entry is dropped on the next request. WIKI-200.
+        if (meta.mtimeMs !== null) {
+          void writeThumbnail({
+            path,
+            mtimeMs: meta.mtimeMs,
+            width: meta.width,
+            height: meta.height,
+            previewBase64: meta.previewBase64,
+            storedAt: Date.now(),
+          });
+        }
+        return meta;
+      } catch {
+        invalidateAssetMeta(path);
+      }
+    }
+    return null;
+  })()
+    .finally(() => {
       assetMetaPending.delete(path);
-      return meta;
-    })
-    .catch(() => {
-      assetMetaPending.delete(path);
-      assetMetaCache.set(path, null);
-      return null;
     });
   assetMetaPending.set(path, request);
   return request;
+}
+
+// Test hook — reset the shared caches between tests. Never call from
+// production code.
+export function __resetAssetMetaForTests(): void {
+  assetMetaCache.clear();
+  assetMetaPending.clear();
+  assetMetaHydrationGeneration.clear();
+}
+
+// Hydrate the in-memory asset meta cache from the IndexedDB thumbnail
+// cache. Callers can await this to force cache warmth; MarkdownImage
+// fires it in the background so the first frame after a cold start
+// still gets a blur-up placeholder even if the network hasn't answered.
+//
+// A network answer that lands before this resolves ALWAYS wins — the
+// hydrated record is discarded rather than written back, so a stale IDB
+// entry can't overwrite fresher server data.
+export async function hydrateAssetMetaFromThumbnailCache(path: string): Promise<AssetMeta | null> {
+  if (assetMetaCache.get(path) !== undefined) return assetMetaCache.get(path) ?? null;
+  const generation = assetMetaHydrationGeneration.get(path) ?? 0;
+  const record: ThumbnailRecord | null = await readThumbnail(path);
+  if (!record) return null;
+  // Re-check the cache AFTER the async IDB read — the network fetch
+  // may have populated it while we were waiting.
+  if (assetMetaCache.get(path) !== undefined) return assetMetaCache.get(path) ?? null;
+  // A rejected network request invalidates this hydration generation.
+  // Do not put stale IDB metadata back into the cache after that point.
+  if ((assetMetaHydrationGeneration.get(path) ?? 0) !== generation) return null;
+  const meta: AssetMeta = {
+    width: record.width,
+    height: record.height,
+    previewBase64: record.previewBase64,
+    mtimeMs: record.mtimeMs,
+  };
+  assetMetaCache.set(path, meta);
+  return meta;
 }
 
 export function seedAssetMetaCache(entries: Record<string, {
   width: number;
   height: number;
   preview_base64?: string | null;
+  mtime_ms?: number | null;
 }> | undefined | null): void {
   if (!entries) return;
   for (const [path, entry] of Object.entries(entries)) {
     if (!entry || typeof entry !== "object") continue;
-    assetMetaCache.set(path, {
+    const mtimeMs = typeof entry.mtime_ms === "number" ? entry.mtime_ms : null;
+    const meta = {
       width: Number(entry.width) || 0,
       height: Number(entry.height) || 0,
       previewBase64: typeof entry.preview_base64 === "string" ? entry.preview_base64 : null,
-    });
+      mtimeMs,
+    };
+    assetMetaCache.set(path, meta);
+    if (mtimeMs !== null) {
+      void writeThumbnail({
+        path,
+        mtimeMs,
+        width: meta.width,
+        height: meta.height,
+        previewBase64: meta.previewBase64,
+        storedAt: Date.now(),
+      });
+    }
   }
 }
 
@@ -197,20 +289,56 @@ export function MarkdownImage({ alt, className, "data-obsidian-width": dataWidth
     return () => window.clearTimeout(timer);
   }, [state]);
 
+  // Tracks the newest source of meta already applied. Slow IDB hydration
+  // must never clobber a fresher network answer that landed first. `null`
+  // = no answer yet; number = mtimeMs; `Infinity` = definitive
+  // network verdict without an mtime (still wins over any IDB record).
+  const metaFreshnessRef = useRef<number | null>(null);
+
   useEffect(() => {
     if (!activeCandidate) return;
+    // Reset the freshness watermark for this candidate; a prior
+    // asset's watermark must not gate the new one.
+    metaFreshnessRef.current = null;
     if (assetMetaFromCache(activeCandidate) !== undefined) return;
     let cancelled = false;
-    fetchAssetMeta(activeCandidate).then((info) => {
+
+    const applyMeta = (info: AssetMeta | null, source: "hydrate" | "network") => {
       if (cancelled) return;
-      setMeta(info);
-      // Only lock the ratio from meta if we don't have one yet — otherwise
-      // the ratio was captured from the image's naturalWidth/Height at load
-      // time and we must NOT change it (that would be the CLS the race test
-      // hunts for).
-      if (info && info.width > 0 && info.height > 0) {
+      if (!info) {
+        if (source === "network") {
+          metaFreshnessRef.current = Number.POSITIVE_INFINITY;
+          setMeta(null);
+        }
+        return;
+      }
+      const incoming = info.mtimeMs ?? (source === "network" ? Number.POSITIVE_INFINITY : -1);
+      const current = metaFreshnessRef.current;
+      // Stale IDB (older mtime OR unknown mtime) never clobbers a value
+      // we've already applied. Network wins ties — a network answer with
+      // the same mtime replaces the hydrated one only if it carries a
+      // different preview payload, guarding against IDB drift.
+      if (current !== null && incoming < current) return;
+      metaFreshnessRef.current = incoming;
+      setMeta((prev) => {
+        if (prev && prev.mtimeMs === info.mtimeMs && prev.previewBase64 === info.previewBase64) return prev;
+        return info;
+      });
+      if (info.width > 0 && info.height > 0) {
         setFrameRatio((prev) => prev ?? { w: info.width, h: info.height });
       }
+    };
+
+    // Hydrate synchronously from IndexedDB first — this puts a blur-up
+    // preview on the frame BEFORE the network answers on a cold start.
+    // The follow-up network fetch still runs; if the server returns a
+    // fresher preview (different mtime), fetchAssetMeta writes over
+    // both caches and the component re-renders with the new preview.
+    void hydrateAssetMetaFromThumbnailCache(activeCandidate).then((warm) => {
+      applyMeta(warm, "hydrate");
+    });
+    fetchAssetMeta(activeCandidate).then((info) => {
+      applyMeta(info, "network");
     });
     return () => {
       cancelled = true;

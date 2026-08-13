@@ -114,6 +114,70 @@ export function artifactExceedsInlineThreshold(
   }
 }
 
+// Per-session-view set of artifact IDs that have already mounted once.
+// First mount for a given ID plays the subtle enter animation; subsequent
+// mounts (row virtualization scrolling back to a row, for example) do
+// not — otherwise fast scrolls would strobe. Scoped by session key so
+// switching sessions plays the animation again for those artifacts;
+// bounded per scope so a long-running session doesn't grow the set
+// unbounded. WIKI-200.
+const SEEN_ARTIFACT_MAX_PER_SCOPE = 512;
+const SEEN_ARTIFACT_MAX_SCOPES = 64;
+const seenArtifactByScope = new Map<string, Set<string>>();
+
+function markSeen(scope: string, artifactId: string): boolean {
+  let scoped = seenArtifactByScope.get(scope);
+  if (!scoped) {
+    scoped = new Set<string>();
+    seenArtifactByScope.set(scope, scoped);
+  } else {
+    // Bump the session scope so the LRU eviction below drops the coldest
+    // session, not the one used most recently.
+    seenArtifactByScope.delete(scope);
+    seenArtifactByScope.set(scope, scoped);
+  }
+  if (scoped.has(artifactId)) {
+    // Bump insertion order so the LRU eviction below drops truly cold
+    // entries rather than active ones.
+    scoped.delete(artifactId);
+    scoped.add(artifactId);
+    return false;
+  }
+  scoped.add(artifactId);
+  while (scoped.size > SEEN_ARTIFACT_MAX_PER_SCOPE) {
+    const oldest = scoped.values().next();
+    if (oldest.done) break;
+    scoped.delete(oldest.value);
+  }
+  while (seenArtifactByScope.size > SEEN_ARTIFACT_MAX_SCOPES) {
+    const oldestScope = seenArtifactByScope.keys().next();
+    if (oldestScope.done) break;
+    seenArtifactByScope.delete(oldestScope.value);
+  }
+  return true;
+}
+
+// Test hook — never call from production code.
+export function __resetSeenArtifactsForTests(): void {
+  seenArtifactByScope.clear();
+}
+
+export function __markSeenArtifactForTests(scope: string, artifactId: string): boolean {
+  return markSeen(scope, artifactId);
+}
+
+export function __seenArtifactScopeCountForTests(): number {
+  return seenArtifactByScope.size;
+}
+
+function useIsFreshArtifact(scope: string, artifactId: string | undefined): boolean {
+  const [fresh] = useState(() => {
+    if (!artifactId) return false;
+    return markSeen(scope, artifactId);
+  });
+  return fresh;
+}
+
 function useInlineExpanded(sessionKey: string, artifactId: string | undefined): [boolean, (next: boolean) => void] {
   const id = artifactId ?? "";
   const state = useSyncExternalStore<{ expanded?: boolean }>(
@@ -204,9 +268,11 @@ export function ArtifactBlock({
       });
   }, [artifact?.kind, event.artifact_id, ticket]);
   const [inlineExpanded, setInlineExpanded] = useInlineExpanded(inlineSessionKey, event.artifact_id);
+  const isEntering = useIsFreshArtifact(inlineSessionKey, event.artifact_id);
+  const shellClass = `artifact-block-shell${inspect ? " has-inspect" : ""}${isEntering ? " is-entering" : ""}`;
   if (!artifact) {
     return (
-      <div className="artifact-block-shell">
+      <div className={shellClass}>
         <ArtifactError title="Artifact payload missing." />
       </div>
     );
@@ -242,7 +308,7 @@ export function ArtifactBlock({
   }
 
   return (
-    <div className={`artifact-block-shell${inspect ? " has-inspect" : ""}`}>
+    <div className={shellClass}>
       <section
         className={`artifact-block${showCompact ? " is-compact" : ""}${inlineExpanded ? " is-expanded" : ""}`}
         data-artifact-compact={showCompact || undefined}
