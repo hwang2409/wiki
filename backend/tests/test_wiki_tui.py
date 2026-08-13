@@ -304,22 +304,57 @@ class KeymapTests(unittest.TestCase):
 
 class AppBehaviorTests(unittest.TestCase):
     def test_stopping_follow_seeds_scroll_at_transcript_tail(self) -> None:
+        class FakeWindow:
+            def __init__(self) -> None:
+                self.calls: list[tuple[int, str]] = []
+
+            def getmaxyx(self) -> tuple[int, int]:
+                return (15, 100)
+
+            def erase(self) -> None:
+                return None
+
+            def attron(self, _attr: int) -> None:
+                return None
+
+            def attroff(self, _attr: int) -> None:
+                return None
+
+            def addnstr(self, y: int, _x: int, text: str, n: int, _attr: int = 0) -> None:
+                self.calls.append((y, text[:n]))
+
         session = session_from_payload(
             "WIKI-290",
             {"events": [{"kind": "assistant", "text": str(i)} for i in range(8)]},
         )
         app = tui_app.App("http://127.0.0.1:8213")
-        app.detail = tui_app.DetailViewState(ticket="WIKI-290", session=session)
+        detail = tui_app.DetailViewState(ticket="WIKI-290", session=session)
+        app.detail = detail
+        snapshot = FleetSnapshot(groups=(), generated_at=None)
+        window = FakeWindow()
 
-        app._handle_detail_key(ord("k"))
-        self.assertFalse(app.detail.follow)
-        self.assertEqual(app.detail.scroll, 6)
+        tui_app.render_detail(window, snapshot, detail, datetime.now(timezone.utc))
+        self.assertEqual(detail.viewport_height, 4)
 
-        app.detail.follow = True
-        app.detail.scroll = 0
         app._handle_detail_key(ord("f"))
-        self.assertFalse(app.detail.follow)
-        self.assertEqual(app.detail.scroll, 7)
+        self.assertFalse(detail.follow)
+        window.calls.clear()
+        tui_app.render_detail(window, snapshot, detail, datetime.now(timezone.utc))
+        visible = [text for _, text in window.calls if text in {"4", "5", "6", "7"}]
+        self.assertEqual(visible, ["4", "5", "6", "7"])
+
+    def test_sse_event_uses_monotonic_clock(self) -> None:
+        pump = tui_app.DataPump("http://127.0.0.1:8213", queue.Queue())
+        original_monotonic = tui_app.time.monotonic
+        original_time = tui_app.time.time
+        tui_app.time.monotonic = lambda: 42.0
+        tui_app.time.time = lambda: 9000.0
+        try:
+            pump._on_sse_event({"type": "agents"})
+        finally:
+            tui_app.time.monotonic = original_monotonic
+            tui_app.time.time = original_time
+        self.assertEqual(pump._last_sse_ts, 42.0)
 
     def test_fallback_wait_reaches_five_seconds(self) -> None:
         clock = 100.0
@@ -352,12 +387,11 @@ class AppBehaviorTests(unittest.TestCase):
 
         pump._trigger = FakeTrigger()
         pump._last_sse_ts = clock
-        fetches = 0
+        fetch_times: list[float] = []
 
         def fetch() -> None:
-            nonlocal fetches
-            fetches += 1
-            if fetches == 2:
+            fetch_times.append(clock)
+            if len(fetch_times) == 3:
                 stop.set()
 
         pump._fetch_and_publish = fetch
@@ -368,8 +402,10 @@ class AppBehaviorTests(unittest.TestCase):
         finally:
             tui_app.time.monotonic = original_monotonic
 
-        self.assertEqual(fetches, 2)
-        self.assertEqual(waits, [2.0, 2.0, 1.0])
+        self.assertEqual(fetch_times, [100.0, 105.0, 110.0])
+        self.assertEqual(fetch_times[1] - fetch_times[0], 5.0)
+        self.assertEqual(fetch_times[2] - fetch_times[1], 5.0)
+        self.assertEqual(waits, [2.0, 2.0, 1.0, 2.0, 2.0, 1.0])
 
     def test_sse_thread_close_closes_active_response(self) -> None:
         class FakeResponse:

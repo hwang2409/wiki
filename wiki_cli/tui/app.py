@@ -56,6 +56,7 @@ class DetailViewState:
     scroll: int = 0
     follow: bool = True
     last_fetch: float = 0.0
+    viewport_height: int = 1
 
 
 # --- Data pump -------------------------------------------------------------
@@ -104,7 +105,7 @@ class DataPump:
             return
         etype = event.get("type")
         if etype in {"agents", "vault"}:
-            self._last_sse_ts = time.time()
+            self._last_sse_ts = time.monotonic()
             self._trigger.set()
 
     def _poll_loop(self) -> None:
@@ -120,9 +121,13 @@ class DataPump:
             # If SSE has been silent for FALLBACK_POLL_S while the
             # trigger did NOT fire, still refresh so we self-heal
             # when the SSE stream is dead but the UI is idle.
-            if not triggered and (time.monotonic() - self._last_sse_ts) < FALLBACK_POLL_S:
+            now = time.monotonic()
+            fallback_due = not triggered and (now - self._last_sse_ts) >= FALLBACK_POLL_S
+            if not triggered and not fallback_due:
                 continue
             self._fetch_and_publish()
+            if fallback_due:
+                self._last_sse_ts = time.monotonic()
 
     def _fetch_and_publish(self) -> None:
         try:
@@ -379,6 +384,7 @@ def render_detail(
     tail_top = row
     tail_bottom = bottom - 1
     tail_height = max(1, tail_bottom - tail_top + 1)
+    detail.viewport_height = tail_height
 
     events = list(session.events) if session else []
     if session and session.fetch_error and not events:
@@ -607,8 +613,7 @@ class App:
         if ch == ord("f"):
             if detail.follow:
                 detail.follow = False
-                if detail.session:
-                    detail.scroll = max(0, len(detail.session.events) - 1)
+                self._seed_detail_tail(detail)
             else:
                 detail.follow = True
             if detail.follow and detail.session:
@@ -623,26 +628,22 @@ class App:
         if ch in (curses.KEY_DOWN, ord("j")):
             if detail.follow:
                 detail.follow = False
-                if detail.session:
-                    detail.scroll = max(0, len(detail.session.events) - 1)
+                self._seed_detail_tail(detail)
             detail.scroll += 1
         elif ch in (curses.KEY_UP, ord("k")):
             if detail.follow:
                 detail.follow = False
-                if detail.session:
-                    detail.scroll = max(0, len(detail.session.events) - 1)
+                self._seed_detail_tail(detail)
             detail.scroll = max(0, detail.scroll - 1)
         elif ch == curses.KEY_NPAGE:
             if detail.follow:
                 detail.follow = False
-                if detail.session:
-                    detail.scroll = max(0, len(detail.session.events) - 1)
+                self._seed_detail_tail(detail)
             detail.scroll += 10
         elif ch == curses.KEY_PPAGE:
             if detail.follow:
                 detail.follow = False
-                if detail.session:
-                    detail.scroll = max(0, len(detail.session.events) - 1)
+                self._seed_detail_tail(detail)
             detail.scroll = max(0, detail.scroll - 10)
         elif ch == ord("g"):
             detail.follow = False
@@ -654,6 +655,14 @@ class App:
         self.detail = DetailViewState(ticket=ticket)
         self.detail_pump = DetailPump(self.backend, ticket, self.q)
         self.detail_pump.start()
+
+    @staticmethod
+    def _seed_detail_tail(detail: DetailViewState) -> None:
+        if detail.session:
+            detail.scroll = max(
+                0,
+                len(detail.session.events) - detail.viewport_height,
+            )
 
     def _exit_detail(self) -> None:
         if self.detail_pump:
