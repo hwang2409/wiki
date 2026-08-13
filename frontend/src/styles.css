@@ -90,25 +90,26 @@
 
   --readable-col: var(--file-line-width);
 
-  --font-interface: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, "Helvetica Neue",
+  /* WIKI-279: one font, one weight, one size for the entire app. Every
+     legacy per-surface font var now aliases the single choice —
+     applyStoredFonts() rewrites all of them together on load and on every
+     picker change. The individual names remain because ~200 CSS callsites
+     reference them; the indirection lets us collapse the surface without
+     touching each rule. */
+  --font-single: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, "Helvetica Neue",
     Helvetica, Arial, sans-serif;
-  --font-text: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, "Helvetica Neue",
-    Helvetica, Arial, sans-serif;
-  --font-agent-prose: var(--font-monospace);
-  --font-monospace: "JetBrains Mono", ui-monospace, SFMono-Regular, "SF Mono", Menlo, Consolas,
-    "Roboto Mono", monospace;
+  --font-single-size: 14.5px;
 
-  /* Chrome font indirection: UI chrome reads --font-chrome so a theme can
-     re-point the whole shell at the mono stack (opencode) without fighting
-     the inline --font-interface var that applyStoredFonts always sets.
-     Weight stays on --font-interface-weight everywhere: the mono WEIGHT
-     setting must only bold true mono surfaces, never the chrome. */
-  --font-chrome: var(--font-interface);
+  --font-interface: var(--font-single);
+  --font-text: var(--font-single);
+  --font-agent-prose: var(--font-single);
+  --font-monospace: var(--font-single);
+  --font-chrome: var(--font-single);
 
-  --font-ui-smaller: 12.5px;
-  --font-ui-small: 13.5px;
-  --font-text-size: 16.5px;
-  --font-monospace-size: 13.5px;
+  --font-ui-smaller: var(--font-single-size);
+  --font-ui-small: var(--font-single-size);
+  --font-text-size: var(--font-single-size);
+  --font-monospace-size: var(--font-single-size);
 
   /* WIKI-246: semantic chrome roles. These names keep the shell on four
      elevation steps while each theme keeps its existing palette values. */
