@@ -5,9 +5,12 @@ from pathlib import Path
 from tempfile import TemporaryDirectory
 from unittest import mock
 
+import pytest
+
 from backend.app.agent_runtime.event_store import (
     EventReducerAdapter,
     SQLiteEventStore,
+    migrate_event_db,
     replay_raw_jsonl,
 )
 
@@ -299,3 +302,53 @@ def test_failed_write_restores_reducer_before_continuing() -> None:
 
         store.materialize("run-1", rows[1], reducer)
         assert store.view_rows("run-1") == clean.view_rows("run-1")
+
+
+@pytest.mark.parametrize(
+    ("table", "predicate"),
+    [
+        ("events", "event_id = 0"),
+        ("patches", "change_cursor = 2"),
+        ("run_projections", "run_id = 'run-1'"),
+        ("run_cursors", "run_id = 'run-1'"),
+    ],
+)
+def test_health_check_covers_every_derived_table(table: str, predicate: str) -> None:
+    with TemporaryDirectory() as tmp:
+        store = SQLiteEventStore(Path(tmp) / "events.sqlite3")
+        store.create_run(
+            "run-1",
+            agent_id="WIKI-282",
+            provider="codex",
+            created_at="2026-08-13T00:00:00Z",
+        )
+        reducer = EventReducerAdapter("codex")
+        for row in sorted(_tool_rows(), key=lambda item: int(item["seq"])):
+            store.materialize("run-1", row, reducer)
+        assert store.run_is_healthy("run-1")
+        with store.connection() as connection:
+            connection.execute(f"DELETE FROM {table} WHERE {predicate}")
+        assert not store.run_is_healthy("run-1")
+
+
+def test_half_applied_migration_is_idempotent() -> None:
+    with TemporaryDirectory() as tmp:
+        path = Path(tmp) / "events.sqlite3"
+        store = SQLiteEventStore(path)
+        with store.connection() as connection:
+            connection.execute(
+                "DELETE FROM schema_migrations WHERE version = 2"
+            )
+        migrate_event_db(path)
+        with store.connection(read_only=True) as connection:
+            versions = connection.execute(
+                "SELECT version FROM schema_migrations ORDER BY version"
+            ).fetchall()
+            columns = {
+                str(row[1])
+                for row in connection.execute(
+                    "PRAGMA table_info(run_projections)"
+                ).fetchall()
+            }
+        assert versions == [(1,), (2,)]
+        assert "unread_event_seq" in columns
