@@ -28,89 +28,6 @@ function stringValue(value: unknown): string | null {
   return typeof value === "string" && value.trim() ? value.trim() : null;
 }
 
-function eventRun(event: ProviderStreamEvent): RecordValue {
-  return recordValue(eventParams(event).run) ?? {};
-}
-
-function hookKeys(event: ProviderStreamEvent): string[] {
-  const run = eventRun(event);
-  const keys: string[] = [];
-  const runId = stringValue(run.id);
-  if (runId) keys.push(`run:${runId}`);
-  const name = stringValue(run.eventName) ?? stringValue(run.name) ?? stringValue(run.id);
-  const turnId = stringValue(eventParams(event).turnId);
-  if (name && turnId) keys.push(`${name}\u0000${turnId}`);
-  return keys;
-}
-
-function hookDisplayKey(event: ProviderStreamEvent): string | null {
-  const run = eventRun(event);
-  const name = stringValue(run.eventName) ?? stringValue(run.name) ?? stringValue(run.id);
-  const turnId = stringValue(eventParams(event).turnId);
-  if (name && turnId) return `${name}\u0000${turnId}`;
-  const runId = stringValue(run.id);
-  return runId ? `run:${runId}` : name ? `name:${name}` : null;
-}
-
-export type HookChip = {
-  key: string;
-  name: string;
-  durationMs: number | null;
-  seq: number;
-};
-
-export function deriveHookChips(events: ProviderStreamEvent[]): HookChip[] {
-  const starts = new Map<string, ProviderStreamEvent[]>();
-  const chips: HookChip[] = [];
-  for (const event of events) {
-    if (event.kind === "hook_started") {
-      for (const key of hookKeys(event)) {
-        const queue = starts.get(key) ?? [];
-        queue.push(event);
-        starts.set(key, queue);
-      }
-      continue;
-    }
-    if (event.kind !== "hook_completed") continue;
-    let start: ProviderStreamEvent | undefined;
-    for (const key of hookKeys(event)) {
-      const candidate = starts.get(key)?.shift();
-      if (candidate) {
-        start = candidate;
-        break;
-      }
-    }
-    const run = eventRun(event);
-    const explicitDuration = run.durationMs;
-    const name = stringValue(run.eventName) ?? stringValue(run.name) ?? stringValue(run.id);
-    if (!name || (!start && typeof explicitDuration !== "number")) continue;
-    if (start) {
-      for (const key of hookKeys(start)) {
-        const queue = starts.get(key);
-        if (!queue) continue;
-        const index = queue.indexOf(start);
-        if (index >= 0) queue.splice(index, 1);
-      }
-    }
-    const durationMs = typeof explicitDuration === "number"
-      ? Math.max(0, explicitDuration)
-      : Math.max(0, Date.parse(event.normalized_at) - Date.parse(start!.normalized_at));
-    chips.push({
-      key: `${hookDisplayKey(event) ?? name}\u0000${event.seq}`,
-      name,
-      durationMs,
-      seq: event.seq,
-    });
-  }
-  return chips;
-}
-
-function formatDuration(durationMs: number | null): string {
-  if (durationMs === null || !Number.isFinite(durationMs)) return "duration unavailable";
-  if (durationMs < 1000) return `${Math.round(durationMs)}ms`;
-  return `${(durationMs / 1000).toFixed(durationMs >= 10_000 ? 1 : 2)}s`;
-}
-
 function commandItemId(event: ProviderStreamEvent): string | null {
   const params = eventParams(event);
   const item = recordValue(params.item);
@@ -717,37 +634,6 @@ function TerminalInteractionRenderer({ events }: { events: ProviderStreamEvent[]
   );
 }
 
-function HookLifecycleRenderer({ events }: { events: ProviderStreamEvent[] }) {
-  const hooks = deriveHookChips(events);
-  if (!hooks.length) return null;
-  return (
-    <div className="codex-stream-chip-row" data-testid="codex-hook-chips">
-      {hooks.map((hook) => (
-        <span className="codex-stream-chip" key={hook.key}>
-          <span>hook: {hook.name}</span>
-          <span className="tabular-nums">({formatDuration(hook.durationMs)})</span>
-        </span>
-      ))}
-    </div>
-  );
-}
-
-function SkillsChangedRenderer({ event }: { event: ProviderStreamEvent }) {
-  const params = eventParams(event);
-  const changed = recordValue(params.skills) ?? params;
-  const addedValue = changed.added ?? changed.addedSkills;
-  const removedValue = changed.removed ?? changed.removedSkills;
-  const added = Array.isArray(addedValue) ? addedValue.filter((value): value is string => typeof value === "string") : [];
-  const removed = Array.isArray(removedValue) ? removedValue.filter((value): value is string => typeof value === "string") : [];
-  const diff = [...added.map((skill) => `+ ${skill}`), ...removed.map((skill) => `- ${skill}`)];
-  return (
-    <span className="codex-stream-chip codex-stream-skills-chip">
-      <span>skills updated</span>
-      <code>{diff.length ? diff.join(", ") : "list refreshed"}</code>
-    </span>
-  );
-}
-
 function PlanRenderer({ event }: { event: ProviderStreamEvent }) {
   const rawPlan = eventParams(event).plan;
   const plan: unknown[] = Array.isArray(rawPlan) ? rawPlan : [];
@@ -778,18 +664,20 @@ export function CodexStreamHighlights({
   const diagnosticEvents = rendered.filter((event) => (
     event.kind === "warning" || event.kind === "turn_moderationMetadata_warning"
   ));
-  const skillEvents = rendered.filter((event) => event.kind === "skills_changed");
   const planEvents = rendered.filter((event) => event.kind === "turn_plan_updated");
-  const hasHookEvents = events.some((event) => event.kind === "hook_started" || event.kind === "hook_completed");
+  const hasCommandInteractions = matchedTerminalInteractions(events).length > 0;
   const diffSource = currentTurnDiff === undefined ? latestDiffSource(events) : currentTurnDiff;
-  if (!rendered.length && !hasHookEvents && diffSource === null) return null;
+  if (
+    !diagnosticEvents.length
+    && !planEvents.length
+    && !hasCommandInteractions
+    && diffSource === null
+  ) return null;
   return (
     <div className="codex-stream-highlights">
       <ProviderDiagnosticsRenderer events={diagnosticEvents} />
-      <HookLifecycleRenderer events={events} />
       <TerminalInteractionRenderer events={events} />
       <DiffRenderer source={diffSource} />
-      {skillEvents.map((event) => <SkillsChangedRenderer event={event} key={event.seq} />)}
       {planEvents.map((event) => <PlanRenderer event={event} key={event.seq} />)}
     </div>
   );
