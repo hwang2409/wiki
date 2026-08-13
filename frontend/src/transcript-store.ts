@@ -424,17 +424,18 @@ export function invalidateTranscript(ticket: string, surface: string | null = nu
 
 /**
  * Manual retry for a specific transcript target (used by the session view's
- * "Try again" affordances). Clears `error`/`refreshError` immediately so the
- * caller can flip to a loading state, then triggers a fresh fetch. Works for
- * subagent + archived targets, unlike `refreshTranscript(ticket)` which is
- * scoped to the primary ticket surface.
+ * "Try again" affordances). Does NOT pre-clear `error`/`refreshError` — those
+ * flags describe the last-observed state of the fetch and must only be
+ * cleared by a *successful* refresh (WIKI-276 Q7 rule: never elevate to
+ * healthy on a manual trigger, only on real success). fetchEntry() already
+ * clears `error` + flips `loading:true` at the point when a cold fetch is
+ * confirmed to start (see the `!session && !loading` branch); for a warm
+ * retry the stale banner stays visible until success replaces both fields.
+ * Works for subagent + archived targets, unlike `refreshTranscript(ticket)`
+ * which is scoped to the primary ticket surface.
  */
 export function retryTranscript(target: TranscriptTarget): Promise<void> {
   const entry = getEntry(target);
-  if (entry.snapshot.error || entry.snapshot.refreshError) {
-    entry.snapshot = { ...entry.snapshot, error: null, refreshError: null };
-    emit(entry);
-  }
   entry.dirty = true;
   return fetchEntry(entry);
 }

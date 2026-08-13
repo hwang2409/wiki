@@ -162,8 +162,16 @@ export function startDashboardPolling<T>(deps: PollingDeps<T>): PollingHandle {
       if (cancelled || current.signal.aborted) return;
       deps.onError(err instanceof Error ? err.message : String(err));
     } finally {
-      if (controller === current) controller = null;
-      scheduleNext();
+      // Only the WINNING load (the one whose controller is still current)
+      // schedules the next poll. If refresh() or a later load() superseded
+      // us mid-flight, our controller has been abandoned — that superseding
+      // load owns the follow-up, and firing scheduleNext here would leave
+      // an orphaned timer (its handle would clobber `timer`, making stop()
+      // and refresh() unable to cancel the newer one).
+      if (controller === current) {
+        controller = null;
+        scheduleNext();
+      }
     }
   };
 

@@ -3616,7 +3616,9 @@ export function SessionTab({
                   ? "The agent is running but has not produced output yet."
                   : subagent
                     ? "This subagent hasn't emitted any events."
-                    : "Send a message below to start the session."}
+                    : showComposer
+                      ? "Send a message below to start the session."
+                      : "This session has no events."}
               </div>
             </div>
           ) : null}

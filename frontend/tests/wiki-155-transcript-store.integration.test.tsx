@@ -119,6 +119,62 @@ test("refresh failure after a successful load populates `refreshError` but keeps
   expect(latest?.error).toBeNull();
 });
 
+test("refreshError survives across the mid-retry window — only a successful refresh may clear it (Q7 rule)", async () => {
+  // Regression: retryTranscript used to pre-clear `refreshError` synchronously
+  // so the banner would disappear the instant the button was clicked, even
+  // though the underlying data was still the stale copy and the retry could
+  // still fail. The store must only clear `refreshError` on real success —
+  // this test observes the intermediate snapshot mid-flight to prove the
+  // banner-driving flag is preserved.
+  let resolveFirst!: (v: AgentSessionData) => void;
+  let rejectSecond!: (e: unknown) => void;
+  getAgentSession.mockImplementationOnce(
+    () => new Promise<AgentSessionData>((resolve) => { resolveFirst = resolve; }),
+  );
+  getAgentSession.mockImplementationOnce(
+    () => new Promise<AgentSessionData>((_, reject) => { rejectSecond = reject; }),
+  );
+
+  render(<Probe ticket="WIKI-STALE-MID" />);
+  // First load in flight — resolve it to seed the session.
+  await act(async () => {
+    resolveFirst(baseSession());
+    await Promise.resolve();
+    await Promise.resolve();
+  });
+  expect(latest?.session).not.toBeNull();
+
+  // Manually push the entry into a refresh-failed state by calling retry
+  // and letting the second fetch reject. Do it in two steps so we can
+  // observe the state BETWEEN "retry initiated" and "retry settled".
+  let retryPromise: Promise<void> | null = null;
+  await act(async () => {
+    // Prime a third fetch that will hang, so the next retry stays mid-flight.
+    getAgentSession.mockImplementationOnce(() => new Promise<AgentSessionData>(() => {}));
+    // First: trigger the failing retry.
+    const failing = retryTranscript({ ticket: "WIKI-STALE-MID" });
+    rejectSecond(new Error("first hiccup"));
+    await failing;
+  });
+  // refreshError populated after the second call fails.
+  expect(latest?.refreshError).toBe("first hiccup");
+
+  // Now the mid-flight assertion: click retry again. The third fetch hangs,
+  // so the retry has not yet succeeded. The banner-driving flag MUST NOT
+  // clear between click and completion.
+  await act(async () => {
+    retryPromise = retryTranscript({ ticket: "WIKI-STALE-MID" });
+    await Promise.resolve();
+    await Promise.resolve();
+  });
+  expect(latest?.refreshError).toBe("first hiccup");
+  expect(latest?.session).not.toBeNull();
+  expect(latest?.error).toBeNull();
+
+  // Cleanup: abort the hanging fetch.
+  void retryPromise;
+});
+
 test("successful retry after failure clears both `error` and `refreshError`", async () => {
   getAgentSession.mockResolvedValueOnce(baseSession());
   getAgentSession.mockRejectedValueOnce(new Error("hiccup"));

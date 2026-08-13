@@ -989,11 +989,34 @@ import {
       banner.hidden = false;
       const prefix = state.data ? "could not refresh (showing last good data): " : "could not load: ";
       $("error-text").textContent = prefix + (err.message || err);
+      // Cold failure: skeletons are still under the section bodies and
+      // aria-busy is still true — showing "loading" and "failed" at the same
+      // time would be a lie. Replace each skeleton with an explicit failure
+      // message so the surface reads correctly. Warm failure keeps last-good
+      // content and delegates the stale signal to the banner above.
+      if (!state.data) {
+        renderColdFailurePlaceholders();
+      }
       setLiveState("offline");
     } finally {
       state.refetching = false;
       if (retryBtn) retryBtn.disabled = false;
     }
+  }
+
+  function renderColdFailurePlaceholders() {
+    ["fleet-body", "tickets-body"].forEach((id) => {
+      const el = $(id);
+      if (!el) return;
+      // Only replace while still in the loading/skeleton state — if a real
+      // render has already populated this body (warm failure path), leave it
+      // alone so the stale banner above owns the messaging.
+      if (el.dataset.state !== "loading") return;
+      el.removeAttribute("aria-busy");
+      el.dataset.state = "failed";
+      const label = id === "fleet-body" ? "fleet" : "tickets";
+      el.innerHTML = '<p class="empty">could not load ' + label + '. retry above.</p>';
+    });
   }
 
   function openEventStream() {
