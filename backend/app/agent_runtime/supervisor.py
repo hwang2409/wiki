@@ -366,6 +366,13 @@ class Supervisor:
             runtime_event_db_path(store.paths.runtime_dir),
             migrate=False,
         )
+        self.store.set_archive_events_exporter(
+            lambda run_id, destination, legacy_source: self.event_store.export_events_jsonl(
+                run_id,
+                destination,
+                legacy_source=legacy_source,
+            )
+        )
         self.materializer_reducers: dict[str, EventReducerAdapter] = {}
         self.materializer_latency_seconds: deque[float] = deque(maxlen=256)
         self.materializer_queue_depth: dict[str, int] = {}
@@ -459,6 +466,8 @@ class Supervisor:
         self.codex_rotation_task: asyncio.Task[dict[str, Any]] | None = None
         self.codex_rotation_operation_id: str | None = None
         self.recovery_scan_lock = asyncio.Lock()
+        self.archive_backfill_task: asyncio.Task[Any] | None = None
+        self.archive_backfill_worker: asyncio.Task[Any] | None = None
         # A supervisor boot invalidates any provider stdin write that had not
         # completed before shutdown: even if the row is at "sending", the
         # previous transport is gone. Sweep once per boot so the on-idle
@@ -2826,7 +2835,36 @@ Preserve the same identity, role, worktree, orchestrator grouping, PR gates, and
                         else:
                             results[index] = reaped
                 results.extend(await self._auto_archive_sweep())
+                self._schedule_archive_backfill()
                 return results
+
+    def _schedule_archive_backfill(self) -> None:
+        """Run a bounded archive parity backfill off the recovery path."""
+
+        if (
+            self.archive_backfill_task is not None
+            and not self.archive_backfill_task.done()
+        ):
+            return
+        from .archive_parity import backfill_headless_runs
+
+        async def run_backfill() -> None:
+            worker = asyncio.create_task(
+                asyncio.to_thread(
+                    backfill_headless_runs,
+                    self.store,
+                    self.event_store,
+                    batch_size=32,
+                ),
+                name="archive-parity-backfill-worker",
+            )
+            self.archive_backfill_worker = worker
+            await asyncio.shield(worker)
+
+        self.archive_backfill_task = self._spawn_monitor_task(
+            run_backfill(),
+            name="archive-parity-backfill",
+        )
 
     async def _normalize_orphan_raw_events(self) -> None:
         """Normalize raw provider rows whose normalization did not commit.
@@ -6152,6 +6190,10 @@ Preserve the same identity, role, worktree, orchestrator grouping, PR gates, and
                 task.cancel()
             await asyncio.gather(*self.monitor_tasks, return_exceptions=True)
         self.monitor_tasks.clear()
+        worker = self.archive_backfill_worker
+        if worker is not None and not worker.done():
+            await worker
+        self.archive_backfill_worker = None
         self.event_routes.clear()
         self.event_processing_locks.clear()
         self.event_inflight_counts.clear()

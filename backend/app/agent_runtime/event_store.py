@@ -7,6 +7,7 @@ transactional cache used by the later read-path migrations.
 from __future__ import annotations
 
 import json
+import os
 import sqlite3
 import tempfile
 import threading
@@ -19,10 +20,20 @@ from typing import Any
 from .. import transcripts
 from . import store as runtime_store
 from .normalizer import NormalizedProviderEvent, normalize_provider_event
-from .types import EventDisposition, LifecycleState, ProviderKind, validate_transition
+from .types import (
+    EventDisposition,
+    LifecycleState,
+    ProviderKind,
+    utc_now,
+    validate_transition,
+)
 
-SCHEMA_VERSION = 2
+SCHEMA_VERSION = 5
 NORMALIZER_VERSION = "wiki-282-1"
+
+
+_RUN_LOCKS: dict[tuple[str, str], threading.RLock] = {}
+_RUN_LOCKS_GUARD = threading.Lock()
 
 
 def runtime_event_db_path(runtime_dir: Path | str) -> Path:
@@ -465,6 +476,30 @@ _MIGRATIONS: dict[int, str] = {
     ALTER TABLE run_projections
         ADD COLUMN unread_event_seq INTEGER NOT NULL DEFAULT 0;
     """,
+    3: """
+    CREATE TABLE IF NOT EXISTS parity_records (
+        record_id INTEGER PRIMARY KEY AUTOINCREMENT,
+        run_id TEXT NOT NULL,
+        normalizer_version TEXT NOT NULL,
+        record_type TEXT NOT NULL,
+        path TEXT NOT NULL,
+        expected_json TEXT,
+        actual_json TEXT,
+        detail_json TEXT NOT NULL,
+        recorded_at TEXT NOT NULL
+    );
+    CREATE INDEX IF NOT EXISTS parity_records_run
+        ON parity_records(run_id, normalizer_version, record_id);
+    """,
+    4: """
+    ALTER TABLE parity_records ADD COLUMN raw_seq INTEGER;
+    """,
+    5: """
+    CREATE TABLE IF NOT EXISTS backfill_progress (
+        normalizer_version TEXT PRIMARY KEY,
+        cursor_run_id TEXT NOT NULL DEFAULT ''
+    );
+    """,
 }
 
 
@@ -490,12 +525,15 @@ def migrate_event_db(path: Path | str) -> None:
             "CREATE TABLE IF NOT EXISTS schema_migrations "
             "(version INTEGER PRIMARY KEY, applied_at TEXT NOT NULL)"
         )
-        current = int(
-            connection.execute(
-                "SELECT COALESCE(MAX(version), 0) FROM schema_migrations"
-            ).fetchone()[0]
-        )
-        for version in range(current + 1, SCHEMA_VERSION + 1):
+        applied_versions = {
+            int(row[0])
+            for row in connection.execute(
+                "SELECT version FROM schema_migrations"
+            ).fetchall()
+        }
+        for version in range(1, SCHEMA_VERSION + 1):
+            if version in applied_versions:
+                continue
             if version == 2:
                 columns = {
                     str(row[1])
@@ -507,6 +545,17 @@ def migrate_event_db(path: Path | str) -> None:
                     connection.execute(
                         "ALTER TABLE run_projections "
                         "ADD COLUMN unread_event_seq INTEGER NOT NULL DEFAULT 0"
+                    )
+            elif version == 4:
+                columns = {
+                    str(row[1])
+                    for row in connection.execute(
+                        "PRAGMA table_info(parity_records)"
+                    ).fetchall()
+                }
+                if "raw_seq" not in columns:
+                    connection.execute(
+                        "ALTER TABLE parity_records ADD COLUMN raw_seq INTEGER"
                     )
             else:
                 connection.executescript(_MIGRATIONS[version])
@@ -548,6 +597,53 @@ class SQLiteEventStore:
             raise
         finally:
             connection.close()
+
+    def run_lock(self, run_id: str) -> threading.RLock:
+        """Return the process-wide lock for one database run view."""
+
+        key = (str(self.path.absolute()), run_id)
+        with _RUN_LOCKS_GUARD:
+            return _RUN_LOCKS.setdefault(key, threading.RLock())
+
+    def backfill_completed_run_ids(self, normalizer_version: str) -> set[str]:
+        """Return runs whose completed marker makes them backfill-ineligible."""
+
+        self.ensure_schema()
+        with self.connection(read_only=True) as connection:
+            rows = connection.execute(
+                "SELECT DISTINCT run_id FROM parity_records "
+                "WHERE normalizer_version = ? AND record_type = 'backfill_completed'",
+                (normalizer_version,),
+            ).fetchall()
+        return {str(row[0]) for row in rows}
+
+    def backfill_cursor(self, normalizer_version: str) -> str:
+        """Return the durable next-batch position for one normalizer."""
+
+        self.ensure_schema()
+        with self.connection(read_only=True) as connection:
+            row = connection.execute(
+                "SELECT cursor_run_id FROM backfill_progress "
+                "WHERE normalizer_version = ?",
+                (normalizer_version,),
+            ).fetchone()
+        return str(row[0]) if row is not None else ""
+
+    def advance_backfill_cursor(
+        self,
+        normalizer_version: str,
+        run_id: str,
+    ) -> None:
+        """Durably advance the backfill scan after one examined run."""
+
+        self.ensure_schema()
+        with self.connection() as connection:
+            connection.execute(
+                "INSERT INTO backfill_progress(normalizer_version, cursor_run_id) "
+                "VALUES (?, ?) ON CONFLICT(normalizer_version) DO UPDATE SET "
+                "cursor_run_id = excluded.cursor_run_id",
+                (normalizer_version, run_id),
+            )
 
     def create_run(
         self,
@@ -824,38 +920,39 @@ class SQLiteEventStore:
         reducer: EventReducerAdapter,
         normalized: NormalizedProviderEvent | None = None,
     ) -> ReducerResult:
-        self.ensure_schema()
-        raw_seq = int(raw["seq"])
-        if self.has_disposition(run_id, raw_seq):
-            raise ValueError(f"raw sequence {raw_seq} is already materialized")
-        try:
-            with self.connection() as connection:
-                connection.execute("BEGIN IMMEDIATE")
-                result = reducer.apply_raw(raw, normalized)
-                received_at = str(raw.get("received_at") or "")
-                normalized = result.normalized
-                connection.execute(
-                    "INSERT INTO dispositions "
-                    "(run_id, raw_seq, disposition, normalized_kind, normalized_json, "
-                    "normalizer_version, created_at) VALUES (?, ?, ?, ?, ?, ?, ?)",
-                    (
-                        run_id,
-                        raw_seq,
-                        normalized["disposition"],
-                        normalized["kind"],
-                        _json_bytes(normalized),
-                        reducer.normalizer_version,
-                        received_at,
-                    ),
-                )
-                self._persist_events(connection, run_id, result, received_at)
-                self._persist_patches(connection, run_id, result, received_at)
-                self._persist_projections(connection, run_id, reducer, result)
-                self._persist_cursor(connection, run_id, result, reducer)
-        except Exception:
-            self._restore_reducer_from_committed_rows(run_id, reducer)
-            raise
-        return result
+        with self.run_lock(run_id):
+            self.ensure_schema()
+            raw_seq = int(raw["seq"])
+            if self.has_disposition(run_id, raw_seq):
+                raise ValueError(f"raw sequence {raw_seq} is already materialized")
+            try:
+                with self.connection() as connection:
+                    connection.execute("BEGIN IMMEDIATE")
+                    result = reducer.apply_raw(raw, normalized)
+                    received_at = str(raw.get("received_at") or "")
+                    normalized = result.normalized
+                    connection.execute(
+                        "INSERT INTO dispositions "
+                        "(run_id, raw_seq, disposition, normalized_kind, normalized_json, "
+                        "normalizer_version, created_at) VALUES (?, ?, ?, ?, ?, ?, ?)",
+                        (
+                            run_id,
+                            raw_seq,
+                            normalized["disposition"],
+                            normalized["kind"],
+                            _json_bytes(normalized),
+                            reducer.normalizer_version,
+                            received_at,
+                        ),
+                    )
+                    self._persist_events(connection, run_id, result, received_at)
+                    self._persist_patches(connection, run_id, result, received_at)
+                    self._persist_projections(connection, run_id, reducer, result)
+                    self._persist_cursor(connection, run_id, result, reducer)
+            except Exception:
+                self._restore_reducer_from_committed_rows(run_id, reducer)
+                raise
+            return result
 
     def _restore_reducer_from_committed_rows(
         self,
@@ -1162,6 +1259,221 @@ class SQLiteEventStore:
             )
             for row in rows
         ]
+
+    def record_parity_record(
+        self,
+        run_id: str,
+        *,
+        normalizer_version: str,
+        record_type: str,
+        path: str,
+        detail: dict[str, Any],
+        expected: Any = None,
+        actual: Any = None,
+        raw_seq: int | None = None,
+    ) -> None:
+        """Persist one parity or backfill decision for later inspection."""
+
+        self.ensure_schema()
+        with self.connection() as connection:
+            connection.execute(
+                "INSERT INTO parity_records "
+                "(run_id, normalizer_version, record_type, path, expected_json, "
+                "actual_json, detail_json, recorded_at, raw_seq) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                (
+                    run_id,
+                    normalizer_version,
+                    record_type,
+                    path,
+                    _json_bytes(expected) if expected is not None else None,
+                    _json_bytes(actual) if actual is not None else None,
+                    _json_bytes(detail),
+                    utc_now(),
+                    raw_seq,
+                ),
+            )
+
+    def parity_records(
+        self,
+        run_id: str | None = None,
+    ) -> list[dict[str, Any]]:
+        self.ensure_schema()
+        query = (
+            "SELECT record_id, run_id, normalizer_version, record_type, path, "
+            "expected_json, actual_json, detail_json, recorded_at, raw_seq "
+            "FROM parity_records"
+        )
+        parameters: tuple[Any, ...] = ()
+        if run_id is not None:
+            query += " WHERE run_id = ?"
+            parameters = (run_id,)
+        query += " ORDER BY record_id"
+        with self.connection(read_only=True) as connection:
+            rows = connection.execute(query, parameters).fetchall()
+        return [
+            {
+                "record_id": int(row[0]),
+                "run_id": str(row[1]),
+                "normalizer_version": str(row[2]),
+                "record_type": str(row[3]),
+                "path": str(row[4]),
+                "expected": json.loads(row[5]) if row[5] is not None else None,
+                "actual": json.loads(row[6]) if row[6] is not None else None,
+                "detail": json.loads(row[7]),
+                "recorded_at": str(row[8]),
+                "raw_seq": int(row[9]) if row[9] is not None else None,
+            }
+            for row in rows
+        ]
+
+    def export_events_jsonl(
+        self,
+        run_id: str,
+        destination: Path | str,
+        *,
+        legacy_source: Path | str | None = None,
+    ) -> bool:
+        """Export the committed SQLite dispositions in archive JSONL order."""
+
+        destination = Path(destination)
+        if not self.path.is_file() or not self.run_is_healthy(run_id):
+            return False
+        cursor = self.cursor(run_id)
+        if (
+            cursor.normalizer_version != NORMALIZER_VERSION
+            or cursor.rebuild_state != "ready"
+        ):
+            return False
+        with self.connection(read_only=True) as connection:
+            rows = connection.execute(
+                "SELECT raw_seq, normalized_json FROM dispositions "
+                "WHERE run_id = ?",
+                (run_id,),
+            ).fetchall()
+        normalized_rows = [
+            (int(raw_seq), json.loads(normalized_json))
+            for raw_seq, normalized_json in rows
+        ]
+        normalized_rows.sort(
+            key=lambda row: (int(row[1].get("seq", 0)), int(row[0]))
+        )
+        legacy_rows: dict[int, dict[str, Any]] = {}
+        if legacy_source is not None:
+            try:
+                with Path(legacy_source).open(encoding="utf-8") as handle:
+                    for line in handle:
+                        if not line.strip():
+                            continue
+                        value = json.loads(line)
+                        if isinstance(value, dict):
+                            legacy_rows[int(value["raw_seq"])] = value
+            except (OSError, TypeError, ValueError, KeyError):
+                legacy_rows = {}
+        destination.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+        if destination.is_symlink():
+            raise OSError(f"refusing symlink archive export: {destination}")
+        fd, raw_tmp = tempfile.mkstemp(
+            prefix=f".{destination.name}.",
+            dir=destination.parent,
+        )
+        temporary = Path(raw_tmp)
+        try:
+            with os.fdopen(fd, "w", encoding="utf-8") as handle:
+                for raw_seq, value in normalized_rows:
+                    exported = dict(value)
+                    legacy_row = legacy_rows.get(raw_seq)
+                    if legacy_row is not None:
+                        exported["normalized_at"] = str(
+                            legacy_row.get("normalized_at") or ""
+                        )
+                        if "lifecycle_state" not in legacy_row:
+                            exported.pop("lifecycle_state", None)
+                    handle.write(_json_bytes(exported))
+                    handle.write("\n")
+                handle.flush()
+                os.fsync(handle.fileno())
+            os.replace(temporary, destination)
+            destination.chmod(0o600)
+            runtime_store._fsync_file(destination)
+            runtime_store._fsync_directory(destination.parent)
+        except BaseException:
+            try:
+                os.close(fd)
+            except OSError:
+                pass
+            temporary.unlink(missing_ok=True)
+            raise
+        return True
+
+    def replace_run_from(
+        self,
+        source: Path | str,
+        run_id: str,
+    ) -> None:
+        """Atomically replace one run from a validated temporary database."""
+
+        with self.run_lock(run_id):
+            self.ensure_schema()
+            source_path = Path(source).absolute()
+            if not source_path.is_file():
+                raise FileNotFoundError(source_path)
+            with self.connection() as connection:
+                connection.execute("ATTACH DATABASE ? AS rebuilt", (str(source_path),))
+                attached = True
+                try:
+                    connection.execute("BEGIN IMMEDIATE")
+                    connection.execute("DELETE FROM runs WHERE run_id = ?", (run_id,))
+                    for table, columns in (
+                    (
+                        "runs",
+                        "run_id, agent_id, provider, format, normalizer_version, "
+                        "created_at, state, archive_state",
+                    ),
+                    (
+                        "run_cursors",
+                        "run_id, raw_seq, materialized_raw_seq, next_event_id, "
+                        "event_base, event_count, change_cursor, patch_base_cursor, "
+                        "last_causal_raw_seq, last_lifecycle_change, "
+                        "normalizer_version, rebuild_state",
+                    ),
+                    (
+                        "run_projections",
+                        "run_id, current_turn_json, tasks_json, pr_json, "
+                        "session_meta_json, pending_requests_json, "
+                        "composer_messages_json, disposition_counts_json, "
+                        "tokens_json, projection_revision, unread_event_seq",
+                    ),
+                    (
+                        "dispositions",
+                        "run_id, raw_seq, disposition, normalized_kind, "
+                        "normalized_json, normalizer_version, created_at",
+                    ),
+                    (
+                        "events",
+                        "run_id, event_id, raw_seq, kind, event_json, created_at, "
+                        "updated_at, revision, deleted",
+                    ),
+                    (
+                        "patches",
+                        "run_id, change_cursor, event_id, raw_seq, patch_json, "
+                        "event_revision, created_at",
+                    ),
+                    ):
+                        connection.execute(
+                            f"INSERT INTO main.{table} ({columns}) "
+                            f"SELECT {columns} FROM rebuilt.{table} WHERE run_id = ?",
+                            (run_id,),
+                        )
+                    connection.commit()
+                    connection.execute("DETACH DATABASE rebuilt")
+                    attached = False
+                except BaseException:
+                    connection.rollback()
+                    raise
+                finally:
+                    if attached:
+                        connection.execute("DETACH DATABASE rebuilt")
 
 
 def replay_raw_jsonl(

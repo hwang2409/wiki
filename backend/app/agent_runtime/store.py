@@ -642,6 +642,7 @@ class RunStore:
         self._control_attached_run_ids: set[str] = set()
         self._start_registry_snapshots: dict[str, dict[str, Any]] = {}
         self._terminal_run_prune_guard: Callable[[RunRecord], bool] | None = None
+        self._archive_events_exporter: Callable[[str, Path, Path], bool] | None = None
         _ensure_private_dir(paths.runtime_dir)
         _ensure_private_dir(paths.runs_dir)
         staging_dir = paths.runs_dir / ".staging"
@@ -677,6 +678,44 @@ class RunStore:
         self, guard: Callable[[RunRecord], bool] | None
     ) -> None:
         self._terminal_run_prune_guard = guard
+
+    def set_archive_events_exporter(
+        self,
+        exporter: Callable[[str, Path, Path], bool] | None,
+    ) -> None:
+        """Set the SQLite archive exporter used before archive commit."""
+
+        self._archive_events_exporter = exporter
+
+    def _export_archive_events(
+        self,
+        run_id: str,
+        source: Path,
+        destination: Path,
+    ) -> bool:
+        exporter = self._archive_events_exporter
+        if exporter is None:
+            try:
+                from .event_store import SQLiteEventStore, runtime_event_db_path
+
+                exporter = SQLiteEventStore(
+                    runtime_event_db_path(self.paths.runtime_dir),
+                    migrate=False,
+                ).export_events_jsonl
+            except Exception:
+                return False
+        try:
+            return bool(
+                exporter(
+                    run_id,
+                    destination,
+                    legacy_source=source,
+                )
+            )
+        except Exception:
+            logger.exception("SQLite archive export failed for %s", run_id)
+            destination.unlink(missing_ok=True)
+            return False
 
     def prune_terminal_runs(self) -> dict[str, int]:
         with self._lock:
@@ -1282,6 +1321,13 @@ class RunStore:
             ),
             (self.provider_log_path(record.run_id), session_dir / "provider.log"),
         ):
+            if destination.name == "events.jsonl" and self._export_archive_events(
+                record.run_id,
+                source,
+                destination,
+            ):
+                expected_paths.append(destination)
+                continue
             if source.is_file():
                 expected_paths.append(destination)
             self._copy_archive_file(source, destination)
@@ -1761,6 +1807,13 @@ class RunStore:
                     session_dir / "current-turn-diff.json",
                 ),
             ):
+                if destination.name == "events.jsonl" and self._export_archive_events(
+                    run_id,
+                    source,
+                    destination,
+                ):
+                    expected_paths.append(destination)
+                    continue
                 if source.is_file():
                     expected_paths.append(destination)
                 self._copy_archive_file(source, destination)
