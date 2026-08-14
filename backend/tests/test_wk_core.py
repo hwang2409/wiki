@@ -193,6 +193,8 @@ def test_cc_cdx_run_shape_is_unchanged_and_wk_metadata_is_additive() -> None:
     assert value["lane"] == "codex"
     assert RunRecord.from_dict(value).kind == "wk-codex"
     assert WkRunMetadata.from_kind("wk-codex").lane == "codex"
+    with pytest.raises(ValueError, match="unsupported wk kind"):
+        WkRunMetadata("wk-other")  # type: ignore[arg-type]
 
     with pytest.raises(ValueError, match="invalid execution kind/provider pair"):
         RunRecord.new(

@@ -59,6 +59,10 @@ class WkRunMetadata:
 
     kind: WkKind
 
+    def __post_init__(self) -> None:
+        if wk_lane_for_kind(self.kind) is None:
+            raise ValueError(f"unsupported wk kind: {self.kind!r}")
+
     @property
     def lane(self) -> str:
         lane = wk_lane_for_kind(self.kind)
