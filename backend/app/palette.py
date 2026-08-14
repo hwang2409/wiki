@@ -541,7 +541,7 @@ def _artifact_payload_from_event(event: dict[str, Any]) -> tuple[str, dict[str, 
                 return artifact_id, {**payload, "artifact": artifact}
         payload = event
         artifact = payload.get("artifact")
-        artifact_id = payload.get("id")
+        artifact_id = payload.get("id") or event.get("artifact_id")
         if isinstance(artifact, dict) and isinstance(artifact_id, str):
             return artifact_id, payload
     return None

@@ -15,7 +15,7 @@ from fastapi.testclient import TestClient
 
 from backend.app import main
 from backend.app.agent_runtime.client import SupervisorClient
-from backend.app.agent_runtime.event_store import replay_raw_jsonl
+from backend.app.agent_runtime.event_store import EventReducerAdapter, SQLiteEventStore, replay_raw_jsonl
 from backend.app.agent_runtime.fake import FixtureAdapterFactory
 from backend.app.agent_runtime.normalizer import normalize_provider_event
 from backend.app.agent_runtime.protocol import UnixSupervisorServer
@@ -27,6 +27,7 @@ from backend.app.agent_runtime.types import ProviderKind, RunRecord
 FIXTURE_DIR = Path(__file__).parent / "fixtures"
 RAW_FIXTURE = FIXTURE_DIR / "headless_pending_ask_raw.jsonl"
 TRANSCRIPT_FIXTURE = FIXTURE_DIR / "claude_native_surfaces.jsonl"
+CODEX_ARTIFACT_FIXTURE = FIXTURE_DIR / "agent_runtime" / "codex_render_artifact_completed.jsonl"
 ADAPTER_FIXTURES = FIXTURE_DIR / "agent_runtime"
 
 
@@ -87,11 +88,17 @@ class DualStackHarness:
 
     ticket = "WIKI-282-HARNESS"
 
-    def __init__(self) -> None:
+    def __init__(
+        self,
+        *,
+        include_pending_overlay: bool = True,
+        include_index_artifact: bool = False,
+    ) -> None:
         self.temp = tempfile.TemporaryDirectory(prefix="wiki-282-dual-stack-")
         self.root = Path(self.temp.name)
         self.run_id = str(uuid4())
-        self.child_run_id = str(uuid4())
+        self.include_pending_overlay = include_pending_overlay
+        self.include_index_artifact = include_index_artifact
         self.paths = RuntimePaths(
             runtime_dir=self.root / "runtime",
             socket_path=self.root / "runtime" / "supervisor.sock",
@@ -108,7 +115,7 @@ class DualStackHarness:
             / f"agent-{self.subagent_id}.jsonl"
         )
         self.raw_path = self.root / "legacy" / "raw.jsonl"
-        self.child_raw_path = self.root / "legacy" / "child-raw.jsonl"
+        self.artifact_raw_path = self.root / "legacy" / "artifact-raw.jsonl"
         self.sqlite_path = self.root / "runtime" / "events.sqlite3"
         self.store: RunStore | None = None
         self.supervisor: Supervisor | None = None
@@ -216,11 +223,15 @@ class DualStackHarness:
             }
             for index, row in enumerate(transcript_rows, start=1)
         ]
-        pending_rows = [
-            json.loads(line)
-            for line in RAW_FIXTURE.read_text(encoding="utf-8").splitlines()
-            if line.strip()
-        ]
+        pending_rows = (
+            [
+                json.loads(line)
+                for line in RAW_FIXTURE.read_text(encoding="utf-8").splitlines()
+                if line.strip()
+            ]
+            if self.include_pending_overlay
+            else []
+        )
         next_seq = len(rows) + 1
         rows.extend(
             {**row, "seq": next_seq + int(row["seq"]) - 1}
@@ -267,45 +278,20 @@ class DualStackHarness:
             "".join(json.dumps(row, separators=(",", ":")) + "\n" for row in rows),
             encoding="utf-8",
         )
-        child_rows = [
-            {
+        if self.include_index_artifact:
+            source = json.loads(CODEX_ARTIFACT_FIXTURE.read_text(encoding="utf-8"))
+            artifact_row = {
                 "seq": 1,
-                "received_at": "2026-07-10T16:00:00Z",
-                "provider": "claude",
-                "direction": "stdout",
+                "received_at": "2026-07-14T22:09:40.564269+00:00",
+                "provider": "codex",
+                "direction": str(source["direction"]),
                 "generation": 1,
-                "payload": {
-                    "type": "user",
-                    "timestamp": "2026-07-10T16:00:00Z",
-                    "message": {
-                        "role": "user",
-                        "content": "Inspect child-only branch for WIKI-282.",
-                    },
-                },
-            },
-            {
-                "seq": 2,
-                "received_at": "2026-07-10T16:00:01Z",
-                "provider": "claude",
-                "direction": "stdout",
-                "generation": 1,
-                "payload": {
-                    "type": "assistant",
-                    "timestamp": "2026-07-10T16:00:01Z",
-                    "message": {
-                        "role": "assistant",
-                        "content": [{"type": "text", "text": "child-only event"}],
-                    },
-                },
-            },
-        ]
-        self.child_raw_path.write_text(
-            "".join(
-                json.dumps(row, separators=(",", ":")) + "\n" for row in child_rows
-            ),
-            encoding="utf-8",
-        )
-
+                "payload": dict(source["message"]),
+            }
+            self.artifact_raw_path.write_text(
+                json.dumps(artifact_row, separators=(",", ":")) + "\n",
+                encoding="utf-8",
+            )
     def _save_main_state(self) -> None:
         names = (
             "AGENT_REGISTRY_PATH",
@@ -378,11 +364,45 @@ class DualStackHarness:
         )
         record.transcript_path = str(self.transcript_path)
         self.store._write_record(record)  # noqa: SLF001
+        legacy_artifacts = [
+            {
+                "kind": "artifact",
+                "artifact_id": "legacy-fixture-mermaid",
+                "payload": {
+                    "kind": "artifact",
+                    "id": "legacy-fixture-mermaid",
+                    "title": "Legacy fixture mermaid",
+                    "caption": "legacy palette fixture",
+                    "artifact": {"kind": "mermaid", "source": "graph TD; A-->B"},
+                    "ts": "2026-07-14T22:09:40+00:00",
+                },
+            },
+            {
+                "kind": "artifact",
+                "artifact_id": "legacy-fixture-table",
+                "payload": {
+                    "kind": "artifact",
+                    "id": "legacy-fixture-table",
+                    "title": "Legacy fixture table",
+                    "caption": "legacy palette fixture",
+                    "artifact": {
+                        "kind": "table",
+                        "columns": [{"key": "name", "label": "Name", "type": "string"}],
+                        "rows": [["fixture"]],
+                    },
+                    "ts": "2026-07-14T22:09:41+00:00",
+                },
+            },
+        ]
+        (self.paths.runs_dir / self.run_id / "events.jsonl").write_text(
+            "".join(
+                json.dumps({"seq": index, **event}, separators=(",", ":")) + "\n"
+                for index, event in enumerate(legacy_artifacts, start=1)
+            ),
+            encoding="utf-8",
+        )
         registry = json.loads(self.paths.registry_path.read_text(encoding="utf-8"))
         registry[self.ticket]["current"]["transcript"] = str(self.transcript_path)
-        registry[self.ticket]["current"]["subagent_run_ids"] = {
-            self.subagent_id: self.child_run_id
-        }
         self.paths.registry_path.write_text(
             json.dumps(registry, separators=(",", ":")) + "\n",
             encoding="utf-8",
@@ -394,13 +414,14 @@ class DualStackHarness:
             agent_id=self.ticket,
             provider=ProviderKind.CLAUDE,
         )
-        replay_raw_jsonl(
-            self.child_raw_path,
-            self.sqlite_path,
-            run_id=self.child_run_id,
-            agent_id=f"{self.ticket}/{self.subagent_id}",
-            provider=ProviderKind.CLAUDE,
-        )
+        if self.include_index_artifact:
+            replay_raw_jsonl(
+                self.artifact_raw_path,
+                self.sqlite_path,
+                run_id=str(uuid4()),
+                agent_id="WIKI-282-artifacts",
+                provider=ProviderKind.CODEX,
+            )
         for row in self._raw_rows():
             envelope = self.store.append_raw(
                 self.run_id,
@@ -474,6 +495,51 @@ class DualStackHarness:
             raise RuntimeError("harness is not active")
         self._set_flag_env(flags)
         return self.client.request(method, path, **kwargs)
+
+    def palette(self, query: str, *, limit: int = 30):
+        return self.request(
+            "GET",
+            "/api/palette/search",
+            params={"q": query, "limit": limit, "mode": "lexical"},
+        )
+
+    def mark_materializer_not_ready(self) -> None:
+        store = SQLiteEventStore(self.sqlite_path, migrate=False)
+        with store.connection() as connection:
+            connection.execute(
+                "UPDATE run_cursors SET rebuild_state = 'needed' WHERE run_id = ?",
+                (self.run_id,),
+            )
+
+    def append_tool_result_patch(self) -> None:
+        store = SQLiteEventStore(self.sqlite_path, migrate=False)
+        reducer = EventReducerAdapter(ProviderKind.CLAUDE)
+        for row in store.read_normalized_events(self.run_id):
+            reducer.apply_normalized_row(row)
+        raw = {
+            "seq": max(int(row["seq"]) for row in self._raw_rows()) + 1,
+            "received_at": "2026-07-14T22:09:42+00:00",
+            "provider": "claude",
+            "direction": "stdout",
+            "generation": 1,
+            "payload": {
+                "type": "user",
+                "timestamp": "2026-07-14T22:09:42+00:00",
+                "message": {
+                    "role": "user",
+                    "content": [
+                        {
+                            "type": "tool_result",
+                            "tool_use_id": "toolu_agent_282",
+                            "content": "patched child output",
+                        }
+                    ],
+                },
+            },
+        }
+        store.materialize(self.run_id, raw, reducer)
+        with self.raw_path.open("a", encoding="utf-8") as handle:
+            handle.write(json.dumps(raw, separators=(",", ":")) + "\n")
 
     def session(
         self,

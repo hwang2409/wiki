@@ -63,24 +63,20 @@ def test_dual_stack_harness_calls_real_session_route() -> None:
     _assert_full_payload_parity(legacy_payload, sqlite_payload)
 
 
-def test_dual_stack_harness_calls_real_delta_route() -> None:
+def test_child_delta_ignores_sqlite_flag_in_pr4a() -> None:
     with DualStackHarness() as harness:
         legacy = harness.delta()
-        sqlite = harness.delta(flags=("delta",))
+        flagged = harness.delta(flags=("delta",))
 
     assert legacy.status_code == 200
-    assert sqlite.status_code == 200
+    assert flagged.status_code == 200
     legacy_payload = legacy.json()
-    sqlite_payload = sqlite.json()
+    flagged_payload = flagged.json()
     assert [event["text"] for event in legacy_payload["events"]] == [
         "Inspect child-only branch for WIKI-282.",
         "child-only event",
     ]
-    assert [event["text"] for event in sqlite_payload["events"]] == [
-        "Inspect child-only branch for WIKI-282.",
-        "child-only event",
-    ]
-    _assert_full_payload_parity(legacy_payload, sqlite_payload)
+    assert flagged_payload == legacy_payload
 
 
 @pytest.mark.parametrize("flags", [(), ("session",), ("delta",), ("older",)])
@@ -97,22 +93,15 @@ def test_older_route_ignores_all_sqlite_flags(flags: tuple[str, ...]) -> None:
     assert not response.json()["path"].startswith("sqlite://")
 
 
-@pytest.mark.parametrize(
-    ("enabled_route", "unrelated_route"),
-    (("session", "delta"), ("delta", "session")),
-)
-def test_route_flags_isolate_real_http_adapters(
-    enabled_route: str,
-    unrelated_route: str,
-) -> None:
+def test_session_flag_does_not_enable_child_real_http_adapter() -> None:
     with DualStackHarness() as harness:
-        enabled = getattr(harness, enabled_route)(flags=(enabled_route,))
-        unrelated = getattr(harness, unrelated_route)(flags=(enabled_route,))
+        enabled = harness.session(flags=("session",))
+        child = harness.delta(flags=("session",))
 
     assert enabled.status_code == 200
     assert enabled.json()["path"].startswith("sqlite://")
-    assert unrelated.status_code == 200
-    assert not unrelated.json()["path"].startswith("sqlite://")
+    assert child.status_code == 200
+    assert not child.json()["path"].startswith("sqlite://")
 
 
 def test_real_rebuild_swap_changes_source_identity_and_resets_cursor() -> None:
@@ -128,6 +117,31 @@ def test_real_rebuild_swap_changes_source_identity_and_resets_cursor() -> None:
     assert rebuilt["path"] != initial["path"]
     assert rebuilt["path"].endswith("rebuild-1")
     assert rebuilt["events"]
+
+
+def test_sqlite_tool_result_patch_advances_once_from_change_cursor() -> None:
+    with DualStackHarness(include_pending_overlay=False) as harness:
+        initial = harness.session(flags=("session",)).json()
+        old_cursor = SQLiteEventStore(harness.sqlite_path, migrate=False).cursor(
+            harness.run_id
+        ).change_cursor
+        harness.append_tool_result_patch()
+        first = harness.session(
+            flags=("session",),
+            cursor=old_cursor,
+            client_path=initial["path"],
+        ).json()
+        second = harness.session(
+            flags=("session",),
+            cursor=first["cursor"],
+            client_path=first["path"],
+        ).json()
+
+    assert first["cursor"] > old_cursor
+    assert len(first["patches"]) == 1
+    assert first["patches"][0]["id"] == 11
+    assert first["patches"][0]["output"] == "patched child output"
+    assert second["patches"] == []
 
 
 def test_real_snapshot_does_not_mix_generations_during_rebuild_swaps() -> None:

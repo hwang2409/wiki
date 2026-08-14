@@ -3639,7 +3639,7 @@ def _sqlite_session_payload(
     projection = snapshot.projection
     events = list(snapshot.events)
     patches = list(snapshot.patches)
-    source_cursor = state.event_count if fmt == "claude-sub" else state.change_cursor
+    source_cursor = state.change_cursor
 
     # A cursor advance on the same source is a true delta.  Source changes
     # (including a rebuild generation change) are the only normal reset.
@@ -3952,6 +3952,7 @@ def _session_delta_payload(
     tail_window: bool = True,
     tail_events: int | None = None,
     read_route: str | None = None,
+    allow_sqlite: bool = True,
     provider_inspector: dict[str, object] | None = None,
     composer_messages: list[dict[str, Any]] | None = None,
 ) -> dict[str, object]:
@@ -3990,7 +3991,12 @@ def _session_delta_payload(
     )
     if read_route is not None and read_route not in {"delta", "session"}:
         raise ValueError(f"unknown session read route: {read_route}")
-    if read_route == "delta" and _sqlite_read_enabled("delta") and isinstance(run_id, str):
+    if (
+        allow_sqlite
+        and read_route == "delta"
+        and _sqlite_read_enabled("delta")
+        and isinstance(run_id, str)
+    ):
         sqlite_payload = _sqlite_session_payload(
             run_id,
             fmt=fmt,
@@ -4475,12 +4481,6 @@ def subagent_session(
         raise HTTPException(status_code=404, detail="No such subagent")
     resolved = _registry_agent(_read_agent_registry(), ticket)
     current = resolved[2] if resolved is not None else {}
-    subagent_run_ids = current.get("subagent_run_ids") if isinstance(current, dict) else None
-    run_id = (
-        subagent_run_ids.get(agent_id)
-        if isinstance(subagent_run_ids, dict)
-        else None
-    )
     # Without a limit the response stays complete (the inspector has no
     # older-page route, so tail-windowed events would become unreachable).
     # The inline child trace passes an explicit limit so its first fetch is
@@ -4496,8 +4496,9 @@ def subagent_session(
         # sentinel; normalize to "no limit" in that case.
         tail_events=limit if isinstance(limit, int) else None,
         read_route="delta",
+        allow_sqlite=False,
         headless_current=current if _is_headless(current) else None,
-        run_id=run_id if isinstance(run_id, str) else None,
+        run_id=None,
     )
 
 
