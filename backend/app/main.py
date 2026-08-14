@@ -69,6 +69,7 @@ from .agent_runtime import costs
 from .agent_runtime import graph_health
 from .agent_runtime.loop_state import derive_loop_state
 from .agent_runtime.archive_protocol import archive_is_committed
+from .agent_runtime.event_store import SQLiteEventStore, runtime_event_db_path
 from .agent_runtime.store import RuntimePaths
 from .agent_runtime.ticket import (
     base_ticket,
@@ -195,13 +196,10 @@ async def lifespan(_app: FastAPI):
         # Health is optional; a broken provider CLI or probe must not prevent
         # the backend from starting.
         pass
-    # Warm the palette artifact cache off the event loop: the cold walk parses
-    # every events.jsonl (~14s observed) and would otherwise land on the first
-    # Cmd-K keystroke.
+    # Warm the palette artifact view off the event loop.  SQLite is the index;
+    # do not parse every events.jsonl before the first Cmd-K keystroke.
     threading.Thread(
-        target=lambda: palette.collect_artifact_items(
-            SUPERVISOR_CLIENT.paths.runs_dir, AGENT_ARCHIVE_DIR
-        ),
+        target=lambda: palette.collect_artifact_items_from_index(_sqlite_event_store()),
         name="palette-artifact-warm",
         daemon=True,
     ).start()
@@ -1093,6 +1091,81 @@ AGENT_ARCHIVE_DIR = Path(
 )
 AGENT_TMP_DIR = Path(os.environ.get("WIKI_AGENT_TMP_DIR") or "/tmp")
 SUPERVISOR_CLIENT = SupervisorClient(RuntimePaths.from_env())
+
+# These switches deliberately stay separate.  A route can move to the
+# materialized view only after its adapter has proved safe in production.
+_SQLITE_READ_ROUTES = {
+    "session": ("WIKI_SQLITE_READ_SESSION", "session_adapter"),
+    "delta": ("WIKI_SQLITE_READ_DELTA", "delta_adapter"),
+}
+_SQLITE_READ_FLAG_ENV = {
+    route: flag for route, (flag, _adapter) in _SQLITE_READ_ROUTES.items()
+}
+
+
+@dataclass(frozen=True)
+class SQLiteSourceKey:
+    """Typed identity for one materialized read source."""
+
+    source_class: str
+    run_id: str
+    rebuild_generation: int
+
+    def format(self) -> str:
+        return (
+            f"sqlite://{self.source_class}/{self.run_id}/"
+            f"rebuild-{self.rebuild_generation}"
+        )
+
+    @classmethod
+    def parse(cls, value: str) -> "SQLiteSourceKey":
+        match = re.fullmatch(
+            r"sqlite://(?P<source_class>[^/]+)/(?P<run_id>[^/]+)/"
+            r"rebuild-(?P<generation>[0-9]+)",
+            value,
+        )
+        if match is None:
+            raise ValueError(f"invalid SQLite source key: {value}")
+        return cls(
+            source_class=match.group("source_class"),
+            run_id=match.group("run_id"),
+            rebuild_generation=int(match.group("generation")),
+        )
+
+
+def _sqlite_read_enabled(route: str) -> bool:
+    """Return whether one independently releasable SQLite read is enabled."""
+
+    value = os.environ.get(_SQLITE_READ_ROUTES[route][0], "")
+    return value.lower() in {"1", "true", "yes", "on"}
+
+
+def _sqlite_event_store() -> SQLiteEventStore:
+    return SQLiteEventStore(runtime_event_db_path(AGENT_RUNTIME_DIR), migrate=False)
+
+
+def _palette_artifacts_or_legacy_scan(
+    event_store: SQLiteEventStore,
+    indexed_artifacts: list[palette.PaletteItem] | None,
+    workers: list[object],
+) -> list[palette.PaletteItem] | None:
+    """Use the index only after every live run has a ready materializer."""
+
+    if indexed_artifacts is None or indexed_artifacts:
+        return indexed_artifacts
+    for worker in workers:
+        if not isinstance(worker, dict):
+            continue
+        run_id = worker.get("run_id")
+        if not isinstance(run_id, str):
+            continue
+        try:
+            state = event_store.cursor(run_id)
+        except Exception:
+            return None
+        if state.rebuild_state != "ready":
+            return None
+    return indexed_artifacts
 RUN_ID_PATTERN = re.compile(
     r"^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$"
 )
@@ -2403,13 +2476,64 @@ async def palette_search(
             return
 
     def _run() -> list[dict[str, object]]:
+        workers = (
+            agents_payload.get("workers", [])
+            if isinstance(agents_payload, dict)
+            else []
+        )
+        ticket_by_run = {
+            str(worker["run_id"]): str(worker["ticket"])
+            for worker in workers
+            if isinstance(worker, dict)
+            and isinstance(worker.get("run_id"), str)
+            and isinstance(worker.get("ticket"), str)
+        }
+        archive_by_run: dict[str, tuple[str, str]] = {}
+        archived = agents_payload.get("archived", []) if isinstance(agents_payload, dict) else []
+        all_archived = list_archived(limit=None)
+        for entry in all_archived:
+            if not isinstance(entry, dict):
+                continue
+            run_id = entry.get("run_id")
+            ticket = entry.get("ticket")
+            archived_at = entry.get("archived_at")
+            if (
+                isinstance(run_id, str)
+                and isinstance(ticket, str)
+                and isinstance(archived_at, str)
+            ):
+                ticket_by_run[run_id] = ticket
+                archive_by_run[run_id] = (ticket, archived_at)
+        for entry in archived:
+            if not isinstance(entry, dict):
+                continue
+            run_id = entry.get("run_id")
+            ticket = entry.get("ticket")
+            if isinstance(run_id, str) and isinstance(ticket, str):
+                ticket_by_run[run_id] = ticket
+        event_store = _sqlite_event_store()
+        indexed_artifacts = palette.collect_artifact_items_from_index(
+            event_store,
+            ticket_by_run=ticket_by_run,
+            archive_by_run=archive_by_run,
+        )
+        indexed_artifacts = _palette_artifacts_or_legacy_scan(
+            event_store,
+            indexed_artifacts,
+            workers,
+        )
+        palette_agents_payload = (
+            dict(agents_payload) if isinstance(agents_payload, dict) else {}
+        )
+        palette_agents_payload["archived"] = all_archived
         return palette.search(
             q,
             limit,
-            agents_payload=agents_payload,
+            agents_payload=palette_agents_payload,
             vault_dir=VAULT_DIR,
             runs_dir=SUPERVISOR_CLIENT.paths.runs_dir,
             archive_dir=AGENT_ARCHIVE_DIR,
+            artifact_items=indexed_artifacts,
             should_cancel=cancelled.is_set,
         )
 
@@ -3342,6 +3466,250 @@ def _overlay_pending_questions(
     }
 
 
+def _enrich_session_delta(
+    delta: dict[str, Any],
+    *,
+    fmt: str,
+    transcript_path: Path | None,
+    raw_path: Path | None,
+    client_cursor: int,
+) -> dict[str, Any]:
+    """Apply the one v2 enrichment pipeline after either read adapter.
+
+    SQLite and transcript readers deliberately produce only the raw v2 delta.
+    This keeps question controls, child links, and inspect data identical when
+    a route changes source.
+    """
+
+    enriched = dict(delta)
+    events = list(delta.get("events") or [])
+    if fmt == "claude" and transcript_path is not None:
+        events = transcripts.annotate_agent_events(transcript_path, events)
+    enriched["events"] = events
+    if transcript_path is not None:
+        enriched = _overlay_pending_questions(
+            enriched,
+            fmt=fmt,
+            transcript_path=transcript_path,
+            raw_path=raw_path,
+            client_cursor=client_cursor,
+        )
+        annotated_by_id = {
+            event.get("id"): event
+            for event in events
+            if isinstance(event.get("id"), int)
+        }
+        merged_events: list[dict[str, Any]] = []
+        for event in enriched.get("events") or []:
+            annotated = annotated_by_id.get(event.get("id"))
+            if annotated is None:
+                merged_events.append(event)
+                continue
+            merged = {**annotated, **event}
+            if isinstance(annotated.get("tool"), dict) and isinstance(event.get("tool"), dict):
+                merged["tool"] = {**annotated["tool"], **event["tool"]}
+            merged_events.append(merged)
+        enriched["events"] = merged_events
+    enriched["events"] = [
+        {**event, "disposition": event.get("disposition", "rendered")}
+        for event in enriched.get("events") or []
+    ]
+    return enriched
+
+
+def _compose_session_payload(
+    raw_delta: dict[str, Any],
+    *,
+    fmt: str,
+    source_path: Path | None,
+    raw_path: Path | None,
+    client_cursor: int,
+    source_key: str,
+    model: str | None,
+    desired_model: str | None,
+    kind: str | None,
+    provider: str | None,
+    working: bool,
+    include_subagents: bool,
+    include_queue: bool,
+    ticket: str | None,
+    provider_inspector: dict[str, object] | None = None,
+    composer_messages: list[dict[str, Any]] | None = None,
+) -> dict[str, object]:
+    """Compose one final v2 payload after either source adapter reads raw data."""
+
+    enriched = _enrich_session_delta(
+        raw_delta,
+        fmt=fmt,
+        transcript_path=source_path,
+        raw_path=raw_path,
+        client_cursor=client_cursor,
+    )
+    payload: dict[str, object] = {
+        "version": 2,
+        "format": fmt,
+        "path": source_key,
+        "tokens": enriched.get("tokens"),
+        "tasks": enriched.get("tasks") or [],
+        "pr": enriched.get("pr"),
+        "session_meta": enriched.get("session_meta") or {},
+        "dispositions": enriched.get("dispositions")
+        or {"rendered": 0, "summarized": 0, "ignored": 0, "unknown": 0},
+        "base": enriched.get("base", 0),
+        "cursor": enriched.get("cursor", 0),
+        "tail_from": enriched.get("tail_from", 0),
+        "events": enriched.get("events") or [],
+        "patches": enriched.get("patches") or [],
+        "working": working,
+        "model": model,
+        "desired_model": desired_model,
+        "kind": kind,
+        "provider": provider,
+    }
+    if "has_older" in enriched:
+        payload["has_older"] = bool(enriched["has_older"])
+    if include_subagents:
+        payload["subagents"] = _active_subagents(source_path) if source_path else []
+    if include_queue:
+        payload["queue"] = _queue_messages(ticket) if ticket else []
+    if provider_inspector is not None:
+        payload["provider_inspector"] = provider_inspector
+    if composer_messages is None and provider_inspector is not None:
+        candidate = provider_inspector.get("composer_messages")
+        if isinstance(candidate, list):
+            composer_messages = candidate
+    if composer_messages is not None:
+        payload["composer_messages"] = composer_messages
+    return payload
+
+
+def _sqlite_session_payload(
+    run_id: str,
+    *,
+    fmt: str,
+    cursor: int,
+    client_path: str | None,
+    model: str | None,
+    desired_model: str | None,
+    kind: str | None,
+    provider: str | None,
+    working: bool,
+    include_subagents: bool = False,
+    include_queue: bool = False,
+    ticket: str | None = None,
+    tail_window: bool = True,
+    tail_events: int | None = None,
+    source_class: str = "live",
+    transcript_path: Path | None = None,
+    raw_path: Path | None = None,
+    provider_inspector: dict[str, object] | None = None,
+    composer_messages: list[dict[str, Any]] | None = None,
+) -> dict[str, object] | None:
+    """Build the v2 session view from a ready materialized run.
+
+    ``path`` is already the v2 source identity.  Changing it from a native or
+    archive path to this key makes old clients take the established full-reset
+    branch without adding a new payload field.
+    """
+
+    try:
+        event_store = _sqlite_event_store()
+        snapshot = event_store.read_session_snapshot(
+            run_id,
+            source_class=source_class,
+            after_cursor=cursor,
+        )
+    except Exception:
+        return None
+
+    try:
+        typed_source_key = SQLiteSourceKey.parse(snapshot.source_key)
+    except (AttributeError, TypeError, ValueError):
+        return None
+    if snapshot.state.rebuild_state != "ready":
+        return None
+    if (
+        typed_source_key.run_id != run_id
+        or typed_source_key.source_class != source_class
+    ):
+        return None
+    source_key = typed_source_key.format()
+    effective_cursor = cursor if client_path == source_key else 0
+    state = snapshot.state
+    projection = snapshot.projection
+    events = list(snapshot.events)
+    patches = list(snapshot.patches)
+    source_cursor = state.change_cursor
+
+    # A cursor advance on the same source is a true delta.  Source changes
+    # (including a rebuild generation change) are the only normal reset.
+    full_reset = (
+        effective_cursor <= 0
+        or effective_cursor > source_cursor
+        or effective_cursor < state.patch_base_cursor
+    )
+    event_base = state.event_base
+    total = event_base + len(events)
+    if full_reset:
+        window_size = tail_events
+        if window_size is None and tail_window:
+            window_size = transcripts.TAIL_WINDOW_EVENTS
+        window_base = max(event_base, total - window_size) if window_size else event_base
+        event_slice = events[window_base - event_base :]
+        patch_payload: list[dict[str, Any]] = []
+        tail_from = window_base
+    else:
+        changed_events = [patch.patch["event"] for patch in patches if "event" in patch.patch]
+        tail_from = min((int(event["id"]) for event in changed_events), default=total)
+        event_slice = [event for event in events if int(event.get("id", -1)) >= tail_from]
+        patch_payload = [
+            {"id": patch.event_id, **patch.patch}
+            for patch in patches
+            if "event" not in patch.patch
+        ]
+
+    try:
+        tokens = json.loads(projection[7]) if projection[7] else None
+        tasks = json.loads(projection[1])
+        pr = json.loads(projection[2]) if projection[2] else None
+        session_meta = json.loads(projection[3])
+        dispositions = json.loads(projection[6])
+    except (TypeError, ValueError):
+        return None
+    raw_delta: dict[str, Any] = {
+        "events": event_slice,
+        "base": window_base if full_reset else event_base,
+        "tokens": tokens,
+        "tasks": tasks,
+        "pr": pr,
+        "session_meta": session_meta,
+        "dispositions": dispositions,
+        "cursor": source_cursor,
+        "tail_from": tail_from,
+        "patches": patch_payload,
+    }
+    if full_reset:
+        raw_delta["has_older"] = window_base > event_base
+    return _compose_session_payload(
+        raw_delta,
+        fmt=fmt,
+        source_path=transcript_path,
+        raw_path=raw_path,
+        client_cursor=effective_cursor,
+        source_key=source_key,
+        model=model,
+        desired_model=desired_model,
+        kind=kind,
+        provider=provider,
+        working=working,
+        include_subagents=include_subagents,
+        include_queue=include_queue,
+        ticket=ticket,
+        provider_inspector=provider_inspector,
+        composer_messages=composer_messages,
+    )
+
+
 def _provider_events(
     agent_id: str,
     *,
@@ -3580,8 +3948,13 @@ def _session_delta_payload(
     desired_model: str | None = None,
     kind: str | None = None,
     provider: str | None = None,
+    run_id: str | None = None,
     tail_window: bool = True,
     tail_events: int | None = None,
+    read_route: str | None = None,
+    allow_sqlite: bool = True,
+    provider_inspector: dict[str, object] | None = None,
+    composer_messages: list[dict[str, Any]] | None = None,
 ) -> dict[str, object]:
     effective_cursor = 0 if client_path is not None and client_path != str(path) else cursor
     result = transcripts.read_session_delta(
@@ -3590,58 +3963,62 @@ def _session_delta_payload(
         effective_cursor,
         tail_window=tail_window,
         tail_events=tail_events,
-        # Endpoint transaction rule: parse + agent annotation happen inside
-        # one path-lock span, never on a released snapshot.
-        annotate_agents=fmt == "claude",
+        annotate_agents=False,
     )
     raw_path: Path | None = None
+    if isinstance(headless_current, dict) and _is_headless(headless_current):
+        raw_log = headless_current.get("log")
+        raw_path = Path(raw_log) if isinstance(raw_log, str) else None
+    if provider_inspector is None and ticket:
+        provider_inspector = _provider_events(ticket, limit=50)
+    payload = _compose_session_payload(
+        result,
+        fmt=fmt,
+        source_path=path,
+        raw_path=raw_path,
+        client_cursor=effective_cursor,
+        source_key=str(path),
+        model=model,
+        desired_model=desired_model,
+        kind=kind,
+        provider=provider,
+        working=_transcript_working(path, ticket),
+        include_subagents=include_subagents,
+        include_queue=include_queue and bool(ticket and valid_agent_id(ticket)),
+        ticket=ticket,
+        provider_inspector=provider_inspector,
+        composer_messages=composer_messages,
+    )
+    if read_route is not None and read_route not in {"delta", "session"}:
+        raise ValueError(f"unknown session read route: {read_route}")
     if (
-        isinstance(headless_current, dict)
-        and _is_headless(headless_current)
-        and isinstance(headless_current.get("log"), str)
+        allow_sqlite
+        and read_route == "delta"
+        and _sqlite_read_enabled("delta")
+        and isinstance(run_id, str)
     ):
-        raw_path = Path(headless_current["log"])
-        result = _overlay_pending_questions(
-            result,
+        sqlite_payload = _sqlite_session_payload(
+            run_id,
             fmt=fmt,
+            cursor=cursor,
+            client_path=client_path,
+            model=model,
+            desired_model=desired_model,
+            kind=kind,
+            provider=provider,
+            working=bool(payload["working"]),
+            include_subagents=include_subagents,
+            include_queue=include_queue,
+            ticket=ticket,
+            tail_window=tail_window,
+            tail_events=tail_events,
             transcript_path=path,
             raw_path=raw_path,
-            client_cursor=effective_cursor,
+            provider_inspector=provider_inspector,
+            composer_messages=composer_messages,
         )
-    events = result["events"]
-    payload: dict[str, object] = {
-        "version": 2,
-        "format": fmt,
-        "path": str(path),
-        "tokens": result["tokens"],
-        "tasks": result.get("tasks") or [],
-        "pr": result.get("pr"),
-        "session_meta": result.get("session_meta") or {},
-        "dispositions": result.get("dispositions") or {"rendered": 0, "summarized": 0, "ignored": 0, "unknown": 0},
-        "base": result["base"],
-        "cursor": result["cursor"],
-        "tail_from": result["tail_from"],
-        "events": events,
-        "patches": result.get("patches") or [],
-        "working": _transcript_working(path, ticket),
-        "model": model,
-        "desired_model": desired_model,
-        "kind": kind,
-        "provider": provider,
-    }
-    if "has_older" in result:
-        payload["has_older"] = bool(result["has_older"])
-    if include_subagents:
-        payload["subagents"] = _active_subagents(path)
-    if include_queue and ticket and valid_agent_id(ticket):
-        payload["queue"] = _queue_messages(ticket)
-    if ticket:
-        provider_inspector = _provider_events(ticket, limit=50)
-        if provider_inspector is not None:
-            payload["provider_inspector"] = provider_inspector
-            composer_messages = provider_inspector.get("composer_messages")
-            if isinstance(composer_messages, list):
-                payload["composer_messages"] = composer_messages
+        if sqlite_payload is not None:
+            return sqlite_payload
     return payload
 
 
@@ -3692,13 +4069,14 @@ def _archived_events_payload(
     return payload
 
 
-@app.get("/api/agents/{ticket}/session")
-def agent_session(
+def _agent_session_impl(
     ticket: str,
     cursor: int = Query(0, ge=0),
     client_path: str | None = Query(None, alias="path"),
     archived_at: str | None = None,
     run_id: str | None = None,
+    *,
+    allow_sqlite: bool,
 ) -> dict[str, object]:
     if not valid_agent_id(ticket):
         raise HTTPException(status_code=400, detail="Bad ticket")
@@ -3764,6 +4142,7 @@ def agent_session(
         archive_kind, spawned_at, archive_dir = _archive_hint(ticket, archived_at)
         current_kind = current_kind or archive_kind
 
+    current_run_id = current.get("run_id") if isinstance(current, dict) else None
     found = None
     if not requested_archive and isinstance(current, dict) and _is_headless(current):
         transcript_hint = current.get("transcript")
@@ -3790,6 +4169,23 @@ def agent_session(
                 archive_dir = _archive_session_for_run_id(current_run_id)
         if isinstance(current, dict) and _is_headless(current):
             provider_inspector = _provider_events(ticket, limit=50)
+            if allow_sqlite and _sqlite_read_enabled("session") and isinstance(current_run_id, str):
+                sqlite_payload = _sqlite_session_payload(
+                    current_run_id,
+                    fmt=current_provider or "provider-events",
+                    cursor=cursor,
+                    client_path=client_path,
+                    model=current_model,
+                    desired_model=current.get("desired_model"),
+                    kind=current_kind,
+                    provider=current_provider,
+                    working=_transcript_working(Path(current.get("log") or "."), ticket),
+                    include_queue=True,
+                    ticket=ticket,
+                    provider_inspector=provider_inspector,
+                )
+                if sqlite_payload is not None:
+                    return sqlite_payload
             if provider_inspector is None:
                 raise HTTPException(
                     status_code=503,
@@ -3799,35 +4195,39 @@ def agent_session(
                 provider_inspector,
                 (current_model, current_kind, current_provider),
             )
-            return {
-                "version": 2,
-                "format": "provider-events",
-                "path": f"provider://{current['run_id']}",
-                "tokens": None,
-                "tasks": [],
-                "pr": None,
-                "session_meta": {},
-                "dispositions": {
-                    "rendered": 0,
-                    "summarized": 0,
-                    "ignored": 0,
-                    "unknown": 0,
+            return _compose_session_payload(
+                {
+                    "events": [],
+                    "tokens": None,
+                    "tasks": [],
+                    "pr": None,
+                    "session_meta": {},
+                    "dispositions": {
+                        "rendered": 0,
+                        "summarized": 0,
+                        "ignored": 0,
+                        "unknown": 0,
+                    },
+                    "base": 0,
+                    "cursor": 0,
+                    "tail_from": 0,
+                    "patches": [],
                 },
-                "base": 0,
-                "cursor": 0,
-                "tail_from": 0,
-                "events": [],
-                "patches": [],
-                "subagents": [],
-                "queue": _queue_messages(ticket),
-                "working": _transcript_working(Path(current.get("log") or "."), ticket),
-                "model": model,
-                "desired_model": current.get("desired_model"),
-                "kind": kind,
-                "provider": provider,
-                "provider_inspector": provider_inspector,
-                "composer_messages": provider_inspector.get("composer_messages") or [],
-            }
+                fmt="provider-events",
+                source_path=None,
+                raw_path=None,
+                client_cursor=0,
+                source_key=f"provider://{current['run_id']}",
+                model=model,
+                desired_model=current.get("desired_model"),
+                kind=kind,
+                provider=provider,
+                working=_transcript_working(Path(current.get("log") or "."), ticket),
+                include_subagents=False,
+                include_queue=True,
+                ticket=ticket,
+                provider_inspector=provider_inspector,
+            )
         # Native transcript gone (cleanup) — the archive owns a durable,
         # normalized provider stream for headless runs.
         if archive_dir is not None:
@@ -3876,7 +4276,12 @@ def agent_session(
     model = current_model
     kind = current_kind or _kind_for_format(fmt)
     provider = current_provider or _provider_for_kind(kind)
-    return _session_delta_payload(
+    provider_inspector = (
+        _provider_events(ticket, limit=50)
+        if isinstance(current, dict) and _is_headless(current)
+        else None
+    )
+    legacy_payload = _session_delta_payload(
         fmt,
         path,
         cursor=cursor,
@@ -3889,6 +4294,53 @@ def agent_session(
         desired_model=current.get("desired_model") if isinstance(current, dict) else None,
         kind=kind,
         provider=provider,
+        run_id=current_run_id if isinstance(current_run_id, str) and _is_headless(current) else None,
+        read_route="session",
+        provider_inspector=provider_inspector,
+    )
+    if (
+        allow_sqlite
+        and _sqlite_read_enabled("session")
+        and isinstance(current_run_id, str)
+        and _is_headless(current)
+    ):
+        sqlite_payload = _sqlite_session_payload(
+            current_run_id,
+            fmt=fmt,
+            cursor=cursor,
+            client_path=client_path,
+            model=model,
+            desired_model=current.get("desired_model") if isinstance(current, dict) else None,
+            kind=kind,
+            provider=provider,
+            working=bool(legacy_payload["working"]),
+            include_subagents=fmt == "claude",
+            include_queue=True,
+            ticket=ticket,
+            transcript_path=path,
+            raw_path=Path(current["log"]) if isinstance(current.get("log"), str) else None,
+            provider_inspector=provider_inspector,
+        )
+        if sqlite_payload is not None:
+            return sqlite_payload
+    return legacy_payload
+
+
+@app.get("/api/agents/{ticket}/session")
+def agent_session(
+    ticket: str,
+    cursor: int = Query(0, ge=0),
+    client_path: str | None = Query(None, alias="path"),
+    archived_at: str | None = None,
+    run_id: str | None = None,
+) -> dict[str, object]:
+    return _agent_session_impl(
+        ticket,
+        cursor=cursor,
+        client_path=client_path,
+        archived_at=archived_at,
+        run_id=run_id,
+        allow_sqlite=True,
     )
 
 
@@ -3900,12 +4352,13 @@ def agent_session_older(
     archived_at: str | None = None,
     run_id: str | None = None,
 ) -> dict[str, object]:
-    session = agent_session(
+    session = _agent_session_impl(
         ticket,
         cursor=0,
         client_path=None,
         archived_at=archived_at,
         run_id=run_id,
+        allow_sqlite=False,
     )
     fmt = session.get("format")
     raw_path = session.get("path")
@@ -4026,6 +4479,8 @@ def subagent_session(
     path = transcripts.subagents_dir(main_path) / f"agent-{agent_id}.jsonl"
     if not path.is_file():
         raise HTTPException(status_code=404, detail="No such subagent")
+    resolved = _registry_agent(_read_agent_registry(), ticket)
+    current = resolved[2] if resolved is not None else {}
     # Without a limit the response stays complete (the inspector has no
     # older-page route, so tail-windowed events would become unreachable).
     # The inline child trace passes an explicit limit so its first fetch is
@@ -4040,6 +4495,10 @@ def subagent_session(
         # Direct (non-HTTP) callers skip FastAPI resolution and pass the Query
         # sentinel; normalize to "no limit" in that case.
         tail_events=limit if isinstance(limit, int) else None,
+        read_route="delta",
+        allow_sqlite=False,
+        headless_current=current if _is_headless(current) else None,
+        run_id=None,
     )
 
 

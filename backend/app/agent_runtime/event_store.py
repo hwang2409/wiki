@@ -28,7 +28,7 @@ from .types import (
     validate_transition,
 )
 
-SCHEMA_VERSION = 5
+SCHEMA_VERSION = 6
 NORMALIZER_VERSION = "wiki-282-1"
 
 
@@ -105,6 +105,7 @@ class RunCursor:
     last_lifecycle_change: tuple[int, int] | None = None
     normalizer_version: str = NORMALIZER_VERSION
     rebuild_state: str = "ready"
+    rebuild_generation: int = 0
 
 
 @dataclass(frozen=True)
@@ -119,6 +120,17 @@ class EventPatch:
     @property
     def patch_json(self) -> str:
         return _json_bytes(self.patch)
+
+
+@dataclass(frozen=True)
+class SessionReadSnapshot:
+    """All SQLite rows needed to build one session response."""
+
+    state: RunCursor
+    source_key: str
+    projection: tuple[Any, ...]
+    events: tuple[dict[str, Any], ...]
+    patches: tuple[EventPatch, ...]
 
 
 @dataclass(frozen=True)
@@ -499,6 +511,10 @@ _MIGRATIONS: dict[int, str] = {
         normalizer_version TEXT PRIMARY KEY,
         cursor_run_id TEXT NOT NULL DEFAULT ''
     );
+    """,
+    6: """
+    CREATE INDEX IF NOT EXISTS events_artifact_index
+        ON events(kind, updated_at DESC);
     """,
 }
 
@@ -1062,10 +1078,6 @@ class SQLiteEventStore:
             ).fetchone()
             if revision_row is None:
                 continue
-            if change.get("kind") == "tail" and int(revision_row[0]) == 1:
-                # A tail change creates the row.  Patches only describe
-                # changes to an existing visible event.
-                continue
             connection.execute(
                 "INSERT INTO patches(run_id, change_cursor, event_id, raw_seq, "
                 "patch_json, event_revision, created_at) VALUES (?, ?, ?, ?, ?, ?, ?)",
@@ -1169,7 +1181,102 @@ class SQLiteEventStore:
         if row is None:
             raise KeyError(run_id)
         lifecycle = json.loads(row[9]) if row[9] else None
-        return RunCursor(*row[:9], lifecycle, row[10], row[11])
+        return RunCursor(
+            *row[:9], lifecycle, row[10], row[11], self.rebuild_generation(run_id)
+        )
+
+    @staticmethod
+    def _source_key(run_id: str, source_class: str, generation: int) -> str:
+        return f"sqlite://{source_class}/{run_id}/rebuild-{generation}"
+
+    def _cursor_from_connection(
+        self,
+        connection: sqlite3.Connection,
+        run_id: str,
+    ) -> RunCursor:
+        row = connection.execute(
+            "SELECT run_id, raw_seq, materialized_raw_seq, next_event_id, "
+            "event_base, event_count, change_cursor, patch_base_cursor, "
+            "last_causal_raw_seq, last_lifecycle_change, normalizer_version, "
+            "rebuild_state FROM run_cursors WHERE run_id = ?",
+            (run_id,),
+        ).fetchone()
+        if row is None:
+            raise KeyError(run_id)
+        lifecycle = json.loads(row[9]) if row[9] else None
+        generation = connection.execute(
+            "SELECT COUNT(*) FROM parity_records WHERE run_id = ? "
+            "AND record_type = 'rebuild_generation'",
+            (run_id,),
+        ).fetchone()[0]
+        return RunCursor(
+            *row[:9], lifecycle, row[10], row[11], int(generation)
+        )
+
+    def read_session_snapshot(
+        self,
+        run_id: str,
+        *,
+        source_class: str,
+        after_cursor: int,
+    ) -> SessionReadSnapshot:
+        """Read cursor, projection, events, and patches in one transaction."""
+
+        with self.connection(read_only=True) as connection:
+            connection.execute("BEGIN")
+            state = self._cursor_from_connection(connection, run_id)
+            source_key = self._source_key(
+                run_id, source_class, state.rebuild_generation
+            )
+            projection = connection.execute(
+                "SELECT current_turn_json, tasks_json, pr_json, session_meta_json, "
+                "pending_requests_json, composer_messages_json, "
+                "disposition_counts_json, tokens_json, unread_event_seq, "
+                "projection_revision FROM run_projections WHERE run_id = ?",
+                (run_id,),
+            ).fetchone()
+            if projection is None:
+                raise KeyError(run_id)
+            event_rows = connection.execute(
+                "SELECT event_json FROM events WHERE run_id = ? "
+                "ORDER BY event_id",
+                (run_id,),
+            ).fetchall()
+            patch_rows = connection.execute(
+                "SELECT change_cursor, event_id, raw_seq, patch_json, "
+                "event_revision, created_at FROM patches "
+                "WHERE run_id = ? AND change_cursor > ? ORDER BY change_cursor",
+                (run_id, after_cursor),
+            ).fetchall()
+        patches = tuple(
+            EventPatch(
+                event_id=int(row[1]),
+                raw_seq=int(row[2]),
+                patch=json.loads(row[3]),
+                event_revision=int(row[4]),
+                change_cursor=int(row[0]),
+                created_at=str(row[5]),
+            )
+            for row in patch_rows
+        )
+        return SessionReadSnapshot(
+            state=state,
+            source_key=source_key,
+            projection=tuple(projection),
+            events=tuple(json.loads(row[0]) for row in event_rows),
+            patches=patches,
+        )
+
+    def rebuild_generation(self, run_id: str) -> int:
+        """Return the durable number of atomic replacements for one run."""
+
+        with self.connection(read_only=True) as connection:
+            row = connection.execute(
+                "SELECT COUNT(*) FROM parity_records WHERE run_id = ? "
+                "AND record_type = 'rebuild_generation'",
+                (run_id,),
+            ).fetchone()
+        return int(row[0]) if row is not None else 0
 
     def view_rows(self, run_id: str) -> dict[str, list[tuple[Any, ...]]]:
         """Return deterministic raw SQLite rows for replay parity tests."""
@@ -1229,6 +1336,37 @@ class SQLiteEventStore:
         with self.connection(read_only=True) as connection:
             rows = connection.execute(query, parameters).fetchall()
         return [json.loads(row[0]) for row in rows]
+
+    def read_normalized_events(
+        self,
+        run_id: str,
+        *,
+        after_seq: int = 0,
+        limit: int | None = None,
+    ) -> list[dict[str, Any]]:
+        """Read the inspector stream from persisted normalized envelopes."""
+
+        with self.connection(read_only=True) as connection:
+            rows = connection.execute(
+                "SELECT normalized_json FROM dispositions WHERE run_id = ? "
+                "ORDER BY raw_seq",
+                (run_id,),
+            ).fetchall()
+        events = [json.loads(row[0]) for row in rows]
+        filtered = [event for event in events if int(event.get("seq", 0)) > after_seq]
+        if limit is None:
+            return filtered
+        return filtered[-limit:] if after_seq == 0 else filtered[:limit]
+
+    def read_artifact_events(self) -> list[tuple[str, dict[str, Any]]]:
+        """Return indexed rendered artifact events without scanning JSONL logs."""
+
+        with self.connection(read_only=True) as connection:
+            rows = connection.execute(
+                "SELECT run_id, event_json FROM events WHERE kind = 'artifact' "
+                "ORDER BY updated_at DESC"
+            ).fetchall()
+        return [(str(row[0]), json.loads(row[1])) for row in rows]
 
     def read_patches(
         self,
@@ -1465,6 +1603,17 @@ class SQLiteEventStore:
                             f"SELECT {columns} FROM rebuilt.{table} WHERE run_id = ?",
                             (run_id,),
                         )
+                    connection.execute(
+                        "INSERT INTO parity_records "
+                        "(run_id, normalizer_version, record_type, path, detail_json, recorded_at) "
+                        "VALUES (?, ?, 'rebuild_generation', 'replace_run_from', ?, ?)",
+                        (
+                            run_id,
+                            NORMALIZER_VERSION,
+                            _json_bytes({"source": str(source_path)}),
+                            utc_now(),
+                        ),
+                    )
                     connection.commit()
                     connection.execute("DETACH DATABASE rebuilt")
                     attached = False

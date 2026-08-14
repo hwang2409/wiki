@@ -86,6 +86,7 @@ class PaletteItem:
     haystack: str
     artifact_id: str | None = None
     ticket: str | None = None
+    archived_at: str | None = None
 
     def to_payload(self, score: float) -> dict[str, Any]:
         payload: dict[str, Any] = {
@@ -376,6 +377,15 @@ def collect_session_items(agents_payload: dict[str, Any]) -> list[PaletteItem]:
             role = entry.get("role") or "archived"
             kind = entry.get("kind") or ""
             outcome = entry.get("outcome") or entry.get("state") or "archived"
+            archived_at = entry.get("archived_at")
+            run_id = entry.get("run_id")
+            if isinstance(run_id, str) and isinstance(archived_at, str):
+                url = (
+                    f"?archived_at={quote(archived_at, safe='')}"
+                    f"&run_id={quote(run_id, safe='')}#/agent/{quote(ticket, safe='')}"
+                )
+            else:
+                url = f"#/agent/{ticket}"
             subtitle = " · ".join(
                 part
                 for part in [
@@ -392,8 +402,8 @@ def collect_session_items(agents_payload: dict[str, Any]) -> list[PaletteItem]:
                     id=ticket,
                     title=ticket,
                     subtitle=subtitle,
-                    url=f"#/agent/{ticket}",
-                    updated_at=_parse_iso(entry.get("archived_at")),
+                    url=url,
+                    updated_at=_parse_iso(archived_at),
                     haystack=" ".join(
                         filter(
                             None,
@@ -531,7 +541,7 @@ def _artifact_payload_from_event(event: dict[str, Any]) -> tuple[str, dict[str, 
                 return artifact_id, {**payload, "artifact": artifact}
         payload = event
         artifact = payload.get("artifact")
-        artifact_id = payload.get("id")
+        artifact_id = payload.get("id") or event.get("artifact_id")
         if isinstance(artifact, dict) and isinstance(artifact_id, str):
             return artifact_id, payload
     return None
@@ -542,6 +552,9 @@ def _make_artifact_item(
     payload: dict[str, Any],
     ticket: str | None,
     updated: datetime | None,
+    *,
+    run_id: str | None = None,
+    archived_at: str | None = None,
 ) -> PaletteItem | None:
     artifact = payload.get("artifact")
     if not isinstance(artifact, dict):
@@ -572,6 +585,9 @@ def _make_artifact_item(
             f"&tab={encoded_artifact}"
             f"&focus={encoded_artifact}"
         )
+        if run_id and archived_at:
+            params += f"&run_id={quote(run_id, safe='')}"
+            params += f"&archived_at={quote(archived_at, safe='')}"
         url = f"?{params}#/agent/{encoded_ticket}"
     else:
         url = "#/agents"
@@ -599,6 +615,7 @@ def _make_artifact_item(
         haystack=haystack,
         artifact_id=artifact_id,
         ticket=ticket,
+        archived_at=archived_at,
     )
 
 
@@ -718,14 +735,56 @@ def collect_artifact_items(
                     and archive_is_committed(Path(entry.path))
                 )
             ]
-            for session_entry in committed_session_dirs[:3]:
+            for session_entry in committed_session_dirs:
                 session_dir = Path(session_entry.path)
                 found = _collect_from_run_dir(session_dir, ticket_entry.name)
                 if found:
                     dirs_seen += 1
                     items.extend(found)
-                    break
+                    if dirs_seen >= max_dirs:
+                        break
 
+    return items
+
+
+def collect_artifact_items_from_index(
+    event_store: Any,
+    *,
+    ticket_by_run: dict[str, str] | None = None,
+    archive_by_run: dict[str, tuple[str, str]] | None = None,
+) -> list[PaletteItem] | None:
+    """Build palette artifacts from SQLite without walking event JSONL files.
+
+    ``None`` means the index is not available yet.  Callers then retain the
+    legacy scan for installations that have not materialized any runs.
+    """
+
+    try:
+        indexed_events = event_store.read_artifact_events()
+    except Exception:
+        return None
+    items: list[PaletteItem] = []
+    seen: set[str] = set()
+    for run_id, event in indexed_events:
+        extracted = _artifact_payload_from_event(event)
+        if extracted is None:
+            continue
+        artifact_id, payload = extracted
+        if artifact_id in seen:
+            continue
+        seen.add(artifact_id)
+        archive_metadata = (archive_by_run or {}).get(run_id)
+        item = _make_artifact_item(
+            artifact_id,
+            payload,
+            (ticket_by_run or {}).get(run_id)
+            or (archive_metadata[0] if archive_metadata else None),
+            _artifact_ts(payload, None),
+            run_id=run_id,
+            archived_at=archive_metadata[1] if archive_metadata else None,
+        )
+        if item is not None:
+            items.append(item)
     return items
 
 
@@ -905,6 +964,7 @@ def collect_all_items(
     vault_dir: Path,
     runs_dir: Path,
     archive_dir: Path,
+    artifact_items: list[PaletteItem] | None = None,
     should_cancel: Callable[[], bool] | None = None,
 ) -> list[PaletteItem]:
     session_items = collect_session_items(agents_payload)
@@ -922,7 +982,10 @@ def collect_all_items(
                 ticket_by_run[run_id] = ticket
     ticket_items = collect_ticket_items(vault_dir, session_ids)
     _check_cancelled(should_cancel)
-    artifact_items = collect_artifact_items(runs_dir, archive_dir, ticket_by_run=ticket_by_run)
+    if artifact_items is None:
+        artifact_items = collect_artifact_items(
+            runs_dir, archive_dir, ticket_by_run=ticket_by_run
+        )
     _check_cancelled(should_cancel)
     note_items = collect_note_items(vault_dir, should_cancel)
     return session_items + ticket_items + artifact_items + note_items
@@ -936,6 +999,7 @@ def search(
     vault_dir: Path,
     runs_dir: Path,
     archive_dir: Path,
+    artifact_items: list[PaletteItem] | None = None,
     should_cancel: Callable[[], bool] | None = None,
 ) -> list[dict[str, Any]]:
     limit = max(1, min(limit, MAX_LIMIT))
@@ -946,6 +1010,7 @@ def search(
         vault_dir=vault_dir,
         runs_dir=runs_dir,
         archive_dir=archive_dir,
+        artifact_items=artifact_items,
         should_cancel=should_cancel,
     )
     _check_cancelled(should_cancel)
