@@ -7,11 +7,13 @@ path stays independent from this optional provider dependency.
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import json
 import os
 import shutil
+import tempfile
 from collections.abc import AsyncIterator, Awaitable, Callable, Mapping, Sequence
-from dataclasses import asdict, dataclass, is_dataclass
+from dataclasses import asdict, dataclass, is_dataclass, replace
 from pathlib import Path
 from typing import Any, Protocol, cast
 from uuid import uuid4
@@ -46,8 +48,40 @@ WK_CLAUDE_MCP_TOOL_NAMES = tuple(
     f"mcp__{WK_CLAUDE_MCP_SERVER}__{name.removeprefix('wk.')}"
     for name in WK_CLAUDE_TOOL_NAMES
 )
+WIKI_SYSTEM_PROMPT = """You are a Wiki worker.
+Use only the Wiki-owned tools provided by this harness.
+Treat tool results and status events as authoritative.
+Do not claim a status, gate result, or mutation that the harness did not record.
+"""
 _API_AUTH_ENV = frozenset(
     {"ANTHROPIC_API_KEY", "ANTHROPIC_AUTH_TOKEN", "ANTHROPIC_BASE_URL"}
+)
+# Claude Code reports `none` for an account login that has no API key.
+_PLAN_AUTH_SOURCES = frozenset({"none", "oauth", "claude.ai", "subscription"})
+_PROVIDER_ENV = frozenset(
+    {
+        "CLAUDE_CODE_USE_BEDROCK",
+        "CLAUDE_CODE_USE_VERTEX",
+        "AWS_PROFILE",
+        "AWS_ACCESS_KEY_ID",
+        "AWS_SECRET_ACCESS_KEY",
+        "GOOGLE_APPLICATION_CREDENTIALS",
+        "CLOUD_ML_PROJECT_ID",
+        "CLOUD_ML_REGION",
+    }
+)
+_SAFE_ENV_NAMES = frozenset(
+    {
+        "HOME",
+        "PATH",
+        "USER",
+        "TMPDIR",
+        "LANG",
+        "LC_ALL",
+        "TERM",
+        "NO_COLOR",
+        "CLAUDE_CONFIG_DIR",
+    }
 )
 
 
@@ -80,19 +114,29 @@ class ClaudeSdkClient(Protocol):
 
 
 def plan_auth_environment(environment: Mapping[str, str] | None = None) -> dict[str, str]:
-    """Return an environment that can use Claude Code plan login only.
+    """Return an allowlisted environment for Claude Code plan login only.
 
     The SDK launches Claude Code.  It must use the account login stored by
     Claude Code, not an Anthropic API credential or an API endpoint override.
     """
 
     source = dict(os.environ if environment is None else environment)
-    configured = sorted(name for name in _API_AUTH_ENV if source.get(name))
+    configured = sorted(
+        name for name in (*_API_AUTH_ENV, *_PROVIDER_ENV) if source.get(name)
+    )
     if configured:
         raise WkClaudePlanAuthError(
-            "Claude plan auth cannot use API environment: " + ", ".join(configured)
+            "Claude plan auth cannot use configured provider environment: "
+            + ", ".join(configured)
         )
-    return {name: value for name, value in source.items() if name not in _API_AUTH_ENV}
+    result = {
+        name: value
+        for name, value in source.items()
+        if name in _SAFE_ENV_NAMES or name.startswith("WIKI_")
+    }
+    result["CLAUDE_CODE_USE_BEDROCK"] = "0"
+    result["CLAUDE_CODE_USE_VERTEX"] = "0"
+    return result
 
 
 def _sdk_imports() -> tuple[Any, Any, Any, Any, Any]:
@@ -243,11 +287,73 @@ class WkClaudeEventTranslator:
         self.session = WkSessionTree()
         self._plan_auth_verified = False
 
+    @property
+    def plan_auth_verified(self) -> bool:
+        return self._plan_auth_verified
+
+    def error_event(
+        self, error: BaseException, *, raw: Mapping[str, Any] | None = None
+    ) -> WkEventEnvelope:
+        value = dict(raw) if raw is not None else {
+            "type": "provider_error",
+            "error_class": type(error).__name__,
+            "error": str(error),
+        }
+        if not self.raw_events or self.raw_events[-1] != value:
+            self.raw_events.append(value)
+        event = self.sequencer.emit(
+            run_id=self.run_id,
+            agent_id=self.agent_id,
+            kind="claude.provider_error",
+            phase=WkEventPhase.STATUS,
+            provider="claude",
+            lane="wk-claude",
+            disposition=WkDisposition.RENDERED,
+            ts=self.timestamp(),
+            payload=value,
+        )
+        self.session.record_event(event)
+        return event
+
+    def _verify_startup_event(self, raw: Mapping[str, Any]) -> None:
+        self.verify_plan_auth_event(raw)
+        source = raw.get("data")
+        init = source if isinstance(source, Mapping) else raw
+        tools = init.get("tools")
+        if not isinstance(tools, Sequence) or isinstance(tools, (str, bytes)):
+            raise WkClaudePlanAuthError(
+                "Claude SDK init did not expose its effective tool list"
+            )
+        effective_tools = {str(tool) for tool in tools}
+        expected_tools = set(WK_CLAUDE_MCP_TOOL_NAMES)
+        if effective_tools != expected_tools:
+            missing = expected_tools - effective_tools
+            extra = effective_tools - expected_tools
+            detail = []
+            if missing:
+                detail.append("missing Wiki tools: " + ", ".join(sorted(missing)))
+            if extra:
+                detail.append("non-Wiki tools: " + ", ".join(sorted(extra)))
+            raise WkClaudePlanAuthError("Claude SDK effective tool policy failed (" + "; ".join(detail) + ")")
+        hooks = init.get("hooks") or init.get("active_hooks")
+        if hooks:
+            raise WkClaudePlanAuthError("Claude SDK exposed active hooks")
+        settings_sources = init.get("setting_sources") or init.get("settingSources")
+        if settings_sources:
+            raise WkClaudePlanAuthError("Claude SDK loaded filesystem settings")
+
     def translate(self, message: object) -> WkEventEnvelope:
         raw = _message_dict(message)
         self.raw_events.append(json.loads(json.dumps(raw, default=str)))
         if _message_type(raw) == "system" and str(raw.get("subtype")) == "init":
-            self.verify_plan_auth_event(raw)
+            self._verify_startup_event(raw)
+        provider_error = raw.get("error")
+        if isinstance(provider_error, str) and provider_error.casefold() in {
+            "authentication_failed",
+            "auth_error",
+            "authentication_error",
+        }:
+            return self.error_event(WkClaudeError(provider_error), raw=raw)
         event = self.sequencer.emit(
             run_id=self.run_id,
             agent_id=self.agent_id,
@@ -271,15 +377,9 @@ class WkClaudeEventTranslator:
         data = raw.get("data")
         source = data if isinstance(data, Mapping) else raw
         auth_source = source.get("apiKeySource") or source.get("api_key_source")
-        if isinstance(auth_source, str) and auth_source.casefold() in {
-            "anthropic_api_key",
-            "api_key",
-            "api-key",
-            "auth_token",
-            "auth-token",
-        }:
+        if not isinstance(auth_source, str) or auth_source.casefold() not in _PLAN_AUTH_SOURCES:
             raise WkClaudePlanAuthError(
-                f"Claude SDK resolved API auth source {auth_source!r}, not plan auth"
+                f"Claude SDK auth source is not proven plan auth: {auth_source!r}"
             )
         self._plan_auth_verified = True
 
@@ -297,6 +397,7 @@ class WkToolLedger:
     def __init__(self, translator: WkClaudeEventTranslator):
         self.translator = translator
         self.operations: dict[str, _LedgerOperation] = {}
+        self._transport_pending: set[str] = set()
 
     @property
     def events(self) -> list[WkEventEnvelope]:
@@ -355,6 +456,35 @@ class WkToolLedger:
         self.translator.session.record_event(event)
         return event
 
+    def record_transport_frame(self, raw: Mapping[str, Any]) -> None:
+        """Track SDK tool-use/result pairs at the transport boundary."""
+
+        message = raw.get("message")
+        content = message.get("content") if isinstance(message, Mapping) else None
+        if not isinstance(content, Sequence) or isinstance(content, (str, bytes)):
+            return
+        for block in content:
+            if not isinstance(block, Mapping):
+                continue
+            block_type = block.get("type")
+            if block_type == "tool_use":
+                tool_id = block.get("id")
+                if isinstance(tool_id, str) and tool_id:
+                    if tool_id in self._transport_pending:
+                        raise WkLedgerError(f"duplicate transport tool call: {tool_id}")
+                    self._transport_pending.add(tool_id)
+            elif block_type == "tool_result":
+                tool_id = block.get("tool_use_id")
+                if not isinstance(tool_id, str) or tool_id not in self._transport_pending:
+                    raise WkLedgerError(f"transport result has no start: {tool_id!r}")
+                self._transport_pending.remove(tool_id)
+
+    def reconcile_transport(self) -> None:
+        if self._transport_pending:
+            raise WkLedgerError(
+                "missing transport tool results: " + ", ".join(sorted(self._transport_pending))
+            )
+
     def reconcile(self, events: Sequence[WkEventEnvelope] | None = None) -> None:
         source = list(self.events if events is None else events)
         started: dict[str, WkEventEnvelope] = {}
@@ -375,9 +505,15 @@ class WkToolLedger:
         if unknown:
             raise WkLedgerError("tool results without starts: " + ", ".join(unknown))
         for call_id, event in started.items():
+            result_event = completed[call_id]
+            result_value = result_event.payload.get("result")
+            if not isinstance(result_value, Mapping):
+                raise WkLedgerError(f"tool result is not typed: {call_id}")
+            exit_code = result_value.get("exit_code")
+            if result_value.get("success") is not (exit_code == 0):
+                raise WkLedgerError(f"tool success disagrees with exit code: {call_id}")
             if event.payload.get("name") != "wk.gate":
                 continue
-            result_event = completed[call_id]
             started_hash = event.integrity.get("input_hash") if event.integrity else None
             result_hash = (
                 result_event.integrity.get("input_hash")
@@ -386,13 +522,15 @@ class WkToolLedger:
             )
             if started_hash != result_hash:
                 raise WkLedgerError(f"tool input hash changed: {call_id}")
-            result_value = result_event.payload.get("result")
-            if not isinstance(result_value, Mapping):
-                raise WkLedgerError(f"gate result is not typed: {call_id}")
-            if not isinstance(result_value.get("exit_code"), int):
+            if not isinstance(exit_code, int):
                 raise WkLedgerError(f"gate result has no real exit code: {call_id}")
-            if result_value.get("success") is not True:
+            if exit_code != 0:
                 raise WkLedgerError(f"gate did not succeed: {call_id}")
+            receipt = result_value.get("mutation_receipt")
+            if not isinstance(receipt, Mapping) or not isinstance(
+                receipt.get("verdict"), Mapping
+            ):
+                raise WkLedgerError(f"gate result has no parsed verdict: {call_id}")
 
 
 def _event_call_id(event: WkEventEnvelope) -> str | None:
@@ -401,9 +539,20 @@ def _event_call_id(event: WkEventEnvelope) -> str | None:
 
 
 def _hash_result(result: WkToolResult) -> str:
-    encoded = json.dumps(result.to_dict(), sort_keys=True, separators=(",", ":")).encode()
-    import hashlib
-
+    value = {
+        "success": result.success,
+        "exit_code": result.exit_code,
+        "stdout": result.stdout,
+        "stderr": result.stderr,
+        "error_class": result.error_class,
+        "error_detail": result.error_detail,
+        "timed_out": result.timed_out,
+        "duration_ms": result.duration_ms,
+        "mutation": result.mutation.value,
+        "mutation_receipt": result.mutation_receipt,
+        "output_artifact": result.output_artifact,
+    }
+    encoded = json.dumps(value, sort_keys=True, separators=(",", ":"), default=str).encode()
     return hashlib.sha256(encoded).hexdigest()
 
 
@@ -414,6 +563,381 @@ def _utc_timestamp() -> str:
 
 
 ApprovalRequest = Callable[[str, Mapping[str, object]], Awaitable[bool]]
+
+
+def _hash_bytes(value: bytes) -> str:
+    return hashlib.sha256(value).hexdigest()
+
+
+class _WkPathTool:
+    def __init__(self, *, root: Path, name: str, mutation: WkMutationClass):
+        self.root = root.resolve()
+        self.name = name
+        self.mutation = mutation
+
+    def _path(self, value: object) -> Path:
+        if not isinstance(value, str) or not value:
+            raise ValueError("path must be a non-empty string")
+        path = (self.root / value).resolve() if not Path(value).is_absolute() else Path(value).resolve()
+        if path != self.root and self.root not in path.parents:
+            raise ValueError("path is outside the wk worktree")
+        return path
+
+
+class WkReadTool(_WkPathTool):
+    def __init__(self, *, root: Path, max_bytes: int = 1_000_000):
+        super().__init__(root=root, name="wk.read", mutation=WkMutationClass.NONE)
+        self.max_bytes = max_bytes
+
+    def validate(self, arguments: Mapping[str, object]) -> Mapping[str, object]:
+        path = self._path(arguments.get("path"))
+        return {"path": str(path), "max_bytes": int(arguments.get("max_bytes", self.max_bytes))}
+
+    async def execute(self, request: WkToolRequest) -> WkToolResult:
+        path = self._path(request.arguments["path"])
+        max_bytes = min(max(1, int(request.arguments.get("max_bytes", self.max_bytes))), self.max_bytes)
+        try:
+            if path.is_dir():
+                output = "\n".join(sorted(item.name for item in path.iterdir()))
+                data = output.encode()
+            else:
+                data = path.read_bytes()
+                output = data[:max_bytes].decode("utf-8", errors="replace")
+            return WkToolResult(
+                success=True,
+                exit_code=0,
+                stdout=output,
+                mutation=self.mutation,
+                mutation_receipt={"path": str(path), "byte_count": len(data)},
+            )
+        except OSError as exc:
+            return WkToolResult(
+                success=False,
+                exit_code=1,
+                error_class=type(exc).__name__,
+                error_detail=str(exc),
+                mutation=self.mutation,
+            )
+
+
+class WkWriteTool(_WkPathTool):
+    def __init__(self, *, root: Path):
+        super().__init__(root=root, name="wk.write", mutation=WkMutationClass.FILE)
+
+    def validate(self, arguments: Mapping[str, object]) -> Mapping[str, object]:
+        path = self._path(arguments.get("path"))
+        content = arguments.get("content", arguments.get("contents"))
+        if not isinstance(content, str):
+            raise ValueError("content must be a string")
+        return {"path": str(path), "content": content}
+
+    async def execute(self, request: WkToolRequest) -> WkToolResult:
+        path = self._path(request.arguments["path"])
+        content = str(request.arguments["content"]).encode()
+        before = _hash_bytes(path.read_bytes()) if path.exists() else None
+        try:
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_bytes(content)
+            return WkToolResult(
+                success=True,
+                exit_code=0,
+                mutation=WkMutationClass.FILE,
+                mutation_receipt={
+                    "path": str(path),
+                    "before": before,
+                    "after": _hash_bytes(content),
+                    "byte_count": len(content),
+                },
+            )
+        except OSError as exc:
+            return WkToolResult(
+                success=False,
+                exit_code=1,
+                error_class=type(exc).__name__,
+                error_detail=str(exc),
+                mutation=WkMutationClass.FILE,
+            )
+
+
+class WkEditTool(_WkPathTool):
+    def __init__(self, *, root: Path):
+        super().__init__(root=root, name="wk.edit", mutation=WkMutationClass.FILE)
+
+    def validate(self, arguments: Mapping[str, object]) -> Mapping[str, object]:
+        path = self._path(arguments.get("path"))
+        old = arguments.get("old")
+        new = arguments.get("new")
+        if not isinstance(old, str) or not isinstance(new, str):
+            raise ValueError("old and new must be strings")
+        return {"path": str(path), "old": old, "new": new, "replace_all": bool(arguments.get("replace_all", False))}
+
+    async def execute(self, request: WkToolRequest) -> WkToolResult:
+        path = self._path(request.arguments["path"])
+        try:
+            before_bytes = path.read_bytes()
+            before = before_bytes.decode("utf-8")
+            old = str(request.arguments["old"])
+            new = str(request.arguments["new"])
+            replace_all = bool(request.arguments.get("replace_all", False))
+            matches = before.count(old)
+            if matches == 0 or (matches > 1 and not replace_all):
+                raise ValueError(f"edit matched {matches} ranges")
+            after = before.replace(old, new, -1 if replace_all else 1)
+            path.write_text(after, encoding="utf-8")
+            return WkToolResult(
+                success=True,
+                exit_code=0,
+                mutation=WkMutationClass.FILE,
+                mutation_receipt={
+                    "path": str(path),
+                    "before": _hash_bytes(before_bytes),
+                    "after": _hash_bytes(after.encode()),
+                    "matched_ranges": matches,
+                },
+            )
+        except (OSError, UnicodeError, ValueError) as exc:
+            return WkToolResult(
+                success=False,
+                exit_code=1,
+                error_class=type(exc).__name__,
+                error_detail=str(exc),
+                mutation=WkMutationClass.FILE,
+            )
+
+
+async def _run_process(
+    argv: Sequence[str],
+    *,
+    cwd: Path,
+    timeout_ms: int,
+    env: Mapping[str, str] | None = None,
+) -> WkToolResult:
+    started = asyncio.get_running_loop().time()
+    try:
+        process = await asyncio.create_subprocess_exec(
+            *argv,
+            cwd=cwd,
+            env=dict(env or os.environ),
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+        )
+        timed_out = False
+        try:
+            stdout, stderr = await asyncio.wait_for(
+                process.communicate(), timeout=max(timeout_ms, 1) / 1000
+            )
+        except TimeoutError:
+            timed_out = True
+            process.kill()
+            stdout, stderr = await process.communicate()
+        duration_ms = int((asyncio.get_running_loop().time() - started) * 1000)
+        exit_code = process.returncode
+        return WkToolResult(
+            success=not timed_out and exit_code == 0,
+            exit_code=exit_code,
+            stdout=stdout.decode("utf-8", errors="replace"),
+            stderr=stderr.decode("utf-8", errors="replace"),
+            error_class="timeout" if timed_out else ("process_failed" if exit_code else None),
+            timed_out=timed_out,
+            duration_ms=duration_ms,
+            mutation=WkMutationClass.PROCESS,
+            mutation_receipt={
+                "pid": process.pid,
+                "stdout_sha256": _hash_bytes(stdout),
+                "stderr_sha256": _hash_bytes(stderr),
+            },
+        )
+    except OSError as exc:
+        return WkToolResult(
+            success=False,
+            exit_code=127,
+            error_class=type(exc).__name__,
+            error_detail=str(exc),
+            mutation=WkMutationClass.PROCESS,
+        )
+
+
+class WkBashTool:
+    name = "wk.bash"
+
+    def __init__(self, *, root: Path, timeout_ms: int = 120_000):
+        self.root = root.resolve()
+        self.timeout_ms = timeout_ms
+
+    def validate(self, arguments: Mapping[str, object]) -> Mapping[str, object]:
+        command = arguments.get("command")
+        if not isinstance(command, str) or not command.strip():
+            raise ValueError("command must be a non-empty string")
+        timeout_ms = min(max(1, int(arguments.get("timeout_ms", self.timeout_ms))), 600_000)
+        return {"command": command, "timeout_ms": timeout_ms}
+
+    async def execute(self, request: WkToolRequest) -> WkToolResult:
+        return await _run_process(
+            ("/bin/sh", "-lc", str(request.arguments["command"])),
+            cwd=self.root,
+            timeout_ms=int(request.arguments.get("timeout_ms", self.timeout_ms)),
+            env=plan_auth_environment(),
+        )
+
+
+class WkGateTool(WkBashTool):
+    name = "wk.gate"
+
+    def __init__(self, *, root: Path, wiki_command: Sequence[str] = ("wiki",)):
+        super().__init__(root=root)
+        self.wiki_command = tuple(wiki_command)
+
+    def validate(self, arguments: Mapping[str, object]) -> Mapping[str, object]:
+        pr = arguments.get("pr")
+        if not isinstance(pr, str) or not pr:
+            raise ValueError("pr must be a non-empty string")
+        value: dict[str, object] = {"pr": pr, "timeout_ms": int(arguments.get("timeout_ms", self.timeout_ms))}
+        expected_sha = arguments.get("expected_sha")
+        if expected_sha is not None:
+            if not isinstance(expected_sha, str) or not expected_sha:
+                raise ValueError("expected_sha must be a non-empty string")
+            value["expected_sha"] = expected_sha
+        return value
+
+    async def execute(self, request: WkToolRequest) -> WkToolResult:
+        argv = [*self.wiki_command, "gate", str(request.arguments["pr"]), "--json"]
+        expected_sha = request.arguments.get("expected_sha")
+        if expected_sha:
+            argv.extend(("--expect-sha", str(expected_sha)))
+        result = await _run_process(
+            argv,
+            cwd=self.root,
+            timeout_ms=int(request.arguments.get("timeout_ms", self.timeout_ms)),
+            env=plan_auth_environment(),
+        )
+        if not result.stdout:
+            return result
+        try:
+            verdict = json.loads(result.stdout)
+        except json.JSONDecodeError:
+            return result
+        if not isinstance(verdict, Mapping):
+            return result
+        receipt = dict(result.mutation_receipt or {})
+        receipt["verdict"] = dict(verdict)
+        return replace(result, mutation_receipt=receipt)
+
+
+class WkStatusTool:
+    name = "wk.status"
+
+    def __init__(self, *, loop: WkLoop):
+        self.loop = loop
+
+    def validate(self, arguments: Mapping[str, object]) -> Mapping[str, object]:
+        state = arguments.get("state")
+        step = arguments.get("step")
+        if not isinstance(state, str) or not isinstance(step, str):
+            raise ValueError("state and step are required strings")
+        return {
+            "state": state,
+            "step": step,
+            "pr": arguments.get("pr"),
+            "blocker": arguments.get("blocker"),
+        }
+
+    async def execute(self, request: WkToolRequest) -> WkToolResult:
+        sequence = self.loop.write_status(
+            state=str(request.arguments["state"]),
+            pr=str(request.arguments["pr"]) if request.arguments.get("pr") else None,
+            step=str(request.arguments["step"]),
+            blocker=(
+                str(request.arguments["blocker"])
+                if request.arguments.get("blocker")
+                else None
+            ),
+        )
+        return WkToolResult(
+            success=True,
+            exit_code=0,
+            stdout=json.dumps({"status_write_seq": sequence}, sort_keys=True),
+        )
+
+
+def register_default_wk_tools(
+    registry: WkToolRegistry,
+    *,
+    root: Path,
+    loop: WkLoop,
+    wiki_command: Sequence[str] = ("wiki",),
+) -> WkToolRegistry:
+    tools: tuple[object, ...] = (
+        WkReadTool(root=root),
+        WkWriteTool(root=root),
+        WkEditTool(root=root),
+        WkBashTool(root=root),
+        WkGateTool(root=root, wiki_command=wiki_command),
+        WkStatusTool(loop=loop),
+    )
+    for tool in tools:
+        if tool.name not in registry.names:  # type: ignore[attr-defined]
+            registry.register(cast(Any, tool))
+    return registry
+
+
+@dataclass(frozen=True)
+class _SteeringItem:
+    message_id: str
+    message: str
+    mode: str
+
+
+class WkSteeringQueue:
+    """Durable steering messages that survive turn boundaries and replacement."""
+
+    def __init__(self, path: Path):
+        self.path = path
+        self._items: list[_SteeringItem] = []
+        if path.exists():
+            value = json.loads(path.read_text(encoding="utf-8"))
+            if not isinstance(value, list):
+                raise WkClaudeError("wk steering queue is not a list")
+            self._items = [
+                _SteeringItem(str(item["id"]), str(item["message"]), str(item["mode"]))
+                for item in value
+            ]
+
+    @property
+    def pending(self) -> tuple[_SteeringItem, ...]:
+        return tuple(self._items)
+
+    def _save(self) -> None:
+        self.path.parent.mkdir(parents=True, exist_ok=True)
+        fd, raw_tmp = tempfile.mkstemp(prefix=f".{self.path.name}.", dir=self.path.parent)
+        tmp = Path(raw_tmp)
+        try:
+            with os.fdopen(fd, "w", encoding="utf-8") as handle:
+                json.dump(
+                    [
+                        {"id": item.message_id, "message": item.message, "mode": item.mode}
+                        for item in self._items
+                    ],
+                    handle,
+                    sort_keys=True,
+                    separators=(",", ":"),
+                )
+                handle.write("\n")
+                handle.flush()
+                os.fsync(handle.fileno())
+            os.replace(tmp, self.path)
+        except BaseException:
+            tmp.unlink(missing_ok=True)
+            raise
+
+    def enqueue(self, message: str, *, mode: str) -> _SteeringItem:
+        item = _SteeringItem(str(uuid4()), message, mode)
+        self._items.append(item)
+        self._save()
+        return item
+
+    def acknowledge(self, message_id: str) -> None:
+        self._items = [item for item in self._items if item.message_id != message_id]
+        self._save()
 
 
 class WkClaudeToolBridge:
@@ -454,10 +978,7 @@ class WkClaudeToolBridge:
         )
         self.ledger.record_started(request)
         try:
-            if name == "wk.status":
-                result = await self._status(arguments)
-            else:
-                result = await self.registry.execute(request)
+            result = await self.registry.execute(request)
         except Exception as exc:
             result = WkToolResult(
                 success=False,
@@ -468,25 +989,6 @@ class WkClaudeToolBridge:
             )
         self.ledger.record_result(request, result)
         return result
-
-    async def _status(self, arguments: Mapping[str, object]) -> WkToolResult:
-        state = str(arguments.get("state") or "")
-        step = str(arguments.get("step") or "")
-        blocker_value = arguments.get("blocker")
-        blocker = str(blocker_value) if blocker_value is not None else None
-        pr_value = arguments.get("pr")
-        pr = str(pr_value) if pr_value is not None else None
-        sequence = self.loop.write_status(
-            state=state,
-            pr=pr,
-            step=step,
-            blocker=blocker,
-        )
-        return WkToolResult(
-            success=True,
-            exit_code=0,
-            stdout=json.dumps({"status_write_seq": sequence}, sort_keys=True),
-        )
 
 
 def _sdk_tool_schema() -> dict[str, object]:
@@ -565,7 +1067,14 @@ def build_claude_sdk_options(
         "cwd": str(worktree),
         "model": model,
         "env": sdk_environment,
-        "setting_sources": ["user", "project", "local"],
+        "setting_sources": [],
+        "hooks": None,
+        "settings": None,
+        "system_prompt": {
+            "type": "preset",
+            "preset": "claude_code",
+            "append": WIKI_SYSTEM_PROMPT,
+        },
     }
     if resume is not None:
         options_kwargs["resume"] = resume
@@ -586,10 +1095,13 @@ class WkClaudeLane:
         agent_id: str,
         worktree: Path,
         model: str,
-        registry: WkToolRegistry,
+        registry: WkToolRegistry | None = None,
         loop: WkLoop,
         client_factory: Callable[[Any], ClaudeSdkClient] | None = None,
+        options_factory: Callable[..., Any] | None = None,
         approval: ApprovalRequest | None = None,
+        steering_path: Path | None = None,
+        wiki_command: Sequence[str] = ("wiki",),
     ) -> None:
         if not wk_enabled():
             raise WkClaudeDisabled("WIKI_ENABLE_WK=1 is required for wk-claude")
@@ -601,29 +1113,46 @@ class WkClaudeLane:
         self.worktree = worktree
         self.model = model
         self.loop = loop
+        self.registry = register_default_wk_tools(
+            registry or WkToolRegistry(),
+            root=worktree,
+            loop=loop,
+            wiki_command=wiki_command,
+        )
         self.translator = WkClaudeEventTranslator(
             metadata=metadata,
             run_id=run_id,
             agent_id=agent_id,
         )
         self.ledger = WkToolLedger(self.translator)
-        self.bridge = WkClaudeToolBridge(registry=registry, ledger=self.ledger, loop=loop)
+        self.bridge = WkClaudeToolBridge(
+            registry=self.registry, ledger=self.ledger, loop=loop
+        )
         self.approval = approval
         self._client_factory = client_factory
+        self._options_factory = options_factory
+        self._steering = WkSteeringQueue(
+            steering_path or loop.status_path.with_name(f"{agent_id}.wk-steering.json")
+        )
         self._client: ClaudeSdkClient | None = None
         self._receive_task: asyncio.Task[None] | None = None
         self._events: asyncio.Queue[dict[str, object] | None] = asyncio.Queue()
         self._closed = False
+        self._startup_ready = asyncio.Event()
+        self._startup_error: BaseException | None = None
 
     def _new_client(self, *, resume: str | None = None) -> ClaudeSdkClient:
-        options = build_claude_sdk_options(
-            prompt="",
-            model=self.model,
-            worktree=self.worktree,
-            bridge=self.bridge,
-            approval=self.approval,
-            resume=resume,
-        )
+        if self._options_factory is None:
+            options = build_claude_sdk_options(
+                prompt="",
+                model=self.model,
+                worktree=self.worktree,
+                bridge=self.bridge,
+                approval=self.approval,
+                resume=resume,
+            )
+        else:
+            options = self._options_factory(resume=resume)
         if self._client_factory is not None:
             return self._client_factory(options)
         _options, client_type, _allow, _deny, _server = _sdk_imports()
@@ -634,45 +1163,94 @@ class WkClaudeLane:
         try:
             async for message in self._client.receive_messages():
                 event = self.translator.translate(message)
+                raw = self.translator.raw_events[-1]
+                self.ledger.record_transport_frame(raw)
+                if raw.get("type") == "system" and raw.get("subtype") == "init":
+                    self._startup_ready.set()
                 await self._events.put(
-                    {"raw": self.translator.raw_events[-1], "event": event.to_dict()}
+                    {"raw": raw, "event": event.to_dict()}
                 )
+                if raw.get("type") == "result":
+                    await self._deliver_pending(include_idle=True)
+            self.ledger.reconcile_transport()
         except asyncio.CancelledError:
             raise
         except Exception as exc:
+            self._startup_error = exc
+            self._startup_ready.set()
+            event = self.translator.error_event(exc)
             await self._events.put(
                 {
-                    "raw": {"type": "provider_error", "error": str(exc)},
-                    "event": {
-                        "phase": WkEventPhase.STATUS.value,
-                        "kind": "claude.error",
-                        "error": str(exc),
-                    },
+                    "raw": self.translator.raw_events[-1],
+                    "event": event.to_dict(),
                 }
             )
-        finally:
-            if self._closed:
-                await self._events.put(None)
 
     async def _ensure_client(self, *, resume: str | None = None) -> None:
         if self._client is not None:
             return
         self._client = self._new_client(resume=resume)
-        await self._client.connect()
+        try:
+            await self._client.connect()
+        except Exception as exc:
+            self._startup_error = exc
+            self._startup_ready.set()
+            event = self.translator.error_event(exc)
+            await self._events.put(
+                {"raw": self.translator.raw_events[-1], "event": event.to_dict()}
+            )
+            self._client = None
+            raise WkClaudeError(str(exc)) from exc
         self._receive_task = asyncio.create_task(self._receive())
+
+    async def _await_startup(self) -> None:
+        try:
+            await asyncio.wait_for(self._startup_ready.wait(), timeout=30)
+        except TimeoutError as exc:
+            self._startup_error = WkClaudePlanAuthError(
+                "Claude SDK startup did not prove plan auth and tool policy"
+            )
+            event = self.translator.error_event(self._startup_error)
+            await self._events.put({"raw": self.translator.raw_events[-1], "event": event.to_dict()})
+            raise self._startup_error from exc
+        if self._startup_error is not None:
+            raise WkClaudeError(str(self._startup_error)) from self._startup_error
+
+    async def _deliver_pending(self, *, include_idle: bool = False) -> None:
+        if self._client is None:
+            return
+        items = tuple(
+            item
+            for item in self._steering.pending
+            if item.mode == "now" or include_idle
+        )
+        for item in items:
+            await self._client.query(item.message)
+            self._steering.acknowledge(item.message_id)
 
     async def start(self, prompt: str) -> None:
         await self._ensure_client()
+        await self._await_startup()
         assert self._client is not None
         await self._client.query(prompt)
+        await self._deliver_pending()
 
     async def resume(self, session_id: str) -> None:
         await self._ensure_client(resume=session_id)
+        await self._await_startup()
+        await self._deliver_pending()
 
     async def send(self, message: str) -> None:
+        await self.send_now(message)
+
+    async def send_now(self, message: str) -> None:
         if self._client is None:
             raise WkClaudeError("Claude lane is not started")
-        await self._client.query(message)
+        self._steering.enqueue(message, mode="now")
+        await self._deliver_pending()
+
+    async def send_on_idle(self, message: str) -> None:
+        self._steering.enqueue(message, mode="on-idle")
 
     async def interrupt(self) -> None:
         if self._client is None:
@@ -680,11 +1258,13 @@ class WkClaudeLane:
         await self._client.interrupt()
 
     async def replace(self, prompt: str) -> None:
-        await self.close()
+        await self._close_transport()
         self._closed = False
+        self._startup_ready = asyncio.Event()
+        self._startup_error = None
         await self.start(prompt)
 
-    async def close(self) -> None:
+    async def _close_transport(self) -> None:
         self._closed = True
         if self._client is not None:
             await self._client.disconnect()
@@ -692,6 +1272,10 @@ class WkClaudeLane:
             await asyncio.gather(self._receive_task, return_exceptions=True)
         self._client = None
         self._receive_task = None
+
+    async def close(self) -> None:
+        await self._close_transport()
+        await self._events.put(None)
 
     async def events(self) -> AsyncIterator[Mapping[str, object]]:
         while True:
@@ -704,15 +1288,24 @@ class WkClaudeLane:
 __all__ = [
     "WK_CLAUDE_MCP_TOOL_NAMES",
     "WK_CLAUDE_TOOL_NAMES",
+    "WIKI_SYSTEM_PROMPT",
+    "WkBashTool",
     "WkClaudeDisabled",
     "WkClaudeError",
     "WkClaudeEventTranslator",
     "WkClaudeLane",
     "WkClaudePlanAuthError",
     "WkClaudeToolBridge",
+    "WkEditTool",
+    "WkGateTool",
     "WkLedgerError",
+    "WkReadTool",
     "WkSessionTree",
+    "WkStatusTool",
+    "WkSteeringQueue",
     "WkToolLedger",
+    "WkWriteTool",
     "build_claude_sdk_options",
     "plan_auth_environment",
+    "register_default_wk_tools",
 ]

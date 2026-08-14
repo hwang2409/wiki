@@ -374,6 +374,12 @@ class WkToolRegistry:
             raise ValueError(f"wk tool already registered: {tool.name!r}")
         self._tools[tool.name] = tool
 
+    @property
+    def names(self) -> frozenset[str]:
+        """Return the registered Wiki tool names."""
+
+        return frozenset(self._tools)
+
     async def execute(self, request: WkToolRequest) -> WkToolResult:
         tool = self._tools.get(request.name)
         if tool is None:
@@ -495,6 +501,12 @@ class WkLoop:
     def __init__(self, *, status_path: Path):
         self._authority = _LoopAuthority()
         self._status_writer = _AtomicStatusWriter(status_path, self._authority)
+
+    @property
+    def status_path(self) -> Path:
+        """Return the loop-owned status path for adjacent durable state."""
+
+        return self._status_writer.path
 
     @property
     def status_write_seq(self) -> int:
