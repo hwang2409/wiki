@@ -80,6 +80,7 @@ class CodexAppServerAdapter(ProviderAdapter):
         env: Mapping[str, str] | None = None,
         request_timeout: float = 30.0,
         identity_resolver: IdentityResolver = resolve_provider_identity,
+        thread_start_options: Mapping[str, Any] | None = None,
     ):
         child_env = dict(os.environ if env is None else env)
         child_env.pop("TMUX", None)
@@ -123,6 +124,12 @@ class CodexAppServerAdapter(ProviderAdapter):
         self._operation_lock = asyncio.Lock()
         self._turn_tasks: set[asyncio.Task[None]] = set()
         self._turn_start_pending = False
+        self._thread_start_options = dict(thread_start_options or {})
+        self._last_thread_start_result: dict[str, Any] | None = None
+
+    @property
+    def last_thread_start_result(self) -> dict[str, Any] | None:
+        return self._last_thread_start_result
 
     def _configure_runtime(self, record: RunRecord) -> None:
         self.env["WIKI_RUN_ID"] = record.run_id
@@ -721,19 +728,22 @@ class CodexAppServerAdapter(ProviderAdapter):
         self._turn_start_pending = False
 
     async def _start_thread(self, prompt: str, generation: int) -> None:
+        params: dict[str, Any] = {
+            "cwd": self.worktree,
+            "runtimeWorkspaceRoots": [self.worktree],
+            "model": self.model,
+            "approvalPolicy": "never",
+            "sandbox": "danger-full-access",
+            "experimentalRawEvents": True,
+            "historyMode": "legacy",
+        }
+        params.update(self._thread_start_options)
         result = await self._rpc(
             "thread/start",
-            {
-                "cwd": self.worktree,
-                "runtimeWorkspaceRoots": [self.worktree],
-                "model": self.model,
-                "approvalPolicy": "never",
-                "sandbox": "danger-full-access",
-                "experimentalRawEvents": True,
-                "historyMode": "legacy",
-            },
+            params,
             generation=generation,
         )
+        self._last_thread_start_result = result
         self._remember_thread(self._thread_from_result(result), generation)
         await self._start_turn(prompt)
         await self._refresh_identity(required=True)
@@ -772,6 +782,7 @@ class CodexAppServerAdapter(ProviderAdapter):
                     },
                     generation=generation,
                 )
+                self._last_thread_start_result = result
                 self._remember_thread(self._thread_from_result(result), generation)
                 if self._resume_state is LifecycleState.WORKING:
                     status_dir = Path(
@@ -926,6 +937,7 @@ class CodexAppServerAdapter(ProviderAdapter):
                     "thread/read",
                     {"threadId": self._session_id, "includeTurns": False},
                 )
+                self._last_thread_start_result = result
                 self._remember_thread(
                     self._thread_from_result(result), self._generation
                 )
