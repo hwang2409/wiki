@@ -358,6 +358,13 @@ class HeadlessMainRouteTests(unittest.IsolatedAsyncioTestCase):
         self.paths.pid_path.write_text(f"{os.getpid()}\n", encoding="utf-8")
         self.client.paths = self.paths
         self.patchers = [
+            mock.patch.dict(
+                os.environ,
+                {
+                    flag: "0"
+                    for flag, _adapter in main._SQLITE_READ_ROUTES.values()
+                },
+            ),
             mock.patch.object(main, "AGENT_REGISTRY_PATH", self.registry),
             mock.patch.object(main, "AGENT_STATUS_DIR", self.status_dir),
             mock.patch.object(main, "AGENT_ARCHIVE_DIR", self.archive_dir),

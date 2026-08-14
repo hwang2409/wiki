@@ -508,7 +508,9 @@ class DualStackHarness:
             else:
                 os.environ[name] = value
 
-    def _set_flag_env(self, enabled: tuple[str, ...]) -> None:
+    def _set_flag_env(
+        self, enabled: tuple[str, ...], *, defaults: bool = False
+    ) -> None:
         flags = {
             **{
                 route: flag
@@ -516,15 +518,25 @@ class DualStackHarness:
             },
         }
         for route, flag in flags.items():
-            if route in enabled:
+            if defaults:
+                os.environ.pop(flag, None)
+            elif route in enabled:
                 os.environ[flag] = "1"
             else:
-                os.environ.pop(flag, None)
+                os.environ[flag] = "0"
 
-    def request(self, method: str, path: str, *, flags: tuple[str, ...] = (), **kwargs: Any):
+    def request(
+        self,
+        method: str,
+        path: str,
+        *,
+        flags: tuple[str, ...] = (),
+        defaults: bool = False,
+        **kwargs: Any,
+    ):
         if self.client is None:
             raise RuntimeError("harness is not active")
-        self._set_flag_env(flags)
+        self._set_flag_env(flags, defaults=defaults)
         return self.client.request(method, path, **kwargs)
 
     def palette(self, query: str, *, limit: int = 30):
@@ -542,12 +554,31 @@ class DualStackHarness:
                 (self.run_id,),
             )
 
+    def make_non_headless(self) -> None:
+        registry = json.loads(self.paths.registry_path.read_text(encoding="utf-8"))
+        current = registry[self.ticket]["current"]
+        current.pop("run_id", None)
+        registry[self.ticket]["current"] = current
+        self.paths.registry_path.write_text(
+            json.dumps(registry, separators=(",", ":")) + "\n",
+            encoding="utf-8",
+        )
+        main._session_paths[self.ticket] = ("claude", self.transcript_path)
+
     def corrupt_sqlite_session_event(self) -> None:
         store = SQLiteEventStore(self.sqlite_path, migrate=False)
         with store.connection() as connection:
             connection.execute(
                 "UPDATE run_projections SET tokens_json = ? WHERE run_id = ?",
                 (json.dumps({"shadow": "corruption"}), self.run_id),
+            )
+
+    def corrupt_sqlite_projection(self) -> None:
+        store = SQLiteEventStore(self.sqlite_path, migrate=False)
+        with store.connection() as connection:
+            connection.execute(
+                "UPDATE run_projections SET tokens_json = ? WHERE run_id = ?",
+                ("{not-json", self.run_id),
             )
 
     def append_tool_result_patch(self) -> None:
@@ -585,6 +616,7 @@ class DualStackHarness:
         self,
         *,
         flags: tuple[str, ...] = (),
+        defaults: bool = False,
         cursor: int = 0,
         client_path: str | None = None,
     ):
@@ -595,6 +627,7 @@ class DualStackHarness:
             "GET",
             f"/api/agents/{self.ticket}/session",
             flags=flags,
+            defaults=defaults,
             params=params,
         )
 
@@ -602,6 +635,7 @@ class DualStackHarness:
         self,
         *,
         flags: tuple[str, ...] = (),
+        defaults: bool = False,
         cursor: int = 0,
         client_path: str | None = None,
     ):
@@ -612,14 +646,23 @@ class DualStackHarness:
             "GET",
             f"/api/agents/{self.ticket}/subagents/{self.subagent_id}/session",
             flags=flags,
+            defaults=defaults,
             params=params,
         )
 
-    def older(self, *, flags: tuple[str, ...] = (), before: int = 1000, count: int = 500):
+    def older(
+        self,
+        *,
+        flags: tuple[str, ...] = (),
+        defaults: bool = False,
+        before: int = 1000,
+        count: int = 500,
+    ):
         return self.request(
             "GET",
             f"/api/agents/{self.ticket}/session/older",
             flags=flags,
+            defaults=defaults,
             params={"before": before, "count": count},
         )
 
@@ -627,6 +670,7 @@ class DualStackHarness:
         self,
         *,
         flags: tuple[str, ...] = (),
+        defaults: bool = False,
         after_seq: int = 0,
         limit: int = 200,
     ):
@@ -634,11 +678,14 @@ class DualStackHarness:
             "GET",
             f"/api/agents/{self.ticket}/events",
             flags=flags,
+            defaults=defaults,
             params={"after_seq": after_seq, "limit": limit},
         )
 
-    def sse_session_event(self, *, flags: tuple[str, ...] = ()) -> dict[str, Any]:
-        self._set_flag_env(flags)
+    def sse_session_event(
+        self, *, flags: tuple[str, ...] = (), defaults: bool = False
+    ) -> dict[str, Any]:
+        self._set_flag_env(flags, defaults=defaults)
         subscriber = main._subscribe_agent_events()
         for _ in range(10):
             while not subscriber.empty():

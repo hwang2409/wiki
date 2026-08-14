@@ -61,6 +61,49 @@ def test_dual_stack_harness_calls_real_session_route() -> None:
     _assert_full_payload_parity(legacy_payload, sqlite_payload)
 
 
+def test_headless_routes_default_to_sqlite_and_explicit_off_stays_legacy() -> None:
+    with DualStackHarness() as harness:
+        session_default = harness.session(defaults=True)
+        session_off = harness.session(flags=())
+        delta_default = harness.delta(defaults=True)
+        older_default = harness.older(defaults=True)
+        provider_default = harness.provider_events(defaults=True)
+
+    assert session_default.status_code == 200
+    assert session_default.json()["path"].startswith("sqlite://live/")
+    assert session_off.status_code == 200
+    assert not session_off.json()["path"].startswith("sqlite://")
+    assert delta_default.status_code == 200
+    assert delta_default.json()["path"].startswith("sqlite://child/")
+    assert older_default.status_code == 200
+    assert older_default.json()["path"].startswith("sqlite://older/")
+    assert provider_default.status_code == 200
+    assert provider_default.json()["events"]
+
+
+def test_default_sqlite_corruption_is_visible_and_repair_recovers_session() -> None:
+    with DualStackHarness() as harness:
+        harness.corrupt_sqlite_projection()
+        failed = harness.session(defaults=True)
+        harness.rebuild_swap()
+        repaired = harness.session(defaults=True)
+
+    assert failed.status_code == 503
+    assert "SQLite session" in failed.json()["detail"]
+    assert repaired.status_code == 200
+    assert repaired.json()["events"]
+
+
+def test_non_headless_session_keeps_native_parser() -> None:
+    with DualStackHarness() as harness:
+        harness.make_non_headless()
+        response = harness.session(defaults=True)
+
+    assert response.status_code == 200
+    assert not response.json()["path"].startswith("sqlite://")
+    assert response.json()["events"]
+
+
 def test_child_delta_uses_production_mapping_and_preserves_parity() -> None:
     with DualStackHarness() as harness:
         mapping = SQLiteEventStore(harness.sqlite_path, migrate=False).child_run_for(

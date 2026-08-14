@@ -1146,8 +1146,18 @@ class SQLiteSourceKey:
 def _sqlite_read_enabled(route: str) -> bool:
     """Return whether one independently releasable SQLite read is enabled."""
 
-    value = os.environ.get(_SQLITE_READ_ROUTES[route][0], "")
+    value = os.environ.get(_SQLITE_READ_ROUTES[route][0])
+    if value is None:
+        return True
     return value.lower() in {"1", "true", "yes", "on"}
+
+
+def _sqlite_read_is_default(route: str) -> bool:
+    return _SQLITE_READ_ROUTES[route][0] not in os.environ
+
+
+class SQLiteReadUnavailable(RuntimeError):
+    """The default SQLite view cannot serve a visible response."""
 
 
 def _sqlite_event_store() -> SQLiteEventStore:
@@ -1186,8 +1196,12 @@ def _record_read_comparison(
     route: str,
     legacy: dict[str, object],
     sqlite_payload: dict[str, object],
+    *,
+    sampled: bool | None = None,
 ) -> None:
-    if not _shadow_sample(route):
+    if sampled is None:
+        sampled = _shadow_sample(route)
+    if not sampled:
         return
     expected = {key: value for key, value in legacy.items() if key != "path"}
     actual = {key: value for key, value in sqlite_payload.items() if key != "path"}
@@ -3668,6 +3682,7 @@ def _sqlite_session_payload(
     raw_path: Path | None = None,
     provider_inspector: dict[str, object] | None = None,
     composer_messages: list[dict[str, Any]] | None = None,
+    required: bool = False,
 ) -> dict[str, object] | None:
     """Build the v2 session view from a ready materialized run.
 
@@ -3683,19 +3698,27 @@ def _sqlite_session_payload(
             source_class=source_class,
             after_cursor=cursor,
         )
-    except Exception:
+    except Exception as exc:
+        if required:
+            raise SQLiteReadUnavailable("SQLite session view is unavailable") from exc
         return None
 
     try:
         typed_source_key = SQLiteSourceKey.parse(snapshot.source_key)
     except (AttributeError, TypeError, ValueError):
+        if required:
+            raise SQLiteReadUnavailable("SQLite session source identity is invalid")
         return None
     if snapshot.state.rebuild_state != "ready":
+        if required:
+            raise SQLiteReadUnavailable("SQLite session view is rebuilding")
         return None
     if (
         typed_source_key.run_id != run_id
         or typed_source_key.source_class != source_class
     ):
+        if required:
+            raise SQLiteReadUnavailable("SQLite session source identity does not match")
         return None
     source_key = typed_source_key.format()
     effective_cursor = cursor if client_path == source_key else 0
@@ -3738,7 +3761,9 @@ def _sqlite_session_payload(
         pr = json.loads(projection[2]) if projection[2] else None
         session_meta = json.loads(projection[3])
         dispositions = json.loads(projection[6])
-    except (TypeError, ValueError):
+    except (TypeError, ValueError) as exc:
+        if required:
+            raise SQLiteReadUnavailable("SQLite session projection is corrupt") from exc
         return None
     raw_delta: dict[str, Any] = {
         "events": event_slice,
@@ -3808,6 +3833,11 @@ def _provider_events(
     )
     if sqlite_enabled and isinstance(run_id, str) and not include_raw:
         ready = _sqlite_ready_store(run_id)
+        if ready is None and _sqlite_read_is_default("provider-events"):
+            raise HTTPException(
+                status_code=503,
+                detail="SQLite provider event view is unavailable",
+            )
         if ready is not None:
             event_store, _state = ready
             try:
@@ -3816,7 +3846,12 @@ def _provider_events(
                     after_seq=after_seq,
                     limit=limit,
                 )
-            except Exception:
+            except Exception as exc:
+                if _sqlite_read_is_default("provider-events"):
+                    raise HTTPException(
+                        status_code=503,
+                        detail="SQLite provider event view is unavailable",
+                    ) from exc
                 sqlite_events = None
             if sqlite_events is not None:
                 sqlite_events = [
@@ -4250,6 +4285,64 @@ def _agent_session_impl(
         current_kind = current_kind or archive_kind
 
     current_run_id = current.get("run_id") if isinstance(current, dict) else None
+    if (
+        allow_sqlite
+        and _sqlite_read_enabled("session")
+        and _sqlite_read_is_default("session")
+        and isinstance(current_run_id, str)
+        and isinstance(current, dict)
+        and _is_headless(current)
+    ):
+        transcript_path = current.get("transcript")
+        transcript_file = (
+            Path(transcript_path)
+            if isinstance(transcript_path, str) and Path(transcript_path).is_file()
+            else None
+        )
+        provider_inspector = _provider_events(ticket, limit=50, use_sqlite=False)
+        sqlite_payload = _sqlite_session_payload(
+            current_run_id,
+            fmt=current_provider or "provider-events",
+            cursor=cursor,
+            client_path=client_path,
+            model=current_model,
+            desired_model=current.get("desired_model"),
+            kind=current_kind,
+            provider=current_provider,
+            working=_transcript_working(
+                Path(current.get("log") or "."), ticket
+            ),
+            include_queue=True,
+            ticket=ticket,
+            transcript_path=transcript_file,
+            raw_path=(
+                Path(current["log"])
+                if isinstance(current.get("log"), str)
+                else None
+            ),
+            provider_inspector=provider_inspector,
+            required=True,
+        )
+        if transcript_file is not None and _shadow_sample("session"):
+            legacy_payload = _session_delta_payload(
+                current_provider or "provider-events",
+                transcript_file,
+                cursor=cursor,
+                client_path=client_path,
+                ticket=ticket,
+                include_queue=True,
+                headless_current=current,
+                model=current_model,
+                desired_model=current.get("desired_model"),
+                kind=current_kind,
+                provider=current_provider,
+                provider_inspector=provider_inspector,
+                allow_sqlite=False,
+            )
+            _record_read_comparison(
+                "session", legacy_payload, sqlite_payload, sampled=True
+            )
+        return sqlite_payload
     found = None
     if not requested_archive and isinstance(current, dict) and _is_headless(current):
         transcript_hint = current.get("transcript")
@@ -4290,6 +4383,7 @@ def _agent_session_impl(
                     include_queue=True,
                     ticket=ticket,
                     provider_inspector=provider_inspector,
+                    required=_sqlite_read_is_default("session"),
                 )
                 if sqlite_payload is not None:
                     return sqlite_payload
@@ -4442,14 +4536,17 @@ def agent_session(
     archived_at: str | None = None,
     run_id: str | None = None,
 ) -> dict[str, object]:
-    return _agent_session_impl(
-        ticket,
-        cursor=cursor,
-        client_path=client_path,
-        archived_at=archived_at,
-        run_id=run_id,
-        allow_sqlite=True,
-    )
+    try:
+        return _agent_session_impl(
+            ticket,
+            cursor=cursor,
+            client_path=client_path,
+            archived_at=archived_at,
+            run_id=run_id,
+            allow_sqlite=True,
+        )
+    except SQLiteReadUnavailable as exc:
+        raise HTTPException(status_code=503, detail=str(exc)) from exc
 
 
 @app.get("/api/agents/{ticket}/session/older")
@@ -4471,6 +4568,11 @@ def agent_session_older(
         and _is_headless(current)
     ):
         ready = _sqlite_ready_store(selected_run_id)
+        if ready is None and _sqlite_read_is_default("older"):
+            raise HTTPException(
+                status_code=503,
+                detail="SQLite older-event view is unavailable",
+            )
         if ready is not None:
             event_store, _state = ready
             try:
@@ -4483,7 +4585,12 @@ def agent_session_older(
                 source_key = SQLiteSourceKey.parse(snapshot.source_key)
                 if source_key.run_id != selected_run_id:
                     raise ValueError("invalid SQLite source key")
-            except Exception:
+            except Exception as exc:
+                if _sqlite_read_is_default("older"):
+                    raise HTTPException(
+                        status_code=503,
+                        detail="SQLite older-event view is unavailable",
+                    ) from exc
                 snapshot = None
             legacy_source = _legacy_source_for_sqlite_run(ticket, selected_run_id)
             if snapshot is not None and legacy_source is not None:
@@ -4677,6 +4784,51 @@ def subagent_session(
         raise HTTPException(status_code=404, detail="No such subagent")
     resolved = _registry_agent(_read_agent_registry(), ticket)
     current = resolved[2] if resolved is not None else {}
+    parent_run_id = current.get("run_id") if isinstance(current, dict) else None
+    mapping = None
+    if _sqlite_read_enabled("delta") and isinstance(parent_run_id, str):
+        try:
+            mapping = _sqlite_event_store().child_run_for(parent_run_id, agent_id)
+        except Exception:
+            mapping = None
+    if (
+        _sqlite_read_is_default("delta")
+        and mapping is not None
+        and _child_materialization_is_current(mapping)
+    ):
+        sqlite_payload = _sqlite_session_payload(
+            mapping.child_run_id,
+            fmt="claude-sub",
+            cursor=cursor,
+            client_path=client_path,
+            model=None,
+            desired_model=None,
+            kind=None,
+            provider=None,
+            working=_transcript_working(path),
+            tail_window=False,
+            tail_events=limit if isinstance(limit, int) else None,
+            source_class="child",
+            transcript_path=path,
+            required=True,
+        )
+        if sqlite_payload is not None:
+            if _shadow_sample("delta"):
+                legacy_shadow = _session_delta_payload(
+                    "claude-sub",
+                    path,
+                    cursor=cursor,
+                    client_path=client_path,
+                    tail_window=False,
+                    tail_events=limit if isinstance(limit, int) else None,
+                    headless_current=current if _is_headless(current) else None,
+                    allow_sqlite=False,
+                    working_override=_transcript_working(path),
+                )
+                _record_read_comparison(
+                    "delta", legacy_shadow, sqlite_payload, sampled=True
+                )
+            return sqlite_payload
     # Without a limit the response stays complete (the inspector has no
     # older-page route, so tail-windowed events would become unreachable).
     # The inline child trace passes an explicit limit so its first fetch is
@@ -4697,10 +4849,9 @@ def subagent_session(
         run_id=None,
         working_override=_transcript_working(path),
     )
-    parent_run_id = current.get("run_id") if isinstance(current, dict) else None
     if _sqlite_read_enabled("delta") and isinstance(parent_run_id, str):
         try:
-            mapping = _sqlite_event_store().child_run_for(parent_run_id, agent_id)
+            mapping = mapping or _sqlite_event_store().child_run_for(parent_run_id, agent_id)
         except Exception:
             mapping = None
         if mapping is not None and _child_materialization_is_current(mapping):
