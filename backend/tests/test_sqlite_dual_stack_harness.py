@@ -211,12 +211,14 @@ class _ChildIngestReader:
         reached: threading.Event,
         release: threading.Event | None = None,
         fail: bool = False,
+        on_eof=None,
     ) -> None:
         self.handle = handle
         self.after_lines = after_lines
         self.reached = reached
         self.release = release
         self.fail = fail
+        self.on_eof = on_eof
 
     def __enter__(self):
         return self
@@ -233,6 +235,11 @@ class _ChildIngestReader:
                     raise RuntimeError("test child ingest crash")
                 if self.release is not None:
                     assert self.release.wait(timeout=5)
+        if self.on_eof is not None:
+            self.on_eof(self.handle.tell())
+
+    def tell(self) -> int:
+        return self.handle.tell()
 
 
 def test_child_delta_falls_back_after_mid_ingest_crash() -> None:
@@ -319,6 +326,65 @@ def test_child_delta_stays_legacy_until_ingest_publishes_eof() -> None:
             after = harness.delta(defaults=True)
 
         assert not errors
+        assert not during.json()["path"].startswith("sqlite://child/")
+        assert after.json()["path"].startswith("sqlite://child/")
+
+
+def test_child_ingest_publishes_consumed_offset_before_writer_append() -> None:
+    with DualStackHarness() as harness:
+        original_open = Path.open
+        used = False
+        consumed_offsets: list[int] = []
+
+        def append_at_eof(offset: int) -> None:
+            consumed_offsets.append(offset)
+            with original_open(
+                harness.subagent_path, "a", encoding="utf-8"
+            ) as handle:
+                handle.write(
+                    json.dumps(
+                        {
+                            "type": "assistant",
+                            "timestamp": "2026-07-10T16:00:03Z",
+                            "message": {
+                                "role": "assistant",
+                                "content": [
+                                    {"type": "text", "text": "appended after EOF"}
+                                ],
+                            },
+                        },
+                        separators=(",", ":"),
+                    )
+                    + "\n"
+                )
+
+        def append_race_open(path: Path, *args: object, **kwargs: object):
+            nonlocal used
+            handle = original_open(path, *args, **kwargs)
+            if path.resolve() == harness.subagent_path.resolve() and not used:
+                used = True
+                return _ChildIngestReader(
+                    handle,
+                    after_lines=100,
+                    reached=threading.Event(),
+                    on_eof=append_at_eof,
+                )
+            return handle
+
+        with mock.patch.object(Path, "open", append_race_open):
+            assert harness.supervisor is not None
+            harness.supervisor.sync_subagent_runs(harness.run_id)
+            during = harness.delta(defaults=True)
+            mapping = SQLiteEventStore(harness.sqlite_path, migrate=False).child_run_for(
+                harness.run_id, harness.subagent_id
+            )
+            harness.supervisor.sync_subagent_runs(harness.run_id)
+            after = harness.delta(defaults=True)
+
+        assert consumed_offsets
+        assert mapping is not None
+        assert mapping.source_size == consumed_offsets[0]
+        assert mapping.source_size < harness.subagent_path.stat().st_size
         assert not during.json()["path"].startswith("sqlite://child/")
         assert after.json()["path"].startswith("sqlite://child/")
 

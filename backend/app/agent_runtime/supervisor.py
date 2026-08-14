@@ -591,7 +591,7 @@ class Supervisor:
                                 "generation": 1,
                                 "payload": payload,
                             }
-                    consumed_size = source_path.stat().st_size
+                        consumed_size = handle.tell()
                 except OSError:
                     return
 
