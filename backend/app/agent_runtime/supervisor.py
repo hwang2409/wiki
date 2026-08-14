@@ -594,6 +594,7 @@ class Supervisor:
                 raw_rows(),
                 provider=ProviderKind.CLAUDE,
             )
+            self.event_store.refresh_child_source_fingerprint(parent_run_id, child_id)
             synced.append(child_id)
         return synced
 

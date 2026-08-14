@@ -1,7 +1,10 @@
 from __future__ import annotations
 
 import json
+import os
 import threading
+from pathlib import Path
+from unittest import mock
 
 from backend.app.agent_runtime.event_store import SQLiteEventStore
 from backend.app.main import SQLiteSourceKey
@@ -107,6 +110,50 @@ def test_default_headless_reads_survive_native_transcript_cleanup() -> None:
     assert delta.json()["path"].startswith("sqlite://child/")
     assert older.status_code == 200
     assert older.json()["path"].startswith("sqlite://older/")
+
+
+def test_default_session_and_child_reads_never_open_native_transcripts() -> None:
+    with DualStackHarness() as harness:
+        native_paths = {
+            harness.transcript_path.resolve(),
+            harness.subagent_path.resolve(),
+        }
+        original_open = Path.open
+
+        def guarded_open(path: Path, *args: object, **kwargs: object):
+            if path.resolve() in native_paths:
+                raise AssertionError(f"native transcript opened: {path}")
+            return original_open(path, *args, **kwargs)
+
+        with mock.patch.object(Path, "open", guarded_open):
+            session = harness.session(defaults=True)
+            child = harness.delta(defaults=True)
+
+    assert session.status_code == 200
+    assert child.status_code == 200
+    assert session.json()["path"].startswith("sqlite://live/")
+    assert child.json()["path"].startswith("sqlite://child/")
+
+
+def test_default_older_payload_is_byte_stable_after_transcript_cleanup() -> None:
+    with DualStackHarness() as harness:
+        native_path = harness.transcript_path.resolve()
+        original_open = Path.open
+
+        def guarded_open(path: Path, *args: object, **kwargs: object):
+            if path.resolve() == native_path:
+                raise AssertionError(f"native transcript opened: {path}")
+            return original_open(path, *args, **kwargs)
+
+        with mock.patch.dict(os.environ, {"WIKI_SQLITE_SHADOW_SAMPLE_RATE": "0"}):
+            with mock.patch.object(Path, "open", guarded_open):
+                present = harness.older(defaults=True)
+            harness.delete_native_transcripts()
+            deleted = harness.older(defaults=True)
+
+    assert present.status_code == 200
+    assert deleted.status_code == 200
+    assert present.content == deleted.content
 
 
 def test_non_headless_session_keeps_native_parser() -> None:

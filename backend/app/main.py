@@ -4293,12 +4293,6 @@ def _agent_session_impl(
         and isinstance(current, dict)
         and _is_headless(current)
     ):
-        transcript_path = current.get("transcript")
-        transcript_file = (
-            Path(transcript_path)
-            if isinstance(transcript_path, str) and Path(transcript_path).is_file()
-            else None
-        )
         provider_inspector = _provider_events(ticket, limit=50, use_sqlite=False)
         sqlite_payload = _sqlite_session_payload(
             current_run_id,
@@ -4323,25 +4317,6 @@ def _agent_session_impl(
             provider_inspector=provider_inspector,
             required=True,
         )
-        if transcript_file is not None and _shadow_sample("session"):
-            legacy_payload = _session_delta_payload(
-                current_provider or "provider-events",
-                transcript_file,
-                cursor=cursor,
-                client_path=client_path,
-                ticket=ticket,
-                include_queue=True,
-                headless_current=current,
-                model=current_model,
-                desired_model=current.get("desired_model"),
-                kind=current_kind,
-                provider=current_provider,
-                provider_inspector=provider_inspector,
-                allow_sqlite=False,
-            )
-            _record_read_comparison(
-                "session", legacy_payload, sqlite_payload, sampled=True
-            )
         return sqlite_payload
     found = None
     if not requested_archive and isinstance(current, dict) and _is_headless(current):
@@ -4592,33 +4567,19 @@ def agent_session_older(
                         detail="SQLite older-event view is unavailable",
                     ) from exc
                 snapshot = None
-            legacy_source = _legacy_source_for_sqlite_run(ticket, selected_run_id)
             if snapshot is not None:
-                legacy_fmt = "provider-events"
-                legacy_page = None
-                if legacy_source is not None:
-                    legacy_fmt, legacy_path = legacy_source
-                    if legacy_fmt.endswith("-normalized"):
-                        legacy_fmt = "provider-events"
-                    if _shadow_sample("older"):
-                        try:
-                            legacy_page = transcripts.read_older_session(
-                                legacy_fmt,
-                                legacy_path,
-                                before,
-                                count,
-                                annotate_agents=legacy_fmt == "claude",
-                            )
-                        except Exception:
-                            legacy_page = None
+                try:
+                    sqlite_fmt = event_store.run_format(selected_run_id)
+                except Exception as exc:
+                    if _sqlite_read_is_default("older"):
+                        raise HTTPException(
+                            status_code=503,
+                            detail="SQLite older-event view is unavailable",
+                        ) from exc
+                    sqlite_fmt = "provider-events"
+                if sqlite_fmt.endswith("-normalized"):
+                    sqlite_fmt = "provider-events"
                 sqlite_events = list(snapshot.events)
-                shadow_events = list(sqlite_events)
-                if legacy_page is not None and legacy_fmt == "claude":
-                    shadow_events = transcripts.annotate_agent_events(
-                        legacy_path, shadow_events
-                    )
-                    if not _sqlite_read_is_default("older"):
-                        sqlite_events = shadow_events
                 sqlite_result = {
                     "events": sqlite_events,
                     "base": int(sqlite_events[0]["id"])
@@ -4626,20 +4587,47 @@ def agent_session_older(
                     else min(before, snapshot.state.event_base),
                     "has_older": snapshot.has_older,
                 }
-                if legacy_page is not None:
-                    _record_read_comparison(
-                        "older",
-                        {
-                            "events": legacy_page["events"],
-                            "base": legacy_page["base"],
-                            "has_older": legacy_page["has_older"],
-                        },
-                        {**sqlite_result, "events": shadow_events},
-                        sampled=True,
+                if _shadow_sample("older"):
+                    legacy_source = _legacy_source_for_sqlite_run(
+                        ticket, selected_run_id
                     )
+                    if legacy_source is not None:
+                        try:
+                            legacy_fmt, legacy_path = legacy_source
+                            if legacy_fmt.endswith("-normalized"):
+                                legacy_fmt = "provider-events"
+                            legacy_page = transcripts.read_older_session(
+                                legacy_fmt,
+                                legacy_path,
+                                before,
+                                count,
+                                annotate_agents=legacy_fmt == "claude",
+                            )
+                            shadow_events = list(sqlite_events)
+                            if legacy_fmt == "claude":
+                                shadow_events = transcripts.annotate_agent_events(
+                                    legacy_path, shadow_events
+                                )
+                            if not _sqlite_read_is_default("older"):
+                                sqlite_result = {
+                                    **sqlite_result,
+                                    "events": shadow_events,
+                                }
+                            _record_read_comparison(
+                                "older",
+                                {
+                                    "events": legacy_page["events"],
+                                    "base": legacy_page["base"],
+                                    "has_older": legacy_page["has_older"],
+                                },
+                                {**sqlite_result, "events": shadow_events},
+                                sampled=True,
+                            )
+                        except Exception:
+                            pass
                 return {
                     "version": 2,
-                    "format": legacy_fmt,
+                    "format": sqlite_fmt,
                     "path": snapshot.source_key,
                     **sqlite_result,
                 }
@@ -4708,17 +4696,22 @@ def _legacy_source_for_sqlite_run(ticket: str, run_id: str) -> tuple[str, Path] 
 
 
 def _child_materialization_is_current(mapping: Any) -> bool:
-    """Use the legacy child file until SQLite has consumed every line."""
+    """Use the legacy child file until SQLite has consumed its current file."""
 
     source_path = Path(mapping.source_path)
     try:
         state = _sqlite_event_store().cursor(mapping.child_run_id)
         if not source_path.is_file():
             return state.rebuild_state == "ready"
-        source_lines = sum(1 for _line in source_path.open(encoding="utf-8"))
+        if mapping.source_size < 0:
+            return False
+        source_stat = source_path.stat()
     except (OSError, KeyError, ValueError):
         return False
-    return state.raw_seq >= source_lines
+    return (
+        state.rebuild_state == "ready"
+        and source_stat.st_size == mapping.source_size
+    )
 
 
 def _transcript_working(path: Path, ticket: str | None = None) -> bool:
@@ -4835,21 +4828,6 @@ def subagent_session(
             required=True,
         )
         if sqlite_payload is not None:
-            if path.is_file() and _shadow_sample("delta"):
-                legacy_shadow = _session_delta_payload(
-                    "claude-sub",
-                    path,
-                    cursor=cursor,
-                    client_path=client_path,
-                    tail_window=False,
-                    tail_events=limit if isinstance(limit, int) else None,
-                    headless_current=current if _is_headless(current) else None,
-                    allow_sqlite=False,
-                    working_override=_transcript_working(path),
-                )
-                _record_read_comparison(
-                    "delta", legacy_shadow, sqlite_payload, sampled=True
-                )
             return sqlite_payload
     # Without a limit the response stays complete (the inspector has no
     # older-page route, so tail-windowed events would become unreachable).

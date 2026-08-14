@@ -28,7 +28,7 @@ from .types import (
     validate_transition,
 )
 
-SCHEMA_VERSION = 7
+SCHEMA_VERSION = 8
 NORMALIZER_VERSION = "wiki-282-1"
 
 
@@ -61,6 +61,13 @@ def _provider_kind(value: object) -> ProviderKind:
     if isinstance(value, str) and value in aliases:
         return aliases[value]
     return ProviderKind(str(value))
+
+
+def _source_size(source_path: Path | str) -> int:
+    try:
+        return Path(source_path).stat().st_size
+    except OSError:
+        return -1
 
 
 def _stored_disposition(disposition: EventDisposition) -> str:
@@ -141,6 +148,7 @@ class ChildRunMapping:
     child_id: str
     child_run_id: str
     source_path: str
+    source_size: int
     created_at: str
 
 
@@ -543,11 +551,14 @@ _MIGRATIONS: dict[int, str] = {
         child_id TEXT NOT NULL,
         child_run_id TEXT NOT NULL UNIQUE REFERENCES runs(run_id) ON DELETE CASCADE,
         source_path TEXT NOT NULL,
+        source_size INTEGER NOT NULL DEFAULT -1,
         created_at TEXT NOT NULL,
         PRIMARY KEY (parent_run_id, child_id)
     );
     CREATE INDEX IF NOT EXISTS child_runs_parent
         ON child_runs(parent_run_id, child_id);
+    """,
+    8: """
     """,
 }
 
@@ -605,6 +616,18 @@ def migrate_event_db(path: Path | str) -> None:
                 if "raw_seq" not in columns:
                     connection.execute(
                         "ALTER TABLE parity_records ADD COLUMN raw_seq INTEGER"
+                    )
+            elif version == 8:
+                columns = {
+                    str(row[1])
+                    for row in connection.execute(
+                        "PRAGMA table_info(child_runs)"
+                    ).fetchall()
+                }
+                if "source_size" not in columns:
+                    connection.execute(
+                        "ALTER TABLE child_runs ADD COLUMN "
+                        "source_size INTEGER NOT NULL DEFAULT -1"
                     )
             else:
                 connection.executescript(_MIGRATIONS[version])
@@ -753,6 +776,7 @@ class SQLiteEventStore:
 
         self.ensure_schema()
         provider_kind = _provider_kind(provider)
+        source_size = _source_size(source_path)
         with self.connection() as connection:
             connection.execute("BEGIN")
             connection.execute(
@@ -785,31 +809,79 @@ class SQLiteEventStore:
             )
             connection.execute(
                 "INSERT INTO child_runs "
-                "(parent_run_id, child_id, child_run_id, source_path, created_at) "
-                "VALUES (?, ?, ?, ?, ?) "
+                "(parent_run_id, child_id, child_run_id, source_path, "
+                "source_size, created_at) "
+                "VALUES (?, ?, ?, ?, ?, ?) "
                 "ON CONFLICT(parent_run_id, child_id) DO UPDATE SET "
                 "source_path = excluded.source_path",
-                (parent_run_id, child_id, child_run_id, source_path, created_at),
+                (
+                    parent_run_id,
+                    child_id,
+                    child_run_id,
+                    source_path,
+                    source_size,
+                    created_at,
+                ),
             )
             row = connection.execute(
-                "SELECT parent_run_id, child_id, child_run_id, source_path, created_at "
+                "SELECT parent_run_id, child_id, child_run_id, source_path, "
+                "source_size, created_at "
                 "FROM child_runs WHERE parent_run_id = ? AND child_id = ?",
                 (parent_run_id, child_id),
             ).fetchone()
         if row is None:
             raise KeyError((parent_run_id, child_id))
-        return ChildRunMapping(*map(str, row))
+        return ChildRunMapping(
+            parent_run_id=str(row[0]),
+            child_id=str(row[1]),
+            child_run_id=str(row[2]),
+            source_path=str(row[3]),
+            source_size=int(row[4]),
+            created_at=str(row[5]),
+        )
 
     def child_run_for(self, parent_run_id: str, child_id: str) -> ChildRunMapping | None:
         """Return the durable child mapping without changing SQLite state."""
 
         with self.connection(read_only=True) as connection:
             row = connection.execute(
-                "SELECT parent_run_id, child_id, child_run_id, source_path, created_at "
+                "SELECT parent_run_id, child_id, child_run_id, source_path, "
+                "source_size, created_at "
                 "FROM child_runs WHERE parent_run_id = ? AND child_id = ?",
                 (parent_run_id, child_id),
             ).fetchone()
-        return ChildRunMapping(*map(str, row)) if row is not None else None
+        return (
+            ChildRunMapping(
+                parent_run_id=str(row[0]),
+                child_id=str(row[1]),
+                child_run_id=str(row[2]),
+                source_path=str(row[3]),
+                source_size=int(row[4]),
+                created_at=str(row[5]),
+            )
+            if row is not None
+            else None
+        )
+
+    def refresh_child_source_fingerprint(
+        self, parent_run_id: str, child_id: str
+    ) -> None:
+        """Record child file metadata after its rows are materialized."""
+
+        with self.connection() as connection:
+            row = connection.execute(
+                "SELECT source_path FROM child_runs "
+                "WHERE parent_run_id = ? AND child_id = ?",
+                (parent_run_id, child_id),
+            ).fetchone()
+            if row is None:
+                return
+            size = _source_size(str(row[0]))
+            connection.execute(
+                "UPDATE child_runs SET source_size = ? "
+                "WHERE parent_run_id = ? AND child_id = ?",
+                (size, parent_run_id, child_id),
+            )
 
     def materialize_raw_rows(
         self,
@@ -1312,6 +1384,17 @@ class SQLiteEventStore:
         return RunCursor(
             *row[:9], lifecycle, row[10], row[11], self.rebuild_generation(run_id)
         )
+
+    def run_format(self, run_id: str) -> str:
+        """Return the format stored for a materialized run."""
+
+        with self.connection(read_only=True) as connection:
+            row = connection.execute(
+                "SELECT format FROM runs WHERE run_id = ?", (run_id,)
+            ).fetchone()
+        if row is None or not row[0]:
+            raise KeyError(run_id)
+        return str(row[0])
 
     @staticmethod
     def _source_key(run_id: str, source_class: str, generation: int) -> str:
