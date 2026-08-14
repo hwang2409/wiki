@@ -2486,6 +2486,7 @@ class RunStore:
         kind: str,
         payload: dict[str, Any],
         lifecycle_state: LifecycleState | None = None,
+        normalized_at: str | None = None,
     ) -> dict[str, Any]:
         with self._lock:
             record = self.get(run_id)
@@ -2496,7 +2497,7 @@ class RunStore:
             envelope = {
                 "seq": record.normalized_event_count + 1,
                 "raw_seq": raw_seq,
-                "normalized_at": utc_now(),
+                "normalized_at": utc_now() if normalized_at is None else normalized_at,
                 "disposition": disposition.value,
                 "kind": kind,
                 "payload": payload,
