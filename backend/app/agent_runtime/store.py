@@ -1169,11 +1169,11 @@ class RunStore:
             return sorted(legacy)
 
     def _registry_current(self, record: RunRecord) -> dict[str, Any]:
-        return {
+        value: dict[str, Any] = {
             "ticket": record.agent_id,
             "run_id": record.run_id,
             "provider": record.provider.value,
-            "kind": record.provider.legacy_kind,
+            "kind": record.kind,
             "role": record.role,
             "auto_archive": record.auto_archive,
             "model": record.model,
@@ -1224,6 +1224,9 @@ class RunStore:
             # into the registry on every current-entry refresh.
             "replaced_legacy_provider": record.replaced_legacy_provider,
         }
+        if record.execution_kind is not None and record.wk_lane is not None:
+            value["lane"] = record.wk_lane
+        return value
 
     def _write_record(self, record: RunRecord) -> None:
         record.updated_at = utc_now()

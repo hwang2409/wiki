@@ -3,8 +3,10 @@ from __future__ import annotations
 from dataclasses import asdict, dataclass
 from typing import Literal
 
+from .agent_runtime.wk_feature import wk_enabled
 
-AgentKind = Literal["cc", "cdx"]
+
+AgentKind = Literal["cc", "cdx", "wk-claude", "wk-codex"]
 AgentProvider = Literal["claude", "codex"]
 
 
@@ -124,13 +126,34 @@ MODEL_OPTIONS: tuple[AgentModelOption, ...] = (
     ),
 )
 
+WK_MODEL_OPTIONS: tuple[AgentModelOption, ...] = (
+    AgentModelOption(
+        id="sonnet",
+        label="Sonnet (wk-claude)",
+        kind="wk-claude",
+        provider="claude",
+        supports_reasoning_effort=False,
+        default_worker=True,
+    ),
+    AgentModelOption(
+        id="gpt-5.6-sol",
+        label="GPT 5.6 Sol (wk-codex)",
+        kind="wk-codex",
+        provider="codex",
+        supports_reasoning_effort=True,
+        default_worker=True,
+    ),
+)
+
 
 def list_model_options() -> list[dict[str, object]]:
-    return [asdict(option) for option in MODEL_OPTIONS]
+    options = MODEL_OPTIONS + WK_MODEL_OPTIONS if wk_enabled() else MODEL_OPTIONS
+    return [asdict(option) for option in options]
 
 
 def model_ids_for_kind(kind: str) -> tuple[str, ...]:
-    return tuple(option.id for option in MODEL_OPTIONS if option.kind == kind)
+    options = MODEL_OPTIONS + WK_MODEL_OPTIONS if wk_enabled() else MODEL_OPTIONS
+    return tuple(option.id for option in options if option.kind == kind)
 
 
 def is_model_allowed(kind: str, model: str) -> bool:

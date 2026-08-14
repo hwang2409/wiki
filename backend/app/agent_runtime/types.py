@@ -162,6 +162,10 @@ class RunRecord:
     role: str
     model: str
     worktree: str
+    # Optional execution metadata.  Existing cc/cdx records omit these keys
+    # from their serialized shape.  wk records use distinct public kinds.
+    execution_kind: str | None = None
+    wk_lane: str | None = None
     auto_archive: bool = False
     backend_base_url: str | None = None
     desired_model: str | None = None
@@ -244,6 +248,18 @@ class RunRecord:
     message_dedupe_keys: list[dict[str, str]] = field(default_factory=list)
     schema_version: int = 1
 
+    @property
+    def kind(self) -> str:
+        """Return the public execution kind without changing legacy records."""
+
+        return self.execution_kind or self.provider.legacy_kind
+
+    @property
+    def lane(self) -> str | None:
+        """Return the wk lane, when this run carries wk metadata."""
+
+        return self.wk_lane
+
     @classmethod
     def new(
         cls,
@@ -251,10 +267,12 @@ class RunRecord:
         agent_id: str,
         provider: ProviderKind,
         role: str,
-        auto_archive: bool = False,
         model: str,
         worktree: str,
         prompt: str,
+        execution_kind: str | None = None,
+        wk_lane: str | None = None,
+        auto_archive: bool = False,
         effort: str | None = None,
         orchestrator_id: str | None = None,
         replaces_run_id: str | None = None,
@@ -267,6 +285,8 @@ class RunRecord:
             run_id=run_id or str(uuid4()),
             agent_id=agent_id,
             provider=provider,
+            execution_kind=execution_kind,
+            wk_lane=wk_lane,
             role=role,
             auto_archive=auto_archive,
             model=model,
@@ -281,7 +301,7 @@ class RunRecord:
         )
 
     def to_dict(self) -> dict[str, Any]:
-        return {
+        value: dict[str, Any] = {
             "schema_version": self.schema_version,
             "run_id": self.run_id,
             "agent_id": self.agent_id,
@@ -345,6 +365,12 @@ class RunRecord:
             "queued_messages": list(self.queued_messages),
             "message_dedupe_keys": list(self.message_dedupe_keys),
         }
+        if self.execution_kind is not None:
+            value["execution_kind"] = self.execution_kind
+            value["kind"] = self.execution_kind
+            if self.wk_lane is not None:
+                value["lane"] = self.wk_lane
+        return value
 
     @classmethod
     def from_dict(cls, value: dict[str, Any]) -> RunRecord:
@@ -356,6 +382,16 @@ class RunRecord:
             run_id=str(value["run_id"]),
             agent_id=str(value["agent_id"]),
             provider=ProviderKind(value["provider"]),
+            execution_kind=(
+                str(value["execution_kind"])
+                if value.get("execution_kind")
+                else (
+                    str(value["kind"])
+                    if str(value.get("kind", "")).startswith("wk-")
+                    else None
+                )
+            ),
+            wk_lane=(str(value["lane"]) if value.get("lane") else None),
             role=str(value["role"]),
             auto_archive=bool(value.get("auto_archive", False)),
             model=str(value["model"]),

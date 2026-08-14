@@ -54,7 +54,7 @@ def runtime_card(record: RunRecord, *, status_path: Path) -> str:
     )
     common = f"""<WIKI_RUNTIME_CARD v=1>
 spawned_by=wiki-supervisor run_id={record.run_id}
-identity: {identity} role={record.role} kind={record.provider.legacy_kind}
+identity: {identity} role={record.role} kind={record.kind}
 backend: {backend}
 worktree: {record.worktree}
 branch: {worktree_branch(record.worktree)}
