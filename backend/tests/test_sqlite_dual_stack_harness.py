@@ -1,7 +1,10 @@
 from __future__ import annotations
 
 import json
+import os
 import threading
+from pathlib import Path
+from unittest import mock
 
 from backend.app.agent_runtime.event_store import SQLiteEventStore
 from backend.app.main import SQLiteSourceKey
@@ -61,6 +64,108 @@ def test_dual_stack_harness_calls_real_session_route() -> None:
     _assert_full_payload_parity(legacy_payload, sqlite_payload)
 
 
+def test_headless_routes_default_to_sqlite_and_explicit_off_stays_legacy() -> None:
+    with DualStackHarness() as harness:
+        session_default = harness.session(defaults=True)
+        session_off = harness.session(flags=())
+        delta_default = harness.delta(defaults=True)
+        older_default = harness.older(defaults=True)
+        provider_default = harness.provider_events(defaults=True)
+
+    assert session_default.status_code == 200
+    assert session_default.json()["path"].startswith("sqlite://live/")
+    assert session_off.status_code == 200
+    assert not session_off.json()["path"].startswith("sqlite://")
+    assert delta_default.status_code == 200
+    assert delta_default.json()["path"].startswith("sqlite://child/")
+    assert older_default.status_code == 200
+    assert older_default.json()["path"].startswith("sqlite://older/")
+    assert provider_default.status_code == 200
+    assert provider_default.json()["events"]
+
+
+def test_default_sqlite_corruption_is_visible_and_repair_recovers_session() -> None:
+    with DualStackHarness() as harness:
+        harness.corrupt_sqlite_projection()
+        failed = harness.session(defaults=True)
+        harness.rebuild_swap()
+        repaired = harness.session(defaults=True)
+
+    assert failed.status_code == 503
+    assert "SQLite session" in failed.json()["detail"]
+    assert repaired.status_code == 200
+    assert repaired.json()["events"]
+
+
+def test_default_headless_reads_survive_native_transcript_cleanup() -> None:
+    with DualStackHarness() as harness:
+        harness.delete_native_transcripts()
+        session = harness.session(defaults=True)
+        delta = harness.delta(defaults=True)
+        older = harness.older(defaults=True)
+
+    assert session.status_code == 200
+    assert session.json()["path"].startswith("sqlite://live/")
+    assert delta.status_code == 200
+    assert delta.json()["path"].startswith("sqlite://child/")
+    assert older.status_code == 200
+    assert older.json()["path"].startswith("sqlite://older/")
+
+
+def test_default_session_and_child_reads_never_open_native_transcripts() -> None:
+    with DualStackHarness() as harness:
+        native_paths = {
+            harness.transcript_path.resolve(),
+            harness.subagent_path.resolve(),
+        }
+        original_open = Path.open
+
+        def guarded_open(path: Path, *args: object, **kwargs: object):
+            if path.resolve() in native_paths:
+                raise AssertionError(f"native transcript opened: {path}")
+            return original_open(path, *args, **kwargs)
+
+        with mock.patch.object(Path, "open", guarded_open):
+            session = harness.session(defaults=True)
+            child = harness.delta(defaults=True)
+
+    assert session.status_code == 200
+    assert child.status_code == 200
+    assert session.json()["path"].startswith("sqlite://live/")
+    assert child.json()["path"].startswith("sqlite://child/")
+
+
+def test_default_older_payload_is_byte_stable_after_transcript_cleanup() -> None:
+    with DualStackHarness() as harness:
+        native_path = harness.transcript_path.resolve()
+        original_open = Path.open
+
+        def guarded_open(path: Path, *args: object, **kwargs: object):
+            if path.resolve() == native_path:
+                raise AssertionError(f"native transcript opened: {path}")
+            return original_open(path, *args, **kwargs)
+
+        with mock.patch.dict(os.environ, {"WIKI_SQLITE_SHADOW_SAMPLE_RATE": "0"}):
+            with mock.patch.object(Path, "open", guarded_open):
+                present = harness.older(defaults=True)
+            harness.delete_native_transcripts()
+            deleted = harness.older(defaults=True)
+
+    assert present.status_code == 200
+    assert deleted.status_code == 200
+    assert present.content == deleted.content
+
+
+def test_non_headless_session_keeps_native_parser() -> None:
+    with DualStackHarness() as harness:
+        harness.make_non_headless()
+        response = harness.session(defaults=True)
+
+    assert response.status_code == 200
+    assert not response.json()["path"].startswith("sqlite://")
+    assert response.json()["events"]
+
+
 def test_child_delta_uses_production_mapping_and_preserves_parity() -> None:
     with DualStackHarness() as harness:
         mapping = SQLiteEventStore(harness.sqlite_path, migrate=False).child_run_for(
@@ -95,6 +200,212 @@ def test_child_delta_falls_back_when_file_grows_without_parent_ingest() -> None:
     payload = response.json()
     assert not payload["path"].startswith("sqlite://")
     assert any(event["text"] == "child grew after ingest" for event in payload["events"])
+
+
+class _ChildIngestReader:
+    def __init__(
+        self,
+        handle,
+        *,
+        after_lines: int,
+        reached: threading.Event,
+        release: threading.Event | None = None,
+        fail: bool = False,
+        on_eof=None,
+    ) -> None:
+        self.handle = handle
+        self.after_lines = after_lines
+        self.reached = reached
+        self.release = release
+        self.fail = fail
+        self.on_eof = on_eof
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *args: object) -> object:
+        return self.handle.__exit__(*args)
+
+    def __iter__(self):
+        for index, line in enumerate(self.handle):
+            yield line
+            if index + 1 == self.after_lines:
+                self.reached.set()
+                if self.fail:
+                    raise RuntimeError("test child ingest crash")
+                if self.release is not None:
+                    assert self.release.wait(timeout=5)
+        if self.on_eof is not None:
+            self.on_eof(self.handle.tell())
+
+    def tell(self) -> int:
+        return self.handle.tell()
+
+
+def test_child_delta_falls_back_after_mid_ingest_crash() -> None:
+    with DualStackHarness() as harness:
+        reached = threading.Event()
+        original_open = Path.open
+        used = False
+
+        def crash_open(path: Path, *args: object, **kwargs: object):
+            nonlocal used
+            handle = original_open(path, *args, **kwargs)
+            if path.resolve() == harness.subagent_path.resolve() and not used:
+                used = True
+                return _ChildIngestReader(
+                    handle,
+                    after_lines=1,
+                    reached=reached,
+                    fail=True,
+                )
+            return handle
+
+        errors: list[BaseException] = []
+
+        def ingest() -> None:
+            try:
+                assert harness.supervisor is not None
+                harness.supervisor.sync_subagent_runs(harness.run_id)
+            except BaseException as exc:
+                errors.append(exc)
+
+        with mock.patch.object(Path, "open", crash_open):
+            worker = threading.Thread(target=ingest)
+            worker.start()
+            assert reached.wait(timeout=5)
+            response = harness.delta(defaults=True)
+            worker.join(timeout=5)
+
+        assert errors
+        assert response.status_code == 200
+        assert not response.json()["path"].startswith("sqlite://child/")
+        mapping = SQLiteEventStore(harness.sqlite_path, migrate=False).child_run_for(
+            harness.run_id, harness.subagent_id
+        )
+        assert mapping is not None
+        assert mapping.source_size == -1
+
+
+def test_child_delta_stays_legacy_until_ingest_publishes_eof() -> None:
+    with DualStackHarness() as harness:
+        reached = threading.Event()
+        release = threading.Event()
+        original_open = Path.open
+        used = False
+
+        def gated_open(path: Path, *args: object, **kwargs: object):
+            nonlocal used
+            handle = original_open(path, *args, **kwargs)
+            if path.resolve() == harness.subagent_path.resolve() and not used:
+                used = True
+                return _ChildIngestReader(
+                    handle,
+                    after_lines=1,
+                    reached=reached,
+                    release=release,
+                )
+            return handle
+
+        errors: list[BaseException] = []
+
+        def ingest() -> None:
+            try:
+                assert harness.supervisor is not None
+                harness.supervisor.sync_subagent_runs(harness.run_id)
+            except BaseException as exc:
+                errors.append(exc)
+
+        with mock.patch.object(Path, "open", gated_open):
+            worker = threading.Thread(target=ingest)
+            worker.start()
+            assert reached.wait(timeout=5)
+            during = harness.delta(defaults=True)
+            release.set()
+            worker.join(timeout=5)
+            after = harness.delta(defaults=True)
+
+        assert not errors
+        assert not during.json()["path"].startswith("sqlite://child/")
+        assert after.json()["path"].startswith("sqlite://child/")
+
+
+def test_child_ingest_publishes_consumed_offset_before_writer_append() -> None:
+    with DualStackHarness() as harness:
+        original_open = Path.open
+        used = False
+        consumed_offsets: list[int] = []
+
+        def append_at_eof(offset: int) -> None:
+            consumed_offsets.append(offset)
+            with original_open(
+                harness.subagent_path, "a", encoding="utf-8"
+            ) as handle:
+                handle.write(
+                    json.dumps(
+                        {
+                            "type": "assistant",
+                            "timestamp": "2026-07-10T16:00:03Z",
+                            "message": {
+                                "role": "assistant",
+                                "content": [
+                                    {"type": "text", "text": "appended after EOF"}
+                                ],
+                            },
+                        },
+                        separators=(",", ":"),
+                    )
+                    + "\n"
+                )
+
+        def append_race_open(path: Path, *args: object, **kwargs: object):
+            nonlocal used
+            handle = original_open(path, *args, **kwargs)
+            if path.resolve() == harness.subagent_path.resolve() and not used:
+                used = True
+                return _ChildIngestReader(
+                    handle,
+                    after_lines=100,
+                    reached=threading.Event(),
+                    on_eof=append_at_eof,
+                )
+            return handle
+
+        with mock.patch.object(Path, "open", append_race_open):
+            assert harness.supervisor is not None
+            harness.supervisor.sync_subagent_runs(harness.run_id)
+            during = harness.delta(defaults=True)
+            mapping = SQLiteEventStore(harness.sqlite_path, migrate=False).child_run_for(
+                harness.run_id, harness.subagent_id
+            )
+            harness.supervisor.sync_subagent_runs(harness.run_id)
+            after = harness.delta(defaults=True)
+
+        assert consumed_offsets
+        assert mapping is not None
+        assert mapping.source_size == consumed_offsets[0]
+        assert mapping.source_size < harness.subagent_path.stat().st_size
+        assert not during.json()["path"].startswith("sqlite://child/")
+        assert after.json()["path"].startswith("sqlite://child/")
+
+
+def test_older_shadow_resolution_error_does_not_change_served_response() -> None:
+    with DualStackHarness() as harness:
+        baseline = harness.older(defaults=True)
+        native_path = harness.transcript_path.resolve()
+        original_open = Path.open
+
+        def corrupt_open(path: Path, *args: object, **kwargs: object):
+            if path.resolve() == native_path:
+                raise UnicodeDecodeError("utf-8", b"\\xff", 0, 1, "fixture")
+            return original_open(path, *args, **kwargs)
+
+        with mock.patch.object(Path, "open", corrupt_open):
+            response = harness.older(defaults=True)
+
+    assert baseline.status_code == 200
+    assert response.status_code == 200
+    assert response.content == baseline.content
 
 
 def test_parent_rebuild_preserves_child_mapping_and_flip() -> None:

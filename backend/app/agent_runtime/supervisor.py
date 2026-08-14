@@ -563,8 +563,13 @@ class Supervisor:
                     source_path=str(source_path),
                     created_at=record.created_at,
                 )
+            self.event_store.invalidate_child_source_fingerprint(
+                parent_run_id, child_id
+            )
+            consumed_size: int | None = None
 
             def raw_rows() -> Iterator[dict[str, Any]]:
+                nonlocal consumed_size
                 try:
                     with source_path.open(encoding="utf-8") as handle:
                         for seq, line in enumerate(handle, start=1):
@@ -586,6 +591,7 @@ class Supervisor:
                                 "generation": 1,
                                 "payload": payload,
                             }
+                        consumed_size = handle.tell()
                 except OSError:
                     return
 
@@ -594,6 +600,10 @@ class Supervisor:
                 raw_rows(),
                 provider=ProviderKind.CLAUDE,
             )
+            if consumed_size is not None:
+                self.event_store.refresh_child_source_fingerprint(
+                    parent_run_id, child_id, consumed_size
+                )
             synced.append(child_id)
         return synced
 
