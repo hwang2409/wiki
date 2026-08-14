@@ -1102,6 +1102,8 @@ _SQLITE_READ_FLAG_ENV = {
     "archive": "WIKI_SQLITE_READ_ARCHIVE",
     "sse": "WIKI_SQLITE_READ_SSE",
 }
+_READ_TELEMETRY: dict[tuple[str, str, bool], int] = {}
+_READ_TELEMETRY_LOCK = threading.Lock()
 
 
 def _sqlite_read_enabled(route: str) -> bool:
@@ -3585,30 +3587,11 @@ def _record_read_mismatch(
     ignored = {"path", "working", "provider_inspector", "composer_messages", "subagents", "queue"}
     expected = {key: value for key, value in legacy.items() if key not in ignored}
     actual = {key: value for key, value in sqlite_payload.items() if key not in ignored}
-    try:
-        ready = _sqlite_ready_store(run_id)
-        if ready is None:
-            return
-        event_store, state = ready
-        matched = expected == actual
-        event_store.record_parity_record(
-            run_id,
-            normalizer_version=state.normalizer_version,
-            record_type="read_counter",
-            path=route,
-            detail={"route": route, "matched": matched},
-        )
-        event_store.record_parity_record(
-            run_id,
-            normalizer_version=state.normalizer_version,
-            record_type="read_match" if matched else "read_mismatch",
-            path=route,
-            detail={"route": route},
-            expected=None if matched else expected,
-            actual=None if matched else actual,
-        )
-    except Exception:
-        return
+    # Reads cannot take a SQLite write lock. The process sampler flushes these
+    # counters out of band; this path only records the denominator and result.
+    key = (route, run_id, expected == actual)
+    with _READ_TELEMETRY_LOCK:
+        _READ_TELEMETRY[key] = _READ_TELEMETRY.get(key, 0) + 1
 
 
 def _provider_events(
