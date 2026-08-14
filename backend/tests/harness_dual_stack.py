@@ -640,22 +640,47 @@ class DualStackHarness:
     def sse_session_event(self, *, flags: tuple[str, ...] = ()) -> dict[str, Any]:
         self._set_flag_env(flags)
         subscriber = main._subscribe_agent_events()
+        for _ in range(10):
+            while not subscriber.empty():
+                subscriber.get_nowait()
+            time.sleep(0.02)
+        gate: asyncio.Event | None = None
+        future = None
         try:
             assert self.supervisor_thread is not None
             assert self.supervisor_thread.loop is not None
             assert self.supervisor is not None
+            assert self.store is not None
+            before_cursor = SQLiteEventStore(self.sqlite_path, migrate=False).cursor(
+                self.run_id
+            ).change_cursor
+            gate = asyncio.Event()
+            self.supervisor.materializer_gate = gate
+            adapter = self.adapter_factory(self.store.get(self.run_id))
+            event = ProviderEvent(
+                ProviderKind.CLAUDE,
+                {"type": "assistant", "message": {"content": [{"type": "text", "text": "sse ingest"}]}},
+                direction="stdout",
+                generation=1,
+                received_at="2026-07-10T16:00:05Z",
+            )
             future = asyncio.run_coroutine_threadsafe(
-                self.supervisor._publish(  # noqa: SLF001
-                    {
-                        "type": "session",
-                        "ticket": self.ticket,
-                        "surface": "session",
-                        "producer_marker": "legacy-input",
-                    }
+                self.supervisor._handle_provider_event_without_admission(  # noqa: SLF001
+                    self.run_id,
+                    adapter,
+                    event,
                 ),
                 self.supervisor_thread.loop,
             )
+            time.sleep(0.05)
+            assert not future.done()
+            assert subscriber.empty()
+            self.supervisor_thread.loop.call_soon_threadsafe(gate.set)
             future.result(timeout=10)
+            after_cursor = SQLiteEventStore(self.sqlite_path, migrate=False).cursor(
+                self.run_id
+            ).change_cursor
+            assert after_cursor > before_cursor
             deadline = time.monotonic() + 2
             while time.monotonic() < deadline:
                 try:
@@ -664,7 +689,31 @@ class DualStackHarness:
                     time.sleep(0.01)
             raise AssertionError("SSE event did not reach the real bridge")
         finally:
+            if gate is not None and future is not None and not future.done():
+                self.supervisor_thread.loop.call_soon_threadsafe(gate.set)
+            self.supervisor.materializer_gate = None
             main._event_subscribers.discard(subscriber)
+
+    def append_child_event_after_ingest(self) -> None:
+        with self.subagent_path.open("a", encoding="utf-8") as handle:
+            handle.write(
+                json.dumps(
+                    {
+                        "type": "assistant",
+                        "timestamp": "2026-07-10T16:00:03Z",
+                        "message": {
+                            "role": "assistant",
+                            "content": [{"type": "text", "text": "child grew after ingest"}],
+                        },
+                    },
+                    separators=(",", ":"),
+                )
+                + "\n"
+            )
+
+    def mark_child_stale(self) -> None:
+        old_time = self.subagent_path.stat().st_mtime - 120
+        os.utime(self.subagent_path, (old_time, old_time))
 
     def rebuild_swap(self) -> None:
         self.rebuild_swap_variant(False)

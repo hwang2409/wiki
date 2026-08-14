@@ -4056,6 +4056,7 @@ def _session_delta_payload(
     allow_sqlite: bool = True,
     provider_inspector: dict[str, object] | None = None,
     composer_messages: list[dict[str, Any]] | None = None,
+    working_override: bool | None = None,
 ) -> dict[str, object]:
     effective_cursor = 0 if client_path is not None and client_path != str(path) else cursor
     result = transcripts.read_session_delta(
@@ -4083,7 +4084,11 @@ def _session_delta_payload(
         desired_model=desired_model,
         kind=kind,
         provider=provider,
-        working=_transcript_working(path, ticket),
+        working=(
+            _transcript_working(path, ticket)
+            if working_override is None
+            else working_override
+        ),
         include_subagents=include_subagents,
         include_queue=include_queue and bool(ticket and valid_agent_id(ticket)),
         ticket=ticket,
@@ -4581,6 +4586,18 @@ def _legacy_source_for_sqlite_run(ticket: str, run_id: str) -> tuple[str, Path] 
     return None
 
 
+def _child_materialization_is_current(mapping: Any) -> bool:
+    """Use the legacy child file until SQLite has consumed every line."""
+
+    source_path = Path(mapping.source_path)
+    try:
+        source_lines = sum(1 for _line in source_path.open(encoding="utf-8"))
+        state = _sqlite_event_store().cursor(mapping.child_run_id)
+    except (OSError, KeyError, ValueError):
+        return False
+    return state.raw_seq >= source_lines
+
+
 def _transcript_working(path: Path, ticket: str | None = None) -> bool:
     """Use supervisor lifecycle, then legacy pane spinner, then transcript mtime."""
     if ticket:
@@ -4678,6 +4695,7 @@ def subagent_session(
         allow_sqlite=False,
         headless_current=current if _is_headless(current) else None,
         run_id=None,
+        working_override=_transcript_working(path),
     )
     parent_run_id = current.get("run_id") if isinstance(current, dict) else None
     if _sqlite_read_enabled("delta") and isinstance(parent_run_id, str):
@@ -4685,7 +4703,7 @@ def subagent_session(
             mapping = _sqlite_event_store().child_run_for(parent_run_id, agent_id)
         except Exception:
             mapping = None
-        if mapping is not None:
+        if mapping is not None and _child_materialization_is_current(mapping):
             sqlite_payload = _sqlite_session_payload(
                 mapping.child_run_id,
                 fmt="claude-sub",
@@ -4695,7 +4713,7 @@ def subagent_session(
                 desired_model=None,
                 kind=None,
                 provider=None,
-                working=_transcript_working(path, ticket),
+                working=_transcript_working(path),
                 tail_window=False,
                 tail_events=limit if isinstance(limit, int) else None,
                 source_class="child",

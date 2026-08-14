@@ -66,6 +66,7 @@ def test_child_delta_uses_production_mapping_and_preserves_parity() -> None:
         mapping = SQLiteEventStore(harness.sqlite_path, migrate=False).child_run_for(
             harness.run_id, harness.subagent_id
         )
+        harness.mark_child_stale()
         legacy = harness.delta()
         sqlite = harness.delta(flags=("delta",))
 
@@ -81,9 +82,36 @@ def test_child_delta_uses_production_mapping_and_preserves_parity() -> None:
         "child-only event",
     ]
     assert sqlite_payload["path"].startswith("sqlite://child/")
-    assert sqlite_payload["events"] == legacy_payload["events"]
-    assert sqlite_payload["tasks"] == legacy_payload["tasks"]
-    assert sqlite_payload["session_meta"] == legacy_payload["session_meta"]
+    _assert_full_payload_parity(legacy_payload, sqlite_payload)
+
+
+def test_child_delta_falls_back_when_file_grows_without_parent_ingest() -> None:
+    with DualStackHarness() as harness:
+        harness.delta(flags=("delta",))
+        harness.append_child_event_after_ingest()
+        response = harness.delta(flags=("delta",))
+
+    assert response.status_code == 200
+    payload = response.json()
+    assert not payload["path"].startswith("sqlite://")
+    assert any(event["text"] == "child grew after ingest" for event in payload["events"])
+
+
+def test_parent_rebuild_preserves_child_mapping_and_flip() -> None:
+    with DualStackHarness() as harness:
+        before = SQLiteEventStore(harness.sqlite_path, migrate=False).child_run_for(
+            harness.run_id, harness.subagent_id
+        )
+        harness.rebuild_swap()
+        after = SQLiteEventStore(harness.sqlite_path, migrate=False).child_run_for(
+            harness.run_id, harness.subagent_id
+        )
+        response = harness.delta(flags=("delta",))
+
+    assert before is not None
+    assert after == before
+    assert response.status_code == 200
+    assert response.json()["path"].startswith("sqlite://child/")
 
 
 def test_older_route_has_independent_sqlite_parity() -> None:

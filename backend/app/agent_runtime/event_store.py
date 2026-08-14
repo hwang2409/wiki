@@ -302,7 +302,7 @@ class EventReducerAdapter:
         for change in parser_changes:
             self._change_cursor += 1
             change["cursor"] = self._change_cursor
-        if projection_changed:
+        if projection_changed and not parser_changes:
             self._change_cursor += 1
         return ReducerResult(
             raw_seq=raw_seq,
@@ -1728,13 +1728,17 @@ class SQLiteEventStore:
                 attached = True
                 try:
                     connection.execute("BEGIN IMMEDIATE")
-                    connection.execute("DELETE FROM runs WHERE run_id = ?", (run_id,))
+                    connection.execute(
+                        "INSERT INTO main.runs "
+                        "(run_id, agent_id, provider, format, normalizer_version, "
+                        "created_at, state, archive_state) "
+                        "SELECT run_id, agent_id, provider, format, normalizer_version, "
+                        "created_at, state, archive_state FROM rebuilt.runs "
+                        "WHERE run_id = ? AND NOT EXISTS "
+                        "(SELECT 1 FROM main.runs WHERE run_id = ?)",
+                        (run_id, run_id),
+                    )
                     for table, columns in (
-                    (
-                        "runs",
-                        "run_id, agent_id, provider, format, normalizer_version, "
-                        "created_at, state, archive_state",
-                    ),
                     (
                         "run_cursors",
                         "run_id, raw_seq, materialized_raw_seq, next_event_id, "
@@ -1766,10 +1770,23 @@ class SQLiteEventStore:
                     ),
                     ):
                         connection.execute(
+                            f"DELETE FROM main.{table} WHERE run_id = ?", (run_id,)
+                        )
+                        connection.execute(
                             f"INSERT INTO main.{table} ({columns}) "
                             f"SELECT {columns} FROM rebuilt.{table} WHERE run_id = ?",
                             (run_id,),
                         )
+                    connection.execute(
+                        "UPDATE main.runs SET agent_id = rebuilt.agent_id, "
+                        "provider = rebuilt.provider, format = rebuilt.format, "
+                        "normalizer_version = rebuilt.normalizer_version, "
+                        "created_at = rebuilt.created_at, state = rebuilt.state, "
+                        "archive_state = rebuilt.archive_state "
+                        "FROM rebuilt.runs AS rebuilt WHERE main.runs.run_id = ? "
+                        "AND rebuilt.run_id = ?",
+                        (run_id, run_id),
+                    )
                     connection.execute(
                         "INSERT INTO parity_records "
                         "(run_id, normalizer_version, record_type, path, detail_json, recorded_at) "
