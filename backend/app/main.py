@@ -4314,7 +4314,7 @@ def _agent_session_impl(
             ),
             include_queue=True,
             ticket=ticket,
-            transcript_path=transcript_file,
+            transcript_path=None,
             raw_path=(
                 Path(current["log"])
                 if isinstance(current.get("log"), str)
@@ -4593,20 +4593,32 @@ def agent_session_older(
                     ) from exc
                 snapshot = None
             legacy_source = _legacy_source_for_sqlite_run(ticket, selected_run_id)
-            if snapshot is not None and legacy_source is not None:
-                legacy_fmt, legacy_path = legacy_source
-                if legacy_fmt.endswith("-normalized"):
-                    legacy_fmt = "provider-events"
-                legacy_page = transcripts.read_older_session(
-                    legacy_fmt,
-                    legacy_path,
-                    before,
-                    count,
-                    annotate_agents=legacy_fmt == "claude",
-                )
+            if snapshot is not None:
+                legacy_fmt = "provider-events"
+                legacy_page = None
+                if legacy_source is not None:
+                    legacy_fmt, legacy_path = legacy_source
+                    if legacy_fmt.endswith("-normalized"):
+                        legacy_fmt = "provider-events"
+                    if _shadow_sample("older"):
+                        try:
+                            legacy_page = transcripts.read_older_session(
+                                legacy_fmt,
+                                legacy_path,
+                                before,
+                                count,
+                                annotate_agents=legacy_fmt == "claude",
+                            )
+                        except Exception:
+                            legacy_page = None
                 sqlite_events = list(snapshot.events)
-                if legacy_fmt == "claude":
-                    sqlite_events = transcripts.annotate_agent_events(legacy_path, sqlite_events)
+                shadow_events = list(sqlite_events)
+                if legacy_page is not None and legacy_fmt == "claude":
+                    shadow_events = transcripts.annotate_agent_events(
+                        legacy_path, shadow_events
+                    )
+                    if not _sqlite_read_is_default("older"):
+                        sqlite_events = shadow_events
                 sqlite_result = {
                     "events": sqlite_events,
                     "base": int(sqlite_events[0]["id"])
@@ -4614,15 +4626,17 @@ def agent_session_older(
                     else min(before, snapshot.state.event_base),
                     "has_older": snapshot.has_older,
                 }
-                _record_read_comparison(
-                    "older",
-                    {
-                        "events": legacy_page["events"],
-                        "base": legacy_page["base"],
-                        "has_older": legacy_page["has_older"],
-                    },
-                    sqlite_result,
-                )
+                if legacy_page is not None:
+                    _record_read_comparison(
+                        "older",
+                        {
+                            "events": legacy_page["events"],
+                            "base": legacy_page["base"],
+                            "has_older": legacy_page["has_older"],
+                        },
+                        {**sqlite_result, "events": shadow_events},
+                        sampled=True,
+                    )
                 return {
                     "version": 2,
                     "format": legacy_fmt,
@@ -4698,8 +4712,10 @@ def _child_materialization_is_current(mapping: Any) -> bool:
 
     source_path = Path(mapping.source_path)
     try:
-        source_lines = sum(1 for _line in source_path.open(encoding="utf-8"))
         state = _sqlite_event_store().cursor(mapping.child_run_id)
+        if not source_path.is_file():
+            return state.rebuild_state == "ready"
+        source_lines = sum(1 for _line in source_path.open(encoding="utf-8"))
     except (OSError, KeyError, ValueError):
         return False
     return state.raw_seq >= source_lines
@@ -4776,12 +4792,6 @@ def subagent_session(
 ) -> dict[str, object]:
     if not valid_agent_id(ticket) or not SUBAGENT_ID_PATTERN.fullmatch(agent_id):
         raise HTTPException(status_code=400, detail="Bad id")
-    main_path = _resolve_main_transcript(ticket)
-    if main_path is None:
-        raise HTTPException(status_code=404, detail="No claude transcript for this agent")
-    path = transcripts.subagents_dir(main_path) / f"agent-{agent_id}.jsonl"
-    if not path.is_file():
-        raise HTTPException(status_code=404, detail="No such subagent")
     resolved = _registry_agent(_read_agent_registry(), ticket)
     current = resolved[2] if resolved is not None else {}
     parent_run_id = current.get("run_id") if isinstance(current, dict) else None
@@ -4791,6 +4801,18 @@ def subagent_session(
             mapping = _sqlite_event_store().child_run_for(parent_run_id, agent_id)
         except Exception:
             mapping = None
+    path: Path | None = Path(mapping.source_path) if mapping is not None else None
+    if path is None:
+        main_path = _resolve_main_transcript(ticket)
+        if main_path is None:
+            raise HTTPException(status_code=404, detail="No claude transcript for this agent")
+        path = transcripts.subagents_dir(main_path) / f"agent-{agent_id}.jsonl"
+    if not path.is_file() and not (
+        _sqlite_read_is_default("delta")
+        and mapping is not None
+        and _child_materialization_is_current(mapping)
+    ):
+        raise HTTPException(status_code=404, detail="No such subagent")
     if (
         _sqlite_read_is_default("delta")
         and mapping is not None
@@ -4809,11 +4831,11 @@ def subagent_session(
             tail_window=False,
             tail_events=limit if isinstance(limit, int) else None,
             source_class="child",
-            transcript_path=path,
+            transcript_path=None,
             required=True,
         )
         if sqlite_payload is not None:
-            if _shadow_sample("delta"):
+            if path.is_file() and _shadow_sample("delta"):
                 legacy_shadow = _session_delta_payload(
                     "claude-sub",
                     path,

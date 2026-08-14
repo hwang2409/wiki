@@ -565,6 +565,10 @@ class DualStackHarness:
         )
         main._session_paths[self.ticket] = ("claude", self.transcript_path)
 
+    def delete_native_transcripts(self) -> None:
+        self.transcript_path.unlink()
+        self.subagent_path.unlink()
+
     def corrupt_sqlite_session_event(self) -> None:
         store = SQLiteEventStore(self.sqlite_path, migrate=False)
         with store.connection() as connection:

@@ -94,6 +94,21 @@ def test_default_sqlite_corruption_is_visible_and_repair_recovers_session() -> N
     assert repaired.json()["events"]
 
 
+def test_default_headless_reads_survive_native_transcript_cleanup() -> None:
+    with DualStackHarness() as harness:
+        harness.delete_native_transcripts()
+        session = harness.session(defaults=True)
+        delta = harness.delta(defaults=True)
+        older = harness.older(defaults=True)
+
+    assert session.status_code == 200
+    assert session.json()["path"].startswith("sqlite://live/")
+    assert delta.status_code == 200
+    assert delta.json()["path"].startswith("sqlite://child/")
+    assert older.status_code == 200
+    assert older.json()["path"].startswith("sqlite://older/")
+
+
 def test_non_headless_session_keeps_native_parser() -> None:
     with DualStackHarness() as harness:
         harness.make_non_headless()
