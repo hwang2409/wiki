@@ -24,13 +24,19 @@ def send(value: dict[str, object]) -> None:
 
 
 if sys.argv[1:4] == ["auth", "status", "--json"]:
+    auth_status_path = Path(os.environ["CLAUDE_CONFIG_DIR"]) / "auth-status.json"
+    auth_status = {
+        "loggedIn": True,
+        "authMethod": "claude.ai",
+        "apiProvider": "firstParty",
+        "accountId": "account-a",
+        "orgId": "organization-a",
+        "subscriptionType": "max",
+    }
+    if auth_status_path.exists():
+        auth_status.update(json.loads(auth_status_path.read_text(encoding="utf-8")))
     send(
-        {
-            "loggedIn": True,
-            "authMethod": "claude.ai",
-            "apiProvider": "firstParty",
-            "subscriptionType": "max",
-        }
+        auth_status
     )
     raise SystemExit(0)
 
@@ -43,6 +49,7 @@ if capture_path:
     )
 
 session_id = "sdk-subprocess-session"
+permission_prompt_enabled = "--permission-prompt-tool" in sys.argv
 for line in sys.stdin:
     message = json.loads(line)
     if message.get("type") == "control_request":
@@ -74,6 +81,43 @@ for line in sys.stdin:
             )
     elif message.get("type") == "user":
         tool_id = "tool-subprocess-1"
+        if permission_prompt_enabled:
+            send(
+                {
+                    "type": "control_request",
+                    "request_id": "permission-subprocess-1",
+                    "request": {
+                        "subtype": "can_use_tool",
+                        "tool_name": "mcp__wiki__read",
+                        "input": {"path": "README.md"},
+                        "tool_use_id": tool_id,
+                        "permission_suggestions": [],
+                    },
+                }
+            )
+            for response_line in sys.stdin:
+                response = json.loads(response_line)
+                if response.get("type") != "control_response":
+                    continue
+                envelope = response.get("response") or {}
+                if envelope.get("request_id") != "permission-subprocess-1":
+                    continue
+                result = envelope.get("response") or {}
+                if result.get("behavior") != "allow":
+                    send(
+                        {
+                            "type": "result",
+                            "subtype": "error_during_execution",
+                            "session_id": session_id,
+                            "is_error": True,
+                            "duration_ms": 1,
+                            "duration_api_ms": 1,
+                            "num_turns": 1,
+                            "result": "permission denied",
+                        }
+                    )
+                    raise SystemExit(1)
+                break
         send(
             {
                 "type": "assistant",

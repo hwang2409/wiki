@@ -8,6 +8,7 @@ import asyncio
 from dataclasses import replace
 from pathlib import Path
 from collections.abc import AsyncIterator, Mapping
+from types import SimpleNamespace
 
 import pytest
 
@@ -25,7 +26,6 @@ from backend.app.agent_runtime.wk_claude import (
     WkGateTool,
     WkReadTool,
     WkWriteTool,
-    _sanitized_transport_class,
     build_claude_sdk_options,
     plan_auth_environment,
     register_default_wk_tools,
@@ -221,7 +221,7 @@ def test_recorded_sdk_frames_cross_lane_transport_boundary(monkeypatch: pytest.M
 def test_real_sdk_subprocess_transport_receives_sanitized_env(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
-    sdk = pytest.importorskip("claude_agent_sdk")
+    pytest.importorskip("claude_agent_sdk")
     stub = Path(__file__).parent / "fixtures" / "agent_runtime" / "claude_sdk_stub_cli.py"
     safe_environment = {
         "HOME": os.environ["HOME"],
@@ -235,16 +235,22 @@ def test_real_sdk_subprocess_transport_receives_sanitized_env(
     ledger = WkToolLedger(translator)
     registry = register_default_wk_tools(WkToolRegistry(), root=tmp_path, loop=loop)
     bridge = WkClaudeToolBridge(registry=registry, ledger=ledger, loop=loop)
+
+    approval_calls: list[tuple[str, Mapping[str, object]]] = []
+
+    async def approve(tool_name: str, arguments: Mapping[str, object]) -> bool:
+        approval_calls.append((tool_name, arguments))
+        return True
+
     options = build_claude_sdk_options(
         prompt="",
         model="sonnet",
         worktree=tmp_path,
         bridge=bridge,
+        approval=approve,
         environment=safe_environment,
     )
     options = replace(options, cli_path=str(stub))
-    monkeypatch.setenv("ANTHROPIC_API_KEY", "must-not-reach-child")
-    monkeypatch.setenv("FOUNDRY_API_KEY", "must-not-reach-child")
     lane = WkClaudeLane(
         metadata=WkRunMetadata("wk-claude"),
         run_id="run-real-subprocess",
@@ -253,12 +259,10 @@ def test_real_sdk_subprocess_transport_receives_sanitized_env(
         model="sonnet",
         loop=loop,
         options_factory=lambda **_kwargs: options,
-        client_factory=lambda value: sdk.ClaudeSDKClient(
-            options=value,
-            transport=_sanitized_transport_class()(prompt=None, options=value),
-        ),
         steering_path=tmp_path / "steering.json",
     )
+    monkeypatch.setenv("ANTHROPIC_API_KEY", "must-not-reach-child")
+    monkeypatch.setenv("FOUNDRY_API_KEY", "must-not-reach-child")
 
     async def run() -> list[Mapping[str, object]]:
         await lane.start("read")
@@ -276,6 +280,7 @@ def test_real_sdk_subprocess_transport_receives_sanitized_env(
     assert "ANTHROPIC_API_KEY" not in captured
     assert "FOUNDRY_API_KEY" not in captured
     assert captured["HOME"] == safe_environment["HOME"]
+    assert approval_calls == [("mcp__wiki__read", {"path": "README.md"})]
     assert any(item["raw"]["type"] == "system" for item in events)
     assert any(item["raw"]["type"] == "user" for item in events)
     assert not any(item["event"]["kind"] == "claude.provider_error" for item in events)
@@ -352,6 +357,47 @@ def test_settings_source_drift_blocks_the_next_turn(
         await lane.start("start")
         settings.write_text('{"hooks":{"PreToolUse":[]}}', encoding="utf-8")
         with pytest.raises(WkClaudeError, match="settings source changed"):
+            await lane.send_now("next")
+        await lane.close()
+        return [item async for item in lane.events()]
+
+    events = asyncio.run(run())
+    assert any(item["event"]["kind"] == "claude.provider_error" for item in events)
+
+
+def test_auth_account_drift_blocks_the_next_turn(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    monkeypatch.setattr(wk_feature, "_WK_ENABLED", True)
+    stub = Path(__file__).parent / "fixtures" / "agent_runtime" / "claude_sdk_stub_cli.py"
+    config_dir = tmp_path / "config"
+    config_dir.mkdir()
+    environment = {
+        "HOME": str(tmp_path),
+        "PATH": os.environ["PATH"],
+        "USER": "worker",
+        "TERM": "xterm",
+        "CLAUDE_CONFIG_DIR": str(config_dir),
+    }
+    options = SimpleNamespace(cli_path=str(stub), env=environment)
+
+    async def run() -> list[dict[str, object]]:
+        lane = WkClaudeLane(
+            metadata=WkRunMetadata("wk-claude"),
+            run_id="run-auth-drift",
+            agent_id="WIKI-289",
+            worktree=tmp_path,
+            model="sonnet",
+            loop=WkLoop(status_path=tmp_path / "status.json"),
+            client_factory=lambda _options: _RecordedClient(_fixture_events()),
+            options_factory=lambda **_kwargs: options,
+            steering_path=tmp_path / "steering.json",
+        )
+        await lane.start("start")
+        (config_dir / "auth-status.json").write_text(
+            json.dumps({"accountId": "account-b"}), encoding="utf-8"
+        )
+        with pytest.raises(WkClaudeError, match="auth identity changed"):
             await lane.send_now("next")
         await lane.close()
         return [item async for item in lane.events()]
@@ -537,6 +583,95 @@ def test_gate_success_cannot_disagree_with_exit_code() -> None:
     ledger.record_started(request)
     ledger.record_result(request, WkToolResult(success=True, exit_code=17))
     with pytest.raises(WkLedgerError, match="disagrees with exit code"):
+        ledger.reconcile()
+
+
+@pytest.mark.parametrize(
+    ("exit_code", "ready", "fails"),
+    ((0, True, False), (0, False, False), (17, True, True), (17, False, False)),
+)
+def test_gate_reconciliation_covers_exit_and_ready_quadrants(
+    exit_code: int, ready: bool, fails: bool
+) -> None:
+    translator = _translator()
+    ledger = WkToolLedger(translator)
+    request = WkToolRequest(
+        call_id=f"gate-{exit_code}-{ready}",
+        name="wk.gate",
+        arguments={"pr": "230"},
+        mutation=WkMutationClass.PROCESS,
+    )
+    ledger.record_started(request)
+    ledger.record_result(
+        request,
+        WkToolResult(
+            success=exit_code == 0,
+            exit_code=exit_code,
+            mutation=WkMutationClass.PROCESS,
+            duration_ms=1,
+            mutation_receipt={
+                "pid": 123,
+                "stdout_sha256": "a" * 64,
+                "stderr_sha256": "b" * 64,
+                "verdict": {"ready": ready},
+            },
+        ),
+    )
+    if fails:
+        with pytest.raises(WkLedgerError, match="ready verdict disagrees"):
+            ledger.reconcile()
+    else:
+        ledger.reconcile()
+
+
+def test_gate_reconciliation_rejects_empty_verdict() -> None:
+    translator = _translator()
+    ledger = WkToolLedger(translator)
+    request = WkToolRequest(
+        call_id="gate-empty",
+        name="wk.gate",
+        arguments={"pr": "230"},
+        mutation=WkMutationClass.PROCESS,
+    )
+    ledger.record_started(request)
+    ledger.record_result(
+        request,
+        WkToolResult(
+            success=True,
+            exit_code=0,
+            mutation=WkMutationClass.PROCESS,
+            mutation_receipt={
+                "pid": 123,
+                "stdout_sha256": "a" * 64,
+                "stderr_sha256": "b" * 64,
+                "verdict": {},
+            },
+        ),
+    )
+    with pytest.raises(WkLedgerError, match="boolean verdict"):
+        ledger.reconcile()
+
+
+def test_gate_reconciliation_rejects_missing_process_receipt() -> None:
+    translator = _translator()
+    ledger = WkToolLedger(translator)
+    request = WkToolRequest(
+        call_id="gate-receipt",
+        name="wk.gate",
+        arguments={"pr": "230"},
+        mutation=WkMutationClass.PROCESS,
+    )
+    ledger.record_started(request)
+    ledger.record_result(
+        request,
+        WkToolResult(
+            success=True,
+            exit_code=0,
+            mutation=WkMutationClass.PROCESS,
+            mutation_receipt={"pid": 123, "verdict": {"ready": True}},
+        ),
+    )
+    with pytest.raises(WkLedgerError, match="process receipt"):
         ledger.reconcile()
 
 

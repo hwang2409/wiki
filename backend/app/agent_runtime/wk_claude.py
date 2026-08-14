@@ -181,16 +181,28 @@ def _verify_cli_plan_auth(
     auth_method = str(status.get("authMethod") or "").casefold()
     api_provider = str(status.get("apiProvider") or "").casefold()
     subscription = status.get("subscriptionType")
+    account_id = status.get("accountId") or status.get("account_id") or status.get("email")
+    organization_id = (
+        status.get("organizationId")
+        or status.get("organization_id")
+        or status.get("orgId")
+    )
     if auth_method not in {"claude.ai", "oauth"}:
         raise WkClaudePlanAuthError("Claude CLI auth method is not subscription auth")
     if api_provider not in {"firstparty", "first_party"}:
         raise WkClaudePlanAuthError("Claude CLI auth provider is not first-party")
     if not isinstance(subscription, str) or not subscription.strip():
         raise WkClaudePlanAuthError("Claude CLI did not report a subscription identity")
+    if not isinstance(account_id, str) or not account_id.strip():
+        raise WkClaudePlanAuthError("Claude CLI did not report an account identity")
+    if not isinstance(organization_id, str) or not organization_id.strip():
+        raise WkClaudePlanAuthError("Claude CLI did not report an organization identity")
     return {
         "auth_method": auth_method,
         "api_provider": api_provider,
         "subscription_type": subscription,
+        "account_id": account_id,
+        "organization_id": organization_id,
     }
 
 
@@ -668,13 +680,20 @@ class WkToolLedger:
                 raise WkLedgerError(f"tool input hash changed: {call_id}")
             if not isinstance(exit_code, int):
                 raise WkLedgerError(f"gate result has no real exit code: {call_id}")
-            if exit_code != 0:
-                raise WkLedgerError(f"gate did not succeed: {call_id}")
             receipt = result_value.get("mutation_receipt")
-            if not isinstance(receipt, Mapping) or not isinstance(
-                receipt.get("verdict"), Mapping
-            ):
+            if not isinstance(receipt, Mapping):
                 raise WkLedgerError(f"gate result has no parsed verdict: {call_id}")
+            if not isinstance(receipt.get("pid"), int) or receipt["pid"] <= 0:
+                raise WkLedgerError(f"gate result has no process receipt: {call_id}")
+            for field in ("stdout_sha256", "stderr_sha256"):
+                value = receipt.get(field)
+                if not isinstance(value, str) or len(value) != 64:
+                    raise WkLedgerError(f"gate result has no process receipt: {call_id}")
+            verdict = receipt.get("verdict")
+            if not isinstance(verdict, Mapping) or type(verdict.get("ready")) is not bool:
+                raise WkLedgerError(f"gate result has no boolean verdict: {call_id}")
+            if verdict["ready"] and exit_code != 0:
+                raise WkLedgerError(f"gate ready verdict disagrees with exit code: {call_id}")
 
 
 def _event_call_id(event: WkEventEnvelope) -> str | None:
@@ -1350,9 +1369,14 @@ class WkClaudeLane:
             return self._client_factory(options)
         _options, client_type, _allow, _deny, _server = _sdk_imports()
         transport_type = _sanitized_transport_class()
+        # claude_agent_sdk/client.py v0.2.128 replaces options with
+        # permission_prompt_tool_name="stdio" before it creates its transport.
+        transport_options = options
+        if getattr(options, "can_use_tool", None):
+            transport_options = replace(options, permission_prompt_tool_name="stdio")
         return client_type(
             options=options,
-            transport=transport_type(prompt=None, options=options),
+            transport=transport_type(prompt=None, options=transport_options),
         )
 
     def _verify_turn_boundary(self) -> None:
