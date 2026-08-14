@@ -123,6 +123,27 @@ class EventPatch:
 
 
 @dataclass(frozen=True)
+class SessionReadSnapshot:
+    """All SQLite rows needed to build one session response."""
+
+    state: RunCursor
+    source_key: str
+    projection: tuple[Any, ...]
+    events: tuple[dict[str, Any], ...]
+    patches: tuple[EventPatch, ...]
+
+
+@dataclass(frozen=True)
+class OlderReadSnapshot:
+    """One older-event page and its source identity."""
+
+    state: RunCursor
+    source_key: str
+    events: tuple[dict[str, Any], ...]
+    has_older: bool
+
+
+@dataclass(frozen=True)
 class ReducerResult:
     raw_seq: int
     normalized: dict[str, Any]
@@ -1172,6 +1193,129 @@ class SQLiteEventStore:
         lifecycle = json.loads(row[9]) if row[9] else None
         return RunCursor(
             *row[:9], lifecycle, row[10], row[11], self.rebuild_generation(run_id)
+        )
+
+    @staticmethod
+    def _source_key(run_id: str, source_class: str, generation: int) -> str:
+        return f"sqlite://{source_class}/{run_id}/rebuild-{generation}"
+
+    def _cursor_from_connection(
+        self,
+        connection: sqlite3.Connection,
+        run_id: str,
+    ) -> RunCursor:
+        row = connection.execute(
+            "SELECT run_id, raw_seq, materialized_raw_seq, next_event_id, "
+            "event_base, event_count, change_cursor, patch_base_cursor, "
+            "last_causal_raw_seq, last_lifecycle_change, normalizer_version, "
+            "rebuild_state FROM run_cursors WHERE run_id = ?",
+            (run_id,),
+        ).fetchone()
+        if row is None:
+            raise KeyError(run_id)
+        lifecycle = json.loads(row[9]) if row[9] else None
+        generation = connection.execute(
+            "SELECT COUNT(*) FROM parity_records WHERE run_id = ? "
+            "AND record_type = 'rebuild_generation'",
+            (run_id,),
+        ).fetchone()[0]
+        return RunCursor(
+            *row[:9], lifecycle, row[10], row[11], int(generation)
+        )
+
+    def read_session_snapshot(
+        self,
+        run_id: str,
+        *,
+        source_class: str,
+        after_cursor: int,
+    ) -> SessionReadSnapshot:
+        """Read cursor, projection, events, and patches in one transaction."""
+
+        with self.connection(read_only=True) as connection:
+            connection.execute("BEGIN")
+            state = self._cursor_from_connection(connection, run_id)
+            source_key = self._source_key(
+                run_id, source_class, state.rebuild_generation
+            )
+            projection = connection.execute(
+                "SELECT current_turn_json, tasks_json, pr_json, session_meta_json, "
+                "pending_requests_json, composer_messages_json, "
+                "disposition_counts_json, tokens_json, unread_event_seq, "
+                "projection_revision FROM run_projections WHERE run_id = ?",
+                (run_id,),
+            ).fetchone()
+            if projection is None:
+                raise KeyError(run_id)
+            event_rows = connection.execute(
+                "SELECT event_json FROM events WHERE run_id = ? "
+                "ORDER BY event_id",
+                (run_id,),
+            ).fetchall()
+            patch_rows = connection.execute(
+                "SELECT change_cursor, event_id, raw_seq, patch_json, "
+                "event_revision, created_at FROM patches "
+                "WHERE run_id = ? AND change_cursor > ? ORDER BY change_cursor",
+                (run_id, after_cursor),
+            ).fetchall()
+        patches = tuple(
+            EventPatch(
+                event_id=int(row[1]),
+                raw_seq=int(row[2]),
+                patch=json.loads(row[3]),
+                event_revision=int(row[4]),
+                change_cursor=int(row[0]),
+                created_at=str(row[5]),
+            )
+            for row in patch_rows
+        )
+        return SessionReadSnapshot(
+            state=state,
+            source_key=source_key,
+            projection=tuple(projection),
+            events=tuple(json.loads(row[0]) for row in event_rows),
+            patches=patches,
+        )
+
+    def read_older_snapshot(
+        self,
+        run_id: str,
+        *,
+        source_class: str,
+        before_event_id: int,
+        limit: int,
+    ) -> OlderReadSnapshot:
+        """Read an older page and source generation in one transaction."""
+
+        with self.connection(read_only=True) as connection:
+            connection.execute("BEGIN")
+            state = self._cursor_from_connection(connection, run_id)
+            source_key = self._source_key(
+                run_id, source_class, state.rebuild_generation
+            )
+            rows = connection.execute(
+                "SELECT event_id, event_json FROM events "
+                "WHERE run_id = ? AND event_id < ? "
+                "ORDER BY event_id DESC LIMIT ?",
+                (run_id, before_event_id, limit),
+            ).fetchall()
+            if rows:
+                oldest_event_id = int(rows[-1][0])
+                has_older = (
+                    connection.execute(
+                        "SELECT 1 FROM events WHERE run_id = ? AND event_id < ?",
+                        (run_id, oldest_event_id),
+                    ).fetchone()
+                    is not None
+                )
+            else:
+                has_older = False
+        rows.reverse()
+        return OlderReadSnapshot(
+            state=state,
+            source_key=source_key,
+            events=tuple(json.loads(row[1]) for row in rows),
+            has_older=has_older,
         )
 
     def rebuild_generation(self, run_id: str) -> int:

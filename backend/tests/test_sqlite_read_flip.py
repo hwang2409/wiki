@@ -33,12 +33,35 @@ class _IndexedStore:
             '{"rendered": 1, "summarized": 0, "ignored": 0, "unknown": 0}',
             None,
         )
+        self.patches = tuple()
+        self.generation = 0
 
     def cursor(self, _run_id: str):
         return self.state
 
     def view_rows(self, _run_id: str):
         return {"projections": [self.projection]}
+
+    def read_session_snapshot(self, _run_id: str, *, source_class: str, after_cursor: int):
+        del after_cursor
+        return SimpleNamespace(
+            state=self.state,
+            source_key=f"sqlite://{source_class}/run-1/rebuild-{self.generation}",
+            projection=self.projection,
+            events=(self.event,),
+            patches=self.patches,
+        )
+
+    def read_older_snapshot(
+        self, _run_id: str, *, source_class: str, before_event_id: int, limit: int
+    ):
+        del before_event_id, limit
+        return SimpleNamespace(
+            state=self.state,
+            source_key=f"sqlite://{source_class}/run-1/rebuild-{self.generation}",
+            events=(self.event,),
+            has_older=False,
+        )
 
     def read_events(self, _run_id: str):
         return [self.event]
@@ -83,11 +106,53 @@ def _sqlite_payload(*, cursor: int, client_path: str | None):
 
 def test_each_read_flag_is_independent(monkeypatch) -> None:
     for route, variable in main._SQLITE_READ_FLAG_ENV.items():
-        monkeypatch.delenv(variable, raising=False)
-        assert not main._sqlite_read_enabled(route)
+        for other_variable in main._SQLITE_READ_FLAG_ENV.values():
+            monkeypatch.delenv(other_variable, raising=False)
         monkeypatch.setenv(variable, "1")
         assert main._sqlite_read_enabled(route)
+        assert all(
+            main._sqlite_read_enabled(other_route) is (other_route == route)
+            for other_route in main._SQLITE_READ_FLAG_ENV
+        )
         monkeypatch.delenv(variable, raising=False)
+
+
+def test_route_registry_assigns_one_adapter_per_flag() -> None:
+    routes = main._SQLITE_READ_ROUTES
+    assert len(routes) == len(main._SQLITE_READ_FLAG_ENV)
+    assert len({flag for flag, _adapter in routes.values()}) == len(routes)
+    assert len({adapter for _flag, adapter in routes.values()}) == len(routes)
+
+
+def test_sqlite_source_key_round_trips_as_typed_data() -> None:
+    key = main.SQLiteSourceKey("archive", "run-1", 12)
+
+    assert main.SQLiteSourceKey.parse(key.format()) == key
+
+
+def test_session_delta_does_not_flip_when_only_delta_flag_is_enabled(monkeypatch) -> None:
+    legacy = {
+        "events": [],
+        "base": 0,
+        "cursor": 1,
+        "tail_from": 0,
+        "patches": [],
+    }
+    with (
+        mock.patch.object(main.transcripts, "read_session_delta", return_value=legacy),
+        mock.patch.object(main, "_sqlite_session_payload") as sqlite,
+    ):
+        monkeypatch.setenv("WIKI_SQLITE_READ_DELTA", "1")
+        payload = main._session_delta_payload(
+            "codex",
+            Path("/legacy.jsonl"),
+            cursor=0,
+            run_id="run-1",
+            read_route="session",
+        )
+
+    assert payload["path"] == "/legacy.jsonl"
+    sqlite.assert_not_called()
 
 
 def test_sqlite_source_change_forces_a_v2_cursor_reset() -> None:
@@ -102,12 +167,43 @@ def test_sqlite_source_change_forces_a_v2_cursor_reset() -> None:
     assert "has_older" not in steady
 
 
+def test_rebuild_generation_change_forces_a_reset() -> None:
+    indexed = _IndexedStore()
+    with mock.patch.object(main, "_sqlite_event_store", return_value=indexed):
+        first = main._sqlite_session_payload(
+            "run-1",
+            fmt="codex",
+            cursor=7,
+            client_path="sqlite://live/run-1/rebuild-0",
+            model=None,
+            desired_model=None,
+            kind="cdx",
+            provider="codex",
+            working=True,
+        )
+        indexed.generation = 1
+        rebuilt = main._sqlite_session_payload(
+            "run-1",
+            fmt="codex",
+            cursor=7,
+            client_path="sqlite://live/run-1/rebuild-0",
+            model=None,
+            desired_model=None,
+            kind="cdx",
+            provider="codex",
+            working=True,
+        )
+
+    assert first is not None and first["events"] == []
+    assert rebuilt is not None
+    assert rebuilt["path"] == "sqlite://live/run-1/rebuild-1"
+    assert rebuilt["events"] == [indexed.event]
+
+
 def test_sqlite_cursor_advance_returns_a_true_tail_delta() -> None:
     indexed = _IndexedStore()
     indexed.state.change_cursor = 8
-    indexed.read_patches = mock.Mock(
-        return_value=[SimpleNamespace(event_id=0, patch={"event": indexed.event})]
-    )
+    indexed.patches = (SimpleNamespace(event_id=0, patch={"event": indexed.event}),)
     with mock.patch.object(main, "_sqlite_event_store", return_value=indexed):
         payload = main._sqlite_session_payload(
             "run-1",
@@ -127,16 +223,25 @@ def test_sqlite_cursor_advance_returns_a_true_tail_delta() -> None:
 
 
 def test_enrichment_pipeline_is_shared_for_sqlite_and_legacy_deltas() -> None:
-    raw = {
+    legacy_raw = {
         "events": [{"id": 0, "kind": "tool", "tool": {"name": "Agent"}}],
         "base": 0,
         "cursor": 1,
         "tail_from": 0,
         "patches": [],
     }
+    sqlite_raw = {**legacy_raw, "events": [dict(legacy_raw["events"][0])]}
     enriched_events = [{"id": 0, "kind": "tool", "tool": {"name": "Agent", "agent_id": "child"}}]
+    provider_inspector = {
+        "events": [{"seq": 2, "kind": "tool"}],
+        "composer_messages": [{"text": "compose"}],
+    }
     with (
-        mock.patch.object(main.transcripts, "annotate_agent_events", return_value=enriched_events),
+        mock.patch.object(
+            main.transcripts,
+            "annotate_agent_events",
+            side_effect=[enriched_events, list(enriched_events)],
+        ),
         mock.patch.object(
             main,
             "_overlay_pending_questions",
@@ -145,15 +250,55 @@ def test_enrichment_pipeline_is_shared_for_sqlite_and_legacy_deltas() -> None:
                 "events": [*delta["events"], {"id": 1, "kind": "question", "text": "pending"}],
             },
         ),
+        mock.patch.object(
+            main,
+            "_provider_events",
+            side_effect=[provider_inspector, dict(provider_inspector)],
+        ),
+        mock.patch.object(
+            main,
+            "_queue_messages",
+            side_effect=[[{"text": "queued"}], [{"text": "queued"}]],
+        ),
     ):
-        legacy = main._enrich_session_delta(
-            raw, fmt="claude", transcript_path=Path("/main.jsonl"), raw_path=Path("/raw.jsonl"), client_cursor=0
+        legacy = main._compose_session_payload(
+            legacy_raw,
+            fmt="claude",
+            source_path=Path("/main.jsonl"),
+            raw_path=Path("/raw.jsonl"),
+            client_cursor=0,
+            source_key="/legacy.jsonl",
+            model=None,
+            desired_model=None,
+            kind="cc",
+            provider="claude",
+            working=True,
+            include_subagents=False,
+            include_queue=True,
+            ticket="WIKI-282",
         )
-        sqlite = main._enrich_session_delta(
-            raw, fmt="claude", transcript_path=Path("/main.jsonl"), raw_path=Path("/raw.jsonl"), client_cursor=0
+        sqlite = main._compose_session_payload(
+            sqlite_raw,
+            fmt="claude",
+            source_path=Path("/main.jsonl"),
+            raw_path=Path("/raw.jsonl"),
+            client_cursor=0,
+            source_key="sqlite://live/run-1/rebuild-0",
+            model=None,
+            desired_model=None,
+            kind="cc",
+            provider="claude",
+            working=True,
+            include_subagents=False,
+            include_queue=True,
+            ticket="WIKI-282",
         )
 
-    assert json.dumps(legacy, separators=(",", ":")) == json.dumps(sqlite, separators=(",", ":"))
+    legacy_without_source = {key: value for key, value in legacy.items() if key != "path"}
+    sqlite_without_source = {key: value for key, value in sqlite.items() if key != "path"}
+    assert legacy_without_source == sqlite_without_source
+    assert legacy["provider_inspector"] == provider_inspector
+    assert legacy["composer_messages"] == provider_inspector["composer_messages"]
 
 
 def test_sqlite_adapter_cannot_bypass_shared_enrichment() -> None:
@@ -182,9 +327,24 @@ def test_sqlite_adapter_cannot_bypass_shared_enrichment() -> None:
 
 
 def test_sse_flip_has_its_own_flag() -> None:
-    source = inspect.getsource(main.supervisor_event_bridge)
-    assert '_sqlite_read_enabled("sse")' in source
-    assert "_publish_sqlite_session_event" in source
+    assert main._SQLITE_READ_ROUTES["sse"] == (
+        "WIKI_SQLITE_READ_SSE",
+        "sse_adapter",
+    )
+
+
+def test_sse_sqlite_adapter_emits_a_distinct_source(monkeypatch) -> None:
+    published: list[dict] = []
+
+    async def capture(event: dict) -> None:
+        published.append(event)
+
+    monkeypatch.setattr(main, "publish_agent_event", capture)
+    import asyncio
+
+    asyncio.run(main._publish_sqlite_session_event({"type": "session"}))
+
+    assert published == [{"type": "session", "source": "sqlite"}]
 
 
 def test_sqlite_adapter_refuses_a_nonready_materializer() -> None:
@@ -227,9 +387,21 @@ def test_delta_flag_flips_only_the_delta_adapter(monkeypatch) -> None:
         mock.patch.object(main, "_record_read_mismatch") as mismatch,
     ):
         monkeypatch.delenv("WIKI_SQLITE_READ_DELTA", raising=False)
-        off = main._session_delta_payload("codex", Path("/legacy.jsonl"), cursor=0, run_id="run-1")
+        off = main._session_delta_payload(
+            "codex",
+            Path("/legacy.jsonl"),
+            cursor=0,
+            run_id="run-1",
+            read_route="delta",
+        )
         monkeypatch.setenv("WIKI_SQLITE_READ_DELTA", "1")
-        on = main._session_delta_payload("codex", Path("/legacy.jsonl"), cursor=0, run_id="run-1")
+        on = main._session_delta_payload(
+            "codex",
+            Path("/legacy.jsonl"),
+            cursor=0,
+            run_id="run-1",
+            read_route="delta",
+        )
 
     assert off["path"] == "/legacy.jsonl"
     assert on["path"] == "sqlite://run-1"
@@ -297,16 +469,51 @@ def test_older_flag_uses_indexed_page_after_a_sqlite_session(monkeypatch) -> Non
         mock.patch.object(
             main,
             "agent_session",
-            return_value={"format": "codex", "path": "sqlite://run-1"},
+            return_value={
+                "format": "codex",
+                "path": "sqlite://live/run-1/rebuild-0",
+            },
         ),
         mock.patch.object(main, "_sqlite_event_store", return_value=indexed),
     ):
         monkeypatch.setenv("WIKI_SQLITE_READ_OLDER", "1")
         payload = main.agent_session_older("WIKI-282", before=1, count=5)
 
-    assert payload["path"] == "sqlite://run-1"
+    assert payload["path"] == "sqlite://live/run-1/rebuild-0"
     assert payload["events"] == [indexed.event]
-    indexed.read_events_before.assert_called_once_with("run-1", before_event_id=1, limit=5)
+
+
+def test_older_telemetry_uses_an_independent_legacy_page(monkeypatch) -> None:
+    indexed = _IndexedStore()
+    legacy_page = {
+        "events": [{"id": 0, "kind": "message", "text": "legacy"}],
+        "base": 0,
+        "has_older": False,
+    }
+    with (
+        mock.patch.object(
+            main,
+            "agent_session",
+            return_value={
+                "format": "codex",
+                "path": "sqlite://live/run-1/rebuild-0",
+            },
+        ),
+        mock.patch.object(main, "_sqlite_event_store", return_value=indexed),
+        mock.patch.object(
+            main,
+            "_legacy_source_for_sqlite_run",
+            return_value=("codex", Path("/legacy.jsonl")),
+        ),
+        mock.patch.object(main.transcripts, "read_older_session", return_value=legacy_page),
+        mock.patch.object(main, "_record_read_mismatch") as mismatch,
+    ):
+        monkeypatch.setenv("WIKI_SQLITE_READ_OLDER", "1")
+        main.agent_session_older("WIKI-282", before=1, count=5)
+
+    legacy, sqlite = mismatch.call_args.args[-2:]
+    assert legacy != sqlite
+    assert legacy["events"] != sqlite["events"]
 
 
 def test_palette_reads_the_sqlite_artifact_index_without_jsonl_walk() -> None:
@@ -318,6 +525,17 @@ def test_palette_reads_the_sqlite_artifact_index_without_jsonl_walk() -> None:
     assert [(item.artifact_id, item.ticket) for item in items] == [
         ("artifact-1", "WIKI-282")
     ]
+
+
+def test_archived_palette_artifact_link_keeps_run_identity() -> None:
+    items = palette.collect_artifact_items_from_index(
+        _IndexedStore(),
+        archive_by_run={"run-1": ("WIKI-282", "2026-08-13T12:00:00+00:00")},
+    )
+
+    assert items is not None
+    assert "run_id=run-1" in items[0].url
+    assert "archived_at=2026-08-13T12%3A00%3A00%2B00%3A00" in items[0].url
 
 
 def test_palette_keeps_the_legacy_scan_fallback_when_index_is_unavailable() -> None:
