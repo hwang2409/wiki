@@ -13,7 +13,7 @@ import tempfile
 import time
 import warnings
 from collections import OrderedDict, deque
-from collections.abc import Callable, Mapping
+from collections.abc import Callable, Iterator, Mapping
 from copy import deepcopy
 from datetime import datetime, timezone
 from enum import Enum
@@ -22,6 +22,7 @@ from typing import Any
 from uuid import NAMESPACE_URL, UUID, uuid4, uuid5
 
 from .. import accounts, provider_health
+from .. import transcripts
 from .command_log import AgentCommand, CommandConflict, CommandQueue, CommandRetryable
 from .event_store import EventReducerAdapter, SQLiteEventStore, runtime_event_db_path
 from .normalizer import NormalizedProviderEvent, normalize_provider_event
@@ -538,6 +539,64 @@ class Supervisor:
             "failures": self.materializer_failures,
         }
 
+    def sync_subagent_runs(self, parent_run_id: str) -> list[str]:
+        """Persist and materialize Claude child transcripts discovered by ingest."""
+
+        record = self.store.get(parent_run_id)
+        if record.provider is not ProviderKind.CLAUDE or not record.transcript_path:
+            return []
+        parent_path = Path(record.transcript_path)
+        child_dir = transcripts.subagents_dir(parent_path)
+        if not child_dir.is_dir():
+            return []
+        synced: list[str] = []
+        for source_path in sorted(child_dir.glob("agent-*.jsonl")):
+            child_id = source_path.stem.removeprefix("agent-")
+            if not child_id:
+                continue
+            mapping = self.event_store.child_run_for(parent_run_id, child_id)
+            if mapping is None:
+                mapping = self.event_store.ensure_child_run(
+                    parent_run_id=parent_run_id,
+                    child_id=child_id,
+                    child_run_id=str(uuid4()),
+                    source_path=str(source_path),
+                    created_at=record.created_at,
+                )
+
+            def raw_rows() -> Iterator[dict[str, Any]]:
+                try:
+                    with source_path.open(encoding="utf-8") as handle:
+                        for seq, line in enumerate(handle, start=1):
+                            if not line.strip():
+                                continue
+                            try:
+                                payload = json.loads(line)
+                            except ValueError:
+                                continue
+                            if not isinstance(payload, dict):
+                                continue
+                            yield {
+                                "seq": seq,
+                                "received_at": str(
+                                    payload.get("timestamp") or record.created_at
+                                ),
+                                "provider": ProviderKind.CLAUDE.value,
+                                "direction": "stdout",
+                                "generation": 1,
+                                "payload": payload,
+                            }
+                except OSError:
+                    return
+
+            self.event_store.materialize_raw_rows(
+                mapping.child_run_id,
+                raw_rows(),
+                provider=ProviderKind.CLAUDE,
+            )
+            synced.append(child_id)
+        return synced
+
     def _materializer_for_record(self, record: RunRecord) -> EventReducerAdapter:
         reducer = self.materializer_reducers.get(record.run_id)
         if reducer is not None:
@@ -574,6 +633,7 @@ class Supervisor:
                 kind=normalized.kind,
                 payload=payload,
                 lifecycle_state=normalized.lifecycle_state,
+                normalized_at=str(raw.get("received_at") or ""),
             )
             normalized_seq = int(legacy["seq"])
         reducer = self._materializer_for_record(record)
@@ -1262,6 +1322,10 @@ Preserve the same identity, role, worktree, orchestrator grouping, PR gates, and
             normalized,
             normalized_payload,
         )
+        try:
+            self.sync_subagent_runs(run_id)
+        except Exception:
+            logger.exception("could not sync Claude child runs for %s", run_id)
         if pending_message is not None:
             # The normalized row is the durable delivery proof. Do not make
             # the steer terminal before this append commits: a failed append

@@ -28,7 +28,7 @@ from .types import (
     validate_transition,
 )
 
-SCHEMA_VERSION = 6
+SCHEMA_VERSION = 7
 NORMALIZER_VERSION = "wiki-282-1"
 
 
@@ -131,6 +131,27 @@ class SessionReadSnapshot:
     projection: tuple[Any, ...]
     events: tuple[dict[str, Any], ...]
     patches: tuple[EventPatch, ...]
+
+
+@dataclass(frozen=True)
+class ChildRunMapping:
+    """Durable parent-to-child identity used by child session reads."""
+
+    parent_run_id: str
+    child_id: str
+    child_run_id: str
+    source_path: str
+    created_at: str
+
+
+@dataclass(frozen=True)
+class OlderReadSnapshot:
+    """One transaction's older-page rows and source identity."""
+
+    state: RunCursor
+    source_key: str
+    events: tuple[dict[str, Any], ...]
+    has_older: bool
 
 
 @dataclass(frozen=True)
@@ -516,6 +537,18 @@ _MIGRATIONS: dict[int, str] = {
     CREATE INDEX IF NOT EXISTS events_artifact_index
         ON events(kind, updated_at DESC);
     """,
+    7: """
+    CREATE TABLE IF NOT EXISTS child_runs (
+        parent_run_id TEXT NOT NULL REFERENCES runs(run_id) ON DELETE CASCADE,
+        child_id TEXT NOT NULL,
+        child_run_id TEXT NOT NULL UNIQUE REFERENCES runs(run_id) ON DELETE CASCADE,
+        source_path TEXT NOT NULL,
+        created_at TEXT NOT NULL,
+        PRIMARY KEY (parent_run_id, child_id)
+    );
+    CREATE INDEX IF NOT EXISTS child_runs_parent
+        ON child_runs(parent_run_id, child_id);
+    """,
 }
 
 
@@ -705,6 +738,97 @@ class SQLiteEventStore:
                 "VALUES (?, '{}', '[]', '{}', '{}', '[]', '{}', 0, 0)",
                 (run_id,),
             )
+
+    def ensure_child_run(
+        self,
+        *,
+        parent_run_id: str,
+        child_id: str,
+        child_run_id: str,
+        source_path: str,
+        created_at: str,
+        provider: ProviderKind | str = ProviderKind.CLAUDE,
+    ) -> ChildRunMapping:
+        """Create one child materialized run and its durable parent mapping."""
+
+        self.ensure_schema()
+        provider_kind = _provider_kind(provider)
+        with self.connection() as connection:
+            connection.execute("BEGIN")
+            connection.execute(
+                "INSERT OR IGNORE INTO runs "
+                "(run_id, agent_id, provider, format, normalizer_version, "
+                "created_at, state, archive_state) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+                (
+                    child_run_id,
+                    f"{parent_run_id}/{child_id}",
+                    provider_kind.value,
+                    provider_kind.value,
+                    NORMALIZER_VERSION,
+                    created_at,
+                    LifecycleState.STARTING.value,
+                    "live",
+                ),
+            )
+            connection.execute(
+                "INSERT OR IGNORE INTO run_cursors(run_id, normalizer_version, rebuild_state) "
+                "VALUES (?, ?, 'ready')",
+                (child_run_id, NORMALIZER_VERSION),
+            )
+            connection.execute(
+                "INSERT OR IGNORE INTO run_projections "
+                "(run_id, current_turn_json, tasks_json, session_meta_json, "
+                "pending_requests_json, composer_messages_json, "
+                "disposition_counts_json, unread_event_seq, projection_revision) "
+                "VALUES (?, '{}', '[]', '{}', '{}', '[]', '{}', 0, 0)",
+                (child_run_id,),
+            )
+            connection.execute(
+                "INSERT INTO child_runs "
+                "(parent_run_id, child_id, child_run_id, source_path, created_at) "
+                "VALUES (?, ?, ?, ?, ?) "
+                "ON CONFLICT(parent_run_id, child_id) DO UPDATE SET "
+                "source_path = excluded.source_path",
+                (parent_run_id, child_id, child_run_id, source_path, created_at),
+            )
+            row = connection.execute(
+                "SELECT parent_run_id, child_id, child_run_id, source_path, created_at "
+                "FROM child_runs WHERE parent_run_id = ? AND child_id = ?",
+                (parent_run_id, child_id),
+            ).fetchone()
+        if row is None:
+            raise KeyError((parent_run_id, child_id))
+        return ChildRunMapping(*map(str, row))
+
+    def child_run_for(self, parent_run_id: str, child_id: str) -> ChildRunMapping | None:
+        """Return the durable child mapping without changing SQLite state."""
+
+        with self.connection(read_only=True) as connection:
+            row = connection.execute(
+                "SELECT parent_run_id, child_id, child_run_id, source_path, created_at "
+                "FROM child_runs WHERE parent_run_id = ? AND child_id = ?",
+                (parent_run_id, child_id),
+            ).fetchone()
+        return ChildRunMapping(*map(str, row)) if row is not None else None
+
+    def materialize_raw_rows(
+        self,
+        run_id: str,
+        rows: Iterator[dict[str, Any]],
+        *,
+        provider: ProviderKind | str,
+    ) -> None:
+        """Materialize new raw rows for a producer-owned child run."""
+
+        reducer = EventReducerAdapter(provider)
+        self.restore_reducer(run_id, reducer)
+        materialized = self.materialized_raw_seqs(run_id)
+        for raw in rows:
+            raw_seq = int(raw["seq"])
+            if raw_seq in materialized:
+                continue
+            self.materialize(run_id, raw, reducer)
+            materialized.add(raw_seq)
 
     def has_disposition(self, run_id: str, raw_seq: int) -> bool:
         with self.connection(read_only=True) as connection:
@@ -998,7 +1122,11 @@ class SQLiteEventStore:
     ) -> None:
         for event in result.events:
             event_id = int(event["id"])
-            event_json = _json_bytes(event)
+            event_for_storage = dict(event)
+            if not event_for_storage.get("ts"):
+                event_for_storage["ts"] = None
+            event_json = _json_bytes(event_for_storage)
+            event_created_at = event_for_storage.get("ts") or timestamp or "replay"
             existing = connection.execute(
                 "SELECT event_json, revision, created_at FROM events "
                 "WHERE run_id = ? AND event_id = ?",
@@ -1015,7 +1143,7 @@ class SQLiteEventStore:
                         raw_seq,
                         str(event.get("kind") or "unknown"),
                         event_json,
-                        str(event.get("ts") or timestamp),
+                        event_created_at,
                         timestamp,
                     ),
                 )
@@ -1277,6 +1405,45 @@ class SQLiteEventStore:
                 (run_id,),
             ).fetchone()
         return int(row[0]) if row is not None else 0
+
+    def read_older_snapshot(
+        self,
+        run_id: str,
+        *,
+        source_class: str,
+        before: int | None = None,
+        count: int | None = None,
+        before_event_id: int | None = None,
+        limit: int | None = None,
+    ) -> OlderReadSnapshot:
+        """Read one bounded older page and its source key in one transaction."""
+
+        if before is None:
+            before = before_event_id
+        if count is None:
+            count = limit
+        if before is None or count is None:
+            raise TypeError("before and count are required")
+        page_size = max(1, count)
+        with self.connection(read_only=True) as connection:
+            connection.execute("BEGIN")
+            state = self._cursor_from_connection(connection, run_id)
+            source_key = self._source_key(
+                run_id, source_class, state.rebuild_generation
+            )
+            rows = connection.execute(
+                "SELECT event_json FROM events WHERE run_id = ? AND event_id < ? "
+                "ORDER BY event_id DESC LIMIT ?",
+                (run_id, max(0, before), page_size + 1),
+            ).fetchall()
+        has_older = len(rows) > page_size
+        events = tuple(json.loads(row[0]) for row in reversed(rows[:page_size]))
+        return OlderReadSnapshot(
+            state=state,
+            source_key=source_key,
+            events=events,
+            has_older=has_older,
+        )
 
     def view_rows(self, run_id: str) -> dict[str, list[tuple[Any, ...]]]:
         """Return deterministic raw SQLite rows for replay parity tests."""

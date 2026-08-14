@@ -7,6 +7,7 @@ import json
 import os
 import tempfile
 import threading
+import time
 from pathlib import Path
 from typing import Any
 from uuid import uuid4
@@ -18,6 +19,7 @@ from backend.app.agent_runtime.client import SupervisorClient
 from backend.app.agent_runtime.event_store import EventReducerAdapter, SQLiteEventStore, replay_raw_jsonl
 from backend.app.agent_runtime.fake import FixtureAdapterFactory
 from backend.app.agent_runtime.normalizer import normalize_provider_event
+from backend.app.agent_runtime.provider import ProviderEvent
 from backend.app.agent_runtime.protocol import UnixSupervisorServer
 from backend.app.agent_runtime.store import RunStore, RuntimePaths
 from backend.app.agent_runtime.supervisor import Supervisor
@@ -93,12 +95,14 @@ class DualStackHarness:
         *,
         include_pending_overlay: bool = True,
         include_index_artifact: bool = False,
+        include_legacy_artifacts: bool = True,
     ) -> None:
         self.temp = tempfile.TemporaryDirectory(prefix="wiki-282-dual-stack-")
         self.root = Path(self.temp.name)
         self.run_id = str(uuid4())
         self.include_pending_overlay = include_pending_overlay
         self.include_index_artifact = include_index_artifact
+        self.include_legacy_artifacts = include_legacy_artifacts
         self.paths = RuntimePaths(
             runtime_dir=self.root / "runtime",
             socket_path=self.root / "runtime" / "supervisor.sock",
@@ -141,6 +145,7 @@ class DualStackHarness:
         self._set_flag_env(())
         self.client = TestClient(main.app, base_url="http://127.0.0.1")
         self.client.__enter__()
+        self._trigger_parent_ingest()
         return self
 
     def __exit__(self, exc_type: object, exc: object, traceback: object) -> None:
@@ -215,7 +220,7 @@ class DualStackHarness:
         rows = [
             {
                 "seq": index,
-                "received_at": str(row.get("timestamp") or "2026-07-10T16:00:00Z"),
+                "received_at": str(row.get("timestamp") or ""),
                 "provider": "claude",
                 "direction": "stdout",
                 "generation": 1,
@@ -308,10 +313,7 @@ class DualStackHarness:
         self._saved_session_paths = dict(main._session_paths)
         self._saved_flags = {
             flag: os.environ.get(flag)
-            for flag in (
-                *(flag for flag, _adapter in main._SQLITE_READ_ROUTES.values()),
-                "WIKI_SQLITE_READ_OLDER",
-            )
+            for flag, _adapter in main._SQLITE_READ_ROUTES.values()
         }
         self._saved_env = {
             name: os.environ.get(name)
@@ -323,6 +325,7 @@ class DualStackHarness:
                 "WIKI_AGENT_RUNS_DIR",
                 "WIKI_AGENT_TMP_DIR",
                 "WIKI_MSG_QUEUE_PATH",
+                "WIKI_SQLITE_SHADOW_SAMPLE_RATE",
             )
         }
 
@@ -335,6 +338,7 @@ class DualStackHarness:
             "WIKI_AGENT_RUNS_DIR": str(self.paths.runs_dir),
             "WIKI_AGENT_TMP_DIR": str(self.root / "tmp"),
             "WIKI_MSG_QUEUE_PATH": str(self.root / "queue.json"),
+            "WIKI_SQLITE_SHADOW_SAMPLE_RATE": "1",
         }
         os.environ.update(values)
 
@@ -394,13 +398,14 @@ class DualStackHarness:
                 },
             },
         ]
-        (self.paths.runs_dir / self.run_id / "events.jsonl").write_text(
-            "".join(
-                json.dumps({"seq": index, **event}, separators=(",", ":")) + "\n"
-                for index, event in enumerate(legacy_artifacts, start=1)
-            ),
-            encoding="utf-8",
-        )
+        if self.include_legacy_artifacts:
+            (self.paths.runs_dir / self.run_id / "events.jsonl").write_text(
+                "".join(
+                    json.dumps({"seq": index, **event}, separators=(",", ":")) + "\n"
+                    for index, event in enumerate(legacy_artifacts, start=1)
+                ),
+                encoding="utf-8",
+            )
         registry = json.loads(self.paths.registry_path.read_text(encoding="utf-8"))
         registry[self.ticket]["current"]["transcript"] = str(self.transcript_path)
         self.paths.registry_path.write_text(
@@ -443,12 +448,39 @@ class DualStackHarness:
                 kind=normalized.kind,
                 payload=normalized.payload,
                 lifecycle_state=normalized.lifecycle_state,
+                normalized_at=str(row.get("received_at") or ""),
             )
+        self.adapter_factory = FixtureAdapterFactory(ADAPTER_FIXTURES, pid=os.getpid())
         self.supervisor = Supervisor(
             self.store,
-            FixtureAdapterFactory(ADAPTER_FIXTURES, pid=os.getpid()),
+            self.adapter_factory,
         )
         main.SUPERVISOR_CLIENT = SupervisorClient(self.paths, timeout=3)
+
+    def _trigger_parent_ingest(self) -> None:
+        """Use the real provider ingest path to discover child transcripts."""
+
+        assert self.supervisor is not None
+        assert self.supervisor_thread is not None
+        assert self.supervisor_thread.loop is not None
+        assert self.store is not None
+        adapter = self.adapter_factory(self.store.get(self.run_id))
+        event = ProviderEvent(
+            ProviderKind.CLAUDE,
+            {"type": "mode", "mode": "fixture-child-discovery"},
+            direction="stdout",
+            generation=1,
+            received_at="2026-07-10T16:00:04Z",
+        )
+        future = asyncio.run_coroutine_threadsafe(
+            self.supervisor._handle_provider_event_without_admission(  # noqa: SLF001
+                self.run_id,
+                adapter,
+                event,
+            ),
+            self.supervisor_thread.loop,
+        )
+        future.result(timeout=10)
 
     def _raw_rows(self) -> list[dict[str, Any]]:
         return [
@@ -482,7 +514,6 @@ class DualStackHarness:
                 route: flag
                 for route, (flag, _adapter) in main._SQLITE_READ_ROUTES.items()
             },
-            "older": "WIKI_SQLITE_READ_OLDER",
         }
         for route, flag in flags.items():
             if route in enabled:
@@ -511,13 +542,22 @@ class DualStackHarness:
                 (self.run_id,),
             )
 
+    def corrupt_sqlite_session_event(self) -> None:
+        store = SQLiteEventStore(self.sqlite_path, migrate=False)
+        with store.connection() as connection:
+            connection.execute(
+                "UPDATE run_projections SET tokens_json = ? WHERE run_id = ?",
+                (json.dumps({"shadow": "corruption"}), self.run_id),
+            )
+
     def append_tool_result_patch(self) -> None:
         store = SQLiteEventStore(self.sqlite_path, migrate=False)
         reducer = EventReducerAdapter(ProviderKind.CLAUDE)
         for row in store.read_normalized_events(self.run_id):
             reducer.apply_normalized_row(row)
+        current_state = store.cursor(self.run_id)
         raw = {
-            "seq": max(int(row["seq"]) for row in self._raw_rows()) + 1,
+            "seq": current_state.raw_seq + 1,
             "received_at": "2026-07-14T22:09:42+00:00",
             "provider": "claude",
             "direction": "stdout",
@@ -574,6 +614,57 @@ class DualStackHarness:
             flags=flags,
             params=params,
         )
+
+    def older(self, *, flags: tuple[str, ...] = (), before: int = 1000, count: int = 500):
+        return self.request(
+            "GET",
+            f"/api/agents/{self.ticket}/session/older",
+            flags=flags,
+            params={"before": before, "count": count},
+        )
+
+    def provider_events(
+        self,
+        *,
+        flags: tuple[str, ...] = (),
+        after_seq: int = 0,
+        limit: int = 200,
+    ):
+        return self.request(
+            "GET",
+            f"/api/agents/{self.ticket}/events",
+            flags=flags,
+            params={"after_seq": after_seq, "limit": limit},
+        )
+
+    def sse_session_event(self, *, flags: tuple[str, ...] = ()) -> dict[str, Any]:
+        self._set_flag_env(flags)
+        subscriber = main._subscribe_agent_events()
+        try:
+            assert self.supervisor_thread is not None
+            assert self.supervisor_thread.loop is not None
+            assert self.supervisor is not None
+            future = asyncio.run_coroutine_threadsafe(
+                self.supervisor._publish(  # noqa: SLF001
+                    {
+                        "type": "session",
+                        "ticket": self.ticket,
+                        "surface": "session",
+                        "producer_marker": "legacy-input",
+                    }
+                ),
+                self.supervisor_thread.loop,
+            )
+            future.result(timeout=10)
+            deadline = time.monotonic() + 2
+            while time.monotonic() < deadline:
+                try:
+                    return subscriber.get_nowait()
+                except asyncio.QueueEmpty:
+                    time.sleep(0.01)
+            raise AssertionError("SSE event did not reach the real bridge")
+        finally:
+            main._event_subscribers.discard(subscriber)
 
     def rebuild_swap(self) -> None:
         self.rebuild_swap_variant(False)

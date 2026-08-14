@@ -3,8 +3,6 @@ from __future__ import annotations
 import json
 import threading
 
-import pytest
-
 from backend.app.agent_runtime.event_store import SQLiteEventStore
 from backend.app.main import SQLiteSourceKey
 from backend.tests.harness_dual_stack import DualStackHarness
@@ -63,34 +61,82 @@ def test_dual_stack_harness_calls_real_session_route() -> None:
     _assert_full_payload_parity(legacy_payload, sqlite_payload)
 
 
-def test_child_delta_ignores_sqlite_flag_in_pr4a() -> None:
+def test_child_delta_uses_production_mapping_and_preserves_parity() -> None:
     with DualStackHarness() as harness:
+        mapping = SQLiteEventStore(harness.sqlite_path, migrate=False).child_run_for(
+            harness.run_id, harness.subagent_id
+        )
         legacy = harness.delta()
-        flagged = harness.delta(flags=("delta",))
+        sqlite = harness.delta(flags=("delta",))
 
+    assert mapping is not None
+    assert mapping.parent_run_id == harness.run_id
+    assert mapping.child_id == harness.subagent_id
     assert legacy.status_code == 200
-    assert flagged.status_code == 200
+    assert sqlite.status_code == 200
     legacy_payload = legacy.json()
-    flagged_payload = flagged.json()
+    sqlite_payload = sqlite.json()
     assert [event["text"] for event in legacy_payload["events"]] == [
         "Inspect child-only branch for WIKI-282.",
         "child-only event",
     ]
-    assert flagged_payload == legacy_payload
+    assert sqlite_payload["path"].startswith("sqlite://child/")
+    assert sqlite_payload["events"] == legacy_payload["events"]
+    assert sqlite_payload["tasks"] == legacy_payload["tasks"]
+    assert sqlite_payload["session_meta"] == legacy_payload["session_meta"]
 
 
-@pytest.mark.parametrize("flags", [(), ("session",), ("delta",), ("older",)])
-def test_older_route_ignores_all_sqlite_flags(flags: tuple[str, ...]) -> None:
+def test_older_route_has_independent_sqlite_parity() -> None:
     with DualStackHarness() as harness:
-        response = harness.request(
-            "GET",
-            f"/api/agents/{harness.ticket}/session/older",
-            flags=flags,
-            params={"before": 1000},
-        )
+        legacy = harness.older()
+        sqlite = harness.older(flags=("older",))
+
+    assert legacy.status_code == 200
+    assert sqlite.status_code == 200
+    _assert_full_payload_parity(legacy.json(), sqlite.json())
+
+
+def test_provider_event_route_has_independent_sqlite_parity() -> None:
+    with DualStackHarness(include_legacy_artifacts=False) as harness:
+        legacy = harness.provider_events()
+        sqlite = harness.provider_events(flags=("provider-events",))
+
+    assert legacy.status_code == 200
+    assert sqlite.status_code == 200
+    assert legacy.json() == sqlite.json()
+
+
+def test_sse_sqlite_producer_preserves_only_browser_contract() -> None:
+    with DualStackHarness() as harness:
+        event = harness.sse_session_event(flags=("sse",))
+
+    assert event == {
+        "type": "session",
+        "ticket": "WIKI-282-HARNESS",
+        "surface": "session",
+    }
+
+
+def test_telemetry_counts_only_sampled_real_route_comparisons() -> None:
+    with DualStackHarness() as harness:
+        response = harness.session(flags=("session",))
+        telemetry = harness.request("GET", "/api/agent-read-telemetry").json()
 
     assert response.status_code == 200
-    assert not response.json()["path"].startswith("sqlite://")
+    assert telemetry["session"]["reads"] == (
+        telemetry["session"]["matches"] + telemetry["session"]["mismatches"]
+    )
+    assert telemetry["session"]["reads"] >= 1
+
+
+def test_telemetry_records_a_real_shadow_mismatch() -> None:
+    with DualStackHarness(include_pending_overlay=False) as harness:
+        harness.corrupt_sqlite_session_event()
+        response = harness.session(flags=("session",))
+        telemetry = harness.request("GET", "/api/agent-read-telemetry").json()
+
+    assert response.status_code == 200
+    assert telemetry["session"]["mismatches"] >= 1
 
 
 def test_session_flag_does_not_enable_child_real_http_adapter() -> None:
