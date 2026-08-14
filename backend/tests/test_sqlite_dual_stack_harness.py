@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import threading
 
 import pytest
@@ -9,8 +10,24 @@ from backend.app.main import SQLiteSourceKey
 from backend.tests.harness_dual_stack import DualStackHarness
 
 
-def _without_source(payload: dict[str, object]) -> dict[str, object]:
-    return {key: value for key, value in payload.items() if key != "path"}
+def _payload_bytes(payload: dict[str, object], *, source_path: str) -> bytes:
+    comparable = dict(payload)
+    comparable["path"] = source_path
+    return json.dumps(comparable, sort_keys=True, separators=(",", ":")).encode()
+
+
+def _assert_full_payload_parity(
+    legacy: dict[str, object], sqlite: dict[str, object]
+) -> None:
+    legacy_path = legacy["path"]
+    sqlite_path = sqlite["path"]
+    assert isinstance(legacy_path, str)
+    assert isinstance(sqlite_path, str)
+    assert legacy_path != sqlite_path
+    assert sqlite_path.startswith("sqlite://")
+    assert _payload_bytes(legacy, source_path="<source>") == _payload_bytes(
+        sqlite, source_path="<source>"
+    )
 
 
 def test_dual_stack_harness_calls_real_session_route() -> None:
@@ -37,8 +54,13 @@ def test_dual_stack_harness_calls_real_session_route() -> None:
         == "child-agent-282"
         for event in legacy_payload["provider_inspector"]["events"]
     )
+    assert any(
+        event.get("tool", {}).get("name") == "Agent"
+        and event.get("tool", {}).get("agent_id") == "abc12345"
+        for event in legacy_payload["events"]
+    )
 
-    assert _without_source(legacy_payload) == _without_source(sqlite_payload)
+    _assert_full_payload_parity(legacy_payload, sqlite_payload)
 
 
 def test_dual_stack_harness_calls_real_delta_route() -> None:
@@ -48,8 +70,31 @@ def test_dual_stack_harness_calls_real_delta_route() -> None:
 
     assert legacy.status_code == 200
     assert sqlite.status_code == 200
-    assert legacy.json()["events"]
-    assert sqlite.json()["path"].startswith("sqlite://")
+    legacy_payload = legacy.json()
+    sqlite_payload = sqlite.json()
+    assert [event["text"] for event in legacy_payload["events"]] == [
+        "Inspect child-only branch for WIKI-282.",
+        "child-only event",
+    ]
+    assert [event["text"] for event in sqlite_payload["events"]] == [
+        "Inspect child-only branch for WIKI-282.",
+        "child-only event",
+    ]
+    _assert_full_payload_parity(legacy_payload, sqlite_payload)
+
+
+@pytest.mark.parametrize("flags", [(), ("session",), ("delta",), ("older",)])
+def test_older_route_ignores_all_sqlite_flags(flags: tuple[str, ...]) -> None:
+    with DualStackHarness() as harness:
+        response = harness.request(
+            "GET",
+            f"/api/agents/{harness.ticket}/session/older",
+            flags=flags,
+            params={"before": 1000},
+        )
+
+    assert response.status_code == 200
+    assert not response.json()["path"].startswith("sqlite://")
 
 
 @pytest.mark.parametrize(

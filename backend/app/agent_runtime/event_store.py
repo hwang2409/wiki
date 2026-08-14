@@ -134,16 +134,6 @@ class SessionReadSnapshot:
 
 
 @dataclass(frozen=True)
-class OlderReadSnapshot:
-    """One older-event page and its source identity."""
-
-    state: RunCursor
-    source_key: str
-    events: tuple[dict[str, Any], ...]
-    has_older: bool
-
-
-@dataclass(frozen=True)
 class ReducerResult:
     raw_seq: int
     normalized: dict[str, Any]
@@ -1277,47 +1267,6 @@ class SQLiteEventStore:
             patches=patches,
         )
 
-    def read_older_snapshot(
-        self,
-        run_id: str,
-        *,
-        source_class: str,
-        before_event_id: int,
-        limit: int,
-    ) -> OlderReadSnapshot:
-        """Read an older page and source generation in one transaction."""
-
-        with self.connection(read_only=True) as connection:
-            connection.execute("BEGIN")
-            state = self._cursor_from_connection(connection, run_id)
-            source_key = self._source_key(
-                run_id, source_class, state.rebuild_generation
-            )
-            rows = connection.execute(
-                "SELECT event_id, event_json FROM events "
-                "WHERE run_id = ? AND event_id < ? "
-                "ORDER BY event_id DESC LIMIT ?",
-                (run_id, before_event_id, limit),
-            ).fetchall()
-            if rows:
-                oldest_event_id = int(rows[-1][0])
-                has_older = (
-                    connection.execute(
-                        "SELECT 1 FROM events WHERE run_id = ? AND event_id < ?",
-                        (run_id, oldest_event_id),
-                    ).fetchone()
-                    is not None
-                )
-            else:
-                has_older = False
-        rows.reverse()
-        return OlderReadSnapshot(
-            state=state,
-            source_key=source_key,
-            events=tuple(json.loads(row[1]) for row in rows),
-            has_older=has_older,
-        )
-
     def rebuild_generation(self, run_id: str) -> int:
         """Return the durable number of atomic replacements for one run."""
 
@@ -1387,34 +1336,6 @@ class SQLiteEventStore:
         with self.connection(read_only=True) as connection:
             rows = connection.execute(query, parameters).fetchall()
         return [json.loads(row[0]) for row in rows]
-
-    def read_events_before(
-        self,
-        run_id: str,
-        *,
-        before_event_id: int,
-        limit: int,
-    ) -> tuple[list[dict[str, Any]], bool]:
-        """Read one older event page and report whether retained rows precede it."""
-
-        with self.connection(read_only=True) as connection:
-            rows = connection.execute(
-                "SELECT event_id, event_json FROM events "
-                "WHERE run_id = ? AND event_id < ? ORDER BY event_id DESC LIMIT ?",
-                (run_id, before_event_id, limit),
-            ).fetchall()
-            if not rows:
-                return [], False
-            oldest_event_id = int(rows[-1][0])
-            has_older = (
-                connection.execute(
-                    "SELECT 1 FROM events WHERE run_id = ? AND event_id < ?",
-                    (run_id, oldest_event_id),
-                ).fetchone()
-                is not None
-            )
-        rows.reverse()
-        return [json.loads(row[1]) for row in rows], has_older
 
     def read_normalized_events(
         self,

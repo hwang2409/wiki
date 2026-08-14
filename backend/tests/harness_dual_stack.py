@@ -5,7 +5,6 @@ from __future__ import annotations
 import asyncio
 import json
 import os
-import shutil
 import tempfile
 import threading
 from pathlib import Path
@@ -92,6 +91,7 @@ class DualStackHarness:
         self.temp = tempfile.TemporaryDirectory(prefix="wiki-282-dual-stack-")
         self.root = Path(self.temp.name)
         self.run_id = str(uuid4())
+        self.child_run_id = str(uuid4())
         self.paths = RuntimePaths(
             runtime_dir=self.root / "runtime",
             socket_path=self.root / "runtime" / "supervisor.sock",
@@ -108,6 +108,7 @@ class DualStackHarness:
             / f"agent-{self.subagent_id}.jsonl"
         )
         self.raw_path = self.root / "legacy" / "raw.jsonl"
+        self.child_raw_path = self.root / "legacy" / "child-raw.jsonl"
         self.sqlite_path = self.root / "runtime" / "events.sqlite3"
         self.store: RunStore | None = None
         self.supervisor: Supervisor | None = None
@@ -145,15 +146,87 @@ class DualStackHarness:
 
     def _prepare_fixture_files(self) -> None:
         self.transcript_path.parent.mkdir(parents=True, exist_ok=True)
-        shutil.copyfile(TRANSCRIPT_FIXTURE, self.transcript_path)
+        transcript_rows = [
+            json.loads(line)
+            for line in TRANSCRIPT_FIXTURE.read_text(encoding="utf-8").splitlines()
+            if line.strip()
+        ]
+        transcript_rows.append(
+            {
+                "type": "assistant",
+                "timestamp": "2026-07-10T16:00:00.300Z",
+                "message": {
+                    "role": "assistant",
+                    "content": [
+                        {
+                            "type": "tool_use",
+                            "id": "toolu_agent_282",
+                            "name": "Agent",
+                            "input": {
+                                "description": "Delegate child fixture",
+                                "prompt": "Inspect child-only branch for WIKI-282.",
+                                "subagent_type": "Explore",
+                            },
+                        }
+                    ],
+                },
+            }
+        )
+        self.transcript_path.write_text(
+            "".join(
+                json.dumps(row, separators=(",", ":")) + "\n"
+                for row in transcript_rows
+            ),
+            encoding="utf-8",
+        )
         self.subagent_path.parent.mkdir(parents=True, exist_ok=True)
-        shutil.copyfile(TRANSCRIPT_FIXTURE, self.subagent_path)
+        child_transcript_rows = [
+            {
+                "type": "user",
+                "timestamp": "2026-07-10T16:00:00Z",
+                "message": {
+                    "role": "user",
+                    "content": "Inspect child-only branch for WIKI-282.",
+                },
+            },
+            {
+                "type": "assistant",
+                "timestamp": "2026-07-10T16:00:01Z",
+                "message": {
+                    "role": "assistant",
+                    "content": [{"type": "text", "text": "child-only event"}],
+                },
+            },
+        ]
+        self.subagent_path.write_text(
+            "".join(
+                json.dumps(row, separators=(",", ":")) + "\n"
+                for row in child_transcript_rows
+            ),
+            encoding="utf-8",
+        )
         rows = [
+            {
+                "seq": index,
+                "received_at": str(row.get("timestamp") or "2026-07-10T16:00:00Z"),
+                "provider": "claude",
+                "direction": "stdout",
+                "generation": 1,
+                "payload": row,
+            }
+            for index, row in enumerate(transcript_rows, start=1)
+        ]
+        pending_rows = [
             json.loads(line)
             for line in RAW_FIXTURE.read_text(encoding="utf-8").splitlines()
             if line.strip()
         ]
-        next_seq = max(int(row["seq"]) for row in rows) + 1
+        next_seq = len(rows) + 1
+        rows.extend(
+            {**row, "seq": next_seq + int(row["seq"]) - 1}
+            for row in pending_rows
+        )
+        next_seq = len(rows) + 1
         rows.extend(
             [
                 {
@@ -163,7 +236,7 @@ class DualStackHarness:
                     "direction": "stdout",
                     "generation": 1,
                     "payload": {
-                        "type": "assistant",
+                        "type": "mode",
                         "tool": {"agent_id": "child-agent-282"},
                         "message": {
                             "content": [
@@ -194,6 +267,44 @@ class DualStackHarness:
             "".join(json.dumps(row, separators=(",", ":")) + "\n" for row in rows),
             encoding="utf-8",
         )
+        child_rows = [
+            {
+                "seq": 1,
+                "received_at": "2026-07-10T16:00:00Z",
+                "provider": "claude",
+                "direction": "stdout",
+                "generation": 1,
+                "payload": {
+                    "type": "user",
+                    "timestamp": "2026-07-10T16:00:00Z",
+                    "message": {
+                        "role": "user",
+                        "content": "Inspect child-only branch for WIKI-282.",
+                    },
+                },
+            },
+            {
+                "seq": 2,
+                "received_at": "2026-07-10T16:00:01Z",
+                "provider": "claude",
+                "direction": "stdout",
+                "generation": 1,
+                "payload": {
+                    "type": "assistant",
+                    "timestamp": "2026-07-10T16:00:01Z",
+                    "message": {
+                        "role": "assistant",
+                        "content": [{"type": "text", "text": "child-only event"}],
+                    },
+                },
+            },
+        ]
+        self.child_raw_path.write_text(
+            "".join(
+                json.dumps(row, separators=(",", ":")) + "\n" for row in child_rows
+            ),
+            encoding="utf-8",
+        )
 
     def _save_main_state(self) -> None:
         names = (
@@ -211,7 +322,10 @@ class DualStackHarness:
         self._saved_session_paths = dict(main._session_paths)
         self._saved_flags = {
             flag: os.environ.get(flag)
-            for flag, _adapter in main._SQLITE_READ_ROUTES.values()
+            for flag in (
+                *(flag for flag, _adapter in main._SQLITE_READ_ROUTES.values()),
+                "WIKI_SQLITE_READ_OLDER",
+            )
         }
         self._saved_env = {
             name: os.environ.get(name)
@@ -266,6 +380,9 @@ class DualStackHarness:
         self.store._write_record(record)  # noqa: SLF001
         registry = json.loads(self.paths.registry_path.read_text(encoding="utf-8"))
         registry[self.ticket]["current"]["transcript"] = str(self.transcript_path)
+        registry[self.ticket]["current"]["subagent_run_ids"] = {
+            self.subagent_id: self.child_run_id
+        }
         self.paths.registry_path.write_text(
             json.dumps(registry, separators=(",", ":")) + "\n",
             encoding="utf-8",
@@ -275,6 +392,13 @@ class DualStackHarness:
             self.sqlite_path,
             run_id=self.run_id,
             agent_id=self.ticket,
+            provider=ProviderKind.CLAUDE,
+        )
+        replay_raw_jsonl(
+            self.child_raw_path,
+            self.sqlite_path,
+            run_id=self.child_run_id,
+            agent_id=f"{self.ticket}/{self.subagent_id}",
             provider=ProviderKind.CLAUDE,
         )
         for row in self._raw_rows():
@@ -332,7 +456,14 @@ class DualStackHarness:
                 os.environ[name] = value
 
     def _set_flag_env(self, enabled: tuple[str, ...]) -> None:
-        for route, (flag, _adapter) in main._SQLITE_READ_ROUTES.items():
+        flags = {
+            **{
+                route: flag
+                for route, (flag, _adapter) in main._SQLITE_READ_ROUTES.items()
+            },
+            "older": "WIKI_SQLITE_READ_OLDER",
+        }
+        for route, flag in flags.items():
             if route in enabled:
                 os.environ[flag] = "1"
             else:
