@@ -11,6 +11,7 @@ import hashlib
 import json
 import os
 import shutil
+import subprocess
 import tempfile
 from collections.abc import AsyncIterator, Awaitable, Callable, Mapping, Sequence
 from dataclasses import asdict, dataclass, is_dataclass, replace
@@ -81,7 +82,11 @@ _SAFE_ENV_NAMES = frozenset(
         "TERM",
         "NO_COLOR",
         "CLAUDE_CONFIG_DIR",
+        "PWD",
     }
+)
+_DISABLED_PROVIDER_ENV = frozenset(
+    {"CLAUDE_CODE_USE_BEDROCK", "CLAUDE_CODE_USE_VERTEX"}
 )
 
 
@@ -122,7 +127,10 @@ def plan_auth_environment(environment: Mapping[str, str] | None = None) -> dict[
 
     source = dict(os.environ if environment is None else environment)
     configured = sorted(
-        name for name in (*_API_AUTH_ENV, *_PROVIDER_ENV) if source.get(name)
+        name
+        for name in (*_API_AUTH_ENV, *_PROVIDER_ENV)
+        if source.get(name)
+        and not (name in _DISABLED_PROVIDER_ENV and source[name] == "0")
     )
     if configured:
         raise WkClaudePlanAuthError(
@@ -132,11 +140,117 @@ def plan_auth_environment(environment: Mapping[str, str] | None = None) -> dict[
     result = {
         name: value
         for name, value in source.items()
-        if name in _SAFE_ENV_NAMES or name.startswith("WIKI_")
+        if name in _SAFE_ENV_NAMES
     }
     result["CLAUDE_CODE_USE_BEDROCK"] = "0"
     result["CLAUDE_CODE_USE_VERTEX"] = "0"
     return result
+
+
+def _verify_cli_plan_auth(
+    cli_path: str | Path | None, environment: Mapping[str, str]
+) -> dict[str, str]:
+    if not cli_path:
+        raise WkClaudePlanAuthError("Claude CLI path is required to prove plan auth")
+    try:
+        completed = subprocess.run(
+            [str(cli_path), "auth", "status", "--json"],
+            cwd=None,
+            env=plan_auth_environment(environment),
+            capture_output=True,
+            text=True,
+            timeout=10,
+            check=False,
+        )
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        raise WkClaudePlanAuthError(
+            f"Claude CLI auth status could not prove plan auth: {type(exc).__name__}"
+        ) from exc
+    if completed.returncode != 0:
+        raise WkClaudePlanAuthError(
+            f"Claude CLI auth status failed with exit code {completed.returncode}"
+        )
+    try:
+        status = json.loads(completed.stdout)
+    except json.JSONDecodeError as exc:
+        raise WkClaudePlanAuthError("Claude CLI auth status was not JSON") from exc
+    if not isinstance(status, Mapping):
+        raise WkClaudePlanAuthError("Claude CLI auth status was not an object")
+    if status.get("loggedIn") is not True:
+        raise WkClaudePlanAuthError("Claude CLI is not logged in with plan auth")
+    auth_method = str(status.get("authMethod") or "").casefold()
+    api_provider = str(status.get("apiProvider") or "").casefold()
+    subscription = status.get("subscriptionType")
+    if auth_method not in {"claude.ai", "oauth"}:
+        raise WkClaudePlanAuthError("Claude CLI auth method is not subscription auth")
+    if api_provider not in {"firstparty", "first_party"}:
+        raise WkClaudePlanAuthError("Claude CLI auth provider is not first-party")
+    if not isinstance(subscription, str) or not subscription.strip():
+        raise WkClaudePlanAuthError("Claude CLI did not report a subscription identity")
+    return {
+        "auth_method": auth_method,
+        "api_provider": api_provider,
+        "subscription_type": subscription,
+    }
+
+
+def _sanitized_transport_class() -> type[Any]:
+    """Return an SDK transport that replaces, rather than merges, the env."""
+
+    import anyio
+    from anyio.streams.text import TextReceiveStream, TextSendStream
+    from claude_agent_sdk._internal._task_compat import spawn_detached
+    from claude_agent_sdk._internal.transport.subprocess_cli import (
+        _ACTIVE_CHILDREN,
+        SubprocessCLITransport,
+    )
+    from claude_agent_sdk._version import __version__
+    from subprocess import PIPE
+
+    class SanitizedSubprocessCLITransport(SubprocessCLITransport):
+        async def connect(self) -> None:
+            if self._process:
+                return
+            if self._cli_path is None:
+                self._cli_path = await anyio.to_thread.run_sync(self._find_cli)
+            self._reject_windows_batch_cli(self._cli_path)
+            cmd = self._build_command()
+            process_env = dict(self._options.env)
+            unexpected = set(process_env) - _SAFE_ENV_NAMES - _DISABLED_PROVIDER_ENV
+            if unexpected:
+                raise WkClaudeError(
+                    "sanitized Claude SDK transport received unsupported environment: "
+                    + ", ".join(sorted(unexpected))
+                )
+            process_env["CLAUDE_CODE_ENTRYPOINT"] = "sdk-py"
+            process_env["CLAUDE_AGENT_SDK_VERSION"] = __version__
+            if self._cwd:
+                process_env["PWD"] = self._cwd
+            try:
+                self._process = await anyio.open_process(
+                    cmd,
+                    stdin=PIPE,
+                    stdout=PIPE,
+                    stderr=PIPE if self._options.stderr is not None else None,
+                    cwd=self._cwd,
+                    env=process_env,
+                    user=self._options.user,
+                )
+                _ACTIVE_CHILDREN.add(self._process)
+                if self._process.stdout:
+                    self._stdout_stream = TextReceiveStream(self._process.stdout)
+                if self._process.stderr:
+                    self._stderr_stream = TextReceiveStream(self._process.stderr)
+                    self._stderr_task = spawn_detached(self._handle_stderr())
+                if self._process.stdin:
+                    self._stdin_stream = TextSendStream(self._process.stdin)
+                self._ready = True
+            except Exception as exc:
+                raise WkClaudeError(
+                    f"sanitized Claude SDK transport failed to start: {exc}"
+                ) from exc
+
+    return SanitizedSubprocessCLITransport
 
 
 def _sdk_imports() -> tuple[Any, Any, Any, Any, Any]:
@@ -183,6 +297,21 @@ def _message_dict(message: object) -> dict[str, Any]:
         value["type"] = raw_type
         if raw_type in {"assistant", "user"}:
             content = value.pop("content", [])
+            if isinstance(content, Sequence) and not isinstance(content, (str, bytes)):
+                normalized_content: list[object] = []
+                for block in content:
+                    if isinstance(block, Mapping) and "type" not in block:
+                        block = dict(block)
+                        if "tool_use_id" in block:
+                            block["type"] = "tool_result"
+                        elif "id" in block and "name" in block:
+                            block["type"] = "tool_use"
+                        elif "text" in block:
+                            block["type"] = "text"
+                        elif "thinking" in block:
+                            block["type"] = "thinking"
+                    normalized_content.append(block)
+                content = normalized_content
             nested: dict[str, Any] = {"content": content}
             if raw_type == "assistant":
                 for field_name in ("model", "usage", "id", "stop_reason"):
@@ -286,6 +415,9 @@ class WkClaudeEventTranslator:
         self.raw_events: list[dict[str, Any]] = []
         self.session = WkSessionTree()
         self._plan_auth_verified = False
+        self._effective_tools: frozenset[str] | None = None
+        self._effective_hooks: object = None
+        self._effective_settings_sources: object = None
 
     @property
     def plan_auth_verified(self) -> bool:
@@ -341,6 +473,18 @@ class WkClaudeEventTranslator:
         settings_sources = init.get("setting_sources") or init.get("settingSources")
         if settings_sources:
             raise WkClaudePlanAuthError("Claude SDK loaded filesystem settings")
+        self._effective_tools = frozenset(effective_tools)
+        self._effective_hooks = hooks
+        self._effective_settings_sources = settings_sources
+
+    def verify_runtime_policy(self) -> None:
+        if self._effective_tools != frozenset(WK_CLAUDE_MCP_TOOL_NAMES):
+            raise WkClaudePlanAuthError("Claude SDK effective tool policy drifted")
+        if self._effective_hooks or self._effective_settings_sources:
+            raise WkClaudePlanAuthError("Claude SDK hooks or settings became active")
+
+    def events_for_kind(self, kind: str) -> tuple[WkEventEnvelope, ...]:
+        return tuple(event for event in self.sequencer.events if event.kind == kind)
 
     def translate(self, message: object) -> WkEventEnvelope:
         raw = _message_dict(message)
@@ -988,6 +1132,7 @@ class WkClaudeToolBridge:
                 mutation=request.mutation,
             )
         self.ledger.record_result(request, result)
+        self.ledger.reconcile()
         return result
 
 
@@ -1084,6 +1229,42 @@ def build_claude_sdk_options(
     return ClaudeAgentOptions(**options_kwargs)
 
 
+def _settings_paths(worktree: Path, environment: Mapping[str, str]) -> tuple[Path, ...]:
+    roots = {worktree / ".claude", Path("/etc/claude-code"), Path("/Library/Application Support/ClaudeCode")}
+    for name in ("CLAUDE_CONFIG_DIR", "HOME"):
+        value = environment.get(name)
+        if value:
+            roots.add(Path(value) / ".claude" if name == "HOME" else Path(value))
+    names = ("settings.json", "settings.local.json", "managed-settings.json")
+    return tuple(sorted({root / name for root in roots if str(root) != "." for name in names}))
+
+
+class _SettingsGuard:
+    def __init__(self, paths: Sequence[Path]):
+        self.paths = tuple(paths)
+        self._fingerprint = self._read()
+
+    def _read(self) -> tuple[tuple[str, bool, str], ...]:
+        rows: list[tuple[str, bool, str]] = []
+        for path in self.paths:
+            try:
+                content = path.read_bytes()
+            except FileNotFoundError:
+                rows.append((str(path), False, ""))
+            except OSError as exc:
+                raise WkClaudeError(
+                    f"cannot inspect Claude settings source {path}: {type(exc).__name__}"
+                ) from exc
+            else:
+                rows.append((str(path), True, hashlib.sha256(content).hexdigest()))
+        return tuple(rows)
+
+    def verify_unchanged(self) -> None:
+        current = self._read()
+        if current != self._fingerprint:
+            raise WkClaudeError("Claude settings source changed during the run")
+
+
 class WkClaudeLane:
     """Minimal turn and steering loop over ClaudeSDKClient."""
 
@@ -1140,6 +1321,12 @@ class WkClaudeLane:
         self._closed = False
         self._startup_ready = asyncio.Event()
         self._startup_error: BaseException | None = None
+        self._auth_identity: dict[str, str] | None = None
+        self._sdk_environment: Mapping[str, str] = {}
+        self._client_options_cli_path: str | Path | None = None
+        self._settings_guard = _SettingsGuard(
+            _settings_paths(worktree, plan_auth_environment())
+        )
 
     def _new_client(self, *, resume: str | None = None) -> ClaudeSdkClient:
         if self._options_factory is None:
@@ -1153,10 +1340,34 @@ class WkClaudeLane:
             )
         else:
             options = self._options_factory(resume=resume)
+        cli_path = getattr(options, "cli_path", None)
+        sdk_environment = getattr(options, "env", None)
+        if cli_path is not None and isinstance(sdk_environment, Mapping):
+            self._client_options_cli_path = cli_path
+            self._sdk_environment = dict(sdk_environment)
+            self._auth_identity = _verify_cli_plan_auth(cli_path, sdk_environment)
         if self._client_factory is not None:
             return self._client_factory(options)
         _options, client_type, _allow, _deny, _server = _sdk_imports()
-        return client_type(options=options)
+        transport_type = _sanitized_transport_class()
+        return client_type(
+            options=options,
+            transport=transport_type(prompt=None, options=options),
+        )
+
+    def _verify_turn_boundary(self) -> None:
+        self._settings_guard.verify_unchanged()
+        if self._auth_identity is None and (
+            self._client_factory is None and self._options_factory is None
+        ):
+            raise WkClaudePlanAuthError("Claude plan auth identity was not verified")
+        if self._auth_identity is not None:
+            current = _verify_cli_plan_auth(
+                self._client_options_cli_path, self._sdk_environment
+            )
+            if current != self._auth_identity:
+                raise WkClaudePlanAuthError("Claude plan auth identity changed during the run")
+        self.translator.verify_runtime_policy()
 
     async def _receive(self) -> None:
         assert self._client is not None
@@ -1172,6 +1383,7 @@ class WkClaudeLane:
                 )
                 if raw.get("type") == "result":
                     await self._deliver_pending(include_idle=True)
+            self.ledger.reconcile()
             self.ledger.reconcile_transport()
         except asyncio.CancelledError:
             raise
@@ -1185,6 +1397,33 @@ class WkClaudeLane:
                     "event": event.to_dict(),
                 }
             )
+
+    async def _emit_provider_error(self, error: BaseException) -> None:
+        event = self.translator.error_event(error)
+        await self._events.put(
+            {"raw": self.translator.raw_events[-1], "event": event.to_dict()}
+        )
+
+    async def _query_provider(self, prompt: str) -> None:
+        if self._client is None:
+            raise WkClaudeError("Claude lane is not started")
+        try:
+            self._verify_turn_boundary()
+            await self._client.query(prompt)
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            await self._emit_provider_error(exc)
+            raise WkClaudeError(str(exc)) from exc
+
+    async def _verify_boundary(self) -> None:
+        try:
+            self._verify_turn_boundary()
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            await self._emit_provider_error(exc)
+            raise WkClaudeError(str(exc)) from exc
 
     async def _ensure_client(self, *, resume: str | None = None) -> None:
         if self._client is not None:
@@ -1225,20 +1464,34 @@ class WkClaudeLane:
             if item.mode == "now" or include_idle
         )
         for item in items:
-            await self._client.query(item.message)
+            await self._query_provider(item.message)
             self._steering.acknowledge(item.message_id)
 
     async def start(self, prompt: str) -> None:
-        await self._ensure_client()
-        await self._await_startup()
-        assert self._client is not None
-        await self._client.query(prompt)
+        try:
+            await self._ensure_client()
+            await self._await_startup()
+            await self._query_provider(prompt)
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            if not self.translator.events_for_kind("claude.provider_error"):
+                await self._emit_provider_error(exc)
+            raise
         await self._deliver_pending()
 
     async def resume(self, session_id: str) -> None:
-        await self._ensure_client(resume=session_id)
-        await self._await_startup()
-        await self._deliver_pending()
+        try:
+            await self._ensure_client(resume=session_id)
+            await self._await_startup()
+            await self._verify_boundary()
+            await self._deliver_pending()
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            if not self.translator.events_for_kind("claude.provider_error"):
+                await self._emit_provider_error(exc)
+            raise
 
     async def send(self, message: str) -> None:
         await self.send_now(message)
@@ -1255,7 +1508,13 @@ class WkClaudeLane:
     async def interrupt(self) -> None:
         if self._client is None:
             raise WkClaudeError("Claude lane is not started")
-        await self._client.interrupt()
+        try:
+            await self._client.interrupt()
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            await self._emit_provider_error(exc)
+            raise WkClaudeError(str(exc)) from exc
 
     async def replace(self, prompt: str) -> None:
         await self._close_transport()
@@ -1267,7 +1526,12 @@ class WkClaudeLane:
     async def _close_transport(self) -> None:
         self._closed = True
         if self._client is not None:
-            await self._client.disconnect()
+            try:
+                await self._client.disconnect()
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:
+                await self._emit_provider_error(exc)
         if self._receive_task is not None:
             await asyncio.gather(self._receive_task, return_exceptions=True)
         self._client = None
