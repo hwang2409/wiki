@@ -59,7 +59,7 @@
   --titlebar-height: 40px;
   --header-height: 40px;
   --status-bar-height: 30px;
-  --file-line-width: 910px;
+  --file-line-width: 1024px;
   --radius-s: 4px;
   --radius-m: 8px;
   --pane-focus-ring: color-mix(in srgb, var(--text-normal) 40%, transparent);
