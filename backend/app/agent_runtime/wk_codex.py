@@ -6,7 +6,7 @@ import asyncio
 import hashlib
 import json
 import os
-import subprocess
+import tomllib
 from collections.abc import AsyncIterator, Mapping, Sequence
 from pathlib import Path
 from typing import Any
@@ -15,13 +15,8 @@ from .codex import CodexAppServerAdapter
 from .normalizer import normalize_provider_event
 from .provider import StartRequest
 from .types import ProviderKind, RunRecord, utc_now
-from .wk_claude import (
-    WkClaudeToolBridge,
-    WkSessionTree,
-    WkSteeringQueue,
-    WkToolLedger,
-    register_default_wk_tools,
-)
+from .wk_common import WkLedgerError, WkSessionTree, WkSteeringQueue, WkToolBridge, WkToolLedger
+from .wk_tools import register_default_wk_tools
 from .wk_core import (
     WkDisposition,
     WkEventEnvelope,
@@ -44,6 +39,14 @@ WK_CODEX_TOOL_NAMES = (
 )
 WK_CODEX_MCP_TOOL_NAMES = tuple(
     f"mcp__wiki__{name.removeprefix('wk.')}" for name in WK_CODEX_TOOL_NAMES
+)
+WK_CODEX_DYNAMIC_TOOLS = tuple(
+    {
+        "name": name.removeprefix("wk."),
+        "description": f"Wiki-owned {name} tool",
+        "inputSchema": {"type": "object", "additionalProperties": True},
+    }
+    for name in WK_CODEX_TOOL_NAMES
 )
 _SAFE_ENV_NAMES = frozenset(
     {
@@ -69,6 +72,9 @@ _CREDENTIAL_ENV_NAMES = frozenset(
         "CODEX_API_KEY",
         "AZURE_OPENAI_API_KEY",
         "AZURE_OPENAI_ENDPOINT",
+        "OPENAI_BEARER_TOKEN",
+        "CODEX_BEARER_TOKEN",
+        "HTTP_AUTHORIZATION",
     }
 )
 
@@ -104,44 +110,52 @@ def codex_plan_auth_environment(
     return result
 
 
-def _file_fingerprint(path: Path) -> str | None:
-    try:
-        return hashlib.sha256(path.read_bytes()).hexdigest()
-    except OSError:
-        return None
-
-
-def _verify_codex_plan_auth(
-    command: Sequence[str], environment: Mapping[str, str]
-) -> dict[str, str | None]:
-    if not command:
-        raise WkCodexPlanAuthError("Codex CLI path is required to prove plan auth")
-    try:
-        completed = subprocess.run(
-            [*command, "login", "status"],
-            env=codex_plan_auth_environment(environment),
-            stdin=subprocess.DEVNULL,
-            capture_output=True,
-            text=True,
-            timeout=10,
-            check=False,
-        )
-    except (OSError, subprocess.TimeoutExpired) as exc:
-        raise WkCodexPlanAuthError(
-            f"Codex login status could not prove plan auth: {type(exc).__name__}"
-        ) from exc
-    output = (completed.stdout or "").strip()
-    if completed.returncode != 0 or "logged in using chatgpt" not in output.casefold():
-        raise WkCodexPlanAuthError("Codex login status did not prove ChatGPT plan auth")
-    identity = output.split("account=", 1)[-1] if "account=" in output else ""
-    account_id, _, organization_id = identity.partition(" organization=")
-    auth_path = Path(codex_plan_auth_environment(environment)["CODEX_HOME"]) / "auth.json"
-    return {
-        "auth_status_hash": hashlib.sha256(output.encode()).hexdigest(),
-        "account_id": account_id or None,
-        "organization_id": organization_id or None,
-        "credential_fingerprint": _file_fingerprint(auth_path),
+_FORBIDDEN_CONFIG_KEYS = frozenset(
+    {
+        "api_key",
+        "apiKey",
+        "bearer_token",
+        "bearerToken",
+        "bearer",
+        "experimental_bearer_token",
+        "oauth_token",
+        "authorization",
+        "http_headers",
+        "httpHeaders",
+        "headers",
+        "static_headers",
+        "env_key",
+        "envKey",
+        "auth_command",
+        "authCommand",
+        "command_auth",
+        "commandAuth",
     }
+)
+
+
+def _reject_auth_sources(paths: Sequence[Path]) -> None:
+    def walk(value: object, path: str) -> None:
+        if not isinstance(value, Mapping):
+            return
+        for key, child in value.items():
+            key_text = str(key)
+            if key_text in _FORBIDDEN_CONFIG_KEYS:
+                raise WkCodexPlanAuthError(
+                    f"Codex plan auth rejects credential config source: {path}.{key_text}"
+                )
+            walk(child, f"{path}.{key_text}")
+
+    for path in paths:
+        try:
+            with path.open("rb") as handle:
+                walk(tomllib.load(handle), str(path))
+        except FileNotFoundError:
+            continue
+        except tomllib.TOMLDecodeError as exc:
+            raise WkCodexPlanAuthError(
+                f"Codex settings are not valid TOML: {path}"
+            ) from exc
 
 
 def _settings_paths(worktree: Path, environment: Mapping[str, str]) -> tuple[Path, ...]:
@@ -208,6 +222,8 @@ class WkCodexEventTranslator:
             return WkEventPhase.COMPACTION
         if method in {"thread/archived", "thread/closed"}:
             return WkEventPhase.ARCHIVE
+        if method == "item/tool/call":
+            return WkEventPhase.TOOL
         if method.startswith("item/") and item_type in {
             "commandExecution",
             "fileChange",
@@ -316,10 +332,11 @@ class WkCodexLane:
         self.model = model
         self.loop = loop
         self.environment = codex_plan_auth_environment(environment)
-        self.auth_command = tuple(auth_command or (command[0],))
+        del auth_command
         self.command = tuple(command)
         self._settings_guard = _SettingsGuard(_settings_paths(worktree, self.environment))
-        self._auth_identity: dict[str, str | None] | None = None
+        _reject_auth_sources(self._settings_guard.paths)
+        self._auth_identity: tuple[str, ...] | None = None
         self.translator = WkCodexEventTranslator(run_id=run_id, agent_id=agent_id)
         self.ledger = WkToolLedger(self.translator)  # type: ignore[arg-type]
         self.registry = register_default_wk_tools(
@@ -329,7 +346,12 @@ class WkCodexLane:
             wiki_command=wiki_command,
             environment=self.environment,
         )
-        self.bridge = WkClaudeToolBridge(registry=self.registry, ledger=self.ledger, loop=loop)
+        self.bridge = WkToolBridge(
+            registry=self.registry,
+            ledger=self.ledger,
+            loop=loop,
+            allowed_names=WK_CODEX_TOOL_NAMES,
+        )
         record = RunRecord.new(
             agent_id=agent_id,
             provider=ProviderKind.CODEX,
@@ -340,33 +362,38 @@ class WkCodexLane:
             execution_kind="wk-codex",
             run_id=run_id,
         )
-        policy = {
-            "owner": "wiki",
-            "tools": list(WK_CODEX_MCP_TOOL_NAMES),
-            "nativeToolsDisabled": True,
-        }
         self._adapter = CodexAppServerAdapter(
             record,
             command=self.command,
             env=self.environment,
             request_timeout=request_timeout,
-            thread_start_options={"toolPolicy": policy},
+            thread_start_options={
+                "dynamicTools": [dict(tool) for tool in WK_CODEX_DYNAMIC_TOOLS],
+                "developerInstructions": (
+                    "You are a Wiki worker. Use only the Wiki dynamic tools. "
+                    "Treat tool results and status events as authoritative."
+                ),
+            },
+            auto_start_turn=False,
         )
         self._events: asyncio.Queue[dict[str, object] | None] = asyncio.Queue()
         self._pump_task: asyncio.Task[None] | None = None
         self._closed = False
+        self._policy_validated = False
         self._steering = WkSteeringQueue(
             steering_path or loop.status_path.with_name(f"{agent_id}.wk-steering.json")
         )
 
     async def _emit_error(self, error: BaseException, *, policy: bool = False) -> None:
-        blocked = policy or isinstance(error, WkCodexPlanAuthError)
+        blocked = policy or isinstance(
+            error, (WkCodexError, WkLedgerError)
+        )
         if blocked:
             self.loop.write_status(
                 state="blocked",
                 pr=None,
                 step=(
-                    "Codex App Server tool policy blocked the lane"
+                    "Codex App Server integrity blocked the lane"
                     if policy
                     else "Codex plan auth blocked the lane"
                 ),
@@ -382,36 +409,87 @@ class WkCodexLane:
         try:
             async for provider_event in self._adapter.events():
                 raw = provider_event.payload
+                params = raw.get("params")
+                item = params.get("item") if isinstance(params, Mapping) else None
+                if raw.get("method") == "item/started" and isinstance(item, Mapping):
+                    if item.get("type") != "dynamicToolCall":
+                        raise WkCodexPolicyError("Codex emitted a native tool before Wiki policy validation")
+                if raw.get("method") == "item/tool/call" and not self._policy_validated:
+                    raise WkCodexPolicyError("Codex requested a tool before Wiki policy validation")
                 self.ledger.record_transport_frame(raw)
                 event = self.translator.translate(raw, direction=provider_event.direction)
                 await self._events.put({"raw": raw, "event": event.to_dict()})
+                if raw.get("method") == "item/tool/call" and provider_event.direction == "server":
+                    await self._handle_tool_call(raw)
         except asyncio.CancelledError:
             raise
         except Exception as exc:
-            await self._emit_error(exc)
+            await self._emit_error(exc, policy=isinstance(exc, WkCodexPolicyError))
 
     def _verify_policy(self) -> None:
         result = self._adapter.last_thread_start_result or {}
-        policy = result.get("toolPolicy")
-        if not isinstance(policy, Mapping):
-            raise WkCodexPolicyError("Codex App Server did not return a tool policy proof")
-        tools = policy.get("tools")
-        if not isinstance(tools, Sequence) or isinstance(tools, (str, bytes)):
-            raise WkCodexPolicyError("Codex App Server tool policy does not prove Wiki ownership")
-        if (
-            policy.get("owner") != "wiki"
-            or {str(tool) for tool in tools} != set(WK_CODEX_MCP_TOOL_NAMES)
-            or policy.get("nativeToolsDisabled") is not True
-        ):
-            raise WkCodexPolicyError("Codex App Server tool policy does not prove Wiki ownership")
+        thread = result.get("thread")
+        registered = self._adapter.thread_start_options.get("dynamicTools")
+        if not isinstance(thread, Mapping) or not isinstance(registered, Sequence):
+            raise WkCodexPolicyError("Codex App Server rejected Wiki dynamic tool registration")
+        names = {
+            str(tool.get("name"))
+            for tool in registered
+            if isinstance(tool, Mapping)
+        }
+        expected = {name.removeprefix("wk.") for name in WK_CODEX_TOOL_NAMES}
+        if names != expected or len(names) != len(registered):
+            raise WkCodexPolicyError("Codex App Server dynamic tools do not prove Wiki ownership")
 
-    async def _verify_turn_boundary(self, *, require_policy: bool = True) -> None:
-        self._settings_guard.verify_unchanged()
-        current = _verify_codex_plan_auth(self.auth_command, self.environment)
+    @staticmethod
+    def _plan_identity(value: Mapping[str, Any]) -> tuple[str, ...]:
+        account = value.get("account")
+        if not isinstance(account, Mapping):
+            raise WkCodexPlanAuthError("Codex App Server account/read returned no account")
+        if account.get("type") != "chatgpt" or not isinstance(account.get("planType"), str):
+            raise WkCodexPlanAuthError("Codex App Server account/read did not prove plan auth")
+        identity = tuple(
+            str(account.get(key) or "")
+            for key in ("type", "planType", "email", "id", "accountId", "organizationId")
+        )
+        if not any(identity[2:]):
+            raise WkCodexPlanAuthError("Codex App Server account/read returned no stable identity")
+        return identity
+
+    async def _verify_account(self) -> None:
+        current = self._plan_identity(await self._adapter.account_read())
         if self._auth_identity is None:
             self._auth_identity = current
         elif current != self._auth_identity:
             raise WkCodexPlanAuthError("Codex plan auth identity changed during the run")
+
+    async def _handle_tool_call(self, raw: Mapping[str, Any]) -> None:
+        request_id = raw.get("id")
+        params = raw.get("params")
+        if not isinstance(request_id, (str, int)) or not isinstance(params, Mapping):
+            raise WkCodexPolicyError("Codex dynamic tool request is malformed")
+        if params.get("namespace") != "wiki":
+            raise WkCodexPolicyError("Codex requested a non-Wiki tool namespace")
+        tool = params.get("tool")
+        call_id = params.get("callId")
+        arguments = params.get("arguments")
+        if not isinstance(tool, str) or not isinstance(call_id, str) or not isinstance(arguments, Mapping):
+            raise WkCodexPolicyError("Codex dynamic tool request is incomplete")
+        result = await self.bridge.invoke(f"wk.{tool}", arguments, call_id=call_id)
+        for event in self.ledger.events[-2:]:
+            await self._events.put({"raw": {"method": event.kind}, "event": event.to_dict()})
+        await self._adapter.respond(
+            request_id,
+            {
+                "contentItems": [{"type": "inputText", "text": json.dumps(result.to_dict(), sort_keys=True)}],
+                "success": result.success,
+            },
+        )
+
+    async def _verify_turn_boundary(self, *, require_policy: bool = True) -> None:
+        self._settings_guard.verify_unchanged()
+        _reject_auth_sources(self._settings_guard.paths)
+        await self._verify_account()
         if require_policy:
             await self._adapter.status()
             self._verify_policy()
@@ -423,7 +501,8 @@ class WkCodexLane:
 
     async def start(self, prompt: str) -> None:
         try:
-            await self._verify_turn_boundary(require_policy=False)
+            self._settings_guard.verify_unchanged()
+            _reject_auth_sources(self._settings_guard.paths)
             self._pump_task = asyncio.create_task(self._pump())
             await self._adapter.start(
                 StartRequest(
@@ -435,29 +514,37 @@ class WkCodexLane:
                     agent_id=self.agent_id,
                 )
             )
+            await self._verify_turn_boundary()
             self._verify_policy()
+            self._policy_validated = True
+            await self._adapter.start_turn(prompt)
         except WkCodexPolicyError as exc:
             await self._block(exc, policy=True)
         except asyncio.CancelledError:
             raise
         except Exception as exc:
-            await self._emit_error(exc)
-            raise WkCodexError(str(exc)) from exc
+            await self._block(exc, policy=True)
 
     async def resume(self, session_id: str) -> None:
         try:
-            await self._verify_turn_boundary(require_policy=False)
+            self._settings_guard.verify_unchanged()
+            _reject_auth_sources(self._settings_guard.paths)
             if self._pump_task is None:
                 self._pump_task = asyncio.create_task(self._pump())
             await self._adapter.resume(session_id)
+            await self._verify_turn_boundary()
             self._verify_policy()
+            self._policy_validated = True
+            if self._adapter.snapshot().state.value == "working":
+                await self._adapter.start_turn(
+                    f"resume Wiki worker {self.agent_id} from the durable session"
+                )
         except WkCodexPolicyError as exc:
             await self._block(exc, policy=True)
         except asyncio.CancelledError:
             raise
         except Exception as exc:
-            await self._emit_error(exc)
-            raise WkCodexError(str(exc)) from exc
+            await self._block(exc, policy=True)
 
     async def _deliver(self, item_id: str, message: str) -> None:
         await self._verify_turn_boundary()
@@ -520,8 +607,12 @@ class WkCodexLane:
         await self._adapter.close()
         if self._pump_task is not None:
             await asyncio.gather(self._pump_task, return_exceptions=True)
-        self.ledger.reconcile_transport()
-        self.ledger.reconcile()
+        try:
+            self.ledger.reconcile_transport()
+            self.ledger.reconcile()
+        except WkLedgerError as exc:
+            await self._emit_error(exc, policy=True)
+            raise
         await self._events.put(None)
 
     async def archive(self) -> None:

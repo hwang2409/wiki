@@ -1202,6 +1202,16 @@ class WkClaudeToolBridge:
         return result
 
 
+from .wk_common import (
+    WkLedgerError,
+    WkSessionTree,
+    WkSteeringQueue,
+    WkToolBridge as WkClaudeToolBridge,
+    WkToolLedger,
+)
+from .wk_tools import register_default_wk_tools
+
+
 def _sdk_tool_schema() -> dict[str, object]:
     return {"type": "object", "additionalProperties": True}
 

@@ -17,7 +17,7 @@ from backend.app.agent_runtime.wk_codex import (
     WkCodexPlanAuthError,
 )
 from backend.app.agent_runtime.wk_core import WkLoop, WkRunMetadata
-from backend.app.agent_runtime.wk_claude import WkLedgerError
+from backend.app.agent_runtime.wk_common import WkLedgerError
 
 
 FIXTURE = Path(__file__).parent / "fixtures" / "agent_runtime" / "wk_codex_app_server.py"
@@ -92,24 +92,44 @@ def test_plan_auth_environment_rejects_api_credentials() -> None:
         codex_plan_auth_environment({"HOME": "/tmp", "OPENAI_API_KEY": "secret"})
 
 
-def test_policy_proof_blocks_start_and_writes_blocked_status(
+def test_dynamic_tool_ownership_blocks_before_the_first_turn(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
     monkeypatch.setattr(wk_feature, "_WK_ENABLED", True)
     env = _environment(tmp_path)
-    (Path(env["CODEX_HOME"]) / "policy.json").write_text(
-        json.dumps({"owner": "provider", "tools": ["shell"], "nativeToolsDisabled": False}),
-        encoding="utf-8",
-    )
     lane = _lane(tmp_path, environment=env)
+    lane._adapter._thread_start_options["dynamicTools"] = []
 
     async def run() -> None:
-        with pytest.raises(WkCodexError, match="tool policy"):
+        with pytest.raises(WkCodexError, match="dynamicTools"):
             await lane.start("start")
 
     asyncio.run(run())
     status = json.loads((tmp_path / "status.json").read_text(encoding="utf-8"))
     assert status["state"] == "blocked"
+    methods = (Path(env["CODEX_HOME"]) / "transport.log").read_text(encoding="utf-8").splitlines()
+    assert "thread/start" in methods
+    assert "turn/start" not in methods
+
+
+def test_policy_validation_finishes_before_any_turn_start(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    monkeypatch.setattr(wk_feature, "_WK_ENABLED", True)
+    lane = _lane(tmp_path)
+
+    def reject_policy() -> None:
+        raise RuntimeError("policy validation failed")
+
+    lane._verify_policy = reject_policy  # type: ignore[method-assign]
+
+    async def run() -> None:
+        with pytest.raises(WkCodexError, match="policy validation failed"):
+            await lane.start("start")
+
+    asyncio.run(run())
+    methods = (Path(lane.environment["CODEX_HOME"]) / "transport.log").read_text(encoding="utf-8").splitlines()
+    assert "turn/start" not in methods
 
 
 def test_real_codex_transport_translates_and_reconciles(
@@ -225,7 +245,7 @@ def test_codex_gate_uses_real_process_and_reconciles(
     monkeypatch.setattr(wk_feature, "_WK_ENABLED", True)
     gate = tmp_path / "wiki-gate"
     gate.write_text(
-        "#!/bin/sh\nprintf '%s\\n' '{\"ready\":true}'\nexit 0\n",
+        "#!/bin/sh\nprintf '%s\\n' invoked > gate-invoked\nprintf '%s\\n' '{\"ready\":true}'\nexit 0\n",
         encoding="utf-8",
     )
     gate.chmod(0o755)
@@ -234,16 +254,20 @@ def test_codex_gate_uses_real_process_and_reconciles(
         environment=_environment(tmp_path),
         wiki_command=(str(gate),),
     )
+    (Path(lane.environment["CODEX_HOME"]) / "gate-call").touch()
 
     async def run() -> None:
-        result = await lane.bridge.invoke("wk.gate", {"pr": "230"}, call_id="gate-1")
-        assert result.success is True
-        assert result.exit_code == 0
-        assert result.mutation_receipt is not None
-        assert result.mutation_receipt["verdict"] == {"ready": True}
-        lane.ledger.reconcile()
+        await lane.start("start")
+        async for row in lane.events():
+            event = row.get("event")
+            if isinstance(event, dict) and event.get("kind") == "codex.turn_completed":
+                break
+        await lane.close()
 
     asyncio.run(run())
+    assert (tmp_path / "gate-invoked").read_text(encoding="utf-8").strip() == "invoked"
+    gate_events = [event for event in lane.ledger.events if event.kind.startswith("tool.")]
+    assert {event.kind for event in gate_events} == {"tool.started", "tool.completed"}
 
 
 def test_dropped_tool_result_fails_transport_reconciliation(

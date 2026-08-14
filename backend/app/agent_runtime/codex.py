@@ -81,6 +81,7 @@ class CodexAppServerAdapter(ProviderAdapter):
         request_timeout: float = 30.0,
         identity_resolver: IdentityResolver = resolve_provider_identity,
         thread_start_options: Mapping[str, Any] | None = None,
+        auto_start_turn: bool = True,
     ):
         child_env = dict(os.environ if env is None else env)
         child_env.pop("TMUX", None)
@@ -126,6 +127,11 @@ class CodexAppServerAdapter(ProviderAdapter):
         self._turn_start_pending = False
         self._thread_start_options = dict(thread_start_options or {})
         self._last_thread_start_result: dict[str, Any] | None = None
+        self._auto_start_turn = auto_start_turn
+
+    @property
+    def thread_start_options(self) -> Mapping[str, Any]:
+        return self._thread_start_options
 
     @property
     def last_thread_start_result(self) -> dict[str, Any] | None:
@@ -745,8 +751,21 @@ class CodexAppServerAdapter(ProviderAdapter):
         )
         self._last_thread_start_result = result
         self._remember_thread(self._thread_from_result(result), generation)
-        await self._start_turn(prompt)
+        if self._auto_start_turn:
+            await self._start_turn(prompt)
         await self._refresh_identity(required=True)
+
+    async def start_turn(self, text: str) -> None:
+        """Start a turn after the lane has completed its integrity checks."""
+
+        async with self._operation_lock:
+            await self._start_turn(text)
+
+    async def account_read(self) -> dict[str, Any]:
+        """Read plan identity on this exact App Server connection."""
+
+        async with self._operation_lock:
+            return await self._rpc("account/read", {"refreshToken": False})
 
     async def start(self, request: StartRequest) -> AdapterStatus:
         async with self._operation_lock:
@@ -784,7 +803,7 @@ class CodexAppServerAdapter(ProviderAdapter):
                 )
                 self._last_thread_start_result = result
                 self._remember_thread(self._thread_from_result(result), generation)
-                if self._resume_state is LifecycleState.WORKING:
+                if self._resume_state is LifecycleState.WORKING and self._auto_start_turn:
                     status_dir = Path(
                         self.env.get(
                             "WIKI_AGENT_STATUS_DIR",
