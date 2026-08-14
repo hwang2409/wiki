@@ -1,0 +1,11 @@
+{"type":"system","subtype":"init","session_id":"sdk-session-1","apiKeySource":"none","tools":["mcp__wiki__read","mcp__wiki__write","mcp__wiki__edit","mcp__wiki__bash","mcp__wiki__gate","mcp__wiki__status"],"hooks":[],"setting_sources":[],"mcp_servers":[{"name":"wiki","status":"connected"}]}
+{"type":"assistant","session_id":"sdk-session-1","message":{"id":"msg-1","model":"claude-sonnet-4-6","role":"assistant","content":[{"type":"text","text":"I will inspect the file."},{"type":"tool_use","id":"tool-read-1","name":"mcp__wiki__read","input":{"path":"README.md"}}],"stop_reason":"tool_use","usage":{"input_tokens":11,"output_tokens":7}}}
+{"type":"user","session_id":"sdk-session-1","message":{"role":"user","content":[{"type":"tool_result","tool_use_id":"tool-read-1","content":"file contents","is_error":false}]}}
+{"type":"result","subtype":"success","duration_ms":12,"duration_api_ms":10,"is_error":false,"num_turns":1,"session_id":"sdk-session-1","result":"done","usage":{"input_tokens":11,"output_tokens":7}}
+{"type":"assistant","session_id":"sdk-session-1","message":{"id":"msg-2","model":"claude-sonnet-4-6","role":"assistant","content":[{"type":"tool_use","id":"tool-bash-1","name":"mcp__wiki__bash","input":{"command":"pytest"}}],"stop_reason":"tool_use","usage":{"input_tokens":13,"output_tokens":5}}}
+{"type":"control_request","request_id":"approval-1","request":{"subtype":"can_use_tool","tool_name":"mcp__wiki__bash","tool_use_id":"tool-bash-1","input":{"command":"pytest"}}}
+{"type":"user","session_id":"sdk-session-1","message":{"role":"user","content":[{"type":"tool_result","tool_use_id":"tool-bash-1","content":"exit code 17","is_error":true}]}}
+{"type":"result","subtype":"error_during_execution","duration_ms":20,"duration_api_ms":18,"is_error":true,"num_turns":1,"session_id":"sdk-session-1","result":"tool failed"}
+{"type":"system","subtype":"compact_boundary","session_id":"sdk-session-1","trigger":"manual","summary":"kept the active task and tool context"}
+{"type":"result","subtype":"interrupted","duration_ms":25,"duration_api_ms":22,"is_error":true,"num_turns":1,"session_id":"sdk-session-1","result":"interrupted"}
+{"type":"system","subtype":"session_resumed","session_id":"sdk-session-1","resume_from":"tool-bash-1"}
