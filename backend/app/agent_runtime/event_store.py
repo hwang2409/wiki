@@ -105,6 +105,7 @@ class RunCursor:
     last_lifecycle_change: tuple[int, int] | None = None
     normalizer_version: str = NORMALIZER_VERSION
     rebuild_state: str = "ready"
+    rebuild_generation: int = 0
 
 
 @dataclass(frozen=True)
@@ -1066,10 +1067,6 @@ class SQLiteEventStore:
             ).fetchone()
             if revision_row is None:
                 continue
-            if change.get("kind") == "tail" and int(revision_row[0]) == 1:
-                # A tail change creates the row.  Patches only describe
-                # changes to an existing visible event.
-                continue
             connection.execute(
                 "INSERT INTO patches(run_id, change_cursor, event_id, raw_seq, "
                 "patch_json, event_revision, created_at) VALUES (?, ?, ?, ?, ?, ?, ?)",
@@ -1173,7 +1170,20 @@ class SQLiteEventStore:
         if row is None:
             raise KeyError(run_id)
         lifecycle = json.loads(row[9]) if row[9] else None
-        return RunCursor(*row[:9], lifecycle, row[10], row[11])
+        return RunCursor(
+            *row[:9], lifecycle, row[10], row[11], self.rebuild_generation(run_id)
+        )
+
+    def rebuild_generation(self, run_id: str) -> int:
+        """Return the durable number of atomic replacements for one run."""
+
+        with self.connection(read_only=True) as connection:
+            row = connection.execute(
+                "SELECT COUNT(*) FROM parity_records WHERE run_id = ? "
+                "AND record_type = 'rebuild_generation'",
+                (run_id,),
+            ).fetchone()
+        return int(row[0]) if row is not None else 0
 
     def view_rows(self, run_id: str) -> dict[str, list[tuple[Any, ...]]]:
         """Return deterministic raw SQLite rows for replay parity tests."""
@@ -1528,6 +1538,17 @@ class SQLiteEventStore:
                             f"SELECT {columns} FROM rebuilt.{table} WHERE run_id = ?",
                             (run_id,),
                         )
+                    connection.execute(
+                        "INSERT INTO parity_records "
+                        "(run_id, normalizer_version, record_type, path, detail_json, recorded_at) "
+                        "VALUES (?, ?, 'rebuild_generation', 'replace_run_from', ?, ?)",
+                        (
+                            run_id,
+                            NORMALIZER_VERSION,
+                            _json_bytes({"source": str(source_path)}),
+                            utc_now(),
+                        ),
+                    )
                     connection.commit()
                     connection.execute("DETACH DATABASE rebuilt")
                     attached = False

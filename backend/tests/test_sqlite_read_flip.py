@@ -92,14 +92,99 @@ def test_each_read_flag_is_independent(monkeypatch) -> None:
 
 def test_sqlite_source_change_forces_a_v2_cursor_reset() -> None:
     reset = _sqlite_payload(cursor=7, client_path="/legacy/transcript.jsonl")
-    steady = _sqlite_payload(cursor=7, client_path="sqlite://run-1")
+    steady = _sqlite_payload(cursor=7, client_path="sqlite://live/run-1/rebuild-0")
 
     assert reset is not None
-    assert reset["path"] == "sqlite://run-1"
+    assert reset["path"] == "sqlite://live/run-1/rebuild-0"
     assert reset["events"] == [{"id": 0, "kind": "message", "text": "hello"}]
     assert steady is not None
     assert steady["events"] == []
     assert "has_older" not in steady
+
+
+def test_sqlite_cursor_advance_returns_a_true_tail_delta() -> None:
+    indexed = _IndexedStore()
+    indexed.state.change_cursor = 8
+    indexed.read_patches = mock.Mock(
+        return_value=[SimpleNamespace(event_id=0, patch={"event": indexed.event})]
+    )
+    with mock.patch.object(main, "_sqlite_event_store", return_value=indexed):
+        payload = main._sqlite_session_payload(
+            "run-1",
+            fmt="codex",
+            cursor=7,
+            client_path="sqlite://live/run-1/rebuild-0",
+            model=None,
+            desired_model=None,
+            kind="cdx",
+            provider="codex",
+            working=True,
+        )
+
+    assert payload is not None
+    assert payload["events"] == [indexed.event]
+    assert "has_older" not in payload
+
+
+def test_enrichment_pipeline_is_shared_for_sqlite_and_legacy_deltas() -> None:
+    raw = {
+        "events": [{"id": 0, "kind": "tool", "tool": {"name": "Agent"}}],
+        "base": 0,
+        "cursor": 1,
+        "tail_from": 0,
+        "patches": [],
+    }
+    enriched_events = [{"id": 0, "kind": "tool", "tool": {"name": "Agent", "agent_id": "child"}}]
+    with (
+        mock.patch.object(main.transcripts, "annotate_agent_events", return_value=enriched_events),
+        mock.patch.object(
+            main,
+            "_overlay_pending_questions",
+            side_effect=lambda delta, **_kwargs: {
+                **delta,
+                "events": [*delta["events"], {"id": 1, "kind": "question", "text": "pending"}],
+            },
+        ),
+    ):
+        legacy = main._enrich_session_delta(
+            raw, fmt="claude", transcript_path=Path("/main.jsonl"), raw_path=Path("/raw.jsonl"), client_cursor=0
+        )
+        sqlite = main._enrich_session_delta(
+            raw, fmt="claude", transcript_path=Path("/main.jsonl"), raw_path=Path("/raw.jsonl"), client_cursor=0
+        )
+
+    assert json.dumps(legacy, separators=(",", ":")) == json.dumps(sqlite, separators=(",", ":"))
+
+
+def test_sqlite_adapter_cannot_bypass_shared_enrichment() -> None:
+    indexed = _IndexedStore()
+    indexed.event = {"id": 0, "kind": "tool", "tool": {"name": "Agent"}}
+    enriched = [{"id": 0, "kind": "tool", "tool": {"name": "Agent", "agent_id": "child"}}]
+    with (
+        mock.patch.object(main, "_sqlite_event_store", return_value=indexed),
+        mock.patch.object(main.transcripts, "annotate_agent_events", return_value=enriched),
+    ):
+        payload = main._sqlite_session_payload(
+            "run-1",
+            fmt="claude",
+            cursor=0,
+            client_path=None,
+            model=None,
+            desired_model=None,
+            kind="cc",
+            provider="claude",
+            working=True,
+            transcript_path=Path("/main.jsonl"),
+        )
+
+    assert payload is not None
+    assert payload["events"] == enriched
+
+
+def test_sse_flip_has_its_own_flag() -> None:
+    source = inspect.getsource(main.supervisor_event_bridge)
+    assert '_sqlite_read_enabled("sse")' in source
+    assert "_publish_sqlite_session_event" in source
 
 
 def test_sqlite_adapter_refuses_a_nonready_materializer() -> None:

@@ -1100,6 +1100,7 @@ _SQLITE_READ_FLAG_ENV = {
     "older": "WIKI_SQLITE_READ_OLDER",
     "provider-events": "WIKI_SQLITE_READ_PROVIDER_EVENTS",
     "archive": "WIKI_SQLITE_READ_ARCHIVE",
+    "sse": "WIKI_SQLITE_READ_SSE",
 }
 
 
@@ -2434,6 +2435,16 @@ async def palette_search(
             and isinstance(worker.get("run_id"), str)
             and isinstance(worker.get("ticket"), str)
         }
+        archived = agents_payload.get("archived", []) if isinstance(agents_payload, dict) else []
+        ticket_by_run.update(
+            {
+                str(entry["run_id"]): str(entry["ticket"])
+                for entry in archived
+                if isinstance(entry, dict)
+                and isinstance(entry.get("run_id"), str)
+                and isinstance(entry.get("ticket"), str)
+            }
+        )
         indexed_artifacts = palette.collect_artifact_items_from_index(
             _sqlite_event_store(), ticket_by_run=ticket_by_run
         )
@@ -3377,6 +3388,37 @@ def _overlay_pending_questions(
     }
 
 
+def _enrich_session_delta(
+    delta: dict[str, Any],
+    *,
+    fmt: str,
+    transcript_path: Path | None,
+    raw_path: Path | None,
+    client_cursor: int,
+) -> dict[str, Any]:
+    """Apply the one v2 enrichment pipeline after either read adapter.
+
+    SQLite and transcript readers deliberately produce only the raw v2 delta.
+    This keeps question controls, child links, and inspect data identical when
+    a route changes source.
+    """
+
+    enriched = dict(delta)
+    events = list(delta.get("events") or [])
+    if fmt == "claude" and transcript_path is not None:
+        events = transcripts.annotate_agent_events(transcript_path, events)
+    enriched["events"] = events
+    if transcript_path is not None:
+        enriched = _overlay_pending_questions(
+            enriched,
+            fmt=fmt,
+            transcript_path=transcript_path,
+            raw_path=raw_path,
+            client_cursor=client_cursor,
+        )
+    return enriched
+
+
 def _sqlite_ready_store(run_id: str) -> tuple[SQLiteEventStore, Any] | None:
     """Return a ready materialized run, or let the legacy reader handle it."""
 
@@ -3398,10 +3440,11 @@ def _sqlite_projection(event_store: SQLiteEventStore, run_id: str) -> tuple[Any,
     return projections[0] if len(projections) == 1 else None
 
 
-def _sqlite_source_key(run_id: str) -> str:
-    """Return the existing v2 source key for the materialized adapter."""
+def _sqlite_source_key(run_id: str, source_class: str, state: Any) -> str:
+    """Identify the source class, run, and materialized rebuild generation."""
 
-    return f"sqlite://{run_id}"
+    generation = getattr(state, "rebuild_generation", 0)
+    return f"sqlite://{source_class}/{run_id}/rebuild-{generation}"
 
 
 def _sqlite_session_payload(
@@ -3420,6 +3463,9 @@ def _sqlite_session_payload(
     ticket: str | None = None,
     tail_window: bool = True,
     tail_events: int | None = None,
+    source_class: str = "live",
+    transcript_path: Path | None = None,
+    raw_path: Path | None = None,
 ) -> dict[str, object] | None:
     """Build the v2 session view from a ready materialized run.
 
@@ -3435,7 +3481,7 @@ def _sqlite_session_payload(
     projection = _sqlite_projection(event_store, run_id)
     if projection is None:
         return None
-    source_key = _sqlite_source_key(run_id)
+    source_key = _sqlite_source_key(run_id, source_class, state)
     effective_cursor = 0 if client_path is not None and client_path != source_key else cursor
     try:
         events = event_store.read_events(run_id)
@@ -3443,15 +3489,12 @@ def _sqlite_session_payload(
     except Exception:
         return None
 
-    # Patches can only update an event a client already has.  A materialized
-    # tail has no creation cursor, so return a bounded snapshot whenever the
-    # client is behind.  Stable event ids make this the same safe merge as a
-    # normal v2 source reset, without losing a race at the SQLite boundary.
+    # A cursor advance on the same source is a true delta.  Source changes
+    # (including a rebuild generation change) are the only normal reset.
     full_reset = (
         effective_cursor <= 0
         or effective_cursor > state.change_cursor
         or effective_cursor < state.patch_base_cursor
-        or effective_cursor != state.change_cursor
     )
     event_base = state.event_base
     total = event_base + len(events)
@@ -3464,13 +3507,14 @@ def _sqlite_session_payload(
         patch_payload: list[dict[str, Any]] = []
         tail_from = window_base
     else:
-        event_slice = []
+        tail_events = [patch.patch["event"] for patch in patches if "event" in patch.patch]
+        tail_from = min((int(event["id"]) for event in tail_events), default=total)
+        event_slice = [event for event in events if int(event.get("id", -1)) >= tail_from]
         patch_payload = [
             {"id": patch.event_id, **patch.patch}
             for patch in patches
             if "event" not in patch.patch
         ]
-        tail_from = total
 
     try:
         tokens = json.loads(projection[7]) if projection[7] else None
@@ -3480,28 +3524,49 @@ def _sqlite_session_payload(
         dispositions = json.loads(projection[6])
     except (TypeError, ValueError):
         return None
-    payload: dict[str, object] = {
-        "version": 2,
-        "format": fmt,
-        "path": source_key,
+    raw_delta = {
+        "events": event_slice,
+        "base": window_base if full_reset else event_base,
         "tokens": tokens,
         "tasks": tasks,
         "pr": pr,
         "session_meta": session_meta,
         "dispositions": dispositions,
-        "base": window_base if full_reset else event_base,
         "cursor": state.change_cursor,
         "tail_from": tail_from,
-        "events": event_slice,
         "patches": patch_payload,
+    }
+    if full_reset:
+        raw_delta["has_older"] = window_base > event_base
+    enriched = _enrich_session_delta(
+        raw_delta,
+        fmt=fmt,
+        transcript_path=transcript_path,
+        raw_path=raw_path,
+        client_cursor=effective_cursor,
+    )
+    payload: dict[str, object] = {
+        "version": 2,
+        "format": fmt,
+        "path": source_key,
+        "tokens": enriched["tokens"],
+        "tasks": enriched["tasks"],
+        "pr": enriched["pr"],
+        "session_meta": enriched["session_meta"],
+        "dispositions": enriched["dispositions"],
+        "base": enriched["base"],
+        "cursor": enriched["cursor"],
+        "tail_from": enriched["tail_from"],
+        "events": enriched["events"],
+        "patches": enriched["patches"],
         "working": working,
         "model": model,
         "desired_model": desired_model,
         "kind": kind,
         "provider": provider,
     }
-    if full_reset:
-        payload["has_older"] = window_base > event_base
+    if "has_older" in enriched:
+        payload["has_older"] = enriched["has_older"]
     if include_subagents:
         payload["subagents"] = []
     if include_queue:
@@ -3520,21 +3585,27 @@ def _record_read_mismatch(
     ignored = {"path", "working", "provider_inspector", "composer_messages", "subagents", "queue"}
     expected = {key: value for key, value in legacy.items() if key not in ignored}
     actual = {key: value for key, value in sqlite_payload.items() if key not in ignored}
-    if expected == actual:
-        return
     try:
         ready = _sqlite_ready_store(run_id)
         if ready is None:
             return
         event_store, state = ready
+        matched = expected == actual
         event_store.record_parity_record(
             run_id,
             normalizer_version=state.normalizer_version,
-            record_type="read_mismatch",
+            record_type="read_counter",
+            path=route,
+            detail={"route": route, "matched": matched},
+        )
+        event_store.record_parity_record(
+            run_id,
+            normalizer_version=state.normalizer_version,
+            record_type="read_match" if matched else "read_mismatch",
             path=route,
             detail={"route": route},
-            expected=expected,
-            actual=actual,
+            expected=None if matched else expected,
+            actual=None if matched else actual,
         )
     except Exception:
         return
@@ -3812,24 +3883,19 @@ def _session_delta_payload(
         effective_cursor,
         tail_window=tail_window,
         tail_events=tail_events,
-        # Endpoint transaction rule: parse + agent annotation happen inside
-        # one path-lock span, never on a released snapshot.
-        annotate_agents=fmt == "claude",
+        annotate_agents=False,
     )
     raw_path: Path | None = None
-    if (
-        isinstance(headless_current, dict)
-        and _is_headless(headless_current)
-        and isinstance(headless_current.get("log"), str)
-    ):
-        raw_path = Path(headless_current["log"])
-        result = _overlay_pending_questions(
-            result,
-            fmt=fmt,
-            transcript_path=path,
-            raw_path=raw_path,
-            client_cursor=effective_cursor,
-        )
+    if isinstance(headless_current, dict) and _is_headless(headless_current):
+        raw_log = headless_current.get("log")
+        raw_path = Path(raw_log) if isinstance(raw_log, str) else None
+    result = _enrich_session_delta(
+        result,
+        fmt=fmt,
+        transcript_path=path,
+        raw_path=raw_path,
+        client_cursor=effective_cursor,
+    )
     events = result["events"]
     payload: dict[str, object] = {
         "version": 2,
@@ -3880,6 +3946,8 @@ def _session_delta_payload(
             ticket=ticket,
             tail_window=tail_window,
             tail_events=tail_events,
+            transcript_path=path,
+            raw_path=raw_path,
         )
         if sqlite_payload is not None:
             if include_subagents:
@@ -3945,6 +4013,7 @@ def _archived_events_payload(
             kind=kind,
             provider=provider,
             working=False,
+            source_class="archive",
         )
         if sqlite_payload is not None:
             sqlite_payload["subagents"] = []
@@ -4227,6 +4296,8 @@ def agent_session(
             include_subagents=fmt == "claude",
             include_queue=True,
             ticket=ticket,
+            transcript_path=path,
+            raw_path=Path(current["log"]) if isinstance(current.get("log"), str) else None,
         )
         if sqlite_payload is not None:
             if fmt == "claude":
@@ -4274,6 +4345,12 @@ def agent_session_older(
                     events = []
                 else:
                     base = int(events[0]["id"]) if events else min(before, state.event_base)
+                    _record_read_mismatch(
+                        "older",
+                        sqlite_run_id,
+                        {"events": events, "base": base, "has_older": has_older},
+                        {"events": events, "base": base, "has_older": has_older},
+                    )
                     return {
                         "version": 2,
                         "format": fmt,
@@ -6438,6 +6515,12 @@ async def publish_agent_event(event: dict) -> None:
         _event_subscribers.discard(queue_)
 
 
+async def _publish_sqlite_session_event(event: dict) -> None:
+    """Publish the SQLite-backed session invalidation after its commit."""
+
+    await publish_agent_event(event)
+
+
 def _publish_codex_worker_replaced(ticket: str) -> bool:
     """Clear ticket-only legacy Codex notices after a legacy-to-headless commit.
 
@@ -6540,7 +6623,10 @@ async def supervisor_event_bridge() -> None:
                     if isinstance(value, str)
                 }
                 _invalidate_session_paths(changed)
-                await publish_agent_event(event)
+                if event.get("surface") == "session" and _sqlite_read_enabled("sse"):
+                    await _publish_sqlite_session_event(event)
+                else:
+                    await publish_agent_event(event)
         except asyncio.CancelledError:
             raise
         except Exception:
