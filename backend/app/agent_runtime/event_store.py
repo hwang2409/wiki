@@ -28,8 +28,12 @@ from .types import (
     validate_transition,
 )
 
-SCHEMA_VERSION = 4
+SCHEMA_VERSION = 5
 NORMALIZER_VERSION = "wiki-282-1"
+
+
+_RUN_LOCKS: dict[tuple[str, str], threading.RLock] = {}
+_RUN_LOCKS_GUARD = threading.Lock()
 
 
 def runtime_event_db_path(runtime_dir: Path | str) -> Path:
@@ -490,6 +494,12 @@ _MIGRATIONS: dict[int, str] = {
     4: """
     ALTER TABLE parity_records ADD COLUMN raw_seq INTEGER;
     """,
+    5: """
+    CREATE TABLE IF NOT EXISTS backfill_progress (
+        normalizer_version TEXT PRIMARY KEY,
+        cursor_run_id TEXT NOT NULL DEFAULT ''
+    );
+    """,
 }
 
 
@@ -587,6 +597,53 @@ class SQLiteEventStore:
             raise
         finally:
             connection.close()
+
+    def run_lock(self, run_id: str) -> threading.RLock:
+        """Return the process-wide lock for one database run view."""
+
+        key = (str(self.path.absolute()), run_id)
+        with _RUN_LOCKS_GUARD:
+            return _RUN_LOCKS.setdefault(key, threading.RLock())
+
+    def backfill_completed_run_ids(self, normalizer_version: str) -> set[str]:
+        """Return runs whose completed marker makes them backfill-ineligible."""
+
+        self.ensure_schema()
+        with self.connection(read_only=True) as connection:
+            rows = connection.execute(
+                "SELECT DISTINCT run_id FROM parity_records "
+                "WHERE normalizer_version = ? AND record_type = 'backfill_completed'",
+                (normalizer_version,),
+            ).fetchall()
+        return {str(row[0]) for row in rows}
+
+    def backfill_cursor(self, normalizer_version: str) -> str:
+        """Return the durable next-batch position for one normalizer."""
+
+        self.ensure_schema()
+        with self.connection(read_only=True) as connection:
+            row = connection.execute(
+                "SELECT cursor_run_id FROM backfill_progress "
+                "WHERE normalizer_version = ?",
+                (normalizer_version,),
+            ).fetchone()
+        return str(row[0]) if row is not None else ""
+
+    def advance_backfill_cursor(
+        self,
+        normalizer_version: str,
+        run_id: str,
+    ) -> None:
+        """Durably advance the backfill scan after one examined run."""
+
+        self.ensure_schema()
+        with self.connection() as connection:
+            connection.execute(
+                "INSERT INTO backfill_progress(normalizer_version, cursor_run_id) "
+                "VALUES (?, ?) ON CONFLICT(normalizer_version) DO UPDATE SET "
+                "cursor_run_id = excluded.cursor_run_id",
+                (normalizer_version, run_id),
+            )
 
     def create_run(
         self,
@@ -863,38 +920,39 @@ class SQLiteEventStore:
         reducer: EventReducerAdapter,
         normalized: NormalizedProviderEvent | None = None,
     ) -> ReducerResult:
-        self.ensure_schema()
-        raw_seq = int(raw["seq"])
-        if self.has_disposition(run_id, raw_seq):
-            raise ValueError(f"raw sequence {raw_seq} is already materialized")
-        try:
-            with self.connection() as connection:
-                connection.execute("BEGIN IMMEDIATE")
-                result = reducer.apply_raw(raw, normalized)
-                received_at = str(raw.get("received_at") or "")
-                normalized = result.normalized
-                connection.execute(
-                    "INSERT INTO dispositions "
-                    "(run_id, raw_seq, disposition, normalized_kind, normalized_json, "
-                    "normalizer_version, created_at) VALUES (?, ?, ?, ?, ?, ?, ?)",
-                    (
-                        run_id,
-                        raw_seq,
-                        normalized["disposition"],
-                        normalized["kind"],
-                        _json_bytes(normalized),
-                        reducer.normalizer_version,
-                        received_at,
-                    ),
-                )
-                self._persist_events(connection, run_id, result, received_at)
-                self._persist_patches(connection, run_id, result, received_at)
-                self._persist_projections(connection, run_id, reducer, result)
-                self._persist_cursor(connection, run_id, result, reducer)
-        except Exception:
-            self._restore_reducer_from_committed_rows(run_id, reducer)
-            raise
-        return result
+        with self.run_lock(run_id):
+            self.ensure_schema()
+            raw_seq = int(raw["seq"])
+            if self.has_disposition(run_id, raw_seq):
+                raise ValueError(f"raw sequence {raw_seq} is already materialized")
+            try:
+                with self.connection() as connection:
+                    connection.execute("BEGIN IMMEDIATE")
+                    result = reducer.apply_raw(raw, normalized)
+                    received_at = str(raw.get("received_at") or "")
+                    normalized = result.normalized
+                    connection.execute(
+                        "INSERT INTO dispositions "
+                        "(run_id, raw_seq, disposition, normalized_kind, normalized_json, "
+                        "normalizer_version, created_at) VALUES (?, ?, ?, ?, ?, ?, ?)",
+                        (
+                            run_id,
+                            raw_seq,
+                            normalized["disposition"],
+                            normalized["kind"],
+                            _json_bytes(normalized),
+                            reducer.normalizer_version,
+                            received_at,
+                        ),
+                    )
+                    self._persist_events(connection, run_id, result, received_at)
+                    self._persist_patches(connection, run_id, result, received_at)
+                    self._persist_projections(connection, run_id, reducer, result)
+                    self._persist_cursor(connection, run_id, result, reducer)
+            except Exception:
+                self._restore_reducer_from_committed_rows(run_id, reducer)
+                raise
+            return result
 
     def _restore_reducer_from_committed_rows(
         self,
@@ -1355,17 +1413,18 @@ class SQLiteEventStore:
     ) -> None:
         """Atomically replace one run from a validated temporary database."""
 
-        self.ensure_schema()
-        source_path = Path(source).absolute()
-        if not source_path.is_file():
-            raise FileNotFoundError(source_path)
-        with self.connection() as connection:
-            connection.execute("ATTACH DATABASE ? AS rebuilt", (str(source_path),))
-            attached = True
-            try:
-                connection.execute("BEGIN IMMEDIATE")
-                connection.execute("DELETE FROM runs WHERE run_id = ?", (run_id,))
-                for table, columns in (
+        with self.run_lock(run_id):
+            self.ensure_schema()
+            source_path = Path(source).absolute()
+            if not source_path.is_file():
+                raise FileNotFoundError(source_path)
+            with self.connection() as connection:
+                connection.execute("ATTACH DATABASE ? AS rebuilt", (str(source_path),))
+                attached = True
+                try:
+                    connection.execute("BEGIN IMMEDIATE")
+                    connection.execute("DELETE FROM runs WHERE run_id = ?", (run_id,))
+                    for table, columns in (
                     (
                         "runs",
                         "run_id, agent_id, provider, format, normalizer_version, "
@@ -1400,21 +1459,21 @@ class SQLiteEventStore:
                         "run_id, change_cursor, event_id, raw_seq, patch_json, "
                         "event_revision, created_at",
                     ),
-                ):
-                    connection.execute(
-                        f"INSERT INTO main.{table} ({columns}) "
-                        f"SELECT {columns} FROM rebuilt.{table} WHERE run_id = ?",
-                        (run_id,),
-                    )
-                connection.commit()
-                connection.execute("DETACH DATABASE rebuilt")
-                attached = False
-            except BaseException:
-                connection.rollback()
-                raise
-            finally:
-                if attached:
+                    ):
+                        connection.execute(
+                            f"INSERT INTO main.{table} ({columns}) "
+                            f"SELECT {columns} FROM rebuilt.{table} WHERE run_id = ?",
+                            (run_id,),
+                        )
+                    connection.commit()
                     connection.execute("DETACH DATABASE rebuilt")
+                    attached = False
+                except BaseException:
+                    connection.rollback()
+                    raise
+                finally:
+                    if attached:
+                        connection.execute("DETACH DATABASE rebuilt")
 
 
 def replay_raw_jsonl(

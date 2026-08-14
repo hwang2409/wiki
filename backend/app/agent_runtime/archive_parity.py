@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import logging
 import tempfile
 from dataclasses import dataclass
 from pathlib import Path
@@ -11,11 +12,85 @@ from typing import Any
 from .. import transcripts
 from .event_store import NORMALIZER_VERSION, SQLiteEventStore, replay_raw_jsonl
 from .store import RunStore
+from .types import TERMINAL_STATES
 
 
 _IGNORED_PARITY_KEYS = frozenset(
     {"normalized_at", "path", "file_path", "transcript_path"}
 )
+
+_LOG = logging.getLogger(__name__)
+
+
+def harness_error_fallback_path(event_store: SQLiteEventStore) -> Path:
+    """Return the append-only fallback journal for failed parity writes."""
+
+    return event_store.path.parent / "archive-parity-harness-errors.jsonl"
+
+
+def _record_parity_record(
+    event_store: SQLiteEventStore,
+    run_id: str,
+    *,
+    normalizer_version: str,
+    record_type: str,
+    path: str,
+    detail: dict[str, Any],
+    expected: Any = None,
+    actual: Any = None,
+    raw_seq: int | None = None,
+) -> bool:
+    """Record parity output without allowing recorder failures to stop a batch."""
+
+    try:
+        event_store.record_parity_record(
+            run_id,
+            normalizer_version=normalizer_version,
+            record_type=record_type,
+            path=path,
+            detail=detail,
+            expected=expected,
+            actual=actual,
+            raw_seq=raw_seq,
+        )
+    except Exception as exc:
+        fallback = {
+            "run_id": run_id,
+            "normalizer_version": normalizer_version,
+            "record_type": record_type,
+            "path": path,
+            "detail": detail,
+            "raw_seq": raw_seq,
+            "recording_error": f"{type(exc).__name__}: {exc}",
+        }
+        _LOG.exception("archive parity recorder failed for %s", run_id)
+        try:
+            fallback_path = harness_error_fallback_path(event_store)
+            fallback_path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+            with fallback_path.open("a", encoding="utf-8") as handle:
+                handle.write(json.dumps(fallback, sort_keys=True))
+                handle.write("\n")
+        except Exception:
+            _LOG.exception("archive parity fallback recorder failed for %s", run_id)
+        return False
+    return True
+
+
+def _record_harness_error(
+    event_store: SQLiteEventStore,
+    run_id: str,
+    *,
+    path: str,
+    error: Exception,
+) -> None:
+    _record_parity_record(
+        event_store,
+        run_id,
+        normalizer_version=_safe_normalizer_version(event_store, run_id),
+        record_type="harness_error",
+        path=path,
+        detail={"error": f"{type(error).__name__}: {error}"},
+    )
 
 
 @dataclass(frozen=True)
@@ -198,7 +273,8 @@ def compare_run_parity(
     )
     if record:
         for mismatch in mismatches:
-            event_store.record_parity_record(
+            _record_parity_record(
+                event_store,
                 run_id,
                 normalizer_version=normalizer_version,
                 record_type="mismatch",
@@ -229,6 +305,226 @@ def _write_jsonl(path: Path, rows: list[dict[str, Any]]) -> None:
             handle.write("\n")
 
 
+def _compare_boundary(
+    event_store: SQLiteEventStore,
+    run_id: str,
+    expected: Any,
+    actual: Any,
+    *,
+    boundary: str,
+    raw_seq: int | None,
+    record: bool,
+) -> ParityReport:
+    normalizer_version = event_store.cursor(run_id).normalizer_version
+    mismatches = tuple(
+        ParityMismatch(run_id, normalizer_version, path, left, right, raw_seq)
+        for path, left, right in _diff_paths(
+            _canonical(expected), _canonical(actual), ""
+        )
+    )
+    if record:
+        for mismatch in mismatches:
+            _record_parity_record(
+                event_store,
+                run_id,
+                normalizer_version=normalizer_version,
+                record_type="mismatch",
+                path=mismatch.path,
+                expected=mismatch.expected,
+                actual=mismatch.actual,
+                detail={
+                    "source": "legacy-parser-vs-sqlite",
+                    "boundary": boundary,
+                    "raw_seq": raw_seq,
+                },
+                raw_seq=raw_seq,
+            )
+    return ParityReport(
+        run_id,
+        normalizer_version,
+        not mismatches,
+        mismatches,
+        boundary=boundary,
+        raw_seq=raw_seq,
+    )
+
+
+def _compare_raw_prefixes(
+    store: RunStore,
+    event_store: SQLiteEventStore,
+    run_id: str,
+    *,
+    record: bool,
+) -> tuple[ParityReport, ...]:
+    record_data = store.get(run_id)
+    raw_rows = sorted(store.read_raw_events(run_id), key=lambda row: int(row["seq"]))
+    normalized_rows = list(store.iter_normalized_events(run_id))
+    reports: list[ParityReport] = []
+    with tempfile.TemporaryDirectory(prefix="wiki-282-parity-") as directory:
+        directory_path = Path(directory)
+        for raw_row in raw_rows:
+            prefix_seq = int(raw_row["seq"])
+            raw_path = directory_path / f"raw-{prefix_seq}.jsonl"
+            normalized_path = directory_path / f"normalized-{prefix_seq}.jsonl"
+            _write_jsonl(
+                raw_path,
+                [row for row in raw_rows if int(row["seq"]) <= prefix_seq],
+            )
+            _write_jsonl(
+                normalized_path,
+                [
+                    row
+                    for row in normalized_rows
+                    if int(row.get("raw_seq", 0)) <= prefix_seq
+                ],
+            )
+            prefix_store = replay_raw_jsonl(
+                raw_path,
+                directory_path / f"prefix-{prefix_seq}.sqlite3",
+                run_id=run_id,
+                agent_id=record_data.agent_id,
+                provider=record_data.provider,
+                created_at=record_data.created_at,
+            )
+            reports.append(
+                _compare_boundary(
+                    event_store,
+                    run_id,
+                    _legacy_payload_at_path(record_data.provider, normalized_path),
+                    _sqlite_payload(prefix_store, run_id),
+                    boundary="raw_prefix",
+                    raw_seq=prefix_seq,
+                    record=record,
+                )
+            )
+    return tuple(reports)
+
+
+def _compare_crash_boundary(
+    store: RunStore,
+    event_store: SQLiteEventStore,
+    run_id: str,
+    *,
+    record: bool,
+) -> ParityReport:
+    record_data = store.get(run_id)
+    with tempfile.TemporaryDirectory(prefix="wiki-282-crash-") as directory:
+        rebuilt = replay_raw_jsonl(
+            store.raw_events_path(run_id),
+            Path(directory) / "replayed.sqlite3",
+            run_id=run_id,
+            agent_id=record_data.agent_id,
+            provider=record_data.provider,
+            created_at=record_data.created_at,
+        )
+        return _compare_boundary(
+            event_store,
+            run_id,
+            _sqlite_payload(rebuilt, run_id),
+            _sqlite_payload(event_store, run_id),
+            boundary="crash_boundary",
+            raw_seq=event_store.cursor(run_id).raw_seq,
+            record=record,
+        )
+
+
+def _compare_stale_cursor(
+    store: RunStore,
+    event_store: SQLiteEventStore,
+    run_id: str,
+    *,
+    record: bool,
+) -> ParityReport:
+    record_data = store.get(run_id)
+    cursor = event_store.cursor(run_id)
+    transcripts._cache.clear()
+    expected = transcripts.read_session_delta(
+        f"{record_data.provider.value}-normalized",
+        store.normalized_events_path(run_id),
+        cursor=cursor.change_cursor + 1,
+        tail_window=False,
+    )
+    expected.pop("tail_from", None)
+    expected.pop("has_older", None)
+    actual = _sqlite_payload(event_store, run_id)
+    actual["patches"] = []
+    return _compare_boundary(
+        event_store,
+        run_id,
+        expected,
+        actual,
+        boundary="stale_cursor",
+        raw_seq=cursor.raw_seq,
+        record=record,
+    )
+
+
+def _compare_older_page(
+    store: RunStore,
+    event_store: SQLiteEventStore,
+    run_id: str,
+    *,
+    record: bool,
+) -> ParityReport:
+    record_data = store.get(run_id)
+    cursor = event_store.cursor(run_id)
+    transcripts._cache.clear()
+    expected = transcripts.read_older_session(
+        f"{record_data.provider.value}-normalized",
+        store.normalized_events_path(run_id),
+        before=len(list(store.iter_normalized_events(run_id))),
+        count=max(1, len(list(store.iter_normalized_events(run_id)))),
+    )
+    actual = {
+        "events": event_store.read_events(run_id),
+        "base": cursor.event_base,
+        "has_older": False,
+    }
+    return _compare_boundary(
+        event_store,
+        run_id,
+        expected,
+        actual,
+        boundary="older_page",
+        raw_seq=cursor.raw_seq,
+        record=record,
+    )
+
+
+def _compare_patch_only_delta(
+    store: RunStore,
+    event_store: SQLiteEventStore,
+    run_id: str,
+    *,
+    record: bool,
+) -> ParityReport:
+    record_data = store.get(run_id)
+    cursor = event_store.cursor(run_id)
+    patch_cursor = max(0, cursor.change_cursor - 1)
+    transcripts._cache.clear()
+    expected = transcripts.read_session_delta(
+        f"{record_data.provider.value}-normalized",
+        store.normalized_events_path(run_id),
+        cursor=patch_cursor,
+        tail_window=False,
+    )
+    actual = {
+        "patches": [
+            {"id": patch.event_id, **patch.patch}
+            for patch in event_store.read_patches(run_id, after_cursor=patch_cursor)
+        ]
+    }
+    return _compare_boundary(
+        event_store,
+        run_id,
+        {"patches": expected.get("patches", [])},
+        actual,
+        boundary="patch_only_delta",
+        raw_seq=cursor.raw_seq,
+        record=record,
+    )
+
+
 def compare_run_boundaries(
     store: RunStore,
     event_store: SQLiteEventStore,
@@ -236,192 +532,16 @@ def compare_run_boundaries(
     *,
     record: bool = True,
 ) -> tuple[ParityReport, ...]:
-    """Compare final state and every raw prefix against the legacy parser."""
+    """Compare raw prefixes and each cursor boundary independently."""
 
-    record_data = store.get(run_id)
-    raw_rows = sorted(
-        store.read_raw_events(run_id), key=lambda row: int(row["seq"])
-    )
-    normalized_rows = list(store.iter_normalized_events(run_id))
-    reports: list[ParityReport] = []
-
-    def add_boundary(
-        expected_value: Any,
-        actual_value: Any,
-        *,
-        boundary: str,
-        raw_seq: int | None,
-    ) -> None:
-        expected_payload = _canonical(expected_value)
-        actual_payload = _canonical(actual_value)
-        normalizer_version = event_store.cursor(run_id).normalizer_version
-        mismatches = tuple(
-            ParityMismatch(
-                run_id,
-                normalizer_version,
-                path,
-                left,
-                right,
-                raw_seq,
-            )
-            for path, left, right in _diff_paths(
-                expected_payload,
-                actual_payload,
-                "",
-            )
+    reports = list(_compare_raw_prefixes(store, event_store, run_id, record=record))
+    reports.extend(
+        (
+            _compare_crash_boundary(store, event_store, run_id, record=record),
+            _compare_stale_cursor(store, event_store, run_id, record=record),
+            _compare_older_page(store, event_store, run_id, record=record),
+            _compare_patch_only_delta(store, event_store, run_id, record=record),
         )
-        report = ParityReport(
-            run_id,
-            normalizer_version,
-            not mismatches,
-            mismatches,
-            boundary=boundary,
-            raw_seq=raw_seq,
-        )
-        if record:
-            for mismatch in mismatches:
-                event_store.record_parity_record(
-                    run_id,
-                    normalizer_version=normalizer_version,
-                    record_type="mismatch",
-                    path=mismatch.path,
-                    expected=mismatch.expected,
-                    actual=mismatch.actual,
-                    detail={
-                        "source": "legacy-parser-vs-sqlite",
-                        "boundary": boundary,
-                        "raw_seq": raw_seq,
-                    },
-                    raw_seq=raw_seq,
-                )
-        reports.append(report)
-
-    with tempfile.TemporaryDirectory(prefix="wiki-282-parity-") as directory:
-        directory_path = Path(directory)
-        for raw_row in raw_rows:
-            prefix_seq = int(raw_row["seq"])
-            prefix_raw = [
-                row for row in raw_rows if int(row["seq"]) <= prefix_seq
-            ]
-            prefix_normalized = [
-                row
-                for row in normalized_rows
-                if int(row.get("raw_seq", 0)) <= prefix_seq
-            ]
-            raw_path = directory_path / f"raw-{prefix_seq}.jsonl"
-            normalized_path = directory_path / f"normalized-{prefix_seq}.jsonl"
-            database_path = directory_path / f"prefix-{prefix_seq}.sqlite3"
-            _write_jsonl(raw_path, prefix_raw)
-            _write_jsonl(normalized_path, prefix_normalized)
-            prefix_store = replay_raw_jsonl(
-                raw_path,
-                database_path,
-                run_id=run_id,
-                agent_id=record_data.agent_id,
-                provider=record_data.provider,
-                created_at=record_data.created_at,
-            )
-            expected = _canonical(
-                _legacy_payload_at_path(record_data.provider, normalized_path)
-            )
-            actual = _canonical(_sqlite_payload(prefix_store, run_id))
-            normalizer_version = prefix_store.cursor(run_id).normalizer_version
-            mismatches = tuple(
-                ParityMismatch(
-                    run_id,
-                    normalizer_version,
-                    path,
-                    left,
-                    right,
-                    prefix_seq,
-                )
-                for path, left, right in _diff_paths(expected, actual, "")
-            )
-            report = ParityReport(
-                run_id,
-                normalizer_version,
-                not mismatches,
-                mismatches,
-                boundary="raw_prefix",
-                raw_seq=prefix_seq,
-            )
-            if record:
-                for mismatch in mismatches:
-                    event_store.record_parity_record(
-                        run_id,
-                        normalizer_version=normalizer_version,
-                        record_type="mismatch",
-                        path=mismatch.path,
-                        expected=mismatch.expected,
-                        actual=mismatch.actual,
-                        detail={
-                            "source": "legacy-parser-vs-sqlite",
-                            "boundary": report.boundary,
-                            "raw_seq": prefix_seq,
-                        },
-                        raw_seq=prefix_seq,
-                    )
-            reports.append(report)
-    cursor = event_store.cursor(run_id)
-    provider_format = f"{record_data.provider.value}-normalized"
-    normalized_path = store.normalized_events_path(run_id)
-    transcripts._cache.clear()
-    stale = transcripts.read_session_delta(
-        provider_format,
-        normalized_path,
-        cursor=cursor.change_cursor + 1,
-        tail_window=False,
-    )
-    stale.pop("tail_from", None)
-    stale.pop("has_older", None)
-    stale_actual = _sqlite_payload(event_store, run_id)
-    stale_actual["patches"] = []
-    add_boundary(
-        stale,
-        stale_actual,
-        boundary="stale_cursor",
-        raw_seq=cursor.raw_seq,
-    )
-    transcripts._cache.clear()
-    older = transcripts.read_older_session(
-        provider_format,
-        normalized_path,
-        before=len(normalized_rows),
-        count=max(1, len(normalized_rows)),
-    )
-    older_actual = {
-        "events": event_store.read_events(run_id),
-        "base": cursor.event_base,
-        "has_older": False,
-    }
-    add_boundary(
-        older,
-        older_actual,
-        boundary="older_page",
-        raw_seq=cursor.raw_seq,
-    )
-    transcripts._cache.clear()
-    patch_cursor = max(0, cursor.change_cursor - 1)
-    patch_delta = transcripts.read_session_delta(
-        provider_format,
-        normalized_path,
-        cursor=patch_cursor,
-        tail_window=False,
-    )
-    patch_actual = {
-        "patches": [
-            {"id": patch.event_id, **patch.patch}
-            for patch in event_store.read_patches(
-                run_id,
-                after_cursor=patch_cursor,
-            )
-        ]
-    }
-    add_boundary(
-        {"patches": patch_delta.get("patches", [])},
-        patch_actual,
-        boundary="patch_only_delta",
-        raw_seq=cursor.raw_seq,
     )
     reports.append(compare_run_parity(store, event_store, run_id, record=record))
     return tuple(reports)
@@ -447,15 +567,11 @@ def run_parity_batch(
         try:
             reports[run_id] = compare_run_boundaries(store, event_store, run_id)
         except Exception as exc:
-            event_store.record_parity_record(
+            _record_harness_error(
+                event_store,
                 run_id,
-                normalizer_version=_safe_normalizer_version(event_store, run_id),
-                record_type="harness_error",
                 path="comparison",
-                detail={
-                    "error": f"{type(exc).__name__}: {exc}",
-                    "boundary": "comparison",
-                },
+                error=exc,
             )
             continue
     return reports
@@ -487,7 +603,8 @@ def _record_backfill_skip(
     reason: str,
     actual: Any,
 ) -> None:
-    event_store.record_parity_record(
+    _record_parity_record(
+        event_store,
         run_id,
         normalizer_version=normalizer_version,
         record_type="backfill_skipped",
@@ -509,92 +626,101 @@ def backfill_headless_runs(
         raise ValueError("batch_size must be positive")
     event_store.ensure_schema()
     results: list[BackfillResult] = []
-    headless = [
-        record
-        for record in store.list_runs()
-        if record.provider_session_id is not None
-    ]
-    eligible: list[tuple[Any, str]] = []
-    for record in headless:
-        metadata = _cursor_metadata(event_store, record.run_id)
-        if metadata is not None:
-            stored_version, rebuild_state = metadata
-            if stored_version != NORMALIZER_VERSION:
+    completed = event_store.backfill_completed_run_ids(NORMALIZER_VERSION)
+    terminal = sorted(
+        (
+            record
+            for record in store.list_runs()
+            if record.provider_session_id is not None
+            and record.state in TERMINAL_STATES
+            and record.run_id not in completed
+        ),
+        key=lambda record: record.run_id,
+    )
+    cursor = event_store.backfill_cursor(NORMALIZER_VERSION)
+    candidates = [record for record in terminal if record.run_id > cursor]
+    candidates.extend(record for record in terminal if record.run_id <= cursor)
+
+    for record in candidates[:batch_size]:
+        version = _safe_normalizer_version(event_store, record.run_id)
+        lock = event_store.run_lock(record.run_id)
+        if not lock.acquire(blocking=False):
+            _record_backfill_skip(
+                event_store,
+                record.run_id,
+                normalizer_version=version,
+                reason="locked",
+                actual="live_materializer",
+            )
+            event_store.advance_backfill_cursor(NORMALIZER_VERSION, record.run_id)
+            results.append(
+                BackfillResult(record.run_id, "skipped", version, "locked")
+            )
+            continue
+        try:
+            current = store.get(record.run_id)
+            if current.state not in TERMINAL_STATES:
                 _record_backfill_skip(
                     event_store,
                     record.run_id,
-                    normalizer_version=stored_version,
-                    reason="normalizer_version",
-                    actual=stored_version,
+                    normalizer_version=version,
+                    reason="nonterminal",
+                    actual=current.state.value,
                 )
                 results.append(
-                    BackfillResult(
-                        record.run_id,
-                        "skipped",
-                        stored_version,
-                        "normalizer_version",
-                    )
+                    BackfillResult(record.run_id, "skipped", version, "nonterminal")
                 )
                 continue
-            if rebuild_state != "ready":
-                _record_backfill_skip(
-                    event_store,
-                    record.run_id,
-                    normalizer_version=stored_version,
-                    reason="rebuild_state",
-                    actual=rebuild_state,
-                )
-                results.append(
-                    BackfillResult(
+            metadata = _cursor_metadata(event_store, record.run_id)
+            if metadata is not None:
+                version, rebuild_state = metadata
+                if version != NORMALIZER_VERSION:
+                    _record_backfill_skip(
+                        event_store,
                         record.run_id,
-                        "skipped",
-                        stored_version,
-                        "rebuild_state",
+                        normalizer_version=version,
+                        reason="normalizer_version",
+                        actual=version,
                     )
-                )
-                continue
+                    results.append(
+                        BackfillResult(
+                            record.run_id,
+                            "skipped",
+                            version,
+                            "normalizer_version",
+                        )
+                    )
+                    continue
+                if rebuild_state != "ready":
+                    _record_backfill_skip(
+                        event_store,
+                        record.run_id,
+                        normalizer_version=version,
+                        reason="rebuild_state",
+                        actual=rebuild_state,
+                    )
+                    results.append(
+                        BackfillResult(
+                            record.run_id,
+                            "skipped",
+                            version,
+                            "rebuild_state",
+                        )
+                    )
+                    continue
             raw_path = store.raw_events_path(record.run_id)
             if not raw_path.is_file():
                 _record_backfill_skip(
                     event_store,
                     record.run_id,
-                    normalizer_version=stored_version,
+                    normalizer_version=version,
                     reason="raw_jsonl",
                     actual="missing",
                 )
                 results.append(
-                    BackfillResult(
-                        record.run_id,
-                        "skipped",
-                        stored_version,
-                        "raw_jsonl",
-                    )
+                    BackfillResult(record.run_id, "skipped", version, "raw_jsonl")
                 )
                 continue
-            eligible.append((record, stored_version))
-            continue
-        raw_path = store.raw_events_path(record.run_id)
-        if not raw_path.is_file():
-            _record_backfill_skip(
-                event_store,
-                record.run_id,
-                normalizer_version=NORMALIZER_VERSION,
-                reason="raw_jsonl",
-                actual="missing",
-            )
-            results.append(
-                BackfillResult(
-                    record.run_id,
-                    "skipped",
-                    NORMALIZER_VERSION,
-                    "raw_jsonl",
-                )
-            )
-            continue
-        eligible.append((record, NORMALIZER_VERSION))
-    for record, _stored_version in eligible[:batch_size]:
-        raw_path = store.raw_events_path(record.run_id)
-        try:
             with tempfile.TemporaryDirectory(prefix="wiki-282-backfill-") as directory:
                 temporary_path = Path(directory) / "events.sqlite3"
                 replay_raw_jsonl(
@@ -612,38 +738,47 @@ def backfill_headless_runs(
                     )
                 event_store.replace_run_from(temporary_path, record.run_id)
             reports = compare_run_boundaries(store, event_store, record.run_id)
-        except Exception as exc:
-            version = _safe_normalizer_version(event_store, record.run_id)
-            event_store.record_parity_record(
+            mismatches = tuple(
+                mismatch for report in reports for mismatch in report.mismatches
+            )
+            matched = not mismatches
+            if not _record_parity_record(
+                event_store,
                 record.run_id,
-                normalizer_version=version,
-                record_type="harness_error",
+                normalizer_version=NORMALIZER_VERSION,
+                record_type="backfill_completed",
+                path="run",
+                detail={"matched": matched, "boundaries": len(reports)},
+            ):
+                results.append(
+                    BackfillResult(
+                        record.run_id,
+                        "harness_error",
+                        version,
+                        "backfill completion record failed",
+                    )
+                )
+                continue
+            results.append(
+                BackfillResult(
+                    record.run_id,
+                    "ready" if matched else "ready_with_mismatches",
+                    NORMALIZER_VERSION,
+                    mismatches=mismatches,
+                )
+            )
+        except Exception as exc:
+            _record_harness_error(
+                event_store,
+                record.run_id,
                 path="backfill",
-                detail={"error": f"{type(exc).__name__}: {exc}"},
+                error=exc,
             )
             results.append(
-                BackfillResult(record.run_id, "harness_error", version, str(exc))
-            )
-            continue
-        mismatches = tuple(
-            mismatch for report in reports for mismatch in report.mismatches
-        )
-        matched = not mismatches
-        event_store.record_parity_record(
-            record.run_id,
-            normalizer_version=NORMALIZER_VERSION,
-            record_type="backfill_completed",
-            path="run",
-            detail={"matched": matched, "boundaries": len(reports)},
-        )
-        results.append(
-            BackfillResult(
-                record.run_id,
-                "ready" if matched else "ready_with_mismatches",
-                NORMALIZER_VERSION,
-                mismatches=mismatches,
-            )
-        )
+                BackfillResult(record.run_id, "harness_error", version, str(exc)))
+        finally:
+            lock.release()
+            event_store.advance_backfill_cursor(NORMALIZER_VERSION, record.run_id)
     return results
 
 

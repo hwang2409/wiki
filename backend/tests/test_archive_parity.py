@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import threading
 from pathlib import Path
 from unittest import mock
 
@@ -8,6 +9,7 @@ from backend.app.agent_runtime.archive_parity import (
     backfill_headless_runs,
     compare_run_parity,
     compare_run_boundaries,
+    harness_error_fallback_path,
     run_parity_batch,
 )
 from backend.app.agent_runtime.archive_protocol import archive_is_committed
@@ -323,6 +325,7 @@ def test_backfill_skips_wrong_version_and_rebuild_state_and_records_both(
     )
     wrong_version.provider_session_id = "session-old"
     store._write_record(wrong_version)  # noqa: SLF001
+    store.transition(wrong_version.run_id, LifecycleState.COMPLETED)
     rebuild_needed = store.create(
         RunRecord.new(
             agent_id="WIKI-282-REBUILD-NEEDED",
@@ -335,6 +338,7 @@ def test_backfill_skips_wrong_version_and_rebuild_state_and_records_both(
     )
     rebuild_needed.provider_session_id = "session-rebuild"
     store._write_record(rebuild_needed)  # noqa: SLF001
+    store.transition(rebuild_needed.run_id, LifecycleState.COMPLETED)
     eligible = store.create(
         RunRecord.new(
             agent_id="WIKI-282-ELIGIBLE",
@@ -363,6 +367,7 @@ def test_backfill_skips_wrong_version_and_rebuild_state_and_records_both(
         payload=normalized.payload,
         lifecycle_state=normalized.lifecycle_state,
     )
+    store.transition(eligible.run_id, LifecycleState.COMPLETED)
 
     event_store = SQLiteEventStore(tmp_path / "runtime" / "events.sqlite3")
     event_store.create_run(
@@ -386,7 +391,7 @@ def test_backfill_skips_wrong_version_and_rebuild_state_and_records_both(
             (rebuild_needed.run_id,),
         )
 
-    results = backfill_headless_runs(store, event_store, batch_size=1)
+    results = backfill_headless_runs(store, event_store, batch_size=3)
 
     by_run = {result.run_id: result for result in results}
     assert by_run[wrong_version.run_id].status == "skipped"
@@ -399,3 +404,196 @@ def test_backfill_skips_wrong_version_and_rebuild_state_and_records_both(
         wrong_version.run_id,
         rebuild_needed.run_id,
     }
+
+
+def _add_terminal_run(
+    store: RunStore,
+    event_store: SQLiteEventStore,
+    *,
+    index: int,
+) -> RunRecord:
+    record = store.create(
+        RunRecord.new(
+            agent_id=f"WIKI-282-BACKFILL-{index:03d}",
+            provider=ProviderKind.CODEX,
+            role="implement",
+            model="fixture",
+            worktree=str(store.paths.runtime_dir.parent),
+            prompt=f"backfill {index}",
+        )
+    )
+    record.provider_session_id = f"session-{index}"
+    store._write_record(record)  # noqa: SLF001
+    payload = {"method": "warning", "params": {"message": str(index)}}
+    raw = store.append_raw(
+        record.run_id,
+        provider="codex",
+        direction="provider",
+        payload=payload,
+    )
+    normalized = normalize_provider_event(ProviderKind.CODEX, payload)
+    legacy = store.append_normalized(
+        record.run_id,
+        raw_seq=int(raw["seq"]),
+        disposition=normalized.disposition,
+        kind=normalized.kind,
+        payload=normalized.payload,
+        lifecycle_state=normalized.lifecycle_state,
+    )
+    event_store.create_run(
+        record.run_id,
+        agent_id=record.agent_id,
+        provider=record.provider,
+        created_at=record.created_at,
+        state=record.state,
+    )
+    event_store.materialize(
+        record.run_id,
+        {**raw, "normalized_seq": int(legacy["seq"])},
+        EventReducerAdapter(record.provider),
+        normalized=normalized,
+    )
+    store.transition(record.run_id, LifecycleState.COMPLETED)
+    return store.get(record.run_id)
+
+
+def test_parity_batch_records_recorder_failure_and_continues(tmp_path: Path) -> None:
+    store, event_store, first = _run_with_one_event(tmp_path)
+    second = _add_terminal_run(store, event_store, index=2)
+    store.transition(first.run_id, LifecycleState.COMPLETED)
+    with mock.patch.object(
+        event_store,
+        "record_parity_record",
+        side_effect=OSError("recorder unavailable"),
+    ):
+        reports = run_parity_batch(store, event_store, [first.run_id, second.run_id])
+
+    assert second.run_id in reports
+    fallback = harness_error_fallback_path(event_store)
+    assert fallback.is_file()
+    assert "recorder unavailable" in fallback.read_text(encoding="utf-8")
+
+
+def test_each_boundary_comparator_records_its_own_mismatch(tmp_path: Path) -> None:
+    store, event_store, record = _run_with_one_event(tmp_path)
+    from backend.app.agent_runtime import archive_parity
+
+    comparators = (
+        ("raw_prefix", "_legacy_payload_at_path", lambda: None),
+        ("crash_boundary", "_sqlite_payload", lambda: None),
+        ("stale_cursor", "read_session_delta", lambda: None),
+        ("older_page", "read_older_session", lambda: None),
+        ("patch_only_delta", "read_session_delta", lambda: None),
+    )
+
+    for boundary, target, _unused in comparators:
+        with event_store.connection() as connection:
+            connection.execute("DELETE FROM parity_records")
+        if boundary == "raw_prefix":
+            with mock.patch.object(
+                archive_parity,
+                target,
+                return_value={"mismatch": boundary},
+            ):
+                archive_parity._compare_raw_prefixes(store, event_store, record.run_id, record=True)  # noqa: SLF001
+        elif boundary == "crash_boundary":
+            original = archive_parity._sqlite_payload  # noqa: SLF001
+
+            def divergent_payload(source: SQLiteEventStore, run_id: str) -> dict[str, object]:
+                payload = original(source, run_id)
+                if source.path.name == "replayed.sqlite3":
+                    return {"mismatch": boundary}
+                return payload
+
+            with mock.patch.object(archive_parity, target, side_effect=divergent_payload):
+                archive_parity._compare_crash_boundary(store, event_store, record.run_id, record=True)  # noqa: SLF001
+        elif boundary == "older_page":
+            with mock.patch.object(
+                archive_parity.transcripts,
+                target,
+                return_value={"mismatch": boundary},
+            ):
+                archive_parity._compare_older_page(store, event_store, record.run_id, record=True)  # noqa: SLF001
+        elif boundary == "stale_cursor":
+            with mock.patch.object(
+                archive_parity.transcripts,
+                target,
+                return_value={"mismatch": boundary},
+            ):
+                archive_parity._compare_stale_cursor(store, event_store, record.run_id, record=True)  # noqa: SLF001
+        else:
+            with mock.patch.object(
+                archive_parity.transcripts,
+                target,
+                return_value={"patches": [{"mismatch": boundary}]},
+            ):
+                archive_parity._compare_patch_only_delta(store, event_store, record.run_id, record=True)  # noqa: SLF001
+
+        assert any(
+            row["record_type"] == "mismatch"
+            and row["detail"]["boundary"] == boundary
+            for row in event_store.parity_records(record.run_id)
+        )
+
+
+def test_backfill_cursor_moves_past_reeligible_completed_runs(tmp_path: Path) -> None:
+    store = RunStore(_paths(tmp_path))
+    event_store = SQLiteEventStore(tmp_path / "runtime" / "events.sqlite3")
+    records = [_add_terminal_run(store, event_store, index=index) for index in range(64)]
+
+    from backend.app.agent_runtime import archive_parity
+
+    matched = archive_parity.ParityReport(
+        run_id="fixture",
+        normalizer_version=NORMALIZER_VERSION,
+        matched=True,
+        mismatches=(),
+    )
+    with (
+        mock.patch.object(event_store, "backfill_completed_run_ids", return_value=set()),
+        mock.patch.object(archive_parity, "compare_run_boundaries", return_value=(matched,)),
+    ):
+        first = backfill_headless_runs(store, event_store, batch_size=32)
+        second = backfill_headless_runs(store, event_store, batch_size=32)
+
+    assert len(first) == len(second) == 32
+    assert {result.run_id for result in first}.isdisjoint(
+        result.run_id for result in second
+    )
+    assert {result.run_id for result in first + second} == {
+        record.run_id for record in records
+    }
+
+
+def test_backfill_skips_live_materializer_lock_then_processes_after_release(
+    tmp_path: Path,
+) -> None:
+    store = RunStore(_paths(tmp_path))
+    event_store = SQLiteEventStore(tmp_path / "runtime" / "events.sqlite3")
+    record = _add_terminal_run(store, event_store, index=1)
+    acquired = threading.Event()
+    release = threading.Event()
+
+    def hold_live_materializer_lock() -> None:
+        with event_store.run_lock(record.run_id):
+            acquired.set()
+            release.wait()
+
+    holder = threading.Thread(target=hold_live_materializer_lock)
+    holder.start()
+    acquired.wait(timeout=1)
+    skipped = backfill_headless_runs(store, event_store, batch_size=1)
+    release.set()
+    holder.join(timeout=1)
+    processed = backfill_headless_runs(store, event_store, batch_size=1)
+
+    assert skipped == [
+        mock.ANY
+    ]
+    assert skipped[0].status == "skipped"
+    assert skipped[0].reason == "locked"
+    assert processed[0].status.startswith("ready")
+    assert any(
+        row["record_type"] == "backfill_skipped" and row["path"] == "locked"
+        for row in event_store.parity_records(record.run_id)
+    )
