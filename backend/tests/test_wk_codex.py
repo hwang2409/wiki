@@ -3,14 +3,18 @@ from __future__ import annotations
 import asyncio
 import json
 import os
+import select
+import shutil
 import subprocess
 import sys
+import time
 from pathlib import Path
 
 import pytest
 
 from backend.app.agent_runtime import wk_feature
 from backend.app.agent_runtime.wk_codex import (
+    WK_CODEX_DYNAMIC_TOOLS,
     WkCodexDisabled,
     WkCodexError,
     WkCodexLane,
@@ -75,6 +79,51 @@ def test_flag_off_boot_does_not_import_codex_lane_or_sdk() -> None:
     assert result.stdout.strip().splitlines()[-1] == "False"
 
 
+def test_live_codex_app_server_accepts_recorded_handshake_when_binary_exists() -> None:
+    binary = shutil.which("codex")
+    if binary is None:
+        pytest.skip("codex binary is not installed")
+    from backend.app.agent_runtime.wk_codex import codex_plan_auth_environment
+
+    try:
+        environment = codex_plan_auth_environment(os.environ)
+    except WkCodexPlanAuthError as exc:
+        pytest.skip(str(exc))
+    process = subprocess.Popen(
+        [binary, "app-server", "--stdio"],
+        cwd=Path.cwd(),
+        env=environment,
+        stdin=subprocess.PIPE,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+        start_new_session=True,
+    )
+    try:
+        assert process.stdin is not None
+        assert process.stdout is not None
+        frames = [
+            {"id": 1, "method": "initialize", "params": {"clientInfo": {"name": "wiki-live-smoke", "title": "Wiki live smoke", "version": "0.1.0"}, "capabilities": {"experimentalApi": True}}},
+            {"id": 2, "method": "thread/start", "params": {"cwd": str(Path.cwd()), "model": "gpt-5.6-terra", "approvalPolicy": "never", "sandboxPolicy": {"type": "dangerFullAccess"}, "dynamicTools": [dict(WK_CODEX_DYNAMIC_TOOLS[0])], "developerInstructions": "handshake only", "experimentalRawEvents": True}},
+        ]
+        for frame in frames:
+            process.stdin.write(json.dumps(frame) + "\n")
+            process.stdin.flush()
+        responses: list[dict[str, object]] = []
+        deadline = time.monotonic() + 20
+        while len(responses) < len(frames):
+            ready, _, _ = select.select([process.stdout], [], [], max(0, deadline - time.monotonic()))
+            assert ready, "Codex App Server did not answer the recorded handshake"
+            response = json.loads(process.stdout.readline())
+            if response.get("id") in {frame["id"] for frame in frames}:
+                responses.append(response)
+        assert responses[0].get("id") == 1 and "result" in responses[0]
+        assert responses[1].get("id") == 2 and "result" in responses[1]
+    finally:
+        process.terminate()
+        process.wait(timeout=10)
+
+
 def test_codex_lane_is_constructible_only_when_flag_is_on(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
@@ -129,6 +178,23 @@ def test_policy_validation_finishes_before_any_turn_start(
 
     asyncio.run(run())
     methods = (Path(lane.environment["CODEX_HOME"]) / "transport.log").read_text(encoding="utf-8").splitlines()
+    assert "turn/start" not in methods
+
+
+def test_native_policy_mismatch_blocks_before_the_first_turn(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    monkeypatch.setattr(wk_feature, "_WK_ENABLED", True)
+    env = _environment(tmp_path)
+    (Path(env["CODEX_HOME"]) / "unsafe-sandbox").touch()
+    lane = _lane(tmp_path, environment=env)
+
+    async def run() -> None:
+        with pytest.raises(WkCodexError, match="read-only native tool confinement"):
+            await lane.start("start")
+
+    asyncio.run(run())
+    methods = (Path(env["CODEX_HOME"]) / "transport.log").read_text(encoding="utf-8").splitlines()
     assert "turn/start" not in methods
 
 
@@ -231,6 +297,30 @@ def test_auth_drift_blocks_the_next_turn(
         await lane.start("start")
         auth_status.write_text("account-b organization-a", encoding="utf-8")
         with pytest.raises(WkCodexError, match="auth identity changed"):
+            await lane.send_now("next")
+        await lane.close()
+
+    asyncio.run(run())
+    status = json.loads((tmp_path / "status.json").read_text(encoding="utf-8"))
+    assert status["state"] == "blocked"
+
+
+def test_codex_trust_write_is_allowed_but_foreign_settings_drift_blocks(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    monkeypatch.setattr(wk_feature, "_WK_ENABLED", True)
+    lane = _lane(tmp_path)
+
+    async def run() -> None:
+        await lane.start("start")
+        async for row in lane.events():
+            event = row.get("event")
+            if isinstance(event, dict) and event.get("kind") == "codex.turn_completed":
+                break
+        config = Path(lane.environment["CODEX_HOME"]) / "config.toml"
+        with config.open("a", encoding="utf-8") as handle:
+            handle.write("\n[foreign]\nvalue = \"changed\"\n")
+        with pytest.raises(WkCodexError, match="settings source changed"):
             await lane.send_now("next")
         await lane.close()
 

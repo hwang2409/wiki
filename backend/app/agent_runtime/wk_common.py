@@ -140,6 +140,25 @@ class WkToolLedger:
         return event
 
     def record_transport_frame(self, raw: Mapping[str, Any]) -> None:
+        message = raw.get("message")
+        content = message.get("content") if isinstance(message, Mapping) else None
+        if isinstance(content, Sequence) and not isinstance(content, (str, bytes)):
+            for block in content:
+                if not isinstance(block, Mapping):
+                    continue
+                block_type = block.get("type")
+                if block_type == "tool_use":
+                    tool_id = block.get("id")
+                    if isinstance(tool_id, str) and tool_id:
+                        if tool_id in self._transport_pending:
+                            raise WkLedgerError(f"duplicate transport tool call: {tool_id}")
+                        self._transport_pending.add(tool_id)
+                elif block_type == "tool_result":
+                    tool_id = block.get("tool_use_id")
+                    if isinstance(tool_id, str) and tool_id:
+                        if tool_id not in self._transport_pending:
+                            raise WkLedgerError(f"transport result has no start: {tool_id}")
+                        self._transport_pending.remove(tool_id)
         params = raw.get("params")
         item = params.get("item") if isinstance(params, Mapping) else None
         if not isinstance(item, Mapping):

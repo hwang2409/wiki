@@ -40,13 +40,21 @@ WK_CODEX_TOOL_NAMES = (
 WK_CODEX_MCP_TOOL_NAMES = tuple(
     f"mcp__wiki__{name.removeprefix('wk.')}" for name in WK_CODEX_TOOL_NAMES
 )
-WK_CODEX_DYNAMIC_TOOLS = tuple(
+WK_CODEX_DYNAMIC_TOOLS = (
     {
-        "name": name.removeprefix("wk."),
-        "description": f"Wiki-owned {name} tool",
-        "inputSchema": {"type": "object", "additionalProperties": True},
-    }
-    for name in WK_CODEX_TOOL_NAMES
+        "type": "namespace",
+        "name": "wiki",
+        "description": "Wiki-owned tools",
+        "tools": [
+            {
+                "type": "function",
+                "name": name.removeprefix("wk."),
+                "description": f"Wiki-owned {name} tool",
+                "inputSchema": {"type": "object", "additionalProperties": True},
+            }
+            for name in WK_CODEX_TOOL_NAMES
+        ],
+    },
 )
 _SAFE_ENV_NAMES = frozenset(
     {
@@ -170,9 +178,15 @@ def _settings_paths(worktree: Path, environment: Mapping[str, str]) -> tuple[Pat
 
 
 class _SettingsGuard:
-    def __init__(self, paths: Sequence[Path]):
+    def __init__(self, paths: Sequence[Path], worktree: Path):
         self.paths = tuple(paths)
+        self.worktree = worktree
         self._fingerprint = self._read()
+        self._initial_values = {
+            str(path): self._load(path)
+            for path in self.paths
+        }
+        self._trust_write_consumed = False
 
     def _read(self) -> tuple[tuple[str, bool, str], ...]:
         rows: list[tuple[str, bool, str]] = []
@@ -186,8 +200,53 @@ class _SettingsGuard:
         return tuple(rows)
 
     def verify_unchanged(self) -> None:
-        if self._read() != self._fingerprint:
+        current = self._read()
+        if current == self._fingerprint:
+            return
+        if self._trust_write_consumed or not self._accept_trust_write(current):
             raise WkCodexError("Codex settings source changed during the run")
+        self._trust_write_consumed = True
+        self._fingerprint = current
+
+    @staticmethod
+    def _load(path: Path) -> Mapping[str, Any]:
+        try:
+            with path.open("rb") as handle:
+                value = tomllib.load(handle)
+        except FileNotFoundError:
+            return {}
+        except (OSError, tomllib.TOMLDecodeError) as exc:
+            raise WkCodexError(f"cannot inspect Codex settings source: {path}") from exc
+        return value if isinstance(value, Mapping) else {}
+
+    def _accept_trust_write(
+        self, current: tuple[tuple[str, bool, str], ...]
+    ) -> bool:
+        changed = [
+            (before, after)
+            for before, after in zip(self._fingerprint, current, strict=True)
+            if before != after
+        ]
+        if len(changed) != 1:
+            return False
+        before, after = changed[0]
+        if not after[1] or not after[0].endswith("/config.toml"):
+            return False
+        old_value = self._initial_values.get(before[0], {})
+        new_value = self._load(Path(after[0]))
+        projects = new_value.get("projects")
+        old_projects = old_value.get("projects", {})
+        if not isinstance(projects, Mapping) or not isinstance(old_projects, Mapping):
+            return False
+        project_path = str(self.worktree)
+        if projects.get(project_path) != {"trust_level": "trusted"}:
+            return False
+        if project_path in old_projects:
+            return False
+        return all(
+            key == project_path or old_projects.get(key) == value
+            for key, value in projects.items()
+        )
 
 
 class WkCodexEventTranslator:
@@ -334,7 +393,9 @@ class WkCodexLane:
         self.environment = codex_plan_auth_environment(environment)
         del auth_command
         self.command = tuple(command)
-        self._settings_guard = _SettingsGuard(_settings_paths(worktree, self.environment))
+        self._settings_guard = _SettingsGuard(
+            _settings_paths(worktree, self.environment), worktree
+        )
         _reject_auth_sources(self._settings_guard.paths)
         self._auth_identity: tuple[str, ...] | None = None
         self.translator = WkCodexEventTranslator(run_id=run_id, agent_id=agent_id)
@@ -385,9 +446,7 @@ class WkCodexLane:
         )
 
     async def _emit_error(self, error: BaseException, *, policy: bool = False) -> None:
-        blocked = policy or isinstance(
-            error, (WkCodexError, WkLedgerError)
-        )
+        blocked = policy or isinstance(error, (WkCodexError, WkLedgerError))
         if blocked:
             self.loop.write_status(
                 state="blocked",
@@ -412,8 +471,16 @@ class WkCodexLane:
                 params = raw.get("params")
                 item = params.get("item") if isinstance(params, Mapping) else None
                 if raw.get("method") == "item/started" and isinstance(item, Mapping):
-                    if item.get("type") != "dynamicToolCall":
-                        raise WkCodexPolicyError("Codex emitted a native tool before Wiki policy validation")
+                    if item.get("type") in {
+                        "commandExecution",
+                        "fileChange",
+                        "mcpToolCall",
+                        "webSearch",
+                        "collabToolCall",
+                    }:
+                        raise WkCodexPolicyError(
+                            "Codex emitted a native tool before Wiki policy validation"
+                        )
                 if raw.get("method") == "item/tool/call" and not self._policy_validated:
                     raise WkCodexPolicyError("Codex requested a tool before Wiki policy validation")
                 self.ledger.record_transport_frame(raw)
@@ -424,7 +491,9 @@ class WkCodexLane:
         except asyncio.CancelledError:
             raise
         except Exception as exc:
-            await self._emit_error(exc, policy=isinstance(exc, WkCodexPolicyError))
+            await self._emit_error(exc, policy=True)
+            await self._adapter.close()
+            await self._events.put(None)
 
     def _verify_policy(self) -> None:
         result = self._adapter.last_thread_start_result or {}
@@ -432,13 +501,26 @@ class WkCodexLane:
         registered = self._adapter.thread_start_options.get("dynamicTools")
         if not isinstance(thread, Mapping) or not isinstance(registered, Sequence):
             raise WkCodexPolicyError("Codex App Server rejected Wiki dynamic tool registration")
+        if result.get("approvalPolicy") != "never":
+            raise WkCodexPolicyError("Codex App Server did not confirm approval confinement")
+        sandbox = result.get("sandbox")
+        if sandbox != {"type": "readOnly", "networkAccess": False}:
+            raise WkCodexPolicyError("Codex App Server did not confirm read-only native tool confinement")
+        namespace = registered[0] if len(registered) == 1 else None
+        tools = namespace.get("tools") if isinstance(namespace, Mapping) else None
         names = {
             str(tool.get("name"))
-            for tool in registered
-            if isinstance(tool, Mapping)
+            for tool in tools or []
+            if isinstance(tool, Mapping) and tool.get("type") == "function"
         }
         expected = {name.removeprefix("wk.") for name in WK_CODEX_TOOL_NAMES}
-        if names != expected or len(names) != len(registered):
+        if (
+            not isinstance(namespace, Mapping)
+            or namespace.get("type") != "namespace"
+            or namespace.get("name") != "wiki"
+            or names != expected
+            or len(names) != len(tools or [])
+        ):
             raise WkCodexPolicyError("Codex App Server dynamic tools do not prove Wiki ownership")
 
     @staticmethod

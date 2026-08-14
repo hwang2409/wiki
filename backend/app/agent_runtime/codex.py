@@ -739,7 +739,7 @@ class CodexAppServerAdapter(ProviderAdapter):
             "runtimeWorkspaceRoots": [self.worktree],
             "model": self.model,
             "approvalPolicy": "never",
-            "sandbox": "danger-full-access",
+            "sandboxPolicy": {"type": "readOnly", "networkAccess": False},
             "experimentalRawEvents": True,
             "historyMode": "legacy",
         }
@@ -796,7 +796,7 @@ class CodexAppServerAdapter(ProviderAdapter):
                         "cwd": self.worktree,
                         "model": self.model,
                         "approvalPolicy": "never",
-                        "sandbox": "danger-full-access",
+                        "sandboxPolicy": {"type": "readOnly", "networkAccess": False},
                         "excludeTurns": True,
                     },
                     generation=generation,
@@ -915,6 +915,8 @@ class CodexAppServerAdapter(ProviderAdapter):
                 await self._spawn(generation)
                 try:
                     await self._start_thread(new_prompt, generation)
+                    if not self._auto_start_turn:
+                        await self._start_turn(new_prompt)
                 except BaseException:
                     await asyncio.shield(terminate_process_group(self._process))
                     raise
@@ -942,6 +944,10 @@ class CodexAppServerAdapter(ProviderAdapter):
             self._active_turn_id = None
             self._state = LifecycleState.STARTING
             await self._start_thread(new_prompt, generation)
+            if not self._auto_start_turn:
+                # client.py v0.2.128 clones options before starting a replacement.
+                # This explicit call preserves the replacement prompt for wk lanes.
+                await self._start_turn(new_prompt)
             return self._status()
 
     async def _refresh_status(self) -> AdapterStatus:
