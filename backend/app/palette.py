@@ -729,6 +729,42 @@ def collect_artifact_items(
     return items
 
 
+def collect_artifact_items_from_index(
+    event_store: Any,
+    *,
+    ticket_by_run: dict[str, str] | None = None,
+) -> list[PaletteItem] | None:
+    """Build palette artifacts from SQLite without walking event JSONL files.
+
+    ``None`` means the index is not available yet.  Callers then retain the
+    legacy scan for installations that have not materialized any runs.
+    """
+
+    try:
+        indexed_events = event_store.read_artifact_events()
+    except Exception:
+        return None
+    items: list[PaletteItem] = []
+    seen: set[str] = set()
+    for run_id, event in indexed_events:
+        extracted = _artifact_payload_from_event(event)
+        if extracted is None:
+            continue
+        artifact_id, payload = extracted
+        if artifact_id in seen:
+            continue
+        seen.add(artifact_id)
+        item = _make_artifact_item(
+            artifact_id,
+            payload,
+            (ticket_by_run or {}).get(run_id),
+            _artifact_ts(payload, None),
+        )
+        if item is not None:
+            items.append(item)
+    return items
+
+
 def _title_from_note(note_path: Path, content: str) -> tuple[str, str]:
     """Return (title, first_paragraph)."""
     title = ""
@@ -905,6 +941,7 @@ def collect_all_items(
     vault_dir: Path,
     runs_dir: Path,
     archive_dir: Path,
+    artifact_items: list[PaletteItem] | None = None,
     should_cancel: Callable[[], bool] | None = None,
 ) -> list[PaletteItem]:
     session_items = collect_session_items(agents_payload)
@@ -922,7 +959,10 @@ def collect_all_items(
                 ticket_by_run[run_id] = ticket
     ticket_items = collect_ticket_items(vault_dir, session_ids)
     _check_cancelled(should_cancel)
-    artifact_items = collect_artifact_items(runs_dir, archive_dir, ticket_by_run=ticket_by_run)
+    if artifact_items is None:
+        artifact_items = collect_artifact_items(
+            runs_dir, archive_dir, ticket_by_run=ticket_by_run
+        )
     _check_cancelled(should_cancel)
     note_items = collect_note_items(vault_dir, should_cancel)
     return session_items + ticket_items + artifact_items + note_items
@@ -936,6 +976,7 @@ def search(
     vault_dir: Path,
     runs_dir: Path,
     archive_dir: Path,
+    artifact_items: list[PaletteItem] | None = None,
     should_cancel: Callable[[], bool] | None = None,
 ) -> list[dict[str, Any]]:
     limit = max(1, min(limit, MAX_LIMIT))
@@ -946,6 +987,7 @@ def search(
         vault_dir=vault_dir,
         runs_dir=runs_dir,
         archive_dir=archive_dir,
+        artifact_items=artifact_items,
         should_cancel=should_cancel,
     )
     _check_cancelled(should_cancel)

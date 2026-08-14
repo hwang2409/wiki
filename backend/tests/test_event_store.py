@@ -9,6 +9,7 @@ import pytest
 
 from backend.app.agent_runtime.event_store import (
     EventReducerAdapter,
+    SCHEMA_VERSION,
     SQLiteEventStore,
     migrate_event_db,
     replay_raw_jsonl,
@@ -350,5 +351,5 @@ def test_half_applied_migration_is_idempotent() -> None:
                     "PRAGMA table_info(run_projections)"
                 ).fetchall()
             }
-        assert versions == [(1,), (2,), (3,), (4,), (5,)]
+        assert versions == [(version,) for version in range(1, SCHEMA_VERSION + 1)]
         assert "unread_event_seq" in columns

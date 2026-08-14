@@ -28,7 +28,7 @@ from .types import (
     validate_transition,
 )
 
-SCHEMA_VERSION = 5
+SCHEMA_VERSION = 6
 NORMALIZER_VERSION = "wiki-282-1"
 
 
@@ -499,6 +499,10 @@ _MIGRATIONS: dict[int, str] = {
         normalizer_version TEXT PRIMARY KEY,
         cursor_run_id TEXT NOT NULL DEFAULT ''
     );
+    """,
+    6: """
+    CREATE INDEX IF NOT EXISTS events_artifact_index
+        ON events(kind, updated_at DESC);
     """,
 }
 
@@ -1229,6 +1233,65 @@ class SQLiteEventStore:
         with self.connection(read_only=True) as connection:
             rows = connection.execute(query, parameters).fetchall()
         return [json.loads(row[0]) for row in rows]
+
+    def read_events_before(
+        self,
+        run_id: str,
+        *,
+        before_event_id: int,
+        limit: int,
+    ) -> tuple[list[dict[str, Any]], bool]:
+        """Read one older event page and report whether retained rows precede it."""
+
+        with self.connection(read_only=True) as connection:
+            rows = connection.execute(
+                "SELECT event_id, event_json FROM events "
+                "WHERE run_id = ? AND event_id < ? ORDER BY event_id DESC LIMIT ?",
+                (run_id, before_event_id, limit),
+            ).fetchall()
+            if not rows:
+                return [], False
+            oldest_event_id = int(rows[-1][0])
+            has_older = (
+                connection.execute(
+                    "SELECT 1 FROM events WHERE run_id = ? AND event_id < ?",
+                    (run_id, oldest_event_id),
+                ).fetchone()
+                is not None
+            )
+        rows.reverse()
+        return [json.loads(row[1]) for row in rows], has_older
+
+    def read_normalized_events(
+        self,
+        run_id: str,
+        *,
+        after_seq: int = 0,
+        limit: int | None = None,
+    ) -> list[dict[str, Any]]:
+        """Read the inspector stream from persisted normalized envelopes."""
+
+        with self.connection(read_only=True) as connection:
+            rows = connection.execute(
+                "SELECT normalized_json FROM dispositions WHERE run_id = ? "
+                "ORDER BY raw_seq",
+                (run_id,),
+            ).fetchall()
+        events = [json.loads(row[0]) for row in rows]
+        filtered = [event for event in events if int(event.get("seq", 0)) > after_seq]
+        if limit is None:
+            return filtered
+        return filtered[-limit:] if after_seq == 0 else filtered[:limit]
+
+    def read_artifact_events(self) -> list[tuple[str, dict[str, Any]]]:
+        """Return indexed rendered artifact events without scanning JSONL logs."""
+
+        with self.connection(read_only=True) as connection:
+            rows = connection.execute(
+                "SELECT run_id, event_json FROM events WHERE kind = 'artifact' "
+                "ORDER BY updated_at DESC"
+            ).fetchall()
+        return [(str(row[0]), json.loads(row[1])) for row in rows]
 
     def read_patches(
         self,

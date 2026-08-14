@@ -69,6 +69,7 @@ from .agent_runtime import costs
 from .agent_runtime import graph_health
 from .agent_runtime.loop_state import derive_loop_state
 from .agent_runtime.archive_protocol import archive_is_committed
+from .agent_runtime.event_store import SQLiteEventStore, runtime_event_db_path
 from .agent_runtime.store import RuntimePaths
 from .agent_runtime.ticket import (
     base_ticket,
@@ -195,13 +196,10 @@ async def lifespan(_app: FastAPI):
         # Health is optional; a broken provider CLI or probe must not prevent
         # the backend from starting.
         pass
-    # Warm the palette artifact cache off the event loop: the cold walk parses
-    # every events.jsonl (~14s observed) and would otherwise land on the first
-    # Cmd-K keystroke.
+    # Warm the palette artifact view off the event loop.  SQLite is the index;
+    # do not parse every events.jsonl before the first Cmd-K keystroke.
     threading.Thread(
-        target=lambda: palette.collect_artifact_items(
-            SUPERVISOR_CLIENT.paths.runs_dir, AGENT_ARCHIVE_DIR
-        ),
+        target=lambda: palette.collect_artifact_items_from_index(_sqlite_event_store()),
         name="palette-artifact-warm",
         daemon=True,
     ).start()
@@ -1093,6 +1091,27 @@ AGENT_ARCHIVE_DIR = Path(
 )
 AGENT_TMP_DIR = Path(os.environ.get("WIKI_AGENT_TMP_DIR") or "/tmp")
 SUPERVISOR_CLIENT = SupervisorClient(RuntimePaths.from_env())
+
+# These switches deliberately stay separate.  A route can move to the
+# materialized view only after its adapter has proved safe in production.
+_SQLITE_READ_FLAG_ENV = {
+    "session": "WIKI_SQLITE_READ_SESSION",
+    "delta": "WIKI_SQLITE_READ_DELTA",
+    "older": "WIKI_SQLITE_READ_OLDER",
+    "provider-events": "WIKI_SQLITE_READ_PROVIDER_EVENTS",
+    "archive": "WIKI_SQLITE_READ_ARCHIVE",
+}
+
+
+def _sqlite_read_enabled(route: str) -> bool:
+    """Return whether one independently releasable SQLite read is enabled."""
+
+    value = os.environ.get(_SQLITE_READ_FLAG_ENV[route], "")
+    return value.lower() in {"1", "true", "yes", "on"}
+
+
+def _sqlite_event_store() -> SQLiteEventStore:
+    return SQLiteEventStore(runtime_event_db_path(AGENT_RUNTIME_DIR), migrate=False)
 RUN_ID_PATTERN = re.compile(
     r"^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$"
 )
@@ -2403,6 +2422,21 @@ async def palette_search(
             return
 
     def _run() -> list[dict[str, object]]:
+        workers = (
+            agents_payload.get("workers", [])
+            if isinstance(agents_payload, dict)
+            else []
+        )
+        ticket_by_run = {
+            str(worker["run_id"]): str(worker["ticket"])
+            for worker in workers
+            if isinstance(worker, dict)
+            and isinstance(worker.get("run_id"), str)
+            and isinstance(worker.get("ticket"), str)
+        }
+        indexed_artifacts = palette.collect_artifact_items_from_index(
+            _sqlite_event_store(), ticket_by_run=ticket_by_run
+        )
         return palette.search(
             q,
             limit,
@@ -2410,6 +2444,7 @@ async def palette_search(
             vault_dir=VAULT_DIR,
             runs_dir=SUPERVISOR_CLIENT.paths.runs_dir,
             archive_dir=AGENT_ARCHIVE_DIR,
+            artifact_items=indexed_artifacts,
             should_cancel=cancelled.is_set,
         )
 
@@ -3342,6 +3377,169 @@ def _overlay_pending_questions(
     }
 
 
+def _sqlite_ready_store(run_id: str) -> tuple[SQLiteEventStore, Any] | None:
+    """Return a ready materialized run, or let the legacy reader handle it."""
+
+    try:
+        event_store = _sqlite_event_store()
+        state = event_store.cursor(run_id)
+    except Exception:
+        return None
+    if state.rebuild_state != "ready":
+        return None
+    return event_store, state
+
+
+def _sqlite_projection(event_store: SQLiteEventStore, run_id: str) -> tuple[Any, ...] | None:
+    try:
+        projections = event_store.view_rows(run_id)["projections"]
+    except Exception:
+        return None
+    return projections[0] if len(projections) == 1 else None
+
+
+def _sqlite_source_key(run_id: str) -> str:
+    """Return the existing v2 source key for the materialized adapter."""
+
+    return f"sqlite://{run_id}"
+
+
+def _sqlite_session_payload(
+    run_id: str,
+    *,
+    fmt: str,
+    cursor: int,
+    client_path: str | None,
+    model: str | None,
+    desired_model: str | None,
+    kind: str | None,
+    provider: str | None,
+    working: bool,
+    include_subagents: bool = False,
+    include_queue: bool = False,
+    ticket: str | None = None,
+    tail_window: bool = True,
+    tail_events: int | None = None,
+) -> dict[str, object] | None:
+    """Build the v2 session view from a ready materialized run.
+
+    ``path`` is already the v2 source identity.  Changing it from a native or
+    archive path to this key makes old clients take the established full-reset
+    branch without adding a new payload field.
+    """
+
+    ready = _sqlite_ready_store(run_id)
+    if ready is None:
+        return None
+    event_store, state = ready
+    projection = _sqlite_projection(event_store, run_id)
+    if projection is None:
+        return None
+    source_key = _sqlite_source_key(run_id)
+    effective_cursor = 0 if client_path is not None and client_path != source_key else cursor
+    try:
+        events = event_store.read_events(run_id)
+        patches = event_store.read_patches(run_id, after_cursor=effective_cursor)
+    except Exception:
+        return None
+
+    # Patches can only update an event a client already has.  A materialized
+    # tail has no creation cursor, so return a bounded snapshot whenever the
+    # client is behind.  Stable event ids make this the same safe merge as a
+    # normal v2 source reset, without losing a race at the SQLite boundary.
+    full_reset = (
+        effective_cursor <= 0
+        or effective_cursor > state.change_cursor
+        or effective_cursor < state.patch_base_cursor
+        or effective_cursor != state.change_cursor
+    )
+    event_base = state.event_base
+    total = event_base + len(events)
+    if full_reset:
+        window_size = tail_events
+        if window_size is None and tail_window:
+            window_size = transcripts.TAIL_WINDOW_EVENTS
+        window_base = max(event_base, total - window_size) if window_size else event_base
+        event_slice = events[window_base - event_base :]
+        patch_payload: list[dict[str, Any]] = []
+        tail_from = window_base
+    else:
+        event_slice = []
+        patch_payload = [
+            {"id": patch.event_id, **patch.patch}
+            for patch in patches
+            if "event" not in patch.patch
+        ]
+        tail_from = total
+
+    try:
+        tokens = json.loads(projection[7]) if projection[7] else None
+        tasks = json.loads(projection[1])
+        pr = json.loads(projection[2]) if projection[2] else None
+        session_meta = json.loads(projection[3])
+        dispositions = json.loads(projection[6])
+    except (TypeError, ValueError):
+        return None
+    payload: dict[str, object] = {
+        "version": 2,
+        "format": fmt,
+        "path": source_key,
+        "tokens": tokens,
+        "tasks": tasks,
+        "pr": pr,
+        "session_meta": session_meta,
+        "dispositions": dispositions,
+        "base": window_base if full_reset else event_base,
+        "cursor": state.change_cursor,
+        "tail_from": tail_from,
+        "events": event_slice,
+        "patches": patch_payload,
+        "working": working,
+        "model": model,
+        "desired_model": desired_model,
+        "kind": kind,
+        "provider": provider,
+    }
+    if full_reset:
+        payload["has_older"] = window_base > event_base
+    if include_subagents:
+        payload["subagents"] = []
+    if include_queue:
+        payload["queue"] = _queue_messages(ticket) if ticket else []
+    return payload
+
+
+def _record_read_mismatch(
+    route: str,
+    run_id: str,
+    legacy: dict[str, object],
+    sqlite_payload: dict[str, object],
+) -> None:
+    """Best-effort route telemetry.  It can never change a read response."""
+
+    ignored = {"path", "working", "provider_inspector", "composer_messages", "subagents", "queue"}
+    expected = {key: value for key, value in legacy.items() if key not in ignored}
+    actual = {key: value for key, value in sqlite_payload.items() if key not in ignored}
+    if expected == actual:
+        return
+    try:
+        ready = _sqlite_ready_store(run_id)
+        if ready is None:
+            return
+        event_store, state = ready
+        event_store.record_parity_record(
+            run_id,
+            normalizer_version=state.normalizer_version,
+            record_type="read_mismatch",
+            path=route,
+            detail={"route": route},
+            expected=expected,
+            actual=actual,
+        )
+    except Exception:
+        return
+
+
 def _provider_events(
     agent_id: str,
     *,
@@ -3367,6 +3565,29 @@ def _provider_events(
             detail="Agent supervisor returned a bad event inspector response",
         )
     payload = dict(result)
+    run_id = resolved[2].get("run_id")
+    if _sqlite_read_enabled("provider-events") and isinstance(run_id, str):
+        ready = _sqlite_ready_store(run_id)
+        if ready is not None:
+            event_store, _state = ready
+            try:
+                sqlite_events = event_store.read_normalized_events(
+                    run_id,
+                    after_seq=after_seq,
+                    limit=limit,
+                )
+            except Exception:
+                sqlite_events = None
+            if sqlite_events is not None:
+                legacy_events = payload.get("events")
+                if isinstance(legacy_events, list):
+                    _record_read_mismatch(
+                        "provider-events",
+                        run_id,
+                        {"events": legacy_events},
+                        {"events": sqlite_events},
+                    )
+                payload["events"] = sqlite_events
     model, kind, provider = _session_identity(resolved[2])
     payload["model"] = payload.get("model") or model
     payload["kind"] = payload.get("kind") or kind
@@ -3580,6 +3801,7 @@ def _session_delta_payload(
     desired_model: str | None = None,
     kind: str | None = None,
     provider: str | None = None,
+    run_id: str | None = None,
     tail_window: bool = True,
     tail_events: int | None = None,
 ) -> dict[str, object]:
@@ -3642,6 +3864,28 @@ def _session_delta_payload(
             composer_messages = provider_inspector.get("composer_messages")
             if isinstance(composer_messages, list):
                 payload["composer_messages"] = composer_messages
+    if _sqlite_read_enabled("delta") and isinstance(run_id, str):
+        sqlite_payload = _sqlite_session_payload(
+            run_id,
+            fmt=fmt,
+            cursor=cursor,
+            client_path=client_path,
+            model=model,
+            desired_model=desired_model,
+            kind=kind,
+            provider=provider,
+            working=bool(payload["working"]),
+            include_subagents=include_subagents,
+            include_queue=include_queue,
+            ticket=ticket,
+            tail_window=tail_window,
+            tail_events=tail_events,
+        )
+        if sqlite_payload is not None:
+            if include_subagents:
+                sqlite_payload["subagents"] = _active_subagents(path)
+            _record_read_mismatch("delta", run_id, payload, sqlite_payload)
+            return sqlite_payload
     return payload
 
 
@@ -3689,7 +3933,58 @@ def _archived_events_payload(
     }
     if "has_older" in result:
         payload["has_older"] = bool(result["has_older"])
+    archive_run_id = entry.get("run_id")
+    if _sqlite_read_enabled("archive") and isinstance(archive_run_id, str):
+        sqlite_payload = _sqlite_session_payload(
+            archive_run_id,
+            fmt="provider-events",
+            cursor=cursor,
+            client_path=client_path,
+            model=model,
+            desired_model=entry.get("desired_model") if isinstance(entry.get("desired_model"), str) else None,
+            kind=kind,
+            provider=provider,
+            working=False,
+        )
+        if sqlite_payload is not None:
+            sqlite_payload["subagents"] = []
+            sqlite_payload["queue"] = []
+            _record_read_mismatch("archive", archive_run_id, payload, sqlite_payload)
+            return sqlite_payload
     return payload
+
+
+def _legacy_source_for_sqlite_run(ticket: str, run_id: str) -> tuple[str, Path] | None:
+    """Find the old source when an independent route remains unflipped."""
+
+    resolved = _registry_agent(_read_agent_registry(), ticket)
+    if resolved is not None:
+        current = resolved[2]
+        if current.get("run_id") == run_id:
+            transcript = current.get("transcript")
+            if isinstance(transcript, str):
+                found = _direct_transcript_session(Path(transcript))
+                if found is not None:
+                    return found
+            found = _session_paths.get(ticket)
+            if found is not None and found[1].is_file():
+                return found
+            found = transcripts.find_session(
+                _session_identity(current)[1],
+                ticket,
+                current.get("spawned_at"),
+                current.get("session_id") if isinstance(current.get("session_id"), str) else None,
+                current.get("worktree"),
+            )
+            if found is not None:
+                return found
+    archive_dir = _archive_session_for_run_id(run_id)
+    if archive_dir is not None:
+        _entry, _model, _kind, provider = _archive_runtime_identity(archive_dir)
+        path = archive_dir / "events.jsonl"
+        if provider in {"codex", "claude"} and path.is_file():
+            return f"{provider}-normalized", path
+    return None
 
 
 @app.get("/api/agents/{ticket}/session")
@@ -3764,6 +4059,7 @@ def agent_session(
         archive_kind, spawned_at, archive_dir = _archive_hint(ticket, archived_at)
         current_kind = current_kind or archive_kind
 
+    current_run_id = current.get("run_id") if isinstance(current, dict) else None
     found = None
     if not requested_archive and isinstance(current, dict) and _is_headless(current):
         transcript_hint = current.get("transcript")
@@ -3789,6 +4085,28 @@ def agent_session(
             if isinstance(current_run_id, str):
                 archive_dir = _archive_session_for_run_id(current_run_id)
         if isinstance(current, dict) and _is_headless(current):
+            if _sqlite_read_enabled("session") and isinstance(current_run_id, str):
+                sqlite_payload = _sqlite_session_payload(
+                    current_run_id,
+                    fmt=current_provider or "provider-events",
+                    cursor=cursor,
+                    client_path=client_path,
+                    model=current_model,
+                    desired_model=current.get("desired_model"),
+                    kind=current_kind,
+                    provider=current_provider,
+                    working=_transcript_working(Path(current.get("log") or "."), ticket),
+                    include_queue=True,
+                    ticket=ticket,
+                )
+                if sqlite_payload is not None:
+                    provider_inspector = _provider_events(ticket, limit=50)
+                    if provider_inspector is not None:
+                        sqlite_payload["provider_inspector"] = provider_inspector
+                        sqlite_payload["composer_messages"] = (
+                            provider_inspector.get("composer_messages") or []
+                        )
+                    return sqlite_payload
             provider_inspector = _provider_events(ticket, limit=50)
             if provider_inspector is None:
                 raise HTTPException(
@@ -3876,7 +4194,7 @@ def agent_session(
     model = current_model
     kind = current_kind or _kind_for_format(fmt)
     provider = current_provider or _provider_for_kind(kind)
-    return _session_delta_payload(
+    legacy_payload = _session_delta_payload(
         fmt,
         path,
         cursor=cursor,
@@ -3889,7 +4207,36 @@ def agent_session(
         desired_model=current.get("desired_model") if isinstance(current, dict) else None,
         kind=kind,
         provider=provider,
+        run_id=current_run_id if isinstance(current_run_id, str) and _is_headless(current) else None,
     )
+    if (
+        _sqlite_read_enabled("session")
+        and isinstance(current_run_id, str)
+        and _is_headless(current)
+    ):
+        sqlite_payload = _sqlite_session_payload(
+            current_run_id,
+            fmt=fmt,
+            cursor=cursor,
+            client_path=client_path,
+            model=model,
+            desired_model=current.get("desired_model") if isinstance(current, dict) else None,
+            kind=kind,
+            provider=provider,
+            working=bool(legacy_payload["working"]),
+            include_subagents=fmt == "claude",
+            include_queue=True,
+            ticket=ticket,
+        )
+        if sqlite_payload is not None:
+            if fmt == "claude":
+                sqlite_payload["subagents"] = legacy_payload.get("subagents") or []
+            for key in ("provider_inspector", "composer_messages"):
+                if key in legacy_payload:
+                    sqlite_payload[key] = legacy_payload[key]
+            _record_read_mismatch("session", current_run_id, legacy_payload, sqlite_payload)
+            return sqlite_payload
+    return legacy_payload
 
 
 @app.get("/api/agents/{ticket}/session/older")
@@ -3911,7 +4258,42 @@ def agent_session_older(
     raw_path = session.get("path")
     if not isinstance(raw_path, str):
         raise HTTPException(status_code=409, detail="Older transcript events are unavailable")
-    path = Path(raw_path)
+    if raw_path.startswith("sqlite://"):
+        sqlite_run_id = raw_path.removeprefix("sqlite://")
+        if _sqlite_read_enabled("older"):
+            ready = _sqlite_ready_store(sqlite_run_id)
+            if ready is not None:
+                event_store, state = ready
+                try:
+                    events, has_older = event_store.read_events_before(
+                        sqlite_run_id,
+                        before_event_id=before,
+                        limit=count,
+                    )
+                except Exception:
+                    events = []
+                else:
+                    base = int(events[0]["id"]) if events else min(before, state.event_base)
+                    return {
+                        "version": 2,
+                        "format": fmt,
+                        "path": raw_path,
+                        "base": base,
+                        "events": events,
+                        "has_older": has_older,
+                    }
+        legacy_source = _legacy_source_for_sqlite_run(ticket, sqlite_run_id)
+        if legacy_source is None:
+            raise HTTPException(
+                status_code=409,
+                detail="Older transcript events are unavailable",
+            )
+        fmt, path = legacy_source
+        if fmt.endswith("-normalized"):
+            fmt = "provider-events"
+        raw_path = str(path)
+    else:
+        path = Path(raw_path)
     if fmt == "provider-events":
         if raw_path.startswith("provider://") or not path.is_file():
             raise HTTPException(
