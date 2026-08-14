@@ -4588,11 +4588,11 @@ def agent_session_older(
                     "has_older": snapshot.has_older,
                 }
                 if _shadow_sample("older"):
-                    legacy_source = _legacy_source_for_sqlite_run(
-                        ticket, selected_run_id
-                    )
-                    if legacy_source is not None:
-                        try:
+                    try:
+                        legacy_source = _legacy_source_for_sqlite_run(
+                            ticket, selected_run_id
+                        )
+                        if legacy_source is not None:
                             legacy_fmt, legacy_path = legacy_source
                             if legacy_fmt.endswith("-normalized"):
                                 legacy_fmt = "provider-events"
@@ -4623,8 +4623,8 @@ def agent_session_older(
                                 {**sqlite_result, "events": shadow_events},
                                 sampled=True,
                             )
-                        except Exception:
-                            pass
+                    except Exception:
+                        pass
                 return {
                     "version": 2,
                     "format": sqlite_fmt,
@@ -4702,7 +4702,7 @@ def _child_materialization_is_current(mapping: Any) -> bool:
     try:
         state = _sqlite_event_store().cursor(mapping.child_run_id)
         if not source_path.is_file():
-            return state.rebuild_state == "ready"
+            return state.rebuild_state == "ready" and mapping.source_size >= 0
         if mapping.source_size < 0:
             return False
         source_stat = source_path.stat()

@@ -776,7 +776,6 @@ class SQLiteEventStore:
 
         self.ensure_schema()
         provider_kind = _provider_kind(provider)
-        source_size = _source_size(source_path)
         with self.connection() as connection:
             connection.execute("BEGIN")
             connection.execute(
@@ -819,7 +818,7 @@ class SQLiteEventStore:
                     child_id,
                     child_run_id,
                     source_path,
-                    source_size,
+                    -1,
                     created_at,
                 ),
             )
@@ -864,23 +863,27 @@ class SQLiteEventStore:
         )
 
     def refresh_child_source_fingerprint(
-        self, parent_run_id: str, child_id: str
+        self, parent_run_id: str, child_id: str, source_size: int
     ) -> None:
-        """Record child file metadata after its rows are materialized."""
+        """Publish the consumed child file size after successful materialization."""
 
         with self.connection() as connection:
-            row = connection.execute(
-                "SELECT source_path FROM child_runs "
-                "WHERE parent_run_id = ? AND child_id = ?",
-                (parent_run_id, child_id),
-            ).fetchone()
-            if row is None:
-                return
-            size = _source_size(str(row[0]))
             connection.execute(
                 "UPDATE child_runs SET source_size = ? "
                 "WHERE parent_run_id = ? AND child_id = ?",
-                (size, parent_run_id, child_id),
+                (source_size, parent_run_id, child_id),
+            )
+
+    def invalidate_child_source_fingerprint(
+        self, parent_run_id: str, child_id: str
+    ) -> None:
+        """Hide a child view while its source is being materialized."""
+
+        with self.connection() as connection:
+            connection.execute(
+                "UPDATE child_runs SET source_size = -1 "
+                "WHERE parent_run_id = ? AND child_id = ?",
+                (parent_run_id, child_id),
             )
 
     def materialize_raw_rows(
