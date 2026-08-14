@@ -58,23 +58,29 @@ class WkRunMetadata:
     """Additive metadata for the two distinct public wk execution kinds."""
 
     kind: WkKind
-    lane: str
 
-    def __post_init__(self) -> None:
+    @property
+    def lane(self) -> str:
         lane = wk_lane_for_kind(self.kind)
-        if lane is None or lane != self.lane:
-            raise ValueError(f"invalid wk kind and lane pair: {self.kind!r}, {self.lane!r}")
+        if lane is None:
+            raise ValueError(f"unsupported wk kind: {self.kind!r}")
+        return lane
+
+    @property
+    def provider(self) -> str:
+        return self.lane
 
     @classmethod
     def from_kind(cls, kind: str) -> WkRunMetadata:
         lane = wk_lane_for_kind(kind)
         if lane is None:
             raise ValueError(f"unsupported wk kind: {kind!r}")
-        return cls(cast(WkKind, kind), lane)
+        return cls(cast(WkKind, kind))
 
 
 _SECRET_KEY = re.compile(
-    r"(?:api[_-]?key|authorization|cookie|password|private[_-]?key|secret|token)",
+    r"^(?:api[_-]?key|authorization|proxy[_-]?authorization|cookie|set[_-]?cookie|"
+    r"password|private[_-]?key|client[_-]?secret|access[_-]?token|refresh[_-]?token)$",
     re.IGNORECASE,
 )
 _SECRET_VALUE = re.compile(
@@ -514,7 +520,7 @@ def mutation_input_hash(request: WkToolRequest) -> str:
         {
             "call_id": request.call_id,
             "name": request.name,
-            "arguments": redact_payload(request.arguments),
+            "arguments": request.arguments,
             "mutation": request.mutation.value,
         }
     )

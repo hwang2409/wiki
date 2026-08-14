@@ -165,7 +165,7 @@ class RunRecord:
     # Optional execution metadata.  Existing cc/cdx records omit these keys
     # from their serialized shape.  wk records use distinct public kinds.
     execution_kind: str | None = None
-    wk_lane: str | None = None
+    wk_lane: str | None = field(default=None, init=False)
     auto_archive: bool = False
     backend_base_url: str | None = None
     desired_model: str | None = None
@@ -248,6 +248,22 @@ class RunRecord:
     message_dedupe_keys: list[dict[str, str]] = field(default_factory=list)
     schema_version: int = 1
 
+    def __post_init__(self) -> None:
+        expected_provider = {
+            "wk-claude": ProviderKind.CLAUDE,
+            "wk-codex": ProviderKind.CODEX,
+        }
+        if self.execution_kind is None:
+            object.__setattr__(self, "wk_lane", None)
+            return
+        provider = expected_provider.get(self.execution_kind)
+        if provider is None or provider is not self.provider:
+            raise ValueError(
+                f"invalid execution kind/provider pair: {self.execution_kind!r}, "
+                f"{self.provider.value!r}"
+            )
+        object.__setattr__(self, "wk_lane", self.execution_kind.removeprefix("wk-"))
+
     @property
     def kind(self) -> str:
         """Return the public execution kind without changing legacy records."""
@@ -271,7 +287,6 @@ class RunRecord:
         worktree: str,
         prompt: str,
         execution_kind: str | None = None,
-        wk_lane: str | None = None,
         auto_archive: bool = False,
         effort: str | None = None,
         orchestrator_id: str | None = None,
@@ -286,7 +301,6 @@ class RunRecord:
             agent_id=agent_id,
             provider=provider,
             execution_kind=execution_kind,
-            wk_lane=wk_lane,
             role=role,
             auto_archive=auto_archive,
             model=model,
@@ -377,7 +391,7 @@ class RunRecord:
         pending_requests = value.get("pending_requests")
         if not isinstance(pending_requests, dict):
             pending_requests = {}
-        return cls(
+        record = cls(
             schema_version=int(value.get("schema_version", 1)),
             run_id=str(value["run_id"]),
             agent_id=str(value["agent_id"]),
@@ -391,7 +405,6 @@ class RunRecord:
                     else None
                 )
             ),
-            wk_lane=(str(value["lane"]) if value.get("lane") else None),
             role=str(value["role"]),
             auto_archive=bool(value.get("auto_archive", False)),
             model=str(value["model"]),
@@ -496,6 +509,10 @@ class RunRecord:
                 if entry is not None
             ],
         )
+        stored_lane = value.get("lane")
+        if stored_lane is not None and stored_lane != record.lane:
+            raise ValueError("stored wk lane does not match its execution kind")
+        return record
 
 
 def validate_transition(current: LifecycleState, target: LifecycleState) -> None:
