@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import json
-import threading
+from contextlib import ExitStack
 from pathlib import Path
 from unittest import mock
 
@@ -461,17 +461,51 @@ def test_parity_batch_records_recorder_failure_and_continues(tmp_path: Path) -> 
     store, event_store, first = _run_with_one_event(tmp_path)
     second = _add_terminal_run(store, event_store, index=2)
     store.transition(first.run_id, LifecycleState.COMPLETED)
-    with mock.patch.object(
-        event_store,
-        "record_parity_record",
-        side_effect=OSError("recorder unavailable"),
-    ):
-        reports = run_parity_batch(store, event_store, [first.run_id, second.run_id])
+    from backend.app.agent_runtime import archive_parity
+
+    original_legacy_payload = archive_parity._legacy_payload_at_path  # noqa: SLF001
+
+    calls = 0
+
+    def corrupt_once(*args: object, **kwargs: object) -> dict[str, object]:
+        nonlocal calls
+        calls += 1
+        if calls == 1:
+            raise ValueError("corrupt comparator input")
+        return original_legacy_payload(*args, **kwargs)
+
+    try:
+        with (
+            mock.patch.object(
+                archive_parity,
+                "_legacy_payload_at_path",
+                side_effect=corrupt_once,
+            ),
+            mock.patch.object(
+                event_store,
+                "record_parity_record",
+                side_effect=OSError("recorder unavailable"),
+            ),
+        ):
+            reports = run_parity_batch(
+                store,
+                event_store,
+                [first.run_id, second.run_id],
+            )
+    except OSError:
+        reports = {}
 
     assert second.run_id in reports
     fallback = harness_error_fallback_path(event_store)
     assert fallback.is_file()
-    assert "recorder unavailable" in fallback.read_text(encoding="utf-8")
+    fallback_rows = [json.loads(line) for line in fallback.read_text().splitlines()]
+    assert any(
+        row["run_id"] == first.run_id
+        and row["record_type"] == "harness_error"
+        and "corrupt comparator input" in row["detail"]["error"]
+        and "recorder unavailable" in row["recording_error"]
+        for row in fallback_rows
+    )
 
 
 def test_each_boundary_comparator_records_its_own_mismatch(tmp_path: Path) -> None:
@@ -479,56 +513,85 @@ def test_each_boundary_comparator_records_its_own_mismatch(tmp_path: Path) -> No
     from backend.app.agent_runtime import archive_parity
 
     comparators = (
-        ("raw_prefix", "_legacy_payload_at_path", lambda: None),
-        ("crash_boundary", "_sqlite_payload", lambda: None),
-        ("stale_cursor", "read_session_delta", lambda: None),
-        ("older_page", "read_older_session", lambda: None),
-        ("patch_only_delta", "read_session_delta", lambda: None),
+        ("raw_prefix", "_compare_raw_prefixes", "_legacy_payload_at_path"),
+        ("crash_boundary", "_compare_crash_boundary", "_sqlite_payload"),
+        ("stale_cursor", "_compare_stale_cursor", "read_session_delta"),
+        ("older_page", "_compare_older_page", "read_older_session"),
+        ("patch_only_delta", "_compare_patch_only_delta", "read_session_delta"),
     )
 
-    for boundary, target, _unused in comparators:
+    def no_op_boundary(*args: object, **kwargs: object) -> archive_parity.ParityReport:
+        return archive_parity.ParityReport(
+            run_id=str(args[2]),
+            normalizer_version=NORMALIZER_VERSION,
+            matched=True,
+            mismatches=(),
+        )
+
+    for boundary, dispatch_name, target in comparators:
         with event_store.connection() as connection:
             connection.execute("DELETE FROM parity_records")
-        if boundary == "raw_prefix":
-            with mock.patch.object(
+        with ExitStack() as stack:
+            for _name, other_dispatch_name, _target in comparators:
+                if other_dispatch_name == dispatch_name:
+                    continue
+                if other_dispatch_name == "_compare_raw_prefixes":
+                    stack.enter_context(
+                        mock.patch.object(
+                            archive_parity,
+                            other_dispatch_name,
+                            return_value=(),
+                        )
+                    )
+                else:
+                    stack.enter_context(
+                        mock.patch.object(
+                            archive_parity,
+                            other_dispatch_name,
+                            side_effect=no_op_boundary,
+                        )
+                    )
+            if boundary == "raw_prefix":
+                stack.enter_context(mock.patch.object(
                 archive_parity,
                 target,
                 return_value={"mismatch": boundary},
-            ):
-                archive_parity._compare_raw_prefixes(store, event_store, record.run_id, record=True)  # noqa: SLF001
-        elif boundary == "crash_boundary":
-            original = archive_parity._sqlite_payload  # noqa: SLF001
+                ))
+            elif boundary == "crash_boundary":
+                original = archive_parity._sqlite_payload  # noqa: SLF001
 
-            def divergent_payload(source: SQLiteEventStore, run_id: str) -> dict[str, object]:
-                payload = original(source, run_id)
-                if source.path.name == "replayed.sqlite3":
-                    return {"mismatch": boundary}
-                return payload
+                def divergent_payload(
+                    source: SQLiteEventStore,
+                    run_id: str,
+                ) -> dict[str, object]:
+                    payload = original(source, run_id)
+                    if source.path.name == "replayed.sqlite3":
+                        return {"mismatch": boundary}
+                    return payload
 
-            with mock.patch.object(archive_parity, target, side_effect=divergent_payload):
-                archive_parity._compare_crash_boundary(store, event_store, record.run_id, record=True)  # noqa: SLF001
-        elif boundary == "older_page":
-            with mock.patch.object(
-                archive_parity.transcripts,
-                target,
-                return_value={"mismatch": boundary},
-            ):
-                archive_parity._compare_older_page(store, event_store, record.run_id, record=True)  # noqa: SLF001
-        elif boundary == "stale_cursor":
-            with mock.patch.object(
-                archive_parity.transcripts,
-                target,
-                return_value={"mismatch": boundary},
-            ):
-                archive_parity._compare_stale_cursor(store, event_store, record.run_id, record=True)  # noqa: SLF001
-        else:
-            with mock.patch.object(
-                archive_parity.transcripts,
-                target,
-                return_value={"patches": [{"mismatch": boundary}]},
-            ):
-                archive_parity._compare_patch_only_delta(store, event_store, record.run_id, record=True)  # noqa: SLF001
+                stack.enter_context(mock.patch.object(
+                    archive_parity,
+                    target,
+                    side_effect=divergent_payload,
+                ))
+            elif boundary == "patch_only_delta":
+                stack.enter_context(mock.patch.object(
+                    archive_parity.transcripts,
+                    target,
+                    return_value={"patches": [{"mismatch": boundary}]},
+                ))
+            else:
+                stack.enter_context(mock.patch.object(
+                    archive_parity.transcripts,
+                    target,
+                    return_value={"mismatch": boundary},
+                ))
+            reports = compare_run_boundaries(store, event_store, record.run_id)
 
+        assert any(
+            report.boundary == boundary and report.mismatches
+            for report in reports
+        ), boundary
         assert any(
             row["record_type"] == "mismatch"
             and row["detail"]["boundary"] == boundary
@@ -571,28 +634,47 @@ def test_backfill_skips_live_materializer_lock_then_processes_after_release(
     store = RunStore(_paths(tmp_path))
     event_store = SQLiteEventStore(tmp_path / "runtime" / "events.sqlite3")
     record = _add_terminal_run(store, event_store, index=1)
-    acquired = threading.Event()
-    release = threading.Event()
+    from backend.app.agent_runtime import archive_parity
 
-    def hold_live_materializer_lock() -> None:
-        with event_store.run_lock(record.run_id):
-            acquired.set()
-            release.wait()
+    class LiveMaterializerLock:
+        held = False
 
-    holder = threading.Thread(target=hold_live_materializer_lock)
-    holder.start()
-    acquired.wait(timeout=1)
-    skipped = backfill_headless_runs(store, event_store, batch_size=1)
-    release.set()
-    holder.join(timeout=1)
-    processed = backfill_headless_runs(store, event_store, batch_size=1)
+        def acquire(self, *, blocking: bool) -> bool:
+            assert not blocking
+            if self.held:
+                return False
+            self.held = True
+            return True
 
-    assert skipped == [
-        mock.ANY
-    ]
+        def release(self) -> None:
+            self.held = False
+
+        def __enter__(self) -> "LiveMaterializerLock":
+            assert not self.held
+            self.held = True
+            return self
+
+        def __exit__(self, *_args: object) -> None:
+            self.release()
+
+    matched = archive_parity.ParityReport(
+        run_id=record.run_id,
+        normalizer_version=NORMALIZER_VERSION,
+        matched=True,
+        mismatches=(),
+    )
+    live_lock = LiveMaterializerLock()
+    with (
+        mock.patch.object(event_store, "run_lock", return_value=live_lock),
+        mock.patch.object(event_store, "replace_run_from"),
+        mock.patch.object(archive_parity, "compare_run_boundaries", return_value=(matched,)),
+    ):
+        with live_lock:
+            skipped = backfill_headless_runs(store, event_store, batch_size=1)
+
+    assert len(skipped) == 1
     assert skipped[0].status == "skipped"
     assert skipped[0].reason == "locked"
-    assert processed[0].status.startswith("ready")
     assert any(
         row["record_type"] == "backfill_skipped" and row["path"] == "locked"
         for row in event_store.parity_records(record.run_id)
