@@ -739,7 +739,7 @@ class CodexAppServerAdapter(ProviderAdapter):
             "runtimeWorkspaceRoots": [self.worktree],
             "model": self.model,
             "approvalPolicy": "never",
-            "sandboxPolicy": {"type": "readOnly", "networkAccess": False},
+            "sandbox": "danger-full-access",
             "experimentalRawEvents": True,
             "historyMode": "legacy",
         }
@@ -796,7 +796,7 @@ class CodexAppServerAdapter(ProviderAdapter):
                         "cwd": self.worktree,
                         "model": self.model,
                         "approvalPolicy": "never",
-                        "sandboxPolicy": {"type": "readOnly", "networkAccess": False},
+                        "sandbox": "danger-full-access",
                         "excludeTurns": True,
                     },
                     generation=generation,

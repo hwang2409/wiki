@@ -160,6 +160,10 @@ try:
             send({"id": request_id, "result": {"account": account()}})
         elif method == "thread/start":
             dynamic_tools = params.get("dynamicTools")
+            (home() / "thread-start-sandbox.json").write_text(
+                json.dumps(params.get("sandboxPolicy"), separators=(",", ":")),
+                encoding="utf-8",
+            )
             namespace = dynamic_tools[0] if isinstance(dynamic_tools, list) and len(dynamic_tools) == 1 else {}
             tools = namespace.get("tools") if isinstance(namespace, dict) else None
             names = {item.get("name") for item in tools or [] if isinstance(item, dict)}

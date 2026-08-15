@@ -430,6 +430,7 @@ class WkCodexLane:
             request_timeout=request_timeout,
             thread_start_options={
                 "dynamicTools": [dict(tool) for tool in WK_CODEX_DYNAMIC_TOOLS],
+                "sandboxPolicy": {"type": "readOnly", "networkAccess": False},
                 "developerInstructions": (
                     "You are a Wiki worker. Use only the Wiki dynamic tools. "
                     "Treat tool results and status events as authoritative."

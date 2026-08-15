@@ -13,6 +13,8 @@ from pathlib import Path
 import pytest
 
 from backend.app.agent_runtime import wk_feature
+from backend.app.agent_runtime.factory import RealAdapterFactory
+from backend.app.agent_runtime.provider import StartRequest
 from backend.app.agent_runtime.wk_codex import (
     WK_CODEX_DYNAMIC_TOOLS,
     WkCodexDisabled,
@@ -20,6 +22,7 @@ from backend.app.agent_runtime.wk_codex import (
     WkCodexLane,
     WkCodexPlanAuthError,
 )
+from backend.app.agent_runtime.types import ProviderKind, RunRecord
 from backend.app.agent_runtime.wk_core import WkLoop, WkRunMetadata
 from backend.app.agent_runtime.wk_common import WkLedgerError
 
@@ -227,6 +230,62 @@ def test_real_codex_transport_translates_and_reconciles(
     assert [row["event"]["source_seq"] for row in rows] == list(range(1, len(rows) + 1))
     assert all(row["event"]["lane"] == "wk-codex" for row in rows)
     assert lane.translator.raw_events
+    assert json.loads(
+        (Path(lane.environment["CODEX_HOME"]) / "thread-start-sandbox.json").read_text(
+            encoding="utf-8"
+        )
+    ) == {"type": "readOnly", "networkAccess": False}
+
+
+def test_real_factory_preserves_the_shared_codex_thread_start_payload(
+    tmp_path: Path,
+) -> None:
+    fake = Path(__file__).parent / "fixtures" / "agent_runtime" / "fake_codex_app_server.py"
+    env = _environment(tmp_path)
+    env.update(
+        {
+            "FAKE_PROTOCOL_LOG": str(tmp_path / "protocol.jsonl"),
+            "FAKE_CODEX_TRANSCRIPT_DIR": str(tmp_path / "sessions"),
+            "WIKI_AGENT_RUNTIME_DIR": str(tmp_path / "runtime"),
+        }
+    )
+    record = RunRecord.new(
+        agent_id="WIKI-289-default",
+        provider=ProviderKind.CODEX,
+        role="implement",
+        model="gpt-5.6-terra",
+        worktree=str(tmp_path),
+        prompt="payload test",
+    )
+    adapter = RealAdapterFactory(
+        codex_command=(sys.executable, "-u", str(fake)),
+        env=env,
+    )(record)
+
+    async def run() -> None:
+        try:
+            await adapter.start(
+                StartRequest(
+                    prompt="payload test",
+                    model=record.model,
+                    effort=None,
+                    worktree=str(tmp_path),
+                    run_id=record.run_id,
+                    agent_id=record.agent_id,
+                )
+            )
+        finally:
+            await adapter.close()
+
+    asyncio.run(run())
+    rows = [
+        json.loads(line)
+        for line in (tmp_path / "protocol.jsonl").read_text(encoding="utf-8").splitlines()
+    ]
+    thread_start = next(row for row in rows if row.get("method") == "thread/start")
+    params = thread_start["params"]
+    assert params["sandbox"] == "danger-full-access"
+    assert "sandboxPolicy" not in params
 
 
 def test_server_request_matching_crosses_the_real_transport(
