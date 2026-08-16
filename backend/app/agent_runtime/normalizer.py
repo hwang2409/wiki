@@ -367,6 +367,22 @@ def normalize_provider_event(
     *,
     direction: str = "provider",
 ) -> NormalizedProviderEvent:
+    wk_event = payload.get("_wk_event")
+    if isinstance(wk_event, dict):
+        provider_payload = {
+            key: value for key, value in payload.items() if key != "_wk_event"
+        }
+        normalized = normalize_provider_event(
+            provider,
+            provider_payload,
+            direction=direction,
+        )
+        return NormalizedProviderEvent(
+            normalized.disposition,
+            normalized.kind,
+            {**normalized.payload, "_wk_event": wk_event},
+            normalized.lifecycle_state,
+        )
     if direction in {"client", "stdin"}:
         is_approval_response = (
             provider is ProviderKind.CODEX

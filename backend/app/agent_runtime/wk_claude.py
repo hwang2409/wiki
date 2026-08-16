@@ -1359,6 +1359,8 @@ class WkClaudeLane:
         approval: ApprovalRequest | None = None,
         steering_path: Path | None = None,
         wiki_command: Sequence[str] = ("wiki",),
+        environment: Mapping[str, str] | None = None,
+        cli_path: str | Path | None = None,
     ) -> None:
         if not wk_enabled():
             raise WkClaudeDisabled("WIKI_ENABLE_WK=1 is required for wk-claude")
@@ -1386,6 +1388,8 @@ class WkClaudeLane:
             registry=self.registry, ledger=self.ledger, loop=loop
         )
         self.approval = approval
+        self._environment = plan_auth_environment(environment)
+        self.cli_path = cli_path
         self._client_factory = client_factory
         self._options_factory = options_factory
         self._steering = WkSteeringQueue(
@@ -1401,7 +1405,7 @@ class WkClaudeLane:
         self._sdk_environment: Mapping[str, str] = {}
         self._client_options_cli_path: str | Path | None = None
         self._settings_guard = _SettingsGuard(
-            _settings_paths(worktree, plan_auth_environment())
+            _settings_paths(worktree, self._environment)
         )
 
     def _new_client(self, *, resume: str | None = None) -> ClaudeSdkClient:
@@ -1413,7 +1417,10 @@ class WkClaudeLane:
                 bridge=self.bridge,
                 approval=self.approval,
                 resume=resume,
+                environment=self._environment,
             )
+            if self.cli_path is not None and is_dataclass(options):
+                options = replace(options, cli_path=str(self.cli_path))
         else:
             options = self._options_factory(resume=resume)
         cli_path = getattr(options, "cli_path", None)

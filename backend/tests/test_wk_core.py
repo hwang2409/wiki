@@ -158,6 +158,8 @@ def test_wk_off_surface_snapshot_matches_origin_main(
         "worker_schema": main.SpawnWorkerIn.model_json_schema(),
         "orchestrator_schema": main.SpawnOrchestratorIn.model_json_schema(),
     }
+    assert main._normalize_kind("wk-codex") is None  # noqa: SLF001
+    assert main._provider_for_kind("wk-codex") is None  # noqa: SLF001
     raw = json.dumps(snapshot, sort_keys=True, separators=(",", ":")).encode()
     assert hashlib.sha256(raw).hexdigest() == (
         "3f1dccb59b5789709fb988a2c0d8cefb190dab5e77bb84f3af19f82c879cf998"

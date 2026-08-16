@@ -162,7 +162,8 @@ def is_model_allowed(kind: str, model: str) -> bool:
 
 def default_model_for_kind(kind: str, *, target: str) -> str:
     field = "default_orchestrator" if target == "Orchestrator" else "default_worker"
-    for option in MODEL_OPTIONS:
+    options = MODEL_OPTIONS + WK_MODEL_OPTIONS if wk_enabled() else MODEL_OPTIONS
+    for option in options:
         if option.kind == kind and getattr(option, field):
             return option.id
     raise ValueError(f"No default {target.lower()} model for {kind}")

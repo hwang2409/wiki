@@ -1206,6 +1206,11 @@ class RunStore:
             "control_attached": record.run_id in self._control_attached_run_ids,
             "provider_generation": record.provider_generation,
             "active_turn_id": record.active_turn_id,
+            **(
+                {"core_phase": record.core_phase}
+                if record.execution_kind is not None
+                else {}
+            ),
             "transcript": record.transcript_path,
             "log": str(self.raw_events_path(record.run_id)),
             # Transitional compatibility only. Headless liveness never reads it.
@@ -2194,6 +2199,8 @@ class RunStore:
                         )
                 record.provider_generation = adapter_status.generation
                 record.active_turn_id = adapter_status.active_turn_id
+                if adapter_status.core_phase is not None:
+                    record.core_phase = adapter_status.core_phase
                 if adapter_status.transcript_path is not None:
                     record.transcript_path = adapter_status.transcript_path
                 if adapter_status.detail and reason is None:
