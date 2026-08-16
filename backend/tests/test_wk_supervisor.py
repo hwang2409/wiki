@@ -286,11 +286,22 @@ def test_wk_dual_stack_routes_start_real_run_and_show_archive(
         assert projected != forged
         assert projected["step"] != forged["step"]
 
+        ledger_status = {
+            key: projected.get(key)
+            for key in ("state", "pr", "step", "blocker")
+        }
+        status_path.write_text(json.dumps(forged) + "\n", encoding="utf-8")
         archived = await supervisor.archive(record.run_id, outcome="review")
         assert archived.state is LifecycleState.COMPLETED
         archived_payload = main.agents()["archived"]
         assert any(item.get("run_id") == record.run_id for item in archived_payload)
         assert any(paths.archive_dir.rglob("archive-complete.json"))
+        final_status_path = next(paths.archive_dir.rglob("final-status.json"))
+        archived_status = json.loads(final_status_path.read_text(encoding="utf-8"))
+        assert {
+            key: archived_status.get(key)
+            for key in ledger_status
+        } == ledger_status
         await supervisor.close()
 
     asyncio.run(run())

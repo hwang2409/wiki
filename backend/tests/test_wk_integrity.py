@@ -32,6 +32,7 @@ from backend.app.agent_runtime.wk_tools import WkGateTool, WkStatusTool, registe
 from backend.app.agent_runtime.wk_claude import WkClaudeLane
 from backend.app.agent_runtime import wk_feature
 from backend.app.agent_runtime.store import RunStore, RuntimePaths
+from backend.app.agent_runtime.supervisor import Supervisor
 from backend.app.agent_runtime.types import EventDisposition, ProviderKind, RunRecord
 
 
@@ -261,29 +262,40 @@ def test_wk_status_replay_uses_causal_sequence_after_orphan_append(tmp_path: Pat
         ts=translator.timestamp(),
         payload={"detail": "failed gate"},
     )
-    for event in (ready, revoked):
-        raw = store.append_raw(
-            record.run_id,
-            provider="claude",
-            direction="inbound",
-            payload=event.to_dict(),
-        )
-        store.append_normalized(
-            record.run_id,
-            raw_seq=int(raw["seq"]),
-            disposition=EventDisposition.RENDERED,
-            kind=event.kind,
-            payload=event.to_dict(),
-        )
-
-    normalized_path = store.normalized_events_path(record.run_id)
-    rows = [json.loads(line) for line in normalized_path.read_text().splitlines() if line]
-    normalized_path.write_text(
-        "".join(json.dumps(row) + "\n" for row in reversed(rows)),
-        encoding="utf-8",
+    ready_raw = store.append_raw(
+        record.run_id,
+        provider="claude",
+        direction="inbound",
+        payload=ready.to_dict(),
     )
+    revoked_raw = store.append_raw(
+        record.run_id,
+        provider="claude",
+        direction="inbound",
+        payload=revoked.to_dict(),
+    )
+    store.append_normalized(
+        record.run_id,
+        raw_seq=int(revoked_raw["seq"]),
+        disposition=EventDisposition.RENDERED,
+        kind=revoked.kind,
+        payload=revoked.to_dict(),
+    )
+    store.append_normalized(
+        record.run_id,
+        raw_seq=int(ready_raw["seq"]),
+        disposition=EventDisposition.RENDERED,
+        kind=ready.kind,
+        payload=ready.to_dict(),
+    )
+    rows = list(store.iter_normalized_events(record.run_id))
+    assert [row["kind"] for row in rows] == [revoked.kind, ready.kind]
+    assert [row["seq"] for row in rows] == [1, 2]
     restarted = RunStore(paths)
-    restored = restarted.rebuild_wk_status_projection(record.run_id)
+    restarted_supervisor = Supervisor(restarted, lambda _record: None)
+    asyncio.run(restarted_supervisor.recover_on_start())
+    restored = restarted.get(record.run_id)
+    asyncio.run(restarted_supervisor.close())
     assert restored.wk_status_state == "blocked"
     assert restored.wk_status_source_seq == revoked.source_seq
 
