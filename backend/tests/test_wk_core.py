@@ -296,13 +296,19 @@ def test_status_writer_is_loop_owned_atomic_and_sequenced(tmp_path: Path) -> Non
     assert loop.write_status(
         state="blocked", pr=None, step="stopped", blocker="tool failed"
     ) == 2
-    assert json.loads(status_path.read_text()) == {
+    value = json.loads(status_path.read_text())
+    assert {
+        key: value[key]
+        for key in ("blocker", "pr", "state", "status_write_seq", "step")
+    } == {
         "blocker": "tool failed",
         "pr": None,
         "state": "blocked",
         "status_write_seq": 2,
         "step": "stopped",
     }
+    assert isinstance(value["status_nonce"], str)
+    assert isinstance(value["status_checksum"], str)
     assert list(tmp_path.glob(".*.agent.json.*")) == []
 
     with pytest.raises(PermissionError):

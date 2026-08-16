@@ -10,6 +10,7 @@ import hashlib
 import json
 import os
 import re
+import subprocess
 import tempfile
 import uuid
 from collections.abc import AsyncIterator, Awaitable, Callable, Mapping, Sequence
@@ -467,12 +468,43 @@ class _AtomicStatusWriter:
         self.path = path
         self._authority = authority
         self._write_seq = 0
+        self._nonce = uuid.uuid4().hex
         try:
             value = json.loads(path.read_text(encoding="utf-8"))
         except (FileNotFoundError, OSError, json.JSONDecodeError):
             value = None
-        if isinstance(value, dict) and isinstance(value.get("status_write_seq"), int):
+        if isinstance(value, dict) and self._valid_value(value):
             self._write_seq = max(0, value["status_write_seq"])
+            self._nonce = value["status_nonce"]
+
+    @staticmethod
+    def _checksum(value: Mapping[str, object]) -> str:
+        fields = {
+            key: value[key]
+            for key in ("state", "pr", "step", "blocker", "status_write_seq", "status_nonce")
+        }
+        return hashlib.sha256(
+            json.dumps(fields, sort_keys=True, separators=(",", ":")).encode()
+        ).hexdigest()
+
+    @classmethod
+    def _valid_value(cls, value: Mapping[str, object]) -> bool:
+        nonce = value.get("status_nonce")
+        checksum = value.get("status_checksum")
+        return (
+            isinstance(nonce, str)
+            and bool(nonce)
+            and isinstance(checksum, str)
+            and all(key in value for key in ("state", "pr", "step", "blocker", "status_write_seq"))
+            and checksum == cls._checksum(value)
+        )
+
+    def verify(self) -> bool:
+        try:
+            value = json.loads(self.path.read_text(encoding="utf-8"))
+        except (FileNotFoundError, OSError, json.JSONDecodeError):
+            return not self.path.exists()
+        return isinstance(value, dict) and self._valid_value(value)
 
     def write(
         self,
@@ -498,7 +530,9 @@ class _AtomicStatusWriter:
             "step": step,
             "blocker": blocker,
             "status_write_seq": self._write_seq,
+            "status_nonce": self._nonce,
         }
+        value["status_checksum"] = self._checksum(value)
         self.path.parent.mkdir(parents=True, exist_ok=True)
         fd, raw_tmp = tempfile.mkstemp(prefix=f".{self.path.name}.", dir=self.path.parent)
         tmp = Path(raw_tmp)
@@ -527,11 +561,13 @@ class WkLoop:
     perform a transition through this method.
     """
 
-    def __init__(self, *, status_path: Path):
+    def __init__(self, *, status_path: Path, worktree: Path | None = None):
         self._authority = _LoopAuthority()
         self._status_writer = _AtomicStatusWriter(status_path, self._authority)
         self._integrity_ledger: object | None = None
         self._integrity_role = "review"
+        self._worktree = worktree.resolve() if worktree is not None else None
+        self._pending_integrity_events: list[WkEventEnvelope] = []
 
     @property
     def status_path(self) -> Path:
@@ -549,6 +585,42 @@ class WkLoop:
         self._integrity_ledger = ledger
         self._integrity_role = role
 
+    def current_head_sha(self) -> str | None:
+        """Read the current git head without accepting model input."""
+
+        if self._worktree is None:
+            return None
+        result = subprocess.run(
+            ("git", "-C", str(self._worktree), "rev-parse", "HEAD"),
+            capture_output=True,
+            check=False,
+            text=True,
+        )
+        if result.returncode != 0:
+            return None
+        value = result.stdout.strip()
+        return value if re.fullmatch(r"[0-9a-fA-F]{40}", value) else None
+
+    def report_integrity_violation(self, detail: str) -> None:
+        """Record a tool boundary violation and force a blocked status."""
+
+        ledger = self._integrity_ledger
+        reporter = getattr(ledger, "record_integrity_event", None)
+        if reporter is not None:
+            self._pending_integrity_events.append(reporter(detail))
+        self._status_writer.write(
+            state="blocked",
+            pr=None,
+            step="wk integrity boundary blocked a direct filesystem write",
+            blocker=detail,
+            authority=self._authority,
+        )
+
+    def drain_integrity_events(self) -> tuple[WkEventEnvelope, ...]:
+        events = tuple(self._pending_integrity_events)
+        self._pending_integrity_events.clear()
+        return events
+
     def write_status(
         self,
         *,
@@ -558,18 +630,22 @@ class WkLoop:
         blocker: str | None,
         status_call_id: str | None = None,
     ) -> int:
+        if not self._status_writer.verify() and state != "blocked":
+            raise WkIntegrityError("wk status file integrity check failed")
         if state == "merge-ready":
             ledger = self._integrity_ledger
-            if ledger is not None:
-                checker = getattr(ledger, "check_merge_ready", None)
-                if checker is None:
-                    raise WkIntegrityError("wk ledger cannot prove merge-ready")
-                allowed, reason = checker(
-                    ignore_call_id=status_call_id,
-                    role=self._integrity_role,
-                )
-                if not allowed:
-                    raise WkIntegrityError(reason)
+            if ledger is None:
+                raise WkIntegrityError("wk ledger is required for merge-ready")
+            checker = getattr(ledger, "check_merge_ready", None)
+            if checker is None:
+                raise WkIntegrityError("wk ledger cannot prove merge-ready")
+            allowed, reason = checker(
+                ignore_call_id=status_call_id,
+                role=self._integrity_role,
+                current_head_sha=self.current_head_sha(),
+            )
+            if not allowed:
+                raise WkIntegrityError(reason)
         return self._status_writer.write(
             state=state,
             pr=pr,

@@ -765,18 +765,10 @@ class WkGateTool(WkBashTool):
         if not isinstance(pr, str) or not pr:
             raise ValueError("pr must be a non-empty string")
         value: dict[str, object] = {"pr": pr, "timeout_ms": int(arguments.get("timeout_ms", self.timeout_ms))}
-        expected_sha = arguments.get("expected_sha")
-        if expected_sha is not None:
-            if not isinstance(expected_sha, str) or not expected_sha:
-                raise ValueError("expected_sha must be a non-empty string")
-            value["expected_sha"] = expected_sha
         return value
 
     async def execute(self, request: WkToolRequest) -> WkToolResult:
         argv = [*self.wiki_command, "gate", str(request.arguments["pr"]), "--json"]
-        expected_sha = request.arguments.get("expected_sha")
-        if expected_sha:
-            argv.extend(("--expect-sha", str(expected_sha)))
         result = await _run_process(
             argv,
             cwd=self.root,
@@ -978,7 +970,11 @@ from .wk_tools import register_default_wk_tools
 
 
 def _sdk_tool_schema() -> dict[str, object]:
-    return {"type": "object", "additionalProperties": True}
+    return {
+        "type": "object",
+        "properties": {},
+        "additionalProperties": True,
+    }
 
 
 def build_claude_sdk_options(
@@ -1140,11 +1136,14 @@ class WkClaudeLane:
         self.model = model
         self.role = role
         self.loop = loop
+        self._events: asyncio.Queue[dict[str, object] | None] = asyncio.Queue()
+        self._environment = plan_auth_environment(environment)
         self.registry = register_default_wk_tools(
             registry or WkToolRegistry(),
             root=worktree,
             loop=loop,
             wiki_command=wiki_command,
+            environment=self._environment,
         )
         self.translator = WkClaudeEventTranslator(
             metadata=metadata,
@@ -1157,8 +1156,8 @@ class WkClaudeLane:
         self.bridge = WkClaudeToolBridge(
             registry=self.registry, ledger=self.ledger, loop=loop
         )
+        self.bridge.event_publisher = self._publish_ledger_events
         self.approval = approval
-        self._environment = plan_auth_environment(environment)
         self.cli_path = cli_path
         self._client_factory = client_factory
         self._options_factory = options_factory
@@ -1167,7 +1166,6 @@ class WkClaudeLane:
         )
         self._client: ClaudeSdkClient | None = None
         self._receive_task: asyncio.Task[None] | None = None
-        self._events: asyncio.Queue[dict[str, object] | None] = asyncio.Queue()
         self._closed = False
         self._startup_ready = asyncio.Event()
         self._startup_error: BaseException | None = None
@@ -1177,6 +1175,11 @@ class WkClaudeLane:
         self._settings_guard = _SettingsGuard(
             _settings_paths(worktree, self._environment)
         )
+
+    async def _publish_ledger_events(self, events: Sequence[WkEventEnvelope]) -> None:
+        for event in events:
+            raw = {"type": "wk_ledger", "event_id": event.source_event_id}
+            await self._events.put({"raw": raw, "event": event.to_dict()})
 
     def _new_client(self, *, resume: str | None = None) -> ClaudeSdkClient:
         if self._options_factory is None:

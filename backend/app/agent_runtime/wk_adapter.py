@@ -28,7 +28,7 @@ class WkProviderAdapter(ProviderAdapter):
             raise ValueError("WkProviderAdapter requires a wk execution kind")
         self.provider = record.provider
         self.record = record
-        self.loop = WkLoop(status_path=status_path)
+        self.loop = WkLoop(status_path=status_path, worktree=Path(record.worktree))
         self._state = record.state
         self._session_id = record.provider_session_id
         self._pid: int | None = record.provider_pid

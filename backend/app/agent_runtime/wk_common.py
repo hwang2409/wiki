@@ -6,7 +6,7 @@ import hashlib
 import json
 import os
 import tempfile
-from collections.abc import Mapping, Sequence
+from collections.abc import Awaitable, Callable, Mapping, Sequence
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -153,6 +153,21 @@ class WkToolLedger:
         self.translator.session.record_event(event)
         return event
 
+    def record_integrity_event(self, detail: str) -> WkEventEnvelope:
+        event = self.translator.sequencer.emit(
+            run_id=self.translator.run_id,
+            agent_id=self.translator.agent_id,
+            kind="wk.integrity_violation",
+            phase=WkEventPhase.STATUS,
+            provider=self.translator.provider,
+            lane=self.translator.lane,
+            disposition=WkDisposition.RENDERED,
+            ts=self.translator.timestamp(),
+            payload={"detail": detail},
+        )
+        self.translator.session.record_event(event)
+        return event
+
     def restore(self, events: Sequence[WkEventEnvelope]) -> None:
         for event in sorted(events, key=lambda item: item.source_seq):
             call_id = event.payload.get("call_id")
@@ -277,6 +292,7 @@ class WkToolLedger:
         *,
         ignore_call_id: str | None = None,
         role: str = "review",
+        current_head_sha: str | None = None,
     ) -> tuple[bool, str]:
         """Return whether the ledger proves a safe merge-ready transition."""
 
@@ -298,40 +314,75 @@ class WkToolLedger:
         ]
         if open_mutations:
             return False, "open mutation operations: " + ", ".join(sorted(open_mutations))
-        for event in reversed(source):
-            if event.kind != "tool.completed" or event.payload.get("name") != "wk.gate":
-                continue
-            result = event.payload.get("result")
-            receipt = result.get("mutation_receipt") if isinstance(result, Mapping) else None
-            verdict = receipt.get("verdict") if isinstance(receipt, Mapping) else None
+        started_by_call = {
+            str(event.payload["call_id"]): event
+            for event in source
+            if event.kind == "tool.started" and event.payload.get("call_id")
+        }
+        completed = {
+            str(event.payload["call_id"]): event
+            for event in source
+            if event.kind in {"tool.completed", "tool.failed"}
+            and event.payload.get("call_id")
+        }
+        gate_events = [
+            event
+            for event in completed.values()
             if (
-                isinstance(result, Mapping)
-                and result.get("success") is True
-                and result.get("exit_code") == 0
-                and isinstance(verdict, Mapping)
-                and verdict.get("ready") is True
-            ):
-                started = next(
-                    (
-                        candidate
-                        for candidate in reversed(source)
-                        if candidate.kind == "tool.started"
-                        and candidate.payload.get("call_id") == event.payload.get("call_id")
-                    ),
-                    None,
-                )
-                arguments = started.payload.get("arguments") if started else None
-                gate_role = arguments.get("role", "review") if isinstance(arguments, Mapping) else "review"
-                if gate_role != role:
-                    continue
-                expected_sha = arguments.get("expected_sha") if isinstance(arguments, Mapping) else None
-                head_sha = verdict.get("head_sha")
-                if expected_sha and (
-                    not isinstance(head_sha, str) or not head_sha.startswith(str(expected_sha))
-                ):
-                    return False, "gate verdict does not match expected SHA"
-                return True, "gate receipt proves merge-ready"
-        return False, "no passing gate receipt proves merge-ready"
+                started_by_call.get(str(event.payload.get("call_id"))) is not None
+                and started_by_call[str(event.payload["call_id"])].payload.get("name") == "wk.gate"
+            )
+        ]
+        if not gate_events:
+            return False, "no gate receipt proves merge-ready"
+        latest_gate = max(gate_events, key=lambda event: event.source_seq)
+        result = latest_gate.payload.get("result")
+        receipt = result.get("mutation_receipt") if isinstance(result, Mapping) else None
+        verdict = receipt.get("verdict") if isinstance(receipt, Mapping) else None
+        if (
+            not isinstance(result, Mapping)
+            or result.get("success") is not True
+            or result.get("exit_code") != 0
+            or not isinstance(verdict, Mapping)
+            or verdict.get("ready") is not True
+        ):
+            return False, "latest gate receipt is not a passing ready verdict"
+        started = next(
+            (
+                candidate
+                for candidate in source
+                if candidate.kind == "tool.started"
+                and candidate.payload.get("call_id") == latest_gate.payload.get("call_id")
+            ),
+            None,
+        )
+        arguments = started.payload.get("arguments") if started else None
+        gate_role = arguments.get("role", "review") if isinstance(arguments, Mapping) else "review"
+        if gate_role != role:
+            return False, "latest gate receipt has the wrong role"
+        head_sha = verdict.get("head_sha")
+        if not isinstance(current_head_sha, str) or not current_head_sha:
+            return False, "current git head is unavailable"
+        if head_sha != current_head_sha:
+            return False, "gate verdict does not match current git head"
+        for event in source:
+            if event.source_seq <= latest_gate.source_seq:
+                continue
+            call_id = event.payload.get("call_id")
+            if event.kind not in {"tool.completed", "tool.failed"} or not isinstance(call_id, str):
+                continue
+            started = next(
+                (
+                    candidate
+                    for candidate in source
+                    if candidate.kind == "tool.started"
+                    and candidate.payload.get("call_id") == call_id
+                ),
+                None,
+            )
+            if started is not None and started.payload.get("mutation") != WkMutationClass.NONE.value:
+                return False, "a mutation completed after the latest gate"
+        return True, "latest gate receipt proves merge-ready"
 
 
 def replay_wk_events(path: Path | None) -> tuple[list[dict[str, Any]], list[WkEventEnvelope]]:
@@ -411,13 +462,14 @@ class WkToolBridge:
         self.ledger = ledger
         self.loop = loop
         self.allowed_names = frozenset(allowed_names)
+        self.event_publisher: Callable[[Sequence[WkEventEnvelope]], Awaitable[None]] | None = None
 
     async def invoke(self, name: str, arguments: Mapping[str, object], *, call_id: str | None = None) -> WkToolResult:
         if name not in self.allowed_names:
             raise WkLedgerError(f"unsupported Wiki tool: {name!r}")
         mutation = WkMutationClass.PROCESS if name in {"wk.bash", "wk.gate"} else WkMutationClass.FILE if name in {"wk.write", "wk.edit"} else WkMutationClass.NONE
         request = WkToolRequest(call_id=call_id or str(uuid4()), name=name, arguments=dict(arguments), mutation=mutation)
-        self.ledger.record_started(request)
+        started_event = self.ledger.record_started(request)
         try:
             result = await self.registry.execute(request)
         except WkIntegrityError as exc:
@@ -436,7 +488,11 @@ class WkToolBridge:
             )
         except Exception as exc:
             result = WkToolResult(success=False, exit_code=None, error_class=type(exc).__name__, error_detail=str(exc), mutation=request.mutation)
-        self.ledger.record_result(request, result)
+        result_event = self.ledger.record_result(request, result)
+        if self.event_publisher is not None:
+            await self.event_publisher(
+                (started_event, *self.loop.drain_integrity_events(), result_event)
+            )
         try:
             self.ledger.reconcile()
         except WkLedgerError as exc:

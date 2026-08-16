@@ -6,7 +6,7 @@ import asyncio
 import hashlib
 import json
 import os
-from collections.abc import Mapping, Sequence
+from collections.abc import Callable, Mapping, Sequence
 from pathlib import Path
 from typing import Any, cast
 
@@ -222,10 +222,26 @@ class WkBashTool:
         root: Path,
         timeout_ms: int = 120_000,
         environment: Mapping[str, str] | None = None,
+        protected_status_path: Path | None = None,
+        integrity_reporter: Callable[[str], None] | None = None,
     ):
         self.root = root.resolve()
         self.timeout_ms = timeout_ms
         self.environment = dict(environment) if environment is not None else None
+        self.protected_status_path = (
+            protected_status_path.resolve() if protected_status_path is not None else None
+        )
+        self.integrity_reporter = integrity_reporter
+
+    def _protected_tree(self) -> dict[str, str]:
+        protected = self.protected_status_path
+        if protected is None or not protected.parent.exists():
+            return {}
+        return {
+            str(path.relative_to(protected.parent)): _hash_bytes(path.read_bytes())
+            for path in protected.parent.rglob("*")
+            if path.is_file()
+        }
 
     def validate(self, arguments: Mapping[str, object]) -> Mapping[str, object]:
         command = arguments.get("command")
@@ -235,7 +251,25 @@ class WkBashTool:
         return {"command": command, "timeout_ms": timeout_ms}
 
     async def execute(self, request: WkToolRequest) -> WkToolResult:
-        return await _run_process(
+        command = str(request.arguments["command"])
+        protected = self.protected_status_path
+        if protected is not None and (
+            str(protected) in command or str(protected.parent) in command
+        ):
+            detail = f"wk.bash referenced protected status path: {protected}"
+            if self.integrity_reporter is not None:
+                self.integrity_reporter(detail)
+            return WkToolResult(
+                success=False,
+                exit_code=126,
+                stderr=detail,
+                error_class="integrity_violation",
+                error_detail=detail,
+                mutation=WkMutationClass.PROCESS,
+                mutation_receipt={"blocked_path": str(protected), "policy": "status_path"},
+            )
+        before = self._protected_tree()
+        result = await _run_process(
             ("/bin/sh", "-lc", str(request.arguments["command"])),
             cwd=self.root,
             timeout_ms=int(request.arguments.get("timeout_ms", self.timeout_ms)),
@@ -245,6 +279,26 @@ class WkBashTool:
                 else plan_auth_environment()
             ),
         )
+        after = self._protected_tree()
+        if protected is not None and before != after:
+            detail = f"wk.bash changed protected status directory: {protected.parent}"
+            if self.integrity_reporter is not None:
+                self.integrity_reporter(detail)
+            receipt = dict(result.mutation_receipt or {})
+            receipt["integrity_violation"] = "status_path"
+            return WkToolResult(
+                success=False,
+                exit_code=result.exit_code if result.exit_code not in {None, 0} else 126,
+                stdout=result.stdout,
+                stderr=result.stderr,
+                error_class="integrity_violation",
+                error_detail=detail,
+                timed_out=result.timed_out,
+                duration_ms=result.duration_ms,
+                mutation=WkMutationClass.PROCESS,
+                mutation_receipt=receipt,
+            )
+        return result
 
 
 WK_GATE_ROLES = frozenset({"plan", "implement", "review"})
@@ -276,7 +330,6 @@ class WkGateRunner:
         *,
         role: str,
         pr: str | None,
-        expected_sha: str | None,
         timeout_ms: int,
     ) -> WkToolResult:
         commands: list[list[str]] = []
@@ -285,8 +338,6 @@ class WkGateRunner:
                 if not pr:
                     raise ValueError("pr is required for gate roles")
                 command = [*self.wiki_command, "gate", pr, "--json"]
-                if expected_sha:
-                    command.extend(("--expect-sha", expected_sha))
             else:
                 command = [*self.wiki_command, command_name]
             commands.append(command)
@@ -379,11 +430,6 @@ class WkGateTool(WkBashTool):
             "pr": pr,
             "timeout_ms": int(arguments.get("timeout_ms", self.timeout_ms)),
         }
-        expected_sha = arguments.get("expected_sha")
-        if expected_sha is not None:
-            if not isinstance(expected_sha, str) or not expected_sha:
-                raise ValueError("expected_sha must be a non-empty string")
-            value["expected_sha"] = expected_sha
         return value
 
     async def execute(self, request: WkToolRequest) -> WkToolResult:
@@ -396,11 +442,6 @@ class WkGateTool(WkBashTool):
         return await runner.run(
             role=str(request.arguments.get("role", "review")),
             pr=(str(request.arguments["pr"]) if request.arguments.get("pr") else None),
-            expected_sha=(
-                str(request.arguments["expected_sha"])
-                if request.arguments.get("expected_sha")
-                else None
-            ),
             timeout_ms=int(request.arguments.get("timeout_ms", self.timeout_ms)),
         )
 
@@ -454,7 +495,12 @@ def register_default_wk_tools(
         WkReadTool(root=root),
         WkWriteTool(root=root),
         WkEditTool(root=root),
-        WkBashTool(root=root, environment=environment),
+        WkBashTool(
+            root=root,
+            environment=environment,
+            protected_status_path=loop.status_path,
+            integrity_reporter=loop.report_integrity_violation,
+        ),
         WkGateTool(root=root, wiki_command=wiki_command, environment=environment),
         WkStatusTool(loop=loop),
     )
