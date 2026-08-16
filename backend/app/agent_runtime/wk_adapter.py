@@ -28,7 +28,7 @@ class WkProviderAdapter(ProviderAdapter):
             raise ValueError("WkProviderAdapter requires a wk execution kind")
         self.provider = record.provider
         self.record = record
-        self.loop = WkLoop(status_path=status_path)
+        self.loop = WkLoop(status_path=status_path, worktree=Path(record.worktree))
         self._state = record.state
         self._session_id = record.provider_session_id
         self._pid: int | None = record.provider_pid
@@ -67,6 +67,7 @@ class WkProviderAdapter(ProviderAdapter):
             "agent_id": record.agent_id,
             "worktree": Path(record.worktree),
             "model": record.model,
+            "role": record.role,
             "loop": self.loop,
         }
         if record.execution_kind == "wk-codex":
@@ -230,6 +231,21 @@ class WkProviderAdapter(ProviderAdapter):
     def snapshot(self) -> AdapterStatus:
         return self._status_from_lane()
 
+    def project_wk_status(
+        self,
+        *,
+        state: str,
+        pr: str | None,
+        step: str,
+        blocker: str | None,
+    ) -> None:
+        self.loop.project_status(
+            state=state,
+            pr=pr,
+            step=step,
+            blocker=blocker,
+        )
+
     async def archive(self) -> AdapterStatus:
         await self._lane.archive()
         self._state = LifecycleState.COMPLETED
@@ -246,7 +262,20 @@ class WkProviderAdapter(ProviderAdapter):
         return self._event_stream()
 
     async def _event_stream(self) -> AsyncIterator[ProviderEvent]:
-        async for item in self._lane.events():
+        lane_events = self._lane.events().__aiter__()
+        try:
+            first_item = await lane_events.__anext__()
+        except StopAsyncIteration:
+            return
+        for event in self.loop.drain_status_events():
+            yield ProviderEvent(
+                provider=self.provider,
+                payload={"type": "wk_status", "_wk_event": event.to_dict()},
+                direction="supervisor",
+                generation=self._generation,
+            )
+        item = first_item
+        while True:
             raw = item.get("raw") if isinstance(item, Mapping) else None
             envelope = item.get("event") if isinstance(item, Mapping) else None
             if not isinstance(raw, Mapping) or not isinstance(envelope, Mapping):
@@ -262,6 +291,17 @@ class WkProviderAdapter(ProviderAdapter):
                 direction="provider",
                 generation=self._generation,
             )
+            try:
+                item = await lane_events.__anext__()
+            except StopAsyncIteration:
+                return
+            for event in self.loop.drain_status_events():
+                yield ProviderEvent(
+                    provider=self.provider,
+                    payload={"type": "wk_status", "_wk_event": event.to_dict()},
+                    direction="supervisor",
+                    generation=self._generation,
+                )
 
     async def close(self) -> None:
         await self.stop()

@@ -993,14 +993,20 @@ Preserve the same identity, role, worktree, orchestrator grouping, PR gates, and
         ):
             return None
         status: dict[str, Any] | None = None
-        try:
-            loaded = json.loads(
-                self.store.status_path(record.agent_id).read_text(encoding="utf-8")
-            )
-            if isinstance(loaded, dict):
-                status = loaded
-        except (OSError, ValueError):
-            pass
+        if is_wk_kind(record.execution_kind):
+            status = {
+                "state": record.wk_status_state,
+                "step": record.wk_status_step,
+            }
+        else:
+            try:
+                loaded = json.loads(
+                    self.store.status_path(record.agent_id).read_text(encoding="utf-8")
+                )
+                if isinstance(loaded, dict):
+                    status = loaded
+            except (OSError, ValueError):
+                pass
         if status is not None:
             state = status.get("state")
             step = status.get("step")
@@ -1347,6 +1353,17 @@ Preserve the same identity, role, worktree, orchestrator grouping, PR gates, and
             )
 
         record = self.store.get(run_id)
+        if is_wk_kind(record.execution_kind):
+            wk_state = record.wk_status_state
+            if wk_state is not None:
+                projector = getattr(adapter, "project_wk_status", None)
+                if projector is not None:
+                    projector(
+                        state=wk_state,
+                        pr=record.wk_status_pr,
+                        step=record.wk_status_step or "wk status projection",
+                        blocker=record.wk_status_blocker,
+                    )
         if normalized.lifecycle_state is not None and update_adapter_snapshot:
             try:
                 adapter_status = adapter.snapshot()
@@ -2918,6 +2935,9 @@ Preserve the same identity, role, worktree, orchestrator grouping, PR gates, and
                 # in-flight normalize race the sweep and the middle-gap case
                 # go undetected (WIKI-232 REVIEW9 F2).
                 await self._normalize_orphan_raw_events()
+                for record in self.store.list_runs():
+                    if is_wk_kind(record.execution_kind):
+                        self.store.rebuild_wk_status_projection(record.run_id)
                 results = await self._recover_once()
                 await self._reconcile_sending_steer_effects()
                 self.store.prune_terminal_runs()

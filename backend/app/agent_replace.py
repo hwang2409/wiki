@@ -307,8 +307,14 @@ def _worker_transcript_path(ticket: str, current: dict) -> str | None:
 
 
 def _worker_pr_hint(ticket: str, current: dict) -> str | None:
-    status = read_agent_status(ticket) or {}
-    for value in (status.get("pr"), current.get("pr")):
+    kind = current.get("kind")
+    is_wk = kind in {"wk-claude", "wk-codex"}
+    if is_wk:
+        status = {"pr": current.get("wk_status_pr")}
+    else:
+        status = read_agent_status(ticket) or {}
+    candidates = (status.get("pr"),) if is_wk else (status.get("pr"), current.get("pr"))
+    for value in candidates:
         if isinstance(value, str) and value.strip():
             return value.strip()
     return None

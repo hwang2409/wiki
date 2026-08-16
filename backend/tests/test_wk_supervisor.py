@@ -9,7 +9,9 @@ from pathlib import Path
 
 import pytest
 
-from backend.app import account_notices, main
+from backend.app import account_notices, github_pr, main
+from backend.app.agent_runtime.autopilot import AutopilotController
+from backend.app.agent_runtime.fleet_monitor import FleetMonitor
 from backend.app.agent_runtime.factory import RealAdapterFactory
 from backend.app.agent_runtime.provider import StartRequest
 from backend.app.agent_runtime.store import RunStore, RuntimePaths
@@ -242,11 +244,64 @@ def test_wk_dual_stack_routes_start_real_run_and_show_archive(
         assert session["events"]
         assert "WIKI-289" in json.dumps(dashboard, sort_keys=True)
 
+        forged = {
+            "state": "merge-ready",
+            "pr": "https://github.com/hwang2409/wiki/pull/999",
+            "step": "forged file state",
+            "blocker": None,
+        }
+        status_path = paths.status_dir / "WIKI-289.json"
+        status_path.write_text(json.dumps(forged) + "\n", encoding="utf-8")
+        worker = next(
+            item for item in main.agents()["workers"] if item["ticket"] == "WIKI-289"
+        )
+        assert worker["state"] != "merge-ready"
+        assert worker["pr"] != forged["pr"]
+
+        monkeypatch.setattr(github_pr, "AGENT_REGISTRY_PATH", paths.registry_path)
+        monkeypatch.setattr(github_pr, "AGENT_STATUS_DIR", paths.status_dir)
+        effective = AutopilotController._default_status("WIKI-289")
+        assert effective.get("state") != "merge-ready"
+        assert effective.get("pr") != forged["pr"]
+        assert github_pr.resolve_pr("WIKI-289") != (
+            forged["pr"],
+            "hwang2409/wiki",
+        )
+
+        live = store.get(record.run_id)
+        live.orchestrator_id = "WIKI-289-ORCH"
+        store._write_record(live)  # noqa: SLF001 - real fleet evaluation fixture
+        async def send_fleet_message(*_args, **_kwargs):
+            return None
+
+        fleet = FleetMonitor(store, send_fleet_message)
+        await fleet.tick()
+        view = next(item for item in fleet._collect_views() if item.record.run_id == record.run_id)  # noqa: SLF001
+        assert view.status_state != "merge-ready"
+        assert view.pr != forged["pr"]
+
+        await supervisor.send_now(record.run_id, "read README again")
+        await asyncio.sleep(0.3)
+        projected = json.loads(status_path.read_text(encoding="utf-8"))
+        assert projected != forged
+        assert projected["step"] != forged["step"]
+
+        ledger_status = {
+            key: projected.get(key)
+            for key in ("state", "pr", "step", "blocker")
+        }
+        status_path.write_text(json.dumps(forged) + "\n", encoding="utf-8")
         archived = await supervisor.archive(record.run_id, outcome="review")
         assert archived.state is LifecycleState.COMPLETED
         archived_payload = main.agents()["archived"]
         assert any(item.get("run_id") == record.run_id for item in archived_payload)
         assert any(paths.archive_dir.rglob("archive-complete.json"))
+        final_status_path = next(paths.archive_dir.rglob("final-status.json"))
+        archived_status = json.loads(final_status_path.read_text(encoding="utf-8"))
+        assert {
+            key: archived_status.get(key)
+            for key in ledger_status
+        } == ledger_status
         await supervisor.close()
 
     asyncio.run(run())

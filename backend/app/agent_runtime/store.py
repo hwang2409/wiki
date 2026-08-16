@@ -9,7 +9,7 @@ import shutil
 import stat
 import tempfile
 import threading
-from collections.abc import Callable, Iterator
+from collections.abc import Callable, Iterator, Mapping
 from copy import deepcopy
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
@@ -75,6 +75,108 @@ class StoreConflict(StoreError):
 
 class RunNotFound(StoreError):
     pass
+
+
+def _apply_wk_status_event(
+    record: RunRecord,
+    *,
+    kind: str,
+    payload: Mapping[str, Any],
+    source_seq: int,
+) -> None:
+    """Apply one durable wk envelope to the supervisor status projection."""
+
+    if payload.get("schema") != "wiki.wk.event.v0":
+        return
+    event_payload = payload.get("payload")
+    if not isinstance(event_payload, Mapping):
+        return
+    if kind == "wk.status_revoked":
+        if record.wk_status_state == "merge-ready":
+            record.wk_status_state = "blocked"
+            record.wk_status_step = "wk merge-ready was revoked by a later ledger operation"
+            record.wk_status_blocker = str(
+                event_payload.get("detail") or "wk status revoked"
+            )
+            record.wk_status_source_seq = source_seq
+        return
+    if kind == "wk.status":
+        state = event_payload.get("state")
+        if state in {"working", "merge-ready", "blocked"}:
+            record.wk_status_state = state
+            record.wk_status_pr = (
+                event_payload.get("pr")
+                if isinstance(event_payload.get("pr"), str)
+                else None
+            )
+            record.wk_status_step = str(event_payload.get("step") or "")
+            record.wk_status_blocker = (
+                event_payload.get("blocker")
+                if isinstance(event_payload.get("blocker"), str)
+                else None
+            )
+            record.wk_status_source_seq = source_seq
+        return
+    call_id = event_payload.get("call_id")
+    if not isinstance(call_id, str) or not call_id:
+        return
+    if kind == "tool.started":
+        name = event_payload.get("name")
+        mutation = event_payload.get("mutation")
+        arguments = event_payload.get("arguments")
+        if isinstance(name, str) and isinstance(arguments, Mapping):
+            record.wk_status_pending[call_id] = {
+                "name": name,
+                "mutation": str(mutation or "none"),
+                "arguments": dict(arguments),
+            }
+        return
+    if kind not in {"tool.completed", "tool.failed"}:
+        return
+    operation = record.wk_status_pending.pop(call_id, None)
+    if not isinstance(operation, Mapping):
+        return
+    result = event_payload.get("result")
+    if not isinstance(result, Mapping):
+        return
+    success = result.get("success") is True and result.get("exit_code") == 0
+    name = operation.get("name")
+    if name == "wk.status":
+        arguments = operation.get("arguments")
+        if success and isinstance(arguments, Mapping):
+            state = arguments.get("state")
+            step = arguments.get("step")
+            if isinstance(state, str) and isinstance(step, str):
+                record.wk_status_state = state
+                record.wk_status_pr = (
+                    str(arguments["pr"]) if arguments.get("pr") else None
+                )
+                record.wk_status_step = step
+                record.wk_status_blocker = (
+                    str(arguments["blocker"]) if arguments.get("blocker") else None
+                )
+                record.wk_status_source_seq = source_seq
+        return
+    if record.wk_status_state != "merge-ready":
+        return
+    if name == "wk.gate":
+        receipt = result.get("mutation_receipt")
+        verdict = receipt.get("verdict") if isinstance(receipt, Mapping) else None
+        authoritative = (
+            success
+            and isinstance(receipt, Mapping)
+            and receipt.get("tree_clean") is True
+            and isinstance(receipt.get("pr"), str)
+            and isinstance(verdict, Mapping)
+            and verdict.get("ready") is True
+        )
+        if authoritative:
+            return
+    elif operation.get("mutation") == "none":
+        return
+    record.wk_status_state = "blocked"
+    record.wk_status_blocker = "wk merge-ready was revoked by a later ledger operation"
+    record.wk_status_source_seq = source_seq
 
 
 def _validated_run_id(run_id: str) -> str:
@@ -1215,6 +1317,11 @@ class RunStore:
                         if record.provider_state is not None
                         else None
                     ),
+                    "wk_status_state": record.wk_status_state,
+                    "wk_status_pr": record.wk_status_pr,
+                    "wk_status_step": record.wk_status_step,
+                    "wk_status_blocker": record.wk_status_blocker,
+                    "wk_status_source_seq": record.wk_status_source_seq,
                 }
                 if record.execution_kind is not None
                 else {}
@@ -1849,10 +1956,18 @@ class RunStore:
             status_path = self.status_path(record.agent_id)
             if status_path.is_file():
                 status_path_to_remove = status_path
-                try:
-                    status = json.loads(status_path.read_text(encoding="utf-8"))
-                except (OSError, ValueError):
-                    status = None
+                if record.execution_kind in {"wk-claude", "wk-codex"}:
+                    status = {
+                        "state": record.wk_status_state,
+                        "pr": record.wk_status_pr,
+                        "step": record.wk_status_step,
+                        "blocker": record.wk_status_blocker,
+                    }
+                else:
+                    try:
+                        status = json.loads(status_path.read_text(encoding="utf-8"))
+                    except (OSError, ValueError):
+                        status = None
                 if isinstance(status, dict):
                     final_status_path = session_dir / "final-status.json"
                     expected_paths.append(final_status_path)
@@ -2588,6 +2703,13 @@ class RunStore:
                 if record.state in TERMINAL_STATES:
                     record.pending_requests.clear()
                 record.last_lifecycle_event_seq = int(envelope["seq"])
+                if record.execution_kind in {"wk-claude", "wk-codex"}:
+                    _apply_wk_status_event(
+                        record,
+                        kind=kind,
+                        payload=payload,
+                        source_seq=int(payload.get("source_seq", envelope["seq"])),
+                    )
             self._write_record(record)
             return envelope
 
@@ -3450,6 +3572,46 @@ class RunStore:
         """Stream normalized-event records for ``run_id`` without materializing the log."""
 
         return self._iter_json_lines(self.normalized_events_path(run_id))
+
+    def rebuild_wk_status_projection(self, run_id: str) -> RunRecord:
+        """Rebuild the wk status projection from durable normalized envelopes."""
+
+        with self._lock:
+            record = self.get(run_id)
+            if record.execution_kind not in {"wk-claude", "wk-codex"}:
+                return record
+            record.wk_status_state = None
+            record.wk_status_pr = None
+            record.wk_status_step = None
+            record.wk_status_blocker = None
+            record.wk_status_source_seq = 0
+            record.wk_status_pending = {}
+            replay: list[tuple[int, int, dict[str, Any], Mapping[str, Any]]] = []
+            for row in self.iter_normalized_events(run_id):
+                payload = row.get("payload")
+                if not isinstance(payload, Mapping):
+                    continue
+                try:
+                    source_seq = int(payload.get("source_seq", row.get("seq", 0)))
+                except (TypeError, ValueError):
+                    source_seq = int(row.get("seq", 0))
+                replay.append((source_seq, int(row.get("seq", 0)), row, payload))
+            for source_seq, _append_seq, row, payload in sorted(
+                replay, key=lambda item: (item[0], item[1])
+            ):
+                _apply_wk_status_event(
+                    record,
+                    kind=str(row.get("kind") or ""),
+                    payload=payload,
+                    source_seq=source_seq,
+                )
+            self._write_record(record)
+            registry = self._read_registry()
+            current = (registry.get(record.agent_id) or {}).get("current") or {}
+            if current.get("run_id") == record.run_id:
+                registry[record.agent_id]["current"] = self._registry_current(record)
+                self._write_registry(registry)
+            return record
 
     def _read_json_lines_tail(
         self,

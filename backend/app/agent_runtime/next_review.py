@@ -215,7 +215,7 @@ def _previous_terminal_reviewer(
         )
         status = _reviewer_status(
             str(value),
-            status_reader or _main().read_agent_status,
+            status_reader or _main().read_effective_agent_status,
         )
         status_state = status.get("state") if isinstance(status, Mapping) else None
         state = str(
@@ -252,7 +252,7 @@ def _previous_terminal_reviewers(
             continue
         status = _reviewer_status(
             str(value),
-            status_reader or _main().read_agent_status,
+            status_reader or _main().read_effective_agent_status,
         )
         status_state = status.get("state") if isinstance(status, Mapping) else None
         state = str(status_state or current.get("state") or current.get("runtime_state") or "").lower()
@@ -760,7 +760,7 @@ def _implicit_result_is_current(
         status = (
             status_reader(registry_id)
             if status_reader is not None
-            else main.read_agent_status(registry_id)
+            else main.read_effective_agent_status(registry_id)
         )
         status_state = status.get("state") if isinstance(status, Mapping) else None
         if str(status_state or "").lower() in _TERMINAL_STATES:

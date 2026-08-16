@@ -111,6 +111,110 @@ for line in sys.stdin:
                     }
                 )
     elif message.get("type") == "user":
+        if (Path(os.environ["CLAUDE_CONFIG_DIR"]) / "integrity-forge").exists():
+            attempts = [
+                (
+                    "tool-forged-status-path",
+                    "mcp__wiki__bash",
+                    {"command": "printf forged > $CLAUDE_CONFIG_DIR/status.json"},
+                ),
+                (
+                    "tool-forged-gate",
+                    "mcp__wiki__gate",
+                    {"pr": "230", "ready": True, "head_sha": "model-head"},
+                ),
+                (
+                    "tool-forged-status",
+                    "mcp__wiki__status",
+                    {
+                        "state": "merge-ready",
+                        "step": "model says gate passed",
+                        "pr": "https://example.test/pull/230",
+                        "gate_receipt": {"ready": True, "head_sha": "model-head"},
+                    },
+                ),
+            ]
+            for tool_id, tool_name, tool_input in attempts:
+                send(
+                    {
+                        "type": "assistant",
+                        "session_id": session_id,
+                        "message": {
+                            "role": "assistant",
+                            "model": "claude-sonnet-4-6",
+                            "content": [
+                                {
+                                    "type": "tool_use",
+                                    "id": tool_id,
+                                    "name": tool_name,
+                                    "input": tool_input,
+                                }
+                            ],
+                        },
+                    }
+                )
+                send(
+                    {
+                        "type": "control_request",
+                        "request_id": f"mcp-{tool_id}",
+                        "request": {
+                            "subtype": "mcp_message",
+                            "server_name": "wiki",
+                            "message": {
+                                "jsonrpc": "2.0",
+                                "id": tool_id,
+                                "method": "tools/call",
+                                "params": {
+                                    "name": tool_name.rsplit("__", 1)[-1],
+                                    "arguments": tool_input,
+                                },
+                            },
+                        },
+                    }
+                )
+                mcp_response = None
+                for response_line in sys.stdin:
+                    response = json.loads(response_line)
+                    if response.get("type") != "control_response":
+                        continue
+                    envelope = response.get("response") or {}
+                    if envelope.get("request_id") != f"mcp-{tool_id}":
+                        continue
+                    mcp_response = envelope.get("response", {}).get("mcp_response")
+                    break
+                if mcp_response is None:
+                    raise RuntimeError(f"missing MCP response for {tool_id}")
+                mcp_result = mcp_response.get("result") or {}
+                send(
+                    {
+                        "type": "user",
+                        "session_id": session_id,
+                        "message": {
+                            "role": "user",
+                            "content": [
+                                {
+                                    "type": "tool_result",
+                                    "tool_use_id": tool_id,
+                                    "content": json.dumps(mcp_result.get("content", [])),
+                                    "is_error": bool(mcp_result.get("isError")),
+                                }
+                            ],
+                        },
+                    }
+                )
+            send(
+                {
+                    "type": "result",
+                    "subtype": "error_during_execution",
+                    "session_id": session_id,
+                    "is_error": True,
+                    "duration_ms": 1,
+                    "duration_api_ms": 1,
+                    "num_turns": 1,
+                    "result": "integrity forgery rejected",
+                }
+            )
+            continue
         tool_id = "tool-subprocess-1"
         if permission_prompt_enabled:
             send(

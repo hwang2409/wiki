@@ -84,7 +84,7 @@ class Notification:
 
 @dataclass
 class _WorkerView:
-    """Merged view of one worker: run record + on-disk status."""
+    """Merged view of one worker: run record + effective status projection."""
 
     record: RunRecord
     status_state: str | None
@@ -661,9 +661,18 @@ class FleetMonitor:
                 continue
             if not record.orchestrator_id:
                 continue
-            status_data, mtime = _read_status_file(
-                self.store.status_path(record.agent_id)
-            )
+            if record.execution_kind in {"wk-claude", "wk-codex"}:
+                status_data = {
+                    "state": record.wk_status_state,
+                    "pr": record.wk_status_pr,
+                    "step": record.wk_status_step,
+                    "blocker": record.wk_status_blocker,
+                }
+                mtime = None
+            else:
+                status_data, mtime = _read_status_file(
+                    self.store.status_path(record.agent_id)
+                )
             if status_data is None:
                 views.append(
                     _WorkerView(

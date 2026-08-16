@@ -48,6 +48,7 @@ def _lane(
     *,
     environment: dict[str, str] | None = None,
     wiki_command: tuple[str, ...] = ("wiki",),
+    role: str = "review",
 ) -> WkCodexLane:
     env = environment or _environment(tmp_path)
     return WkCodexLane(
@@ -57,6 +58,7 @@ def _lane(
         worktree=tmp_path,
         model="gpt-5-codex",
         loop=WkLoop(status_path=tmp_path / "status.json"),
+        role=role,
         command=(sys.executable, str(FIXTURE)),
         auth_command=(sys.executable, str(FIXTURE)),
         environment=env,
@@ -135,6 +137,12 @@ def test_codex_lane_is_constructible_only_when_flag_is_on(
         _lane(tmp_path)
     monkeypatch.setattr(wk_feature, "_WK_ENABLED", True)
     assert _lane(tmp_path).metadata.kind == "wk-codex"
+
+
+def test_codex_inner_record_preserves_lane_role(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    monkeypatch.setattr(wk_feature, "_WK_ENABLED", True)
+    lane = _lane(tmp_path, role="review")
+    assert lane._adapter.env["WIKI_AGENT_ROLE"] == "review"
 
 
 def test_plan_auth_environment_rejects_api_credentials() -> None:

@@ -373,6 +373,7 @@ class WkCodexLane:
         worktree: Path,
         model: str,
         loop: WkLoop,
+        role: str = "review",
         command: Sequence[str] = ("codex", "app-server", "--stdio"),
         auth_command: Sequence[str] | None = None,
         environment: Mapping[str, str] | None = None,
@@ -390,6 +391,7 @@ class WkCodexLane:
         self.agent_id = agent_id
         self.worktree = worktree
         self.model = model
+        self.role = role
         self.loop = loop
         self.environment = codex_plan_auth_environment(environment)
         del auth_command
@@ -405,6 +407,7 @@ class WkCodexLane:
             sequencer=sequencer,
         )
         self.ledger = WkToolLedger(self.translator)  # type: ignore[arg-type]
+        self.loop.bind_integrity(self.ledger, role=role)
         self.registry = register_default_wk_tools(
             WkToolRegistry(),
             root=worktree,
@@ -418,10 +421,11 @@ class WkCodexLane:
             loop=loop,
             allowed_names=WK_CODEX_TOOL_NAMES,
         )
+        self.bridge.event_publisher = self._publish_ledger_events
         record = RunRecord.new(
             agent_id=agent_id,
             provider=ProviderKind.CODEX,
-            role="implement",
+            role=role,
             model=model,
             worktree=str(worktree),
             prompt="",
@@ -450,6 +454,11 @@ class WkCodexLane:
         self._steering = WkSteeringQueue(
             steering_path or loop.status_path.with_name(f"{agent_id}.wk-steering.json")
         )
+
+    async def _publish_ledger_events(self, events: Sequence[WkEventEnvelope]) -> None:
+        for event in events:
+            raw = {"type": "wk_ledger", "event_id": event.source_event_id}
+            await self._events.put({"raw": raw, "event": event.to_dict()})
 
     async def _emit_error(self, error: BaseException, *, policy: bool = False) -> None:
         blocked = policy or isinstance(error, (WkCodexError, WkLedgerError))
@@ -564,8 +573,6 @@ class WkCodexLane:
         if not isinstance(tool, str) or not isinstance(call_id, str) or not isinstance(arguments, Mapping):
             raise WkCodexPolicyError("Codex dynamic tool request is incomplete")
         result = await self.bridge.invoke(f"wk.{tool}", arguments, call_id=call_id)
-        for event in self.ledger.events[-2:]:
-            await self._events.put({"raw": {"method": event.kind}, "event": event.to_dict()})
         await self._adapter.respond(
             request_id,
             {
