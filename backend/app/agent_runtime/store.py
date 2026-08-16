@@ -3596,7 +3596,7 @@ class RunStore:
                 except (TypeError, ValueError):
                     source_seq = int(row.get("seq", 0))
                 replay.append((source_seq, int(row.get("seq", 0)), row, payload))
-            for source_seq, append_seq, row, payload in sorted(
+            for source_seq, _append_seq, row, payload in sorted(
                 replay, key=lambda item: (item[0], item[1])
             ):
                 _apply_wk_status_event(

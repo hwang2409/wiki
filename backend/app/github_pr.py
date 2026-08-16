@@ -123,12 +123,13 @@ def resolve_pr(ticket: str) -> tuple[str, str] | None:
     registry = _read_json(AGENT_REGISTRY_PATH) or {}
     entry = registry.get(ticket) or registry.get(ticket.upper()) or {}
     current = entry.get("current") if isinstance(entry, dict) else None
-    if isinstance(current, dict) and current.get("kind") in {"wk-claude", "wk-codex"}:
+    is_wk = isinstance(current, dict) and current.get("kind") in {"wk-claude", "wk-codex"}
+    if is_wk:
         status = {"pr": current.get("wk_status_pr")}
     else:
         status = _read_json(AGENT_STATUS_DIR / f"{ticket}.json") or {}
     expected_repo = _expected_repo(ticket, registry)
-    if isinstance(current, dict) and current.get("kind") in {"wk-claude", "wk-codex"}:
+    if is_wk:
         candidates = [status.get("pr")]
     else:
         candidates = [

@@ -84,7 +84,7 @@ class Notification:
 
 @dataclass
 class _WorkerView:
-    """Merged view of one worker: run record + on-disk status."""
+    """Merged view of one worker: run record + effective status projection."""
 
     record: RunRecord
     status_state: str | None
