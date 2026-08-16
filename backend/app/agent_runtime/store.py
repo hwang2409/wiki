@@ -1956,10 +1956,18 @@ class RunStore:
             status_path = self.status_path(record.agent_id)
             if status_path.is_file():
                 status_path_to_remove = status_path
-                try:
-                    status = json.loads(status_path.read_text(encoding="utf-8"))
-                except (OSError, ValueError):
-                    status = None
+                if record.execution_kind in {"wk-claude", "wk-codex"}:
+                    status = {
+                        "state": record.wk_status_state,
+                        "pr": record.wk_status_pr,
+                        "step": record.wk_status_step,
+                        "blocker": record.wk_status_blocker,
+                    }
+                else:
+                    try:
+                        status = json.loads(status_path.read_text(encoding="utf-8"))
+                    except (OSError, ValueError):
+                        status = None
                 if isinstance(status, dict):
                     final_status_path = session_dir / "final-status.json"
                     expected_paths.append(final_status_path)
@@ -3578,15 +3586,24 @@ class RunStore:
             record.wk_status_blocker = None
             record.wk_status_source_seq = 0
             record.wk_status_pending = {}
+            replay: list[tuple[int, int, dict[str, Any], Mapping[str, Any]]] = []
             for row in self.iter_normalized_events(run_id):
                 payload = row.get("payload")
                 if not isinstance(payload, Mapping):
                     continue
+                try:
+                    source_seq = int(payload.get("source_seq", row.get("seq", 0)))
+                except (TypeError, ValueError):
+                    source_seq = int(row.get("seq", 0))
+                replay.append((source_seq, int(row.get("seq", 0)), row, payload))
+            for source_seq, append_seq, row, payload in sorted(
+                replay, key=lambda item: (item[0], item[1])
+            ):
                 _apply_wk_status_event(
                     record,
                     kind=str(row.get("kind") or ""),
                     payload=payload,
-                    source_seq=int(payload.get("source_seq", row.get("seq", 0))),
+                    source_seq=source_seq,
                 )
             self._write_record(record)
             registry = self._read_registry()

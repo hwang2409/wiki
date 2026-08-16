@@ -11,7 +11,9 @@ import pytest
 
 from backend.app.agent_runtime.wk_common import WkLedgerError, WkToolBridge, WkToolLedger
 from backend.app.agent_runtime.wk_core import (
+    WkDisposition,
     WkEventSequencer,
+    WkEventPhase,
     WkLoop,
     WkMutationClass,
     WkRunMetadata,
@@ -29,6 +31,8 @@ from backend.app.agent_runtime.wk_experiment import (
 from backend.app.agent_runtime.wk_tools import WkGateTool, WkStatusTool, register_default_wk_tools
 from backend.app.agent_runtime.wk_claude import WkClaudeLane
 from backend.app.agent_runtime import wk_feature
+from backend.app.agent_runtime.store import RunStore, RuntimePaths
+from backend.app.agent_runtime.types import EventDisposition, ProviderKind, RunRecord
 
 
 class _Translator:
@@ -212,6 +216,76 @@ def test_forged_status_projection_is_overwritten_and_not_authoritative(tmp_path:
     assert status["state"] == "working"
     assert status["pr"] is None
     assert any(event.kind == "wk.integrity_violation" for event in ledger.events)
+
+
+def test_wk_status_replay_uses_causal_sequence_after_orphan_append(tmp_path: Path) -> None:
+    paths = RuntimePaths(
+        runtime_dir=tmp_path / "runtime",
+        socket_path=tmp_path / "runtime" / "supervisor.sock",
+        registry_path=tmp_path / "registry.json",
+        archive_dir=tmp_path / "archive",
+        status_dir=tmp_path / "status",
+    )
+    store = RunStore(paths)
+    record = store.create(
+        RunRecord.new(
+            agent_id="WIKI-289",
+            provider=ProviderKind.CLAUDE,
+            role="implement",
+            model="claude-plan",
+            worktree=str(tmp_path),
+            prompt="replay",
+            execution_kind="wk-claude",
+        )
+    )
+    translator = _Translator()
+    ready = translator.sequencer.emit(
+        run_id=record.run_id,
+        agent_id=record.agent_id,
+        kind="wk.status",
+        phase=WkEventPhase.STATUS,
+        provider="claude",
+        lane="wk-claude",
+        disposition=WkDisposition.RENDERED,
+        ts=translator.timestamp(),
+        payload={"state": "merge-ready", "pr": "https://github.com/hwang2409/wiki/pull/234", "step": "ready", "blocker": None},
+    )
+    revoked = translator.sequencer.emit(
+        run_id=record.run_id,
+        agent_id=record.agent_id,
+        kind="wk.status_revoked",
+        phase=WkEventPhase.STATUS,
+        provider="claude",
+        lane="wk-claude",
+        disposition=WkDisposition.RENDERED,
+        ts=translator.timestamp(),
+        payload={"detail": "failed gate"},
+    )
+    for event in (ready, revoked):
+        raw = store.append_raw(
+            record.run_id,
+            provider="claude",
+            direction="inbound",
+            payload=event.to_dict(),
+        )
+        store.append_normalized(
+            record.run_id,
+            raw_seq=int(raw["seq"]),
+            disposition=EventDisposition.RENDERED,
+            kind=event.kind,
+            payload=event.to_dict(),
+        )
+
+    normalized_path = store.normalized_events_path(record.run_id)
+    rows = [json.loads(line) for line in normalized_path.read_text().splitlines() if line]
+    normalized_path.write_text(
+        "".join(json.dumps(row) + "\n" for row in reversed(rows)),
+        encoding="utf-8",
+    )
+    restarted = RunStore(paths)
+    restored = restarted.rebuild_wk_status_projection(record.run_id)
+    assert restored.wk_status_state == "blocked"
+    assert restored.wk_status_source_seq == revoked.source_seq
 
 
 def test_merge_ready_without_a_bound_ledger_fails_closed(tmp_path: Path) -> None:

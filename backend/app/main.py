@@ -1421,6 +1421,17 @@ def _status_for_registry_entry(ticket: str, entry: object) -> dict | None:
     return read_agent_status(ticket)
 
 
+def read_effective_agent_status(ticket: str) -> dict | None:
+    """Return durable worker state, using the status file only for legacy runs."""
+
+    registry = _read_agent_registry()
+    for candidate in reviewer_id_candidates(ticket):
+        entry = registry.get(candidate)
+        if entry is not None:
+            return _status_for_registry_entry(candidate, entry)
+    return read_agent_status(ticket)
+
+
 def _agent_status_paths() -> Iterator[Path]:
     """Yield worker status files, excluding workgraph sidecars."""
     if not AGENT_STATUS_DIR.is_dir():

@@ -121,13 +121,21 @@ def _expected_repo(ticket: str, registry: dict[str, Any]) -> str:
 
 def resolve_pr(ticket: str) -> tuple[str, str] | None:
     registry = _read_json(AGENT_REGISTRY_PATH) or {}
-    status = _read_json(AGENT_STATUS_DIR / f"{ticket}.json") or {}
+    entry = registry.get(ticket) or registry.get(ticket.upper()) or {}
+    current = entry.get("current") if isinstance(entry, dict) else None
+    if isinstance(current, dict) and current.get("kind") in {"wk-claude", "wk-codex"}:
+        status = {"pr": current.get("wk_status_pr")}
+    else:
+        status = _read_json(AGENT_STATUS_DIR / f"{ticket}.json") or {}
     expected_repo = _expected_repo(ticket, registry)
-    candidates = [
-        status.get("pr"),
-        ((registry.get(ticket) or {}).get("current") or {}).get("pr"),
-        (registry.get(ticket) or {}).get("pr"),
-    ]
+    if isinstance(current, dict) and current.get("kind") in {"wk-claude", "wk-codex"}:
+        candidates = [status.get("pr")]
+    else:
+        candidates = [
+            status.get("pr"),
+            (current or {}).get("pr") if isinstance(current, dict) else None,
+            (entry or {}).get("pr") if isinstance(entry, dict) else None,
+        ]
     mismatched_repos: set[str] = set()
     for candidate in candidates:
         url = _normalize_pr_url(candidate)

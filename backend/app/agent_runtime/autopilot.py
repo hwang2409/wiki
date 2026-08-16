@@ -927,7 +927,7 @@ class AutopilotController:
     def _default_status(ticket: str) -> Mapping[str, Any]:
         from .. import main
 
-        return main.read_agent_status(ticket) or {}
+        return main.read_effective_agent_status(ticket) or {}
 
     @staticmethod
     def _default_registry() -> Mapping[str, Any]:

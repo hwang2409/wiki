@@ -9,7 +9,9 @@ from pathlib import Path
 
 import pytest
 
-from backend.app import account_notices, main
+from backend.app import account_notices, github_pr, main
+from backend.app.agent_runtime.autopilot import AutopilotController
+from backend.app.agent_runtime.fleet_monitor import FleetMonitor
 from backend.app.agent_runtime.factory import RealAdapterFactory
 from backend.app.agent_runtime.provider import StartRequest
 from backend.app.agent_runtime.store import RunStore, RuntimePaths
@@ -244,7 +246,7 @@ def test_wk_dual_stack_routes_start_real_run_and_show_archive(
 
         forged = {
             "state": "merge-ready",
-            "pr": "https://example.invalid/forged",
+            "pr": "https://github.com/hwang2409/wiki/pull/999",
             "step": "forged file state",
             "blocker": None,
         }
@@ -255,6 +257,28 @@ def test_wk_dual_stack_routes_start_real_run_and_show_archive(
         )
         assert worker["state"] != "merge-ready"
         assert worker["pr"] != forged["pr"]
+
+        monkeypatch.setattr(github_pr, "AGENT_REGISTRY_PATH", paths.registry_path)
+        monkeypatch.setattr(github_pr, "AGENT_STATUS_DIR", paths.status_dir)
+        effective = AutopilotController._default_status("WIKI-289")
+        assert effective.get("state") != "merge-ready"
+        assert effective.get("pr") != forged["pr"]
+        assert github_pr.resolve_pr("WIKI-289") != (
+            forged["pr"],
+            "hwang2409/wiki",
+        )
+
+        live = store.get(record.run_id)
+        live.orchestrator_id = "WIKI-289-ORCH"
+        store._write_record(live)  # noqa: SLF001 - real fleet evaluation fixture
+        async def send_fleet_message(*_args, **_kwargs):
+            return None
+
+        fleet = FleetMonitor(store, send_fleet_message)
+        await fleet.tick()
+        view = next(item for item in fleet._collect_views() if item.record.run_id == record.run_id)  # noqa: SLF001
+        assert view.status_state != "merge-ready"
+        assert view.pr != forged["pr"]
 
         await supervisor.send_now(record.run_id, "read README again")
         await asyncio.sleep(0.3)
