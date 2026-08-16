@@ -52,6 +52,7 @@ from .types import (
     restart_recovery_decision,
 )
 from .version import RUNTIME_FINGERPRINT
+from .wk_feature import is_wk_kind, wk_enabled
 
 
 AdapterFactory = Callable[[RunRecord], ProviderAdapter]
@@ -2614,7 +2615,29 @@ Preserve the same identity, role, worktree, orchestrator grouping, PR gates, and
         request_id: str | None = None,
         run_id: str | None = None,
         implicit_request_id: bool = False,
+        execution_kind: str | None = None,
     ) -> RunRecord:
+        if execution_kind is not None:
+            if not wk_enabled() or not is_wk_kind(execution_kind):
+                raise ValueError("wk execution kind is disabled")
+            expected_provider = {
+                "wk-claude": ProviderKind.CLAUDE,
+                "wk-codex": ProviderKind.CODEX,
+            }[execution_kind]
+            if provider is not expected_provider:
+                raise ValueError("wk execution kind does not match provider")
+            if role.casefold() != "review":
+                raise ValueError("wk workers are review-only")
+            if execution_kind == "wk-codex" and effort not in {
+                "minimal",
+                "low",
+                "medium",
+                "high",
+                "xhigh",
+            }:
+                raise ValueError("Reasoning effort is required for wk-codex workers")
+            if execution_kind == "wk-claude" and effort is not None:
+                raise ValueError("wk-claude workers do not accept reasoning effort")
         _validate_auto_archive_policy(role, auto_archive)
         if request_id:
             durable = self.store.find_start_request(request_id)
@@ -2630,6 +2653,7 @@ Preserve the same identity, role, worktree, orchestrator grouping, PR gates, and
             model=model,
             worktree=str(resolved),
             prompt=prompt,
+            execution_kind=execution_kind,
             effort=effort,
             orchestrator_id=orchestrator_id,
             backend_base_url=backend_base_url,
@@ -5214,6 +5238,7 @@ Preserve the same identity, role, worktree, orchestrator grouping, PR gates, and
         replacement_run_id: str | None = None,
         effect_id: str | None = None,
         command_hash: str | None = None,
+        execution_kind: str | None = None,
     ) -> RunRecord:
         async with self._run_mutation_admission():
             old = self.store.get(run_id)
@@ -5233,6 +5258,7 @@ Preserve the same identity, role, worktree, orchestrator grouping, PR gates, and
                             replacement_run_id,
                             effect_id=effect_id,
                             command_hash=command_hash,
+                            execution_kind=execution_kind,
                         )
             else:
                 async with self._run_lock(run_id):
@@ -5246,6 +5272,7 @@ Preserve the same identity, role, worktree, orchestrator grouping, PR gates, and
                         replacement_run_id,
                         effect_id=effect_id,
                         command_hash=command_hash,
+                        execution_kind=execution_kind,
                     )
         if old.model != replacement.model:
             self._append_model_changed_event(
@@ -5285,6 +5312,7 @@ Preserve the same identity, role, worktree, orchestrator grouping, PR gates, and
         *,
         effect_id: str | None = None,
         command_hash: str | None = None,
+        execution_kind: str | None = None,
     ) -> RunRecord:
         """Replace a run after the caller has acquired mutation admission."""
 
@@ -5298,6 +5326,7 @@ Preserve the same identity, role, worktree, orchestrator grouping, PR gates, and
             replacement_run_id,
             effect_id=effect_id,
             command_hash=command_hash,
+            execution_kind=execution_kind,
         )
 
     async def _replace_without_handover(
@@ -5312,12 +5341,27 @@ Preserve the same identity, role, worktree, orchestrator grouping, PR gates, and
         *,
         effect_id: str | None = None,
         command_hash: str | None = None,
+        execution_kind: str | None = None,
     ) -> RunRecord:
         old = self.store.get(run_id)
         if not self.store.is_current(old):
             raise StoreConflict("replacement target is no longer current")
         resolve_safe_worktree(old.worktree)
         target_provider = provider or old.provider
+        target_execution_kind = (
+            old.execution_kind if execution_kind is None else execution_kind or None
+        )
+        if target_execution_kind is not None:
+            if not wk_enabled() or not is_wk_kind(target_execution_kind):
+                raise ValueError("wk execution kind is disabled")
+            expected_provider = {
+                "wk-claude": ProviderKind.CLAUDE,
+                "wk-codex": ProviderKind.CODEX,
+            }[target_execution_kind]
+            if target_provider is not expected_provider:
+                raise ValueError("wk execution kind does not match provider")
+            if old.role.casefold() != "review":
+                raise ValueError("wk workers are review-only")
         target_model = model or old.model
         target_effort = effort if target_provider is ProviderKind.CODEX else None
         replacement = RunRecord.new(
@@ -5328,6 +5372,7 @@ Preserve the same identity, role, worktree, orchestrator grouping, PR gates, and
             model=target_model,
             worktree=old.worktree,
             prompt=prompt,
+            execution_kind=target_execution_kind,
             effort=target_effort,
             orchestrator_id=old.orchestrator_id,
             replaces_run_id=old.run_id,
@@ -5389,7 +5434,11 @@ Preserve the same identity, role, worktree, orchestrator grouping, PR gates, and
                 )
             return result
 
-        if target_provider is not old.provider:
+        if (
+            target_provider is not old.provider
+            or target_execution_kind != old.execution_kind
+            or target_execution_kind is not None
+        ):
             try:
                 await self._close_and_drain_adapter(
                     run_id,
@@ -5865,6 +5914,11 @@ Preserve the same identity, role, worktree, orchestrator grouping, PR gates, and
                 worktree=str(params["worktree"]),
                 prompt=str(params["prompt"]),
                 effort=params.get("effort"),
+                execution_kind=(
+                    str(params["execution_kind"])
+                    if params.get("execution_kind") is not None
+                    else None
+                ),
                 orchestrator_id=params.get("orchestrator_id"),
                 migrate_legacy=migrate_legacy,
                 backend_base_url=params.get("backend_base_url"),
@@ -5898,6 +5952,21 @@ Preserve the same identity, role, worktree, orchestrator grouping, PR gates, and
             )
         if method == "run/status":
             return self._runtime_status(self.store.get(self._resolve_run_id(params)))
+        if method == "run/integrity_block":
+            run_id = self._resolve_run_id(params)
+            reason = str(params.get("reason") or "wk integrity state mismatch")
+            record = self.store.get(run_id)
+            if record.execution_kind not in {"wk-claude", "wk-codex"}:
+                raise ValueError("integrity blocking is restricted to wk runs")
+            async with self._run_mutation_admission():
+                async with self._run_lock(run_id):
+                    return _public_run(
+                        self.store.transition(
+                            run_id,
+                            LifecycleState.BLOCKED,
+                            reason=reason,
+                        )
+                    )
         if method == "run/mark_viewed":
             requested_seq = params.get("seq")
             if requested_seq is not None and (
@@ -6166,6 +6235,11 @@ Preserve the same identity, role, worktree, orchestrator grouping, PR gates, and
                     replacement_run_id,
                     effect_id=params.get("request_id"),
                     command_hash=command_hash,
+                    execution_kind=(
+                        str(params["execution_kind"])
+                        if params.get("execution_kind") is not None
+                        else None
+                    ),
                 )
             )
         if method == "run/respond":

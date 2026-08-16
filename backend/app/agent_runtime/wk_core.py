@@ -224,6 +224,25 @@ class WkEventSequencer:
         self._event_id_factory = event_id_factory or (lambda: str(uuid.uuid4()))
         self.events: list[WkEventEnvelope] = []
 
+    @classmethod
+    def from_events(
+        cls,
+        events: Sequence[WkEventEnvelope],
+        *,
+        event_id_factory: Callable[[], str] | None = None,
+    ) -> WkEventSequencer:
+        ordered = sorted(events, key=lambda event: event.source_seq)
+        if ordered and [event.source_seq for event in ordered] != list(
+            range(ordered[0].source_seq, ordered[-1].source_seq + 1)
+        ):
+            raise ValueError("wk event sequence has a gap")
+        sequencer = cls(
+            start_seq=(ordered[-1].source_seq + 1) if ordered else 1,
+            event_id_factory=event_id_factory,
+        )
+        sequencer.events.extend(ordered)
+        return sequencer
+
     def emit(
         self,
         *,
@@ -444,6 +463,12 @@ class _AtomicStatusWriter:
         self.path = path
         self._authority = authority
         self._write_seq = 0
+        try:
+            value = json.loads(path.read_text(encoding="utf-8"))
+        except (FileNotFoundError, OSError, json.JSONDecodeError):
+            value = None
+        if isinstance(value, dict) and isinstance(value.get("status_write_seq"), int):
+            self._write_seq = max(0, value["status_write_seq"])
 
     def write(
         self,

@@ -376,6 +376,7 @@ class WkCodexLane:
         command: Sequence[str] = ("codex", "app-server", "--stdio"),
         auth_command: Sequence[str] | None = None,
         environment: Mapping[str, str] | None = None,
+        sequencer: WkEventSequencer | None = None,
         steering_path: Path | None = None,
         request_timeout: float = 30.0,
         wiki_command: Sequence[str] = ("wiki",),
@@ -398,7 +399,11 @@ class WkCodexLane:
         )
         _reject_auth_sources(self._settings_guard.paths)
         self._auth_identity: tuple[str, ...] | None = None
-        self.translator = WkCodexEventTranslator(run_id=run_id, agent_id=agent_id)
+        self.translator = WkCodexEventTranslator(
+            run_id=run_id,
+            agent_id=agent_id,
+            sequencer=sequencer,
+        )
         self.ledger = WkToolLedger(self.translator)  # type: ignore[arg-type]
         self.registry = register_default_wk_tools(
             WkToolRegistry(),

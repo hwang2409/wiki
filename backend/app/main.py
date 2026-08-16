@@ -79,6 +79,7 @@ from .agent_runtime.ticket import (
 )
 from .agent_runtime.unknown_kind_telemetry import UnknownKindTelemetry
 from .agent_runtime.version import RUNTIME_FINGERPRINT
+from .agent_runtime.wk_feature import WK_KINDS, is_wk_kind, wk_enabled
 from .frontend_static import mount_frontend_static
 from .next_review_schema import NextReviewIn
 from .rebase_schema import RebaseDirtyPrIn
@@ -1282,6 +1283,8 @@ def valid_agent_id(value: str) -> bool:
 
 
 def _normalize_kind(value: object) -> str | None:
+    if value in WK_KINDS and wk_enabled():
+        return str(value)
     if value == "cc" or value == "claude":
         return "cc"
     if value == "cdx" or value == "codex":
@@ -1298,6 +1301,11 @@ def _normalize_provider(value: object) -> str | None:
 
 
 def _provider_for_kind(kind: str | None) -> str | None:
+    if wk_enabled():
+        if kind == "wk-claude":
+            return "claude"
+        if kind == "wk-codex":
+            return "codex"
     if kind == "cc":
         return "claude"
     if kind == "cdx":
@@ -2245,7 +2253,12 @@ def agents(include_history: bool = False) -> dict[str, object]:
             continue
         headless = _is_headless(current)
         runtime = current if headless else {}
-        runtime_state = runtime.get("state") if headless else None
+        runtime_state = (
+            runtime.get("runtime_state", runtime.get("state"))
+            if headless
+            else None
+        )
+        provider_state = runtime.get("provider_state") if headless else None
         control_attached = (
             supervisor_alive and runtime.get("control_attached") is True
             if headless
@@ -2259,6 +2272,35 @@ def agents(include_history: bool = False) -> dict[str, object]:
         window_alive = (
             control_attached if headless else current.get("window") in live_windows
         )
+        wk_parity_blocker: str | None = None
+        if isinstance(current_kind, str) and is_wk_kind(current_kind):
+            status_state = (status or {}).get("state")
+            if status_state == "blocked" and runtime_state != "blocked":
+                wk_parity_blocker = "wk status is blocked while runtime is not blocked"
+            elif status_state == "merge-ready" and runtime_state not in {
+                "idle",
+                "completed",
+            }:
+                wk_parity_blocker = "wk merge-ready status has no idle or completed runtime"
+            elif status_state == "working" and runtime_state in {
+                "blocked",
+                "dead",
+                "completed",
+            }:
+                wk_parity_blocker = "wk working status has a terminal or blocked runtime"
+            elif provider_state is not None and provider_state != runtime_state:
+                wk_parity_blocker = "wk provider and runtime states diverged"
+            if wk_parity_blocker and supervisor_alive:
+                try:
+                    _supervisor_request(
+                        "run/integrity_block",
+                        {
+                            "run_id": current.get("run_id"),
+                            "reason": wk_parity_blocker,
+                        },
+                    )
+                except Exception:
+                    pass
         if current.get("role") == "orchestrator":
             transcript = current.get("transcript")
             orchestrators.append(
@@ -2298,6 +2340,14 @@ def agents(include_history: bool = False) -> dict[str, object]:
                 "window_alive": window_alive,
                 "run_id": current.get("run_id"),
                 "runtime_state": runtime_state,
+                **(
+                    {
+                        "provider_state": provider_state,
+                        "core_phase": current.get("core_phase"),
+                    }
+                    if isinstance(current_kind, str) and is_wk_kind(current_kind)
+                    else {}
+                ),
                 "state_reason": runtime.get("state_reason") if headless else None,
                 "control_attached": control_attached,
                 "provider_session_id": current.get("provider_session_id"),
@@ -2314,10 +2364,10 @@ def agents(include_history: bool = False) -> dict[str, object]:
                 "session": current.get("session"),
                 "spawned_at": current.get("spawned_at"),
                 **({"history": entry.get("history", [])} if include_history else {}),
-                "state": (status or {}).get("state") or runtime_state,
+                "state": "blocked" if wk_parity_blocker else (status or {}).get("state") or runtime_state,
                 "pr": (status or {}).get("pr"),
                 "step": (status or {}).get("step"),
-                "blocker": (status or {}).get("blocker"),
+                "blocker": wk_parity_blocker or (status or {}).get("blocker"),
                 "status_age_seconds": (
                     int(now - status["_mtime"]) if status else None
                 ),
@@ -5160,14 +5210,14 @@ class SetModelIn(BaseModel):
 
 class SpawnReplaceIn(BaseModel):
     model: str | None = Field(default=None, max_length=64)
-    kind: str | None = Field(default=None, max_length=8)
+    kind: str | None = Field(default=None, max_length=9 if wk_enabled() else 8)
     effort: str | None = Field(default=None, max_length=16)
     request_id: str | None = Field(default=None, min_length=1, max_length=200)
 
 
 class SpawnWorkerIn(BaseModel):
     ticket: str = Field(..., min_length=1, max_length=80)
-    kind: str = Field(..., min_length=2, max_length=8)
+    kind: str = Field(..., min_length=2, max_length=9 if wk_enabled() else 8)
     role: str = Field(..., min_length=4, max_length=16)
     auto_archive: bool | None = None
     model: str = Field(..., min_length=2, max_length=64)
@@ -5191,9 +5241,9 @@ class SpawnWorkerIn(BaseModel):
             raise ValueError(
                 f"auto_archive=one-shot is not allowed for role={self.role!r}"
             )
-        if kind == "cdx" and effort not in REASONING_EFFORTS:
+        if kind in {"cdx", "wk-codex"} and effort not in REASONING_EFFORTS:
             raise ValueError("Reasoning effort is required for Codex workers")
-        if kind == "cc" and effort is not None:
+        if kind in {"cc", "wk-claude"} and effort is not None:
             raise ValueError("Claude workers do not accept reasoning effort")
         return self
 
@@ -5238,7 +5288,12 @@ class AutopilotEnableIn(BaseModel):
 
 
 def _allowed_model_message(kind: str, model: str, *, target: str) -> str:
-    provider = {"cdx": "Codex", "cc": "Claude"}.get(kind, kind)
+    provider = {
+        "cdx": "Codex",
+        "cc": "Claude",
+        "wk-codex": "Codex wk",
+        "wk-claude": "Claude wk",
+    }.get(kind, kind)
     allowed = ", ".join(model_ids_for_kind(kind))
     return (
         f"{target} model {model!r} is not allowed for {provider}. "
@@ -5668,13 +5723,19 @@ def replace_agent(
 
     resolved_id, _, current = resolved
     current_kind = current.get("kind")
-    if current_kind not in {"cc", "cdx"}:
+    if current_kind not in {"cc", "cdx"} and not (
+        wk_enabled() and isinstance(current_kind, str) and is_wk_kind(current_kind)
+    ):
         raise HTTPException(status_code=400, detail="Agent kind is unknown")
     target = "Orchestrator" if current.get("role") == "orchestrator" else "Worker"
     requested_kind = (body.kind or "").strip() if body is not None else ""
-    if requested_kind and requested_kind not in {"cc", "cdx"}:
+    if requested_kind and requested_kind not in {"cc", "cdx"} and not (
+        wk_enabled() and is_wk_kind(requested_kind)
+    ):
         raise HTTPException(status_code=400, detail="Kind must be cdx or cc")
     kind = requested_kind or current_kind
+    if is_wk_kind(kind) and current.get("role") != "review":
+        raise HTTPException(status_code=400, detail="wk workers are review-only")
 
     requested_model = (body.model or "").strip() if body is not None else ""
     if requested_model:
@@ -5690,7 +5751,7 @@ def replace_agent(
 
     requested_effort = (body.effort or "").strip() if body is not None else ""
     has_override = bool(requested_kind or requested_model or requested_effort)
-    if kind == "cc":
+    if kind in {"cc", "wk-claude"}:
         if requested_effort:
             raise HTTPException(
                 status_code=400,
@@ -5709,7 +5770,12 @@ def replace_agent(
         {
             "run_id": current["run_id"],
             "prompt": _headless_replacement_prompt(resolved_id, current),
-            "provider": "codex" if kind == "cdx" else "claude",
+            "provider": "codex" if kind in {"cdx", "wk-codex"} else "claude",
+            **(
+                {"execution_kind": kind if is_wk_kind(kind) else ""}
+                if requested_kind
+                else {}
+            ),
             "model": model,
             "effort": effort,
             "backend_base_url": backend_base_url,
@@ -5929,12 +5995,14 @@ def spawn_agent(
         ticket = ticket.upper()
 
     kind = body.kind.strip()
-    if kind not in {"cdx", "cc"}:
+    if kind not in {"cdx", "cc"} and not (wk_enabled() and is_wk_kind(kind)):
         raise HTTPException(status_code=400, detail="Kind must be cdx or cc")
 
     role = body.role.strip()
     if role not in WORKER_ROLES:
         raise HTTPException(status_code=400, detail="Role must be plan, implement, or review")
+    if is_wk_kind(kind) and role != "review":
+        raise HTTPException(status_code=400, detail="wk workers are review-only")
 
     model = body.model.strip()
     _require_allowed_model(kind, model, target="Worker")
@@ -5952,7 +6020,7 @@ def spawn_agent(
     request_id = body.request_id or _stable_spawn_request_id(
         {
             "agent_id": ticket,
-            "provider": "codex" if kind == "cdx" else "claude",
+            "provider": "codex" if kind in {"cdx", "wk-codex"} else "claude",
             "role": role,
             "auto_archive": body.auto_archive,
             "model": model,
@@ -6011,11 +6079,9 @@ def spawn_agent(
         raise HTTPException(status_code=409, detail=f"{ticket} already has a live worker window")
 
     migrate_legacy_flag = bool(current) and not current_is_headless
-    result = _supervisor_request(
-        "run/start",
-        {
+    start_params: dict[str, object] = {
             "agent_id": ticket,
-            "provider": "codex" if kind == "cdx" else "claude",
+            "provider": "codex" if kind in {"cdx", "wk-codex"} else "claude",
             "role": role,
             "auto_archive": body.auto_archive,
             "model": model,
@@ -6028,7 +6094,7 @@ def spawn_agent(
             "implicit_request_id": implicit_request_id,
             "command_hash_payload": {
                 "agent_id": ticket,
-                "provider": "codex" if kind == "cdx" else "claude",
+                "provider": "codex" if kind in {"cdx", "wk-codex"} else "claude",
                 "role": role,
                 "auto_archive": body.auto_archive,
                 "model": model,
@@ -6042,8 +6108,11 @@ def spawn_agent(
                 "orchestrator_id": orch or None,
             },
             "backend_base_url": backend_base_url,
-        },
-    )
+        }
+    if is_wk_kind(kind):
+        start_params["execution_kind"] = kind
+        cast(dict[str, object], start_params["command_hash_payload"])["execution_kind"] = kind
+    result = _supervisor_request("run/start", start_params)
     if not isinstance(result, dict):
         raise HTTPException(status_code=502, detail="Agent supervisor returned a bad run")
     # Key the ticket-only Codex-notice cleanup off the REPLACED legacy identity

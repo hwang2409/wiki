@@ -6,6 +6,7 @@ from __future__ import annotations
 import json
 import os
 import sys
+import time
 from pathlib import Path
 
 
@@ -79,6 +80,36 @@ for line in sys.stdin:
                     "setting_sources": [],
                 }
             )
+            if (Path(os.environ["CLAUDE_CONFIG_DIR"]) / "resume-result").exists():
+                send(
+                    {
+                        "type": "user",
+                        "session_id": session_id,
+                        "message": {
+                            "role": "user",
+                            "content": [
+                                {
+                                    "type": "tool_result",
+                                    "tool_use_id": "tool-subprocess-1",
+                                    "content": "fixture read after resume",
+                                    "is_error": False,
+                                }
+                            ],
+                        },
+                    }
+                )
+                send(
+                    {
+                        "type": "result",
+                        "subtype": "success",
+                        "session_id": session_id,
+                        "is_error": False,
+                        "duration_ms": 1,
+                        "duration_api_ms": 1,
+                        "num_turns": 1,
+                        "result": "fixture resumed",
+                    }
+                )
     elif message.get("type") == "user":
         tool_id = "tool-subprocess-1"
         if permission_prompt_enabled:
@@ -137,6 +168,13 @@ for line in sys.stdin:
             }
         )
         if os.environ.get("WK_DROP_TOOL_RESULT") != "1":
+            pause_file = Path(os.environ["CLAUDE_CONFIG_DIR"]) / "pause-before-result"
+            if pause_file.exists():
+                (pause_file.with_name("pause-ready")).write_text(
+                    "tool-use-emitted", encoding="utf-8"
+                )
+                while pause_file.exists():
+                    time.sleep(0.01)
             send(
                 {
                     "type": "user",

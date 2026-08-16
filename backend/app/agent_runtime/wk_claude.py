@@ -30,9 +30,8 @@ from .wk_core import (
     WkToolRegistry,
     WkToolRequest,
     WkToolResult,
-    mutation_input_hash,
-    redact_payload,
 )
+from .wk_common import WkLedgerError, WkSessionTree, WkToolLedger
 from .wk_feature import wk_enabled
 
 
@@ -100,10 +99,6 @@ class WkClaudeDisabled(WkClaudeError):
 
 class WkClaudePlanAuthError(WkClaudeError):
     """The lane would use an API credential instead of plan auth."""
-
-
-class WkLedgerError(WkClaudeError):
-    """The tool ledger cannot prove a complete operation."""
 
 
 class ClaudeSdkClient(Protocol):
@@ -376,37 +371,6 @@ def _event_timestamp(value: Mapping[str, Any], fallback: str) -> str:
     return str(timestamp) if timestamp else fallback
 
 
-@dataclass
-class WkSessionTree:
-    """Append-only parent-linked session entries."""
-
-    entries: list[dict[str, object]]
-    current_id: str | None = None
-
-    def __init__(self) -> None:
-        self.entries = []
-        self.current_id = None
-
-    def append(self, entry: Mapping[str, object]) -> str:
-        entry_id = str(entry.get("id") or uuid4())
-        value = dict(entry)
-        value["id"] = entry_id
-        value["parent_id"] = value.get("parent_id", self.current_id)
-        self.entries.append(value)
-        self.current_id = entry_id
-        return entry_id
-
-    def record_event(self, event: WkEventEnvelope) -> str:
-        return self.append(
-            {
-                "kind": event.kind,
-                "phase": event.phase.value,
-                "source_event_id": event.source_event_id,
-                "payload": cast(dict[str, object], redact_payload(event.payload)),
-            }
-        )
-
-
 class WkClaudeEventTranslator:
     """Retain raw SDK records, then publish normalized Wiki envelopes."""
 
@@ -546,202 +510,6 @@ class WkClaudeEventTranslator:
                 f"Claude SDK auth source is not proven plan auth: {auth_source!r}"
             )
         self._plan_auth_verified = True
-
-
-@dataclass(frozen=True)
-class _LedgerOperation:
-    request: WkToolRequest
-    started: WkEventEnvelope
-    result: WkToolResult | None = None
-
-
-class WkToolLedger:
-    """Record and reconcile every Wiki tool call and result."""
-
-    def __init__(self, translator: WkClaudeEventTranslator):
-        self.translator = translator
-        self.operations: dict[str, _LedgerOperation] = {}
-        self._transport_pending: set[str] = set()
-
-    @property
-    def events(self) -> list[WkEventEnvelope]:
-        return self.translator.sequencer.events
-
-    def record_started(self, request: WkToolRequest) -> WkEventEnvelope:
-        if request.call_id in self.operations:
-            raise WkLedgerError(f"duplicate tool call: {request.call_id}")
-        event = self.translator.sequencer.emit(
-            run_id=self.translator.run_id,
-            agent_id=self.translator.agent_id,
-            kind="tool.started",
-            phase=WkEventPhase.TOOL,
-            provider=self.translator.provider,
-            lane=self.translator.lane,
-            disposition=WkDisposition.RENDERED,
-            ts=self.translator.timestamp(),
-            payload={
-                "call_id": request.call_id,
-                "name": request.name,
-                "arguments": dict(request.arguments),
-                "mutation": request.mutation.value,
-            },
-            integrity={"input_hash": mutation_input_hash(request)},
-        )
-        self.operations[request.call_id] = _LedgerOperation(request, event)
-        self.translator.session.record_event(event)
-        return event
-
-    def record_result(
-        self, request: WkToolRequest, result: WkToolResult
-    ) -> WkEventEnvelope:
-        operation = self.operations.get(request.call_id)
-        if operation is None:
-            raise WkLedgerError(f"tool result has no start: {request.call_id}")
-        if operation.result is not None:
-            raise WkLedgerError(f"duplicate tool result: {request.call_id}")
-        if mutation_input_hash(operation.request) != mutation_input_hash(request):
-            raise WkLedgerError(f"tool request changed: {request.call_id}")
-        event = self.translator.sequencer.emit(
-            run_id=self.translator.run_id,
-            agent_id=self.translator.agent_id,
-            kind="tool.completed" if result.success else "tool.failed",
-            phase=WkEventPhase.TOOL,
-            provider=self.translator.provider,
-            lane=self.translator.lane,
-            disposition=WkDisposition.RENDERED,
-            ts=self.translator.timestamp(),
-            payload={"call_id": request.call_id, "result": result.to_dict()},
-            integrity={
-                "input_hash": mutation_input_hash(request),
-                "result_hash": _hash_result(result),
-            },
-        )
-        self.operations[request.call_id] = _LedgerOperation(request, event, result)
-        self.translator.session.record_event(event)
-        return event
-
-    def record_transport_frame(self, raw: Mapping[str, Any]) -> None:
-        """Track SDK tool-use/result pairs at the transport boundary."""
-
-        message = raw.get("message")
-        content = message.get("content") if isinstance(message, Mapping) else None
-        if isinstance(content, Sequence) and not isinstance(content, (str, bytes)):
-            for block in content:
-                if not isinstance(block, Mapping):
-                    continue
-                block_type = block.get("type")
-                if block_type == "tool_use":
-                    tool_id = block.get("id")
-                    if isinstance(tool_id, str) and tool_id:
-                        if tool_id in self._transport_pending:
-                            raise WkLedgerError(f"duplicate transport tool call: {tool_id}")
-                        self._transport_pending.add(tool_id)
-                elif block_type == "tool_result":
-                    tool_id = block.get("tool_use_id")
-                    if not isinstance(tool_id, str) or tool_id not in self._transport_pending:
-                        raise WkLedgerError(f"transport result has no start: {tool_id!r}")
-                    self._transport_pending.remove(tool_id)
-        params = raw.get("params")
-        item = params.get("item") if isinstance(params, Mapping) else None
-        if not isinstance(item, Mapping):
-            return
-        item_type = item.get("type")
-        if item_type not in {"commandExecution", "fileChange", "mcpToolCall", "dynamicToolCall"}:
-            return
-        item_id = item.get("id")
-        if not isinstance(item_id, str) or not item_id:
-            return
-        if raw.get("method") == "item/started":
-            if item_id in self._transport_pending:
-                raise WkLedgerError(f"duplicate transport tool call: {item_id}")
-            self._transport_pending.add(item_id)
-        elif raw.get("method") == "item/completed":
-            if item_id not in self._transport_pending:
-                raise WkLedgerError(f"transport result has no start: {item_id!r}")
-            self._transport_pending.remove(item_id)
-
-    def reconcile_transport(self) -> None:
-        if self._transport_pending:
-            raise WkLedgerError(
-                "missing transport tool results: " + ", ".join(sorted(self._transport_pending))
-            )
-
-    def reconcile(self, events: Sequence[WkEventEnvelope] | None = None) -> None:
-        source = list(self.events if events is None else events)
-        started: dict[str, WkEventEnvelope] = {}
-        completed: dict[str, WkEventEnvelope] = {}
-        for event in source:
-            if event.kind == "tool.started":
-                call_id = _event_call_id(event)
-                if call_id is not None:
-                    started[call_id] = event
-            elif event.kind in {"tool.completed", "tool.failed"}:
-                call_id = _event_call_id(event)
-                if call_id is not None:
-                    completed[call_id] = event
-        missing = sorted(set(started) - set(completed))
-        if missing:
-            raise WkLedgerError("missing tool results: " + ", ".join(missing))
-        unknown = sorted(set(completed) - set(started))
-        if unknown:
-            raise WkLedgerError("tool results without starts: " + ", ".join(unknown))
-        for call_id, event in started.items():
-            result_event = completed[call_id]
-            result_value = result_event.payload.get("result")
-            if not isinstance(result_value, Mapping):
-                raise WkLedgerError(f"tool result is not typed: {call_id}")
-            exit_code = result_value.get("exit_code")
-            if result_value.get("success") is not (exit_code == 0):
-                raise WkLedgerError(f"tool success disagrees with exit code: {call_id}")
-            if event.payload.get("name") != "wk.gate":
-                continue
-            started_hash = event.integrity.get("input_hash") if event.integrity else None
-            result_hash = (
-                result_event.integrity.get("input_hash")
-                if result_event.integrity
-                else None
-            )
-            if started_hash != result_hash:
-                raise WkLedgerError(f"tool input hash changed: {call_id}")
-            if not isinstance(exit_code, int):
-                raise WkLedgerError(f"gate result has no real exit code: {call_id}")
-            receipt = result_value.get("mutation_receipt")
-            if not isinstance(receipt, Mapping):
-                raise WkLedgerError(f"gate result has no parsed verdict: {call_id}")
-            if not isinstance(receipt.get("pid"), int) or receipt["pid"] <= 0:
-                raise WkLedgerError(f"gate result has no process receipt: {call_id}")
-            for field in ("stdout_sha256", "stderr_sha256"):
-                value = receipt.get(field)
-                if not isinstance(value, str) or len(value) != 64:
-                    raise WkLedgerError(f"gate result has no process receipt: {call_id}")
-            verdict = receipt.get("verdict")
-            if not isinstance(verdict, Mapping) or type(verdict.get("ready")) is not bool:
-                raise WkLedgerError(f"gate result has no boolean verdict: {call_id}")
-            if verdict["ready"] and exit_code != 0:
-                raise WkLedgerError(f"gate ready verdict disagrees with exit code: {call_id}")
-
-
-def _event_call_id(event: WkEventEnvelope) -> str | None:
-    value = event.payload.get("call_id")
-    return str(value) if value else None
-
-
-def _hash_result(result: WkToolResult) -> str:
-    value = {
-        "success": result.success,
-        "exit_code": result.exit_code,
-        "stdout": result.stdout,
-        "stderr": result.stderr,
-        "error_class": result.error_class,
-        "error_detail": result.error_detail,
-        "timed_out": result.timed_out,
-        "duration_ms": result.duration_ms,
-        "mutation": result.mutation.value,
-        "mutation_receipt": result.mutation_receipt,
-        "output_artifact": result.output_artifact,
-    }
-    encoded = json.dumps(value, sort_keys=True, separators=(",", ":"), default=str).encode()
-    return hashlib.sha256(encoded).hexdigest()
 
 
 def _utc_timestamp() -> str:
@@ -1203,11 +971,8 @@ class WkClaudeToolBridge:
 
 
 from .wk_common import (
-    WkLedgerError,
-    WkSessionTree,
     WkSteeringQueue,
     WkToolBridge as WkClaudeToolBridge,
-    WkToolLedger,
 )
 from .wk_tools import register_default_wk_tools
 
@@ -1359,6 +1124,9 @@ class WkClaudeLane:
         approval: ApprovalRequest | None = None,
         steering_path: Path | None = None,
         wiki_command: Sequence[str] = ("wiki",),
+        environment: Mapping[str, str] | None = None,
+        cli_path: str | Path | None = None,
+        sequencer: WkEventSequencer | None = None,
     ) -> None:
         if not wk_enabled():
             raise WkClaudeDisabled("WIKI_ENABLE_WK=1 is required for wk-claude")
@@ -1380,12 +1148,15 @@ class WkClaudeLane:
             metadata=metadata,
             run_id=run_id,
             agent_id=agent_id,
+            sequencer=sequencer,
         )
         self.ledger = WkToolLedger(self.translator)
         self.bridge = WkClaudeToolBridge(
             registry=self.registry, ledger=self.ledger, loop=loop
         )
         self.approval = approval
+        self._environment = plan_auth_environment(environment)
+        self.cli_path = cli_path
         self._client_factory = client_factory
         self._options_factory = options_factory
         self._steering = WkSteeringQueue(
@@ -1401,7 +1172,7 @@ class WkClaudeLane:
         self._sdk_environment: Mapping[str, str] = {}
         self._client_options_cli_path: str | Path | None = None
         self._settings_guard = _SettingsGuard(
-            _settings_paths(worktree, plan_auth_environment())
+            _settings_paths(worktree, self._environment)
         )
 
     def _new_client(self, *, resume: str | None = None) -> ClaudeSdkClient:
@@ -1413,7 +1184,10 @@ class WkClaudeLane:
                 bridge=self.bridge,
                 approval=self.approval,
                 resume=resume,
+                environment=self._environment,
             )
+            if self.cli_path is not None and is_dataclass(options):
+                options = replace(options, cli_path=str(self.cli_path))
         else:
             options = self._options_factory(resume=resume)
         cli_path = getattr(options, "cli_path", None)
@@ -1603,6 +1377,34 @@ class WkClaudeLane:
         self._startup_ready = asyncio.Event()
         self._startup_error = None
         await self.start(prompt)
+
+    async def archive(self) -> None:
+        try:
+            self._verify_turn_boundary()
+            self.ledger.reconcile_transport()
+            self.ledger.reconcile()
+            raw = {"type": "archive", "session_id": self.run_id}
+            self.translator.raw_events.append(raw)
+            event = self.translator.sequencer.emit(
+                run_id=self.run_id,
+                agent_id=self.agent_id,
+                kind="claude.archive",
+                phase=WkEventPhase.ARCHIVE,
+                provider="claude",
+                lane="wk-claude",
+                disposition=WkDisposition.RENDERED,
+                ts=self.translator.timestamp(),
+                payload=raw,
+            )
+            self.translator.session.record_event(event)
+            await self._events.put({"raw": raw, "event": event.to_dict()})
+            await self._close_transport()
+            await self._events.put(None)
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            await self._emit_provider_error(exc)
+            raise WkClaudeError(str(exc)) from exc
 
     async def _close_transport(self) -> None:
         self._closed = True

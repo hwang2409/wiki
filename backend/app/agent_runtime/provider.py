@@ -52,6 +52,7 @@ class AdapterStatus:
     active_turn_id: str | None = None
     transcript_path: str | None = None
     detail: str | None = None
+    core_phase: str | None = None
 
 
 class ProviderAdapter(ABC):
