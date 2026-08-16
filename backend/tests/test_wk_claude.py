@@ -449,12 +449,25 @@ def test_tool_ledger_records_success_nonzero_and_timeout_results() -> None:
         (
             "bash-1",
             "wk.bash",
-            WkToolResult(success=False, exit_code=17, error_class="process_failed"),
+            WkToolResult(
+                success=False,
+                exit_code=17,
+                error_class="process_failed",
+                mutation=WkMutationClass.PROCESS,
+                mutation_receipt={"pid": 123, "stdout_sha256": "a" * 64, "stderr_sha256": "b" * 64},
+            ),
         ),
         (
             "bash-timeout",
             "wk.bash",
-            WkToolResult(success=False, exit_code=None, timed_out=True, error_class="timeout"),
+            WkToolResult(
+                success=False,
+                exit_code=None,
+                timed_out=True,
+                error_class="timeout",
+                mutation=WkMutationClass.PROCESS,
+                mutation_receipt={"pid": 124, "stdout_sha256": "c" * 64, "stderr_sha256": "d" * 64},
+            ),
         ),
     )
     for call_id, name, result in cases:

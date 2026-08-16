@@ -67,6 +67,7 @@ class WkProviderAdapter(ProviderAdapter):
             "agent_id": record.agent_id,
             "worktree": Path(record.worktree),
             "model": record.model,
+            "role": record.role,
             "loop": self.loop,
         }
         if record.execution_kind == "wk-codex":

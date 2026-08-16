@@ -53,6 +53,10 @@ class WkMutationClass(str, Enum):
     UNKNOWN = "unknown"
 
 
+class WkIntegrityError(RuntimeError):
+    """The harness cannot prove a requested integrity transition."""
+
+
 @dataclass(frozen=True)
 class WkRunMetadata:
     """Additive metadata for the two distinct public wk execution kinds."""
@@ -526,6 +530,8 @@ class WkLoop:
     def __init__(self, *, status_path: Path):
         self._authority = _LoopAuthority()
         self._status_writer = _AtomicStatusWriter(status_path, self._authority)
+        self._integrity_ledger: object | None = None
+        self._integrity_role = "review"
 
     @property
     def status_path(self) -> Path:
@@ -537,6 +543,12 @@ class WkLoop:
     def status_write_seq(self) -> int:
         return self._status_writer._write_seq
 
+    def bind_integrity(self, ledger: object, *, role: str = "review") -> None:
+        """Bind the loop to the ledger that proves merge-ready transitions."""
+
+        self._integrity_ledger = ledger
+        self._integrity_role = role
+
     def write_status(
         self,
         *,
@@ -544,7 +556,20 @@ class WkLoop:
         pr: str | None,
         step: str,
         blocker: str | None,
+        status_call_id: str | None = None,
     ) -> int:
+        if state == "merge-ready":
+            ledger = self._integrity_ledger
+            if ledger is not None:
+                checker = getattr(ledger, "check_merge_ready", None)
+                if checker is None:
+                    raise WkIntegrityError("wk ledger cannot prove merge-ready")
+                allowed, reason = checker(
+                    ignore_call_id=status_call_id,
+                    role=self._integrity_role,
+                )
+                if not allowed:
+                    raise WkIntegrityError(reason)
         return self._status_writer.write(
             state=state,
             pr=pr,
@@ -576,6 +601,7 @@ __all__ = [
     "WkEventPhase",
     "WkEventSequencer",
     "WkEventSink",
+    "WkIntegrityError",
     "WkLoop",
     "WkMutationClass",
     "WkProvider",

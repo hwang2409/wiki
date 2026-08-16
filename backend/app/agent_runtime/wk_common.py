@@ -16,6 +16,7 @@ from .wk_core import (
     WkDisposition,
     WkEventEnvelope,
     WkEventPhase,
+    WkIntegrityError,
     WkLoop,
     WkMutationClass,
     WkToolRegistry,
@@ -247,6 +248,13 @@ class WkToolLedger:
             exit_code = result.get("exit_code")
             if result.get("success") is not (exit_code == 0):
                 raise WkLedgerError(f"tool success disagrees with exit code: {call_id}")
+            mutation = str(event.payload.get("mutation", WkMutationClass.NONE.value))
+            if mutation != WkMutationClass.NONE.value:
+                if result.get("mutation") != mutation:
+                    raise WkLedgerError(f"tool mutation class changed: {call_id}")
+                receipt = result.get("mutation_receipt")
+                if not isinstance(receipt, Mapping):
+                    raise WkLedgerError(f"mutation result has no receipt: {call_id}")
             if event.payload.get("name") != "wk.gate":
                 continue
             started_hash = event.integrity.get("input_hash") if event.integrity else None
@@ -263,6 +271,67 @@ class WkToolLedger:
                 raise WkLedgerError(f"gate result has no boolean verdict: {call_id}")
             if verdict["ready"] and exit_code != 0:
                 raise WkLedgerError(f"gate ready verdict disagrees with exit code: {call_id}")
+
+    def check_merge_ready(
+        self,
+        *,
+        ignore_call_id: str | None = None,
+        role: str = "review",
+    ) -> tuple[bool, str]:
+        """Return whether the ledger proves a safe merge-ready transition."""
+
+        source = [
+            event
+            for event in self.events
+            if event.payload.get("call_id") != ignore_call_id
+        ]
+        try:
+            self.reconcile(source)
+        except WkLedgerError as exc:
+            return False, str(exc)
+        open_mutations = [
+            operation.request.call_id
+            for operation in self.operations.values()
+            if operation.result is None
+            and operation.request.call_id != ignore_call_id
+            and operation.request.mutation is not WkMutationClass.NONE
+        ]
+        if open_mutations:
+            return False, "open mutation operations: " + ", ".join(sorted(open_mutations))
+        for event in reversed(source):
+            if event.kind != "tool.completed" or event.payload.get("name") != "wk.gate":
+                continue
+            result = event.payload.get("result")
+            receipt = result.get("mutation_receipt") if isinstance(result, Mapping) else None
+            verdict = receipt.get("verdict") if isinstance(receipt, Mapping) else None
+            if (
+                isinstance(result, Mapping)
+                and result.get("success") is True
+                and result.get("exit_code") == 0
+                and isinstance(verdict, Mapping)
+                and verdict.get("ready") is True
+            ):
+                started = next(
+                    (
+                        candidate
+                        for candidate in reversed(source)
+                        if candidate.kind == "tool.started"
+                        and candidate.payload.get("call_id") == event.payload.get("call_id")
+                    ),
+                    None,
+                )
+                arguments = started.payload.get("arguments") if started else None
+                gate_role = arguments.get("role", "review") if isinstance(arguments, Mapping) else "review"
+                if gate_role != role:
+                    continue
+                expected_sha = arguments.get("expected_sha") if isinstance(arguments, Mapping) else None
+                head_sha = verdict.get("head_sha")
+                if expected_sha and (
+                    not isinstance(head_sha, str) or not head_sha.startswith(str(expected_sha))
+                ):
+                    return False, "gate verdict does not match expected SHA"
+                return True, "gate receipt proves merge-ready"
+        return False, "no passing gate receipt proves merge-ready"
 
 
 def replay_wk_events(path: Path | None) -> tuple[list[dict[str, Any]], list[WkEventEnvelope]]:
@@ -351,8 +420,31 @@ class WkToolBridge:
         self.ledger.record_started(request)
         try:
             result = await self.registry.execute(request)
+        except WkIntegrityError as exc:
+            self.loop.write_status(
+                state="blocked",
+                pr=None,
+                step="wk integrity guard blocked the requested status",
+                blocker=str(exc),
+            )
+            result = WkToolResult(
+                success=False,
+                exit_code=None,
+                error_class=type(exc).__name__,
+                error_detail=str(exc),
+                mutation=request.mutation,
+            )
         except Exception as exc:
             result = WkToolResult(success=False, exit_code=None, error_class=type(exc).__name__, error_detail=str(exc), mutation=request.mutation)
         self.ledger.record_result(request, result)
-        self.ledger.reconcile()
+        try:
+            self.ledger.reconcile()
+        except WkLedgerError as exc:
+            self.loop.write_status(
+                state="blocked",
+                pr=None,
+                step="wk ledger reconciliation blocked the run",
+                blocker=str(exc),
+            )
+            raise
         return result

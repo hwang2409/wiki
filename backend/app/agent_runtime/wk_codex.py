@@ -373,6 +373,7 @@ class WkCodexLane:
         worktree: Path,
         model: str,
         loop: WkLoop,
+        role: str = "review",
         command: Sequence[str] = ("codex", "app-server", "--stdio"),
         auth_command: Sequence[str] | None = None,
         environment: Mapping[str, str] | None = None,
@@ -390,6 +391,7 @@ class WkCodexLane:
         self.agent_id = agent_id
         self.worktree = worktree
         self.model = model
+        self.role = role
         self.loop = loop
         self.environment = codex_plan_auth_environment(environment)
         del auth_command
@@ -405,6 +407,7 @@ class WkCodexLane:
             sequencer=sequencer,
         )
         self.ledger = WkToolLedger(self.translator)  # type: ignore[arg-type]
+        self.loop.bind_integrity(self.ledger, role=role)
         self.registry = register_default_wk_tools(
             WkToolRegistry(),
             root=worktree,

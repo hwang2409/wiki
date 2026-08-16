@@ -1117,8 +1117,9 @@ class WkClaudeLane:
         agent_id: str,
         worktree: Path,
         model: str,
-        registry: WkToolRegistry | None = None,
         loop: WkLoop,
+        role: str = "review",
+        registry: WkToolRegistry | None = None,
         client_factory: Callable[[Any], ClaudeSdkClient] | None = None,
         options_factory: Callable[..., Any] | None = None,
         approval: ApprovalRequest | None = None,
@@ -1137,6 +1138,7 @@ class WkClaudeLane:
         self.agent_id = agent_id
         self.worktree = worktree
         self.model = model
+        self.role = role
         self.loop = loop
         self.registry = register_default_wk_tools(
             registry or WkToolRegistry(),
@@ -1151,6 +1153,7 @@ class WkClaudeLane:
             sequencer=sequencer,
         )
         self.ledger = WkToolLedger(self.translator)
+        self.loop.bind_integrity(self.ledger, role=role)
         self.bridge = WkClaudeToolBridge(
             registry=self.registry, ledger=self.ledger, loop=loop
         )

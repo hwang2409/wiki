@@ -7,7 +7,6 @@ import hashlib
 import json
 import os
 from collections.abc import Mapping, Sequence
-from dataclasses import replace
 from pathlib import Path
 from typing import Any, cast
 
@@ -248,6 +247,113 @@ class WkBashTool:
         )
 
 
+WK_GATE_ROLES = frozenset({"plan", "implement", "review"})
+WK_GATE_COMMANDS = {
+    "plan": ("lint",),
+    "implement": ("gate",),
+    "review": ("gate",),
+}
+
+
+class WkGateRunner:
+    """Run the role-specific Wiki gate commands as real subprocesses."""
+
+    def __init__(
+        self,
+        *,
+        root: Path,
+        wiki_command: Sequence[str],
+        environment: Mapping[str, str] | None,
+        timeout_ms: int,
+    ) -> None:
+        self.root = root
+        self.wiki_command = tuple(wiki_command)
+        self.environment = environment
+        self.timeout_ms = timeout_ms
+
+    async def run(
+        self,
+        *,
+        role: str,
+        pr: str | None,
+        expected_sha: str | None,
+        timeout_ms: int,
+    ) -> WkToolResult:
+        commands: list[list[str]] = []
+        for command_name in WK_GATE_COMMANDS[role]:
+            if command_name == "gate":
+                if not pr:
+                    raise ValueError("pr is required for gate roles")
+                command = [*self.wiki_command, "gate", pr, "--json"]
+                if expected_sha:
+                    command.extend(("--expect-sha", expected_sha))
+            else:
+                command = [*self.wiki_command, command_name]
+            commands.append(command)
+
+        results: list[WkToolResult] = []
+        for command in commands:
+            result = await _run_process(
+                command,
+                cwd=self.root,
+                timeout_ms=timeout_ms,
+                env=(self.environment if self.environment is not None else plan_auth_environment()),
+            )
+            results.append(result)
+            if not result.success:
+                break
+
+        exit_code = next(
+            (result.exit_code for result in results if result.exit_code != 0),
+            results[-1].exit_code if results else None,
+        )
+        stdout = "\n".join(result.stdout for result in results)
+        stderr = "\n".join(result.stderr for result in results if result.stderr)
+        verdict: dict[str, object] | None = None
+        gate_result = next(
+            (result for result, command in zip(results, commands) if "gate" in command),
+            None,
+        )
+        if gate_result is not None and gate_result.stdout:
+            try:
+                parsed = json.loads(gate_result.stdout)
+            except json.JSONDecodeError:
+                parsed = None
+            if isinstance(parsed, Mapping):
+                verdict = dict(parsed)
+        if verdict is None and role == "plan" and results:
+            verdict = {"ready": results[0].success, "command": "lint"}
+        success = all(result.success for result in results) and verdict is not None
+        if not success and all(result.success for result in results) and verdict is None:
+            error_class = "invalid_gate_verdict"
+        else:
+            error_class = next((result.error_class for result in results if result.error_class), None)
+        processes = [dict(result.mutation_receipt or {}) for result in results]
+        primary = processes[-1] if processes else {}
+        receipt = {
+            "role": role,
+            "commands": commands,
+            "exit_codes": [result.exit_code for result in results],
+            "summaries": [result.stdout.strip().splitlines()[-1] if result.stdout.strip() else "" for result in results],
+            "processes": processes,
+            "pid": primary.get("pid"),
+            "stdout_sha256": primary.get("stdout_sha256"),
+            "stderr_sha256": primary.get("stderr_sha256"),
+            "verdict": verdict,
+        }
+        return WkToolResult(
+            success=success,
+            exit_code=exit_code,
+            stdout=stdout,
+            stderr=stderr,
+            error_class=error_class,
+            timed_out=any(result.timed_out for result in results),
+            duration_ms=sum(result.duration_ms or 0 for result in results),
+            mutation=WkMutationClass.PROCESS,
+            mutation_receipt=receipt,
+        )
+
+
 class WkGateTool(WkBashTool):
     name = "wk.gate"
 
@@ -262,10 +368,17 @@ class WkGateTool(WkBashTool):
         self.wiki_command = tuple(wiki_command)
 
     def validate(self, arguments: Mapping[str, object]) -> Mapping[str, object]:
+        role = str(arguments.get("role", "review"))
+        if role not in WK_GATE_ROLES:
+            raise ValueError(f"unsupported wk gate role: {role!r}")
         pr = arguments.get("pr")
-        if not isinstance(pr, str) or not pr:
+        if role != "plan" and (not isinstance(pr, str) or not pr):
             raise ValueError("pr must be a non-empty string")
-        value: dict[str, object] = {"pr": pr, "timeout_ms": int(arguments.get("timeout_ms", self.timeout_ms))}
+        value: dict[str, object] = {
+            "role": role,
+            "pr": pr,
+            "timeout_ms": int(arguments.get("timeout_ms", self.timeout_ms)),
+        }
         expected_sha = arguments.get("expected_sha")
         if expected_sha is not None:
             if not isinstance(expected_sha, str) or not expected_sha:
@@ -274,31 +387,22 @@ class WkGateTool(WkBashTool):
         return value
 
     async def execute(self, request: WkToolRequest) -> WkToolResult:
-        argv = [*self.wiki_command, "gate", str(request.arguments["pr"]), "--json"]
-        expected_sha = request.arguments.get("expected_sha")
-        if expected_sha:
-            argv.extend(("--expect-sha", str(expected_sha)))
-        result = await _run_process(
-            argv,
-            cwd=self.root,
-            timeout_ms=int(request.arguments.get("timeout_ms", self.timeout_ms)),
-            env=(
-                self.environment
-                if self.environment is not None
-                else plan_auth_environment()
-            ),
+        runner = WkGateRunner(
+            root=self.root,
+            wiki_command=self.wiki_command,
+            environment=self.environment,
+            timeout_ms=self.timeout_ms,
         )
-        if not result.stdout:
-            return result
-        try:
-            verdict = json.loads(result.stdout)
-        except json.JSONDecodeError:
-            return result
-        if not isinstance(verdict, Mapping):
-            return result
-        receipt = dict(result.mutation_receipt or {})
-        receipt["verdict"] = dict(verdict)
-        return replace(result, mutation_receipt=receipt)
+        return await runner.run(
+            role=str(request.arguments.get("role", "review")),
+            pr=(str(request.arguments["pr"]) if request.arguments.get("pr") else None),
+            expected_sha=(
+                str(request.arguments["expected_sha"])
+                if request.arguments.get("expected_sha")
+                else None
+            ),
+            timeout_ms=int(request.arguments.get("timeout_ms", self.timeout_ms)),
+        )
 
 
 class WkStatusTool:
@@ -329,6 +433,7 @@ class WkStatusTool:
                 if request.arguments.get("blocker")
                 else None
             ),
+            status_call_id=request.call_id,
         )
         return WkToolResult(
             success=True,
