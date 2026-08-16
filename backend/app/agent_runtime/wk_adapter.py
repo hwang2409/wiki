@@ -8,7 +8,8 @@ from typing import Any
 
 from .provider import AdapterStatus, ProviderAdapter, ProviderEvent, ProviderProtocolError, StartRequest
 from .types import LifecycleState, ProviderKind, RunRecord
-from .wk_core import WkLoop, WkRunMetadata
+from .wk_common import replay_wk_events
+from .wk_core import WkEventSequencer, WkLoop, WkRunMetadata
 
 
 class WkProviderAdapter(ProviderAdapter):
@@ -21,6 +22,7 @@ class WkProviderAdapter(ProviderAdapter):
         status_path: Path,
         command: Sequence[str],
         env: Mapping[str, str] | None,
+        raw_events_path: Path | None = None,
     ) -> None:
         if record.execution_kind not in {"wk-claude", "wk-codex"}:
             raise ValueError("WkProviderAdapter requires a wk execution kind")
@@ -34,7 +36,15 @@ class WkProviderAdapter(ProviderAdapter):
         self._active_turn_id = record.active_turn_id
         self._core_phase: str | None = record.core_phase or "run"
         self._detail: str | None = None
-        self._lane: Any = self._build_lane(record, command=command, env=env)
+        self._raw_rows, durable_events = replay_wk_events(raw_events_path)
+        self._sequencer = WkEventSequencer.from_events(durable_events)
+        self._lane: Any = self._build_lane(
+            record,
+            command=command,
+            env=env,
+            sequencer=self._sequencer,
+        )
+        self._restore_lane(durable_events)
         self._process_created_callback: Any = None
         self._closed = False
 
@@ -48,6 +58,7 @@ class WkProviderAdapter(ProviderAdapter):
         *,
         command: Sequence[str],
         env: Mapping[str, str] | None,
+        sequencer: WkEventSequencer,
     ) -> Any:
         metadata = WkRunMetadata.from_kind(record.execution_kind or "")
         kwargs = {
@@ -65,6 +76,7 @@ class WkProviderAdapter(ProviderAdapter):
                 **kwargs,
                 command=command,
                 environment=env,
+                sequencer=sequencer,
             )
         from .wk_claude import WkClaudeLane
 
@@ -72,6 +84,25 @@ class WkProviderAdapter(ProviderAdapter):
             **kwargs,
             environment=env,
             cli_path=command[0] if command else None,
+            sequencer=sequencer,
+        )
+
+    def _restore_lane(self, events: Sequence[Any]) -> None:
+        translator = getattr(self._lane, "translator", None)
+        ledger = getattr(self._lane, "ledger", None)
+        if translator is None or ledger is None:
+            return
+        translator.raw_events.extend(
+            row.get("payload", {})
+            for row in self._raw_rows
+            if isinstance(row.get("payload"), Mapping)
+        )
+        translator.session.restore(events)
+        ledger.restore(events)
+        ledger.restore_transport_frames(
+            row.get("payload", {})
+            for row in self._raw_rows
+            if isinstance(row.get("payload"), Mapping)
         )
 
     def _process_created(self, pid: int) -> None:
@@ -92,6 +123,22 @@ class WkProviderAdapter(ProviderAdapter):
             self._generation = status.generation
             self._active_turn_id = status.active_turn_id
             self._detail = status.detail
+        translator = getattr(self._lane, "translator", None)
+        if translator is not None and translator.raw_events:
+            latest = translator.raw_events[-1]
+            for key in ("session_id", "sessionId"):
+                if isinstance(latest.get(key), str) and latest[key]:
+                    self._session_id = latest[key]
+            params = latest.get("params")
+            thread = params.get("thread") if isinstance(params, Mapping) else None
+            if isinstance(thread, Mapping) and isinstance(thread.get("id"), str):
+                self._session_id = thread["id"]
+        client = getattr(self._lane, "_client", None)
+        transport = getattr(client, "_transport", None) or getattr(client, "transport", None)
+        process = getattr(transport, "_process", None)
+        pid = getattr(process, "pid", None)
+        if isinstance(pid, int) and pid > 1:
+            self._pid = pid
         return AdapterStatus(
             state=self._state,
             session_id=self._session_id,
@@ -129,6 +176,7 @@ class WkProviderAdapter(ProviderAdapter):
     async def start(self, request: StartRequest) -> AdapterStatus:
         self._state = LifecycleState.STARTING
         await self._lane.start(request.prompt)
+        self._status_from_lane()
         self._state = LifecycleState.WORKING
         self.loop.write_status(
             state="working",
@@ -140,6 +188,7 @@ class WkProviderAdapter(ProviderAdapter):
 
     async def resume(self, session_id: str) -> AdapterStatus:
         await self._lane.resume(session_id)
+        self._status_from_lane()
         self._state = LifecycleState.WORKING
         return self._status_from_lane()
 

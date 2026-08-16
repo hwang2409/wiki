@@ -5434,7 +5434,11 @@ Preserve the same identity, role, worktree, orchestrator grouping, PR gates, and
                 )
             return result
 
-        if target_provider is not old.provider:
+        if (
+            target_provider is not old.provider
+            or target_execution_kind != old.execution_kind
+            or target_execution_kind is not None
+        ):
             try:
                 await self._close_and_drain_adapter(
                     run_id,
@@ -5948,6 +5952,21 @@ Preserve the same identity, role, worktree, orchestrator grouping, PR gates, and
             )
         if method == "run/status":
             return self._runtime_status(self.store.get(self._resolve_run_id(params)))
+        if method == "run/integrity_block":
+            run_id = self._resolve_run_id(params)
+            reason = str(params.get("reason") or "wk integrity state mismatch")
+            record = self.store.get(run_id)
+            if record.execution_kind not in {"wk-claude", "wk-codex"}:
+                raise ValueError("integrity blocking is restricted to wk runs")
+            async with self._run_mutation_admission():
+                async with self._run_lock(run_id):
+                    return _public_run(
+                        self.store.transition(
+                            run_id,
+                            LifecycleState.BLOCKED,
+                            reason=reason,
+                        )
+                    )
         if method == "run/mark_viewed":
             requested_seq = params.get("seq")
             if requested_seq is not None and (

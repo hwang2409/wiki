@@ -2253,7 +2253,12 @@ def agents(include_history: bool = False) -> dict[str, object]:
             continue
         headless = _is_headless(current)
         runtime = current if headless else {}
-        runtime_state = runtime.get("state") if headless else None
+        runtime_state = (
+            runtime.get("runtime_state", runtime.get("state"))
+            if headless
+            else None
+        )
+        provider_state = runtime.get("provider_state") if headless else None
         control_attached = (
             supervisor_alive and runtime.get("control_attached") is True
             if headless
@@ -2283,6 +2288,19 @@ def agents(include_history: bool = False) -> dict[str, object]:
                 "completed",
             }:
                 wk_parity_blocker = "wk working status has a terminal or blocked runtime"
+            elif provider_state is not None and provider_state != runtime_state:
+                wk_parity_blocker = "wk provider and runtime states diverged"
+            if wk_parity_blocker and supervisor_alive:
+                try:
+                    _supervisor_request(
+                        "run/integrity_block",
+                        {
+                            "run_id": current.get("run_id"),
+                            "reason": wk_parity_blocker,
+                        },
+                    )
+                except Exception:
+                    pass
         if current.get("role") == "orchestrator":
             transcript = current.get("transcript")
             orchestrators.append(
@@ -2324,7 +2342,7 @@ def agents(include_history: bool = False) -> dict[str, object]:
                 "runtime_state": runtime_state,
                 **(
                     {
-                        "provider_state": runtime_state,
+                        "provider_state": provider_state,
                         "core_phase": current.get("core_phase"),
                     }
                     if isinstance(current_kind, str) and is_wk_kind(current_kind)

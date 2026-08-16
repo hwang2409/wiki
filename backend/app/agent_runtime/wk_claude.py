@@ -1361,6 +1361,7 @@ class WkClaudeLane:
         wiki_command: Sequence[str] = ("wiki",),
         environment: Mapping[str, str] | None = None,
         cli_path: str | Path | None = None,
+        sequencer: WkEventSequencer | None = None,
     ) -> None:
         if not wk_enabled():
             raise WkClaudeDisabled("WIKI_ENABLE_WK=1 is required for wk-claude")
@@ -1382,6 +1383,7 @@ class WkClaudeLane:
             metadata=metadata,
             run_id=run_id,
             agent_id=agent_id,
+            sequencer=sequencer,
         )
         self.ledger = WkToolLedger(self.translator)
         self.bridge = WkClaudeToolBridge(
@@ -1610,6 +1612,34 @@ class WkClaudeLane:
         self._startup_ready = asyncio.Event()
         self._startup_error = None
         await self.start(prompt)
+
+    async def archive(self) -> None:
+        try:
+            self._verify_turn_boundary()
+            self.ledger.reconcile_transport()
+            self.ledger.reconcile()
+            raw = {"type": "archive", "session_id": self.run_id}
+            self.translator.raw_events.append(raw)
+            event = self.translator.sequencer.emit(
+                run_id=self.run_id,
+                agent_id=self.agent_id,
+                kind="claude.archive",
+                phase=WkEventPhase.ARCHIVE,
+                provider="claude",
+                lane="wk-claude",
+                disposition=WkDisposition.RENDERED,
+                ts=self.translator.timestamp(),
+                payload=raw,
+            )
+            self.translator.session.record_event(event)
+            await self._events.put({"raw": raw, "event": event.to_dict()})
+            await self._close_transport()
+            await self._events.put(None)
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            await self._emit_provider_error(exc)
+            raise WkClaudeError(str(exc)) from exc
 
     async def _close_transport(self) -> None:
         self._closed = True

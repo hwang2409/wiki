@@ -369,19 +369,19 @@ def normalize_provider_event(
 ) -> NormalizedProviderEvent:
     wk_event = payload.get("_wk_event")
     if isinstance(wk_event, dict):
-        provider_payload = {
-            key: value for key, value in payload.items() if key != "_wk_event"
-        }
-        normalized = normalize_provider_event(
-            provider,
-            provider_payload,
-            direction=direction,
-        )
+        disposition_value = str(wk_event.get("disposition", "unknown"))
+        if disposition_value == "intentionally_ignored":
+            disposition_value = EventDisposition.IGNORED.value
+        disposition = EventDisposition(disposition_value)
+        phase = str(wk_event.get("phase", "status"))
+        lifecycle_state = {
+            "archive": LifecycleState.COMPLETED,
+        }.get(phase)
         return NormalizedProviderEvent(
-            normalized.disposition,
-            normalized.kind,
-            {**normalized.payload, "_wk_event": wk_event},
-            normalized.lifecycle_state,
+            disposition,
+            str(wk_event.get("kind") or "wk.event"),
+            dict(wk_event),
+            lifecycle_state,
         )
     if direction in {"client", "stdin"}:
         is_approval_response = (

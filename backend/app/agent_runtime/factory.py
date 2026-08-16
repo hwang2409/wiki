@@ -20,10 +20,16 @@ class RealAdapterFactory:
         codex_command: Sequence[str] = ("codex", "app-server", "--stdio"),
         claude_command: Sequence[str] = ("claude",),
         env: Mapping[str, str] | None = None,
+        runtime_dir: Path | None = None,
     ):
         self.codex_command = tuple(codex_command)
         self.claude_command = tuple(claude_command)
         self.env = dict(env) if env is not None else None
+        self.runtime_dir = runtime_dir or (
+            Path(self.env["WIKI_AGENT_RUNTIME_DIR"])
+            if self.env is not None and self.env.get("WIKI_AGENT_RUNTIME_DIR")
+            else Path(os.environ.get("WIKI_AGENT_RUNTIME_DIR", "~/.wiki/agent-runtime")).expanduser()
+        )
 
     def __call__(self, record: RunRecord) -> ProviderAdapter:
         if record.execution_kind in {"wk-claude", "wk-codex"}:
@@ -47,6 +53,7 @@ class RealAdapterFactory:
                 status_path=status_dir / f"{record.agent_id}.json",
                 command=command,
                 env=self.env,
+                raw_events_path=self.runtime_dir / "runs" / record.run_id / "raw.jsonl",
             )
         if record.provider is ProviderKind.CODEX:
             return CodexAppServerAdapter(

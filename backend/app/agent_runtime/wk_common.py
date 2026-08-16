@@ -56,6 +56,19 @@ class WkSessionTree:
             }
         )
 
+    def restore(self, events: Sequence[WkEventEnvelope]) -> None:
+        for event in sorted(events, key=lambda item: item.source_seq):
+            self.append(
+                {
+                    "id": event.source_event_id,
+                    "kind": event.kind,
+                    "phase": event.phase.value,
+                    "source_event_id": event.source_event_id,
+                    "parent_id": event.parent_source_event_id,
+                    "payload": dict(redact_payload(event.payload)),
+                }
+            )
+
 
 def _hash_result(result: WkToolResult) -> str:
     value = {
@@ -139,6 +152,41 @@ class WkToolLedger:
         self.translator.session.record_event(event)
         return event
 
+    def restore(self, events: Sequence[WkEventEnvelope]) -> None:
+        for event in sorted(events, key=lambda item: item.source_seq):
+            call_id = event.payload.get("call_id")
+            if not isinstance(call_id, str) or not call_id:
+                continue
+            if event.kind == "tool.started":
+                arguments = event.payload.get("arguments")
+                if not isinstance(arguments, Mapping):
+                    raise WkLedgerError(f"durable tool request is not typed: {call_id}")
+                self.operations[call_id] = _LedgerOperation(
+                    WkToolRequest(
+                        call_id=call_id,
+                        name=str(event.payload.get("name") or ""),
+                        arguments=dict(arguments),
+                        mutation=WkMutationClass(
+                            str(event.payload.get("mutation", WkMutationClass.NONE.value))
+                        ),
+                    ),
+                    event,
+                )
+            elif event.kind in {"tool.completed", "tool.failed"}:
+                operation = self.operations.get(call_id)
+                result = event.payload.get("result")
+                if operation is None or not isinstance(result, Mapping):
+                    raise WkLedgerError(f"durable tool result has no start: {call_id}")
+                self.operations[call_id] = _LedgerOperation(
+                    operation.request,
+                    operation.started,
+                    WkToolResult.from_dict(result),
+                )
+
+    def restore_transport_frames(self, raws: Sequence[Mapping[str, Any]]) -> None:
+        for raw in raws:
+            self.record_transport_frame(raw)
+
     def record_transport_frame(self, raw: Mapping[str, Any]) -> None:
         message = raw.get("message")
         content = message.get("content") if isinstance(message, Mapping) else None
@@ -215,6 +263,26 @@ class WkToolLedger:
                 raise WkLedgerError(f"gate result has no boolean verdict: {call_id}")
             if verdict["ready"] and exit_code != 0:
                 raise WkLedgerError(f"gate ready verdict disagrees with exit code: {call_id}")
+
+
+def replay_wk_events(path: Path | None) -> tuple[list[dict[str, Any]], list[WkEventEnvelope]]:
+    if path is None or not path.is_file():
+        return [], []
+    raw_rows: list[dict[str, Any]] = []
+    events: list[WkEventEnvelope] = []
+    with path.open(encoding="utf-8") as handle:
+        for line in handle:
+            if not line.strip():
+                continue
+            row = json.loads(line)
+            if not isinstance(row, dict):
+                continue
+            raw_rows.append(row)
+            payload = row.get("payload")
+            envelope = payload.get("_wk_event") if isinstance(payload, Mapping) else None
+            if isinstance(envelope, Mapping):
+                events.append(WkEventEnvelope.from_dict(envelope))
+    return raw_rows, sorted(events, key=lambda event: event.source_seq)
 
 
 @dataclass(frozen=True)

@@ -150,7 +150,7 @@ async def run_daemon(args: argparse.Namespace) -> None:
     factory = (
         FixtureAdapterFactory(Path(fixture_dir))
         if fixture_dir
-        else RealAdapterFactory()
+        else RealAdapterFactory(runtime_dir=paths.runtime_dir)
     )
     supervisor = Supervisor(RunStore(paths), factory)
     server = UnixSupervisorServer(supervisor, paths.socket_path)

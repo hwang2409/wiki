@@ -11,7 +11,7 @@ import os
 import sqlite3
 import tempfile
 import threading
-from collections.abc import Iterator
+from collections.abc import Iterator, Mapping
 from contextlib import contextmanager
 from dataclasses import dataclass
 from pathlib import Path
@@ -214,6 +214,7 @@ class EventReducerAdapter:
         self.projection = _Projection()
         self._event_raw_seqs: dict[int, int] = {}
         self._change_cursor = 0
+        self._wk_mode = False
 
     def apply_raw(
         self,
@@ -224,6 +225,8 @@ class EventReducerAdapter:
         normalized_seq = int(raw.get("normalized_seq", raw_seq))
         if normalized is None:
             normalized = _normalize(raw)
+        if self._is_wk_envelope(normalized.payload):
+            return self._apply_wk_envelope(raw, normalized)
         received_at = str(raw.get("received_at") or "")
         row = {
             "seq": normalized_seq,
@@ -246,6 +249,22 @@ class EventReducerAdapter:
             event_disposition = EventDisposition.IGNORED
         else:
             event_disposition = EventDisposition(str(disposition))
+        if row.get("schema") == "wiki.wk.event.v0":
+            lifecycle_state = {
+                "archive": LifecycleState.COMPLETED,
+            }.get(str(row.get("phase", "status")))
+            return self._apply_wk_envelope(
+                {
+                    "seq": row.get("raw_seq", row.get("seq", 0)),
+                    "received_at": row.get("normalized_at", ""),
+                },
+                NormalizedProviderEvent(
+                    event_disposition,
+                    str(row["kind"]),
+                    dict(row),
+                    lifecycle_state,
+                ),
+            )
         lifecycle_value = row.get("lifecycle_state")
         lifecycle_state = (
             LifecycleState(str(lifecycle_value))
@@ -258,7 +277,76 @@ class EventReducerAdapter:
             row.get("payload") if isinstance(row.get("payload"), dict) else {},
             lifecycle_state,
         )
+        if self._is_wk_envelope(normalized.payload):
+            return self._apply_wk_envelope(
+                {
+                    "seq": row.get("raw_seq", row.get("seq", 0)),
+                    "received_at": row.get("normalized_at", ""),
+                },
+                normalized,
+            )
         return self._apply_row(row, normalized)
+
+    @staticmethod
+    def _is_wk_envelope(payload: Mapping[str, Any]) -> bool:
+        return payload.get("schema") == "wiki.wk.event.v0"
+
+    def _apply_wk_envelope(
+        self,
+        raw: dict[str, Any],
+        normalized: NormalizedProviderEvent,
+    ) -> ReducerResult:
+        from .wk_core import WkEventEnvelope
+
+        envelope = WkEventEnvelope.from_dict(normalized.payload)
+        raw_seq = int(raw["seq"])
+        source_seq = envelope.source_seq
+        before_projection = self._client_projection_key()
+        self._wk_mode = True
+        event = envelope.to_dict()
+        event.update(
+            {
+                "id": source_seq,
+                "seq": source_seq,
+                "raw_seq": raw_seq,
+                "normalized_at": str(raw.get("received_at") or envelope.ts),
+                "disposition": _stored_disposition(envelope.disposition),
+            }
+        )
+        events = self.state.setdefault("events", [])
+        if not any(
+            isinstance(item, dict) and item.get("id") == source_seq
+            for item in events
+        ):
+            events.append(event)
+        dispositions = self.state.setdefault("dispositions", {})
+        disposition = _stored_disposition(envelope.disposition)
+        dispositions[disposition] = int(dispositions.get(disposition, 0)) + 1
+        self.projection.last_causal_raw_seq = max(
+            self.projection.last_causal_raw_seq, raw_seq
+        )
+        self.projection.unread_event_seq = max(
+            self.projection.unread_event_seq, source_seq
+        )
+        self._event_raw_seqs[source_seq] = raw_seq
+        self._change_cursor += 1
+        change = {
+            "kind": "tail",
+            "from": source_seq,
+            "id": source_seq,
+            "event": event,
+            "cursor": self._change_cursor,
+        }
+        return ReducerResult(
+            raw_seq=raw_seq,
+            normalized={**event},
+            changes=(change,),
+            events=tuple(item for item in events if isinstance(item, dict)),
+            event_raw_seqs=dict(self._event_raw_seqs),
+            state=self.state,
+            projection_changed=before_projection != self._client_projection_key(),
+            change_cursor=self._change_cursor,
+        )
 
     def _apply_row(
         self,
@@ -337,6 +425,7 @@ class EventReducerAdapter:
         self.projection = other.projection
         self._event_raw_seqs = other._event_raw_seqs
         self._change_cursor = other._change_cursor
+        self._wk_mode = other._wk_mode
 
     def _apply_projection(
         self,
@@ -1069,6 +1158,11 @@ class SQLiteEventStore:
                 key=lambda row: int(row[0]),
             ):
                 normalized_row = json.loads(normalized_json)
+                normalized_payload = (
+                    normalized_row
+                    if normalized_row.get("schema") == "wiki.wk.event.v0"
+                    else normalized_row["payload"]
+                )
                 normalized = NormalizedProviderEvent(
                     EventDisposition.IGNORED
                     if normalized_row["disposition"] in {
@@ -1077,10 +1171,14 @@ class SQLiteEventStore:
                     }
                     else EventDisposition(normalized_row["disposition"]),
                     str(normalized_row["kind"]),
-                    normalized_row["payload"],
-                    LifecycleState(normalized_row["lifecycle_state"])
-                    if normalized_row.get("lifecycle_state") is not None
-                    else None,
+                    normalized_payload,
+                    (
+                        LifecycleState(normalized_row["lifecycle_state"])
+                        if normalized_row.get("lifecycle_state") is not None
+                        else {
+                            "archive": LifecycleState.COMPLETED,
+                        }.get(str(normalized_row.get("phase", "status")))
+                    ),
                 )
                 expected.materialize(
                     run_id,

@@ -1207,7 +1207,15 @@ class RunStore:
             "provider_generation": record.provider_generation,
             "active_turn_id": record.active_turn_id,
             **(
-                {"core_phase": record.core_phase}
+                {
+                    "runtime_state": record.state.value,
+                    "core_phase": record.core_phase,
+                    "provider_state": (
+                        record.provider_state.value
+                        if record.provider_state is not None
+                        else None
+                    ),
+                }
                 if record.execution_kind is not None
                 else {}
             ),
@@ -2175,6 +2183,8 @@ class RunStore:
             if target in TERMINAL_STATES:
                 record.pending_requests.clear()
             if adapter_status is not None:
+                if record.execution_kind is not None:
+                    record.provider_state = adapter_status.state
                 if adapter_status.session_id is not None:
                     record.provider_session_id = adapter_status.session_id
                 record.provider_pid = adapter_status.pid

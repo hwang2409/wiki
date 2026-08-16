@@ -181,6 +181,7 @@ class RunRecord:
     provider_generation: int = 0
     active_turn_id: str | None = None
     core_phase: str | None = None
+    provider_state: LifecycleState | None = None
     current_turn_diff_turn_id: str | None = None
     current_turn_diff_started_seq: int = 0
     current_turn_diff_seq: int = 0
@@ -384,6 +385,9 @@ class RunRecord:
             value["execution_kind"] = self.execution_kind
             value["kind"] = self.execution_kind
             value["core_phase"] = self.core_phase
+            value["provider_state"] = (
+                self.provider_state.value if self.provider_state is not None else None
+            )
             if self.wk_lane is not None:
                 value["lane"] = self.wk_lane
         return value
@@ -445,6 +449,11 @@ class RunRecord:
             provider_generation=int(value.get("provider_generation", 0)),
             active_turn_id=value.get("active_turn_id"),
             core_phase=value.get("core_phase"),
+            provider_state=(
+                LifecycleState(str(value["provider_state"]))
+                if value.get("provider_state") is not None
+                else None
+            ),
             current_turn_diff_turn_id=value.get("current_turn_diff_turn_id"),
             current_turn_diff_started_seq=int(value.get("current_turn_diff_started_seq", 0)),
             current_turn_diff_seq=int(value.get("current_turn_diff_seq", 0)),
