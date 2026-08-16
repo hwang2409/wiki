@@ -222,6 +222,7 @@ def test_real_sdk_subprocess_transport_receives_sanitized_env(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
     pytest.importorskip("claude_agent_sdk")
+    monkeypatch.setattr(wk_feature, "_WK_ENABLED", True)
     stub = Path(__file__).parent / "fixtures" / "agent_runtime" / "claude_sdk_stub_cli.py"
     safe_environment = {
         "HOME": os.environ["HOME"],

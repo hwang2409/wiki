@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import json
 import os
+import signal
 import sys
 from pathlib import Path
 
@@ -10,14 +11,17 @@ import pytest
 
 from backend.app import account_notices, main
 from backend.app.agent_runtime.factory import RealAdapterFactory
+from backend.app.agent_runtime.provider import StartRequest
 from backend.app.agent_runtime.store import RunStore, RuntimePaths
 from backend.app.agent_runtime.supervisor import Supervisor
 from backend.app.agent_runtime.types import LifecycleState, ProviderKind, RunRecord
 from backend.app.agent_runtime.wk_adapter import WkProviderAdapter
+from backend.app.agent_runtime.wk_common import WkSessionTree, WkToolLedger
 from backend.app.agent_runtime import wk_feature
 
 
 FIXTURE = Path(__file__).parent / "fixtures" / "agent_runtime" / "wk_codex_app_server.py"
+CLAUDE_FIXTURE = Path(__file__).parent / "fixtures" / "agent_runtime" / "claude_sdk_stub_cli.py"
 
 
 def _paths(root: Path) -> RuntimePaths:
@@ -42,6 +46,21 @@ def _factory(root: Path, paths: RuntimePaths) -> RealAdapterFactory:
     }
     return RealAdapterFactory(
         codex_command=(sys.executable, "-u", str(FIXTURE)),
+        env=environment,
+        runtime_dir=paths.runtime_dir,
+    )
+
+
+def _claude_factory(
+    root: Path, paths: RuntimePaths, environment: dict[str, str]
+) -> RealAdapterFactory:
+    environment.setdefault("HOME", str(root))
+    environment.setdefault("PATH", os.environ["PATH"])
+    environment.setdefault("CLAUDE_CONFIG_DIR", str(root / "claude-config"))
+    environment.setdefault("WIKI_AGENT_STATUS_DIR", str(paths.status_dir))
+    Path(environment["CLAUDE_CONFIG_DIR"]).mkdir(parents=True, exist_ok=True)
+    return RealAdapterFactory(
+        claude_command=(str(CLAUDE_FIXTURE.resolve()),),
         env=environment,
         runtime_dir=paths.runtime_dir,
     )
@@ -86,6 +105,60 @@ def test_wk_admission_is_blocked_when_flag_is_off(
                 execution_kind="wk-codex",
             )
         await supervisor.close()
+
+    asyncio.run(run())
+
+
+@pytest.mark.parametrize("execution_kind", ("wk-claude", "wk-codex"))
+def test_wk_adapter_fresh_constructs_and_starts_without_durable_events(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    execution_kind: str,
+) -> None:
+    monkeypatch.setattr(wk_feature, "_WK_ENABLED", True)
+    paths = _paths(tmp_path)
+    if execution_kind == "wk-claude":
+        environment = {"CLAUDE_CONFIG_DIR": str(tmp_path / "claude-config")}
+        factory = _claude_factory(tmp_path, paths, environment)
+        command = factory.claude_command
+        provider = ProviderKind.CLAUDE
+    else:
+        factory = _factory(tmp_path, paths)
+        command = factory.codex_command
+        provider = ProviderKind.CODEX
+    record = RunRecord.new(
+        agent_id=f"WIKI-289-{execution_kind}",
+        provider=provider,
+        role="review",
+        model="gpt-5.6-terra",
+        worktree=str(tmp_path),
+        prompt="start",
+        execution_kind=execution_kind,
+    )
+
+    async def run() -> None:
+        adapter = WkProviderAdapter(
+            record,
+            status_path=paths.status_dir / f"{record.agent_id}.json",
+            command=command,
+            env=factory.env,
+            raw_events_path=paths.runtime_dir / "runs" / record.run_id / "raw.jsonl",
+        )
+        assert isinstance(adapter._lane.translator.session, WkSessionTree)  # noqa: SLF001
+        assert isinstance(adapter._lane.ledger, WkToolLedger)  # noqa: SLF001
+        status = await adapter.start(
+            StartRequest(
+                prompt="start",
+                model=record.model,
+                effort=None,
+                worktree=record.worktree,
+                run_id=record.run_id,
+                agent_id=record.agent_id,
+            )
+        )
+        assert status.session_id
+        await asyncio.sleep(0.3)
+        await adapter.close()
 
     asyncio.run(run())
 
@@ -273,6 +346,94 @@ def test_real_wk_run_uses_supervisor_ingest_and_recovers(
         assert max(resumed_source_seq) > max(before_source_seq)
         transport = (tmp_path / "codex" / "transport.log").read_text(encoding="utf-8")
         assert "thread/resume" in transport
+        await restarted.close()
+
+    asyncio.run(run())
+
+
+def test_real_wk_claude_run_replays_and_resolves_open_tool_on_restart(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    pytest.importorskip("claude_agent_sdk")
+    monkeypatch.setattr(wk_feature, "_WK_ENABLED", True)
+    paths = _paths(tmp_path)
+    config_dir = tmp_path / "claude-config"
+    config_dir.mkdir()
+    pause_request = config_dir / "pause-before-result"
+    pause_ready = config_dir / "pause-ready"
+    resume_result = config_dir / "resume-result"
+    pause_request.touch()
+    environment = {"CLAUDE_CONFIG_DIR": str(config_dir)}
+    supervisor = Supervisor(
+        RunStore(paths),
+        _claude_factory(tmp_path, paths, environment),
+        pid_alive=lambda _pid: False,
+    )
+
+    async def wait_for(predicate: object) -> None:
+        for _ in range(300):
+            if callable(predicate) and predicate():
+                return
+            await asyncio.sleep(0.01)
+        raise AssertionError("timed out waiting for Claude fixture state")
+
+    async def run() -> None:
+        record = await supervisor.start_run(
+            agent_id="WIKI-289-CLAUDE",
+            provider=ProviderKind.CLAUDE,
+            role="review",
+            model="claude-sonnet-4-6",
+            worktree=str(tmp_path),
+            prompt="read README",
+            effort=None,
+            execution_kind="wk-claude",
+        )
+        await wait_for(pause_ready.exists)
+        current = supervisor.store.get(record.run_id)
+        assert isinstance(current.provider_pid, int) and current.provider_pid > 1
+        os.kill(current.provider_pid, signal.SIGKILL)
+        pause_request.unlink()
+        await asyncio.sleep(0.3)
+        before_events = supervisor.event_store.read_events(record.run_id)
+        assert before_events
+        assert any(
+            row.get("payload", {}).get("type") == "assistant"
+            for row in supervisor.store.read_raw_events(record.run_id)
+        )
+        await supervisor.close()
+
+        resume_result.touch()
+        restarted = Supervisor(
+            RunStore(paths),
+            _claude_factory(tmp_path, paths, environment),
+            pid_alive=lambda _pid: False,
+        )
+        recovery = await restarted.recover_on_start()
+        assert any(item["run_id"] == record.run_id and item["action"] == "resume" for item in recovery)
+        await wait_for(
+            lambda: any(
+                row.get("payload", {}).get("result") == "fixture resumed"
+                for row in restarted.store.read_raw_events(record.run_id)
+            )
+        )
+        resumed_adapter = restarted.adapters[record.run_id]
+        assert isinstance(resumed_adapter._lane.translator.session, WkSessionTree)  # noqa: SLF001
+        assert resumed_adapter._lane.translator.session.entries  # noqa: SLF001
+        restored_ids = [
+            str(entry["source_event_id"])
+            for entry in resumed_adapter._lane.translator.session.entries  # noqa: SLF001
+            if entry.get("source_event_id")
+        ]
+        assert restored_ids[: len(before_events)] == [
+            str(event["source_event_id"]) for event in before_events
+        ]
+        assert not resumed_adapter._lane.ledger._transport_pending  # noqa: SLF001
+        resumed_events = restarted.event_store.read_events(record.run_id)
+        resumed_sequences = [int(event["source_seq"]) for event in resumed_events]
+        before_sequences = [int(event["source_seq"]) for event in before_events]
+        assert resumed_sequences[: len(before_sequences)] == before_sequences
+        assert len(resumed_sequences) == len(set(resumed_sequences))
+        assert max(resumed_sequences) > max(before_sequences)
         await restarted.close()
 
     asyncio.run(run())
