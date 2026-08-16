@@ -435,6 +435,14 @@ class WkClaudeEventTranslator:
     def plan_auth_verified(self) -> bool:
         return self._plan_auth_verified
 
+    @property
+    def provider(self) -> str:
+        return "claude"
+
+    @property
+    def lane(self) -> str:
+        return "wk-claude"
+
     def error_event(
         self, error: BaseException, *, raw: Mapping[str, Any] | None = None
     ) -> WkEventEnvelope:
@@ -567,8 +575,8 @@ class WkToolLedger:
             agent_id=self.translator.agent_id,
             kind="tool.started",
             phase=WkEventPhase.TOOL,
-            provider="claude",
-            lane="wk-claude",
+            provider=self.translator.provider,
+            lane=self.translator.lane,
             disposition=WkDisposition.RENDERED,
             ts=self.translator.timestamp(),
             payload={
@@ -598,8 +606,8 @@ class WkToolLedger:
             agent_id=self.translator.agent_id,
             kind="tool.completed" if result.success else "tool.failed",
             phase=WkEventPhase.TOOL,
-            provider="claude",
-            lane="wk-claude",
+            provider=self.translator.provider,
+            lane=self.translator.lane,
             disposition=WkDisposition.RENDERED,
             ts=self.translator.timestamp(),
             payload={"call_id": request.call_id, "result": result.to_dict()},
@@ -617,23 +625,40 @@ class WkToolLedger:
 
         message = raw.get("message")
         content = message.get("content") if isinstance(message, Mapping) else None
-        if not isinstance(content, Sequence) or isinstance(content, (str, bytes)):
+        if isinstance(content, Sequence) and not isinstance(content, (str, bytes)):
+            for block in content:
+                if not isinstance(block, Mapping):
+                    continue
+                block_type = block.get("type")
+                if block_type == "tool_use":
+                    tool_id = block.get("id")
+                    if isinstance(tool_id, str) and tool_id:
+                        if tool_id in self._transport_pending:
+                            raise WkLedgerError(f"duplicate transport tool call: {tool_id}")
+                        self._transport_pending.add(tool_id)
+                elif block_type == "tool_result":
+                    tool_id = block.get("tool_use_id")
+                    if not isinstance(tool_id, str) or tool_id not in self._transport_pending:
+                        raise WkLedgerError(f"transport result has no start: {tool_id!r}")
+                    self._transport_pending.remove(tool_id)
+        params = raw.get("params")
+        item = params.get("item") if isinstance(params, Mapping) else None
+        if not isinstance(item, Mapping):
             return
-        for block in content:
-            if not isinstance(block, Mapping):
-                continue
-            block_type = block.get("type")
-            if block_type == "tool_use":
-                tool_id = block.get("id")
-                if isinstance(tool_id, str) and tool_id:
-                    if tool_id in self._transport_pending:
-                        raise WkLedgerError(f"duplicate transport tool call: {tool_id}")
-                    self._transport_pending.add(tool_id)
-            elif block_type == "tool_result":
-                tool_id = block.get("tool_use_id")
-                if not isinstance(tool_id, str) or tool_id not in self._transport_pending:
-                    raise WkLedgerError(f"transport result has no start: {tool_id!r}")
-                self._transport_pending.remove(tool_id)
+        item_type = item.get("type")
+        if item_type not in {"commandExecution", "fileChange", "mcpToolCall", "dynamicToolCall"}:
+            return
+        item_id = item.get("id")
+        if not isinstance(item_id, str) or not item_id:
+            return
+        if raw.get("method") == "item/started":
+            if item_id in self._transport_pending:
+                raise WkLedgerError(f"duplicate transport tool call: {item_id}")
+            self._transport_pending.add(item_id)
+        elif raw.get("method") == "item/completed":
+            if item_id not in self._transport_pending:
+                raise WkLedgerError(f"transport result has no start: {item_id!r}")
+            self._transport_pending.remove(item_id)
 
     def reconcile_transport(self) -> None:
         if self._transport_pending:
@@ -923,9 +948,16 @@ async def _run_process(
 class WkBashTool:
     name = "wk.bash"
 
-    def __init__(self, *, root: Path, timeout_ms: int = 120_000):
+    def __init__(
+        self,
+        *,
+        root: Path,
+        timeout_ms: int = 120_000,
+        environment: Mapping[str, str] | None = None,
+    ):
         self.root = root.resolve()
         self.timeout_ms = timeout_ms
+        self.environment = dict(environment) if environment is not None else None
 
     def validate(self, arguments: Mapping[str, object]) -> Mapping[str, object]:
         command = arguments.get("command")
@@ -939,15 +971,25 @@ class WkBashTool:
             ("/bin/sh", "-lc", str(request.arguments["command"])),
             cwd=self.root,
             timeout_ms=int(request.arguments.get("timeout_ms", self.timeout_ms)),
-            env=plan_auth_environment(),
+            env=(
+                self.environment
+                if self.environment is not None
+                else plan_auth_environment()
+            ),
         )
 
 
 class WkGateTool(WkBashTool):
     name = "wk.gate"
 
-    def __init__(self, *, root: Path, wiki_command: Sequence[str] = ("wiki",)):
-        super().__init__(root=root)
+    def __init__(
+        self,
+        *,
+        root: Path,
+        wiki_command: Sequence[str] = ("wiki",),
+        environment: Mapping[str, str] | None = None,
+    ):
+        super().__init__(root=root, environment=environment)
         self.wiki_command = tuple(wiki_command)
 
     def validate(self, arguments: Mapping[str, object]) -> Mapping[str, object]:
@@ -971,7 +1013,11 @@ class WkGateTool(WkBashTool):
             argv,
             cwd=self.root,
             timeout_ms=int(request.arguments.get("timeout_ms", self.timeout_ms)),
-            env=plan_auth_environment(),
+            env=(
+                self.environment
+                if self.environment is not None
+                else plan_auth_environment()
+            ),
         )
         if not result.stdout:
             return result
@@ -1028,13 +1074,14 @@ def register_default_wk_tools(
     root: Path,
     loop: WkLoop,
     wiki_command: Sequence[str] = ("wiki",),
+    environment: Mapping[str, str] | None = None,
 ) -> WkToolRegistry:
     tools: tuple[object, ...] = (
         WkReadTool(root=root),
         WkWriteTool(root=root),
         WkEditTool(root=root),
-        WkBashTool(root=root),
-        WkGateTool(root=root, wiki_command=wiki_command),
+        WkBashTool(root=root, environment=environment),
+        WkGateTool(root=root, wiki_command=wiki_command, environment=environment),
         WkStatusTool(loop=loop),
     )
     for tool in tools:
@@ -1153,6 +1200,16 @@ class WkClaudeToolBridge:
         self.ledger.record_result(request, result)
         self.ledger.reconcile()
         return result
+
+
+from .wk_common import (
+    WkLedgerError,
+    WkSessionTree,
+    WkSteeringQueue,
+    WkToolBridge as WkClaudeToolBridge,
+    WkToolLedger,
+)
+from .wk_tools import register_default_wk_tools
 
 
 def _sdk_tool_schema() -> dict[str, object]:

@@ -469,6 +469,20 @@ def test_tool_ledger_records_success_nonzero_and_timeout_results() -> None:
     ledger.reconcile()
 
 
+def test_claude_message_content_tool_result_completes_transport_ledger() -> None:
+    translator = _translator()
+    ledger = WkToolLedger(translator)
+    ledger.record_transport_frame(
+        {"message": {"content": [{"type": "tool_use", "id": "tool-content-1"}]}}
+    )
+    with pytest.raises(WkLedgerError, match="missing transport tool results"):
+        ledger.reconcile_transport()
+    ledger.record_transport_frame(
+        {"message": {"content": [{"type": "tool_result", "tool_use_id": "tool-content-1"}]}}
+    )
+    ledger.reconcile_transport()
+
+
 def test_real_file_tools_and_registration(tmp_path: Path) -> None:
     loop = WkLoop(status_path=tmp_path / "status.json")
     registry = register_default_wk_tools(WkToolRegistry(), root=tmp_path, loop=loop)

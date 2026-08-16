@@ -80,6 +80,8 @@ class CodexAppServerAdapter(ProviderAdapter):
         env: Mapping[str, str] | None = None,
         request_timeout: float = 30.0,
         identity_resolver: IdentityResolver = resolve_provider_identity,
+        thread_start_options: Mapping[str, Any] | None = None,
+        auto_start_turn: bool = True,
     ):
         child_env = dict(os.environ if env is None else env)
         child_env.pop("TMUX", None)
@@ -123,6 +125,17 @@ class CodexAppServerAdapter(ProviderAdapter):
         self._operation_lock = asyncio.Lock()
         self._turn_tasks: set[asyncio.Task[None]] = set()
         self._turn_start_pending = False
+        self._thread_start_options = dict(thread_start_options or {})
+        self._last_thread_start_result: dict[str, Any] | None = None
+        self._auto_start_turn = auto_start_turn
+
+    @property
+    def thread_start_options(self) -> Mapping[str, Any]:
+        return self._thread_start_options
+
+    @property
+    def last_thread_start_result(self) -> dict[str, Any] | None:
+        return self._last_thread_start_result
 
     def _configure_runtime(self, record: RunRecord) -> None:
         self.env["WIKI_RUN_ID"] = record.run_id
@@ -721,22 +734,38 @@ class CodexAppServerAdapter(ProviderAdapter):
         self._turn_start_pending = False
 
     async def _start_thread(self, prompt: str, generation: int) -> None:
+        params: dict[str, Any] = {
+            "cwd": self.worktree,
+            "runtimeWorkspaceRoots": [self.worktree],
+            "model": self.model,
+            "approvalPolicy": "never",
+            "sandbox": "danger-full-access",
+            "experimentalRawEvents": True,
+            "historyMode": "legacy",
+        }
+        params.update(self._thread_start_options)
         result = await self._rpc(
             "thread/start",
-            {
-                "cwd": self.worktree,
-                "runtimeWorkspaceRoots": [self.worktree],
-                "model": self.model,
-                "approvalPolicy": "never",
-                "sandbox": "danger-full-access",
-                "experimentalRawEvents": True,
-                "historyMode": "legacy",
-            },
+            params,
             generation=generation,
         )
+        self._last_thread_start_result = result
         self._remember_thread(self._thread_from_result(result), generation)
-        await self._start_turn(prompt)
+        if self._auto_start_turn:
+            await self._start_turn(prompt)
         await self._refresh_identity(required=True)
+
+    async def start_turn(self, text: str) -> None:
+        """Start a turn after the lane has completed its integrity checks."""
+
+        async with self._operation_lock:
+            await self._start_turn(text)
+
+    async def account_read(self) -> dict[str, Any]:
+        """Read plan identity on this exact App Server connection."""
+
+        async with self._operation_lock:
+            return await self._rpc("account/read", {"refreshToken": False})
 
     async def start(self, request: StartRequest) -> AdapterStatus:
         async with self._operation_lock:
@@ -772,8 +801,9 @@ class CodexAppServerAdapter(ProviderAdapter):
                     },
                     generation=generation,
                 )
+                self._last_thread_start_result = result
                 self._remember_thread(self._thread_from_result(result), generation)
-                if self._resume_state is LifecycleState.WORKING:
+                if self._resume_state is LifecycleState.WORKING and self._auto_start_turn:
                     status_dir = Path(
                         self.env.get(
                             "WIKI_AGENT_STATUS_DIR",
@@ -885,6 +915,8 @@ class CodexAppServerAdapter(ProviderAdapter):
                 await self._spawn(generation)
                 try:
                     await self._start_thread(new_prompt, generation)
+                    if not self._auto_start_turn:
+                        await self._start_turn(new_prompt)
                 except BaseException:
                     await asyncio.shield(terminate_process_group(self._process))
                     raise
@@ -912,6 +944,10 @@ class CodexAppServerAdapter(ProviderAdapter):
             self._active_turn_id = None
             self._state = LifecycleState.STARTING
             await self._start_thread(new_prompt, generation)
+            if not self._auto_start_turn:
+                # client.py v0.2.128 clones options before starting a replacement.
+                # This explicit call preserves the replacement prompt for wk lanes.
+                await self._start_turn(new_prompt)
             return self._status()
 
     async def _refresh_status(self) -> AdapterStatus:
@@ -926,6 +962,7 @@ class CodexAppServerAdapter(ProviderAdapter):
                     "thread/read",
                     {"threadId": self._session_id, "includeTurns": False},
                 )
+                self._last_thread_start_result = result
                 self._remember_thread(
                     self._thread_from_result(result), self._generation
                 )
