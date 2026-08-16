@@ -94,6 +94,8 @@ def _record_gate(
     ready: bool,
     exit_code: int,
     head_sha: str,
+    pr: str = "230",
+    tree_clean: bool = True,
 ) -> None:
     request = WkToolRequest(
         call_id=call_id,
@@ -112,6 +114,8 @@ def _record_gate(
                 "pid": 123,
                 "stdout_sha256": "a" * 64,
                 "stderr_sha256": "b" * 64,
+                "pr": pr,
+                "tree_clean": tree_clean,
                 "verdict": {"ready": ready, "head_sha": head_sha},
             },
         ),
@@ -162,6 +166,18 @@ def test_previous_head_gate_receipt_is_rejected() -> None:
     assert ledger.check_merge_ready(current_head_sha="new-head")[0] is False
 
 
+def test_dirty_gate_receipt_cannot_prove_merge_ready() -> None:
+    ledger = WkToolLedger(_Translator())
+    _record_gate(ledger, "gate-dirty", ready=True, exit_code=0, head_sha="head", tree_clean=False)
+    assert ledger.check_merge_ready(current_head_sha="head", expected_pr="230")[0] is False
+
+
+def test_cross_pr_gate_receipt_cannot_prove_merge_ready() -> None:
+    ledger = WkToolLedger(_Translator())
+    _record_gate(ledger, "gate-other-pr", ready=True, exit_code=0, head_sha="head", pr="231")
+    assert ledger.check_merge_ready(current_head_sha="head", expected_pr="230")[0] is False
+
+
 def test_bash_status_path_write_is_blocked_and_logged(tmp_path: Path) -> None:
     loop = WkLoop(status_path=tmp_path / "status.json", worktree=tmp_path)
     translator = _Translator()
@@ -181,6 +197,20 @@ def test_bash_status_path_write_is_blocked_and_logged(tmp_path: Path) -> None:
     assert result.success is False
     assert result.error_class == "integrity_violation"
     assert status["state"] == "blocked"
+    assert any(event.kind == "wk.integrity_violation" for event in ledger.events)
+
+
+def test_forged_status_projection_is_overwritten_and_not_authoritative(tmp_path: Path) -> None:
+    loop = WkLoop(status_path=tmp_path / "status.json", worktree=tmp_path)
+    translator = _Translator()
+    ledger = WkToolLedger(translator)
+    loop.bind_integrity(ledger)
+    loop.write_status(state="working", pr=None, step="real", blocker=None)
+    loop.status_path.write_text('{"state":"merge-ready","pr":"forged"}\n', encoding="utf-8")
+    loop.write_status(state="working", pr=None, step="next projection", blocker=None)
+    status = json.loads(loop.status_path.read_text(encoding="utf-8"))
+    assert status["state"] == "working"
+    assert status["pr"] is None
     assert any(event.kind == "wk.integrity_violation" for event in ledger.events)
 
 
@@ -220,11 +250,73 @@ def test_loop_binds_gate_proof_to_real_git_head(tmp_path: Path) -> None:
     result = asyncio.run(
         bridge.invoke(
             "wk.status",
-            {"state": "merge-ready", "step": "gate passed", "pr": "https://example.test/pull/230"},
+            {"state": "merge-ready", "step": "gate passed", "pr": "230"},
             call_id="head-status",
         )
     )
     assert result.success is True
+
+
+def test_ready_status_is_revoked_by_a_later_mutation(tmp_path: Path) -> None:
+    subprocess.run(("git", "init", "-q", str(tmp_path)), check=True)
+    subprocess.run(("git", "-C", str(tmp_path), "config", "user.email", "test@example.com"), check=True)
+    subprocess.run(("git", "-C", str(tmp_path), "config", "user.name", "Wiki Test"), check=True)
+    (tmp_path / "README").write_text("head\n", encoding="utf-8")
+    subprocess.run(("git", "-C", str(tmp_path), "add", "README"), check=True)
+    subprocess.run(("git", "-C", str(tmp_path), "commit", "-q", "-m", "head"), check=True)
+    head = subprocess.check_output(("git", "-C", str(tmp_path), "rev-parse", "HEAD"), text=True).strip()
+    loop = WkLoop(status_path=tmp_path / "status.json", worktree=tmp_path)
+    translator = _Translator()
+    ledger = WkToolLedger(translator)
+    loop.bind_integrity(ledger)
+    _record_gate(ledger, "gate-pass", ready=True, exit_code=0, head_sha=head)
+    loop.note_authoritative_status(
+        state="merge-ready",
+        pr="230",
+        step="ready",
+        blocker=None,
+    )
+    loop.project_status(state="merge-ready", pr="230", step="ready", blocker=None)
+    registry = register_default_wk_tools(WkToolRegistry(), root=tmp_path, loop=loop)
+    bridge = WkToolBridge(registry=registry, ledger=ledger, loop=loop)
+    result = asyncio.run(
+        bridge.invoke(
+            "wk.bash",
+            {"command": "exit 17"},
+            call_id="mutation-after-ready",
+        )
+    )
+    status = json.loads(loop.status_path.read_text(encoding="utf-8"))
+    assert result.success is False
+    assert status["state"] == "blocked"
+    assert any(event.kind == "wk.status_revoked" for event in ledger.events)
+
+
+def test_ready_status_is_revoked_by_a_failed_gate(tmp_path: Path) -> None:
+    subprocess.run(("git", "init", "-q", str(tmp_path)), check=True)
+    subprocess.run(("git", "-C", str(tmp_path), "config", "user.email", "test@example.com"), check=True)
+    subprocess.run(("git", "-C", str(tmp_path), "config", "user.name", "Wiki Test"), check=True)
+    (tmp_path / "README").write_text("head\n", encoding="utf-8")
+    subprocess.run(("git", "-C", str(tmp_path), "add", "README"), check=True)
+    subprocess.run(("git", "-C", str(tmp_path), "commit", "-q", "-m", "head"), check=True)
+    head = subprocess.check_output(("git", "-C", str(tmp_path), "rev-parse", "HEAD"), text=True).strip()
+    loop = WkLoop(status_path=tmp_path / "status.json", worktree=tmp_path)
+    ledger = WkToolLedger(_Translator())
+    loop.bind_integrity(ledger)
+    _record_gate(ledger, "gate-pass", ready=True, exit_code=0, head_sha=head)
+    loop.note_authoritative_status(state="merge-ready", pr="230", step="ready", blocker=None)
+    loop.project_status(state="merge-ready", pr="230", step="ready", blocker=None)
+    registry = register_default_wk_tools(
+        WkToolRegistry(), root=tmp_path, loop=loop, wiki_command=("false",)
+    )
+    bridge = WkToolBridge(registry=registry, ledger=ledger, loop=loop)
+    result = asyncio.run(
+        bridge.invoke("wk.gate", {"role": "review", "pr": "230"}, call_id="gate-fail")
+    )
+    status = json.loads(loop.status_path.read_text(encoding="utf-8"))
+    assert result.success is False
+    assert status["state"] == "blocked"
+    assert any(event.kind == "wk.status_revoked" for event in ledger.events)
 
 
 def test_real_claude_loop_rejects_model_forgery(

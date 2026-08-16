@@ -168,6 +168,48 @@ class WkToolLedger:
         self.translator.session.record_event(event)
         return event
 
+    def record_status_revocation(self, detail: str) -> WkEventEnvelope:
+        event = self.translator.sequencer.emit(
+            run_id=self.translator.run_id,
+            agent_id=self.translator.agent_id,
+            kind="wk.status_revoked",
+            phase=WkEventPhase.STATUS,
+            provider=self.translator.provider,
+            lane=self.translator.lane,
+            disposition=WkDisposition.RENDERED,
+            ts=self.translator.timestamp(),
+            payload={"detail": detail},
+        )
+        self.translator.session.record_event(event)
+        return event
+
+    def record_status(
+        self,
+        *,
+        state: str,
+        pr: str | None,
+        step: str,
+        blocker: str | None,
+    ) -> WkEventEnvelope:
+        event = self.translator.sequencer.emit(
+            run_id=self.translator.run_id,
+            agent_id=self.translator.agent_id,
+            kind="wk.status",
+            phase=WkEventPhase.STATUS,
+            provider=self.translator.provider,
+            lane=self.translator.lane,
+            disposition=WkDisposition.RENDERED,
+            ts=self.translator.timestamp(),
+            payload={
+                "state": state,
+                "pr": pr,
+                "step": step,
+                "blocker": blocker,
+            },
+        )
+        self.translator.session.record_event(event)
+        return event
+
     def restore(self, events: Sequence[WkEventEnvelope]) -> None:
         for event in sorted(events, key=lambda item: item.source_seq):
             call_id = event.payload.get("call_id")
@@ -293,6 +335,7 @@ class WkToolLedger:
         ignore_call_id: str | None = None,
         role: str = "review",
         current_head_sha: str | None = None,
+        expected_pr: str | None = None,
     ) -> tuple[bool, str]:
         """Return whether the ledger proves a safe merge-ready transition."""
 
@@ -347,6 +390,11 @@ class WkToolLedger:
             or verdict.get("ready") is not True
         ):
             return False, "latest gate receipt is not a passing ready verdict"
+        if not isinstance(receipt, Mapping) or receipt.get("tree_clean") is not True:
+            return False, "latest gate receipt does not prove a clean tree"
+        receipt_pr = receipt.get("pr")
+        if expected_pr is not None and receipt_pr != expected_pr:
+            return False, "latest gate receipt does not match the status PR"
         started = next(
             (
                 candidate
@@ -488,10 +536,74 @@ class WkToolBridge:
             )
         except Exception as exc:
             result = WkToolResult(success=False, exit_code=None, error_class=type(exc).__name__, error_detail=str(exc), mutation=request.mutation)
+        if (
+            name == "wk.status"
+            and result.success
+            and request.arguments.get("state") == "merge-ready"
+        ):
+            try:
+                self.loop.validate_merge_ready(
+                    status_call_id=request.call_id,
+                    pr=(
+                        str(request.arguments["pr"])
+                        if request.arguments.get("pr")
+                        else None
+                    ),
+                )
+            except WkIntegrityError as exc:
+                self.loop.project_status(
+                    state="blocked",
+                    pr=(
+                        str(request.arguments["pr"])
+                        if request.arguments.get("pr")
+                        else None
+                    ),
+                    step="wk integrity guard blocked the requested status",
+                    blocker=str(exc),
+                )
+                result = WkToolResult(
+                    success=False,
+                    exit_code=None,
+                    error_class=type(exc).__name__,
+                    error_detail=str(exc),
+                    mutation=request.mutation,
+                )
         result_event = self.ledger.record_result(request, result)
+        if name == "wk.status" and result.success:
+            self.loop.note_authoritative_status(
+                state=str(request.arguments["state"]),
+                pr=(
+                    str(request.arguments["pr"])
+                    if request.arguments.get("pr")
+                    else None
+                ),
+                step=str(request.arguments["step"]),
+                blocker=(
+                    str(request.arguments["blocker"])
+                    if request.arguments.get("blocker")
+                    else None
+                ),
+            )
+        elif name == "wk.gate" or request.mutation is not WkMutationClass.NONE:
+            current = self.loop.authoritative_status()
+            if current is not None and current.get("state") == "merge-ready":
+                allowed, reason = self.ledger.check_merge_ready(
+                    current_head_sha=self.loop.current_head_sha(),
+                    expected_pr=(
+                        str(current["pr"]) if current.get("pr") else None
+                    ),
+                )
+                if not allowed:
+                    self.loop.revoke_authoritative_status(reason)
         if self.event_publisher is not None:
+            status_events = self.loop.drain_status_events()
             await self.event_publisher(
-                (started_event, *self.loop.drain_integrity_events(), result_event)
+                (
+                    started_event,
+                    *status_events,
+                    result_event,
+                    *self.loop.drain_integrity_events(),
+                )
             )
         try:
             self.ledger.reconcile()

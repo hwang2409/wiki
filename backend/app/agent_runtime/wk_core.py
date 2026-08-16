@@ -12,6 +12,7 @@ import os
 import re
 import subprocess
 import tempfile
+import threading
 import uuid
 from collections.abc import AsyncIterator, Awaitable, Callable, Mapping, Sequence
 from dataclasses import dataclass, replace
@@ -568,6 +569,9 @@ class WkLoop:
         self._integrity_role = "review"
         self._worktree = worktree.resolve() if worktree is not None else None
         self._pending_integrity_events: list[WkEventEnvelope] = []
+        self._pending_status_events: list[WkEventEnvelope] = []
+        self._authoritative_status: dict[str, object] | None = None
+        self._transition_lock = threading.RLock()
 
     @property
     def status_path(self) -> Path:
@@ -621,6 +625,68 @@ class WkLoop:
         self._pending_integrity_events.clear()
         return events
 
+    def drain_status_events(self) -> tuple[WkEventEnvelope, ...]:
+        events = tuple(self._pending_status_events)
+        self._pending_status_events.clear()
+        return events
+
+    def project_status(
+        self,
+        *,
+        state: str,
+        pr: str | None,
+        step: str,
+        blocker: str | None,
+    ) -> int:
+        """Write the display projection without treating its old contents as authority."""
+
+        return self._status_writer.write(
+            state=state,
+            pr=pr,
+            step=step,
+            blocker=blocker,
+            authority=self._authority,
+        )
+
+    def note_authoritative_status(
+        self,
+        *,
+        state: str,
+        pr: str | None,
+        step: str,
+        blocker: str | None,
+    ) -> None:
+        self._authoritative_status = {
+            "state": state,
+            "pr": pr,
+            "step": step,
+            "blocker": blocker,
+        }
+
+    def authoritative_status(self) -> Mapping[str, object] | None:
+        return dict(self._authoritative_status) if self._authoritative_status else None
+
+    def revoke_authoritative_status(self, reason: str) -> None:
+        current = self._authoritative_status
+        if current is None or current.get("state") != "merge-ready":
+            return
+        ledger = self._integrity_ledger
+        reporter = getattr(ledger, "record_status_revocation", None)
+        if reporter is not None:
+            self._pending_integrity_events.append(reporter(reason))
+        self._authoritative_status = {
+            "state": "blocked",
+            "pr": current.get("pr"),
+            "step": "wk merge-ready was revoked by a later ledger operation",
+            "blocker": reason,
+        }
+        self.project_status(
+            state="blocked",
+            pr=str(current["pr"]) if current.get("pr") else None,
+            step="wk merge-ready was revoked by a later ledger operation",
+            blocker=reason,
+        )
+
     def write_status(
         self,
         *,
@@ -630,9 +696,38 @@ class WkLoop:
         blocker: str | None,
         status_call_id: str | None = None,
     ) -> int:
-        if not self._status_writer.verify() and state != "blocked":
-            raise WkIntegrityError("wk status file integrity check failed")
-        if state == "merge-ready":
+        with self._transition_lock:
+            if self._status_writer.path.exists() and not self._status_writer.verify():
+                self.report_integrity_violation(
+                    "wk status projection was modified outside the loop"
+                )
+            if state == "merge-ready":
+                self.validate_merge_ready(status_call_id=status_call_id, pr=pr)
+            result = self.project_status(
+                state=state,
+                pr=pr,
+                step=step,
+                blocker=blocker,
+            )
+            self._authoritative_status = {
+                "state": state,
+                "pr": pr,
+                "step": step,
+                "blocker": blocker,
+            }
+            reporter = getattr(self._integrity_ledger, "record_status", None)
+            if reporter is not None:
+                self._pending_status_events.append(
+                    reporter(state=state, pr=pr, step=step, blocker=blocker)
+                )
+            return result
+
+    def validate_merge_ready(
+        self, *, status_call_id: str | None, pr: str | None
+    ) -> None:
+        with self._transition_lock:
+            if not isinstance(pr, str) or not pr:
+                raise WkIntegrityError("merge-ready requires a PR identity")
             ledger = self._integrity_ledger
             if ledger is None:
                 raise WkIntegrityError("wk ledger is required for merge-ready")
@@ -643,16 +738,10 @@ class WkLoop:
                 ignore_call_id=status_call_id,
                 role=self._integrity_role,
                 current_head_sha=self.current_head_sha(),
+                expected_pr=pr,
             )
             if not allowed:
                 raise WkIntegrityError(reason)
-        return self._status_writer.write(
-            state=state,
-            pr=pr,
-            step=step,
-            blocker=blocker,
-            authority=self._authority,
-        )
 
 
 def mutation_input_hash(request: WkToolRequest) -> str:

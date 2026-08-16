@@ -242,6 +242,26 @@ def test_wk_dual_stack_routes_start_real_run_and_show_archive(
         assert session["events"]
         assert "WIKI-289" in json.dumps(dashboard, sort_keys=True)
 
+        forged = {
+            "state": "merge-ready",
+            "pr": "https://example.invalid/forged",
+            "step": "forged file state",
+            "blocker": None,
+        }
+        status_path = paths.status_dir / "WIKI-289.json"
+        status_path.write_text(json.dumps(forged) + "\n", encoding="utf-8")
+        worker = next(
+            item for item in main.agents()["workers"] if item["ticket"] == "WIKI-289"
+        )
+        assert worker["state"] != "merge-ready"
+        assert worker["pr"] != forged["pr"]
+
+        await supervisor.send_now(record.run_id, "read README again")
+        await asyncio.sleep(0.3)
+        projected = json.loads(status_path.read_text(encoding="utf-8"))
+        assert projected != forged
+        assert projected["step"] != forged["step"]
+
         archived = await supervisor.archive(record.run_id, outcome="review")
         assert archived.state is LifecycleState.COMPLETED
         archived_payload = main.agents()["archived"]

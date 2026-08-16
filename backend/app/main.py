@@ -1395,11 +1395,30 @@ def read_agent_status(ticket: str) -> dict | None:
         path = AGENT_STATUS_DIR / f"{candidate}.json"
         try:
             data = json.loads(path.read_text(encoding="utf-8"))
+            if not isinstance(data, dict):
+                continue
             data["_mtime"] = path.stat().st_mtime
             return data
         except (OSError, ValueError):
             continue
     return None
+
+
+def _status_for_registry_entry(ticket: str, entry: object) -> dict | None:
+    """Read wk state from the ledger projection, not its file projection."""
+    if isinstance(entry, dict):
+        current = entry.get("current")
+        if isinstance(current, dict):
+            kind = _normalize_kind(current.get("kind"))
+            if isinstance(kind, str) and is_wk_kind(kind):
+                return {
+                    "state": current.get("wk_status_state"),
+                    "pr": current.get("wk_status_pr"),
+                    "step": current.get("wk_status_step"),
+                    "blocker": current.get("wk_status_blocker"),
+                    "_mtime": None,
+                }
+    return read_agent_status(ticket)
 
 
 def _agent_status_paths() -> Iterator[Path]:
@@ -2264,10 +2283,19 @@ def agents(include_history: bool = False) -> dict[str, object]:
             if headless
             else False
         )
-        status = read_agent_status(ticket)
         seen_tickets.add(ticket)
         live_runs[ticket] = current.get("run_id") if isinstance(current.get("run_id"), str) else None
         current_kind = _normalize_kind(current.get("kind"))
+        if isinstance(current_kind, str) and is_wk_kind(current_kind):
+            status = {
+                "state": current.get("wk_status_state"),
+                "pr": current.get("wk_status_pr"),
+                "step": current.get("wk_status_step"),
+                "blocker": current.get("wk_status_blocker"),
+                "_mtime": None,
+            }
+        else:
+            status = read_agent_status(ticket)
         live_providers[ticket] = _normalize_provider(current.get("provider")) or _provider_for_kind(current_kind)
         window_alive = (
             control_attached if headless else current.get("window") in live_windows
@@ -2369,7 +2397,9 @@ def agents(include_history: bool = False) -> dict[str, object]:
                 "step": (status or {}).get("step"),
                 "blocker": wk_parity_blocker or (status or {}).get("blocker"),
                 "status_age_seconds": (
-                    int(now - status["_mtime"]) if status else None
+                    int(now - status["_mtime"])
+                    if status and isinstance(status.get("_mtime"), (int, float))
+                    else None
                 ),
                 "latest_event_at": latest_event_at,
                 "latest_event_seq": latest_event_seq,
@@ -2568,10 +2598,17 @@ def dashboard_tickets() -> dict[str, object]:
     except (OSError, ValueError):
         pass
     statuses: dict[str, dict] = {}
-    for path in _agent_status_paths():
-        status = read_agent_status(path.stem)
+    for ticket, entry in registry.items():
+        if ticket.startswith("_"):
+            continue
+        status = _status_for_registry_entry(ticket, entry)
         if status:
-            statuses[path.stem] = status
+            statuses[ticket] = status
+    for path in _agent_status_paths():
+        if path.stem not in statuses:
+            status = read_agent_status(path.stem)
+            if status:
+                statuses[path.stem] = status
     return dashboard.build_payload(
         registry, statuses, list_archived(limit=None, latest_per_ticket=True)
     )
@@ -2808,7 +2845,7 @@ def _fleet_worker_metadata(registry: dict) -> dict[str, dict[str, object]]:
         current = entry.get("current")
         if not isinstance(current, dict) or current.get("role") == "orchestrator":
             continue
-        status = read_agent_status(ticket) or {}
+        status = _status_for_registry_entry(ticket, entry) or {}
         workers[ticket] = {
             "ticket": ticket,
             "orch": current.get("orch"),
@@ -7637,10 +7674,17 @@ def _dashboard_page_payload() -> dict:
     except (OSError, ValueError):
         pass
     statuses: dict[str, dict] = {}
-    for path in _agent_status_paths():
-        status = read_agent_status(path.stem)
+    for ticket, entry in registry.items():
+        if ticket.startswith("_"):
+            continue
+        status = _status_for_registry_entry(ticket, entry)
         if status:
-            statuses[path.stem] = status
+            statuses[ticket] = status
+    for path in _agent_status_paths():
+        if path.stem not in statuses:
+            status = read_agent_status(path.stem)
+            if status:
+                statuses[path.stem] = status
     archived = list_archived(limit=None, latest_per_ticket=False)
     return dashboard.build_page_payload(registry, statuses, archived)
 

@@ -6,6 +6,7 @@ import asyncio
 import hashlib
 import json
 import os
+import subprocess
 from collections.abc import Callable, Mapping, Sequence
 from pathlib import Path
 from typing import Any, cast
@@ -23,6 +24,26 @@ def plan_auth_environment(environment: Mapping[str, str] | None = None) -> dict[
 
 def _hash_bytes(value: bytes) -> str:
     return hashlib.sha256(value).hexdigest()
+
+
+def _git_tree_receipt(root: Path) -> dict[str, object]:
+    head = subprocess.run(
+        ("git", "-C", str(root), "rev-parse", "HEAD"),
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    status = subprocess.run(
+        ("git", "-C", str(root), "status", "--porcelain", "--untracked-files=all"),
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    head_sha = head.stdout.strip()
+    return {
+        "head_sha": head_sha if head.returncode == 0 and head_sha else None,
+        "tree_clean": head.returncode == 0 and status.returncode == 0 and not status.stdout,
+    }
 
 
 class _WkPathTool:
@@ -383,6 +404,7 @@ class WkGateRunner:
         primary = processes[-1] if processes else {}
         receipt = {
             "role": role,
+            "pr": pr,
             "commands": commands,
             "exit_codes": [result.exit_code for result in results],
             "summaries": [result.stdout.strip().splitlines()[-1] if result.stdout.strip() else "" for result in results],
@@ -392,6 +414,12 @@ class WkGateRunner:
             "stderr_sha256": primary.get("stderr_sha256"),
             "verdict": verdict,
         }
+        receipt.update(_git_tree_receipt(self.root))
+        if receipt["verdict"] is None and exit_code not in {None, 0}:
+            receipt["verdict"] = {
+                "ready": False,
+                "head_sha": receipt.get("head_sha"),
+            }
         return WkToolResult(
             success=success,
             exit_code=exit_code,
