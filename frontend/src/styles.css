@@ -806,60 +806,89 @@ button:disabled {
   background-color: var(--background-primary);
 }
 
-.view-header.is-hidden {
-  display: none;
-}
-
-.view-header {
+/* WIKI-300: bb AppPageHeader shape — sidebar trigger + breadcrumb + actions. */
+.app-page-header {
   display: flex;
   align-items: center;
   justify-content: space-between;
   gap: 12px;
-  height: var(--header-height);
+  height: 40px;
+  flex-shrink: 0;
   padding: 0 12px;
+  border-bottom: 1px solid var(--border-seam, var(--hairline));
+  background-color: transparent;
 }
 
-.view-header-title-container {
+.app-page-header.is-hidden {
+  display: none;
+}
+
+.app-page-header__leading {
   display: flex;
   align-items: center;
+  gap: 8px;
   min-width: 0;
-  color: var(--text-faint);
-  font-size: var(--font-ui-smaller);
+  flex: 1 1 auto;
 }
 
-.view-header-breadcrumb {
+.app-page-header__sidebar-trigger {
+  flex-shrink: 0;
+}
+
+.app-page-header__breadcrumb {
+  min-width: 0;
+  flex: 1 1 auto;
+}
+
+.app-page-header__breadcrumb ol {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  min-width: 0;
+  margin: 0;
+  padding: 0;
+  list-style: none;
+  font-family: var(--font-chrome);
+  font-size: var(--font-ui-small);
+  font-weight: var(--fw-semibold, 600);
+  line-height: 1.2;
+}
+
+.app-page-header__breadcrumb li {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  min-width: 0;
+}
+
+.app-page-header__breadcrumb li:last-child {
+  flex: 1 1 auto;
+}
+
+.app-page-header__breadcrumb-separator {
+  flex-shrink: 0;
+  color: var(--text-faint);
+}
+
+.app-page-header__breadcrumb-segment {
+  display: inline-block;
+  color: var(--text-muted);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  min-width: 0;
+}
+
+.app-page-header__breadcrumb-segment.is-current {
+  color: var(--text-normal);
+  max-width: 100%;
+}
+
+.app-page-header__actions {
   display: flex;
   align-items: center;
   gap: 2px;
-  white-space: nowrap;
-}
-
-.view-header-breadcrumb:last-child span {
-  color: var(--text-muted);
-}
-
-.view-actions {
-  display: flex;
-  gap: 4px;
-}
-
-.view-action {
-  display: flex;
-  align-items: center;
-  justify-content: center;
-  width: 28px;
-  height: 26px;
-  border-radius: var(--radius-s);
-  color: var(--text-muted);
-}
-
-.view-action:hover:not(:disabled) {
-  background-color: var(--background-modifier-hover);
-  color: var(--text-normal);
-}
-
-.view-action:active:not(:disabled) {
-  scale: 0.96;
+  flex-shrink: 0;
 }
 
 .notice {
@@ -16503,29 +16532,21 @@ body {
   overflow: hidden;
 }
 
-/* Top bar: minimal, hairline separator inside the panel. */
-.view-header {
-  height: 44px;
-  padding: 0 16px;
-  border-bottom: 1px solid var(--hairline);
-}
-
-.view-header-title-container {
-  font-size: var(--font-ui-small);
+/* WIKI-300: page-header block replaces .view-header. Legacy .view-action
+   below is kept as-is because terminal-pane + secondary-pane still render it. */
+.view-action {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  width: 28px;
+  height: 26px;
+  border-radius: var(--radius-md);
   color: var(--text-muted);
 }
 
-.view-header-breadcrumb:last-child span {
+.view-action:hover:not(:disabled) {
+  background-color: var(--background-modifier-hover);
   color: var(--text-normal);
-  font-weight: var(--fw-medium);
-}
-
-.view-actions {
-  gap: 2px;
-}
-
-.view-action {
-  border-radius: var(--radius-md);
 }
 
 /* Panes area breathes inside the panel. */
