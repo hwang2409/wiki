@@ -7576,12 +7576,57 @@ body.is-resizing-panes .pane-cell {
 
 .session-virtual-row[data-align="end"] > .session-user {
   align-self: flex-end;
-  max-width: min(72ch, 85%);
+  max-width: min(70%, 72ch);
+}
+
+@media (max-width: 760px) {
+  .session-virtual-row[data-align="end"] > .session-user {
+    max-width: min(92%, 72ch);
+  }
 }
 
 .session-text {
   white-space: pre-wrap;
   overflow-wrap: break-word;
+}
+
+.session-user-content {
+  position: relative;
+}
+
+.session-user-content.is-clamped {
+  max-height: calc(15 * 1.55em);
+  overflow: hidden;
+}
+
+.session-user-content.is-clamped::after {
+  position: absolute;
+  right: 0;
+  bottom: 0;
+  left: 0;
+  height: 2.5em;
+  background: linear-gradient(to bottom, transparent, var(--surface-recessed, var(--background-secondary)));
+  content: "";
+  pointer-events: none;
+}
+
+.session-envelope {
+  margin: 0 0 8px;
+  color: var(--text-muted);
+  font-family: var(--font-monospace);
+  font-size: var(--font-chrome-size);
+}
+
+.session-envelope summary {
+  min-height: 24px;
+  cursor: pointer;
+  list-style-position: inside;
+}
+
+.session-envelope-raw {
+  margin: 4px 0 0 1.5ch;
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
 }
 
 .session-expand {
@@ -7592,7 +7637,7 @@ body.is-resizing-panes .pane-cell {
   color: var(--text-faint);
   font-family: var(--font-monospace);
   font-weight: var(--font-monospace-weight);
-  font-size: var(--font-chrome-size);
+  font-size: var(--font-control-size);
   text-decoration: underline;
 }
 
@@ -8324,16 +8369,38 @@ body.is-resizing-panes .pane-cell {
 .session-thinking-chip {
   display: inline-flex;
   margin-right: 8px;
-  padding: 1px 6px;
-  border: 1px solid var(--background-modifier-border);
-  border-radius: var(--radius-xs);
+  padding: 0;
+  border: 0;
+  border-radius: 0;
   color: var(--text-muted);
   font-family: var(--font-monospace);
   font-weight: var(--font-monospace-weight);
-  font-size: var(--fs-xs);
+  font-size: var(--font-chrome-size);
   font-style: normal;
-  letter-spacing: 0.03em;
-  text-transform: uppercase;
+  letter-spacing: 0.02em;
+  text-transform: none;
+  opacity: 0.72;
+}
+
+.session-thinking-group {
+  min-width: 0;
+}
+
+.session-thinking-group-head {
+  font-size: var(--font-control-size);
+}
+
+.session-thinking-group-rows {
+  margin: 3px 0 8px;
+  padding-left: 2ch;
+}
+
+.session-thinking-group-rows .session-thinking {
+  margin-bottom: 8px;
+}
+
+.session-thinking-head.is-live {
+  color: var(--text-normal);
 }
 
 .session-question {

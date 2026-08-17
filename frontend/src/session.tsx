@@ -1108,13 +1108,38 @@ export function ProviderActionRequired({
 
 const IMG_TOKEN_PATTERN = /\u27e6img:([^\u27e7]+)\u27e7/g;
 const PROMPT_MENTION_PATTERN = /(^|[\s([{])(@(?:thread|project|section):[^\s.,!?;)}\]]+|@[A-Za-z0-9_.-]+\/[^\s.,!?;)}\]]+)/g;
+const expandedThoughtGroups = new Map<string, boolean>();
 
 type UserTextPart =
   | { kind: "text"; text: string }
-  | { kind: "image"; url: string };
+  | { kind: "image"; url: string }
+  | { kind: "envelope"; label: string; text: string };
+type RenderedUserTextPart = Exclude<UserTextPart, { kind: "envelope" }>;
 
-function splitImgTokens(text: string): UserTextPart[] {
+const KNOWN_ENVELOPE_PATTERN = /<(recommended_plugins|WIKI_RUNTIME_CARD)(?:\s[^>]*)?>[\s\S]*?<\/\1>/gi;
+
+function splitKnownEnvelopes(text: string): UserTextPart[] {
   const parts: UserTextPart[] = [];
+  let last = 0;
+  for (const match of text.matchAll(KNOWN_ENVELOPE_PATTERN)) {
+    const index = match.index ?? 0;
+    const raw = match[0];
+    const tag = match[1]?.toLowerCase();
+    if (!raw || !tag) continue;
+    if (index > last) parts.push({ kind: "text", text: text.slice(last, index) });
+    parts.push({
+      kind: "envelope",
+      label: tag === "recommended_plugins" ? "recommended plugins" : "runtime card",
+      text: raw,
+    });
+    last = index + raw.length;
+  }
+  if (last < text.length) parts.push({ kind: "text", text: text.slice(last) });
+  return parts.length ? parts : [{ kind: "text", text }];
+}
+
+function splitImgTokens(text: string): RenderedUserTextPart[] {
+  const parts: RenderedUserTextPart[] = [];
   let last = 0;
   for (const match of text.matchAll(IMG_TOKEN_PATTERN)) {
     if (match.index! > last) parts.push({ kind: "text", text: text.slice(last, match.index) });
@@ -1149,31 +1174,77 @@ function renderUserText(text: string, keyPrefix: string): ReactNode {
   return nodes.length ? nodes : text;
 }
 
-function UserText({
+export function UserText({
   text,
   imageNums = [],
 }: {
   text: string;
   imageNums?: number[];
 }) {
-  const parts = splitImgTokens(text);
+  const contentRef = useRef<HTMLDivElement | null>(null);
+  const contentId = useId();
+  const [expanded, setExpanded] = useState(false);
+  const [measured, setMeasured] = useState(false);
+  const [overflowing, setOverflowing] = useState(false);
   let imgIndex = -1;
+
+  useLayoutEffect(() => {
+    if (expanded) return;
+    const content = contentRef.current;
+    if (!content) return;
+    const measure = () => {
+      setOverflowing(content.scrollHeight > content.clientHeight + 1);
+      setMeasured(true);
+    };
+    measure();
+    const observer = new ResizeObserver(measure);
+    observer.observe(content);
+    return () => observer.disconnect();
+  }, [expanded, text]);
+
+  const parts = splitKnownEnvelopes(text);
+  const isClamped = !expanded && (!measured || overflowing);
+  const renderTextPart = (value: string, keyPrefix: string) => splitImgTokens(value).map((part, index) => {
+    if (part.kind === "image") {
+      imgIndex += 1;
+      return <ImageChip key={`${keyPrefix}-image-${index}`} num={imageNums[imgIndex] ?? 0} url={part.url} />;
+    }
+    return <span key={`${keyPrefix}-text-${index}`}>{renderUserText(part.text, keyPrefix)}</span>;
+  });
   return (
-    <div className="session-text">
-      {parts.map((part, i) => {
-        if (part.kind === "image") {
-          imgIndex += 1;
+    <>
+      <div
+        aria-busy={!measured}
+        className={`session-user-content session-text${isClamped ? " is-clamped" : ""}`}
+        data-rendered-overflow={overflowing ? "true" : "false"}
+        id={contentId}
+        ref={contentRef}
+      >
+      {parts.map((part, index) => {
+        if (part.kind === "envelope") {
           return (
-            <ImageChip
-              key={i}
-              num={imageNums[imgIndex] ?? 0}
-              url={part.url}
-            />
+            <details className="session-envelope" key={`envelope-${index}`}>
+              <summary>{part.label}</summary>
+              <pre className="session-envelope-raw">{part.text}</pre>
+            </details>
           );
         }
-        return <span key={i}>{renderUserText(part.text, `part-${i}`)}</span>;
+        if (part.kind !== "text") return null;
+        return <span key={`text-${index}`}>{renderTextPart(part.text, `part-${index}`)}</span>;
       })}
-    </div>
+      </div>
+      {overflowing ? (
+        <button
+          aria-controls={contentId}
+          aria-expanded={expanded}
+          className="session-expand"
+          type="button"
+          onClick={() => setExpanded((value) => !value)}
+        >
+          {expanded ? "Show less" : "Show more"}
+        </button>
+      ) : null}
+    </>
   );
 }
 
@@ -1703,7 +1774,46 @@ function normalizeCodexThinkingMarkdown(text: string): string {
     .join("\n");
 }
 
-export function ThinkingRow({ event, durationMs = null }: { event: SessionEvent; durationMs?: number | null }) {
+export function groupSettledThoughtRows(rows: readonly EventRow[]): EventRow[] {
+  const grouped: EventRow[] = [];
+  let index = 0;
+  while (index < rows.length) {
+    const row = rows[index];
+    if (row.event.kind !== "thinking" || row.event.partial) {
+      grouped.push(row.event.kind === "thinking" ? { ...row, live: true } : row);
+      index += 1;
+      continue;
+    }
+    const settled: EventRow[] = [];
+    while (index < rows.length) {
+      const candidate = rows[index];
+      if (candidate.event.kind !== "thinking" || candidate.event.partial) break;
+      settled.push(candidate);
+      index += 1;
+    }
+    const latest = settled.pop();
+    if (!latest) continue;
+    if (settled.length > 1) {
+      grouped.push({ ...settled[0], thoughts: settled });
+    } else {
+      grouped.push(...settled);
+    }
+    grouped.push({ ...latest, live: true });
+  }
+  return grouped;
+}
+
+export function ThinkingRow({
+  event,
+  durationMs = null,
+  initiallyExpanded = false,
+  live = false,
+}: {
+  event: SessionEvent;
+  durationMs?: number | null;
+  initiallyExpanded?: boolean;
+  live?: boolean;
+}) {
   // Provider capability markers can arrive as truthy wire values after an
   // app-server round trip. Do not require a strict boolean identity.
   const codexSummary = Boolean(event.encrypted);
@@ -1711,11 +1821,11 @@ export function ThinkingRow({ event, durationMs = null }: { event: SessionEvent;
     ? normalizeCodexThinkingPreview(event.text)
     : event.text.split("\n", 1)[0].trim();
   const markdown = codexSummary ? normalizeCodexThinkingMarkdown(event.text) : event.text;
-  const [expanded, setExpanded] = useState(false);
+  const [expanded, setExpanded] = useState(initiallyExpanded);
   const title = preview.slice(0, 120);
   const duration = durationMs !== null ? formatEventDuration(durationMs) : null;
   return (
-    <div className="session-activity-row is-reasoning">
+    <div className={`session-activity-row is-reasoning${live ? " is-live" : ""}`}>
       <button
         className="session-thinking-head"
         type="button"
@@ -1746,6 +1856,56 @@ export function ThinkingRow({ event, durationMs = null }: { event: SessionEvent;
           >
             {prepareTranscriptMarkdown(markdown)}
           </ReactMarkdown>
+        </div>
+      ) : null}
+    </div>
+  );
+}
+
+export function ThoughtGroupRow({
+  events,
+  groupId = String(events[0]?.key ?? ""),
+  durations,
+}: {
+  groupId?: string;
+  events: readonly EventRow[];
+  durations: ReadonlyMap<number, number>;
+}) {
+  const [expanded, setExpanded] = useState(() => expandedThoughtGroups.get(groupId) ?? false);
+  const totalDuration = events.reduce(
+    (total, row) => total + (durations.get(row.key) ?? 0),
+    0,
+  );
+  const encrypted = events.some((row) => Boolean(row.event.encrypted));
+  return (
+    <div className="session-thinking-group">
+      <button
+        aria-expanded={expanded}
+        className="session-thinking-head session-thinking-group-head"
+        type="button"
+        onClick={() => setExpanded((value) => {
+          const next = !value;
+          expandedThoughtGroups.set(groupId, next);
+          return next;
+        })}
+      >
+        <span aria-hidden="true" className="session-thinking-prefix">{expanded ? "-" : "+"}</span>
+        <span className="session-thinking-line">
+          {events.length} thoughts
+          {totalDuration > 0 ? ` · ${formatEventDuration(totalDuration)}` : ""}
+        </span>
+        {encrypted ? <span className="session-thinking-chip">encrypted</span> : null}
+      </button>
+      {expanded ? (
+        <div className="session-thinking-group-rows">
+          {events.map((row) => (
+            <ThinkingRow
+              event={row.event}
+              initiallyExpanded
+              key={row.key}
+              durationMs={durations.get(row.key) ?? null}
+            />
+          ))}
         </div>
       ) : null}
     </div>
@@ -2668,19 +2828,32 @@ export function ActivityEventRow({
   rowKey,
   onInspect,
   thoughtDurationMs = null,
+  thoughtDurationsByKey,
+  thoughts,
+  live = false,
   ticket,
 }: {
   event: SessionEvent;
   rowKey: number;
   onInspect?: (agentId: string) => void;
   thoughtDurationMs?: number | null;
+  thoughtDurationsByKey?: ReadonlyMap<number, number>;
+  thoughts?: readonly EventRow[];
+  live?: boolean;
   ticket: string;
 }) {
   const rows = useMemo(() => traceRows(activityTimeline([event])), [event]);
+  if (thoughts && thoughtDurationsByKey) {
+    return (
+      <div className="session-activity">
+        <ThoughtGroupRow durations={thoughtDurationsByKey} events={thoughts} groupId={`${ticket}:${rowKey}`} />
+      </div>
+    );
+  }
   if (event.kind === "thinking" && event.text) {
     return (
       <div className="session-activity">
-        <ThinkingRow durationMs={thoughtDurationMs} event={event} />
+        <ThinkingRow durationMs={thoughtDurationMs} event={event} live={live} />
       </div>
     );
   }
@@ -2716,6 +2889,10 @@ function useMeasuredRow(row: EventRow, onHeightChange: (row: EventRow, height: n
 
 function rowTimestamp(row: EventRow): string | null {
   return row.event.ts;
+}
+
+function rowEventRefs(row: EventRow): readonly SessionEvent[] {
+  return row.thoughts ? row.thoughts.map((thought) => thought.event) : [row.event];
 }
 
 function rowAlign(row: EventRow): "end" | "start" {
@@ -2800,6 +2977,7 @@ const VirtualSessionRow = memo(function VirtualSessionRow({
   sessionKey,
   showTimestamp,
   thoughtDurationMs = null,
+  thoughtDurationsByKey,
   top,
   ticket,
   turnMeta = null,
@@ -2815,6 +2993,7 @@ const VirtualSessionRow = memo(function VirtualSessionRow({
   sessionKey: string;
   showTimestamp: boolean;
   thoughtDurationMs?: number | null;
+  thoughtDurationsByKey: ReadonlyMap<number, number>;
   top: number;
   ticket: string;
   turnMeta?: TurnMeta | null;
@@ -2840,6 +3019,9 @@ const VirtualSessionRow = memo(function VirtualSessionRow({
           rowKey={row.key}
           onInspect={onInspect}
           thoughtDurationMs={thoughtDurationMs}
+          thoughtDurationsByKey={thoughtDurationsByKey}
+          thoughts={row.thoughts}
+          live={row.live}
           ticket={ticket}
         />
       ) : (
@@ -2871,6 +3053,7 @@ const VirtualSessionRow = memo(function VirtualSessionRow({
     prev.onOpenArtifact !== next.onOpenArtifact ||
     prev.showTimestamp !== next.showTimestamp ||
     prev.thoughtDurationMs !== next.thoughtDurationMs ||
+    prev.thoughtDurationsByKey !== next.thoughtDurationsByKey ||
     prev.ticket !== next.ticket ||
     prev.turnMeta !== next.turnMeta ||
     prev.uiState !== next.uiState
@@ -2879,6 +3062,8 @@ const VirtualSessionRow = memo(function VirtualSessionRow({
   }
   return prev.row.key === next.row.key &&
     prev.row.event === next.row.event &&
+    prev.row.live === next.row.live &&
+    prev.row.thoughts === next.row.thoughts &&
     sameImageNums(prev.imageNums, next.imageNums);
 });
 
@@ -3050,7 +3235,6 @@ export function SessionTab({
   const rowHeightsRef = useRef<Map<number, RowMeasurement>>(new Map());
   const eventRowsCacheRef = useRef<EventRowsCache | null>(null);
   const layoutCacheRef = useRef<VirtualLayoutCache | null>(null);
-  const layoutDirtyFromRef = useRef(Number.POSITIVE_INFINITY);
   const layoutRef = useRef<VirtualLayout | null>(null);
   const layoutResetKeyRef = useRef(resetKey);
   const [containerNode, setContainerNode] = useState<HTMLDivElement | null>(null);
@@ -3071,7 +3255,6 @@ export function SessionTab({
     rowHeightsRef.current = new Map();
     eventRowsCacheRef.current = null;
     layoutCacheRef.current = null;
-    layoutDirtyFromRef.current = 0;
   }
 
   const target = useMemo(
@@ -3337,20 +3520,19 @@ export function SessionTab({
     eventRowsCacheRef.current = result.cache;
     return result;
   }, [displayEvents, session?.base, session?.eventsChangedFrom]);
-  const rows = rowResult.rows;
+  const rawRows = rowResult.rows;
+  const rows = useMemo(() => groupSettledThoughtRows(rawRows), [rawRows]);
   const layout = useMemo(() => {
-    const changedFrom = Math.min(rowResult.changedFrom, layoutDirtyFromRef.current);
     const result = buildVirtualLayoutIncremental(
       rows,
       rowHeightsRef.current,
       rowHeightVersion,
       layoutCacheRef.current,
-      Number.isFinite(changedFrom) ? changedFrom : undefined,
+      0,
     );
     layoutCacheRef.current = result.cache;
-    layoutDirtyFromRef.current = Number.POSITIVE_INFINITY;
     return result.layout;
-  }, [rowResult.changedFrom, rows, resetKey, rowHeightVersion]);
+  }, [rows, resetKey, rowHeightVersion]);
   const [visibleRange, setVisibleRange] = useState<{ start: number; end: number }>({ start: 0, end: -1 });
   const visibleRangeViewportRef = useRef<{ top: number; height: number } | null>(null);
   const syncVisibleRange = useCallback((viewport: { top: number; height: number }, force = false) => {
@@ -3403,17 +3585,13 @@ export function SessionTab({
   const reportRowHeight = useCallback((row: EventRow, height: number) => {
     const measurement: RowMeasurement = {
       height,
-      refs: [row.event],
+      refs: rowEventRefs(row),
     };
     const current = rowHeightsRef.current.get(row.key);
     if (current && current.height === measurement.height && sameEventRefs(current.refs, measurement.refs)) {
       return;
     }
     rowHeightsRef.current.set(row.key, measurement);
-    const index = layoutCacheRef.current?.layout.keyToIndex.get(row.key);
-    if (index !== undefined) {
-      layoutDirtyFromRef.current = Math.min(layoutDirtyFromRef.current, index);
-    }
     setRowHeightVersion((version) => version + 1);
   }, []);
 
@@ -3573,16 +3751,16 @@ export function SessionTab({
   const sessionWorking = session?.working ?? false;
   const sessionModel = session?.model ?? null;
   const sessionAgentName = session?.sessionMeta.agent_name ?? session?.kind ?? null;
-  const thoughtDurationByKey = useMemo(() => thoughtDurations(rows), [rows]);
+  const thoughtDurationByKey = useMemo(() => thoughtDurations(rawRows), [rawRows]);
   // Stable per-key TurnMeta objects so row memoization holds between renders.
   const turnMetaByKey = useMemo(() => {
     const metas = new Map<number, TurnMeta>();
     if (!sessionAgentName && !sessionModel) return metas;
-    for (const [key, durationMs] of turnMetaDurations(rows, sessionWorking)) {
+    for (const [key, durationMs] of turnMetaDurations(rawRows, sessionWorking)) {
       metas.set(key, { agent: sessionAgentName ?? "agent", model: sessionModel, durationMs });
     }
     return metas;
-  }, [rows, sessionAgentName, sessionModel, sessionWorking]);
+  }, [rawRows, sessionAgentName, sessionModel, sessionWorking]);
 
   const imageNumbers = useMemo(() => {
     const map = new Map<SessionEvent, number[]>();
@@ -3773,6 +3951,7 @@ export function SessionTab({
                 sessionKey={inlineArtifactKey}
                 showTimestamp={timestampKeys.has(row.key)}
                 thoughtDurationMs={thoughtDurationByKey.get(row.key) ?? null}
+                thoughtDurationsByKey={thoughtDurationByKey}
                 ticket={ticket}
                 top={top}
                 turnMeta={turnMetaByKey.get(row.key) ?? null}

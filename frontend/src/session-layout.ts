@@ -2,7 +2,12 @@ import type { SessionEvent } from "./api";
 
 export const VIRTUAL_ROW_GAP = 14;
 
-export type EventRow = { event: SessionEvent; key: number };
+export type EventRow = {
+  event: SessionEvent;
+  key: number;
+  live?: boolean;
+  thoughts?: readonly EventRow[];
+};
 
 export type RowPresentation = "inline" | "block" | "thought" | "prose";
 
