@@ -2930,6 +2930,60 @@ function resolveScrollAnchorTarget(
   return { index, key, target };
 }
 
+const EMPTY_THREAD_SUGGESTIONS = [
+  "ask a question",
+  "summarize a note",
+  "search the vault",
+] as const;
+
+interface SessionEmptyWelcomeProps {
+  showComposer: boolean;
+  subagent: boolean;
+  working: boolean;
+}
+
+function SessionEmptyWelcome({
+  showComposer,
+  subagent,
+  working,
+}: SessionEmptyWelcomeProps) {
+  const title = working
+    ? "Waiting for the first event…"
+    : subagent
+      ? "No events yet"
+      : "Start a conversation";
+  const body = working
+    ? "The agent is running but has not produced output yet."
+    : subagent
+      ? "This subagent hasn't emitted any events."
+      : showComposer
+        ? "Send a message below to start the session."
+        : "This session has no events.";
+
+  return (
+    <div
+      className="session-zero-events"
+      role="status"
+      data-testid="session-zero-events"
+    >
+      <div className="session-zero-events-mark" aria-hidden="true">
+        <MessageCircleQuestion size={18} />
+      </div>
+      <div className="session-zero-events-title">{title}</div>
+      <div className="session-zero-events-body">{body}</div>
+      {!working && !subagent && showComposer ? (
+        <div className="session-zero-events-suggestions" role="group" aria-label="Suggested prompts">
+          {EMPTY_THREAD_SUGGESTIONS.map((suggestion) => (
+            <span className="session-zero-events-chip" key={suggestion}>
+              {suggestion}
+            </span>
+          ))}
+        </div>
+      ) : null}
+    </div>
+  );
+}
+
 export function SessionTab({
   ticket,
   subagent,
@@ -3548,25 +3602,31 @@ export function SessionTab({
     if (error && !loading) {
       return (
         <div className="session-tab" ref={setContainerNode}>
-          <div className="session-empty session-empty-error" role="alert">
-            <div className="session-empty-title">Could not load transcript</div>
-            <div className="session-empty-body">{error}</div>
-            <button
-              type="button"
-              className="session-empty-retry"
-              onClick={retry}
-              disabled={retrying}
-            >
-              <RefreshCw size={12} />
-              {retrying ? "Retrying…" : "Try again"}
-            </button>
+          <div className="session-empty session-empty-error" role="alert" data-testid="session-load-error">
+            <div className="session-error-card">
+              <AlertTriangle aria-hidden="true" className="session-error-icon" size={16} />
+              <div className="session-error-content">
+                <div className="session-empty-title">Could not load transcript</div>
+                <div className="session-empty-body">{error}</div>
+                <button
+                  type="button"
+                  className="session-empty-retry"
+                  onClick={retry}
+                  disabled={retrying}
+                  aria-busy={retrying}
+                >
+                  <RefreshCw size={12} />
+                  {retrying ? "Retrying…" : "Try again"}
+                </button>
+              </div>
+            </div>
           </div>
         </div>
       );
     }
     return (
       <div className="session-tab" ref={setContainerNode}>
-        <div className="session-empty">
+        <div className="session-empty session-empty-loading" role="status" aria-busy="true" aria-label="Loading transcript">
           <LoadingPlaceholder className="session-loading" lines={[82, 96, 74, 88]} />
         </div>
       </div>
@@ -3652,24 +3712,11 @@ export function SessionTab({
             </div>
           ) : null}
           {displayEvents.length === 0 && pendingUserMessages.length === 0 ? (
-            <div
-              className="session-zero-events"
-              role="status"
-              data-testid="session-zero-events"
-            >
-              <div className="session-zero-events-title">
-                {session.working ? "Waiting for the first event…" : "No events yet"}
-              </div>
-              <div className="session-zero-events-body">
-                {session.working
-                  ? "The agent is running but has not produced output yet."
-                  : subagent
-                    ? "This subagent hasn't emitted any events."
-                    : showComposer
-                      ? "Send a message below to start the session."
-                      : "This session has no events."}
-              </div>
-            </div>
+            <SessionEmptyWelcome
+              showComposer={showComposer}
+              subagent={Boolean(subagent)}
+              working={session.working}
+            />
           ) : null}
           <div className="session-virtual-list" style={{ height: layout.totalHeight }}>
             {visibleRows.map(({ row, top }) => (
