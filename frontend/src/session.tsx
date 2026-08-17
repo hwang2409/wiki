@@ -159,6 +159,7 @@ import {
 import {
   buildVirtualLayoutIncremental,
   eventRowsIncremental,
+  rowEventRefs,
   sameEventRefs,
   type EventRow,
   type EventRowsCache,
@@ -2894,10 +2895,6 @@ function useMeasuredRow(row: EventRow, onHeightChange: (row: EventRow, height: n
 
 function rowTimestamp(row: EventRow): string | null {
   return row.event.ts;
-}
-
-function rowEventRefs(row: EventRow): readonly SessionEvent[] {
-  return row.thoughts ? row.thoughts.map((thought) => thought.event) : [row.event];
 }
 
 function rowAlign(row: EventRow): "end" | "start" {

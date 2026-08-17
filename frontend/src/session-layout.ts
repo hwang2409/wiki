@@ -149,6 +149,10 @@ export function sameEventRefs(prev: readonly SessionEvent[], next: readonly Sess
   return prev.length === next.length && prev.every((event, index) => event === next[index]);
 }
 
+export function rowEventRefs(row: EventRow): readonly SessionEvent[] {
+  return row.thoughts ? row.thoughts.map((thought) => thought.event) : [row.event];
+}
+
 function estimateWrappedLines(text: string, charsPerLine: number): number {
   let total = 0;
   for (const line of text.split("\n")) total += Math.max(1, Math.ceil(line.length / charsPerLine));
@@ -203,7 +207,8 @@ function getEstimatedRowHeight(row: EventRow): number {
 
 function getRowHeight(row: EventRow, heights: Map<number, RowMeasurement>): number {
   const measurement = heights.get(row.key);
-  return measurement && sameEventRefs(measurement.refs, [row.event])
+  const refs = rowEventRefs(row);
+  return measurement && sameEventRefs(measurement.refs, refs)
     ? measurement.height
     : getEstimatedRowHeight(row);
 }
