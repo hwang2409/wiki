@@ -142,6 +142,39 @@
   --send-diameter: 34px;
   --section-label-tracking: 0.14em;
   --section-label-size: var(--fs-2xs);
+
+  /* WIKI-295: bb shell-token fallbacks. Every theme inherits these; the
+     mono-light and mono-dark blocks in themes.css override with bb-exact
+     oklch values. Other themes translate through color-mix over their
+     existing family variables — no per-theme redefinition needed unless
+     a family wants a hand-tuned override. */
+  --border-seam: color-mix(in srgb, var(--text-normal) 10%, var(--background-primary));
+  --border-hairline: color-mix(in srgb, var(--text-normal) 15%, var(--background-primary));
+  --surface-recessed: color-mix(in srgb, var(--text-normal) 6%, transparent);
+  --surface-raised: color-mix(in srgb, var(--text-normal) 2.5%, transparent);
+  --surface-selected: color-mix(in srgb, var(--accent-primary) 16%, transparent);
+  /* bb-language state fills alias the wiki modifier tokens so they cannot
+     drift as themes customize their hover/active tints. */
+  --state-hover: var(--background-modifier-hover);
+  --state-active: var(--background-modifier-active);
+  --sidebar: color-mix(in srgb, var(--text-normal) 2.2%, var(--background-primary));
+  --shadow-lift: 0 -4px 12px -4px rgba(0, 0, 0, 0.12);
+  --readback-foreground: color-mix(in srgb, var(--text-muted) 60%, var(--text-subtle-readable));
+  --timeline-accent: oklch(0.6 0.09 250);
+  --pr-merged: oklch(0.6 0.2 295);
+  --attention: oklch(0.75 0.15 80);
+  --warning: oklch(0.72 0.16 50);
+  --warning-text: oklch(0.65 0.14 50);
+  --success-foreground: color-mix(in srgb, var(--accent-success) 55%, var(--text-normal));
+  --pill-surface: linear-gradient(
+    to bottom,
+    color-mix(in srgb, var(--text-normal) 4.5%, var(--background-primary)),
+    color-mix(in srgb, var(--text-normal) 5%, var(--background-primary))
+  );
+  --pill-surface-border: color-mix(in srgb, var(--text-normal) 14%, var(--background-primary));
+  --pill-foreground: var(--text-normal);
+  --pill-icon: var(--text-normal);
+  --pill-shadow: 0 1px 1px 0 rgba(0, 0, 0, 0.06);
 }
 
 * {
