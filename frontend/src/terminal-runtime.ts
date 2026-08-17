@@ -99,7 +99,7 @@ function readTerminalFontFamily() {
 }
 
 function readTerminalFontSize() {
-  const raw = getComputedStyle(document.documentElement).getPropertyValue("--font-ui-small").trim();
+  const raw = getComputedStyle(document.documentElement).getPropertyValue("--font-control-size").trim();
   const parsed = Number.parseFloat(raw);
   return Number.isFinite(parsed) ? parsed + 0.5 : 14;
 }
