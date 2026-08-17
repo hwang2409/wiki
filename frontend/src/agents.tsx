@@ -8,11 +8,12 @@ import {
   ExternalLink,
   GitPullRequest,
   MoreHorizontal,
-  Plus,
   RefreshCw,
   ScrollText,
-  X,
 } from "lucide-react";
+import { BbDialog } from "./dialogs";
+import type { FocusReturnRef } from "./modal-a11y";
+import { Button } from "./primitives";
 import {
   archiveAgent,
   controlAgent,
@@ -46,8 +47,6 @@ import type { SidebarTarget } from "./session";
 import { BranchPill } from "./branch-pill";
 import { StatusBadge } from "./status-badge";
 import { toast } from "./toast";
-import { useModalA11y } from "./modal-a11y";
-import { Button } from "./primitives";
 
 declare global {
   interface Window {
@@ -245,11 +244,13 @@ function writeExpandedOrchs(expanded: Record<string, boolean>) {
 }
 
 export function SpawnWorkerModal({
+  fallbackRef,
   models,
   orchestrators,
   onClose,
   onSpawn,
 }: {
+  fallbackRef?: FocusReturnRef;
   models: AgentModelOption[];
   orchestrators: Orchestrator[];
   onClose: () => void;
@@ -273,7 +274,6 @@ export function SpawnWorkerModal({
   const [confirming, setConfirming] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [advancedOpen, setAdvancedOpen] = useState(false);
-  const dialogRef = useModalA11y<HTMLFormElement>(true, requestClose);
 
   function requestClose() {
     if (submitting) return;
@@ -434,30 +434,32 @@ export function SpawnWorkerModal({
   }
 
   return (
-    <>
-      <div aria-hidden="true" className="settings-backdrop" onClick={requestClose} />
-      <form
-        aria-modal="true"
-        aria-labelledby="spawn-worker-dialog-title"
-        className="dialog agent-spawn-modal"
-        role="dialog"
-        ref={dialogRef}
-        tabIndex={-1}
-        onSubmit={submit}
-      >
-        <div className="settings-header">
-          <div className="dialog-title" id="spawn-worker-dialog-title">Spawn worker</div>
-          <button
-            aria-label="Close spawn dialog"
-            className="session-close"
-            type="button"
-            onClick={requestClose}
+    <BbDialog
+      as="form"
+      title="Spawn worker"
+      description="Kick off a worker with a ticket and prompt. Provider tuning lives under Advanced."
+      size="lg"
+      closeLabel="Close spawn dialog"
+      busy={submitting}
+      fallbackRef={fallbackRef}
+      onClose={requestClose}
+      onSubmit={submit}
+      footer={
+        <>
+          <Button variant="ghost" onClick={requestClose} disabled={submitting}>
+            Cancel
+          </Button>
+          <Button
+            type="submit"
+            variant="default"
+            disabled={!canSubmit}
           >
-            <X size={14} />
-          </button>
-        </div>
-
-        <div className="agent-spawn-fields">
+            {submitting ? "Spawning…" : confirming ? "Confirm spawn" : "Spawn"}
+          </Button>
+        </>
+      }
+    >
+      <div className="agent-spawn-fields">
           {/* Lead: what task, and what the worker should do. */}
           <label className="agent-spawn-field">
             <span className="agent-spawn-label">Ticket</span>
@@ -728,33 +730,25 @@ export function SpawnWorkerModal({
           ) : null}
         </div>
 
-        {!ticketValid && normalizedTicket ? (
-          <div className="agent-spawn-error">Ticket ids must stay uppercase and match the worker pattern.</div>
-        ) : null}
-        {!workdirValid ? <div className="agent-spawn-error">Working dir is required.</div> : null}
-        {preludeError ? <div className="agent-spawn-error">{preludeError}</div> : null}
-        {error ? <div className="agent-spawn-error">{error}</div> : null}
-
-        <div className="dialog-actions">
-          <button className="dialog-button" type="button" onClick={requestClose}>
-            Cancel
-          </button>
-          <button className="dialog-button dialog-confirm" disabled={!canSubmit} type="submit">
-            {submitting ? "Spawning…" : confirming ? "Confirm spawn" : "Spawn"}
-          </button>
-        </div>
-      </form>
-    </>
+      {!ticketValid && normalizedTicket ? (
+        <div className="agent-spawn-error">Ticket ids must stay uppercase and match the worker pattern.</div>
+      ) : null}
+      {!workdirValid ? <div className="agent-spawn-error">Working dir is required.</div> : null}
+      {preludeError ? <div className="agent-spawn-error">{preludeError}</div> : null}
+      {error ? <div className="agent-spawn-error">{error}</div> : null}
+    </BbDialog>
   );
 }
 
 export function SpawnOrchestratorModal({
+  fallbackRef,
   models,
   workspaceRoot,
   workspaceRootReady = true,
   onClose,
   onSpawn,
 }: {
+  fallbackRef?: FocusReturnRef;
   models: AgentModelOption[];
   workspaceRoot?: string | null;
   workspaceRootReady?: boolean;
@@ -771,7 +765,6 @@ export function SpawnOrchestratorModal({
   const [confirming, setConfirming] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [advancedOpen, setAdvancedOpen] = useState(false);
-  const dialogRef = useModalA11y<HTMLFormElement>(true, requestClose);
   const projectDirTouched = useRef(false);
   const workspaceRootProvided = workspaceRootReady && Boolean(workspaceRoot?.trim());
 
@@ -860,30 +853,28 @@ export function SpawnOrchestratorModal({
   }
 
   return (
-    <>
-      <div aria-hidden="true" className="settings-backdrop" onClick={requestClose} />
-      <form
-        aria-modal="true"
-        aria-labelledby="spawn-orchestrator-dialog-title"
-        className="dialog agent-spawn-modal"
-        role="dialog"
-        ref={dialogRef}
-        tabIndex={-1}
-        onSubmit={submit}
-      >
-        <div className="settings-header">
-          <div className="dialog-title" id="spawn-orchestrator-dialog-title">Spawn orchestrator</div>
-          <button
-            aria-label="Close orchestrator dialog"
-            className="session-close"
-            type="button"
-            onClick={requestClose}
-          >
-            <X size={14} />
-          </button>
-        </div>
-
-        <div className="agent-spawn-fields">
+    <BbDialog
+      as="form"
+      title="Spawn orchestrator"
+      description="Launch an orchestrator. Provider tuning lives under Advanced."
+      size="lg"
+      closeLabel="Close orchestrator dialog"
+      busy={submitting}
+      fallbackRef={fallbackRef}
+      onClose={requestClose}
+      onSubmit={submit}
+      footer={
+        <>
+          <Button variant="ghost" onClick={requestClose} disabled={submitting}>
+            Cancel
+          </Button>
+          <Button type="submit" variant="default" disabled={!canSubmit}>
+            {submitting ? "Launching…" : confirming ? "Confirm launch" : "Launch"}
+          </Button>
+        </>
+      }
+    >
+      <div className="agent-spawn-fields">
           {/* Lead: who this orchestrator is and what it should do. Provider
               tuning lives inside Advanced (WIKI-154 finding 4 → round-5
               family sweep, orchestrator dialog). */}
@@ -1034,24 +1025,14 @@ export function SpawnOrchestratorModal({
           </div>
         </div>
 
-        {!idValid && normalizedId ? (
-          <div className="agent-spawn-error">
-            Orchestrator ids must start with a letter or number and only use letters, numbers, dashes, or underscores.
-          </div>
-        ) : null}
-        {!projectDirValid ? <div className="agent-spawn-error">Project directory is required.</div> : null}
-        {error ? <div className="agent-spawn-error">{error}</div> : null}
-
-        <div className="dialog-actions">
-          <button className="dialog-button" type="button" onClick={requestClose}>
-            Cancel
-          </button>
-          <button className="dialog-button dialog-confirm" disabled={!canSubmit} type="submit">
-            {submitting ? "Launching…" : confirming ? "Confirm launch" : "Launch"}
-          </button>
+      {!idValid && normalizedId ? (
+        <div className="agent-spawn-error">
+          Orchestrator ids must start with a letter or number and only use letters, numbers, dashes, or underscores.
         </div>
-      </form>
-    </>
+      ) : null}
+      {!projectDirValid ? <div className="agent-spawn-error">Project directory is required.</div> : null}
+      {error ? <div className="agent-spawn-error">{error}</div> : null}
+    </BbDialog>
   );
 }
 
@@ -1235,6 +1216,7 @@ export function AgentsView({
   refreshTick,
   openTicket,
   onOpenTicket,
+  spawnWorkerFallbackRef,
   startRunRequest = 0,
   onStartRunRequestHandled,
 }: {
@@ -1251,6 +1233,7 @@ export function AgentsView({
   refreshTick: number;
   openTicket: AgentOpenTarget | null;
   onOpenTicket: (target: AgentOpenTarget | null) => void;
+  spawnWorkerFallbackRef?: FocusReturnRef;
   startRunRequest?: number;
   onStartRunRequestHandled?: () => void;
 }) {
@@ -1262,6 +1245,8 @@ export function AgentsView({
   const [availableModels, setAvailableModels] = useState<AgentModelOption[]>([]);
   const [spawnWorkerOpen, setSpawnWorkerOpen] = useState(false);
   const [spawnOrchestratorOpen, setSpawnOrchestratorOpen] = useState(false);
+  const spawnOrchestratorTriggerRef = useRef<HTMLButtonElement | null>(null);
+  const replaceFallbackRef = useRef<FocusReturnRef>({ current: null });
   const [replaceTarget, setReplaceTarget] = useState<ReplaceAgentTarget | null>(null);
   const [controlConfirm, setControlConfirm] = useState<string | null>(null);
   const [controlPending, setControlPending] = useState<string | null>(null);
@@ -1904,6 +1889,9 @@ export function AgentsView({
                             type="button"
                             onClick={() => {
                               if (item.disabled) return;
+                              const menuButton = menuButtonRefs.current.get(orch.id);
+                              replaceFallbackRef.current.current = menuButton ?? null;
+                              menuButton?.focus();
                               closeMenu("pointer");
                               item.run();
                             }}
@@ -2230,6 +2218,9 @@ export function AgentsView({
                             type="button"
                             onClick={() => {
                               if (item.disabled) return;
+                              const menuButton = menuButtonRefs.current.get(worker.ticket);
+                              replaceFallbackRef.current.current = menuButton ?? null;
+                              menuButton?.focus();
                               setOpenMenuTicket(null);
                               item.run();
                             }}
@@ -2356,6 +2347,7 @@ export function AgentsView({
             className="agents-orchestrator-button"
             disabled={workers === null}
             leadingIcon={<Bot aria-hidden size={14} />}
+            ref={spawnOrchestratorTriggerRef}
             size="sm"
             variant="outline"
             onClick={() => setSpawnOrchestratorOpen(true)}
@@ -2375,6 +2367,7 @@ export function AgentsView({
       ) : null}
       {spawnWorkerOpen ? (
         <SpawnWorkerModal
+          fallbackRef={spawnWorkerFallbackRef}
           models={availableModels}
           orchestrators={orchestrators}
           onClose={() => setSpawnWorkerOpen(false)}
@@ -2389,6 +2382,7 @@ export function AgentsView({
       ) : null}
       {spawnOrchestratorOpen ? (
         <SpawnOrchestratorModal
+          fallbackRef={spawnOrchestratorTriggerRef}
           models={availableModels}
           workspaceRoot={workspaceRoot}
           workspaceRootReady={workspaceRootReady}
@@ -2403,6 +2397,7 @@ export function AgentsView({
       ) : null}
       {replaceTarget ? (
         <ReplaceAgentModal
+          fallbackRef={replaceFallbackRef.current}
           models={availableModels}
           target={replaceTarget}
           onClose={() => setReplaceTarget(null)}

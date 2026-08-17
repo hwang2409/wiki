@@ -154,6 +154,8 @@
   --surface-destructive: color-mix(in oklab, var(--accent-danger) 8%, var(--background-primary));
   --destructive-text: var(--accent-danger);
   --surface-selected: color-mix(in srgb, var(--accent-primary) 16%, transparent);
+  --surface-scrim: rgb(0 0 0 / 8%);
+  --surface-scrim: color-mix(in oklab, var(--canvas, var(--background-primary, #fff)) 92%, transparent);
   /* bb-language state fills alias the wiki modifier tokens so they cannot
      drift as themes customize their hover/active tints. */
   --state-hover: var(--background-modifier-hover);
@@ -18334,4 +18336,193 @@ body {
 .kanban-column:hover .kanban-add-button.bb-button,
 .kanban-add-button.bb-button:focus-visible {
   opacity: 1;
+}
+
+/* WIKI-308 — bb Dialog shape (settings, spawn, replace, confirm). */
+.bb-dialog-scrim {
+  position: fixed;
+  inset: 0;
+  z-index: 120;
+  background-color: var(--surface-scrim);
+}
+
+.bb-dialog {
+  position: fixed;
+  top: 50%;
+  left: 50%;
+  z-index: 121;
+  display: grid;
+  grid-template-rows: auto minmax(0, 1fr) auto;
+  width: min(560px, calc(100vw - 32px));
+  max-height: min(80vh, 720px);
+  padding: 0;
+  border: 1px solid var(--border-hairline, var(--background-modifier-border));
+  border-radius: var(--radius-xl, 12px);
+  background-color: var(--background-primary);
+  box-shadow: 0 1px 0 0 var(--border-hairline, var(--background-modifier-border)),
+    0 12px 32px -12px color-mix(in oklab, var(--ink, #000) 20%, transparent);
+  translate: -50% -50%;
+  overflow: hidden;
+  outline: none;
+}
+
+.bb-dialog--sm { width: min(440px, calc(100vw - 32px)); }
+.bb-dialog--md { width: min(560px, calc(100vw - 32px)); }
+.bb-dialog--lg,
+.bb-dialog--has-rail { width: min(720px, calc(100vw - 32px)); }
+
+.bb-dialog__header {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 12px;
+  padding: 16px 16px 12px;
+  border-bottom: 1px solid var(--border-seam, var(--background-modifier-border));
+}
+
+.bb-dialog__heading {
+  display: flex;
+  flex: 1;
+  flex-direction: column;
+  gap: 2px;
+  min-width: 0;
+}
+
+.bb-dialog__title {
+  margin: 0;
+  color: var(--text-normal);
+  font-family: var(--font-chrome);
+  font-size: var(--fs-base, 14px);
+  font-weight: 600;
+  letter-spacing: -0.005em;
+  line-height: 1.3;
+}
+
+.bb-dialog__description {
+  margin: 0;
+  color: var(--text-muted);
+  font-size: var(--fs-sm, 13px);
+  line-height: 1.45;
+}
+
+.bb-dialog__close {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 24px;
+  height: 24px;
+  padding: 0;
+  border: 0;
+  border-radius: var(--radius-sm, 4px);
+  background: transparent;
+  color: var(--text-muted);
+  cursor: pointer;
+  transition: background-color var(--motion-duration) var(--motion-easing), color var(--motion-duration) var(--motion-easing);
+}
+
+.bb-dialog__close:hover:not(:disabled) {
+  background: var(--state-hover, var(--background-modifier-hover));
+  color: var(--text-normal);
+}
+
+.bb-dialog__close:focus-visible {
+  outline: 2px solid var(--ring);
+  outline-offset: 2px;
+}
+
+.bb-dialog__close:disabled { cursor: not-allowed; opacity: 0.5; }
+
+.bb-dialog__body { min-height: 0; padding: 16px; overflow-y: auto; }
+
+.bb-dialog__split {
+  display: grid;
+  grid-template-columns: 152px minmax(0, 1fr);
+  min-height: 0;
+  overflow: hidden;
+}
+
+.bb-dialog__rail {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  padding: 12px 8px;
+  border-right: 1px solid var(--border-seam, var(--background-modifier-border));
+  background-color: color-mix(in oklab, var(--ink, transparent) 2.2%, var(--background-primary));
+  overflow-y: auto;
+}
+
+.bb-dialog__rail-item {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  height: 28px;
+  padding: 0 10px;
+  border: 0;
+  border-radius: var(--radius-md, 6px);
+  background: transparent;
+  color: var(--text-muted);
+  font-family: var(--font-chrome);
+  font-size: var(--fs-sm, 13px);
+  font-weight: 500;
+  cursor: pointer;
+  text-align: left;
+  transition: background-color var(--motion-duration) var(--motion-easing), color var(--motion-duration) var(--motion-easing);
+}
+
+.bb-dialog__rail-item:hover { background: var(--state-hover, var(--background-modifier-hover)); color: var(--text-normal); }
+.bb-dialog__rail-item.is-active { background: var(--surface-selected, var(--background-modifier-hover)); color: var(--text-normal); }
+.bb-dialog__rail-item:focus-visible { outline: 2px solid var(--ring); outline-offset: 2px; }
+.bb-dialog__rail-count { color: var(--text-faint); font-variant-numeric: tabular-nums; }
+
+.bb-dialog__footer {
+  display: flex;
+  align-items: center;
+  justify-content: flex-end;
+  gap: 8px;
+  padding: 12px 16px;
+  border-top: 1px solid var(--border-seam, var(--background-modifier-border));
+  background-color: color-mix(in oklab, var(--ink, transparent) 2.2%, var(--background-primary));
+}
+
+.bb-dialog__group { display: flex; flex-direction: column; gap: 14px; }
+.bb-dialog__group + .bb-dialog__group { margin-top: 20px; padding-top: 20px; border-top: 1px solid var(--border-seam, var(--background-modifier-border)); }
+.bb-dialog__group-title { margin: 0; color: var(--text-normal); font-family: var(--font-chrome); font-size: var(--fs-xs, 11px); font-weight: 600; letter-spacing: 0.06em; text-transform: uppercase; }
+.bb-dialog__group-hint { margin: 0; color: var(--text-muted); font-size: var(--fs-sm, 13px); line-height: 1.45; }
+
+.bb-dialog[role="alertdialog"] .bb-dialog__body p { margin: 0; color: var(--text-normal); font-size: var(--fs-sm, 13px); line-height: 1.5; }
+.bb-dialog[role="alertdialog"] .bb-dialog__body p + p { margin-top: 8px; color: var(--text-muted); }
+
+.bb-dialog-input {
+  width: 100%;
+  padding: 8px 12px;
+  border: 1px solid var(--border-hairline, var(--background-modifier-border));
+  border-radius: var(--radius-md, 6px);
+  background-color: var(--background-primary);
+  color: var(--text-normal);
+  font-family: var(--font-monospace);
+  font-size: var(--fs-sm, 13px);
+  outline: none;
+  transition: border-color var(--motion-duration) var(--motion-easing), box-shadow var(--motion-duration) var(--motion-easing);
+}
+
+.bb-dialog-input:focus,
+.bb-dialog-input:focus-visible { border-color: var(--ring); outline: 2px solid var(--ring); outline-offset: 2px; }
+
+@media (max-width: 640px) {
+  .bb-dialog,
+  .bb-dialog--sm,
+  .bb-dialog--md,
+  .bb-dialog--lg,
+  .bb-dialog--has-rail {
+    top: 8px;
+    left: 8px;
+    right: 8px;
+    width: auto;
+    max-height: calc(100vh - 16px);
+    translate: 0 0;
+  }
+
+  .bb-dialog__split { grid-template-columns: minmax(0, 1fr); }
+  .bb-dialog__rail { flex-direction: row; flex-wrap: wrap; border-right: 0; border-bottom: 1px solid var(--border-seam, var(--background-modifier-border)); }
 }

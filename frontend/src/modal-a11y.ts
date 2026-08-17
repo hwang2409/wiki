@@ -1,6 +1,6 @@
-import { useEffect, useRef } from "react";
+import { useLayoutEffect, useRef } from "react";
 
-type ElementRef = { current: HTMLElement | null };
+export type FocusReturnRef = { current: HTMLElement | null };
 
 const FOCUSABLE_SELECTOR = [
   "a[href]",
@@ -10,6 +10,36 @@ const FOCUSABLE_SELECTOR = [
   "textarea:not([disabled])",
   '[tabindex]:not([tabindex="-1"])',
 ].join(",");
+
+let scrollLockCount = 0;
+let previousBodyOverflow: string | null = null;
+let lastInteractionTarget: HTMLElement | null = null;
+
+document.addEventListener(
+  "pointerdown",
+  (event) => {
+    const target = event.target;
+    if (!(target instanceof HTMLElement)) return;
+    lastInteractionTarget = target.closest("button, a, [role='button']") ?? target;
+  },
+  true,
+);
+
+function lockDocumentScroll() {
+  if (scrollLockCount === 0) {
+    previousBodyOverflow = document.body.style.overflow;
+    document.body.style.overflow = "hidden";
+  }
+  scrollLockCount += 1;
+}
+
+function unlockDocumentScroll() {
+  scrollLockCount = Math.max(0, scrollLockCount - 1);
+  if (scrollLockCount === 0 && previousBodyOverflow !== null) {
+    document.body.style.overflow = previousBodyOverflow;
+    previousBodyOverflow = null;
+  }
+}
 
 function focusableWithin(root: HTMLElement): HTMLElement[] {
   return Array.from(root.querySelectorAll<HTMLElement>(FOCUSABLE_SELECTOR)).filter(
@@ -22,20 +52,36 @@ function focusableWithin(root: HTMLElement): HTMLElement[] {
 export function useModalA11y<T extends HTMLElement>(
   open: boolean,
   onEscape?: () => void,
-  fallbackRef?: ElementRef,
+  fallbackRef?: FocusReturnRef,
+  initialFocusRef?: FocusReturnRef,
 ) {
   const dialogRef = useRef<T | null>(null);
   const invokerRef = useRef<HTMLElement | null>(null);
   const onEscapeRef = useRef(onEscape);
   onEscapeRef.current = onEscape;
 
-  useEffect(() => {
+  useLayoutEffect(() => {
     if (!open) return;
     const dialog = dialogRef.current;
     if (!dialog) return;
 
+    lockDocumentScroll();
     const active = document.activeElement;
-    invokerRef.current = active instanceof HTMLElement ? active : null;
+    const isValidCandidate = (candidate: HTMLElement | null | undefined): candidate is HTMLElement =>
+      candidate !== null &&
+      candidate !== undefined &&
+      document.contains(candidate) &&
+      candidate !== document.body &&
+      !dialog.contains(candidate);
+    const fallback = fallbackRef?.current;
+    const validFallback = isValidCandidate(fallback) ? fallback : null;
+    const interactionTarget = isValidCandidate(lastInteractionTarget) ? lastInteractionTarget : null;
+    const activeElement = active instanceof HTMLElement ? active : null;
+    const activeInvoker = isValidCandidate(activeElement)
+      ? activeElement
+      : null;
+    lastInteractionTarget = null;
+    invokerRef.current = validFallback ?? interactionTarget ?? activeInvoker;
     const inertRoots: Array<{
       element: HTMLElement;
       inert: string | null;
@@ -68,11 +114,8 @@ export function useModalA11y<T extends HTMLElement>(
       if (child instanceof HTMLElement) markInert(child);
     }
 
-    const focusFirst = () => {
-      const first = focusableWithin(dialog)[0];
-      (first ?? dialog).focus();
-    };
-    const frame = window.requestAnimationFrame(focusFirst);
+    const initialFocus = initialFocusRef?.current ?? focusableWithin(dialog)[0] ?? dialog;
+    initialFocus.focus();
     const onKeyDown = (event: KeyboardEvent) => {
       if (event.key === "Escape") {
         const onEscape = onEscapeRef.current;
@@ -97,16 +140,16 @@ export function useModalA11y<T extends HTMLElement>(
           event.preventDefault();
           last.focus();
         }
-      } else if (activeElement === last) {
+      } else if (activeElement === last || !dialog.contains(activeElement)) {
         event.preventDefault();
         first.focus();
       }
     };
-    document.addEventListener("keydown", onKeyDown, true);
+    document.addEventListener("keydown", onKeyDown);
 
     return () => {
-      window.cancelAnimationFrame(frame);
-      document.removeEventListener("keydown", onKeyDown, true);
+      document.removeEventListener("keydown", onKeyDown);
+      unlockDocumentScroll();
       for (const root of inertRoots) {
         if (root.inert === null) root.element.removeAttribute("inert");
         else root.element.setAttribute("inert", root.inert);
@@ -124,7 +167,7 @@ export function useModalA11y<T extends HTMLElement>(
         target?.focus();
       });
     };
-  }, [fallbackRef, open]);
+  }, [fallbackRef, initialFocusRef, open]);
 
   return dialogRef;
 }

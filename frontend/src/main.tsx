@@ -1,5 +1,7 @@
 import { StrictMode } from "react";
 import { createRoot } from "react-dom/client";
+import "@fontsource-variable/inter";
+import "@fontsource/fira-code/400.css";
 import "katex/dist/katex.min.css";
 import "react-diff-view/style/index.css";
 import App from "./App";

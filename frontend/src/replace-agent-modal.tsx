@@ -1,11 +1,14 @@
 import { useEffect, useState, type FormEvent } from "react";
-import { ChevronDown, RefreshCw, X } from "lucide-react";
+import { ChevronDown, RefreshCw } from "lucide-react";
 import { getAgentModels, replaceAgent } from "./api";
 import { DisclosureContent } from "./disclosure";
-import { useModalA11y } from "./modal-a11y";
+import { BbDialog } from "./dialogs";
+import type { FocusReturnRef } from "./modal-a11y";
+import { Button } from "./primitives";
 import { isWorkerRole, presetWorkerModel } from "./role-pipeline";
 import type {
   AgentModelOption,
+  ReplaceAgentInput,
   ReplaceAgentResult,
   SpawnWorkerEffort,
   SpawnWorkerKind,
@@ -43,7 +46,9 @@ export function ReplaceAgentModal({
   onClose,
   onReplaced,
   target,
+  fallbackRef,
 }: {
+  fallbackRef?: FocusReturnRef;
   models?: AgentModelOption[];
   onClose: () => void;
   onReplaced?: (result: ReplaceAgentResult) => void;
@@ -56,9 +61,6 @@ export function ReplaceAgentModal({
   const [submitting, setSubmitting] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [advancedOpen, setAdvancedOpen] = useState(false);
-  const dialogRef = useModalA11y<HTMLFormElement>(true, () => {
-    if (!submitting) onClose();
-  });
 
   useEffect(() => {
     if (models) {
@@ -100,11 +102,12 @@ export function ReplaceAgentModal({
     setSubmitting(true);
     setError(null);
     try {
-      const result = await replaceAgent(target.id, {
+      const input: ReplaceAgentInput = {
         kind,
         model,
-        ...(kind === "cdx" ? { effort } : {}),
-      });
+      };
+      if (kind === "cdx") input.effort = effort;
+      const result = await replaceAgent(target.id, input);
       onReplaced?.(result);
       onClose();
     } catch (err) {
@@ -114,37 +117,33 @@ export function ReplaceAgentModal({
   }
 
   return (
-    <>
-      <div aria-hidden="true" className="settings-backdrop" onClick={() => !submitting && onClose()} />
-      <form
-        aria-label={`Replace ${target.id}`}
-        aria-modal="true"
-        aria-labelledby="replace-agent-dialog-title"
-        className="dialog agent-replace-modal"
-        role="dialog"
-        ref={dialogRef}
-        tabIndex={-1}
-        onSubmit={submit}
-      >
-        <div className="settings-header">
-          <div>
-            <div className="dialog-title" id="replace-agent-dialog-title">Replace {target.id}</div>
-            <div className="agent-replace-summary">
-              Stop the current run and continue from its durable context.
-            </div>
-          </div>
-          <button
-            aria-label="Close replace dialog"
-            className="session-close"
-            disabled={submitting}
-            type="button"
-            onClick={onClose}
+    <BbDialog
+      as="form"
+      title={`Replace ${target.id}`}
+      description="Stop the current run and continue from its durable context."
+      size="md"
+      closeLabel="Close replace dialog"
+      busy={submitting}
+      fallbackRef={fallbackRef}
+      onClose={onClose}
+      onSubmit={submit}
+      footer={
+        <>
+          <Button variant="ghost" onClick={onClose} disabled={submitting}>
+            Cancel
+          </Button>
+          <Button
+            type="submit"
+            variant="default"
+            disabled={!model || submitting}
+            leadingIcon={<RefreshCw size={12} />}
           >
-            <X size={14} />
-          </button>
-        </div>
-
-        <div className="agent-spawn-fields">
+            {submitting ? "Replacing…" : "Replace agent"}
+          </Button>
+        </>
+      }
+    >
+      <div className="agent-spawn-fields">
           {/* Default view leads with the task and the change preview. Provider /
               model / effort tuning lives inside Advanced. */}
           <div className="agent-spawn-preview">
@@ -242,21 +241,10 @@ export function ReplaceAgentModal({
           </div>
         </div>
 
-        <div className="agent-replace-warning">
-          This ends the active provider process. The replacement starts with the existing handoff prompt.
-        </div>
-        {error ? <div className="agent-spawn-error">{error}</div> : null}
-
-        <div className="dialog-actions">
-          <button className="dialog-button" disabled={submitting} type="button" onClick={onClose}>
-            Cancel
-          </button>
-          <button className="dialog-button dialog-confirm" disabled={!model || submitting} type="submit">
-            <RefreshCw size={12} />
-            {submitting ? "Replacing…" : "Replace agent"}
-          </button>
-        </div>
-      </form>
-    </>
+      <div className="agent-replace-warning">
+        This ends the active provider process. The replacement starts with the existing handoff prompt.
+      </div>
+      {error ? <div className="agent-spawn-error">{error}</div> : null}
+    </BbDialog>
   );
 }
