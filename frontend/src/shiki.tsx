@@ -10,6 +10,8 @@ import { DEFAULT_THEME, normalizeTheme, type ThemeId } from "./themes";
 const APP_THEME_TO_SHIKI: Record<ThemeId, BundledTheme> = {
   "bb-light": "github-light",
   "bb-dark": "github-dark",
+  "macos-light": "github-light",
+  "macos-dark": "github-dark",
   opencode: "everforest-dark",
   "mono-light": "github-light",
   "mono-dark": "github-dark",
