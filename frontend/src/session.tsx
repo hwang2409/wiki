@@ -2524,7 +2524,7 @@ function ClaudeRateLimitRow({ event }: { event: SessionEvent }) {
 function InterruptRow({ text }: { text: string }) {
   return (
     <div className="session-interrupt">
-      <CircleSlash size={12} />
+      <CircleSlash size={14} />
       <span>{text}</span>
     </div>
   );
@@ -2534,7 +2534,7 @@ function PrRow({ pr, text }: { pr: SessionPr | undefined; text: string }) {
   if (!pr) return null;
   return (
     <a className="session-pr-chip" href={pr.url} {...externalLinkProps(pr.url)}>
-      <GitPullRequest size={12} />
+      <GitPullRequest size={14} />
       <span>{text}</span>
     </a>
   );
@@ -2762,7 +2762,7 @@ const MessageBlock = memo(function MessageBlock({
   if (event.kind === "notification") {
     return (
       <div className="session-notification">
-        <Bell size={12} />
+        <Bell size={14} />
         <span>{event.text}</span>
       </div>
     );
@@ -2770,7 +2770,7 @@ const MessageBlock = memo(function MessageBlock({
   if (event.kind === "command") {
     return (
       <div className="session-command">
-        <SlashSquare size={12} />
+        <SlashSquare size={14} />
         <span>{event.text}</span>
       </div>
     );
