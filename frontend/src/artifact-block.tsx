@@ -1,6 +1,7 @@
 import { useCallback, useEffect, useRef, useState, useSyncExternalStore } from "react";
 import {
   BarChart3,
+  ChevronRight,
   Code2,
   Columns2,
   Copy,
@@ -25,7 +26,7 @@ import type {
   SessionArtifact,
   SessionEvent,
 } from "./api";
-import { classifyArtifact } from "./artifact-kind";
+import { classifyArtifact, humanizeArtifactKind } from "./artifact-kind";
 import { downloadArtifact, imageBase64, textPayload } from "./artifact-payload";
 import { ArtifactError } from "./artifact-state";
 import {
@@ -59,6 +60,14 @@ export const KIND_ICONS: Record<ArtifactKind, LucideIcon> = {
   "visual-diff": Columns2,
 };
 
+
+function formatBytes(bytes: number): string {
+  if (!Number.isFinite(bytes) || bytes < 0) return "";
+  if (bytes < 1024) return `${bytes} B`;
+  if (bytes < 1024 * 1024) return `${(bytes / 1024).toFixed(1)} KB`;
+  if (bytes < 1024 * 1024 * 1024) return `${(bytes / (1024 * 1024)).toFixed(1)} MB`;
+  return `${(bytes / (1024 * 1024 * 1024)).toFixed(2)} GB`;
+}
 
 function mermaidNodeCount(source: string): number {
   const nodes = new Set<string>();
@@ -212,6 +221,8 @@ export function ArtifactBlock({
   const artifact = event.artifact;
   const inlineSessionKey = sessionKey ?? ticket;
   const [inspect, setInspect] = useState(false);
+  const [rawOpen, setRawOpen] = useState(false);
+  const [rawCopied, setRawCopied] = useState(false);
   const [copied, setCopied] = useState(false);
   const [imageBounds, setImageBounds] = useState<{ width: number; height: number } | null>(null);
   const [renderFailure, setRenderFailure] = useState<ArtifactRenderFailure | null>(null);
@@ -283,8 +294,9 @@ export function ArtifactBlock({
   const oversized = artifactExceedsInlineThreshold(resolvedArtifact, imageBounds);
   const showCompact = oversized && !inlineExpanded;
   const primaryTitle = event.title || resolvedArtifact.filename || null;
-  const headingTitle = primaryTitle || resolvedArtifact.kind;
+  const headingTitle = primaryTitle || "Untitled artifact";
   const descriptionText = event.caption || (primaryTitle && resolvedArtifact.filename && resolvedArtifact.filename !== primaryTitle ? resolvedArtifact.filename : null);
+  const kindLabel = humanizeArtifactKind(resolvedArtifact.kind);
 
   function showCopied() {
     setCopied(true);
@@ -322,6 +334,7 @@ export function ArtifactBlock({
           <div className="artifact-heading">
             <Icon aria-hidden="true" size={13} />
             <span className="artifact-title" title={headingTitle}>{headingTitle}</span>
+            <span className="artifact-kind-chip">{kindLabel}</span>
             {descriptionText ? (
               <span className="artifact-caption" title={descriptionText}>{descriptionText}</span>
             ) : null}
@@ -418,10 +431,74 @@ export function ArtifactBlock({
       {inspect ? (
         <aside aria-label="Artifact inspector" className="artifact-inspect-panel">
           <header>
-            <span>Artifact event</span>
+            <span>Details</span>
             <button aria-label="Close artifact inspector" type="button" onClick={() => setInspect(false)}><X size={13} /></button>
           </header>
-          <pre>{JSON.stringify(event, null, 2)}</pre>
+          <dl className="bb-detail-card bb-detail-card--flat artifact-inspect-details">
+            <div className="bb-detail-row">
+              <dt className="bb-detail-row__label">Title</dt>
+              <dd className="bb-detail-row__value">{primaryTitle ?? "Untitled artifact"}</dd>
+            </div>
+            <div className="bb-detail-row">
+              <dt className="bb-detail-row__label">Type</dt>
+              <dd className="bb-detail-row__value">{kindLabel}</dd>
+            </div>
+            {resolvedArtifact.byte_size !== undefined && resolvedArtifact.byte_size > 0 ? (
+              <div className="bb-detail-row">
+                <dt className="bb-detail-row__label">Size</dt>
+                <dd className="bb-detail-row__value tabular-nums">{formatBytes(resolvedArtifact.byte_size)}</dd>
+              </div>
+            ) : null}
+            {resolvedArtifact.filename ? (
+              <div className="bb-detail-row">
+                <dt className="bb-detail-row__label">Source</dt>
+                <dd className="bb-detail-row__value"><code>{resolvedArtifact.filename}</code></dd>
+              </div>
+            ) : null}
+            {resolvedArtifact.mime ? (
+              <div className="bb-detail-row">
+                <dt className="bb-detail-row__label">MIME</dt>
+                <dd className="bb-detail-row__value"><code>{resolvedArtifact.mime}</code></dd>
+              </div>
+            ) : null}
+            {event.artifact_id ? (
+              <div className="bb-detail-row">
+                <dt className="bb-detail-row__label">ID</dt>
+                <dd className="bb-detail-row__value"><code>{event.artifact_id}</code></dd>
+              </div>
+            ) : null}
+          </dl>
+          <div className="artifact-inspect-raw">
+            <button
+              aria-expanded={rawOpen}
+              aria-controls={`artifact-inspect-raw-${event.artifact_id ?? "unknown"}`}
+              className="artifact-inspect-raw-toggle"
+              type="button"
+              onClick={() => setRawOpen((value) => !value)}
+            >
+              <ChevronRight aria-hidden="true" size={12} className={`artifact-inspect-raw-caret${rawOpen ? " is-open" : ""}`} />
+              <span>View raw event</span>
+            </button>
+            {rawOpen ? (
+              <div className="artifact-inspect-raw-body" id={`artifact-inspect-raw-${event.artifact_id ?? "unknown"}`}>
+                <div className="artifact-inspect-raw-actions">
+                  <button
+                    className="artifact-action"
+                    type="button"
+                    onClick={() => {
+                      void navigator.clipboard.writeText(JSON.stringify(event, null, 2));
+                      setRawCopied(true);
+                      window.setTimeout(() => setRawCopied(false), 1400);
+                    }}
+                  >
+                    <Copy aria-hidden="true" size={12} />
+                    <span className="artifact-action-label">{rawCopied ? "Copied" : "Copy JSON"}</span>
+                  </button>
+                </div>
+                <pre>{JSON.stringify(event, null, 2)}</pre>
+              </div>
+            ) : null}
+          </div>
         </aside>
       ) : null}
     </div>

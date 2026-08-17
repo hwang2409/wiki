@@ -18,10 +18,8 @@ import { classifyArtifact, humanizeArtifactKind } from "./artifact-kind";
 import { ArtifactFallback } from "./artifact-state";
 import type { ArtifactViewState, PanelState } from "./transcript-store";
 
-function titleFor(event: SessionEvent | undefined, _id: string): string {
-  return event?.title
-    || event?.artifact?.filename
-    || humanizeArtifactKind(event?.artifact?.kind);
+function tabLabelFor(event: SessionEvent | undefined): string {
+  return event?.title || event?.artifact?.filename || humanizeArtifactKind(event?.artifact?.kind);
 }
 
 
@@ -113,68 +111,89 @@ export function ArtifactPanel({
       onKeyDown={onKeyDown}
     >
       <div aria-label="Resize artifact panel" className="session-resize" onPointerDown={onResizeStart} />
-      <div className="artifact-panel-tabs" role="tablist" aria-label="Open artifacts">
-        {state.tabs.map((artifactId) => {
-          const event = artifacts.get(artifactId);
-          const selected = artifactId === focusedId;
-          const label = titleFor(event, artifactId);
-          return (
-            <div className={`artifact-panel-tab${selected ? " is-active" : ""}`} key={artifactId}>
-              <button
-                aria-selected={selected}
-                className="artifact-panel-tab-main"
-                role="tab"
-                title={label}
-                type="button"
-                onClick={() => onFocusTab(artifactId)}
+      <div className="artifact-panel-chrome">
+        <div className="artifact-panel-tabs" role="tablist" aria-label="Open artifacts">
+          {state.tabs.map((artifactId) => {
+            const event = artifacts.get(artifactId);
+            const selected = artifactId === focusedId;
+            const label = tabLabelFor(event);
+            return (
+              <div
+                className={`bb-tab-pill bb-tab-pill--closable${selected ? " bb-tab-pill--active" : ""}`}
+                key={artifactId}
               >
-                <span>{label}</span>
-              </button>
-              <button aria-label={`Close ${label}`} className="artifact-panel-tab-action" type="button" onClick={() => onCloseTab(artifactId)}><X size={12} /></button>
-            </div>
-          );
-        })}
-        <div className="artifact-panel-overflow" ref={overflowRef}>
-          <button
-            aria-controls="artifact-panel-overflow-menu"
-            aria-expanded={overflowOpen}
-            aria-label="Artifact panel menu"
-            className="artifact-panel-close artifact-panel-overflow-toggle"
-            type="button"
-            onClick={() => setOverflowOpen((value) => !value)}
-          >
-            <MoreHorizontal size={14} />
-          </button>
-          {overflowOpen ? (
-            <div className="artifact-panel-overflow-menu" id="artifact-panel-overflow-menu" role="menu">
-              {state.recentlyClosed.length > 0 ? (
-                <>
-                  <div className="artifact-panel-overflow-heading" role="presentation">
-                    <Clock3 aria-hidden="true" size={11} />
-                    <span>Recently closed</span>
-                  </div>
-                  {state.recentlyClosed.map((artifactId) => (
-                    <button
-                      className="artifact-panel-overflow-item"
-                      key={artifactId}
-                      role="menuitem"
-                      type="button"
-                      onClick={() => {
-                        setOverflowOpen(false);
-                        onReopen(artifactId);
-                      }}
-                    >
-                      {titleFor(artifacts.get(artifactId), artifactId)}
-                    </button>
-                  ))}
-                </>
-              ) : (
-                <div className="artifact-panel-overflow-empty" role="presentation">No recently closed artifacts.</div>
-              )}
-            </div>
-          ) : null}
+                <button
+                  aria-selected={selected}
+                  className="bb-tab-pill__button"
+                  role="tab"
+                  title={label}
+                  type="button"
+                  onClick={() => onFocusTab(artifactId)}
+                >
+                  <span className="bb-tab-pill__label">{label}</span>
+                </button>
+                <button
+                  aria-label={`Close ${label}`}
+                  className="bb-tab-pill__close"
+                  type="button"
+                  onClick={() => onCloseTab(artifactId)}
+                >
+                  <X aria-hidden="true" className="bb-tab-pill__close-glyph" />
+                </button>
+              </div>
+            );
+          })}
         </div>
-        <button aria-label="Close artifact panel" className="artifact-panel-close" type="button" onClick={onClosePanel}><X size={14} /></button>
+        <div className="artifact-panel-actions">
+          <div className="artifact-panel-overflow" ref={overflowRef}>
+            <button
+              aria-controls="artifact-panel-overflow-menu"
+              aria-expanded={overflowOpen}
+              aria-label="Artifact panel menu"
+              className="bb-icon-button"
+              type="button"
+              onClick={() => setOverflowOpen((value) => !value)}
+            >
+              <MoreHorizontal aria-hidden="true" />
+            </button>
+            {overflowOpen ? (
+              <div className="artifact-panel-overflow-menu" id="artifact-panel-overflow-menu" role="menu">
+                {state.recentlyClosed.length > 0 ? (
+                  <>
+                    <div className="artifact-panel-overflow-heading" role="presentation">
+                      <Clock3 aria-hidden="true" size={11} />
+                      <span>Recently closed</span>
+                    </div>
+                    {state.recentlyClosed.map((artifactId) => (
+                      <button
+                        className="artifact-panel-overflow-item"
+                        key={artifactId}
+                        role="menuitem"
+                        type="button"
+                        onClick={() => {
+                          setOverflowOpen(false);
+                          onReopen(artifactId);
+                        }}
+                      >
+                        {tabLabelFor(artifacts.get(artifactId))}
+                      </button>
+                    ))}
+                  </>
+                ) : (
+                  <div className="artifact-panel-overflow-empty" role="presentation">No recently closed artifacts.</div>
+                )}
+              </div>
+            ) : null}
+          </div>
+          <button
+            aria-label="Close artifact panel"
+            className="bb-icon-button"
+            type="button"
+            onClick={onClosePanel}
+          >
+            <X aria-hidden="true" />
+          </button>
+        </div>
       </div>
       <div className="artifact-panel-detail" data-artifact-detail-kind={artifact?.kind}>
         {detail ?? (
