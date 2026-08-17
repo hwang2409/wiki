@@ -723,38 +723,10 @@ button:disabled {
   font-size: var(--font-ui-small);
 }
 
-/* Search panel */
-
-.search-panel {
-  display: flex;
-  flex-direction: column;
-  min-height: 0;
-  flex: 1;
-}
-
-.search-input-container {
-  padding: 8px;
-}
-
-.search-input-container input {
-  width: 100%;
-  padding: 6px 10px;
-  border: 1px solid var(--background-modifier-border);
-  border-radius: var(--radius-s);
-  background-color: var(--background-primary);
-  color: var(--text-normal);
-  font-family: inherit;
-  font-size: var(--font-ui-small);
-  outline: none;
-}
-
-.search-input-container input:focus {
-  border-color: var(--text-faint);
-}
-
-.search-input-container input::placeholder {
-  color: var(--text-faint);
-}
+/* Search results (used by the sidebar-search-overlay in App.tsx). The
+   old .search-panel + .search-input-container wrappers were retired
+   with the Search sidebar tab in WIKI-299; results now render directly
+   inside .sidebar-search-overlay above and share these row styles. */
 
 .search-results {
   flex: 1;
@@ -17297,3 +17269,210 @@ body {
   color: var(--text-normal);
 }
 
+/* ================================================================== */
+/* WIKI-299: bb sidebar section grammar                               */
+/*                                                                    */
+/* Sticky section-label tier + sticky parent-folder tier, 28px row    */
+/* anatomy (40px on coarse pointers), persistent inline search,       */
+/* manilla search-match tint. Layers on top of the WIKI-246 reskin    */
+/* without breaking WIKI-246 chrome assertions on .tree-item-self     */
+/* and .nav-agent hover/active rules.                                 */
+/* ================================================================== */
+
+.workspace-sidebar {
+  /* Row-height + sticky tier tokens (bb theme.css:130-160 parity). The
+     bb reference uses 28px rows with a 40px coarse-pointer bump; the
+     sticky project/label/parent-row tiers are derived from these. */
+  --wiki-sidebar-row-height: 28px;
+  --wiki-sidebar-parent-stride: 28px;
+  --wiki-sidebar-sticky-label-top: 0;
+  --wiki-sidebar-sticky-parent-base-top: 0;
+  --wiki-sidebar-search-match:
+    color-mix(in oklab, oklch(0.8 0.13 88) 24%, transparent);
+}
+
+@media (max-width: 767px) and (pointer: coarse) {
+  .workspace-sidebar {
+    --wiki-sidebar-row-height: 40px;
+    --wiki-sidebar-parent-stride: 40px;
+  }
+}
+
+/* Persistent inline search — the sidebar's top chrome. Always visible;
+   no longer a separate mode. Query persists across section collapse
+   and tab switches; results overlay replaces the mode body. */
+
+.sidebar-search {
+  position: relative;
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  margin: 6px 8px 4px;
+  padding: 0 8px;
+  height: var(--wiki-sidebar-row-height);
+  border: 1px solid var(--border-hairline, var(--background-modifier-border));
+  border-radius: var(--radius-md);
+  background-color: var(--background-primary);
+  transition-property: border-color, box-shadow;
+  transition-duration: var(--motion-duration);
+  transition-timing-function: var(--motion-easing);
+}
+
+.sidebar-search:focus-within {
+  border-color: var(--border-active, var(--text-faint));
+  box-shadow: 0 0 0 2px color-mix(in srgb, var(--ring, var(--text-normal)) 18%, transparent);
+}
+
+.sidebar-search-icon {
+  flex-shrink: 0;
+  color: var(--text-faint);
+}
+
+.sidebar-search-input {
+  min-width: 0;
+  flex: 1;
+  padding: 0;
+  border: 0;
+  background-color: transparent;
+  color: var(--text-normal);
+  font-family: inherit;
+  font-size: var(--fs-sm);
+  outline: none;
+}
+
+.sidebar-search-input::placeholder {
+  color: var(--text-faint);
+}
+
+.sidebar-search-clear {
+  display: inline-flex;
+  flex-shrink: 0;
+  align-items: center;
+  justify-content: center;
+  width: 18px;
+  height: 18px;
+  border-radius: var(--radius-sm);
+  color: var(--text-faint);
+  background-color: transparent;
+}
+
+.sidebar-search-clear:hover {
+  background-color: var(--state-hover, var(--background-modifier-hover));
+  color: var(--text-muted);
+}
+
+/* Search-results overlay: replaces the active mode body when query
+   is non-empty. Same row shape as the file tree. */
+
+.sidebar-search-overlay {
+  display: flex;
+  flex: 1;
+  flex-direction: column;
+  min-height: 0;
+  padding: 4px 6px 24px;
+  overflow-y: auto;
+}
+
+.sidebar-search-overlay .search-result {
+  min-height: var(--wiki-sidebar-row-height);
+  padding: 4px 10px;
+  border-radius: var(--radius-md);
+  gap: 2px;
+}
+
+.sidebar-search-overlay .search-result mark {
+  padding: 0 2px;
+  border-radius: 3px;
+  background-color: var(--wiki-sidebar-search-match);
+  color: inherit;
+}
+
+.sidebar-search-overlay .search-result:hover {
+  background-color: var(--state-hover, var(--background-modifier-hover));
+}
+
+.sidebar-search-overlay .search-result:active:not(:disabled) {
+  scale: 0.98;
+}
+
+/* Tree row anatomy: bb 28px rows, icon+label, translucent hover,
+   quiet selection. The WIKI-246 rules at ~16481 still win — this
+   block only sets height + scale-on-press + sticky readiness. */
+
+.tree-item-self {
+  min-height: var(--wiki-sidebar-row-height);
+  align-items: center;
+  gap: 6px;
+}
+
+.tree-item-self:active:not(:disabled) {
+  scale: 0.98;
+}
+
+/* Sticky parent-folder tier: each folder button pins as its subtree
+   scrolls past, stacking depth-first so ancestors stay visible. Depth
+   is set inline per row via --folder-depth. Shallower ancestors get
+   higher z-index so they cover deeper rows during overlap. Backing
+   fill comes from --background-panel so scrolled content cannot
+   bleed through the pinned row. */
+
+.nav-files-container .tree-item-self.nav-folder-title,
+.sidebar-search-overlay .tree-item-self.nav-folder-title {
+  position: sticky;
+  top: calc(var(--folder-depth, 0) * var(--wiki-sidebar-parent-stride));
+  z-index: calc(30 - var(--folder-depth, 0));
+  background-color: var(--background-panel);
+}
+
+.nav-files-container .tree-item-self.nav-folder-title:hover {
+  background-color: color-mix(
+    in srgb,
+    var(--state-hover, var(--background-modifier-hover)) 100%,
+    var(--background-panel)
+  );
+}
+
+/* Agents in the sidebar: 28px row anatomy, sticky group labels.
+   Preserves WIKI-247 (no active dot on nav-agent) and WIKI-246
+   hover assertions (background-only, no color/border-color). */
+
+.nav-agent {
+  min-height: var(--wiki-sidebar-row-height);
+  padding-top: 4px;
+  padding-bottom: 4px;
+}
+
+.nav-agent.is-owned {
+  min-height: var(--wiki-sidebar-row-height);
+}
+
+.nav-orch-toggle {
+  min-height: var(--wiki-sidebar-row-height);
+}
+
+/* Sticky Active / group labels inside the nav-agents scroll container.
+   Same tier grammar as folder rows: pins under the mode title. */
+
+.nav-agents .nav-agents-group-title {
+  position: sticky;
+  top: 0;
+  z-index: 30;
+  margin: 0;
+  padding: 8px 10px 4px;
+  border-top: 0;
+  background-color: var(--background-panel);
+}
+
+.nav-agents-group-title:first-child {
+  padding-top: 4px;
+}
+
+/* Sticky orchestrator row header — pins one stride below the Active
+   group label so a scrolled worker list still shows its orch. */
+
+.nav-agents .nav-orch-row {
+  position: sticky;
+  top: calc(var(--wiki-sidebar-parent-stride) + 4px);
+  z-index: 20;
+  background-color: var(--background-panel);
+}
