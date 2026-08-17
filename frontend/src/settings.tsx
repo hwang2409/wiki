@@ -1,15 +1,14 @@
-import { useEffect, useMemo, useRef, useState } from "react";
-import { ChevronDown } from "lucide-react";
+import { useEffect, useMemo, useState } from "react";
 import { THEMES, type ThemeId } from "./themes";
 import { applyLowercase, getStoredLowercase } from "./lowercase-mode";
 import { BbDialog, DialogRail } from "./dialogs";
 import type { FocusReturnRef } from "./modal-a11y";
 import { Button } from "./primitives";
+import { FontSettings } from "./font-settings";
 import {
   classifyEnumerated,
   fetchInstalledFamilies,
   fetchInstalledFonts,
-  INSTALLED_FONT_FACE_REGISTERED_EVENT,
   isEnumeratedFamily,
   loadInstalledFontsForClassification,
   makeCanvasMonoProbe,
@@ -196,7 +195,7 @@ const CHROME_FAMILY_VARS = FAMILY_VARS.filter((cssVar) => cssVar !== "--font-mon
 const MONO_FAMILY_VARS = ["--font-monospace"];
 
 const MONO_SAMPLE = "→ const x = 0O1lIi";
-const PROP_SAMPLE = "The quick brown fox";
+export const PROP_SAMPLE = "The quick brown fox";
 
 function firstStored(keys: string[]): string | null {
   for (const key of keys) {
@@ -227,7 +226,7 @@ function migrateLegacyOnce(): void {
   }
 }
 
-async function loadFontFaces(choice: FontChoice): Promise<void> {
+export async function loadFontFaces(choice: FontChoice): Promise<void> {
   if (!document.fonts) return;
   await Promise.all(
     WEIGHT_STOPS.map((weight) =>
@@ -297,7 +296,7 @@ const ALWAYS_AVAILABLE_FAMILIES = new Set([
   "Moxy Static",
 ]);
 
-function isAvailable(choice: FontChoice): boolean {
+export function isAvailable(choice: FontChoice): boolean {
   if (ALWAYS_AVAILABLE_FAMILIES.has(choice.family)) return true;
   if (isEnumeratedFamily(choice.family)) return true;
   return isFontInstalled(choice.family);
@@ -323,7 +322,7 @@ function measureWeightSignature(ctx: CanvasRenderingContext2D, family: string, w
     .join("|");
 }
 
-function preferredWeight(weights: number[]): number {
+export function preferredWeight(weights: number[]): number {
   return weights.reduce((best, weight) =>
     Math.abs(weight - 400) < Math.abs(best - 400) ? weight : best
   );
@@ -384,7 +383,7 @@ export function detectFontWeights(family: string): number[] {
   }
 }
 
-function weightLabel(weight: number): string {
+export function weightLabel(weight: number): string {
   return WEIGHT_LABELS[weight] ?? String(weight);
 }
 
@@ -429,7 +428,7 @@ function storedSize(): number {
   return Number.isFinite(raw) && raw >= SIZE_MIN && raw <= SIZE_MAX ? raw : SIZE_DEFAULT;
 }
 
-function pickChoice(fonts: FontChoice[], stored: string | null): FontChoice {
+export function pickChoice(fonts: FontChoice[], stored: string | null): FontChoice {
   if (stored) {
     const hit = fonts.find((font) => font.label === stored);
     if (hit) return hit;
@@ -443,11 +442,11 @@ function pickChoice(fonts: FontChoice[], stored: string | null): FontChoice {
 
 // Any CSS font-weight is legal (1–1000): variable fonts render arbitrary
 // values, static fonts round to the nearest face.
-function clampWeight(weight: number): number {
+export function clampWeight(weight: number): number {
   return Math.min(1000, Math.max(1, Math.round(weight)));
 }
 
-function storedWeight(): number | null {
+export function storedWeight(): number | null {
   const raw = localStorage.getItem(WEIGHT_KEY);
   if (raw === null) return null;
   const weight = Number(raw);
@@ -477,7 +476,7 @@ function persistFontLabel(label: string, fonts: FontChoice[]) {
   applyFamilyEverywhere(choice);
 }
 
-function setFontWeight(weight: number | null) {
+export function setFontWeight(weight: number | null) {
   if (weight === null) localStorage.removeItem(WEIGHT_KEY);
   else localStorage.setItem(WEIGHT_KEY, String(weight));
   applyWeightEverywhere(weight);
@@ -488,201 +487,6 @@ function setFontSize(size: number) {
   applySizeEverywhere(size);
 }
 
-function FontPicker({
-  fonts,
-  current,
-  sample,
-  weight,
-  onChange,
-}: {
-  fonts: FontChoice[];
-  current: string;
-  sample: string;
-  weight: number;
-  onChange: (label: string) => void;
-}) {
-  const [open, setOpen] = useState(false);
-  const [availTick, setAvailTick] = useState(0);
-  const [query, setQuery] = useState("");
-  const rootRef = useRef<HTMLDivElement | null>(null);
-  const filterRef = useRef<HTMLInputElement | null>(null);
-  const optionRefs = useRef<Array<HTMLButtonElement | null>>([]);
-  const triggerRef = useRef<HTMLButtonElement | null>(null);
-  const wasOpenRef = useRef(false);
-  const [activeIndex, setActiveIndex] = useState(0);
-
-  const currentChoice = useMemo(() => pickChoice(fonts, current), [fonts, current]);
-
-  useEffect(() => {
-    if (!open) {
-      setQuery("");
-      return;
-    }
-    setAvailTick((t) => t + 1);
-  }, [open, fonts]);
-
-  useEffect(() => {
-    if (!open) return;
-    void Promise.all(fonts.map(loadFontFaces));
-  }, [open, fonts]);
-
-  useEffect(() => {
-    if (!open) return;
-    // Focus the filter on open so power users can type-narrow immediately.
-    filterRef.current?.focus();
-  }, [open]);
-
-  useEffect(() => {
-    if (!open) return;
-    const onDocDown = (event: MouseEvent) => {
-      if (!rootRef.current) return;
-      if (!rootRef.current.contains(event.target as Node)) setOpen(false);
-    };
-    document.addEventListener("mousedown", onDocDown);
-    return () => {
-      document.removeEventListener("mousedown", onDocDown);
-    };
-  }, [open]);
-
-  useEffect(() => {
-    if (wasOpenRef.current && !open) triggerRef.current?.focus();
-    wasOpenRef.current = open;
-  }, [open]);
-
-  const available = useMemo(
-    () => fonts.filter((font) => font.label === current || isAvailable(font)),
-    // availTick invalidates the memo after loads land
-    [fonts, current, availTick]
-  );
-  const visible = useMemo(() => {
-    const needle = query.trim().toLowerCase();
-    if (!needle) return available;
-    return available.filter((font) => font.label.toLowerCase().includes(needle));
-  }, [available, query]);
-
-  useEffect(() => {
-    if (!open) return;
-    const selectedIndex = visible.findIndex((font) => font.label === current);
-    setActiveIndex(selectedIndex >= 0 ? selectedIndex : 0);
-  }, [current, open, visible]);
-
-  function focusOption(index: number) {
-    if (visible.length === 0) return;
-    const nextIndex = Math.max(0, Math.min(index, visible.length - 1));
-    setActiveIndex(nextIndex);
-    optionRefs.current[nextIndex]?.focus();
-  }
-
-  function handlePickerNavigation(event: React.KeyboardEvent<HTMLElement>) {
-    if (visible.length === 0) return;
-    if (event.key === "ArrowDown") {
-      event.preventDefault();
-      focusOption(activeIndex + 1);
-    } else if (event.key === "ArrowUp") {
-      event.preventDefault();
-      focusOption(activeIndex - 1);
-    } else if (event.key === "Home") {
-      event.preventDefault();
-      focusOption(0);
-    } else if (event.key === "End") {
-      event.preventDefault();
-      focusOption(visible.length - 1);
-    }
-  }
-
-  return (
-    <div
-      className={`font-picker${open ? " is-open" : ""}`}
-      ref={rootRef}
-      onKeyDown={(event) => {
-        if (!open || event.key !== "Escape") return;
-        event.preventDefault();
-        event.stopPropagation();
-        setOpen(false);
-      }}
-    >
-      <button
-        aria-expanded={open}
-        aria-haspopup="listbox"
-        className="font-picker-trigger"
-        ref={triggerRef}
-        type="button"
-        onClick={() => setOpen((o) => !o)}
-      >
-        <span
-          className="font-picker-trigger-label"
-          style={{ fontFamily: currentChoice.stack, fontWeight: weight }}
-        >
-          {currentChoice.label}
-        </span>
-        <ChevronDown aria-hidden className="font-picker-trigger-chevron" size={14} />
-      </button>
-      {open ? (
-        <div className="font-picker-menu">
-          <input
-            aria-label="Filter fonts"
-            className="font-picker-filter"
-            placeholder="Filter fonts"
-            ref={filterRef}
-            type="text"
-            value={query}
-            onChange={(event) => setQuery(event.target.value)}
-            onKeyDown={(event) => {
-              handlePickerNavigation(event);
-              if (event.key === "Enter" && visible.length > 0) {
-                event.preventDefault();
-                onChange(visible[0].label);
-                setOpen(false);
-              }
-            }}
-          />
-          <div
-            aria-label="Available fonts"
-            className="font-picker-options"
-            role="listbox"
-            onKeyDown={handlePickerNavigation}
-          >
-            {visible.length === 0 ? (
-              <div className="font-picker-empty">No fonts match “{query}”.</div>
-            ) : null}
-            {visible.map((font, index) => {
-              const active = font.label === current;
-              return (
-                <button
-                  aria-selected={active}
-                  className={`font-picker-option${active ? " is-active" : ""}`}
-                  key={font.label}
-                  ref={(element) => { optionRefs.current[index] = element; }}
-                  role="option"
-                  tabIndex={index === activeIndex ? 0 : -1}
-                  type="button"
-                  onClick={() => {
-                    onChange(font.label);
-                    setOpen(false);
-                  }}
-                >
-                  <span
-                    className="font-picker-option-label"
-                    style={{ fontFamily: font.stack, fontWeight: weight }}
-                  >
-                    {font.label}
-                  </span>
-                  <span
-                    aria-hidden
-                    className="font-picker-option-sample"
-                    style={{ fontFamily: font.stack, fontWeight: weight }}
-                  >
-                    {sample}
-                  </span>
-                </button>
-              );
-            })}
-          </div>
-        </div>
-      ) : null}
-    </div>
-  );
-}
 
 // Enumerated OS families arrive from the backend once per session. The
 // unified single-font pool absorbs BOTH mono and proportional buckets, each
@@ -717,128 +521,6 @@ function useInstalledFontPool(): FontChoice[] {
   }, [installed]);
 }
 
-function FontRow({
-  fonts,
-  label,
-  weight,
-  onFontChange,
-  onWeightChange,
-}: {
-  fonts: FontChoice[];
-  label: string;
-  weight: number;
-  onFontChange: (label: string) => void;
-  onWeightChange: (weight: number) => void;
-}) {
-  const [weights, setWeights] = useState<number[]>([]);
-  const [fontFaceRevision, setFontFaceRevision] = useState(0);
-  const [weightText, setWeightText] = useState(() => String(storedWeight() ?? 400));
-  const choice = useMemo(() => pickChoice(fonts, label), [fonts, label]);
-
-  useEffect(() => {
-    const onFaceRegistered = (event: Event) => {
-      const family = handleInstalledFontFaceRegistered(event);
-      if (family !== choice.family) return;
-      setFontFaceRevision((revision) => revision + 1);
-    };
-    window.addEventListener(INSTALLED_FONT_FACE_REGISTERED_EVENT, onFaceRegistered);
-    return () => window.removeEventListener(INSTALLED_FONT_FACE_REGISTERED_EVENT, onFaceRegistered);
-  }, [choice.family]);
-
-  useEffect(() => {
-    let cancelled = false;
-    void loadFontFaces(choice).then(() => {
-      if (cancelled) return;
-      const nextWeights = detectFontWeights(choice.family);
-      // A saved weight is respected as-is, even off the detected stops —
-      // arbitrary values are the point (variable fonts). Only the unset case
-      // adopts the face's preferred default.
-      const savedWeight = storedWeight();
-      const nextWeight = savedWeight ?? preferredWeight(nextWeights);
-      if (savedWeight === null && nextWeight !== 400) {
-        setFontWeight(nextWeight);
-      }
-      setWeights(nextWeights);
-      onWeightChange(nextWeight);
-      setWeightText(String(nextWeight));
-    });
-    return () => {
-      cancelled = true;
-    };
-  }, [choice, fontFaceRevision, onWeightChange]);
-
-  const applyWeight = (next: number) => {
-    setFontWeight(next);
-    onWeightChange(next);
-  };
-
-  return (
-    <div className="settings-row">
-      <div className="settings-row-info">
-        <div className="settings-row-name">Font</div>
-        <div className="settings-row-desc">
-          One family for every surface — prose, chat, code, diffs, chrome, dashboard.
-        </div>
-      </div>
-      <div className="font-setting-controls">
-        <FontPicker
-          current={label}
-          fonts={fonts}
-          sample={PROP_SAMPLE}
-          weight={weight}
-          onChange={(next) => {
-            onFontChange(next);
-            setWeights([]);
-          }}
-        />
-        <input
-          aria-label="Font weight (1–1000)"
-          className="font-weight-input"
-          inputMode="numeric"
-          max={1000}
-          min={1}
-          step={1}
-          title="Font weight, any value from 1 to 1000"
-          type="number"
-          value={weightText}
-          onBlur={() => {
-            const parsed = Number(weightText);
-            const next = Number.isFinite(parsed) && weightText.trim() !== "" ? clampWeight(parsed) : weight;
-            applyWeight(next);
-            setWeightText(String(next));
-          }}
-          onChange={(event) => {
-            const raw = event.target.value;
-            setWeightText(raw);
-            const parsed = Number(raw);
-            if (Number.isFinite(parsed) && parsed >= 1 && parsed <= 1000) {
-              applyWeight(clampWeight(parsed));
-            }
-          }}
-        />
-        {weights.length > 1 ? (
-          <div aria-label="Detected font weights" className="font-weight-stops" role="group">
-            {weights.map((option) => (
-              <button
-                key={option}
-                className={`font-weight-stop${option === weight ? " is-active" : ""}`}
-                title={weightLabel(option)}
-                type="button"
-                onClick={() => {
-                  applyWeight(option);
-                  setWeightText(String(option));
-                }}
-              >
-                {option}
-              </button>
-            ))}
-          </div>
-        ) : null}
-      </div>
-    </div>
-  );
-}
-
 export function SettingsModal({
   fallbackRef,
   onClose,
@@ -852,8 +534,6 @@ export function SettingsModal({
 }) {
   const [size, setSize] = useState(() => storedSize());
   const [lowercase, setLowercase] = useState(() => getStoredLowercase());
-  const [fontLabel, setFontLabel] = useState(() => currentLabel());
-  const [fontWeight, setFontWeightState] = useState(() => storedWeight() ?? 400);
   const [section, setSection] = useState<SettingsSection>("appearance");
   const fontPool = useInstalledFontPool();
 
@@ -960,15 +640,14 @@ export function SettingsModal({
           aria-labelledby="bb-rail-typography"
           className="bb-dialog__group"
         >
-          <FontRow
+          <FontSettings
             fonts={fontPool}
-            label={fontLabel}
-            weight={fontWeight}
+            initialLabel={currentLabel()}
+            initialWeight={storedWeight() ?? 400}
             onFontChange={(next) => {
-              setFontLabel(next);
               persistFontLabel(next, fontPool);
             }}
-            onWeightChange={setFontWeightState}
+            onWeightChange={setFontWeight}
           />
           <div
             className="settings-preview"

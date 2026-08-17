@@ -67,17 +67,21 @@ export function useModalA11y<T extends HTMLElement>(
 
     lockDocumentScroll();
     const active = document.activeElement;
+    const isValidCandidate = (candidate: HTMLElement | null | undefined): candidate is HTMLElement =>
+      candidate !== null &&
+      candidate !== undefined &&
+      document.contains(candidate) &&
+      candidate !== document.body &&
+      !dialog.contains(candidate);
     const fallback = fallbackRef?.current;
-    const interactionTarget = lastInteractionTarget && document.contains(lastInteractionTarget)
-      ? lastInteractionTarget
-      : null;
-    const activeInvoker = active instanceof HTMLElement &&
-      active !== document.body &&
-      !dialog.contains(active)
-      ? active
+    const validFallback = isValidCandidate(fallback) ? fallback : null;
+    const interactionTarget = isValidCandidate(lastInteractionTarget) ? lastInteractionTarget : null;
+    const activeElement = active instanceof HTMLElement ? active : null;
+    const activeInvoker = isValidCandidate(activeElement)
+      ? activeElement
       : null;
     lastInteractionTarget = null;
-    invokerRef.current = interactionTarget ?? activeInvoker ?? fallback ?? null;
+    invokerRef.current = validFallback ?? interactionTarget ?? activeInvoker;
     const inertRoots: Array<{
       element: HTMLElement;
       inert: string | null;

@@ -79,7 +79,7 @@ import {
   slashMenuOptionId,
 } from "./composer-slash-menu";
 import { externalLinkProps } from "./external-links";
-import { useModalA11y } from "./modal-a11y";
+import { useModalA11y, type FocusReturnRef } from "./modal-a11y";
 import {
   GhPreviewCard,
   GhPreviewInline,
@@ -865,13 +865,14 @@ export function SessionModelFooter({
   const [loading, setLoading] = useState(false);
   const [confirmModel, setConfirmModel] = useState<string | null>(null);
   const modelTriggerRef = useRef<HTMLButtonElement | null>(null);
+  const modelConfirmFallbackRef = useRef<FocusReturnRef>({ current: null });
   const modelA11yId = useId();
   const modelMenuId = `session-model-menu-${modelA11yId}`;
   const modelConfirmTitleId = `session-model-confirm-title-${modelA11yId}`;
   const modelConfirmRef = useModalA11y<HTMLDivElement>(
     Boolean(confirmModel),
     () => setConfirmModel(null),
-    modelTriggerRef,
+    modelConfirmFallbackRef.current,
   );
   const modelMenuRef = useRef<HTMLDivElement | null>(null);
   const modelOptionRefs = useRef<Array<HTMLButtonElement | null>>([]);
@@ -944,6 +945,7 @@ export function SessionModelFooter({
         ticket,
         result.desired_model === undefined ? confirmModel : result.desired_model,
       );
+      modelConfirmFallbackRef.current.current = modelTriggerRef.current;
       setConfirmModel(null);
       setOpen(false);
       invalidateTranscript(ticket, "session");
@@ -1027,7 +1029,10 @@ export function SessionModelFooter({
               role="menuitem"
               tabIndex={index === menuActiveIndex ? 0 : -1}
               type="button"
-              onClick={() => setConfirmModel(option.id)}
+              onClick={(event) => {
+                modelConfirmFallbackRef.current.current = event.currentTarget;
+                setConfirmModel(option.id);
+              }}
             >
               <span>{option.label}</span>
               <code>{option.id}</code>

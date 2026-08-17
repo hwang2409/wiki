@@ -1,5 +1,5 @@
-import { useId } from "react";
-import type { FormEventHandler, ReactNode } from "react";
+import { useId, useRef } from "react";
+import type { FormEventHandler, KeyboardEvent, ReactNode } from "react";
 import { X } from "lucide-react";
 import { useModalA11y, type FocusReturnRef } from "./modal-a11y";
 
@@ -124,7 +124,7 @@ export function BbDialog(props: BbDialogProps) {
 
   const body = rail ? (
     <div className="bb-dialog__split">
-      <nav className="bb-dialog__rail" aria-label="Sections">
+      <nav className="bb-dialog__rail" aria-label="Sections" role="tablist" aria-orientation="vertical">
         {rail}
       </nav>
       <div className="bb-dialog__body">{children}</div>
@@ -203,19 +203,36 @@ export interface DialogRailProps {
 }
 
 export function DialogRail({ items, active, onSelect }: DialogRailProps) {
+  const buttonRefs = useRef<Array<HTMLButtonElement | null>>([]);
+
+  function moveFocus(index: number, event: KeyboardEvent<HTMLButtonElement>) {
+    let nextIndex: number | null = null;
+    if (event.key === "ArrowDown") nextIndex = (index + 1) % items.length;
+    else if (event.key === "ArrowUp") nextIndex = (index - 1 + items.length) % items.length;
+    else if (event.key === "Home") nextIndex = 0;
+    else if (event.key === "End") nextIndex = items.length - 1;
+    if (nextIndex === null) return;
+    event.preventDefault();
+    buttonRefs.current[nextIndex]?.focus();
+  }
+
   return (
     <>
-      {items.map((item) => {
+      {items.map((item, index) => {
         const isActive = item.id === active;
         return (
           <button
             key={item.id}
             id={`bb-rail-${item.id}`}
             aria-controls={`bb-rail-panel-${item.id}`}
-            aria-pressed={isActive}
+            aria-selected={isActive}
+            role="tab"
+            ref={(element) => { buttonRefs.current[index] = element; }}
+            tabIndex={isActive ? 0 : -1}
             type="button"
             className={`bb-dialog__rail-item${isActive ? " is-active" : ""}`}
             onClick={() => onSelect(item.id)}
+            onKeyDown={(event) => moveFocus(index, event)}
           >
             <span className="bb-dialog__rail-label">{item.label}</span>
             {item.count !== undefined ? (
