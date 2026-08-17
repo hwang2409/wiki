@@ -279,7 +279,7 @@ export function KanbanBoard({
       {lanes.map((lane) => (
         <section
           aria-label={lane.title}
-          className="kanban-column bb-detail-card"
+          className="kanban-column"
           key={lane.title}
           style={
             {
