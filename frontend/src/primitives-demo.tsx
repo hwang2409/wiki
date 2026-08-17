@@ -24,6 +24,7 @@ import {
   type ButtonSize,
   type ButtonVariant
 } from "./primitives";
+import { toast, Toaster } from "./toast";
 
 const BUTTON_VARIANTS: ButtonVariant[] = [
   "default",
@@ -213,6 +214,58 @@ export function PrimitivesDemo() {
           </MenuRow>
         </div>
       </section>
+
+      <section className="bb-primitives-demo__section" aria-labelledby="primitives-toast">
+        <h2 className="bb-primitives-demo__section-title" id="primitives-toast">
+          Toast
+        </h2>
+        <div className="bb-primitives-demo__row">
+          <div className="bb-primitives-demo__row-label">trigger</div>
+          <div className="bb-primitives-demo__row-content">
+            <Button
+              size="sm"
+              variant="secondary"
+              onClick={() => toast.message("Reminder", { description: "Something worth noticing" })}
+            >
+              Message
+            </Button>
+            <Button
+              size="sm"
+              variant="secondary"
+              onClick={() =>
+                toast.success("Spawned PHO-15864", {
+                  description: "run 8f4a1c2b · log /tmp/pho-15864.log",
+                })
+              }
+            >
+              Success
+            </Button>
+            <Button
+              size="sm"
+              variant="secondary"
+              onClick={() =>
+                toast.warning("Codex limit approaching", {
+                  description: "70 minutes of budget remaining across your accounts.",
+                })
+              }
+            >
+              Warning
+            </Button>
+            <Button
+              size="sm"
+              variant="destructive"
+              onClick={() =>
+                toast.error("Could not save note", {
+                  description: "Backend returned 500 while writing vault/log/2026-08-17.md.",
+                })
+              }
+            >
+              Error
+            </Button>
+          </div>
+        </div>
+      </section>
+      <Toaster />
     </div>
   );
 }

@@ -863,17 +863,6 @@ button:disabled {
   flex-shrink: 0;
 }
 
-.notice {
-  display: flex;
-  align-items: center;
-  gap: 8px;
-  margin: 0 12px 8px;
-  padding: 6px 10px;
-  border-left: 2px solid var(--accent-danger, var(--text-normal));
-  color: var(--text-normal);
-  font-size: var(--fs-sm);
-}
-
 .app-container.sidebar-hidden {
   grid-template-columns: 0 minmax(0, 1fr);
 }
@@ -17476,3 +17465,211 @@ body {
   z-index: 20;
   background-color: var(--background-panel);
 }
+
+/* WIKI-302 — Toast surface (bb sonner shape).
+   Bottom-right stack of one-line-with-optional-description cards. Transient
+   errors and receipts live here; the persistent inline banner in agents.tsx
+   is the only remaining static error surface. */
+.bb-toaster {
+  position: fixed;
+  bottom: 16px;
+  right: 16px;
+  z-index: 200;
+  display: flex;
+  flex-direction: column-reverse;
+  gap: 8px;
+  align-items: stretch;
+  max-width: min(calc(100vw - 32px), 380px);
+  pointer-events: none;
+}
+
+.bb-toast {
+  display: grid;
+  grid-template-columns: 16px minmax(0, 1fr) auto;
+  align-items: start;
+  gap: 12px;
+  padding: 10px 12px;
+  border: 1px solid var(--border-hairline);
+  border-radius: var(--radius-md);
+  background: var(--background-primary);
+  color: var(--text-normal);
+  box-shadow: var(--shadow-lifted, 0 2px 6px rgb(0 0 0 / 8%), 0 6px 20px rgb(0 0 0 / 12%));
+  pointer-events: auto;
+  opacity: 0;
+  transform: translateY(8px);
+  transition-property: opacity, transform;
+  transition-duration: var(--motion-duration);
+  transition-timing-function: var(--motion-easing);
+  overflow-wrap: anywhere;
+}
+
+.bb-toast.is-mounted {
+  opacity: 1;
+  transform: translateY(0);
+}
+
+.bb-toast.is-leaving {
+  opacity: 0;
+  transform: translateY(4px);
+}
+
+.bb-toast__icon {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 16px;
+  height: 20px;
+  color: var(--text-muted);
+}
+
+.bb-toast.is-success .bb-toast__icon {
+  color: var(--accent-success);
+}
+
+.bb-toast.is-warning .bb-toast__icon {
+  color: var(--accent-warning, var(--accent-danger));
+}
+
+.bb-toast.is-error .bb-toast__icon {
+  color: var(--accent-danger);
+}
+
+.bb-toast__copy {
+  min-width: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+}
+
+.bb-toast__title {
+  font-size: var(--fs-sm, 13px);
+  font-weight: var(--fw-medium, 500);
+  line-height: 1.35;
+  color: var(--text-normal);
+}
+
+.bb-toast__description {
+  font-size: var(--fs-xs, 12px);
+  line-height: 1.4;
+  color: var(--text-muted);
+}
+
+.bb-toast__close {
+  align-self: start;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 20px;
+  height: 20px;
+  padding: 0;
+  border: none;
+  background: transparent;
+  color: var(--text-faint, var(--text-muted));
+  border-radius: var(--radius-sm, 4px);
+  cursor: pointer;
+  opacity: 0;
+  transition-property: opacity, background-color, color;
+  transition-duration: var(--motion-duration);
+  transition-timing-function: var(--motion-easing);
+}
+
+.bb-toast:hover .bb-toast__close,
+.bb-toast:focus-within .bb-toast__close {
+  opacity: 1;
+}
+
+.bb-toast__close:hover,
+.bb-toast__close:focus-visible {
+  background: var(--state-hover, var(--background-modifier-hover));
+  color: var(--text-normal);
+  outline: none;
+}
+
+.bb-toast__close:focus-visible {
+  box-shadow: 0 0 0 2px var(--ring, var(--text-normal));
+}
+
+/* Extend the interactive close hit-area without visually enlarging the glyph. */
+.bb-toast__close::before {
+  content: "";
+  position: absolute;
+  inset: -10px;
+}
+
+.bb-toast__close {
+  position: relative;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .bb-toast,
+  .bb-toast.is-mounted,
+  .bb-toast.is-leaving {
+    transform: none;
+    transition-property: opacity;
+  }
+}
+
+/* WIKI-302 — Persistent account banner (bb-detail-card shape).
+   Replaces the ad-hoc coloured left-border strip; keeps AccountEventsBanner
+   for unrecoverable states (sign-in required, quota exhausted). */
+.agents-account-banner {
+  gap: 6px;
+}
+
+.agents-account-banner-row {
+  display: grid;
+  grid-template-columns: 16px minmax(0, 1fr);
+  gap: 10px;
+  align-items: start;
+  padding: 10px 12px;
+  border: 1px solid var(--border-hairline);
+  border-left-width: 1px;
+  border-radius: var(--radius-md);
+  background: var(--surface-raised, var(--background-secondary));
+  color: var(--text-normal);
+  font-family: var(--font-chrome, inherit);
+  font-weight: 400;
+  font-size: var(--fs-sm, 13px);
+  line-height: 1.4;
+  overflow-wrap: anywhere;
+}
+
+.agents-account-banner-row.is-info {
+  color: var(--text-normal);
+}
+
+.agents-account-banner-row.is-warn {
+  color: var(--text-normal);
+}
+
+.agents-account-banner-row.is-danger {
+  color: var(--destructive-text, var(--accent-danger));
+  border-color: color-mix(in oklab, var(--accent-danger) 45%, var(--border-hairline));
+  background: color-mix(in oklab, var(--accent-danger) 6%, var(--background-primary));
+}
+
+.agents-account-banner-row svg {
+  width: 16px;
+  height: 16px;
+  margin-top: 2px;
+  color: var(--text-muted);
+}
+
+.agents-account-banner-row.is-warn svg {
+  color: var(--accent-warning, var(--accent-danger));
+}
+
+.agents-account-banner-row.is-danger svg {
+  color: var(--destructive-text, var(--accent-danger));
+}
+
+.agents-account-banner-row.is-warn .agents-account-banner-action,
+.agents-account-banner-row.is-danger .agents-account-banner-action {
+  color: inherit;
+  opacity: 0.85;
+}
+
+.agents-account-banner-diagnostics {
+  border-left-color: color-mix(in oklab, currentColor 30%, transparent);
+}
+
