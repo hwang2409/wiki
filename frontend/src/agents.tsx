@@ -1869,6 +1869,7 @@ export function AgentsView({
                             type="button"
                             onClick={() => {
                               if (item.disabled) return;
+                              menuButtonRefs.current.get(orch.id)?.focus();
                               closeMenu("pointer");
                               item.run();
                             }}
@@ -2195,6 +2196,7 @@ export function AgentsView({
                             type="button"
                             onClick={() => {
                               if (item.disabled) return;
+                              menuButtonRefs.current.get(worker.ticket)?.focus();
                               setOpenMenuTicket(null);
                               item.run();
                             }}
