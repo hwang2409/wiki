@@ -298,6 +298,7 @@ button:disabled {
   .status-bar,
   .activity-feed,
   .agents-view,
+  .session-scroll,
   .session-tab,
   .dialog
 ) :where(.lucide[width="10"], .lucide[width="11"], .lucide[width="12"], .lucide[width="13"]) {
@@ -3560,7 +3561,7 @@ body.is-resizing-panes .pane-cell {
   border: 1px solid var(--background-modifier-border);
   border-radius: var(--radius-m);
   background-color: var(--code-background);
-  line-height: 1.5;
+  line-height: var(--font-control-line-height);
   min-width: 0;
 }
 
@@ -3592,7 +3593,7 @@ body.is-resizing-panes .pane-cell {
   border: 1px solid var(--background-modifier-border);
   border-radius: var(--radius-m);
   font-size: var(--font-control-size);
-  line-height: 1.5;
+  line-height: var(--font-control-line-height);
   min-width: 0;
 }
 
@@ -4870,15 +4871,15 @@ body.is-resizing-panes .pane-cell {
   display: flex;
   flex-direction: column;
   justify-content: flex-end;
-  height: calc(var(--fleet-screencast-lines) * var(--font-chrome-size) * var(--fleet-screencast-line-height) + 12px);
-  min-height: calc(var(--fleet-screencast-lines) * var(--font-chrome-size) * var(--fleet-screencast-line-height) + 12px);
-  max-height: calc(var(--fleet-screencast-lines) * var(--font-chrome-size) * var(--fleet-screencast-line-height) + 12px);
+  height: calc(var(--fleet-screencast-lines) * var(--font-control-size) * var(--fleet-screencast-line-height) + 12px);
+  min-height: calc(var(--fleet-screencast-lines) * var(--font-control-size) * var(--fleet-screencast-line-height) + 12px);
+  max-height: calc(var(--fleet-screencast-lines) * var(--font-control-size) * var(--fleet-screencast-line-height) + 12px);
   padding: 6px 8px;
   overflow: hidden;
   background-color: var(--background-primary);
   color: var(--text-muted);
   font-family: var(--font-monospace);
-  font-size: var(--font-chrome-size);
+  font-size: var(--font-control-size);
   line-height: var(--fleet-screencast-line-height);
   white-space: nowrap;
   contain: layout paint size;
@@ -4900,6 +4901,7 @@ body.is-resizing-panes .pane-cell {
 
 .fleet-screencast-line[data-kind="assistant"] .fleet-screencast-text {
   color: var(--text-normal);
+  font-size: var(--font-prose-size);
 }
 
 .fleet-screencast-line[data-kind="tool"] .fleet-screencast-text {
@@ -4908,6 +4910,7 @@ body.is-resizing-panes .pane-cell {
 
 .fleet-screencast-line[data-kind="user"] .fleet-screencast-text {
   color: var(--text-accent);
+  font-size: var(--font-prose-size);
 }
 
 .fleet-screencast-line[data-kind="marker"] .fleet-screencast-text {
@@ -4916,7 +4919,8 @@ body.is-resizing-panes .pane-cell {
 
 .fleet-screencast-glyph {
   flex: 0 0 auto;
-  width: 10px;
+  width: var(--icon-chrome-size);
+  height: var(--icon-chrome-size);
   color: var(--text-faint);
   text-align: center;
 }
@@ -5666,19 +5670,27 @@ body.is-resizing-panes .pane-cell {
   color: var(--text-muted);
   font-family: var(--font-monospace);
   font-weight: var(--font-monospace-weight);
-  font-size: var(--font-chrome-size);
   overflow-wrap: anywhere;
 }
 
 .session-notification {
   color: var(--text-faint);
+  font-size: var(--font-prose-size);
+  line-height: var(--font-prose-line-height);
   border-style: dashed;
   background-color: transparent;
+}
+
+.session-command {
+  font-size: var(--font-control-size);
+  line-height: var(--font-control-line-height);
 }
 
 .session-notification svg,
 .session-command svg {
   flex-shrink: 0;
+  width: var(--icon-chrome-size);
+  height: var(--icon-chrome-size);
   align-self: center;
 }
 
@@ -5692,7 +5704,7 @@ body.is-resizing-panes .pane-cell {
   font-family: var(--font-monospace);
   font-weight: var(--font-monospace-weight);
   font-size: var(--font-control-size);
-  line-height: 1.55;
+  line-height: var(--font-control-line-height);
   white-space: pre-wrap;
   overflow-wrap: anywhere;
 }
@@ -5961,6 +5973,12 @@ body.is-resizing-panes .pane-cell {
   font-size: var(--font-chrome-size);
 }
 
+.session-interrupt svg,
+.session-pr-chip svg {
+  width: var(--icon-chrome-size);
+  height: var(--icon-chrome-size);
+}
+
 .session-pr-chip {
   display: inline-flex;
   align-items: center;
@@ -6146,14 +6164,15 @@ body.is-resizing-panes .pane-cell {
   color: var(--readback-foreground);
   font-family: var(--font-monospace);
   font-weight: var(--font-monospace-weight);
-  font-size: var(--font-chrome-size);
+  font-size: var(--font-control-size);
+  line-height: var(--font-control-line-height);
   overflow-wrap: anywhere;
 }
 
 .session-marker-label {
   flex: 0 0 auto;
   color: var(--text-faint);
-  font-size: var(--fs-2xs);
+  font-size: var(--font-control-size);
   font-weight: var(--fw-semibold);
   letter-spacing: var(--section-label-tracking);
   text-transform: uppercase;
@@ -6196,13 +6215,14 @@ body.is-resizing-panes .pane-cell {
   color: var(--text-muted);
   font-family: var(--font-monospace);
   font-weight: var(--font-monospace-weight);
-  font-size: var(--font-chrome-size);
-  line-height: 1.55;
+  font-size: var(--font-prose-size);
+  line-height: var(--font-prose-line-height);
 }
 
 .session-synthetic-source-chip {
   flex-shrink: 0;
   color: var(--text-faint);
+  font-size: var(--font-chrome-size);
   letter-spacing: 0.02em;
   text-transform: none;
 }
@@ -6216,7 +6236,7 @@ body.is-resizing-panes .pane-cell {
   align-self: flex-start;
   font-family: var(--font-monospace);
   font-weight: var(--font-monospace-weight);
-  font-size: var(--font-chrome-size);
+  font-size: var(--font-control-size);
   color: var(--text-faint);
 }
 
@@ -6274,6 +6294,8 @@ body.is-resizing-panes .pane-cell {
   border-radius: var(--radius-xs);
   background-color: var(--background-primary);
   color: var(--text-muted);
+  font-size: var(--font-control-size);
+  line-height: var(--font-control-line-height);
   overflow-wrap: anywhere;
 }
 
@@ -6287,7 +6309,7 @@ body.is-resizing-panes .pane-cell {
 .codex-stream-artifact-count,
 .codex-stream-diff-kind {
   color: var(--text-faint);
-  font-size: var(--fs-2xs);
+  font-size: var(--font-chrome-size);
 }
 
 /* Coalesced provider diagnostics (WIKI-239). One row per stable
@@ -6334,6 +6356,8 @@ body.is-resizing-panes .pane-cell {
   background: transparent;
   color: var(--text-normal);
   font: inherit;
+  font-size: var(--font-control-size);
+  line-height: var(--font-control-line-height);
   text-align: left;
   cursor: pointer;
 }
@@ -6368,7 +6392,7 @@ body.is-resizing-panes .pane-cell {
 .codex-stream-diagnostic-flag {
   flex-shrink: 0;
   color: var(--text-faint);
-  font-size: var(--fs-2xs);
+  font-size: var(--font-chrome-size);
   text-transform: lowercase;
 }
 
@@ -6388,7 +6412,7 @@ body.is-resizing-panes .pane-cell {
   border-radius: var(--radius-full);
   background-color: color-mix(in srgb, var(--text-normal) 12%, transparent);
   color: var(--text-normal);
-  font-size: var(--fs-2xs);
+  font-size: var(--font-chrome-size);
   font-weight: var(--fw-semibold);
   text-align: center;
 }
@@ -6423,7 +6447,8 @@ body.is-resizing-panes .pane-cell {
   margin: 0;
   color: var(--text-normal);
   font-family: inherit;
-  font-size: var(--fs-xs);
+  font-size: var(--font-control-size);
+  line-height: var(--font-control-line-height);
   white-space: pre-wrap;
   overflow-wrap: anywhere;
 }
@@ -6432,6 +6457,7 @@ body.is-resizing-panes .pane-cell {
   min-width: 0;
   overflow: hidden;
   color: var(--text-normal);
+  font-size: var(--font-control-size);
   text-overflow: ellipsis;
   white-space: pre;
 }
@@ -6455,6 +6481,7 @@ body.is-resizing-panes .pane-cell {
   border: 1px solid color-mix(in srgb, var(--accent-primary) 50%, var(--background-modifier-border));
   border-radius: var(--radius-full);
   color: var(--accent-primary);
+  font-size: var(--font-chrome-size);
   white-space: nowrap;
 }
 
@@ -6545,7 +6572,7 @@ body.is-resizing-panes .pane-cell {
   color: var(--text-muted);
   font-family: var(--font-monospace);
   font-weight: var(--font-monospace-weight);
-  font-size: var(--fs-xs);
+  font-size: var(--font-control-size);
   text-transform: lowercase;
   cursor: pointer;
 }
@@ -6591,8 +6618,8 @@ body.is-resizing-panes .pane-cell {
   min-width: 0;
   border-top: 1px solid var(--background-modifier-border);
   color: var(--text-muted);
-  font-size: var(--fs-2xs);
-  line-height: 1.45;
+  font-size: var(--font-control-size);
+  line-height: var(--font-control-line-height);
 }
 
 .codex-stream-diff-hunk + .codex-stream-diff-hunk {
@@ -6602,6 +6629,7 @@ body.is-resizing-panes .pane-cell {
 .codex-stream-diff-hunk-head {
   padding: 3px 7px;
   color: var(--text-faint);
+  font-size: var(--font-chrome-size);
 }
 
 .codex-stream-diff-line {
@@ -7936,7 +7964,8 @@ body.is-resizing-panes .pane-cell {
   color: inherit;
   font-family: var(--font-monospace);
   font-weight: var(--font-monospace-weight);
-  font-size: var(--font-chrome-size);
+  font-size: var(--font-control-size);
+  line-height: var(--font-control-line-height);
   text-align: left;
 }
 
@@ -8011,7 +8040,7 @@ body.is-resizing-panes .pane-cell {
   background: transparent;
   color: var(--text-muted);
   font: inherit;
-  font-size: var(--fs-xs);
+  font-size: var(--font-control-size);
   cursor: pointer;
 }
 
@@ -8167,14 +8196,14 @@ body.is-resizing-panes .pane-cell {
 .session-tool-output-peek-meta {
   flex: 0 0 auto;
   color: var(--text-faint);
-  font-size: var(--fs-xs);
+  font-size: var(--font-chrome-size);
   font-variant-numeric: tabular-nums;
 }
 
 .session-tool-output-peek-hint {
   flex: 0 0 auto;
   color: var(--text-faint);
-  font-size: var(--fs-xs);
+  font-size: var(--font-control-size);
   opacity: 0;
   /* WIKI-298 survivor: `opacity` reveals the hint on hover. */
   transition-property: opacity;
@@ -8196,7 +8225,7 @@ body.is-resizing-panes .pane-cell {
   color: var(--text-faint);
   font: inherit;
   font-family: var(--font-monospace);
-  font-size: var(--fs-xs);
+  font-size: var(--font-control-size);
   font-style: italic;
   cursor: pointer;
 }
@@ -8216,7 +8245,7 @@ body.is-resizing-panes .pane-cell {
   background: transparent;
   color: inherit;
   font-family: var(--font-monospace);
-  font-size: var(--fs-xs);
+  font-size: var(--font-control-size);
   cursor: pointer;
   /* WIKI-298 survivor: `opacity` reveals the toggle on head hover. */
   transition-property: opacity, background-color, border-color, color;
@@ -8273,7 +8302,7 @@ body.is-resizing-panes .pane-cell {
 .session-tool-result-state {
   flex-shrink: 0;
   color: var(--activity-metadata-color);
-  font-size: var(--fs-xs);
+  font-size: var(--font-chrome-size);
   letter-spacing: 0.04em;
   text-transform: uppercase;
 }
@@ -8307,7 +8336,7 @@ body.is-resizing-panes .pane-cell {
   color: var(--text-muted);
   font-family: var(--font-monospace);
   font-weight: var(--font-monospace-weight);
-  font-size: var(--fs-xs);
+  font-size: var(--font-control-size);
 }
 
 .session-subtrace-more {
@@ -8315,7 +8344,7 @@ body.is-resizing-panes .pane-cell {
   color: var(--text-faint);
   font-family: var(--font-monospace);
   font-weight: var(--font-monospace-weight);
-  font-size: var(--fs-xs);
+  font-size: var(--font-control-size);
 }
 
 .session-tool-body pre {
@@ -8327,7 +8356,7 @@ body.is-resizing-panes .pane-cell {
   font-family: var(--font-monospace);
   font-weight: var(--font-monospace-weight);
   font-size: var(--font-control-size);
-  line-height: 1.5;
+  line-height: var(--font-control-line-height);
   white-space: pre-wrap;
   overflow-wrap: break-word;
 }
@@ -8367,7 +8396,7 @@ body.is-resizing-panes .pane-cell {
   font-weight: var(--font-agent-prose-weight, var(--font-text-weight));
   font-size: var(--font-control-size);
   font-style: normal;
-  line-height: 1.6;
+  line-height: var(--font-control-line-height);
   white-space: pre-wrap;
   overflow-wrap: break-word;
 }
@@ -8387,7 +8416,8 @@ body.is-resizing-panes .pane-cell {
   color: var(--activity-state-working-color);
   font: inherit;
   font-family: var(--font-monospace);
-  font-size: var(--font-chrome-size);
+  font-size: var(--font-control-size);
+  line-height: var(--font-control-line-height);
   text-align: left;
   cursor: pointer;
 }
@@ -8417,6 +8447,10 @@ body.is-resizing-panes .pane-cell {
 .session-thinking-title,
 .session-thinking-duration {
   color: inherit;
+}
+
+.session-thinking-duration {
+  font-size: var(--font-chrome-size);
 }
 
 .session-thinking-chip {
@@ -8608,7 +8642,8 @@ body.is-resizing-panes .pane-cell {
   gap: 2px;
   font-family: var(--font-monospace);
   font-weight: var(--font-monospace-weight);
-  font-size: var(--font-chrome-size);
+  font-size: var(--font-control-size);
+  line-height: var(--font-control-line-height);
 }
 
 /* ANSI (SGR) — colored terminal-style output inside bash/tool/pane-log pres.
@@ -9467,7 +9502,7 @@ body.is-resizing-panes .pane-cell {
   border: 1px solid var(--background-modifier-border);
   border-radius: var(--radius-xs);
   color: var(--text-muted);
-  font-size: var(--fs-xs);
+  font-size: var(--font-control-size);
   cursor: pointer;
 }
 
@@ -11515,8 +11550,8 @@ textarea.composer-command-input {
   color: var(--text-normal);
   font-family: var(--font-monospace);
   font-weight: var(--font-monospace-weight);
-  font-size: var(--font-chrome-size);
-  line-height: 1.55;
+  font-size: var(--font-control-size);
+  line-height: var(--font-control-line-height);
 }
 
 .artifact-code-line {
@@ -12701,7 +12736,8 @@ textarea.composer-command-input {
   --diff-font-family: var(--font-monospace);
   font-family: var(--font-monospace);
   font-weight: var(--font-monospace-weight);
-  font-size: var(--font-chrome-size);
+  font-size: var(--font-control-size);
+  line-height: var(--font-control-line-height);
   color: var(--text-normal);
 }
 
@@ -12764,7 +12800,7 @@ textarea.composer-command-input {
   display: block;
   min-width: 0;
   padding: 4px 0;
-  line-height: 1.55;
+  line-height: var(--font-control-line-height);
 }
 
 /* WIKI-251: side-by-side split — deletions LEFT / insertions RIGHT, aligned
