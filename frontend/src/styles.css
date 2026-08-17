@@ -3080,7 +3080,7 @@ body.is-resizing-panes .pane-cell {
 }
 
 .kanban-add-button:active {
-  scale: 0.98;
+  scale: 0.96;
 }
 
 .kanban-add-button:hover {
@@ -3906,17 +3906,19 @@ body.is-resizing-panes .pane-cell {
 
 .utility-page-header {
   display: flex;
-  align-items: flex-end;
+  align-items: center;
   justify-content: space-between;
-  gap: 16px;
-  padding: 18px 24px 14px;
-  border-bottom: 1px solid var(--background-modifier-border);
+  gap: 12px;
+  min-height: 40px;
+  height: auto;
+  padding: 6px 12px;
 }
 
 .utility-page-heading {
   display: flex;
   flex-direction: column;
-  gap: 2px;
+  align-items: flex-start;
+  gap: 1px;
   min-width: 0;
 }
 
@@ -3924,7 +3926,7 @@ body.is-resizing-panes .pane-cell {
   margin: 0;
   color: var(--text-normal);
   font-family: var(--font-chrome);
-  font-size: var(--fs-lg);
+  font-size: var(--fs-sm);
   font-weight: var(--fw-semibold);
   letter-spacing: -0.005em;
 }
@@ -3932,7 +3934,9 @@ body.is-resizing-panes .pane-cell {
 .utility-page-subtitle {
   margin: 0;
   color: var(--text-muted);
-  font-size: var(--font-ui-small);
+  font-size: var(--fs-xs);
+  line-height: 1.25;
+  text-wrap: pretty;
 }
 
 .utility-page-subtitle code,
@@ -3950,7 +3954,7 @@ body.is-resizing-panes .pane-cell {
 .utility-page-actions {
   display: inline-flex;
   align-items: center;
-  gap: 8px;
+  gap: 4px;
   flex-wrap: wrap;
 }
 
@@ -4208,18 +4212,25 @@ body.is-resizing-panes .pane-cell {
   margin-bottom: 4px;
 }
 
+.activity-commit.bb-detail-card {
+  gap: 0;
+  overflow: hidden;
+  padding: 0;
+  background: var(--surface-raised);
+}
+
 .activity-commit-row {
   display: flex;
   align-items: baseline;
   gap: 8px;
   width: 100%;
-  padding: 5px 8px;
+  padding: 6px 10px;
   border-radius: var(--radius-s);
   text-align: left;
 }
 
 .activity-commit-row:hover {
-  background-color: var(--background-modifier-hover);
+  background-color: var(--state-hover, var(--background-modifier-hover));
 }
 
 .activity-commit-row .collapse-icon {
@@ -4878,18 +4889,17 @@ body.is-resizing-panes .pane-cell {
   display: flex;
   align-items: center;
   flex-wrap: wrap;
-  gap: 12px;
+  gap: 8px;
   margin-bottom: 16px;
 }
 
 .health-stat {
-  display: flex;
-  align-items: baseline;
-  gap: 6px;
-  padding: 6px 12px;
-  border: 1px solid var(--background-modifier-border);
-  border-radius: var(--radius-m);
-  background-color: var(--background-secondary);
+  min-width: 176px;
+  flex: 1 1 176px;
+}
+
+.health-stat .bb-detail-row {
+  grid-template-columns: minmax(0, 1fr) auto;
 }
 
 .health-stat-count {
@@ -17879,4 +17889,53 @@ body {
 
 .agents-account-banner-diagnostics {
   border-left-color: color-mix(in oklab, currentColor 30%, transparent);
+}
+/* WIKI-311: utility surfaces keep the bb detail-card grammar. */
+.tokens-chart.bb-detail-card {
+  gap: 0;
+  padding: 0;
+  background: var(--surface-raised);
+}
+
+.tokens-chart-state.bb-detail-card {
+  padding: 20px;
+}
+
+.kanban-view {
+  display: flex;
+  flex: 1;
+  min-height: 0;
+  flex-direction: column;
+}
+
+.kanban-page-header {
+  flex-shrink: 0;
+}
+
+.kanban-column.bb-detail-card {
+  gap: 0;
+  padding: 0;
+  background: var(--surface-raised);
+}
+
+.kanban-card {
+  border: 1px solid var(--border-hairline);
+  border-radius: var(--radius-md);
+  background: var(--surface-raised);
+  box-shadow: var(--shadow-sm, 0 1px 2px color-mix(in oklab, var(--ink) 8%, transparent));
+}
+
+.kanban-add-button.bb-button {
+  justify-content: flex-start;
+  width: 100%;
+  margin: 0;
+  opacity: 0;
+  transition-property: opacity, background-color, color;
+  transition-duration: var(--motion-duration);
+  transition-timing-function: var(--motion-easing);
+}
+
+.kanban-column:hover .kanban-add-button.bb-button,
+.kanban-add-button.bb-button:focus-visible {
+  opacity: 1;
 }

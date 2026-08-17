@@ -34,12 +34,14 @@ export function UtilityPage({
 
   return (
     <section className="utility-page" aria-label={title}>
-      <header className="utility-page-header">
-        <div className="utility-page-heading">
+      <header className="app-page-header utility-page-header">
+        <div className="app-page-header__leading utility-page-heading">
           <h1 className="utility-page-title">{title}</h1>
           {subtitle ? <p className="utility-page-subtitle">{subtitle}</p> : null}
         </div>
-        {actions ? <div className="utility-page-actions">{actions}</div> : null}
+        {actions ? (
+          <div className="app-page-header__actions utility-page-actions">{actions}</div>
+        ) : null}
       </header>
       <div className={bodyClasses}>
         <div className={contentClasses}>{children}</div>

@@ -260,10 +260,12 @@ function ActivityBody({
             const isOpen = expanded.has(commit.sha);
             const shortSha = commit.sha.slice(0, 7);
             return (
-              <article className="activity-commit" key={commit.sha}>
+              <article className="activity-commit bb-detail-card" key={commit.sha}>
                 <button
                   aria-expanded={isOpen}
-                  className="activity-commit-row"
+                  className={`activity-commit-row session-activity-row session-tool${
+                    isOpen ? " is-working" : ""
+                  }`}
                   type="button"
                   onClick={() => onToggle(commit.sha)}
                 >
