@@ -1,5 +1,7 @@
 import { useMemo, useState } from "react";
 import { FileText } from "lucide-react";
+import { DetailCard, DetailRow } from "./primitives";
+import { StatusBadge, type StatusBadgeState } from "./status-badge";
 import type { NoteSummary } from "./types";
 import { UtilityEmpty, UtilityError, UtilityLoading, UtilityPage } from "./utility-page";
 
@@ -63,6 +65,12 @@ const BUCKET_LABEL: Record<Bucket, string> = {
   aging: "aging (7–30d)",
   stale: "stale (>30d)",
 };
+
+const BUCKET_BADGE_STATE = {
+  fresh: "ok",
+  aging: "warning",
+  stale: "error",
+} satisfies Record<Bucket, StatusBadgeState>;
 
 export function HealthView({
   notes,
@@ -130,10 +138,19 @@ export function HealthView({
         <div className="health-view">
           <div className="health-summary" role="group" aria-label="Note freshness summary">
             {(Object.keys(counts) as Bucket[]).map((bucket) => (
-              <div className={`health-stat health-${bucket}`} key={bucket}>
-                <span className="health-stat-count tabular-nums">{counts[bucket]}</span>
-                <span className="health-stat-label">{BUCKET_LABEL[bucket]}</span>
-              </div>
+              <DetailCard className={`health-stat health-${bucket}`} key={bucket}>
+                <DetailRow
+                  label={
+                    <StatusBadge
+                      compact
+                      state={BUCKET_BADGE_STATE[bucket]}
+                      label={BUCKET_LABEL[bucket]}
+                    />
+                  }
+                >
+                  <span className="health-stat-count tabular-nums">{counts[bucket]}</span>
+                </DetailRow>
+              </DetailCard>
             ))}
           </div>
 

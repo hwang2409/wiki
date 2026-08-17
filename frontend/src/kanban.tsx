@@ -244,7 +244,13 @@ export function KanbanBoard({
   }
 
   return (
-    <div className="kanban-board">
+    <div className="kanban-view">
+      <header className="app-page-header kanban-page-header">
+        <div className="app-page-header__leading">
+          <span className="app-page-header__breadcrumb-segment is-current">Kanban</span>
+        </div>
+      </header>
+      <div className="kanban-board">
       {dragging ? (
         <div
           className={`kanban-done-zone${doneHover ? " is-active" : ""}`}
@@ -273,7 +279,7 @@ export function KanbanBoard({
       {lanes.map((lane) => (
         <section
           aria-label={lane.title}
-          className="kanban-column"
+          className="kanban-column bb-detail-card"
           key={lane.title}
           style={
             {
@@ -371,7 +377,7 @@ export function KanbanBoard({
               />
             ) : (
               <button
-                className="kanban-add-button"
+                className="kanban-add-button bb-button bb-button--ghost bb-button--sm"
                 type="button"
                 onClick={() => {
                   setAddingLane(lane.title);
@@ -385,6 +391,7 @@ export function KanbanBoard({
           </footer>
         </section>
       ))}
+      </div>
     </div>
   );
 }

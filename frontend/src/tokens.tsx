@@ -1,6 +1,7 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { getTokens, type TokenBucket, type TokensResponse } from "./api";
 import { UtilityEmpty, UtilityError, UtilityLoading, UtilityPage } from "./utility-page";
+import { DetailCard, DetailRow } from "./primitives";
 
 type Preset = "24h" | "7d" | "30d";
 type BucketMode = "hour" | "day";
@@ -407,34 +408,32 @@ export function TokensView() {
           </div>
         ) : null}
 
-        <div className="tokens-totals" role="group" aria-label="Token totals">
-          <TotalCell label="input" total={totals.input} available={availability.input} />
-          <TotalCell label="output" total={totals.output} available={availability.output} />
-          <TotalCell
-            label="reasoning"
-            total={totals.reasoning}
-            available={availability.reasoning}
-          />
-          <TotalCell
-            label="cached"
-            total={totals.cached}
-            available={availability.cached}
-            secondary
-          />
-          <div className="tokens-total tokens-total-secondary">
-            <span className="tokens-total-label">sessions</span>
+        <DetailCard className="tokens-totals" role="group" aria-label="Token totals">
+          <DetailRow label="input">
+            <TotalCell total={totals.input} available={availability.input} />
+          </DetailRow>
+          <DetailRow label="output">
+            <TotalCell total={totals.output} available={availability.output} />
+          </DetailRow>
+          <DetailRow label="reasoning">
+            <TotalCell total={totals.reasoning} available={availability.reasoning} />
+          </DetailRow>
+          <DetailRow label="cached">
+            <TotalCell total={totals.cached} available={availability.cached} secondary />
+          </DetailRow>
+          <DetailRow label="sessions">
             <span className="tokens-total-value tabular-nums">
               {data ? formatNumber(data.sessions_scanned) : "—"}
             </span>
-          </div>
-        </div>
+          </DetailRow>
+        </DetailCard>
 
         {loading && !data ? (
-          <div className="tokens-chart tokens-chart-state">
+          <div className="tokens-chart tokens-chart-state bb-detail-card">
             <UtilityLoading label="Reading token telemetry…" lines={[70, 90, 60, 84]} />
           </div>
         ) : !hasAnyData ? (
-          <div className="tokens-chart tokens-chart-state">
+          <div className="tokens-chart tokens-chart-state bb-detail-card">
             <UtilityEmpty
               title={
                 cliFilter.size > 0 || modelFilter.size > 0
@@ -474,19 +473,16 @@ export function TokensView() {
 }
 
 function TotalCell({
-  label,
   total,
   available,
   secondary = false,
 }: {
-  label: string;
   total: number;
   available: boolean;
   secondary?: boolean;
 }) {
   return (
     <div className={`tokens-total${secondary ? " tokens-total-secondary" : ""}`}>
-      <span className="tokens-total-label">{label}</span>
       <span
         className={`tokens-total-value tabular-nums${available ? "" : " is-unavailable"}`}
         title={available ? undefined : "This metric was not reported for the current selection."}
@@ -638,7 +634,7 @@ function TokensChart({
   return (
     <div
       ref={wrapRef}
-      className="tokens-chart"
+      className="tokens-chart bb-detail-card"
       onMouseMove={onMouseMove}
       onMouseLeave={onMouseLeave}
     >
