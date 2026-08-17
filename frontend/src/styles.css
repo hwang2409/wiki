@@ -10114,14 +10114,19 @@ textarea.composer-command-input {
 
 /* Native artifacts: content is the visual signature; chrome stays quiet and flat. */
 
+/* WIKI-310: bb detail-card grammar — rounded, hairline border, surface-raised.
+   The shell wraps both the artifact body and the optional inspector column;
+   the inspector drops its own outer border in favor of a single left seam. */
 .artifact-block-shell {
   display: grid;
   grid-template-columns: minmax(0, 1fr);
   align-self: stretch;
   min-width: 0;
-  padding-top: 12px;
-  border-top: 1px solid var(--background-modifier-border);
-  background: transparent;
+  margin-top: 8px;
+  border: 1px solid var(--border-hairline, var(--background-modifier-border));
+  border-radius: var(--radius-md);
+  background: var(--surface-raised, transparent);
+  overflow: hidden;
 }
 
 /* Subtle enter animation — 150ms fade + 4px translate. Applied only on
@@ -10156,7 +10161,7 @@ textarea.composer-command-input {
 
 .artifact-block {
   min-width: 0;
-  padding-bottom: 12px;
+  padding: 10px 12px 12px;
   background: transparent;
   overflow: visible;
 }
@@ -10208,6 +10213,23 @@ textarea.composer-command-input {
   font-weight: var(--fw-semibold);
   line-height: 1.25;
   text-overflow: ellipsis;
+  text-transform: none;
+  white-space: nowrap;
+}
+
+/* WIKI-310: type chip sits next to the title so a fallback "Untitled artifact"
+   title still tells the reader what kind of artifact it is. */
+.artifact-kind-chip {
+  flex: 0 0 auto;
+  padding: 1px 6px;
+  border-radius: var(--radius-full);
+  background: var(--surface-selected, var(--background-modifier-hover));
+  color: var(--text-muted);
+  font-family: var(--font-chrome);
+  font-size: var(--fs-2xs);
+  font-weight: 500;
+  line-height: 1.4;
+  letter-spacing: 0.01em;
   text-transform: none;
   white-space: nowrap;
 }
@@ -10859,46 +10881,115 @@ textarea.composer-command-input {
   background: color-mix(in srgb, var(--code-background) 94%, var(--accent-primary)) !important;
 }
 
+/* WIKI-310: inspector sits inside the bb detail-card shell, so it owns only a
+   single left seam and its own header — no nested card border. */
 .artifact-inspect-panel {
+  display: flex;
+  flex-direction: column;
   min-width: 0;
-  border: 1px solid var(--background-modifier-border);
-  border-left: 0;
-  background: var(--background-secondary);
+  border-left: 1px solid var(--border-hairline, var(--background-modifier-border));
+  background: transparent;
 }
 
 .artifact-inspect-panel > header {
   display: flex;
   align-items: center;
   justify-content: space-between;
-  height: 39px;
-  padding: 0 8px 0 10px;
-  border-bottom: 1px solid var(--background-modifier-border);
+  height: 34px;
+  padding: 0 6px 0 12px;
+  border-bottom: 1px solid var(--border-hairline, var(--background-modifier-border));
   color: var(--text-muted);
-  font-family: var(--font-monospace);
-  font-weight: var(--font-monospace-weight);
+  font-family: var(--font-chrome);
   font-size: var(--fs-2xs);
+  font-weight: 600;
   text-transform: uppercase;
   letter-spacing: 0.06em;
 }
 
-.artifact-inspect-panel button {
+.artifact-inspect-panel > header button {
   display: grid;
   width: 24px;
   height: 24px;
   place-items: center;
-  border-radius: var(--radius-xs);
+  border-radius: var(--radius-sm);
   color: var(--text-muted);
+  background: transparent;
 }
 
-.artifact-inspect-panel button:hover {
-  background: var(--background-modifier-hover);
+.artifact-inspect-panel > header button:hover {
+  background: var(--state-hover, var(--background-modifier-hover));
   color: var(--text-normal);
 }
 
-.artifact-inspect-panel pre {
-  max-height: 500px;
+.artifact-inspect-details {
+  --bb-detail-label-width: 68px;
+  padding: 10px 12px 4px;
+}
+
+.artifact-inspect-details .bb-detail-row__value code {
+  padding: 1px 4px;
+  border-radius: var(--radius-xs);
+  background: var(--surface-recessed, transparent);
+  font-family: var(--font-monospace);
+  font-size: var(--fs-2xs);
+  overflow-wrap: anywhere;
+  word-break: break-all;
+}
+
+.artifact-inspect-raw {
+  border-top: 1px solid var(--border-hairline, var(--background-modifier-border));
+}
+
+.artifact-inspect-raw-toggle {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  width: 100%;
+  padding: 8px 12px;
+  background: transparent;
+  color: var(--text-muted);
+  font-family: var(--font-chrome);
+  font-size: var(--fs-2xs);
+  font-weight: 500;
+  text-align: left;
+  cursor: pointer;
+}
+
+.artifact-inspect-raw-toggle:hover {
+  background: var(--state-hover, var(--background-modifier-hover));
+  color: var(--text-normal);
+}
+
+.artifact-inspect-raw-toggle:focus-visible {
+  outline: 2px solid var(--ring);
+  outline-offset: -2px;
+}
+
+.artifact-inspect-raw-caret {
+  flex: 0 0 auto;
+  transition: transform var(--motion-duration, 120ms) var(--motion-easing, cubic-bezier(0.2, 0, 0, 1));
+}
+
+.artifact-inspect-raw-caret.is-open {
+  transform: rotate(90deg);
+}
+
+.artifact-inspect-raw-body {
+  display: flex;
+  flex-direction: column;
+  gap: 0;
+}
+
+.artifact-inspect-raw-actions {
+  display: flex;
+  justify-content: flex-end;
+  padding: 4px 8px;
+}
+
+.artifact-inspect-raw-body pre {
+  max-height: 420px;
   margin: 0;
-  padding: 10px;
+  padding: 10px 12px 12px;
   overflow-x: hidden;
   overflow-y: auto;
   background: transparent;
@@ -10912,7 +11003,7 @@ textarea.composer-command-input {
   word-break: break-word;
 }
 
-/* Artifact split-pane */
+/* Artifact split-pane — bb secondary-panel chrome. WIKI-310. */
 
 .artifact-panel {
   z-index: 20;
@@ -10921,112 +11012,53 @@ textarea.composer-command-input {
   overflow: visible;
 }
 
-.artifact-panel-tabs {
-  position: relative;
+.artifact-panel-chrome {
+  position: sticky;
+  top: 0;
+  z-index: 5;
   display: flex;
   flex: 0 0 auto;
-  min-height: 36px;
-  padding-right: 64px;
-  border-bottom: 1px solid var(--background-modifier-border);
-  overflow: visible;
+  align-items: center;
+  gap: 6px;
+  min-height: 40px;
+  padding: 6px 6px 6px 8px;
+  background: var(--sidebar, var(--background-secondary));
+  border-bottom: 1px solid var(--border-seam, var(--background-modifier-border));
 }
 
-.artifact-panel-tab {
-  position: relative;
+.artifact-panel-tabs {
   display: flex;
-  flex: 1 1 132px;
+  flex: 1 1 auto;
+  align-items: center;
+  gap: 2px;
   min-width: 0;
+  overflow-x: auto;
+  scrollbar-width: none;
+}
+
+.artifact-panel-tabs::-webkit-scrollbar {
+  display: none;
+}
+
+.artifact-panel-tabs .bb-tab-pill {
+  flex: 0 0 auto;
   max-width: 220px;
-  color: var(--text-faint);
 }
 
-.artifact-panel-tab:hover {
-  color: var(--text-normal);
-}
-
-.artifact-panel-tab.is-active {
-  color: var(--text-normal);
-  box-shadow: inset 0 -1px 0 var(--text-normal);
-}
-
-.artifact-panel-tab-main {
+.artifact-panel-actions {
   display: flex;
-  flex: 1;
-  flex-direction: column;
-  min-width: 0;
-  padding: 6px 5px 5px 9px;
-  text-align: left;
-}
-
-.artifact-panel-tab-main span {
-  overflow: hidden;
-  font-family: var(--font-monospace);
-  font-size: var(--fs-2xs);
-  font-weight: var(--fw-semibold);
-  text-overflow: ellipsis;
-  white-space: nowrap;
-}
-
-/* WIKI-144: artifact kind label rendered via StatusBadge is-faint compact. */
-.artifact-panel-tab-main .artifact-panel-tab-kind {
-  align-self: flex-start;
-  padding: 0;
-}
-
-.artifact-panel-tab-action,
-.artifact-panel-close {
-  display: grid;
-  flex: 0 0 22px;
-  width: 22px;
-  place-items: center;
-  color: var(--text-faint);
-  opacity: 0;
-}
-
-.artifact-panel-tab:hover .artifact-panel-tab-action,
-.artifact-panel-tab.is-active .artifact-panel-tab-action,
-.artifact-panel:hover .artifact-panel-close,
-.artifact-panel-tab-action:focus-visible,
-.artifact-panel-close:focus-visible {
-  opacity: 1;
-}
-
-.artifact-panel-tab-action:hover,
-.artifact-panel-close:hover {
-  background: var(--background-modifier-hover);
-  color: var(--text-normal);
-}
-
-.artifact-panel-close {
-  position: absolute;
-  top: 7px;
-  right: 6px;
-  z-index: 2;
-  height: 26px;
+  flex: 0 0 auto;
+  align-items: center;
+  gap: 2px;
 }
 
 .artifact-panel-overflow {
-  position: absolute;
-  top: 6px;
-  right: 32px;
-  z-index: 3;
-}
-
-.artifact-panel-overflow-toggle {
-  position: static;
-  height: 26px;
-  opacity: 0;
-}
-
-.artifact-panel:hover .artifact-panel-overflow-toggle,
-.artifact-panel-overflow-toggle[aria-expanded="true"],
-.artifact-panel-overflow-toggle:focus-visible {
-  opacity: 1;
+  position: relative;
 }
 
 .artifact-panel-overflow-menu {
   position: absolute;
-  top: 32px;
+  top: calc(100% + 4px);
   right: 0;
   z-index: 40;
   min-width: 220px;
@@ -11081,6 +11113,8 @@ textarea.composer-command-input {
 }
 
 .artifact-panel-detail {
+  position: relative;
+  z-index: 0;
   display: flex;
   flex: 1;
   min-height: 0;
@@ -11429,8 +11463,8 @@ textarea.composer-command-input {
   }
 
   .artifact-inspect-panel {
-    border-top: 0;
-    border-left: 1px solid var(--background-modifier-border);
+    border-left: 0;
+    border-top: 1px solid var(--border-hairline, var(--background-modifier-border));
   }
 
   .artifact-header {
@@ -17713,4 +17747,3 @@ body {
 .agents-account-banner-diagnostics {
   border-left-color: color-mix(in oklab, currentColor 30%, transparent);
 }
-
