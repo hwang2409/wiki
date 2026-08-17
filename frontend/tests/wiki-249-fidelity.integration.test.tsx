@@ -1,5 +1,5 @@
 // WIKI-249 OpenCode 1:1 fidelity pins: turn meta row anatomy, thought
-// duration format, click-to-expand placement, glyph vocabulary, color-only
+// duration format, click-to-expand placement, icon vocabulary, color-only
 // tool state, structured-output pretty rendering, the polished disclosure,
 // and agent-declared fence handling.
 import { cleanup, fireEvent, render } from "@testing-library/react";
@@ -15,7 +15,7 @@ import {
   parseEmbeddedScripts,
   prettyPrintedJson,
   thoughtDurations,
-  toolGlyph,
+  toolIcon,
   toolPathHint,
   turnMetaDurations,
 } from "../src/transcript-event-utils";
@@ -111,7 +111,7 @@ test("turn meta row renders the OpenCode boundary anatomy", () => {
     <TurnMetaRow meta={{ agent: "cc:WIKI-249", model: "claude-fable-5", durationMs: 2500 }} />,
   );
   const row = container.querySelector(".session-turn-meta");
-  expect(row?.textContent).toBe("▣cc:WIKI-249 · claude-fable-5 · 2.5s");
+  expect(row?.textContent).toBe("cc:WIKI-249 · claude-fable-5 · 2.5s");
   expect(row?.querySelector(".session-turn-meta-glyph")?.getAttribute("aria-hidden")).toBe("true");
 });
 
@@ -119,7 +119,7 @@ test("turn meta row omits missing model and duration silently", () => {
   const { container } = render(
     <TurnMetaRow meta={{ agent: "cc:WIKI-249", model: null, durationMs: null }} />,
   );
-  expect(container.querySelector(".session-turn-meta")?.textContent).toBe("▣cc:WIKI-249");
+  expect(container.querySelector(".session-turn-meta")?.textContent).toBe("cc:WIKI-249");
 });
 
 // --- thought row anatomy (OpenCode index.tsx:1655-1673) ---
@@ -238,16 +238,16 @@ test("non-Codex thinking keeps the existing collapsed behavior", () => {
   expect(container.querySelector(".session-thinking")).toBeNull();
 });
 
-// --- glyph vocabulary + color-only state ---
+// --- icon vocabulary + color-only state ---
 
-test("toolGlyph maps the OpenCode icon vocabulary", () => {
-  expect(toolGlyph(tool({ archetype: "bash", name: "Bash" }), "done")).toBe("$");
-  expect(toolGlyph(tool(), "done")).toBe("→");
-  expect(toolGlyph(tool({ archetype: "edit", name: "Edit" }), "done")).toBe("←");
-  expect(toolGlyph(tool({ archetype: "search", name: "Grep" }), "done")).toBe("✱");
-  expect(toolGlyph(tool({ archetype: "agent", name: "Task" }), "working")).toBe("│");
-  expect(toolGlyph(tool({ archetype: "agent", name: "Task" }), "done")).toBe("✓");
-  expect(toolGlyph(tool({ archetype: "tool", name: "launch_thing" }), "done")).toBe("⚙");
+test("toolIcon maps the OpenCode icon vocabulary", () => {
+  expect(toolIcon(tool({ archetype: "bash", name: "Bash" }), "done").displayName).toBe("Terminal");
+  expect(toolIcon(tool(), "done").displayName).toBe("ArrowRight");
+  expect(toolIcon(tool({ archetype: "edit", name: "Edit" }), "done").displayName).toBe("ArrowLeft");
+  expect(toolIcon(tool({ archetype: "search", name: "Grep" }), "done").displayName).toBe("Search");
+  expect(toolIcon(tool({ archetype: "agent", name: "Task" }), "working").displayName).toBe("CircleDashed");
+  expect(toolIcon(tool({ archetype: "agent", name: "Task" }), "done").displayName).toBe("Check");
+  expect(toolIcon(tool({ archetype: "tool", name: "launch_thing" }), "done").displayName).toBe("Wrench");
 });
 
 test("tool rows carry state as color classes plus sr-only text, not words", () => {
@@ -256,7 +256,7 @@ test("tool rows carry state as color classes plus sr-only text, not words", () =
   );
   expect(container.querySelector(".session-tool-status")).toBeNull();
   expect(container.querySelector(".session-tool")?.classList.contains("is-done")).toBe(true);
-  expect(container.querySelector(".session-tool-icon-text")?.textContent).toBe("→");
+  expect(container.querySelector(".session-tool-icon")?.tagName).toBe("svg");
   expect(container.querySelector(".sr-only")?.textContent).toBe("done");
 });
 

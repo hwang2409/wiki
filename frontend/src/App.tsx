@@ -3,6 +3,9 @@ import type { MouseEvent as ReactMouseEvent, ReactNode } from "react";
 import {
   BookOpen,
   Bot,
+  Circle,
+  CircleCheck,
+  CircleDashed,
   ClipboardList,
   Code2,
   ChevronRight,
@@ -793,12 +796,11 @@ function findFleetItem(groups: FleetGroup[], ticket: string | null): FleetItem |
   return null;
 }
 
-function agentStateGlyph(state: string | null, live: boolean): string {
-  if (!live) return "○";
-  if (state === "merge-ready") return "◎";
-  if (state === "blocked") return "○";
-  if (state === "working") return "●";
-  return "·";
+function agentStateIcon(state: string | null, live: boolean): LucideIcon {
+  if (!live || state === "blocked") return Circle;
+  if (state === "merge-ready") return CircleCheck;
+  if (state === "working") return CircleDashed;
+  return Circle;
 }
 
 const emptyDraft: NoteDraft = { title: "", path: "", content: "" };
@@ -1967,10 +1969,11 @@ export default function App() {
         const location = agentLocations.get(worker.ticket);
         const sourceWindow =
           location ? windowState.windows.find((window) => window.id === location.windowId) ?? null : null;
+        const StateIcon = agentStateIcon(worker.state, worker.live);
         items.push({
           key: `agent:${worker.ticket}`,
           value: worker.ticket,
-          icon: <span className="fleet-switcher-glyph">{agentStateGlyph(worker.state, worker.live)}</span>,
+          icon: <StateIcon aria-hidden="true" className="fleet-switcher-glyph" size={14} />,
           label: worker.ticket,
           meta: `${sourceWindow ? windowLabel(sourceWindow, terminalNames) : "not open"}${
             worker.detail ? ` · ${worker.detail}` : ""
