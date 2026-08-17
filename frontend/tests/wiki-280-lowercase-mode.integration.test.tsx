@@ -120,7 +120,7 @@ describe("thinking body regression (WIKI-280)", () => {
   // the row was opened. The fix drops the exclusion; the DOM path that
   // used to be a text-transform:none island is now under the plain
   // `.lowercase-mode` rule and lowercases like everything else.
-  test("expanded thinking body renders inside a .shiki-block that is no longer excluded", () => {
+  test("expanded thinking body renders markdown without a code wrapper", () => {
     const event: SessionEvent = {
       id: 1,
       kind: "thinking",
@@ -130,10 +130,11 @@ describe("thinking body regression (WIKI-280)", () => {
     };
     const { container } = render(<ThinkingRow event={event} />);
     fireEvent.click(container.querySelector(".session-thinking-head") as HTMLButtonElement);
-    const body = container.querySelector(".session-thinking .shiki-block");
+    const body = container.querySelector(".session-thinking");
     expect(body).not.toBeNull();
+    expect(body?.querySelector("strong")?.textContent).toBe("Deciding");
     // Sanity: the summary text is present (before or after highlight resolution).
-    expect(container.querySelector(".session-thinking")?.textContent ?? "").toContain(
+    expect(body?.textContent ?? "").toContain(
       "Considering",
     );
     // The CSS rule that used to force text-transform:none on this subtree

@@ -8274,24 +8274,6 @@ body.is-resizing-panes .pane-cell {
   overflow-wrap: break-word;
 }
 
-/* Damp the markdown token colors, not the muted base text — the audit-visible
-   body color stays as approved; only the syntax accents render subtle. */
-.session-thinking .shiki-block {
-  opacity: 0.7;
-}
-
-.session-thinking .shiki-block pre {
-  margin: 0;
-  padding: 0;
-  background: transparent;
-  font-family: var(--font-agent-prose);
-  font-weight: var(--font-agent-prose-weight, var(--font-text-weight));
-  font-size: var(--font-ui-small);
-  line-height: 1.6;
-  white-space: pre-wrap;
-  overflow-wrap: break-word;
-}
-
 /* OpenCode reasoning header: one warning-hued line `+ Thought: title · 463ms`
    (session/index.tsx:1655-1673); the open state drops to thinkingOpacity
    (:1643-1646). Hover/focus restores full strength for the affordance. */
