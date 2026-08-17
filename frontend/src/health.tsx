@@ -1,7 +1,5 @@
 import { useMemo, useState } from "react";
 import { FileText } from "lucide-react";
-import { DetailCard, DetailRow } from "./primitives";
-import { StatusBadge, type StatusBadgeState } from "./status-badge";
 import type { NoteSummary } from "./types";
 import { UtilityEmpty, UtilityError, UtilityLoading, UtilityPage } from "./utility-page";
 
@@ -65,12 +63,6 @@ const BUCKET_LABEL: Record<Bucket, string> = {
   aging: "aging (7–30d)",
   stale: "stale (>30d)",
 };
-
-const BUCKET_BADGE_STATE = {
-  fresh: "ok",
-  aging: "warning",
-  stale: "error",
-} satisfies Record<Bucket, StatusBadgeState>;
 
 export function HealthView({
   notes,
@@ -138,19 +130,10 @@ export function HealthView({
         <div className="health-view">
           <div className="health-summary" role="group" aria-label="Note freshness summary">
             {(Object.keys(counts) as Bucket[]).map((bucket) => (
-              <DetailCard className={`health-stat health-${bucket}`} key={bucket}>
-                <DetailRow
-                  label={
-                    <StatusBadge
-                      compact
-                      state={BUCKET_BADGE_STATE[bucket]}
-                      label={BUCKET_LABEL[bucket]}
-                    />
-                  }
-                >
-                  <span className="health-stat-count tabular-nums">{counts[bucket]}</span>
-                </DetailRow>
-              </DetailCard>
+              <div className="health-stat" key={bucket}>
+                <span className="health-stat-count tabular-nums">{counts[bucket]}</span>
+                <span className="health-stat-label">{BUCKET_LABEL[bucket]}</span>
+              </div>
             ))}
           </div>
 
@@ -181,10 +164,16 @@ export function HealthView({
                   onClick={() => onOpenNote(note.path)}
                 >
                   <FileText size={13} />
-                  <span className="health-name">{basename(note.path)}</span>
-                  <span className="health-type">{note.note_type ?? "—"}</span>
-                  <span className="health-path">{note.path}</span>
-                  <span className="health-age tabular-nums">
+                  <span className="health-name" title={basename(note.path)}>
+                    {basename(note.path)}
+                  </span>
+                  <span className="health-type" title={note.note_type ?? "—"}>
+                    {note.note_type ?? "—"}
+                  </span>
+                  <span className="health-path" title={note.path}>
+                    {note.path}
+                  </span>
+                  <span className="health-age tabular-nums" title={`${days} days old`}>
                     {days === 0 ? "today" : `${days}d`}
                   </span>
                 </button>
