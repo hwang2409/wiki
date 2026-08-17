@@ -506,8 +506,10 @@ function FontPicker({
   const [query, setQuery] = useState("");
   const rootRef = useRef<HTMLDivElement | null>(null);
   const filterRef = useRef<HTMLInputElement | null>(null);
+  const optionRefs = useRef<Array<HTMLButtonElement | null>>([]);
   const triggerRef = useRef<HTMLButtonElement | null>(null);
   const wasOpenRef = useRef(false);
+  const [activeIndex, setActiveIndex] = useState(0);
 
   const currentChoice = useMemo(() => pickChoice(fonts, current), [fonts, current]);
 
@@ -558,6 +560,36 @@ function FontPicker({
     return available.filter((font) => font.label.toLowerCase().includes(needle));
   }, [available, query]);
 
+  useEffect(() => {
+    if (!open) return;
+    const selectedIndex = visible.findIndex((font) => font.label === current);
+    setActiveIndex(selectedIndex >= 0 ? selectedIndex : 0);
+  }, [current, open, visible]);
+
+  function focusOption(index: number) {
+    if (visible.length === 0) return;
+    const nextIndex = Math.max(0, Math.min(index, visible.length - 1));
+    setActiveIndex(nextIndex);
+    optionRefs.current[nextIndex]?.focus();
+  }
+
+  function handlePickerNavigation(event: React.KeyboardEvent<HTMLElement>) {
+    if (visible.length === 0) return;
+    if (event.key === "ArrowDown") {
+      event.preventDefault();
+      focusOption(activeIndex + 1);
+    } else if (event.key === "ArrowUp") {
+      event.preventDefault();
+      focusOption(activeIndex - 1);
+    } else if (event.key === "Home") {
+      event.preventDefault();
+      focusOption(0);
+    } else if (event.key === "End") {
+      event.preventDefault();
+      focusOption(visible.length - 1);
+    }
+  }
+
   return (
     <div
       className={`font-picker${open ? " is-open" : ""}`}
@@ -586,7 +618,7 @@ function FontPicker({
         <ChevronDown aria-hidden className="font-picker-trigger-chevron" size={14} />
       </button>
       {open ? (
-        <div className="font-picker-menu" role="listbox">
+        <div className="font-picker-menu">
           <input
             aria-label="Filter fonts"
             className="font-picker-filter"
@@ -596,6 +628,7 @@ function FontPicker({
             value={query}
             onChange={(event) => setQuery(event.target.value)}
             onKeyDown={(event) => {
+              handlePickerNavigation(event);
               if (event.key === "Enter" && visible.length > 0) {
                 event.preventDefault();
                 onChange(visible[0].label);
@@ -603,39 +636,48 @@ function FontPicker({
               }
             }}
           />
-          {visible.length === 0 ? (
-            <div className="font-picker-empty">No fonts match “{query}”.</div>
-          ) : null}
-          {visible.map((font) => {
-            const active = font.label === current;
-            return (
-              <button
-                aria-selected={active}
-                className={`font-picker-option${active ? " is-active" : ""}`}
-                key={font.label}
-                role="option"
-                type="button"
-                onClick={() => {
-                  onChange(font.label);
-                  setOpen(false);
-                }}
-              >
-                <span
-                  className="font-picker-option-label"
-                  style={{ fontFamily: font.stack, fontWeight: weight }}
+          <div
+            aria-label="Available fonts"
+            className="font-picker-options"
+            role="listbox"
+            onKeyDown={handlePickerNavigation}
+          >
+            {visible.length === 0 ? (
+              <div className="font-picker-empty">No fonts match “{query}”.</div>
+            ) : null}
+            {visible.map((font, index) => {
+              const active = font.label === current;
+              return (
+                <button
+                  aria-selected={active}
+                  className={`font-picker-option${active ? " is-active" : ""}`}
+                  key={font.label}
+                  ref={(element) => { optionRefs.current[index] = element; }}
+                  role="option"
+                  tabIndex={index === activeIndex ? 0 : -1}
+                  type="button"
+                  onClick={() => {
+                    onChange(font.label);
+                    setOpen(false);
+                  }}
                 >
-                  {font.label}
-                </span>
-                <span
-                  aria-hidden
-                  className="font-picker-option-sample"
-                  style={{ fontFamily: font.stack, fontWeight: weight }}
-                >
-                  {sample}
-                </span>
-              </button>
-            );
-          })}
+                  <span
+                    className="font-picker-option-label"
+                    style={{ fontFamily: font.stack, fontWeight: weight }}
+                  >
+                    {font.label}
+                  </span>
+                  <span
+                    aria-hidden
+                    className="font-picker-option-sample"
+                    style={{ fontFamily: font.stack, fontWeight: weight }}
+                  >
+                    {sample}
+                  </span>
+                </button>
+              );
+            })}
+          </div>
         </div>
       ) : null}
     </div>

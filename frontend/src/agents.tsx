@@ -8,7 +8,6 @@ import {
   ExternalLink,
   GitPullRequest,
   MoreHorizontal,
-  Plus,
   RefreshCw,
   ScrollText,
 } from "lucide-react";
@@ -1217,6 +1216,7 @@ export function AgentsView({
   refreshTick,
   openTicket,
   onOpenTicket,
+  spawnWorkerFallbackRef,
   startRunRequest = 0,
   onStartRunRequestHandled,
 }: {
@@ -1233,6 +1233,7 @@ export function AgentsView({
   refreshTick: number;
   openTicket: AgentOpenTarget | null;
   onOpenTicket: (target: AgentOpenTarget | null) => void;
+  spawnWorkerFallbackRef?: FocusReturnRef;
   startRunRequest?: number;
   onStartRunRequestHandled?: () => void;
 }) {
@@ -1244,7 +1245,6 @@ export function AgentsView({
   const [availableModels, setAvailableModels] = useState<AgentModelOption[]>([]);
   const [spawnWorkerOpen, setSpawnWorkerOpen] = useState(false);
   const [spawnOrchestratorOpen, setSpawnOrchestratorOpen] = useState(false);
-  const spawnWorkerTriggerRef = useRef<HTMLButtonElement | null>(null);
   const spawnOrchestratorTriggerRef = useRef<HTMLButtonElement | null>(null);
   const replaceFallbackRef = useRef<FocusReturnRef>({ current: null });
   const [replaceTarget, setReplaceTarget] = useState<ReplaceAgentTarget | null>(null);
@@ -1316,12 +1316,6 @@ export function AgentsView({
     localStorage.setItem(SCREENCAST_EXPANDED_KEY, JSON.stringify([...expandedScreencasts]));
   }, [expandedScreencasts]);
 
-  useEffect(() => {
-    if (startRunRequest === 0) return;
-    setSpawnWorkerOpen(true);
-    onStartRunRequestHandled?.();
-  }, [onStartRunRequestHandled, startRunRequest]);
-
   function toggleScreencast(ticket: string) {
     setExpandedScreencasts((prev) => {
       const next = new Set(prev);
@@ -1330,6 +1324,12 @@ export function AgentsView({
       return next;
     });
   }
+
+  useEffect(() => {
+    if (startRunRequest === 0) return;
+    setSpawnWorkerOpen(true);
+    onStartRunRequestHandled?.();
+  }, [onStartRunRequestHandled, startRunRequest]);
 
   useEffect(() => {
     if (data) return;
@@ -1820,7 +1820,7 @@ export function AgentsView({
     }
 
     return (
-      <div className="agents-orch-group" key={orch.id}>
+      <div className="agents-orch-group agent-activity-row" key={orch.id}>
         <div className="agents-orch-head">
           <Bot size={13} />
           <span className="agents-orch-id">{orch.id}</span>
@@ -2305,31 +2305,31 @@ export function AgentsView({
   } else {
     const activeCount = orchestrators.length + liveWorkers.length;
     body = (
-      <>
+      <div className="agents-sections">
         {activeCount > 0 ? (
-          <div className="agents-section-head is-primary" data-testid="agents-section-active">
-            <span className="agents-section-title">Active</span>
-            <span className="agents-section-count tabular-nums">{activeCount}</span>
-          </div>
+          <section className="agents-section agents-section-active" aria-labelledby="agents-section-active">
+            <div className="agents-section-head is-primary" data-testid="agents-section-active">
+              <span className="agents-section-title" id="agents-section-active">Active</span>
+              <span className="agents-section-count tabular-nums">{activeCount}</span>
+            </div>
+            {grouped.map(({ orch, owned }) => renderOrchGroup(orch, owned))}
+            {ungrouped.length > 0 && grouped.length > 0 ? (
+              <div className="agents-section-head">unassigned workers</div>
+            ) : null}
+            {ungrouped.map(renderWorker)}
+          </section>
         ) : null}
-        {grouped.map(({ orch, owned }) => renderOrchGroup(orch, owned))}
-
-        {ungrouped.length > 0 && grouped.length > 0 ? (
-          <div className="agents-section-head">unassigned workers</div>
-        ) : null}
-        {ungrouped.map(renderWorker)}
-
         {archived.length > 0 ? (
-          <>
+          <section className="agents-section agents-section-history" aria-labelledby="agents-section-history">
             <div className="agents-section-head is-primary" data-testid="agents-section-history">
               <Archive size={13} />
-              <span className="agents-section-title">History</span>
+              <span className="agents-section-title" id="agents-section-history">History</span>
               <span className="agents-section-count tabular-nums">{archived.length}</span>
             </div>
             {archived.map(renderHistoryRow)}
-          </>
+          </section>
         ) : null}
-      </>
+      </div>
     );
   }
 
@@ -2337,41 +2337,23 @@ export function AgentsView({
     <ScreencastProvider>
     <div className={`agents-layout${openWorker ? " has-sidebar" : ""}`}>
       <div className="agents-view">
-        <div className="agents-toolbar">
-          <div>
-            <div className="agents-toolbar-title">Runs</div>
-            <div className="agents-toolbar-meta">
-              {orchestrators.length} orchestrator{orchestrators.length === 1 ? "" : "s"} ·{" "}
-              {liveWorkers.length} live worker{liveWorkers.length === 1 ? "" : "s"} ·{" "}
-              {archived.length} in history
-            </div>
-          </div>
-          <div className="dialog-actions">
-            <button
-              className="agents-spawn-button"
-              disabled={workers === null}
-              ref={spawnOrchestratorTriggerRef}
-              type="button"
-              onClick={() => {
-                setSpawnOrchestratorOpen(true);
-              }}
-            >
-              <Bot size={14} />
-              Spawn orchestrator
-            </button>
-            <button
-              className="agents-spawn-button"
-              disabled={workers === null}
-              ref={spawnWorkerTriggerRef}
-              type="button"
-              onClick={() => {
-                setSpawnWorkerOpen(true);
-              }}
-            >
-              <Plus size={14} />
-              Spawn worker
-            </button>
-          </div>
+        <div className="agents-page-tools">
+          <span className="agents-run-count">
+            {orchestrators.length} orchestrator{orchestrators.length === 1 ? "" : "s"} ·{" "}
+            {liveWorkers.length} live worker{liveWorkers.length === 1 ? "" : "s"} ·{" "}
+            {archived.length} in history
+          </span>
+          <Button
+            className="agents-orchestrator-button"
+            disabled={workers === null}
+            leadingIcon={<Bot aria-hidden size={14} />}
+            ref={spawnOrchestratorTriggerRef}
+            size="sm"
+            variant="outline"
+            onClick={() => setSpawnOrchestratorOpen(true)}
+          >
+            Spawn orchestrator
+          </Button>
         </div>
         <AccountEventsBanner events={accountNotices} />
         {body}
@@ -2385,7 +2367,7 @@ export function AgentsView({
       ) : null}
       {spawnWorkerOpen ? (
         <SpawnWorkerModal
-          fallbackRef={spawnWorkerTriggerRef}
+          fallbackRef={spawnWorkerFallbackRef}
           models={availableModels}
           orchestrators={orchestrators}
           onClose={() => setSpawnWorkerOpen(false)}

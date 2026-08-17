@@ -71,8 +71,13 @@ export function useModalA11y<T extends HTMLElement>(
     const interactionTarget = lastInteractionTarget && document.contains(lastInteractionTarget)
       ? lastInteractionTarget
       : null;
+    const activeInvoker = active instanceof HTMLElement &&
+      active !== document.body &&
+      !dialog.contains(active)
+      ? active
+      : null;
     lastInteractionTarget = null;
-    invokerRef.current = interactionTarget ?? (active instanceof HTMLElement ? active : null) ?? fallback ?? null;
+    invokerRef.current = interactionTarget ?? activeInvoker ?? fallback ?? null;
     const inertRoots: Array<{
       element: HTMLElement;
       inert: string | null;

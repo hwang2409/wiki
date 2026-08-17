@@ -1407,6 +1407,7 @@ export default function App() {
   const [contextMenu, setContextMenu] = useState<ContextMenuState | null>(null);
   const [dialog, setDialog] = useState<DialogState | null>(null);
   const settingsTriggerRef = useRef<HTMLButtonElement | null>(null);
+  const agentsStartRunRef = useRef<HTMLButtonElement | null>(null);
   const paneIdRef = useRef(0);
   const windowIdRef = useRef(0);
   const paneRefs = useRef(new Map<string, HTMLDivElement>());
@@ -3515,6 +3516,7 @@ export default function App() {
       return (
         <AgentsView
           data={agentsState}
+          spawnWorkerFallbackRef={agentsStartRunRef}
           workspaceRoot={spawnWorkspaceRoot}
           workspaceRootReady={workspaceDiscoveryReady}
           onOpenAgent={openAgent}
@@ -4056,6 +4058,7 @@ export default function App() {
               <Button
                 className="agents-page-start-button"
                 leadingIcon={<Plus aria-hidden size={14} />}
+                ref={agentsStartRunRef}
                 type="button"
                 onClick={() => setAgentsStartRunRequest((request) => request + 1)}
               >
@@ -4127,6 +4130,7 @@ export default function App() {
               ) : mode === "agents" ? (
                 <AgentsView
                   data={agentsState}
+                  spawnWorkerFallbackRef={agentsStartRunRef}
                   workspaceRoot={spawnWorkspaceRoot}
                   workspaceRootReady={workspaceDiscoveryReady}
                   onOpenAgent={openAgent}
