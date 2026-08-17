@@ -10,7 +10,7 @@ import {
   useRef,
   useState,
 } from "react";
-import type { ComponentProps, CSSProperties } from "react";
+import type { ComponentProps, CSSProperties, ReactNode } from "react";
 import {
   AlertTriangle,
   Bell,
@@ -3662,21 +3662,26 @@ export function SessionTab({
           ticket={ticket}
           guidance={composerGuidance}
           onInspect={onInspect}
+          footer={
+            <div className="session-footer tabular-nums">
+              <SessionModelFooter session={session} ticket={ticket} />
+              <div aria-hidden="true" className="session-footer-hints">
+                {composerGuidance.shortcuts.map((shortcut) => (
+                  <span className="session-hint" key={shortcut.key}>
+                    <span className="session-hint-key">{shortcut.key}</span>{" "}
+                    {shortcut.action}
+                  </span>
+                ))}
+              </div>
+            </div>
+          }
         />
       )}
-      <div className="session-footer tabular-nums">
-        <SessionModelFooter session={session} ticket={ticket} />
-        {subagent || !showComposer ? null : (
-          <div aria-hidden="true" className="session-footer-hints">
-            {composerGuidance.shortcuts.map((shortcut) => (
-              <span className="session-hint" key={shortcut.key}>
-                <span className="session-hint-key">{shortcut.key}</span>{" "}
-                {shortcut.action}
-              </span>
-            ))}
-          </div>
-        )}
-      </div>
+      {subagent || !showComposer ? (
+        <div className="session-footer tabular-nums">
+          <SessionModelFooter session={session} ticket={ticket} />
+        </div>
+      ) : null}
       </div>
       </SessionUiStateContext.Provider>
     </QuestionUiContext.Provider>
@@ -3730,6 +3735,7 @@ function MessageComposer({
   thinking = false,
   guidance,
   onInspect,
+  footer,
 }: {
   stateKey: string;
   ticket: string;
@@ -3740,6 +3746,7 @@ function MessageComposer({
   thinking?: boolean;
   guidance: ComposerGuidance;
   onInspect?: (agentId: string) => void;
+  footer: ReactNode;
 }) {
   const cachedComposer = getComposerState(stateKey);
   const selectionRef = useRef({
@@ -4594,7 +4601,7 @@ function MessageComposer({
         <div className="session-skill-menu">
           {menuItems.map((skill, i) => (
             <button
-              className={`session-skill-item${i === menuIndex ? " is-active" : ""}`}
+              className={`bb-menu-row session-skill-item${i === menuIndex ? " is-active" : ""}`}
               key={skill.name}
               type="button"
               onMouseDown={(event) => {
@@ -4602,7 +4609,7 @@ function MessageComposer({
                 acceptSkill(skill.name);
               }}
             >
-              <span className="session-skill-name">
+              <span className="session-skill-name prompt-mention-pill">
                 {trigger?.sigil === "$" ? "$" : "/"}
                 {skill.name}
               </span>
@@ -4660,19 +4667,25 @@ function MessageComposer({
         </div>
       ) : null}
       {activeCommand ? (
-        <CommandForm
-          command={activeCommand}
-          values={commandValues}
-          onChange={(name, value) =>
-            setCommandValues((current) => ({ ...current, [name]: value }))
-          }
-          onSubmit={() => void runCommand()}
-          onCancel={() => cancelCommand()}
-          busy={commandBusy}
-          error={commandError}
-        />
-      ) : (
         <>
+          <CommandForm
+            command={activeCommand}
+            values={commandValues}
+            onChange={(name, value) =>
+              setCommandValues((current) => ({ ...current, [name]: value }))
+            }
+            onSubmit={() => void runCommand()}
+            onCancel={() => cancelCommand()}
+            busy={commandBusy}
+            error={commandError}
+          />
+          {footer}
+        </>
+      ) : (
+        // WIKI-303: bb PromptBox parity — quiet outer card holds the input row
+        // + a text-2xs metadata footer. Card owns border / radius / focus lift;
+        // the row keeps its label/input/send grid.
+        <div className="session-composer-card">
           <div className="session-composer-row">
             <label className="session-composer-target" htmlFor={composerInputId}>
               <span>ask or steer</span>
@@ -4849,37 +4862,38 @@ function MessageComposer({
               <SendHorizontal aria-hidden="true" size={14} />
             </button>
           </div>
-        </>
+          <div className="session-composer-meta">
+            {thinking ? <span className="session-thinking-indicator">thinking</span> : null}
+            <div className="session-subagents">
+              {runningSubagents.map((entry) => (
+                <button
+                  className="session-subagent-chip"
+                  disabled={!onInspect}
+                  key={entry.id}
+                  title={entry.head}
+                  type="button"
+                  onClick={() => onInspect?.(entry.id)}
+                >
+                  <span className="session-tool-running" />
+                  subagent {entry.id.slice(0, 8)}
+                </button>
+              ))}
+            </div>
+            {vimMode !== "insert" ? (
+              <span className={`session-vim-mode is-${vimMode}`}>
+                {vimMode === "visual"
+                  ? "-- VISUAL --"
+                  : vimMode === "pane"
+                    ? "-- PANE --"
+                    : "-- NORMAL --"}
+              </span>
+            ) : null}
+            {footer}
+          </div>
+        </div>
       )}
       <div id={composerHelpId} className="session-composer-help">
         {guidance.accessibleText}
-      </div>
-      <div className="session-composer-status">
-        {thinking ? <span className="session-thinking-indicator">thinking</span> : null}
-        <div className="session-subagents">
-          {runningSubagents.map((entry) => (
-            <button
-              className="session-subagent-chip"
-              disabled={!onInspect}
-              key={entry.id}
-              title={entry.head}
-              type="button"
-              onClick={() => onInspect?.(entry.id)}
-            >
-              <span className="session-tool-running" />
-              subagent {entry.id.slice(0, 8)}
-            </button>
-          ))}
-        </div>
-        {vimMode !== "insert" ? (
-          <span className={`session-vim-mode is-${vimMode}`}>
-            {vimMode === "visual"
-              ? "-- VISUAL --"
-              : vimMode === "pane"
-                ? "-- PANE --"
-                : "-- NORMAL --"}
-          </span>
-        ) : null}
       </div>
     </div>
   );
