@@ -3,6 +3,7 @@ import { ChevronDown, RefreshCw } from "lucide-react";
 import { getAgentModels, replaceAgent } from "./api";
 import { DisclosureContent } from "./disclosure";
 import { BbDialog } from "./dialogs";
+import type { FocusReturnRef } from "./modal-a11y";
 import { Button } from "./primitives";
 import { isWorkerRole, presetWorkerModel } from "./role-pipeline";
 import type {
@@ -45,7 +46,9 @@ export function ReplaceAgentModal({
   onClose,
   onReplaced,
   target,
+  fallbackRef,
 }: {
+  fallbackRef?: FocusReturnRef;
   models?: AgentModelOption[];
   onClose: () => void;
   onReplaced?: (result: ReplaceAgentResult) => void;
@@ -121,6 +124,7 @@ export function ReplaceAgentModal({
       size="md"
       closeLabel="Close replace dialog"
       busy={submitting}
+      fallbackRef={fallbackRef}
       onClose={onClose}
       onSubmit={submit}
       footer={

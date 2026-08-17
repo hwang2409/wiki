@@ -154,6 +154,8 @@
   --surface-destructive: color-mix(in oklab, var(--accent-danger) 8%, var(--background-primary));
   --destructive-text: var(--accent-danger);
   --surface-selected: color-mix(in srgb, var(--accent-primary) 16%, transparent);
+  --surface-scrim: rgb(0 0 0 / 8%);
+  --surface-scrim: color-mix(in oklab, var(--canvas, var(--background-primary, #fff)) 92%, transparent);
   /* bb-language state fills alias the wiki modifier tokens so they cannot
      drift as themes customize their hover/active tints. */
   --state-hover: var(--background-modifier-hover);

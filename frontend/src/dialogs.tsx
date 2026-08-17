@@ -1,7 +1,7 @@
 import { useId } from "react";
 import type { FormEventHandler, ReactNode } from "react";
 import { X } from "lucide-react";
-import { useModalA11y } from "./modal-a11y";
+import { useModalA11y, type FocusReturnRef } from "./modal-a11y";
 
 // WIKI-308: shared bb-parity Dialog shape used by every wiki modal
 // (settings, spawn worker, spawn orchestrator, replace agent, destructive
@@ -32,6 +32,10 @@ interface CommonDialogProps {
   busy?: boolean;
   /** Extra class merged onto the panel. */
   panelClassName?: string;
+  /** Element to focus when the dialog closes if the opener unmounts. */
+  fallbackRef?: FocusReturnRef;
+  /** Element that receives initial focus after the dialog mounts. */
+  initialFocusRef?: FocusReturnRef;
 }
 
 interface DialogAsDivProps extends CommonDialogProps {
@@ -70,6 +74,8 @@ export function BbDialog(props: BbDialogProps) {
     busy = false,
     panelClassName,
     className,
+    fallbackRef,
+    initialFocusRef,
     onClose,
   } = props;
 
@@ -80,7 +86,7 @@ export function BbDialog(props: BbDialogProps) {
 
   const titleId = useId();
   const descriptionId = useId();
-  const dialogRef = useModalA11y<HTMLElement>(true, requestClose);
+  const dialogRef = useModalA11y<HTMLElement>(true, requestClose, fallbackRef, initialFocusRef);
 
   const panelClasses = ["bb-dialog", dialogSizeClass(size)];
   if (rail) panelClasses.push("bb-dialog--has-rail");
@@ -118,9 +124,9 @@ export function BbDialog(props: BbDialogProps) {
 
   const body = rail ? (
     <div className="bb-dialog__split">
-      <aside className="bb-dialog__rail" role="tablist" aria-label="Sections">
+      <nav className="bb-dialog__rail" aria-label="Sections">
         {rail}
-      </aside>
+      </nav>
       <div className="bb-dialog__body">{children}</div>
     </div>
   ) : (
@@ -206,9 +212,7 @@ export function DialogRail({ items, active, onSelect }: DialogRailProps) {
             key={item.id}
             id={`bb-rail-${item.id}`}
             aria-controls={`bb-rail-panel-${item.id}`}
-            aria-selected={isActive}
-            role="tab"
-            tabIndex={isActive ? 0 : -1}
+            aria-pressed={isActive}
             type="button"
             className={`bb-dialog__rail-item${isActive ? " is-active" : ""}`}
             onClick={() => onSelect(item.id)}

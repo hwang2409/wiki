@@ -3,6 +3,7 @@ import { ChevronDown } from "lucide-react";
 import { THEMES, type ThemeId } from "./themes";
 import { applyLowercase, getStoredLowercase } from "./lowercase-mode";
 import { BbDialog, DialogRail } from "./dialogs";
+import type { FocusReturnRef } from "./modal-a11y";
 import { Button } from "./primitives";
 import {
   classifyEnumerated,
@@ -505,6 +506,8 @@ function FontPicker({
   const [query, setQuery] = useState("");
   const rootRef = useRef<HTMLDivElement | null>(null);
   const filterRef = useRef<HTMLInputElement | null>(null);
+  const triggerRef = useRef<HTMLButtonElement | null>(null);
+  const wasOpenRef = useRef(false);
 
   const currentChoice = useMemo(() => pickChoice(fonts, current), [fonts, current]);
 
@@ -533,18 +536,15 @@ function FontPicker({
       if (!rootRef.current) return;
       if (!rootRef.current.contains(event.target as Node)) setOpen(false);
     };
-    const onKey = (event: KeyboardEvent) => {
-      if (event.key !== "Escape") return;
-      // stop the settings modal's window keydown from closing the whole modal
-      event.stopPropagation();
-      setOpen(false);
-    };
     document.addEventListener("mousedown", onDocDown);
-    document.addEventListener("keydown", onKey);
     return () => {
       document.removeEventListener("mousedown", onDocDown);
-      document.removeEventListener("keydown", onKey);
     };
+  }, [open]);
+
+  useEffect(() => {
+    if (wasOpenRef.current && !open) triggerRef.current?.focus();
+    wasOpenRef.current = open;
   }, [open]);
 
   const available = useMemo(
@@ -559,11 +559,21 @@ function FontPicker({
   }, [available, query]);
 
   return (
-    <div className={`font-picker${open ? " is-open" : ""}`} ref={rootRef}>
+    <div
+      className={`font-picker${open ? " is-open" : ""}`}
+      ref={rootRef}
+      onKeyDown={(event) => {
+        if (!open || event.key !== "Escape") return;
+        event.preventDefault();
+        event.stopPropagation();
+        setOpen(false);
+      }}
+    >
       <button
         aria-expanded={open}
         aria-haspopup="listbox"
         className="font-picker-trigger"
+        ref={triggerRef}
         type="button"
         onClick={() => setOpen((o) => !o)}
       >
@@ -788,10 +798,12 @@ function FontRow({
 }
 
 export function SettingsModal({
+  fallbackRef,
   onClose,
   onThemeChange,
   theme,
 }: {
+  fallbackRef?: FocusReturnRef;
   onClose: () => void;
   onThemeChange: (theme: ThemeId) => void;
   theme: ThemeId;
@@ -814,6 +826,7 @@ export function SettingsModal({
       description="Applied immediately. Close when you are done."
       size="lg"
       onClose={onClose}
+      fallbackRef={fallbackRef}
       rail={
         <DialogRail
           active={section}

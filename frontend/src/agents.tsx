@@ -13,6 +13,7 @@ import {
   ScrollText,
 } from "lucide-react";
 import { BbDialog } from "./dialogs";
+import type { FocusReturnRef } from "./modal-a11y";
 import { Button } from "./primitives";
 import {
   archiveAgent,
@@ -244,11 +245,13 @@ function writeExpandedOrchs(expanded: Record<string, boolean>) {
 }
 
 export function SpawnWorkerModal({
+  fallbackRef,
   models,
   orchestrators,
   onClose,
   onSpawn,
 }: {
+  fallbackRef?: FocusReturnRef;
   models: AgentModelOption[];
   orchestrators: Orchestrator[];
   onClose: () => void;
@@ -439,6 +442,7 @@ export function SpawnWorkerModal({
       size="lg"
       closeLabel="Close spawn dialog"
       busy={submitting}
+      fallbackRef={fallbackRef}
       onClose={requestClose}
       onSubmit={submit}
       footer={
@@ -738,12 +742,14 @@ export function SpawnWorkerModal({
 }
 
 export function SpawnOrchestratorModal({
+  fallbackRef,
   models,
   workspaceRoot,
   workspaceRootReady = true,
   onClose,
   onSpawn,
 }: {
+  fallbackRef?: FocusReturnRef;
   models: AgentModelOption[];
   workspaceRoot?: string | null;
   workspaceRootReady?: boolean;
@@ -855,6 +861,7 @@ export function SpawnOrchestratorModal({
       size="lg"
       closeLabel="Close orchestrator dialog"
       busy={submitting}
+      fallbackRef={fallbackRef}
       onClose={requestClose}
       onSubmit={submit}
       footer={
@@ -1233,6 +1240,9 @@ export function AgentsView({
   const [availableModels, setAvailableModels] = useState<AgentModelOption[]>([]);
   const [spawnWorkerOpen, setSpawnWorkerOpen] = useState(false);
   const [spawnOrchestratorOpen, setSpawnOrchestratorOpen] = useState(false);
+  const spawnWorkerTriggerRef = useRef<HTMLButtonElement | null>(null);
+  const spawnOrchestratorTriggerRef = useRef<HTMLButtonElement | null>(null);
+  const replaceFallbackRef = useRef<FocusReturnRef>({ current: null });
   const [replaceTarget, setReplaceTarget] = useState<ReplaceAgentTarget | null>(null);
   const [controlConfirm, setControlConfirm] = useState<string | null>(null);
   const [controlPending, setControlPending] = useState<string | null>(null);
@@ -1869,7 +1879,9 @@ export function AgentsView({
                             type="button"
                             onClick={() => {
                               if (item.disabled) return;
-                              menuButtonRefs.current.get(orch.id)?.focus();
+                              const menuButton = menuButtonRefs.current.get(orch.id);
+                              replaceFallbackRef.current.current = menuButton ?? null;
+                              menuButton?.focus();
                               closeMenu("pointer");
                               item.run();
                             }}
@@ -2196,7 +2208,9 @@ export function AgentsView({
                             type="button"
                             onClick={() => {
                               if (item.disabled) return;
-                              menuButtonRefs.current.get(worker.ticket)?.focus();
+                              const menuButton = menuButtonRefs.current.get(worker.ticket);
+                              replaceFallbackRef.current.current = menuButton ?? null;
+                              menuButton?.focus();
                               setOpenMenuTicket(null);
                               item.run();
                             }}
@@ -2326,6 +2340,7 @@ export function AgentsView({
             <button
               className="agents-spawn-button"
               disabled={workers === null}
+              ref={spawnOrchestratorTriggerRef}
               type="button"
               onClick={() => {
                 setSpawnOrchestratorOpen(true);
@@ -2337,6 +2352,7 @@ export function AgentsView({
             <button
               className="agents-spawn-button"
               disabled={workers === null}
+              ref={spawnWorkerTriggerRef}
               type="button"
               onClick={() => {
                 setSpawnWorkerOpen(true);
@@ -2359,6 +2375,7 @@ export function AgentsView({
       ) : null}
       {spawnWorkerOpen ? (
         <SpawnWorkerModal
+          fallbackRef={spawnWorkerTriggerRef}
           models={availableModels}
           orchestrators={orchestrators}
           onClose={() => setSpawnWorkerOpen(false)}
@@ -2373,6 +2390,7 @@ export function AgentsView({
       ) : null}
       {spawnOrchestratorOpen ? (
         <SpawnOrchestratorModal
+          fallbackRef={spawnOrchestratorTriggerRef}
           models={availableModels}
           workspaceRoot={workspaceRoot}
           workspaceRootReady={workspaceRootReady}
@@ -2387,6 +2405,7 @@ export function AgentsView({
       ) : null}
       {replaceTarget ? (
         <ReplaceAgentModal
+          fallbackRef={replaceFallbackRef.current}
           models={availableModels}
           target={replaceTarget}
           onClose={() => setReplaceTarget(null)}

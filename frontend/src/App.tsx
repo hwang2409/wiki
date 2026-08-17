@@ -83,6 +83,7 @@ import {
 } from "./file-workspaces";
 import { SettingsModal, applyStoredFonts } from "./settings";
 import { BbDialog } from "./dialogs";
+import type { FocusReturnRef } from "./modal-a11y";
 import { Button } from "./primitives";
 import { ActivityFeed } from "./activity";
 import { AgentsSidebar, AgentsView, type AccountEvent, type AgentOpenTarget } from "./agents";
@@ -1032,6 +1033,7 @@ type ContextMenuState = {
   y: number;
   kind: "file" | "folder";
   path: string;
+  origin: HTMLElement | null;
 };
 
 type DialogState = {
@@ -1040,11 +1042,14 @@ type DialogState = {
   input?: string;
   confirmLabel: string;
   danger?: boolean;
+  fallbackRef?: FocusReturnRef;
   onConfirm: (value: string) => void;
 };
 
 function Dialog({ dialog, onClose }: { dialog: DialogState; onClose: () => void }) {
   const [value, setValue] = useState(dialog.input ?? "");
+  const initialButtonRef = useRef<HTMLButtonElement | null>(null);
+  const initialInputRef = useRef<HTMLInputElement | null>(null);
 
   function confirm() {
     onClose();
@@ -1058,13 +1063,15 @@ function Dialog({ dialog, onClose }: { dialog: DialogState; onClose: () => void 
       description={dialog.description}
       size="sm"
       onClose={onClose}
+      fallbackRef={dialog.fallbackRef}
+      initialFocusRef={dialog.input === undefined ? initialButtonRef : initialInputRef}
       footer={
         <>
           <Button variant="ghost" onClick={onClose}>
             Cancel
           </Button>
           <Button
-            autoFocus={dialog.input === undefined}
+            ref={dialog.input === undefined ? initialButtonRef : undefined}
             variant={dialog.danger ? "destructive" : "default"}
             onClick={confirm}
           >
@@ -1075,9 +1082,9 @@ function Dialog({ dialog, onClose }: { dialog: DialogState; onClose: () => void 
     >
       {dialog.input !== undefined ? (
         <input
-          autoFocus
           aria-label={dialog.title}
           className="bb-dialog-input"
+          ref={initialInputRef}
           type="text"
           value={value}
           onChange={(event) => setValue(event.target.value)}
@@ -1218,7 +1225,7 @@ function FolderTree({
   onNoteDragStart: (path: string) => void;
   onNoteDragEnd: () => void;
   onDropOnFolder: (folderPath: string) => void;
-  onContextMenu: (event: ReactMouseEvent, kind: "file" | "folder", path: string) => void;
+  onContextMenu: (event: ReactMouseEvent<HTMLElement>, kind: "file" | "folder", path: string) => void;
 }) {
   return (
     <>
@@ -1400,6 +1407,7 @@ export default function App() {
   };
   const [contextMenu, setContextMenu] = useState<ContextMenuState | null>(null);
   const [dialog, setDialog] = useState<DialogState | null>(null);
+  const settingsTriggerRef = useRef<HTMLButtonElement | null>(null);
   const paneIdRef = useRef(0);
   const windowIdRef = useRef(0);
   const paneRefs = useRef(new Map<string, HTMLDivElement>());
@@ -2872,13 +2880,13 @@ export default function App() {
   }
 
   function handleTreeContextMenu(
-    event: ReactMouseEvent,
+    event: ReactMouseEvent<HTMLElement>,
     kind: "file" | "folder",
     path: string
   ) {
     event.preventDefault();
     event.stopPropagation();
-    setContextMenu({ x: event.clientX, y: event.clientY, kind, path });
+    setContextMenu({ x: event.clientX, y: event.clientY, kind, path, origin: event.currentTarget });
   }
 
   async function doRename(oldPath: string, newPathRaw: string) {
@@ -2901,23 +2909,25 @@ export default function App() {
     }
   }
 
-  function promptRename(path: string) {
+  function promptRename(path: string, origin?: HTMLElement | null) {
     setDialog({
       title: "Rename / move note",
       input: path,
       confirmLabel: "Rename",
+      fallbackRef: origin ? { current: origin } : undefined,
       onConfirm: (value) => {
         if (value && value !== path) doRename(path, value);
       }
     });
   }
 
-  function promptDelete(path: string) {
+  function promptDelete(path: string, origin?: HTMLElement | null) {
     setDialog({
       title: `Delete ${basename(path)}?`,
       description: `This removes ${basename(path)} from the vault. Recoverable from version history.`,
       confirmLabel: "Delete",
       danger: true,
+      fallbackRef: origin ? { current: origin } : undefined,
       onConfirm: async () => {
         try {
           await deleteNote(path);
@@ -2970,13 +2980,14 @@ export default function App() {
     }
   }
 
-  function promptNewNoteIn(folderPath: string) {
+  function promptNewNoteIn(folderPath: string, origin?: HTMLElement | null) {
     const noteFolder = noteFolderFromTreePath(folderPath, showAllFiles);
     if (noteFolder === null) return;
     setDialog({
       title: "New note",
       input: noteFolder ? `${noteFolder}/` : "",
       confirmLabel: "Create",
+      fallbackRef: origin ? { current: origin } : undefined,
       onConfirm: (value) => {
         if (value && !value.endsWith("/")) createFromPath(value);
       }
@@ -3976,6 +3987,7 @@ export default function App() {
           <button
             aria-label="Settings"
             className="sidebar-footer-action"
+            ref={settingsTriggerRef}
             title="Settings"
             type="button"
             onClick={() => setSettingsOpen(true)}
@@ -4188,9 +4200,9 @@ export default function App() {
                 <button
                   type="button"
                   onClick={() => {
-                    const { path } = contextMenu;
+                    const { origin, path } = contextMenu;
                     setContextMenu(null);
-                    promptRename(path);
+                    promptRename(path, origin);
                   }}
                 >
                   Rename / move…
@@ -4199,9 +4211,9 @@ export default function App() {
                   className="is-danger"
                   type="button"
                   onClick={() => {
-                    const { path } = contextMenu;
+                    const { origin, path } = contextMenu;
                     setContextMenu(null);
-                    promptDelete(path);
+                    promptDelete(path, origin);
                   }}
                 >
                   Delete
@@ -4212,9 +4224,9 @@ export default function App() {
               disabled={noteFolderFromTreePath(contextMenu.path, showAllFiles) === null}
               type="button"
               onClick={() => {
-                const { path } = contextMenu;
+                const { origin, path } = contextMenu;
                 setContextMenu(null);
-                promptNewNoteIn(path);
+                promptNewNoteIn(path, origin);
               }}
             >
               New note…
@@ -4226,7 +4238,12 @@ export default function App() {
       {dialog ? <Dialog dialog={dialog} onClose={() => setDialog(null)} /> : null}
 
       {settingsOpen ? (
-        <SettingsModal theme={theme} onClose={() => setSettingsOpen(false)} onThemeChange={setTheme} />
+        <SettingsModal
+          fallbackRef={settingsTriggerRef}
+          theme={theme}
+          onClose={() => setSettingsOpen(false)}
+          onThemeChange={setTheme}
+        />
       ) : null}
       {paletteOpen ? (
         <CommandPalette
