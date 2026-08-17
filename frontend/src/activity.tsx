@@ -6,10 +6,6 @@ import { LoadingPlaceholder } from "./loading";
 import { SplitDiffView } from "./split-diff";
 import { UtilityEmpty, UtilityError, UtilityLoading, UtilityPage } from "./utility-page";
 
-function basename(path: string) {
-  return path.split("/").pop()?.replace(/\.md$/, "") ?? path;
-}
-
 function vaultNotePath(filePath: string): string | null {
   if (!filePath.startsWith("vault/") || !filePath.endsWith(".md")) return null;
   return filePath.slice("vault/".length);
@@ -260,12 +256,13 @@ function ActivityBody({
             const isOpen = expanded.has(commit.sha);
             const shortSha = commit.sha.slice(0, 7);
             return (
-              <article className="activity-commit bb-detail-card" key={commit.sha}>
+              <article
+                className={`activity-commit${isOpen ? " is-active" : ""}`}
+                key={commit.sha}
+              >
                 <button
                   aria-expanded={isOpen}
-                  className={`activity-commit-row session-activity-row session-tool${
-                    isOpen ? " is-working" : ""
-                  }`}
+                  className="activity-commit-row"
                   type="button"
                   onClick={() => onToggle(commit.sha)}
                 >
@@ -297,7 +294,7 @@ function ActivityBody({
                         }}
                       >
                         <FileText size={11} />
-                        <span>{basename(file.path)}</span>
+                        <span className="activity-file-path">{file.path}</span>
                         <span
                           className="activity-file-status"
                           title={`status: ${file.status}`}
