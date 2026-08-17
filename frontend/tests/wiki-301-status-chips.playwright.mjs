@@ -103,8 +103,9 @@ try {
       if (chip.fontWeight !== "500") {
         throw new Error(`${theme}: chip font-weight ${chip.fontWeight} !== 500`);
       }
-      if (chip.fontSize !== "10px") {
-        throw new Error(`${theme}: chip font-size ${chip.fontSize} unexpected (want 10)`);
+      // WIKI-334: one size everywhere — chips render at the base size.
+      if (chip.fontSize !== "15px") {
+        throw new Error(`${theme}: chip font-size ${chip.fontSize} unexpected (want 15)`);
       }
     }
 

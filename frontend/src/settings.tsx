@@ -132,9 +132,9 @@ function isSettingsSection(value: string): value is SettingsSection {
   return value === "appearance" || value === "typography";
 }
 
-// Single storage keys — one font, one weight, and one base size. The base size
-// derives prose, control, and chrome tiers in styles.css (WIKI-318). Legacy
-// per-role keys are read once for migration then deleted.
+// Single storage keys — one font, one weight, and one size. Every surface
+// renders at the one picked size (WIKI-334). Legacy per-role keys are read
+// once for migration then deleted.
 const FONT_KEY = "wiki-font";
 // Resolved CSS stack for cross-document rendering (dashboard). Persisted so
 // the dashboard doesn't need to re-import the FontChoice pool to map a label
@@ -167,8 +167,8 @@ const LEGACY_SIZE_KEYS = [
   "wiki-font-size-mono",
 ];
 
-// Family and weight roles remain aliases of the single user choice. Size is
-// written only to the base token; styles.css derives the semantic tiers.
+// Family, weight, and size roles remain aliases of the single user choice;
+// size is written only to the base token.
 const FAMILY_VARS = [
   "--font-single",
   "--font-interface",
@@ -665,8 +665,8 @@ export function SettingsModal({
             <div className="settings-row-info">
               <div className="settings-row-name">Size</div>
               <div className="settings-row-desc">
-                One base size derives 15px prose, 13px controls, and 10px chrome.
-                All tiers scale together.
+                One size for everything — prose, controls, and chrome all
+                render at this size.
               </div>
             </div>
             <div className="settings-slider">

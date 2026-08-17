@@ -135,8 +135,8 @@ try {
   });
   assert(
     JSON.stringify(legacyTierSizes) ===
-      JSON.stringify({ "2xs": "10px", xs: "10px", sm: "13px", md: "13px", base: "15px", lg: "15px" }),
-    `legacy size aliases drifted: ${JSON.stringify(legacyTierSizes)}`,
+      JSON.stringify({ "2xs": "15px", xs: "15px", sm: "15px", md: "15px", base: "15px", lg: "15px" }),
+    `legacy size aliases drifted (one size everywhere, WIKI-334): ${JSON.stringify(legacyTierSizes)}`,
   );
 
   const semanticSizes = await page.evaluate(() => {
@@ -153,8 +153,8 @@ try {
     return { values, families };
   });
   assert(
-    JSON.stringify(semanticSizes.values) === JSON.stringify(["15px", "13px", "10px", "13px"]),
-    `semantic type tiers changed: ${JSON.stringify(semanticSizes.values)}`,
+    JSON.stringify(semanticSizes.values) === JSON.stringify(["15px", "15px", "15px", "15px"]),
+    `one-size contract broken (WIKI-334): ${JSON.stringify(semanticSizes.values)}`,
   );
   assert(
     semanticSizes.families[0].startsWith('"Inter Variable"'),
@@ -180,8 +180,8 @@ try {
     return values;
   });
   assert(
-    JSON.stringify(scaledSizes) === JSON.stringify(["18px", "15.6px", "12px"]),
-    `semantic tiers did not scale together: ${JSON.stringify(scaledSizes)}`,
+    JSON.stringify(scaledSizes) === JSON.stringify(["18px", "18px", "18px"]),
+    `sizes did not scale together (WIKI-334): ${JSON.stringify(scaledSizes)}`,
   );
 
   const scaleBinding = await page.evaluate(() => {
@@ -199,7 +199,7 @@ try {
     probe.remove();
     return result;
   });
-  assert(scaleBinding.fontSize === "13px", `--fs-md expected 13px, got ${scaleBinding.fontSize}`);
+  assert(scaleBinding.fontSize === "15px", `--fs-md expected 15px (one size, WIKI-334), got ${scaleBinding.fontSize}`);
   assert(scaleBinding.fontWeight === "500", `--fw-medium expected 500, got ${scaleBinding.fontWeight}`);
   assert(
     scaleBinding.borderRadius === "8px",
@@ -273,23 +273,12 @@ try {
     host.remove();
     return results;
   });
-  const expectedSurfaceSizes = {
-    agents: ["10px", "10px"],
-    session: ["10px", "10px"],
-    dialogs: ["15px", "13px", "13px", "10px", "13px", "13px"],
-    settings: ["13px", "10px", "10px", "10px"],
-    spawn: ["10px", "13px", "10px", "13px", "10px"],
-    dashboard: ["13px", "13px", "10px", "10px", "13px", "10px"],
-    tokens: ["13px", "10px", "10px", "15px"],
-    kanban: ["13px", "13px", "13px", "10px", "13px"],
-    toasts: ["13px", "10px"],
-    "status-strip": ["10px", "10px"],
-  };
-  for (const [surface, expectedSizes] of Object.entries(expectedSurfaceSizes)) {
-    const actualSizes = surfaceSizes[surface].map(({ fontSize }) => fontSize);
+  // WIKI-334: every probed surface renders at the one picked size.
+  for (const [surface, probes] of Object.entries(surfaceSizes)) {
+    const offSize = probes.filter(({ fontSize }) => fontSize !== "15px");
     assert(
-      JSON.stringify(actualSizes) === JSON.stringify(expectedSizes),
-      `${surface} semantic sizes changed: ${JSON.stringify(actualSizes)}`,
+      offSize.length === 0,
+      `${surface} has off-size probes (WIKI-334): ${JSON.stringify(offSize)}`,
     );
   }
 

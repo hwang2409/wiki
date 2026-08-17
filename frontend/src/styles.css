@@ -92,19 +92,21 @@
 
   --readable-col: var(--file-line-width);
 
-  /* WIKI-318: one user-facing base size derives semantic type tiers. The
-     selected family still applies to every surface, including code and
-     terminal output. */
+  /* WIKI-334: one size for every surface (Henry 2026-08-17, supersedes the
+     WIKI-318 15/13/10 tiers). The single picker size drives prose, controls,
+     and chrome alike; the tier token names survive as aliases because
+     hundreds of rules consume them. The selected family still applies to
+     every surface, including code and terminal output. */
   --font-single: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, "Helvetica Neue",
     Helvetica, Arial, sans-serif;
   --font-single-size: 15px;
 
   --font-prose-size: var(--font-single-size);
   --font-prose-line-height: calc(var(--font-prose-size) * 22 / 15);
-  --font-control-size: calc(var(--font-single-size) * 13 / 15);
-  --font-control-line-height: calc(var(--font-control-size) * 18 / 13);
-  --font-chrome-size: calc(var(--font-single-size) * 10 / 15);
-  --font-chrome-line-height: calc(var(--font-chrome-size) * 14 / 10);
+  --font-control-size: var(--font-single-size);
+  --font-control-line-height: var(--font-prose-line-height);
+  --font-chrome-size: var(--font-single-size);
+  --font-chrome-line-height: var(--font-prose-line-height);
 
   --font-interface: var(--font-single);
   --font-text: var(--font-single);
@@ -139,7 +141,8 @@
   --hairline: color-mix(in srgb, var(--background-modifier-border) 55%, transparent);
   --hairline-strong: color-mix(in srgb, var(--background-modifier-border) 75%, transparent);
   --chip-radius: var(--radius-full);
-  --composer-radius: var(--radius-xl);
+  /* WIKI-334: square composer, flush with the pane background (Henry). */
+  --composer-radius: 0;
   --send-diameter: 34px;
   --section-label-tracking: 0.14em;
   --section-label-size: var(--fs-2xs);
@@ -3190,7 +3193,7 @@ body.is-resizing-panes .pane-cell {
 }
 
 .markdown-preview-view.kanban-card-content .priority-badge {
-  line-height: 14px;
+  line-height: 1.4;
   vertical-align: 0;
 }
 
@@ -16968,24 +16971,22 @@ body {
 /* round send-button stays per WIKI-294 §6 W10 (Henry-locked).          */
 /* ==================================================================== */
 
+/* WIKI-334: square card, transparent fill (flush with the pane), no lift
+   shadow. Focus shifts the hairline only. */
 .session-composer-card {
   display: flex;
   flex-direction: column;
   border: 1px solid var(--border-hairline);
   border-radius: var(--composer-radius);
-  background-color: var(--background-primary);
-  box-shadow: var(--shadow-lift);
+  background-color: transparent;
   overflow: hidden;
-  transition-property: border-color, box-shadow;
+  transition-property: border-color;
   transition-duration: var(--motion-duration);
   transition-timing-function: var(--motion-easing);
 }
 
 .session-composer-card:focus-within {
   border-color: color-mix(in srgb, var(--text-normal) 45%, var(--border-hairline));
-  box-shadow:
-    var(--shadow-lift),
-    0 0 0 1px color-mix(in srgb, var(--ring) 55%, transparent);
 }
 
 /* Neutralize the WIKI-293 card chrome that used to live on the row —

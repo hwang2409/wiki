@@ -22,7 +22,8 @@ const OUT_DIR = process.env.WIKI_PLAYWRIGHT_OUT_DIR
   : path.join(ROOT, ".playwright-mcp", "wiki-332");
 const VIEWPORT = { width: 1440, height: 900 };
 const TICKET = "WIKI-332";
-const TIERS = ["15px", "13px", "10px"];
+// WIKI-334: one size everywhere — every visible text leaf renders at the base.
+const TIERS = ["15px"];
 
 function assert(condition, message) {
   if (!condition) throw new Error(message);

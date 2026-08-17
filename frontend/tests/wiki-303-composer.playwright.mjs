@@ -186,9 +186,10 @@ async function main() {
         composerMetrics.cardBorderWidth === "1px",
         `[${theme}] card border width: ${composerMetrics.cardBorderWidth}`,
       );
+      // WIKI-334: the card is flat — square, transparent, no lift shadow.
       assert(
-        composerMetrics.cardShadow !== "none",
-        `[${theme}] card must carry --shadow-lift`,
+        composerMetrics.cardShadow === "none",
+        `[${theme}] card must be flat (WIKI-334), got ${composerMetrics.cardShadow}`,
       );
       assert(
         composerMetrics.rowBorder === "0px",
@@ -196,16 +197,18 @@ async function main() {
       );
       assert(composerMetrics.hasFooter, `[${theme}] model footer must live inside the card`);
 
-      // Focus lift on the CARD (bb pattern: focus-within lifts the outer card,
-      // not the row inside it). Compare shadow before/after focusing the input.
-      const restingShadow = composerMetrics.cardShadow;
+      // WIKI-334: focus shifts the card hairline only — compare border color
+      // before/after focusing the input.
+      const restingBorder = await page.evaluate(
+        () => getComputedStyle(document.querySelector(".session-composer-card")).borderTopColor,
+      );
       await composer.focus();
-      const focusedShadow = await page.evaluate(
-        () => getComputedStyle(document.querySelector(".session-composer-card")).boxShadow,
+      const focusedBorder = await page.evaluate(
+        () => getComputedStyle(document.querySelector(".session-composer-card")).borderTopColor,
       );
       assert(
-        focusedShadow !== restingShadow,
-        `[${theme}] focus-within must change the card shadow (was ${restingShadow})`,
+        focusedBorder !== restingBorder,
+        `[${theme}] focus-within must shift the card border (was ${restingBorder})`,
       );
 
       // Skill-menu opens with a bb-menu-row + .prompt-mention-pill preview.

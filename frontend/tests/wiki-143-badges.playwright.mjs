@@ -131,8 +131,8 @@ try {
       `state ${state} expected pill (999px) radius, got ${rendered.shapes[state].borderRadius}`,
     );
     assert(
-      rendered.shapes[state].fontSize === "10px",
-      `state ${state} expected 10px (chrome tier), got ${rendered.shapes[state].fontSize}`,
+      rendered.shapes[state].fontSize === "15px",
+      `state ${state} expected 15px (one size everywhere, WIKI-334), got ${rendered.shapes[state].fontSize}`,
     );
     assert(
       rendered.shapes[state].fontWeight === "500",
