@@ -1047,9 +1047,9 @@ type DialogState = {
   onConfirm: (value: string) => void;
 };
 
-function Dialog({ dialog, onClose }: { dialog: DialogState; onClose: () => void }) {
+export function Dialog({ dialog, onClose }: { dialog: DialogState; onClose: () => void }) {
   const [value, setValue] = useState(dialog.input ?? "");
-  const initialButtonRef = useRef<HTMLButtonElement | null>(null);
+  const initialCancelRef = useRef<HTMLButtonElement | null>(null);
   const initialInputRef = useRef<HTMLInputElement | null>(null);
 
   function confirm() {
@@ -1065,14 +1065,17 @@ function Dialog({ dialog, onClose }: { dialog: DialogState; onClose: () => void 
       size="sm"
       onClose={onClose}
       fallbackRef={dialog.fallbackRef}
-      initialFocusRef={dialog.input === undefined ? initialButtonRef : initialInputRef}
+      initialFocusRef={dialog.input === undefined ? initialCancelRef : initialInputRef}
       footer={
         <>
-          <Button variant="ghost" onClick={onClose}>
+          <Button
+            ref={dialog.input === undefined ? initialCancelRef : undefined}
+            variant="ghost"
+            onClick={onClose}
+          >
             Cancel
           </Button>
           <Button
-            ref={dialog.input === undefined ? initialButtonRef : undefined}
             variant={dialog.danger ? "destructive" : "default"}
             onClick={confirm}
           >
