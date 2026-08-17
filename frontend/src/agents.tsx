@@ -47,6 +47,7 @@ import { BranchPill } from "./branch-pill";
 import { StatusBadge } from "./status-badge";
 import { toast } from "./toast";
 import { useModalA11y } from "./modal-a11y";
+import { Button } from "./primitives";
 
 declare global {
   interface Window {
@@ -1234,6 +1235,8 @@ export function AgentsView({
   refreshTick,
   openTicket,
   onOpenTicket,
+  startRunRequest = 0,
+  onStartRunRequestHandled,
 }: {
   data?: {
     workers: AgentWorker[] | null;
@@ -1248,6 +1251,8 @@ export function AgentsView({
   refreshTick: number;
   openTicket: AgentOpenTarget | null;
   onOpenTicket: (target: AgentOpenTarget | null) => void;
+  startRunRequest?: number;
+  onStartRunRequestHandled?: () => void;
 }) {
   const [fetchedWorkers, setFetchedWorkers] = useState<AgentWorker[] | null>(null);
   const [fetchedOrchestrators, setFetchedOrchestrators] = useState<Orchestrator[]>([]);
@@ -1334,6 +1339,12 @@ export function AgentsView({
       return next;
     });
   }
+
+  useEffect(() => {
+    if (startRunRequest === 0) return;
+    setSpawnWorkerOpen(true);
+    onStartRunRequestHandled?.();
+  }, [onStartRunRequestHandled, startRunRequest]);
 
   useEffect(() => {
     if (data) return;
@@ -1619,7 +1630,7 @@ export function AgentsView({
     const detailsOpen = expandedDetails.has(key);
     return (
       <article
-        className={`agent-card is-archived${isOpen ? " is-selected" : ""}`}
+        className={`agent-card agent-activity-row is-archived${isOpen ? " is-selected" : ""}`}
         key={key}
         onClick={(event) => {
           const target = event.target as HTMLElement;
@@ -1823,7 +1834,7 @@ export function AgentsView({
     }
 
     return (
-      <div className="agents-orch-group" key={orch.id}>
+      <div className="agents-orch-group agent-activity-row" key={orch.id}>
         <div className="agents-orch-head">
           <Bot size={13} />
           <span className="agents-orch-id">{orch.id}</span>
@@ -2097,7 +2108,7 @@ export function AgentsView({
 
     return (
       <article
-        className={`agent-card${isOpen ? " is-selected" : ""}`}
+        className={`agent-card agent-activity-row${isOpen ? " is-selected" : ""}`}
         key={worker.ticket}
         onClick={(event) => {
           const target = event.target as HTMLElement;
@@ -2301,31 +2312,31 @@ export function AgentsView({
   } else {
     const activeCount = orchestrators.length + liveWorkers.length;
     body = (
-      <>
+      <div className="agents-sections">
         {activeCount > 0 ? (
-          <div className="agents-section-head is-primary" data-testid="agents-section-active">
-            <span className="agents-section-title">Active</span>
-            <span className="agents-section-count tabular-nums">{activeCount}</span>
-          </div>
+          <section className="agents-section agents-section-active" aria-labelledby="agents-section-active">
+            <div className="agents-section-head is-primary" data-testid="agents-section-active">
+              <span className="agents-section-title" id="agents-section-active">Active</span>
+              <span className="agents-section-count tabular-nums">{activeCount}</span>
+            </div>
+            {grouped.map(({ orch, owned }) => renderOrchGroup(orch, owned))}
+            {ungrouped.length > 0 && grouped.length > 0 ? (
+              <div className="agents-section-head">unassigned workers</div>
+            ) : null}
+            {ungrouped.map(renderWorker)}
+          </section>
         ) : null}
-        {grouped.map(({ orch, owned }) => renderOrchGroup(orch, owned))}
-
-        {ungrouped.length > 0 && grouped.length > 0 ? (
-          <div className="agents-section-head">unassigned workers</div>
-        ) : null}
-        {ungrouped.map(renderWorker)}
-
         {archived.length > 0 ? (
-          <>
+          <section className="agents-section agents-section-history" aria-labelledby="agents-section-history">
             <div className="agents-section-head is-primary" data-testid="agents-section-history">
               <Archive size={13} />
-              <span className="agents-section-title">History</span>
+              <span className="agents-section-title" id="agents-section-history">History</span>
               <span className="agents-section-count tabular-nums">{archived.length}</span>
             </div>
             {archived.map(renderHistoryRow)}
-          </>
+          </section>
         ) : null}
-      </>
+      </div>
     );
   }
 
@@ -2333,39 +2344,22 @@ export function AgentsView({
     <ScreencastProvider>
     <div className={`agents-layout${openWorker ? " has-sidebar" : ""}`}>
       <div className="agents-view">
-        <div className="agents-toolbar">
-          <div>
-            <div className="agents-toolbar-title">Runs</div>
-            <div className="agents-toolbar-meta">
-              {orchestrators.length} orchestrator{orchestrators.length === 1 ? "" : "s"} ·{" "}
-              {liveWorkers.length} live worker{liveWorkers.length === 1 ? "" : "s"} ·{" "}
-              {archived.length} in history
-            </div>
-          </div>
-          <div className="dialog-actions">
-            <button
-              className="agents-spawn-button"
-              disabled={workers === null}
-              type="button"
-              onClick={() => {
-                setSpawnOrchestratorOpen(true);
-              }}
-            >
-              <Bot size={14} />
-              Spawn orchestrator
-            </button>
-            <button
-              className="agents-spawn-button"
-              disabled={workers === null}
-              type="button"
-              onClick={() => {
-                setSpawnWorkerOpen(true);
-              }}
-            >
-              <Plus size={14} />
-              Spawn worker
-            </button>
-          </div>
+        <div className="agents-page-tools">
+          <span className="agents-run-count">
+            {orchestrators.length} orchestrator{orchestrators.length === 1 ? "" : "s"} ·{" "}
+            {liveWorkers.length} live worker{liveWorkers.length === 1 ? "" : "s"} ·{" "}
+            {archived.length} in history
+          </span>
+          <Button
+            className="agents-orchestrator-button"
+            disabled={workers === null}
+            leadingIcon={<Bot aria-hidden size={14} />}
+            size="sm"
+            variant="outline"
+            onClick={() => setSpawnOrchestratorOpen(true)}
+          >
+            Spawn orchestrator
+          </Button>
         </div>
         <AccountEventsBanner events={accountNotices} />
         {body}

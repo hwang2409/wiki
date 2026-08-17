@@ -21,6 +21,7 @@ import {
   Moon,
   PanelLeft,
   Pencil,
+  Plus,
   RefreshCw,
   Search,
   Settings,
@@ -114,6 +115,7 @@ import {
 import { CommandPalette } from "./command-palette";
 import type { PaletteResult } from "./api";
 import type { Note, NoteDraft, NoteSummary } from "./types";
+import { Button } from "./primitives";
 
 type Mode =
   | "empty"
@@ -1407,6 +1409,7 @@ export default function App() {
   const [isSaving, setIsSaving] = useState(false);
   const [theme, setTheme] = useState<ThemeId>(() => getStoredTheme());
   const [agentsOpenTicket, setAgentsOpenTicket] = useState<AgentOpenTarget | null>(null);
+  const [agentsStartRunRequest, setAgentsStartRunRequest] = useState(0);
   const viewContentRef = useRef<HTMLDivElement | null>(null);
   const terminalControllersRef = useRef(new Map<string, TerminalPaneController>());
   const openTerminalIdsRef = useRef<Set<string>>(new Set());
@@ -3313,7 +3316,7 @@ export default function App() {
     activity: "Activity",
     graph: "Graph",
     health: "Health",
-    agents: "Agents",
+    agents: "Runs",
     tokens: "Tokens",
     dashboard: "Dashboard",
     "fleet-graph": "Fleet graph"
@@ -3507,6 +3510,8 @@ export default function App() {
           onOpenTicket={setAgentsOpenTicket}
           openTicket={agentsOpenTicket}
           refreshTick={refreshTick}
+          startRunRequest={agentsStartRunRequest}
+          onStartRunRequestHandled={() => setAgentsStartRunRequest(0)}
         />
       );
     }
@@ -4035,6 +4040,16 @@ export default function App() {
             ) : null}
           </div>
           <div className="app-page-header__actions">
+            {mode === "agents" ? (
+              <Button
+                className="agents-page-start-button"
+                leadingIcon={<Plus aria-hidden size={14} />}
+                type="button"
+                onClick={() => setAgentsStartRunRequest((request) => request + 1)}
+              >
+                Start run
+              </Button>
+            ) : null}
             {mode === "view" ? (
               <button
                 aria-label="Edit this note"
@@ -4106,6 +4121,8 @@ export default function App() {
                   refreshTick={refreshTick}
                   openTicket={agentsOpenTicket}
                   onOpenTicket={setAgentsOpenTicket}
+                  startRunRequest={agentsStartRunRequest}
+                  onStartRunRequestHandled={() => setAgentsStartRunRequest(0)}
                 />
               ) : mode === "tokens" ? (
                 <TokensView />
