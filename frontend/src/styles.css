@@ -18272,14 +18272,8 @@ body {
 .kanban-add-button.bb-button:focus-visible {
   opacity: 1;
 }
-/* WIKI-308 — bb Dialog shape (settings, spawn, replace, confirm).       */
-/* One panel geometry across every modal: rounded-xl, centered, scrim    */
-/* over canvas 92%, sticky footer, close X. Roles: dialog / alertdialog. */
-/* All existing `.dialog` / `.settings-modal` / `.agent-spawn-modal`     */
-/* selectors keep working; the WIKI-293 reskin layer no longer applies   */
-/* — every consumer moves to `.bb-dialog`.                               */
-/* ==================================================================== */
 
+/* WIKI-308 — bb Dialog shape (settings, spawn, replace, confirm). */
 .bb-dialog-scrim {
   position: fixed;
   inset: 0;
@@ -18307,21 +18301,10 @@ body {
   outline: none;
 }
 
-.bb-dialog--sm {
-  width: min(440px, calc(100vw - 32px));
-}
-
-.bb-dialog--md {
-  width: min(560px, calc(100vw - 32px));
-}
-
-.bb-dialog--lg {
-  width: min(720px, calc(100vw - 32px));
-}
-
-.bb-dialog--has-rail {
-  width: min(720px, calc(100vw - 32px));
-}
+.bb-dialog--sm { width: min(440px, calc(100vw - 32px)); }
+.bb-dialog--md { width: min(560px, calc(100vw - 32px)); }
+.bb-dialog--lg,
+.bb-dialog--has-rail { width: min(720px, calc(100vw - 32px)); }
 
 .bb-dialog__header {
   display: flex;
@@ -18334,10 +18317,10 @@ body {
 
 .bb-dialog__heading {
   display: flex;
+  flex: 1;
   flex-direction: column;
   gap: 2px;
   min-width: 0;
-  flex: 1;
 }
 
 .bb-dialog__title {
@@ -18369,9 +18352,7 @@ body {
   background: transparent;
   color: var(--text-muted);
   cursor: pointer;
-  transition-property: background-color, color;
-  transition-duration: var(--motion-duration);
-  transition-timing-function: var(--motion-easing);
+  transition: background-color var(--motion-duration) var(--motion-easing), color var(--motion-duration) var(--motion-easing);
 }
 
 .bb-dialog__close:hover:not(:disabled) {
@@ -18384,16 +18365,9 @@ body {
   outline-offset: 2px;
 }
 
-.bb-dialog__close:disabled {
-  cursor: not-allowed;
-  opacity: 0.5;
-}
+.bb-dialog__close:disabled { cursor: not-allowed; opacity: 0.5; }
 
-.bb-dialog__body {
-  padding: 16px;
-  overflow-y: auto;
-  min-height: 0;
-}
+.bb-dialog__body { min-height: 0; padding: 16px; overflow-y: auto; }
 
 .bb-dialog__split {
   display: grid;
@@ -18428,30 +18402,13 @@ body {
   font-weight: 500;
   cursor: pointer;
   text-align: left;
-  transition-property: background-color, color;
-  transition-duration: var(--motion-duration);
-  transition-timing-function: var(--motion-easing);
+  transition: background-color var(--motion-duration) var(--motion-easing), color var(--motion-duration) var(--motion-easing);
 }
 
-.bb-dialog__rail-item:hover {
-  background: var(--state-hover, var(--background-modifier-hover));
-  color: var(--text-normal);
-}
-
-.bb-dialog__rail-item.is-active {
-  background: var(--surface-selected, var(--background-modifier-hover));
-  color: var(--text-normal);
-}
-
-.bb-dialog__rail-item:focus-visible {
-  outline: 2px solid var(--ring);
-  outline-offset: 2px;
-}
-
-.bb-dialog__rail-count {
-  color: var(--text-faint);
-  font-variant-numeric: tabular-nums;
-}
+.bb-dialog__rail-item:hover { background: var(--state-hover, var(--background-modifier-hover)); color: var(--text-normal); }
+.bb-dialog__rail-item.is-active { background: var(--surface-selected, var(--background-modifier-hover)); color: var(--text-normal); }
+.bb-dialog__rail-item:focus-visible { outline: 2px solid var(--ring); outline-offset: 2px; }
+.bb-dialog__rail-count { color: var(--text-faint); font-variant-numeric: tabular-nums; }
 
 .bb-dialog__footer {
   display: flex;
@@ -18463,52 +18420,14 @@ body {
   background-color: color-mix(in oklab, var(--ink, transparent) 2.2%, var(--background-primary));
 }
 
-.bb-dialog__group {
-  display: flex;
-  flex-direction: column;
-  gap: 14px;
-}
+.bb-dialog__group { display: flex; flex-direction: column; gap: 14px; }
+.bb-dialog__group + .bb-dialog__group { margin-top: 20px; padding-top: 20px; border-top: 1px solid var(--border-seam, var(--background-modifier-border)); }
+.bb-dialog__group-title { margin: 0; color: var(--text-normal); font-family: var(--font-chrome); font-size: var(--fs-xs, 11px); font-weight: 600; letter-spacing: 0.06em; text-transform: uppercase; }
+.bb-dialog__group-hint { margin: 0; color: var(--text-muted); font-size: var(--fs-sm, 13px); line-height: 1.45; }
 
-.bb-dialog__group + .bb-dialog__group {
-  margin-top: 20px;
-  padding-top: 20px;
-  border-top: 1px solid var(--border-seam, var(--background-modifier-border));
-}
+.bb-dialog[role="alertdialog"] .bb-dialog__body p { margin: 0; color: var(--text-normal); font-size: var(--fs-sm, 13px); line-height: 1.5; }
+.bb-dialog[role="alertdialog"] .bb-dialog__body p + p { margin-top: 8px; color: var(--text-muted); }
 
-.bb-dialog__group-title {
-  margin: 0;
-  color: var(--text-normal);
-  font-family: var(--font-chrome);
-  font-size: var(--fs-xs, 11px);
-  font-weight: 600;
-  letter-spacing: 0.06em;
-  text-transform: uppercase;
-}
-
-.bb-dialog__group-hint {
-  margin: 0;
-  color: var(--text-muted);
-  font-size: var(--fs-sm, 13px);
-  line-height: 1.45;
-}
-
-/* Alertdialog: destructive confirms lean on `role="alertdialog"` so
-   screen readers announce them differently; the visual chrome stays
-   identical to the base dialog. */
-
-.bb-dialog[role="alertdialog"] .bb-dialog__body p {
-  margin: 0;
-  color: var(--text-normal);
-  font-size: var(--fs-sm, 13px);
-  line-height: 1.5;
-}
-
-.bb-dialog[role="alertdialog"] .bb-dialog__body p + p {
-  margin-top: 8px;
-  color: var(--text-muted);
-}
-
-/* Text input used inside a bb-dialog (prompts: rename, new note, etc.). */
 .bb-dialog-input {
   width: 100%;
   padding: 8px 12px;
@@ -18519,17 +18438,11 @@ body {
   font-family: var(--font-monospace);
   font-size: var(--fs-sm, 13px);
   outline: none;
-  transition-property: border-color, box-shadow;
-  transition-duration: var(--motion-duration);
-  transition-timing-function: var(--motion-easing);
+  transition: border-color var(--motion-duration) var(--motion-easing), box-shadow var(--motion-duration) var(--motion-easing);
 }
 
 .bb-dialog-input:focus,
-.bb-dialog-input:focus-visible {
-  border-color: var(--ring);
-  outline: 2px solid var(--ring);
-  outline-offset: 2px;
-}
+.bb-dialog-input:focus-visible { border-color: var(--ring); outline: 2px solid var(--ring); outline-offset: 2px; }
 
 @media (max-width: 640px) {
   .bb-dialog,
@@ -18545,14 +18458,6 @@ body {
     translate: 0 0;
   }
 
-  .bb-dialog__split {
-    grid-template-columns: minmax(0, 1fr);
-  }
-
-  .bb-dialog__rail {
-    flex-direction: row;
-    flex-wrap: wrap;
-    border-right: 0;
-    border-bottom: 1px solid var(--border-seam, var(--background-modifier-border));
-  }
+  .bb-dialog__split { grid-template-columns: minmax(0, 1fr); }
+  .bb-dialog__rail { flex-direction: row; flex-wrap: wrap; border-right: 0; border-bottom: 1px solid var(--border-seam, var(--background-modifier-border)); }
 }

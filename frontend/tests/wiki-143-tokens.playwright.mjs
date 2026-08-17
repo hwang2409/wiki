@@ -147,8 +147,12 @@ try {
     `semantic type tiers changed: ${JSON.stringify(semanticSizes.values)}`,
   );
   assert(
-    semanticSizes.families[0] === semanticSizes.families[1],
-    `code family changed independently from the selected family: ${JSON.stringify(semanticSizes.families)}`,
+    semanticSizes.families[0].startsWith('"Inter Variable"'),
+    `new-install chrome family changed: ${JSON.stringify(semanticSizes.families)}`,
+  );
+  assert(
+    semanticSizes.families[1].startsWith('"Fira Code"'),
+    `new-install mono family changed: ${JSON.stringify(semanticSizes.families)}`,
   );
 
   const scaledSizes = await page.evaluate(() => {
