@@ -408,7 +408,12 @@ export function TokensView() {
           </div>
         ) : null}
 
-        <DetailCard className="tokens-totals" role="group" aria-label="Token totals">
+        <DetailCard
+          appearance="flat"
+          className="tokens-totals"
+          role="group"
+          aria-label="Token totals"
+        >
           <DetailRow label="input">
             <TotalCell total={totals.input} available={availability.input} />
           </DetailRow>
@@ -429,11 +434,11 @@ export function TokensView() {
         </DetailCard>
 
         {loading && !data ? (
-          <div className="tokens-chart tokens-chart-state bb-detail-card">
+          <div className="tokens-chart tokens-chart-state">
             <UtilityLoading label="Reading token telemetry…" lines={[70, 90, 60, 84]} />
           </div>
         ) : !hasAnyData ? (
-          <div className="tokens-chart tokens-chart-state bb-detail-card">
+          <div className="tokens-chart tokens-chart-state">
             <UtilityEmpty
               title={
                 cliFilter.size > 0 || modelFilter.size > 0
@@ -634,7 +639,7 @@ function TokensChart({
   return (
     <div
       ref={wrapRef}
-      className="tokens-chart bb-detail-card"
+      className="tokens-chart"
       onMouseMove={onMouseMove}
       onMouseLeave={onMouseLeave}
     >

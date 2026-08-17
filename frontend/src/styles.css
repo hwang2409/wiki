@@ -9994,6 +9994,8 @@ textarea.composer-command-input {
   margin: 0;
   width: 100%;
   max-width: 480px;
+  border: 0;
+  background: transparent;
 }
 
 .tokens-total-value.is-unavailable {
@@ -10078,27 +10080,38 @@ textarea.composer-command-input {
   line-height: 1.2;
 }
 
-.tokens-totals {
+.bb-detail-card.tokens-totals {
   display: flex;
+  flex-direction: row;
+  align-items: flex-start;
   flex-wrap: wrap;
   gap: 24px;
-  padding: 10px 12px;
-  border: 1px solid var(--background-modifier-border);
-  border-radius: var(--radius-xs);
-  background: var(--background-primary-alt);
+  padding: 8px 0 10px;
+  border-bottom: 1px solid var(--border-seam, var(--background-modifier-border));
+  background: transparent;
+}
+
+.tokens-totals .bb-detail-row {
+  display: flex;
+  flex: 1 1 100px;
+  flex-direction: column;
+  align-items: flex-start;
+  gap: 2px;
+  padding: 2px 0;
+}
+
+.tokens-totals .bb-detail-row__label {
+  color: var(--text-faint);
+  font-size: var(--font-chrome-size);
+  line-height: var(--font-chrome-line-height);
+  letter-spacing: 0.06em;
+  text-transform: uppercase;
 }
 
 .tokens-total {
   display: flex;
   flex-direction: column;
   gap: 2px;
-}
-
-.tokens-total-label {
-  color: var(--text-muted);
-  font-size: var(--fs-2xs);
-  text-transform: uppercase;
-  letter-spacing: 0.06em;
 }
 
 .tokens-total-value {
@@ -10116,7 +10129,7 @@ textarea.composer-command-input {
   position: relative;
   flex: 1 1 auto;
   min-height: 240px;
-  border: 1px solid var(--background-modifier-border);
+  border: 1px solid var(--border-hairline, var(--background-modifier-border));
   border-radius: var(--radius-xs);
   background: var(--background-primary);
   overflow: hidden;
@@ -10129,7 +10142,7 @@ textarea.composer-command-input {
 .tokens-tooltip {
   position: absolute;
   background: var(--background-primary);
-  border: 1px solid var(--background-modifier-border);
+  border: 1px solid var(--border-hairline, var(--background-modifier-border));
   border-radius: var(--radius-xs);
   padding: 8px 10px;
   font-size: var(--fs-xs);
@@ -10185,7 +10198,7 @@ textarea.composer-command-input {
   display: flex;
   flex-wrap: wrap;
   gap: 12px;
-  color: var(--text-muted);
+  color: var(--text-faint);
   font-size: var(--fs-xs);
 }
 
@@ -11606,8 +11619,9 @@ textarea.composer-command-input {
 
 .dashboard-header h2 {
   margin: 0;
-  font-size: var(--fs-2xl);
+  font-size: var(--font-control-size);
   font-weight: var(--fw-semibold);
+  line-height: var(--font-control-line-height);
   letter-spacing: -0.005em;
 }
 
@@ -11921,23 +11935,28 @@ textarea.composer-command-input {
 .cost-dashboard {
   display: flex;
   flex-direction: column;
-  gap: 12px;
+  gap: 0;
   margin-top: 16px;
-  padding-top: 16px;
-  border-top: 1px solid var(--background-modifier-border);
+  border: 1px solid var(--border-hairline, var(--background-modifier-border));
+  border-radius: var(--radius-md);
+  background: var(--surface-raised, var(--background-primary));
+  overflow: hidden;
 }
 
 .cost-dashboard-header {
   display: flex;
   align-items: center;
   justify-content: space-between;
+  gap: 12px;
+  padding: 10px 12px;
 }
 
 .cost-dashboard-header h2 {
   display: inline;
-  margin: 0 10px 0 0;
-  font-size: var(--fs-lg);
-  font-weight: var(--fw-medium);
+  margin: 0 8px 0 0;
+  font-size: var(--font-control-size);
+  font-weight: var(--fw-semibold);
+  line-height: var(--font-control-line-height);
 }
 
 .cost-summary {
@@ -11945,9 +11964,8 @@ textarea.composer-command-input {
   flex-wrap: wrap;
   gap: 24px;
   padding: 10px 12px;
-  border: 1px solid var(--background-modifier-border);
-  border-radius: var(--radius-xs);
-  background: var(--background-primary-alt);
+  border-top: 1px solid var(--border-seam, var(--background-modifier-border));
+  background: transparent;
 }
 
 .cost-summary div {
@@ -11981,14 +11999,22 @@ textarea.composer-command-input {
   display: grid;
   grid-template-columns: repeat(2, minmax(0, 1fr));
   gap: 1px;
-  border: 1px solid var(--background-modifier-border);
-  background: var(--background-modifier-border);
+  border-top: 1px solid var(--border-seam, var(--background-modifier-border));
+  background: var(--border-seam, var(--background-modifier-border));
 }
 
 .cost-panel-section {
   min-width: 0;
   padding: 10px 12px;
-  background: var(--background-primary);
+  background: var(--surface-raised, var(--background-primary));
+}
+
+.cost-panel-section:nth-child(odd) {
+  border-right: 1px solid var(--border-seam, var(--background-modifier-border));
+}
+
+.cost-panel-section:nth-child(-n + 2) {
+  border-bottom: 1px solid var(--border-seam, var(--background-modifier-border));
 }
 
 .cost-panel-section-title {
@@ -12001,7 +12027,12 @@ textarea.composer-command-input {
   gap: 10px;
   align-items: baseline;
   padding: 4px 0;
-  font-size: var(--fs-sm);
+  font-size: var(--font-control-size);
+  line-height: var(--font-control-line-height);
+}
+
+.cost-row + .cost-row {
+  border-top: 1px solid color-mix(in srgb, var(--border-seam, var(--background-modifier-border)) 70%, transparent);
 }
 
 .cost-row-label {
@@ -12023,8 +12054,8 @@ textarea.composer-command-input {
 
 .cost-prompt-panel {
   padding: 10px 12px;
-  border: 1px solid var(--background-modifier-border);
-  background: var(--background-primary);
+  border-top: 1px solid var(--border-seam, var(--background-modifier-border));
+  background: transparent;
 }
 
 .cost-prompt-bars {
@@ -12059,6 +12090,18 @@ textarea.composer-command-input {
 @media (max-width: 720px) {
   .cost-panel-grid {
     grid-template-columns: 1fr;
+  }
+
+  .cost-panel-section:nth-child(odd) {
+    border-right: 0;
+  }
+
+  .cost-panel-section {
+    border-bottom: 1px solid var(--border-seam, var(--background-modifier-border));
+  }
+
+  .cost-panel-section:last-child {
+    border-bottom: 0;
   }
 }
 
@@ -13709,9 +13752,10 @@ textarea.composer-command-input {
   display: flex;
   align-items: center;
   gap: 12px;
-  margin: 0 0 12px;
-  border: 1px solid var(--background-modifier-border);
-  border-radius: var(--radius-sm);
+  margin: 0;
+  border: 1px solid var(--border-hairline, var(--background-modifier-border));
+  border-radius: var(--radius-md);
+  background: var(--surface-raised, var(--background-primary));
   padding: 8px 10px;
   color: var(--text-faint);
   font-size: var(--font-chrome-size);
@@ -18181,17 +18225,6 @@ body {
 .agents-account-banner-diagnostics {
   border-left-color: color-mix(in oklab, currentColor 30%, transparent);
 }
-/* WIKI-311: utility surfaces keep the bb detail-card grammar. */
-.tokens-chart.bb-detail-card {
-  gap: 0;
-  padding: 0;
-  background: var(--surface-raised);
-}
-
-.tokens-chart-state.bb-detail-card {
-  padding: 20px;
-}
-
 .kanban-view {
   display: flex;
   flex: 1;
