@@ -8,6 +8,8 @@ import {
   useState,
   type ReactNode,
 } from "react";
+import { AlertTriangle, MessageSquare, UserRound, Wrench } from "lucide-react";
+import type { LucideIcon } from "lucide-react";
 import { getFleetScreencast, type ScreencastFrame, type ScreencastWorker } from "./api";
 
 const POLL_INTERVAL_MS = 2000;
@@ -212,18 +214,18 @@ export function ScreencastProvider({ children }: { children: ReactNode }) {
 
 // ------------------------------------------------------------ strip UI
 
-function frameGlyph(kind: ScreencastFrame["kind"]): string {
+function frameIcon(kind: ScreencastFrame["kind"]): LucideIcon {
   switch (kind) {
     case "assistant":
-      return "»";
+      return MessageSquare;
     case "user":
-      return "‹";
+      return UserRound;
     case "tool":
-      return "·";
+      return Wrench;
     case "marker":
-      return "!";
+      return AlertTriangle;
     default:
-      return " ";
+      return MessageSquare;
   }
 }
 
@@ -277,18 +279,19 @@ export function ScreencastStrip({
                 : "no recent output"}
           </div>
         ) : (
-          frames.map((frame, index) => (
-            <div
-              className="fleet-screencast-line"
-              data-kind={frame.kind}
-              key={`${index}-${frame.ts ?? ""}`}
-            >
-              <span className="fleet-screencast-glyph" aria-hidden="true">
-                {frameGlyph(frame.kind)}
-              </span>
-              <span className="fleet-screencast-text">{frame.text}</span>
-            </div>
-          ))
+          frames.map((frame, index) => {
+            const FrameIcon = frameIcon(frame.kind);
+            return (
+              <div
+                className="fleet-screencast-line"
+                data-kind={frame.kind}
+                key={`${index}-${frame.ts ?? ""}`}
+              >
+                <FrameIcon aria-hidden="true" className="fleet-screencast-glyph" size={14} />
+                <span className="fleet-screencast-text">{frame.text}</span>
+              </div>
+            );
+          })
         )}
       </div>
     </div>

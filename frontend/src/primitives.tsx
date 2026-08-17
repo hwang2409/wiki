@@ -1,5 +1,6 @@
 import { forwardRef } from "react";
 import type { ButtonHTMLAttributes, HTMLAttributes, ReactNode } from "react";
+import { X } from "lucide-react";
 
 // WIKI-297: shared primitives that mirror bb's Button / icon-button /
 // tab-pill / detail-card / menu-row grammar, but styled entirely through
@@ -276,21 +277,5 @@ export const MenuRow = forwardRef<HTMLButtonElement, MenuRowProps>(function Menu
 });
 
 function CloseGlyph() {
-  return (
-    <svg
-      viewBox="0 0 12 12"
-      width="12"
-      height="12"
-      aria-hidden
-      focusable="false"
-      className="bb-tab-pill__close-glyph"
-    >
-      <path
-        d="M2.5 2.5l7 7M9.5 2.5l-7 7"
-        stroke="currentColor"
-        strokeWidth="1.4"
-        strokeLinecap="round"
-      />
-    </svg>
-  );
+  return <X aria-hidden className="bb-tab-pill__close-glyph" size={14} />;
 }

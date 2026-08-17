@@ -184,6 +184,12 @@
   --motion-duration: 120ms;
   --motion-easing: cubic-bezier(0.2, 0, 0, 1);
   --ring: var(--accent-primary, var(--text-normal));
+
+  /* WIKI-326: lucide is the open icon set for the app. Keep chrome icons
+     optical with the 13px control tier without using Apple's SF Symbols. */
+  --icon-chrome-size: 14px;
+  --icon-chrome-hit-size: 28px;
+  --icon-stroke-width: 1.75;
 }
 
 * {
@@ -270,6 +276,31 @@ button:disabled {
 
 :where(h1, h2, h3, .inline-title, .activity-day-heading, .dialog-title) {
   text-wrap: balance;
+}
+
+/* WIKI-326: one icon contract. Lucide already uses rounded geometry; the
+   shared stroke keeps every imported glyph at the same optical weight. */
+.lucide {
+  stroke-width: var(--icon-stroke-width);
+  stroke-linecap: round;
+  stroke-linejoin: round;
+  vertical-align: middle;
+}
+
+/* Row and chrome icons use a 14px glyph in the existing 28px control rows.
+   Larger sizes stay available for genuine empty states, previews, and media
+   controls. Small legacy size props are normalized only on app chrome. */
+:where(
+  .workspace-sidebar,
+  .app-page-header,
+  .status-bar,
+  .activity-feed,
+  .agents-view,
+  .session-tab,
+  .dialog
+) :where(.lucide[width="10"], .lucide[width="11"], .lucide[width="12"], .lucide[width="13"]) {
+  width: var(--icon-chrome-size);
+  height: var(--icon-chrome-size);
 }
 
 .tabular-nums {
@@ -406,7 +437,7 @@ button:disabled {
   align-items: center;
   gap: 10px;
   width: 100%;
-  height: 28px;
+  height: var(--icon-chrome-hit-size);
   padding: 0 8px;
   border-radius: var(--radius-md);
   color: var(--text-muted);
@@ -467,8 +498,8 @@ button:disabled {
   display: inline-flex;
   align-items: center;
   justify-content: center;
-  width: 28px;
-  height: 28px;
+  width: var(--icon-chrome-hit-size);
+  height: var(--icon-chrome-hit-size);
   border-radius: var(--radius-md);
   color: var(--text-muted);
   transition-property: background-color, color;
@@ -645,7 +676,7 @@ button:disabled {
   align-items: center;
   justify-content: center;
   width: 28px;
-  height: 26px;
+  height: var(--icon-chrome-hit-size);
   border-radius: var(--radius-s);
   color: var(--text-muted);
 }
@@ -4853,8 +4884,16 @@ body.is-resizing-panes .pane-cell {
 
 .fleet-screencast-line {
   display: flex;
+  align-items: center;
   gap: 6px;
   min-width: 0;
+}
+
+.fleet-screencast-glyph {
+  flex: 0 0 var(--icon-chrome-size);
+  width: var(--icon-chrome-size);
+  height: var(--icon-chrome-size);
+  color: var(--text-faint);
 }
 
 .fleet-screencast-line[data-kind="assistant"] .fleet-screencast-text {
@@ -7746,8 +7785,8 @@ body.is-resizing-panes .pane-cell {
   font-size: var(--fs-xs);
 }
 
-/* OpenCode turn boundary `▣ Build · Big Pickle · 2.5s` — glyph in the agent
-   accent, name in text, model/duration muted (session/index.tsx:1536-1557). */
+/* OpenCode turn boundary — agent accent, name in text, model/duration muted
+   (session/index.tsx:1536-1557). */
 .session-turn-meta {
   display: block;
   margin-top: 8px;
@@ -7758,6 +7797,7 @@ body.is-resizing-panes .pane-cell {
 }
 
 .session-turn-meta-glyph {
+  display: inline-block;
   margin-right: 1ch;
   color: var(--accent-primary);
 }
@@ -7908,21 +7948,13 @@ body.is-resizing-panes .pane-cell {
 }
 
 .session-tool-icon {
-  flex-shrink: 0;
-  width: 2ch;
-  height: 1em;
-  color: inherit;
-}
-
-/* OpenCode's 2-char glyph column ($ → ← ✱ % ◈ ⚙ ✓ │) — text glyphs, not
-   SVGs (session/index.tsx:1570, :2090-2291). */
-.session-tool-icon-text {
   display: inline-flex;
-  align-items: baseline;
-  height: auto;
-  font-family: var(--font-monospace);
-  font-weight: var(--font-monospace-weight);
-  line-height: inherit;
+  align-items: center;
+  justify-content: center;
+  flex-shrink: 0;
+  width: var(--icon-chrome-size);
+  height: var(--icon-chrome-size);
+  color: inherit;
 }
 
 .session-tool-summary {
@@ -17078,7 +17110,7 @@ body {
 }
 
 .bb-button--md {
-  height: 28px;
+  height: var(--icon-chrome-hit-size);
   padding: 0 12px;
 }
 
@@ -17175,8 +17207,8 @@ body {
   display: inline-flex;
   align-items: center;
   justify-content: center;
-  width: 28px;
-  height: 28px;
+  width: var(--icon-chrome-hit-size);
+  height: var(--icon-chrome-hit-size);
   padding: 0;
   border: 1px solid transparent;
   border-radius: var(--radius-md);
@@ -17324,8 +17356,8 @@ body {
 }
 
 .bb-tab-pill__close-glyph {
-  width: 12px;
-  height: 12px;
+  width: var(--icon-chrome-size);
+  height: var(--icon-chrome-size);
 }
 
 /* Chip — one-line status pill, follows bb's tab-pill grammar but static. */

@@ -1,5 +1,7 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import {
+  ChevronsLeft,
+  ChevronsRight,
   ChevronLeft,
   ChevronRight,
   Maximize2,
@@ -356,7 +358,7 @@ export function PdfArtifactDetail({
       <div className="artifact-detail-toolbar artifact-pdf-toolbar">
         <div className="artifact-pdf-toolbar-group">
           <button aria-label="First page" data-pdf-first="true" type="button" onClick={() => setPage(1)} disabled={page <= 1}>
-            «
+            <ChevronsLeft size={14} />
           </button>
           <button aria-label="Previous page" data-pdf-prev="true" type="button" onClick={goPrev} disabled={page <= 1}>
             <ChevronLeft size={12} />
@@ -368,7 +370,7 @@ export function PdfArtifactDetail({
             <ChevronRight size={12} />
           </button>
           <button aria-label="Last page" data-pdf-last="true" type="button" onClick={() => numPages && setPage(numPages)} disabled={!numPages || page >= numPages}>
-            »
+            <ChevronsRight size={14} />
           </button>
         </div>
         <div className="artifact-pdf-toolbar-group">

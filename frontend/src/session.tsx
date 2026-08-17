@@ -14,6 +14,7 @@ import type { ComponentProps, CSSProperties, ReactNode } from "react";
 import {
   AlertTriangle,
   Bell,
+  Bot,
   ChevronRight,
   Circle,
   CircleCheck,
@@ -106,7 +107,7 @@ import {
   parseEmbeddedScripts,
   thoughtDurations,
   toolDiffIsTruncated,
-  toolGlyph,
+  toolIcon,
   toolInlineResult,
   toolDiffSource,
   toolOutputPeek,
@@ -1927,6 +1928,7 @@ export function ToolCallRow({
 }) {
   const tool = event.tool!;
   const status = toolStatus(tool);
+  const ToolIcon = toolIcon(tool, status);
   const running = status === "working";
   const detail = toolInlineDetail(tool);
   const { verb, target } = toolSummaryParts(tool);
@@ -1985,11 +1987,9 @@ export function ToolCallRow({
       data-tool-event-id={nested ? undefined : event.id}
     >
       <div className="session-tool-head">
-        {/* OpenCode's glyph micro-vocabulary in a fixed 2-char column; state
-            is the row's COLOR (muted done, error failed), never a word. */}
-        <span aria-hidden="true" className="session-tool-icon session-tool-icon-text">
-          {toolGlyph(tool, status)}
-        </span>
+        {/* The icon carries the tool family. State remains in row color and
+            the screen-reader-only status text. */}
+        <ToolIcon aria-hidden="true" className="session-tool-icon" size={14} />
         <span className="session-tool-summary" title={toolSummaryLine(tool)}>
           <span className="session-tool-verb">{verb}</span>
           {target ? <><span aria-hidden="true">{" "}</span><span className="session-tool-target">{target}</span></> : null}
@@ -2939,13 +2939,12 @@ export type TurnMeta = {
   durationMs: number | null;
 };
 
-// OpenCode's turn boundary (session/index.tsx:1534-1559): `▣ Build · model ·
-// duration` after the final part of each completed turn — glyph in the agent
-// color, name in text, the rest muted.
+// OpenCode's turn boundary (session/index.tsx:1534-1559): agent, model, and
+// duration after the final part of each completed turn.
 export function TurnMetaRow({ meta }: { meta: TurnMeta }) {
   return (
     <div className="session-turn-meta" data-testid="session-turn-meta">
-      <span aria-hidden="true" className="session-turn-meta-glyph">▣</span>
+      <Bot aria-hidden="true" className="session-turn-meta-glyph" size={14} />
       <span className="session-turn-meta-agent">{meta.agent}</span>
       {meta.model ? <span className="session-turn-meta-detail"> · {meta.model}</span> : null}
       {meta.durationMs !== null ? (
