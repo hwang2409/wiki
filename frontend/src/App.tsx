@@ -118,7 +118,6 @@ import {
 import { CommandPalette } from "./command-palette";
 import type { PaletteResult } from "./api";
 import type { Note, NoteDraft, NoteSummary } from "./types";
-import { Button } from "./primitives";
 
 type Mode =
   | "empty"

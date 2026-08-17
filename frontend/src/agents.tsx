@@ -1217,6 +1217,8 @@ export function AgentsView({
   refreshTick,
   openTicket,
   onOpenTicket,
+  startRunRequest = 0,
+  onStartRunRequestHandled,
 }: {
   data?: {
     workers: AgentWorker[] | null;
@@ -1231,6 +1233,8 @@ export function AgentsView({
   refreshTick: number;
   openTicket: AgentOpenTarget | null;
   onOpenTicket: (target: AgentOpenTarget | null) => void;
+  startRunRequest?: number;
+  onStartRunRequestHandled?: () => void;
 }) {
   const [fetchedWorkers, setFetchedWorkers] = useState<AgentWorker[] | null>(null);
   const [fetchedOrchestrators, setFetchedOrchestrators] = useState<Orchestrator[]>([]);
@@ -1311,6 +1315,12 @@ export function AgentsView({
   useEffect(() => {
     localStorage.setItem(SCREENCAST_EXPANDED_KEY, JSON.stringify([...expandedScreencasts]));
   }, [expandedScreencasts]);
+
+  useEffect(() => {
+    if (startRunRequest === 0) return;
+    setSpawnWorkerOpen(true);
+    onStartRunRequestHandled?.();
+  }, [onStartRunRequestHandled, startRunRequest]);
 
   function toggleScreencast(ticket: string) {
     setExpandedScreencasts((prev) => {
