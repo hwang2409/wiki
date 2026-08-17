@@ -443,7 +443,7 @@ export function ArtifactBlock({
               <dt className="bb-detail-row__label">Type</dt>
               <dd className="bb-detail-row__value">{kindLabel}</dd>
             </div>
-            {typeof resolvedArtifact.byte_size === "number" && resolvedArtifact.byte_size > 0 ? (
+            {resolvedArtifact.byte_size !== undefined && resolvedArtifact.byte_size > 0 ? (
               <div className="bb-detail-row">
                 <dt className="bb-detail-row__label">Size</dt>
                 <dd className="bb-detail-row__value tabular-nums">{formatBytes(resolvedArtifact.byte_size)}</dd>

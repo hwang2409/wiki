@@ -11015,7 +11015,8 @@ textarea.composer-command-input {
 .artifact-panel-chrome {
   position: sticky;
   top: 0;
-  z-index: 5;
+  z-index: 10;
+  isolation: isolate;
   display: flex;
   flex: 0 0 auto;
   align-items: center;
