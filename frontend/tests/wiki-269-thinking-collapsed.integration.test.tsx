@@ -43,6 +43,37 @@ describe("thinking rows collapse by default", () => {
     expect(container.querySelector(".session-thinking")).toBeNull();
   });
 
+  test("codex preview strips bold markers and separates adjacent summary sections", () => {
+    const { container } = render(
+      <ThinkingRow
+        event={thinkingEvent({
+          encrypted: true,
+          text: "**diagnosing duplicate sed output and planning harness simplification****planning incremental dashboard…",
+        })}
+      />,
+    );
+    const head = container.querySelector(".session-thinking-head") as HTMLButtonElement;
+    expect(container.querySelector(".session-thinking-title")?.textContent).toBe(
+      "diagnosing duplicate sed output and planning harness simplification · planning incremental dashboard…",
+    );
+    expect(head.textContent).not.toContain("**");
+
+    fireEvent.click(head);
+    expect(container.querySelectorAll(".session-thinking strong")).toHaveLength(2);
+    expect(container.querySelector(".session-thinking")?.textContent).toContain(
+      "diagnosing duplicate sed output and planning harness simplification · planning incremental dashboard…",
+    );
+  });
+
+  test("clean Codex thought text passes through unchanged", () => {
+    const { container } = render(
+      <ThinkingRow event={thinkingEvent({ encrypted: true, text: "planning the next step" })} />,
+    );
+    expect(container.querySelector(".session-thinking-title")?.textContent).toBe(
+      "planning the next step",
+    );
+  });
+
   test("click expands the body, second click collapses it", () => {
     const { container } = render(<ThinkingRow event={thinkingEvent()} />);
     const head = container.querySelector(".session-thinking-head") as HTMLButtonElement;

@@ -1665,21 +1665,54 @@ function SubagentTrace({
 // markdown at reduced strength. Codex supplies only summaries here; Wiki
 // cannot decrypt the private reasoning payload. Rows always mount collapsed
 // so a transcript full of thoughts stays scannable; click to open a body.
-function normalizeCodexThinkingSummary(text: string): string {
-  const lines = text.split("\n");
-  const first = lines[0].trim();
-  const wrapped = first.match(/^\*\*([^*]+)\*\*$/);
-  if (wrapped) lines[0] = wrapped[1].trim();
-  return lines.join("\n");
+function codexThinkingSections(line: string): string[] | null {
+  const sections: string[] = [];
+  let remaining = line.trim();
+  while (remaining.startsWith("**")) {
+    const close = remaining.indexOf("**", 2);
+    if (close < 0) {
+      const finalSection = remaining.slice(2).trim();
+      if (!finalSection) return null;
+      sections.push(finalSection);
+      remaining = "";
+      break;
+    }
+    const section = remaining.slice(2, close).trim();
+    if (!section || section.includes("*")) return null;
+    sections.push(section);
+    remaining = remaining.slice(close + 2).trimStart();
+  }
+  return remaining || sections.length === 0 ? null : sections;
+}
+
+function normalizeCodexThinkingPreview(text: string): string {
+  const firstLine = text.split("\n", 1)[0].trim();
+  const sections = codexThinkingSections(firstLine);
+  return sections ? sections.join(" · ") : firstLine;
+}
+
+function normalizeCodexThinkingMarkdown(text: string): string {
+  return text
+    .split("\n")
+    .map((line) => {
+      const sections = codexThinkingSections(line);
+      return sections && sections.length > 1
+        ? sections.map((section) => `**${section}**`).join(" · ")
+        : line;
+    })
+    .join("\n");
 }
 
 export function ThinkingRow({ event, durationMs = null }: { event: SessionEvent; durationMs?: number | null }) {
   // Provider capability markers can arrive as truthy wire values after an
   // app-server round trip. Do not require a strict boolean identity.
   const codexSummary = Boolean(event.encrypted);
-  const summary = codexSummary ? normalizeCodexThinkingSummary(event.text) : event.text;
+  const preview = codexSummary
+    ? normalizeCodexThinkingPreview(event.text)
+    : event.text.split("\n", 1)[0].trim();
+  const markdown = codexSummary ? normalizeCodexThinkingMarkdown(event.text) : event.text;
   const [expanded, setExpanded] = useState(false);
-  const title = summary.split("\n")[0].trim().slice(0, 120);
+  const title = preview.slice(0, 120);
   const duration = durationMs !== null ? formatEventDuration(durationMs) : null;
   return (
     <div className="session-activity-row is-reasoning">
@@ -1705,10 +1738,14 @@ export function ThinkingRow({ event, durationMs = null }: { event: SessionEvent;
         {event.encrypted ? <span className="session-thinking-chip">encrypted</span> : null}
       </button>
       {expanded ? (
-        <div className="session-thinking">
-          {/* Subtle scheme: markdown tokens damped by the container (OpenCode
-              renders reasoning syntax at thinkingOpacity, theme/index.ts:292). */}
-          <ShikiCode className="session-thinking-code" code={summary} lang="markdown" transparent />
+        <div className="session-thinking markdown-preview-view">
+          <ReactMarkdown
+            components={sessionMarkdownComponents}
+            rehypePlugins={[rehypeKatex, rehypeEscapeRawHtml]}
+            remarkPlugins={[remarkGfm, [remarkMath, { singleDollarTextMath: false }]]}
+          >
+            {prepareTranscriptMarkdown(markdown)}
+          </ReactMarkdown>
         </div>
       ) : null}
     </div>
