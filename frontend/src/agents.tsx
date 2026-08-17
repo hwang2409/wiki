@@ -1820,7 +1820,7 @@ export function AgentsView({
     }
 
     return (
-      <div className="agents-orch-group agent-activity-row" key={orch.id}>
+      <div className="agents-orch-group" key={orch.id}>
         <div className="agents-orch-head">
           <Bot size={13} />
           <span className="agents-orch-id">{orch.id}</span>
