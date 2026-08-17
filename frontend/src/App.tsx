@@ -20,6 +20,7 @@ import {
   History,
   Lock,
   Moon,
+  PanelLeft,
   Pencil,
   RefreshCw,
   Search,
@@ -3988,52 +3989,85 @@ export default function App() {
       </aside>
 
       <main className="workspace-leaf">
-        <div className={`view-header${mode === "agent" || mode === "terminal" ? " is-hidden" : ""}`}>
-          <div className="view-header-title-container">
-            {breadcrumbs.map((crumb, index) => (
-              <span className="view-header-breadcrumb" key={`${crumb}-${index}`}>
-                {index > 0 ? <ChevronRight size={14} /> : null}
-                <span>{crumb}</span>
-              </span>
-            ))}
+        <header
+          className={`app-page-header${mode === "agent" || mode === "terminal" ? " is-hidden" : ""}`}
+        >
+          <div className="app-page-header__leading">
+            <button
+              aria-label={sidebarVisible ? "Hide sidebar" : "Show sidebar"}
+              aria-pressed={sidebarVisible}
+              className="bb-icon-button app-page-header__sidebar-trigger"
+              title={`${sidebarVisible ? "Hide" : "Show"} sidebar`}
+              type="button"
+              onClick={() => setSidebarVisible((visible) => !visible)}
+            >
+              <PanelLeft aria-hidden size={16} />
+            </button>
+            {breadcrumbs.length > 0 ? (
+              <nav aria-label="Breadcrumb" className="app-page-header__breadcrumb">
+                <ol>
+                  {breadcrumbs.map((crumb, index) => {
+                    const isLast = index === breadcrumbs.length - 1;
+                    return (
+                      <li key={`${crumb}-${index}`}>
+                        {index > 0 ? (
+                          <ChevronRight
+                            aria-hidden
+                            className="app-page-header__breadcrumb-separator"
+                            size={14}
+                          />
+                        ) : null}
+                        <span
+                          aria-current={isLast ? "page" : undefined}
+                          className={`app-page-header__breadcrumb-segment${isLast ? " is-current" : ""}`}
+                          title={crumb}
+                        >
+                          {crumb}
+                        </span>
+                      </li>
+                    );
+                  })}
+                </ol>
+              </nav>
+            ) : null}
           </div>
-          <div className="view-actions">
+          <div className="app-page-header__actions">
             {mode === "view" ? (
               <button
                 aria-label="Edit this note"
-                className="view-action"
+                className="bb-icon-button"
                 title="Edit this note"
                 type="button"
                 onClick={startEditing}
               >
-                <Pencil size={16} />
+                <Pencil aria-hidden size={16} />
               </button>
             ) : null}
             {isEditor ? (
               <>
                 <button
                   aria-label="Save and read"
-                  className="view-action"
+                  className="bb-icon-button"
                   disabled={!canSave || isSaving}
                   title="Save and switch to reading view"
                   type="button"
                   onClick={saveDraft}
                 >
-                  <BookOpen size={16} />
+                  <BookOpen aria-hidden size={16} />
                 </button>
                 <button
                   aria-label="Discard changes"
-                  className="view-action"
+                  className="bb-icon-button"
                   title="Discard changes"
                   type="button"
                   onClick={cancelEditing}
                 >
-                  <X size={16} />
+                  <X aria-hidden size={16} />
                 </button>
               </>
             ) : null}
           </div>
-        </div>
+        </header>
 
         {error ? (
           <div className="notice" role="alert">
