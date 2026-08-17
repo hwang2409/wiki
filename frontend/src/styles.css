@@ -6102,41 +6102,57 @@ body.is-resizing-panes .pane-cell {
   text-overflow: ellipsis;
 }
 
+/* WIKI-304: bb info-row grammar — text-2xs uppercase label chip + one-line
+   body in --readback-foreground; info state is chromeless (label carries the
+   type), warn/error keep tinted borders + severity-toned text. Shared
+   severity vocabulary (info/warn/error) drives both color and label. */
 .session-marker {
-  /* Stretch to the transcript column so marker rows and synthetic-source
-     rows share one uniform width (Henry 2026-07-22). */
   display: flex;
   align-items: center;
-  gap: 6px;
+  gap: 10px;
   align-self: stretch;
   padding: 2px 8px;
-  border: 1px solid var(--background-modifier-border);
+  border: 1px solid transparent;
   border-radius: var(--radius-xs);
   background-color: transparent;
-  color: var(--text-muted);
+  color: var(--readback-foreground);
   font-family: var(--font-monospace);
   font-weight: var(--font-monospace-weight);
   font-size: var(--font-ui-smaller);
   overflow-wrap: anywhere;
 }
 
-.session-marker.is-info {
-  color: var(--text-muted);
-  border-color: var(--background-modifier-border);
+.session-marker-label {
+  flex: 0 0 auto;
+  color: var(--text-faint);
+  font-size: var(--fs-2xs);
+  font-weight: var(--fw-semibold);
+  letter-spacing: var(--section-label-tracking);
+  text-transform: uppercase;
 }
 
-.session-marker.is-info svg {
-  color: var(--text-faint);
+.session-marker-text {
+  min-width: 0;
+  flex: 1 1 auto;
+  overflow-wrap: anywhere;
 }
 
 .session-marker.is-warn {
-  color: color-mix(in srgb, var(--accent-warning, var(--accent-danger)) 85%, var(--text-normal));
   border-color: color-mix(in srgb, var(--accent-warning, var(--accent-danger)) 45%, var(--background-modifier-border));
+  color: color-mix(in srgb, var(--accent-warning, var(--accent-danger)) 85%, var(--text-normal));
+}
+
+.session-marker.is-warn .session-marker-label {
+  color: color-mix(in srgb, var(--accent-warning, var(--accent-danger)) 75%, var(--text-normal));
 }
 
 .session-marker.is-error {
-  color: var(--accent-danger);
   border-color: color-mix(in srgb, var(--accent-danger) 50%, var(--background-modifier-border));
+  color: var(--accent-danger);
+}
+
+.session-marker.is-error .session-marker-label {
+  color: var(--accent-danger);
 }
 
 .session-synthetic-source {
@@ -7863,13 +7879,23 @@ body.is-resizing-panes .pane-cell {
   gap: 4px;
   margin: 3px 0 5px;
   padding: 2px 0 2px 8px;
-  border-left: 1px solid var(--background-modifier-border);
-  background-color: var(--background-primary-alt);
+  border-left: 1px solid var(--border-hairline);
+  background-color: transparent;
   /* WIKI-247: block interiors are mono, full stop — pin the stack here so a
      prose font on any ancestor can never leak into diff or output text. */
   font-family: var(--font-monospace);
   font-weight: var(--font-monospace-weight);
   font-size: var(--font-ui-smaller);
+}
+
+/* WIKI-304: --timeline-accent left rail ONLY for streaming/pending state.
+   Settled rows keep the quiet hairline indent guide; a running tool call
+   promotes the rail to the timeline color so scanning the transcript picks
+   out live work at a glance. */
+.session-tool.is-working > .session-trace-indent > .session-tool-body {
+  border-left-color: var(--timeline-accent);
+  border-left-width: 2px;
+  padding-left: 7px;
 }
 
 /* WIKI-247: transcript diffs are quiet interiors — no box around the diff,
@@ -7909,12 +7935,20 @@ body.is-resizing-panes .pane-cell {
 }
 
 /* WIKI-247: the bash command line is content, not chrome — it reads in text
-   color while the output below recedes to the muted row color. */
+   color while the output below recedes to the muted row color. WIKI-304
+   adds a bb-parity hairline separator whenever content follows the command
+   so the eye can hop from `$ …` to output without a jump. */
 .session-tool-block-title.is-command {
   color: var(--text-normal);
   white-space: pre-wrap;
   overflow-wrap: anywhere;
   text-overflow: clip;
+}
+
+.session-tool-block-body .session-tool-block-title.is-command:not(:last-child) {
+  padding-bottom: 4px;
+  border-bottom: 1px solid var(--border-hairline);
+  margin-bottom: 2px;
 }
 
 .session-tool-block-preview {
@@ -7954,6 +7988,10 @@ body.is-resizing-panes .pane-cell {
 
 .session-tool-output-peek-chevron {
   flex: 0 0 auto;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 1ch;
   color: var(--text-faint);
   /* WIKI-298 survivor: `transform` rotates the chevron on hover. */
   transition-property: transform, color;
@@ -7961,9 +7999,12 @@ body.is-resizing-panes .pane-cell {
   transition-timing-function: var(--motion-easing);
 }
 
+/* WIKI-304 bb-parity: on hover the chevron nudges toward the peek preview,
+   telegraphing "expand" without a full spin. */
 .session-tool-output-peek:hover .session-tool-output-peek-chevron,
 .session-tool-output-peek:focus-visible .session-tool-output-peek-chevron {
   color: var(--text-muted);
+  transform: translateX(1px);
 }
 
 .session-tool-output-peek-preview {
