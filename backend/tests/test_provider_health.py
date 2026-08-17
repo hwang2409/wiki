@@ -429,6 +429,8 @@ class MainWiringTests(unittest.TestCase):
         from backend.app import main
 
         self._main = main
+        self._nofile_limit_patcher = mock.patch.object(main, "raise_nofile_limit")
+        self._nofile_limit_mock = self._nofile_limit_patcher.start()
         self._prior = main.PROVIDER_HEALTH
         self._tmp = TemporaryDirectory()
         root = Path(self._tmp.name)
@@ -452,6 +454,7 @@ class MainWiringTests(unittest.TestCase):
         )
 
     def tearDown(self) -> None:
+        self._nofile_limit_patcher.stop()
         self._main.PROVIDER_HEALTH = self._prior
         self._tmp.cleanup()
 
@@ -599,6 +602,7 @@ class MainWiringTests(unittest.TestCase):
             mock.patch.object(self._main.terminal.TERMINAL_MANAGER, "close_all"),
         ):
             asyncio.run(exercise())
+        self._nofile_limit_mock.assert_called_once_with()
 
     def test_successful_authenticated_event_clears_changed_credential(self) -> None:
         self._main.get_provider_health(refresh=True)
