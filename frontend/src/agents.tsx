@@ -1631,6 +1631,7 @@ export function AgentsView({
     return (
       <article
         className={`agent-card agent-activity-row is-archived${isOpen ? " is-selected" : ""}`}
+        data-state={entry.outcome ?? entry.state ?? "archived"}
         key={key}
         onClick={(event) => {
           const target = event.target as HTMLElement;
@@ -1834,7 +1835,7 @@ export function AgentsView({
     }
 
     return (
-      <div className="agents-orch-group agent-activity-row" key={orch.id}>
+      <div className="agents-orch-group" key={orch.id}>
         <div className="agents-orch-head">
           <Bot size={13} />
           <span className="agents-orch-id">{orch.id}</span>
@@ -2109,6 +2110,7 @@ export function AgentsView({
     return (
       <article
         className={`agent-card agent-activity-row${isOpen ? " is-selected" : ""}`}
+        data-state={worker.state ?? "unknown"}
         key={worker.ticket}
         onClick={(event) => {
           const target = event.target as HTMLElement;

@@ -17565,40 +17565,50 @@ body {
 }
 
 .agent-activity-row {
-  padding: 8px 10px;
-  border: 1px solid var(--border-hairline, var(--background-modifier-border));
-  border-radius: var(--radius-md);
-  background-color: color-mix(
-    in oklab,
-    var(--background-secondary) 82%,
-    var(--background-primary)
-  );
-  box-shadow: var(--shadow-lift, 0 1px 2px rgb(0 0 0 / 4%));
+  padding: 10px 0;
+  border: 0;
+  border-radius: 0;
+  background-color: transparent;
+  box-shadow: none;
   transition-property: background-color, border-color, box-shadow, opacity;
   transition-duration: var(--motion-duration, 160ms);
   transition-timing-function: var(--motion-easing, ease-out);
 }
 
-.agent-activity-row:hover,
-.agent-activity-row.is-selected {
-  border-color: color-mix(
-    in oklab,
-    var(--text-muted) 42%,
-    var(--border-hairline, var(--background-modifier-border))
-  );
+.agent-activity-row[data-state="working"],
+.agent-activity-row[data-state="starting"],
+.agent-activity-row[data-state="waiting-approval"] {
   background-color: color-mix(
     in oklab,
-    var(--background-secondary) 94%,
-    var(--text-normal)
+    var(--accent-primary) 5%,
+    transparent
   );
-  box-shadow: var(--shadow-lifted, 0 2px 6px rgb(0 0 0 / 6%));
+  box-shadow: inset 2px 0 0 var(--accent-primary);
+}
+
+.agent-activity-row[data-state="blocked"] {
+  background-color: color-mix(in oklab, var(--accent-warning) 6%, transparent);
+  box-shadow: inset 2px 0 0 var(--accent-warning);
+}
+
+.agent-activity-row[data-state="failed"],
+.agent-activity-row[data-state="error"],
+.agent-activity-row[data-state="dead"] {
+  background-color: color-mix(in oklab, var(--accent-danger) 6%, transparent);
+  box-shadow: inset 2px 0 0 var(--accent-danger);
+}
+
+.agent-activity-row.is-selected {
+  background-color: color-mix(in oklab, var(--text-normal) 5%, transparent);
+  box-shadow: inset 2px 0 0 var(--text-normal);
 }
 
 .agents-section .agents-orch-group {
   width: auto;
   max-width: none;
   align-self: stretch;
-  gap: 8px;
+  gap: 6px;
+  padding-top: 10px;
 }
 
 .agents-section .agents-orch-group .agent-card {
@@ -17614,6 +17624,39 @@ body {
 .agents-section .agent-card.is-archived:hover,
 .agents-section .agent-card.is-archived.is-selected {
   opacity: 1;
+}
+
+/* Keep optional controls in the row's layout, but reveal them only when they
+   help the operator. The reserved width prevents labels from moving. */
+:is(.agent-activity-row, .agents-orch-head) :is(.agent-log-toggle, .agent-card-menu) {
+  opacity: 0;
+  pointer-events: none;
+  transition-property: opacity, color, background-color;
+  transition-duration: var(--motion-duration, 160ms);
+  transition-timing-function: var(--motion-easing, ease-out);
+}
+
+.agent-actions,
+.agents-orch-actions {
+  flex-shrink: 0;
+}
+
+:is(.agent-activity-row, .agents-orch-head):is(
+    :hover,
+    :focus-within,
+    :has(.agent-log-toggle.is-active),
+    :has([aria-expanded="true"])
+  )
+  :is(.agent-log-toggle, .agent-card-menu) {
+  opacity: 1;
+  pointer-events: auto;
+}
+
+@media (max-width: 640px), (pointer: coarse) {
+  :is(.agent-activity-row, .agents-orch-head) :is(.agent-log-toggle, .agent-card-menu) {
+    opacity: 1;
+    pointer-events: auto;
+  }
 }
 
 @media (min-width: 880px) {
