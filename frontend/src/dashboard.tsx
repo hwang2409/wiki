@@ -21,6 +21,7 @@ import {
   type SortKey,
 } from "./dashboard-logic";
 import { externalLinkProps } from "./external-links";
+import { Button } from "./primitives";
 import { StatusBadge } from "./status-badge";
 import { formatRelative } from "./timestamp-format";
 
@@ -208,7 +209,7 @@ export function DashboardView({
   function header(key: SortKey, label: string) {
     const active = key === sortKey;
     return (
-      <th>
+      <th key={key} scope="col">
         <button type="button" onClick={() => toggleSort(key)}>
           <span>{label}</span>
           {active ? sortAsc ? <ArrowUp size={12} /> : <ArrowDown size={12} /> : null}
@@ -250,29 +251,33 @@ export function DashboardView({
           <span className="dashboard-stale-body">
             Refresh failed — showing last-loaded tickets. {error}
           </span>
-          <button
+          <Button
             type="button"
+            variant="outline"
+            size="sm"
             className="dashboard-retry"
+            leadingIcon={<RefreshCw size={12} />}
             onClick={retryTickets}
             disabled={retryingTickets}
           >
-            <RefreshCw size={12} />
             {retryingTickets ? "Retrying…" : "Retry"}
-          </button>
+          </Button>
         </div>
       ) : null}
       {error && !tickets ? (
         <div className="dashboard-error" role="alert">
           <div className="dashboard-error-body">Could not load tickets: {error}</div>
-          <button
+          <Button
             type="button"
+            variant="outline"
+            size="sm"
             className="dashboard-retry"
+            leadingIcon={<RefreshCw size={12} />}
             onClick={retryTickets}
             disabled={retryingTickets}
           >
-            <RefreshCw size={12} />
             {retryingTickets ? "Retrying…" : "Try again"}
-          </button>
+          </Button>
         </div>
       ) : null}
       {!tickets && !error ? <DashboardTableSkeleton /> : null}
@@ -293,8 +298,8 @@ export function DashboardView({
         </div>
       ) : null}
       {sorted.length > 0 ? (
-        <div className="artifact-table-scroll dashboard-table-scroll">
-          <table className="artifact-table">
+        <div className="dashboard-table-scroll">
+          <table className="dashboard-table">
             <thead>
               <tr>
                 {header("ticket", "Ticket")}
@@ -340,29 +345,33 @@ export function DashboardView({
         <div className="dashboard-stale" role="status">
           <span className="dashboard-stale-label">stale</span>
           <span className="dashboard-stale-body">Cost data: {costError}</span>
-          <button
+          <Button
             type="button"
+            variant="outline"
+            size="sm"
             className="dashboard-retry"
+            leadingIcon={<RefreshCw size={12} />}
             onClick={retryCosts}
             disabled={retryingCosts}
           >
-            <RefreshCw size={12} />
             {retryingCosts ? "Retrying…" : "Retry"}
-          </button>
+          </Button>
         </div>
       ) : null}
       {costError && !costs ? (
         <div className="dashboard-error" role="alert">
           <div className="dashboard-error-body">Could not load cost data: {costError}</div>
-          <button
+          <Button
             type="button"
+            variant="outline"
+            size="sm"
             className="dashboard-retry"
+            leadingIcon={<RefreshCw size={12} />}
             onClick={retryCosts}
             disabled={retryingCosts}
           >
-            <RefreshCw size={12} />
             {retryingCosts ? "Retrying…" : "Try again"}
-          </button>
+          </Button>
         </div>
       ) : null}
       {costs ? <CostDashboard costs={costs} /> : null}
@@ -381,11 +390,11 @@ const SKELETON_ROW_WIDTHS: Array<[number, number, number, number, number]> = [
 function DashboardTableSkeleton() {
   return (
     <div
-      className="artifact-table-scroll dashboard-table-scroll dashboard-skeleton"
+      className="dashboard-table-scroll dashboard-skeleton"
       aria-hidden="true"
       data-testid="dashboard-skeleton"
     >
-      <table className="artifact-table">
+      <table className="dashboard-table">
         <thead>
           <tr>
             <th>Ticket</th>
@@ -535,15 +544,17 @@ function DashboardFilterBar({
         </label>
       </div>
       {isFiltered ? (
-        <button
+        <Button
           type="button"
+          variant="ghost"
+          size="sm"
           className="dashboard-filter-clear"
+          leadingIcon={<X size={12} />}
           onClick={onClear}
           title="Clear all filters"
         >
-          <X size={12} />
-          <span>Clear</span>
-        </button>
+          Clear
+        </Button>
       ) : null}
     </div>
   );
@@ -607,9 +618,11 @@ function MultiSelectDropdown({ label, options, selected, onToggle }: MultiSelect
 
   return (
     <div className="dashboard-filter-multi" ref={rootRef}>
-      <button
+      <Button
         ref={triggerRef}
         type="button"
+        variant="outline"
+        size="sm"
         className={`dashboard-filter-trigger${selected.length > 0 ? " is-active" : ""}`}
         onClick={() => {
           if (open) close("pointer");
@@ -619,10 +632,10 @@ function MultiSelectDropdown({ label, options, selected, onToggle }: MultiSelect
         aria-expanded={open}
         aria-controls={optionsId}
         disabled={disabled}
+        trailingIcon={<ChevronDown size={12} />}
       >
-        <span>{summary}</span>
-        <ChevronDown size={12} />
-      </button>
+        {summary}
+      </Button>
       {open ? (
         <div
           id={optionsId}
