@@ -178,7 +178,7 @@ try {
   assert(/mono/i.test(bodyFont), `opencode chrome must be mono, got ${bodyFont}`);
 
   logStep("state 2: orchestrator-first sidebar with persisted disclosure");
-  await page.click('[data-testid="workspace-ribbon"] [aria-label="Agent list"]');
+  await page.click('[data-testid="sidebar-views"] [aria-label="Agent list"]');
   await page.waitForSelector('[data-testid="nav-agents-group-active"]');
   const initialRows = await page.evaluate(() =>
     Array.from(document.querySelectorAll(".nav-agent")).map((el) =>

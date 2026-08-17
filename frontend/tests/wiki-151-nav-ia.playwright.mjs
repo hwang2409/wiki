@@ -22,20 +22,12 @@ let browser;
 let backend;
 const fixtures = makeFixtureRoot("wiki-151-nav-ia-");
 
-async function ribbonZoneCount(page) {
+async function sidebarViewsLabels(page) {
   return page.evaluate(() => {
-    const ribbon = document.querySelector('[data-testid="workspace-ribbon"]');
-    if (!(ribbon instanceof HTMLElement)) return -1;
-    return ribbon.querySelectorAll(".ribbon-zone").length;
-  });
-}
-
-async function ribbonZoneNames(page) {
-  return page.evaluate(() => {
-    const ribbon = document.querySelector('[data-testid="workspace-ribbon"]');
-    if (!(ribbon instanceof HTMLElement)) return [];
-    return Array.from(ribbon.querySelectorAll(".ribbon-zone")).map((zone) =>
-      zone.getAttribute("data-zone"),
+    const nav = document.querySelector('[data-testid="sidebar-views"]');
+    if (!(nav instanceof HTMLElement)) return [];
+    return Array.from(nav.querySelectorAll(".sidebar-views-row")).map((row) =>
+      row.getAttribute("aria-label"),
     );
   });
 }
@@ -58,7 +50,7 @@ async function sidebarModeTitleY(page) {
 async function switchSidebarTo(page, tab) {
   const label =
     tab === "files" ? "Files" : tab === "search" ? "Search" : "Agent list";
-  await page.click(`[data-testid="workspace-ribbon"] [aria-label="${label}"]`);
+  await page.click(`[data-testid="sidebar-views"] [aria-label="${label}"]`);
   await page.waitForSelector(`.sidebar-mode[data-mode="${tab}"]`);
 }
 
@@ -197,39 +189,39 @@ try {
 
   await page.goto(`${backend.baseUrl}/`, { waitUntil: "domcontentloaded" });
   await page.waitForSelector(".app-container");
-  await page.waitForSelector('[data-testid="workspace-ribbon"]');
+  await page.waitForSelector('[data-testid="sidebar-views"]');
 
-  // 1. Ribbon: exactly three zones, ordered content / run-management / app-controls.
-  const zoneCount = await ribbonZoneCount(page);
-  assert(zoneCount === 3, `expected 3 ribbon zones, got ${zoneCount}`);
-  const zoneNames = await ribbonZoneNames(page);
-  assert(
-    JSON.stringify(zoneNames) === JSON.stringify(["content", "run-management", "app-controls"]),
-    `unexpected ribbon zone order: ${zoneNames.join(",")}`,
-  );
-
-  // 2. Ribbon overflow menu: opens, contains ≥ one secondary utility, primary
-  // destinations (new note, files, agents, settings, theme) remain 1-click.
-  const primaryLabels = [
+  // 1. Views section: one flat, ordered list of destinations. WIKI-296
+  // dissolved the ribbon and its overflow menu into a single sidebar nav so
+  // every primary and secondary destination is a one-click row.
+  const viewsLabels = await sidebarViewsLabels(page);
+  const expectedLabels = [
     "New note",
     "Files",
     "Search",
     "Agent list",
+    "New terminal",
     "Agents",
-    "Settings",
+    "Activity feed",
+    "Graph view",
+    "Note freshness",
+    "Token usage",
+    "Ticket dashboard",
+    "Fleet graph",
   ];
-  for (const label of primaryLabels) {
-    const count = await page
-      .locator(`[data-testid="workspace-ribbon"] [aria-label="${label}"]`)
-      .count();
-    assert(count === 1, `ribbon primary "${label}" expected exactly 1, got ${count}`);
-  }
-  await page.click('[data-testid="ribbon-more-button"]');
-  await page.waitForSelector('[data-testid="ribbon-more-menu"]');
-  const overflowItems = await page.locator('[data-testid="ribbon-more-menu"] [role="menuitem"]').count();
-  assert(overflowItems >= 3, `overflow menu expected ≥ 3 items, got ${overflowItems}`);
-  // Close menu again by clicking the button.
-  await page.click('[data-testid="ribbon-more-button"]');
+  assert(
+    JSON.stringify(viewsLabels) === JSON.stringify(expectedLabels),
+    `unexpected sidebar Views ordering: ${viewsLabels.join(",")}`,
+  );
+
+  // 2. Sidebar footer holds app-level toggles (Settings + theme). Theme
+  // toggle carries a dynamic aria-label ("Switch to <target>"), so anchor
+  // on Settings and the footer test-id.
+  await page.waitForSelector('[data-testid="sidebar-footer"] [aria-label="Settings"]');
+  const footerActions = await page
+    .locator('[data-testid="sidebar-footer"] .sidebar-footer-action')
+    .count();
+  assert(footerActions === 2, `sidebar footer expected 2 actions, got ${footerActions}`);
 
   // 3. Sidebar shell: mode-title present in all three modes; align at same
   // vertical offset across modes (single-line header, no stacked headers).
@@ -468,8 +460,8 @@ try {
     path.join(OUT_DIR, "summary.json"),
     JSON.stringify(
       {
-        ribbon_zones: zoneNames,
-        overflow_items: overflowItems,
+        sidebar_views: viewsLabels,
+        sidebar_footer_actions: footerActions,
         sidebar_mode_titles: { files: filesTitle, search: searchTitle, agents: agentsTitle },
         sort_order: activeWorkerTickets,
         workspace_labels: optionLabels,

@@ -183,8 +183,11 @@ describe("WIKI-246 OpenCode chrome states", () => {
   });
 
   test("chrome hover keeps elevation without foreground or border promotion", () => {
+    // WIKI-296 replaced the ribbon column with sidebar Views rows; the
+    // sidebar-footer icon row carries the theme + settings toggles that
+    // used to sit in the ribbon. Both hover-state contracts still apply.
     for (const selector of [
-      ".ribbon-action:hover",
+      ".sidebar-footer-action:hover",
       ".nav-action-button:hover",
       ".tree-item-self:hover",
       ".dialog-button:hover",
@@ -231,7 +234,7 @@ describe("WIKI-246 OpenCode chrome states", () => {
     // element-on-element or transparent hover backgrounds are invisible; the
     // FINAL rule in source order must carry the modifier token so a reverted
     // late override cannot hide behind an earlier legacy rule.
-    for (const selector of [".ribbon-action:hover", ".dialog-button:hover", ".tmux-status-item:hover"]) {
+    for (const selector of [".sidebar-footer-action:hover", ".dialog-button:hover", ".tmux-status-item:hover"]) {
       const finalBody = finalCssDeclarations(selector);
       expect(finalBody).toContain("var(--background-modifier-hover)");
       expect(finalBody).not.toContain("var(--background-element)");

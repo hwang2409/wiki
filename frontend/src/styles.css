@@ -315,128 +315,160 @@ button:disabled {
 
 .app-container {
   display: grid;
-  grid-template-columns: 44px 200px minmax(0, 1fr);
+  grid-template-columns: 216px minmax(0, 1fr);
   height: 100vh;
 }
 
-/* Ribbon */
+/* Sidebar */
 
-.workspace-ribbon {
+.workspace-sidebar {
   display: flex;
   flex-direction: column;
-  align-items: center;
-  gap: 0;
-  padding: 10px 0;
-  background-color: var(--background-secondary);
+  min-height: 0;
   border-right: 1px solid var(--background-modifier-border);
 }
 
-.ribbon-zone {
+/* Views section: bb SidebarMenu row grammar — 28px rows, icon + label,
+   translucent hover, quiet selection. Header is a collapsible section
+   label with a rotating chevron. */
+
+.sidebar-views {
   display: flex;
   flex-direction: column;
+  padding: 6px 6px 8px;
+}
+
+.sidebar-views-header {
+  display: inline-flex;
   align-items: center;
   gap: 6px;
-  padding: 6px 0;
-}
-
-.ribbon-zone + .ribbon-zone {
-  border-top: 1px solid var(--background-modifier-border);
-}
-
-.workspace-ribbon > .ribbon-zone:first-child {
-  padding-top: 0;
-}
-
-.workspace-ribbon > .ribbon-zone:last-child {
-  padding-bottom: 0;
-}
-
-.ribbon-more-container {
-  position: relative;
-}
-
-.ribbon-more-menu {
-  position: absolute;
-  top: 0;
-  left: calc(100% + 8px);
-  z-index: 20;
-  display: flex;
-  flex-direction: column;
-  min-width: 220px;
-  padding: 6px;
-  background-color: var(--background-primary);
-  border: 1px solid var(--background-modifier-border);
-  border-radius: var(--radius-m, 8px);
-  box-shadow: 0 6px 20px rgba(0, 0, 0, 0.18);
-}
-
-.ribbon-more-title {
-  padding: 6px 10px 4px;
+  align-self: flex-start;
+  height: 22px;
+  padding: 0 6px;
+  border-radius: var(--radius-md);
   color: var(--text-faint);
   font-family: var(--font-chrome);
-  font-size: var(--fs-xs);
+  font-size: var(--section-label-size, var(--fs-2xs));
   font-weight: var(--fw-semibold);
-  letter-spacing: 0.08em;
+  letter-spacing: var(--section-label-tracking, 0.14em);
   text-transform: uppercase;
+  cursor: pointer;
+  transition-property: background-color, color;
+  transition-duration: 120ms;
+  transition-timing-function: cubic-bezier(0.2, 0, 0, 1);
 }
 
-.ribbon-more-item {
+.sidebar-views-header:hover {
+  background-color: var(--state-hover, var(--background-modifier-hover));
+  color: var(--text-muted);
+}
+
+.sidebar-views-chevron {
+  color: var(--text-faint);
+  transition-property: transform;
+  transition-duration: 120ms;
+  transition-timing-function: cubic-bezier(0.2, 0, 0, 1);
+}
+
+.sidebar-views-chevron.is-open {
+  transform: rotate(90deg);
+}
+
+.sidebar-views-list {
+  display: flex;
+  flex-direction: column;
+  gap: 1px;
+  margin: 4px 0 0;
+  padding: 0;
+  list-style: none;
+}
+
+.sidebar-views-item {
+  margin: 0;
+}
+
+.sidebar-views-row {
+  position: relative;
   display: flex;
   align-items: center;
   gap: 10px;
   width: 100%;
-  padding: 7px 10px;
-  border-radius: var(--radius-s);
-  color: var(--text-normal);
+  height: 28px;
+  padding: 0 8px;
+  border-radius: var(--radius-md);
+  color: var(--text-muted);
   font-family: var(--font-chrome);
   font-size: var(--fs-sm);
   text-align: left;
+  transition-property: background-color, color;
+  transition-duration: 120ms;
+  transition-timing-function: cubic-bezier(0.2, 0, 0, 1);
 }
 
-.ribbon-more-item svg {
+.sidebar-views-row-icon {
+  flex: 0 0 auto;
+  color: var(--text-faint);
+}
+
+.sidebar-views-row-label {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.sidebar-views-row:hover {
+  background-color: var(--state-hover, var(--background-modifier-hover));
+  color: var(--text-normal);
+}
+
+.sidebar-views-row:hover .sidebar-views-row-icon {
   color: var(--text-muted);
 }
 
-.ribbon-more-item:hover {
-  background-color: var(--background-modifier-hover);
-}
-
-.ribbon-more-item.is-active {
-  background-color: var(--background-modifier-active-hover, var(--background-modifier-hover));
+.sidebar-views-row.is-active {
+  background-color: var(--surface-selected, var(--background-modifier-active-hover, var(--background-modifier-hover)));
   color: var(--text-normal);
 }
 
-.ribbon-more-item.is-active svg {
+.sidebar-views-row.is-active .sidebar-views-row-icon {
   color: var(--text-normal);
 }
 
-.ribbon-action {
-  position: relative;
+.sidebar-views-row:active:not(:disabled) {
+  scale: 0.96;
+}
+
+/* Sidebar footer: bb SidebarFooter icon row for app-level toggles. */
+
+.sidebar-footer {
   display: flex;
   align-items: center;
+  gap: 2px;
+  margin-top: auto;
+  padding: 6px 8px;
+  border-top: 1px solid var(--hairline, var(--background-modifier-border));
+}
+
+.sidebar-footer-action {
+  display: inline-flex;
+  align-items: center;
   justify-content: center;
-  width: 30px;
-  height: 30px;
-  border-radius: var(--radius-s);
+  width: 28px;
+  height: 28px;
+  border-radius: var(--radius-md);
   color: var(--text-muted);
+  transition-property: background-color, color;
+  transition-duration: 120ms;
+  transition-timing-function: cubic-bezier(0.2, 0, 0, 1);
 }
 
-.ribbon-action::after {
-  content: "";
-  position: absolute;
-  inset: -3px;
+.sidebar-footer-action:hover {
+  background-color: var(--state-hover, var(--background-modifier-hover));
 }
 
-.ribbon-action:hover {
-  background-color: var(--background-modifier-hover);
-}
-
-.ribbon-action.is-active {
-  color: var(--text-normal);
-}
-
-.ribbon-spacer {
-  flex: 1;
+.sidebar-footer-action:active:not(:disabled) {
+  scale: 0.96;
 }
 
 .theme-icon-stack {
@@ -444,8 +476,8 @@ button:disabled {
   display: flex;
   align-items: center;
   justify-content: center;
-  width: 18px;
-  height: 18px;
+  width: 16px;
+  height: 16px;
 }
 
 .theme-icon {
@@ -459,15 +491,6 @@ button:disabled {
   opacity: 1;
   scale: 1;
   filter: blur(0px);
-}
-
-/* Sidebar */
-
-.workspace-sidebar {
-  display: flex;
-  flex-direction: column;
-  min-height: 0;
-  border-right: 1px solid var(--background-modifier-border);
 }
 
 .sidebar-mode {
@@ -839,7 +862,7 @@ button:disabled {
 }
 
 .app-container.sidebar-hidden {
-  grid-template-columns: 44px 0 minmax(0, 1fr);
+  grid-template-columns: 0 minmax(0, 1fr);
 }
 
 .app-container.sidebar-hidden .workspace-sidebar {
@@ -8539,7 +8562,7 @@ body.is-resizing-panes .pane-cell {
 
 @media (max-width: 900px) {
   .app-container {
-    grid-template-columns: 44px minmax(0, 1fr);
+    grid-template-columns: minmax(0, 1fr);
   }
 
   .workspace-sidebar {
@@ -15897,7 +15920,6 @@ textarea.composer-command-input {
 /* ------------------------------------------------------------------ */
 
 /* Surfaces use elevation. Borders stay for focus and separators only. */
-.workspace-ribbon,
 .workspace-sidebar,
 .session-sidebar,
 .session-side-panel {
@@ -15905,15 +15927,10 @@ textarea.composer-command-input {
   border-color: var(--border-subtle);
 }
 
-.workspace-ribbon {
-  background-color: var(--background-element);
-}
-
 .workspace-sidebar {
   border-right-width: 1px;
 }
 
-.ribbon-zone + .ribbon-zone,
 .sidebar-mode-title,
 .session-footer,
 .agent-session-surface-head,
@@ -15921,7 +15938,6 @@ textarea.composer-command-input {
   border-color: var(--border-subtle);
 }
 
-.ribbon-action,
 .nav-action-button,
 .tree-item-self,
 .nav-agent,
@@ -15940,11 +15956,6 @@ textarea.composer-command-input {
 .kanban-card:hover,
 .quick-switcher-result:hover:not(.is-selected):not(.is-disabled) {
   background-color: var(--background-element);
-}
-
-/* ribbon rests on element bg; hover needs the modifier token to stay visible */
-.ribbon-action:hover {
-  background-color: var(--background-modifier-hover);
 }
 
 /* Current items are marked by text and a gutter dot. Cursor selection uses
@@ -16408,35 +16419,11 @@ body {
   padding: var(--canvas-inset);
   gap: var(--canvas-inset);
   background-color: var(--canvas-bg);
-  grid-template-columns: 40px 216px minmax(0, 1fr);
+  grid-template-columns: 216px minmax(0, 1fr);
 }
 
 .app-container.sidebar-hidden {
-  grid-template-columns: 40px 0 minmax(0, 1fr);
-}
-
-/* Ribbon: transparent, no hard border — it sits on the canvas. */
-.workspace-ribbon {
-  padding: 4px 0;
-  border-right: 0;
-  background-color: transparent;
-}
-
-.ribbon-zone + .ribbon-zone {
-  margin-top: 4px;
-  padding-top: 10px;
-  border-top: 1px solid var(--hairline);
-}
-
-.ribbon-action {
-  border-radius: var(--radius-md);
-  transition-property: background-color, color, scale;
-  transition-duration: 120ms;
-  transition-timing-function: cubic-bezier(0.2, 0, 0, 1);
-}
-
-.ribbon-action:active:not(:disabled) {
-  scale: 0.96;
+  grid-template-columns: 0 minmax(0, 1fr);
 }
 
 /* Sidebar: quiet — no hard border, soft small-caps section headers. */
