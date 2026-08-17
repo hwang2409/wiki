@@ -2,6 +2,7 @@ export const THEME_STORAGE_KEY = "wiki-theme";
 
 export type ThemeFamilyId =
   | "bb"
+  | "macos"
   | "opencode"
   | "mono"
   | "gruvbox"
@@ -16,6 +17,8 @@ export type ThemePolarity = "light" | "dark";
 export type ThemeId =
   | "bb-light"
   | "bb-dark"
+  | "macos-light"
+  | "macos-dark"
   | "opencode"
   | "mono-light"
   | "mono-dark"
@@ -54,6 +57,20 @@ export const THEMES: readonly ThemeDefinition[] = [
     family: "bb",
     polarity: "dark",
     preview: ["#323232", "#282828", "#454545", "#d1d1d1"],
+  },
+  {
+    id: "macos-light",
+    label: "macOS Light",
+    family: "macos",
+    polarity: "light",
+    preview: ["#f5f5f7", "#ffffff", "#d2d2d7", "#007aff"],
+  },
+  {
+    id: "macos-dark",
+    label: "macOS Dark",
+    family: "macos",
+    polarity: "dark",
+    preview: ["#1c1c1e", "#2c2c2e", "#38383a", "#0a84ff"],
   },
   {
     id: "opencode",
@@ -151,6 +168,7 @@ export const THEMES: readonly ThemeDefinition[] = [
 const THEME_BY_ID = new Map(THEMES.map((theme) => [theme.id, theme]));
 const FAMILY_VARIANTS: Record<ThemeFamilyId, Partial<Record<ThemePolarity, ThemeId>>> = {
   bb: { light: "bb-light", dark: "bb-dark" },
+  macos: { light: "macos-light", dark: "macos-dark" },
   opencode: { dark: "opencode" },
   mono: { light: "mono-light", dark: "mono-dark" },
   gruvbox: { light: "gruvbox-light", dark: "gruvbox-dark" },

@@ -1297,3 +1297,283 @@
   );
   --pill-surface-selected-border: color-mix(in oklch, var(--ink) 25.2%, var(--canvas));
 }
+
+/* WIKI-327: macOS light appearance. The neutral ramp follows AppKit's
+   grouped chrome and label hierarchy; blue is reserved for interactive state. */
+[data-theme="macos-light"] {
+  color-scheme: light;
+
+  --canvas: #f5f5f7;
+  --ink: #1d1d1f;
+  --background-primary: var(--canvas);
+  --background-primary-alt: #ffffff;
+  --background-secondary: #f2f2f7;
+  --background-modifier-border: #d2d2d7;
+  --background-modifier-border-hover: #a1a1a6;
+  --background-modifier-hover: color-mix(in srgb, var(--ink) 4.5%, transparent);
+  --background-modifier-active: color-mix(in srgb, var(--primary) 12%, transparent);
+  --background-modifier-error: color-mix(in srgb, var(--destructive) 7%, transparent);
+  --background-modifier-success: color-mix(in srgb, var(--success) 12%, transparent);
+
+  --text-normal: var(--ink);
+  --text-muted: #636366;
+  --text-subtle-readable: #6e6e73;
+  --text-faint: #8e8e93;
+  --text-on-accent: #ffffff;
+  --text-selection: color-mix(in srgb, var(--primary) 18%, transparent);
+  --destructive-text: #d70015;
+
+  --activity-metadata-color: var(--text-normal);
+  --activity-state-done-color: var(--text-muted);
+  --activity-state-working-color: var(--primary);
+  --activity-state-failed-color: var(--destructive-text);
+  --activity-state-interrupted-color: var(--destructive-text);
+  --activity-state-waiting-color: var(--warning-text);
+  --link-color: var(--text-normal);
+  --link-color-hover: var(--primary);
+  --link-unresolved-opacity: 0.6;
+
+  --code-background: #eaeaef;
+  --image-outline: rgba(0, 0, 0, 0.1);
+  --kanban-backdrop: #eaeaef;
+  --kanban-lane: #f2f2f7;
+  --kanban-card: #ffffff;
+  --kanban-card-shadow: 0 1px 2px rgba(0, 0, 0, 0.08);
+  --hr-color: var(--border);
+  --blockquote-border-color: #c7c7cc;
+  --table-border-color: var(--border);
+  --checkbox-color: var(--primary);
+  --scrollbar-thumb: #c7c7cc;
+  --scrollbar-thumb-hover: #aeaeb2;
+
+  --primary: #007aff;
+  --accent-primary: var(--primary);
+  --success: #34c759;
+  --warning: #ff9500;
+  --destructive: #ff3b30;
+  --accent-success: var(--success);
+  --accent-warning: var(--warning);
+  --accent-danger: var(--destructive);
+  --attention: #ffcc00;
+  --warning-text: #b25000;
+  --success-foreground: #248a3d;
+  --text-error: var(--destructive-text);
+  --text-warning: var(--warning-text);
+  --text-success: var(--success-foreground);
+
+  --background-overlay-soft: var(--surface-scrim);
+  --background-overlay-strong: color-mix(in srgb, var(--canvas) 86%, transparent);
+  --shadow-floating: 0 1px 2px rgba(0, 0, 0, 0.12), 0 8px 24px rgba(0, 0, 0, 0.14);
+  --shadow-modal: 0 2px 4px rgba(0, 0, 0, 0.12), 0 16px 40px rgba(0, 0, 0, 0.2);
+  --shadow-lifted: 0 1px 2px rgba(0, 0, 0, 0.1), 0 6px 18px rgba(0, 0, 0, 0.12);
+  --shadow-lift: 0 -4px 12px -4px rgba(0, 0, 0, 0.08);
+  --shadow-top: var(--shadow-lift);
+
+  --status-working-background: color-mix(in srgb, var(--primary) 12%, transparent);
+  --status-working-border: var(--primary);
+  --status-working-color: var(--primary);
+  --status-merge-ready-background: var(--primary);
+  --status-merge-ready-border: var(--primary);
+  --status-merge-ready-color: #ffffff;
+  --status-blocked-background: var(--surface-destructive);
+  --status-blocked-border: var(--destructive-text);
+  --status-blocked-color: var(--destructive-text);
+
+  --diff-added: #248a3d;
+  --diff-removed: #c9342f;
+  --diff-add-background: color-mix(in srgb, var(--diff-added) 12%, transparent);
+  --diff-add-foreground: var(--diff-added);
+  --diff-remove-background: color-mix(in srgb, var(--diff-removed) 10%, transparent);
+  --diff-remove-foreground: var(--diff-removed);
+  --diff-hatch-color: color-mix(in srgb, var(--diff-removed) 12%, transparent);
+
+  --selection-inverse-background: var(--primary);
+  --selection-inverse-color: #ffffff;
+  --syntax-text: var(--text-normal);
+  --syntax-comment: var(--text-faint);
+  --syntax-keyword: var(--text-normal);
+  --syntax-function: var(--text-normal);
+  --syntax-string: var(--text-muted);
+  --syntax-number: var(--text-muted);
+  --syntax-type: var(--text-muted);
+  --syntax-variable: var(--text-normal);
+
+  --border: #d2d2d7;
+  --border-seam: color-mix(in srgb, var(--ink) 9%, var(--canvas));
+  --border-seam-vertical: var(--border-seam);
+  --border-hairline: #d2d2d7;
+  --input: #8e8e93;
+  --ring: var(--primary);
+  --state-hover: var(--background-modifier-hover);
+  --state-active: var(--background-modifier-active);
+  --surface-recessed: color-mix(in srgb, var(--ink) 6%, transparent);
+  --surface-recessed-solid: #eaeaef;
+  --surface-recessed-soft-solid: #f0f0f5;
+  --surface-raised: color-mix(in srgb, #ffffff 82%, transparent);
+  --surface-raised-solid: #ffffff;
+  --surface-scrim: color-mix(in srgb, var(--canvas) 92%, transparent);
+  --surface-destructive: color-mix(in srgb, var(--destructive) 7%, transparent);
+  --surface-destructive-border: color-mix(in srgb, var(--destructive) 25%, transparent);
+  --surface-attention: color-mix(in srgb, var(--attention) 16%, transparent);
+  --surface-selected: color-mix(in srgb, var(--primary) 14%, transparent);
+  --surface-selected-border: color-mix(in srgb, var(--primary) 36%, transparent);
+  --sidebar: #f2f2f7;
+  --sidebar-foreground: var(--ink);
+  --sidebar-accent: #e5e5ea;
+  --sidebar-accent-foreground: var(--ink);
+  --sidebar-border: var(--border);
+  --sidebar-search-match: #ffe680;
+  --sidebar-search-match-border: #e5b700;
+  --sidebar-ring: var(--primary);
+  --readback-foreground: #6e6e73;
+  --timeline-accent: var(--primary);
+  --file-accent: var(--timeline-accent);
+  --pr-merged: #af52de;
+  --pill-surface: linear-gradient(to bottom, #ffffff, #f7f7fa);
+  --pill-surface-border: var(--border);
+  --pill-foreground: var(--ink);
+  --pill-icon: var(--ink);
+  --pill-shadow: 0 1px 1px rgba(0, 0, 0, 0.04);
+  --pill-surface-selected: linear-gradient(to bottom, #e5f1ff, #d8eaff);
+  --pill-surface-selected-border: color-mix(in srgb, var(--primary) 35%, var(--canvas));
+}
+
+/* WIKI-327: macOS dark appearance. Elevated surfaces step up from the
+   charcoal canvas; white label tones and system blue retain clear hierarchy. */
+[data-theme="macos-dark"] {
+  color-scheme: dark;
+
+  --canvas: #1c1c1e;
+  --ink: #f5f5f7;
+  --background-primary: var(--canvas);
+  --background-primary-alt: #2c2c2e;
+  --background-secondary: #242426;
+  --background-modifier-border: #38383a;
+  --background-modifier-border-hover: #636366;
+  --background-modifier-hover: color-mix(in srgb, var(--ink) 10%, transparent);
+  --background-modifier-active: color-mix(in srgb, var(--primary) 18%, transparent);
+  --background-modifier-error: color-mix(in srgb, var(--destructive) 10%, transparent);
+  --background-modifier-success: color-mix(in srgb, var(--success) 12%, transparent);
+
+  --text-normal: var(--ink);
+  --text-muted: #98989d;
+  --text-subtle-readable: #aeaeb2;
+  --text-faint: #636366;
+  --text-on-accent: #ffffff;
+  --text-selection: color-mix(in srgb, var(--primary) 24%, transparent);
+  --destructive-text: #ff6961;
+
+  --activity-metadata-color: var(--text-normal);
+  --activity-state-done-color: var(--text-muted);
+  --activity-state-working-color: var(--primary);
+  --activity-state-failed-color: var(--destructive-text);
+  --activity-state-interrupted-color: var(--destructive-text);
+  --activity-state-waiting-color: var(--warning-text);
+  --link-color: var(--text-normal);
+  --link-color-hover: var(--primary);
+  --link-unresolved-opacity: 0.6;
+
+  --code-background: #2c2c2e;
+  --image-outline: rgba(255, 255, 255, 0.1);
+  --kanban-backdrop: #18181a;
+  --kanban-lane: #242426;
+  --kanban-card: #2c2c2e;
+  --kanban-card-shadow: 0 1px 2px rgba(0, 0, 0, 0.35);
+  --hr-color: var(--border);
+  --blockquote-border-color: #48484a;
+  --table-border-color: var(--border);
+  --checkbox-color: var(--primary);
+  --scrollbar-thumb: #48484a;
+  --scrollbar-thumb-hover: #636366;
+
+  --primary: #0a84ff;
+  --accent-primary: var(--primary);
+  --success: #30d158;
+  --warning: #ff9f0a;
+  --destructive: #ff453a;
+  --accent-success: var(--success);
+  --accent-warning: var(--warning);
+  --accent-danger: var(--destructive);
+  --attention: #ffd60a;
+  --warning-text: #ffb340;
+  --success-foreground: #30d158;
+  --text-error: var(--destructive-text);
+  --text-warning: var(--warning-text);
+  --text-success: var(--success-foreground);
+
+  --background-overlay-soft: var(--surface-scrim);
+  --background-overlay-strong: color-mix(in srgb, var(--canvas) 86%, transparent);
+  --shadow-floating: 0 1px 2px rgba(0, 0, 0, 0.32), 0 8px 24px rgba(0, 0, 0, 0.4);
+  --shadow-modal: 0 2px 4px rgba(0, 0, 0, 0.32), 0 16px 40px rgba(0, 0, 0, 0.5);
+  --shadow-lifted: 0 1px 2px rgba(0, 0, 0, 0.28), 0 6px 18px rgba(0, 0, 0, 0.35);
+  --shadow-lift: 0 -4px 12px -4px rgba(0, 0, 0, 0.3);
+  --shadow-top: var(--shadow-lift);
+
+  --status-working-background: color-mix(in srgb, var(--primary) 18%, transparent);
+  --status-working-border: var(--primary);
+  --status-working-color: var(--primary);
+  --status-merge-ready-background: var(--primary);
+  --status-merge-ready-border: var(--primary);
+  --status-merge-ready-color: #ffffff;
+  --status-blocked-background: var(--surface-destructive);
+  --status-blocked-border: var(--destructive-text);
+  --status-blocked-color: var(--destructive-text);
+
+  --diff-added: #30d158;
+  --diff-removed: #ff6961;
+  --diff-add-background: color-mix(in srgb, var(--diff-added) 16%, transparent);
+  --diff-add-foreground: var(--diff-added);
+  --diff-remove-background: color-mix(in srgb, var(--diff-removed) 14%, transparent);
+  --diff-remove-foreground: var(--diff-removed);
+  --diff-hatch-color: color-mix(in srgb, var(--diff-removed) 16%, transparent);
+
+  --selection-inverse-background: var(--primary);
+  --selection-inverse-color: #ffffff;
+  --syntax-text: var(--text-normal);
+  --syntax-comment: var(--text-faint);
+  --syntax-keyword: var(--text-normal);
+  --syntax-function: var(--text-normal);
+  --syntax-string: var(--text-muted);
+  --syntax-number: var(--text-muted);
+  --syntax-type: var(--text-muted);
+  --syntax-variable: var(--text-normal);
+
+  --border: #38383a;
+  --border-seam: color-mix(in srgb, var(--ink) 11%, var(--canvas));
+  --border-seam-vertical: var(--border-seam);
+  --border-hairline: #38383a;
+  --input: #636366;
+  --ring: var(--primary);
+  --state-hover: var(--background-modifier-hover);
+  --state-active: var(--background-modifier-active);
+  --surface-recessed: color-mix(in srgb, var(--ink) 7%, transparent);
+  --surface-recessed-solid: #242426;
+  --surface-recessed-soft-solid: #202022;
+  --surface-raised: color-mix(in srgb, #2c2c2e 82%, transparent);
+  --surface-raised-solid: #2c2c2e;
+  --surface-scrim: color-mix(in srgb, var(--canvas) 92%, transparent);
+  --surface-destructive: color-mix(in srgb, var(--destructive) 10%, transparent);
+  --surface-destructive-border: color-mix(in srgb, var(--destructive) 30%, transparent);
+  --surface-attention: color-mix(in srgb, var(--attention) 14%, transparent);
+  --surface-selected: color-mix(in srgb, var(--primary) 18%, transparent);
+  --surface-selected-border: color-mix(in srgb, var(--primary) 42%, transparent);
+  --sidebar: #242426;
+  --sidebar-foreground: var(--ink);
+  --sidebar-accent: #3a3a3c;
+  --sidebar-accent-foreground: var(--ink);
+  --sidebar-border: var(--border);
+  --sidebar-search-match: #665c26;
+  --sidebar-search-match-border: #9a871c;
+  --sidebar-ring: var(--primary);
+  --readback-foreground: #aeaeb2;
+  --timeline-accent: var(--primary);
+  --file-accent: var(--timeline-accent);
+  --pr-merged: #bf5af2;
+  --pill-surface: linear-gradient(to bottom, #2c2c2e, #29292b);
+  --pill-surface-border: var(--border);
+  --pill-foreground: var(--ink);
+  --pill-icon: var(--ink);
+  --pill-shadow: 0 1px 1px rgba(0, 0, 0, 0.16);
+  --pill-surface-selected: linear-gradient(to bottom, #354e67, #30465d);
+  --pill-surface-selected-border: color-mix(in srgb, var(--primary) 42%, var(--canvas));
+}
