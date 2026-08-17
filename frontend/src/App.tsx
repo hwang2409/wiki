@@ -20,7 +20,6 @@ import {
   History,
   Lock,
   Moon,
-  MoreHorizontal,
   Pencil,
   RefreshCw,
   Search,
@@ -1330,7 +1329,9 @@ export default function App() {
   const [leaderArmed, setLeaderArmed] = useState(false);
   const [windowChooserOpen, setWindowChooserOpen] = useState(false);
   const [settingsOpen, setSettingsOpen] = useState(false);
-  const [ribbonMoreOpen, setRibbonMoreOpen] = useState(false);
+  const [sidebarViewsOpen, setSidebarViewsOpen] = useState(
+    () => localStorage.getItem("wiki-sidebar-views-open") !== "false"
+  );
   const [workspaceDiscoveryError, setWorkspaceDiscoveryError] = useState<string | null>(null);
   const [workspaceDiscoveryReady, setWorkspaceDiscoveryReady] = useState(false);
 
@@ -1419,25 +1420,8 @@ export default function App() {
   }
 
   useEffect(() => {
-    if (!ribbonMoreOpen) return;
-    const handlePointer = (event: MouseEvent) => {
-      const target = event.target as Node | null;
-      if (!target) return;
-      const container = document.querySelector('[data-testid="ribbon-more-menu"]');
-      const button = document.querySelector('[data-testid="ribbon-more-button"]');
-      if (container?.contains(target) || button?.contains(target)) return;
-      setRibbonMoreOpen(false);
-    };
-    const handleKey = (event: KeyboardEvent) => {
-      if (event.key === "Escape") setRibbonMoreOpen(false);
-    };
-    window.addEventListener("mousedown", handlePointer);
-    window.addEventListener("keydown", handleKey);
-    return () => {
-      window.removeEventListener("mousedown", handlePointer);
-      window.removeEventListener("keydown", handleKey);
-    };
-  }, [ribbonMoreOpen]);
+    localStorage.setItem("wiki-sidebar-views-open", String(sidebarViewsOpen));
+  }, [sidebarViewsOpen]);
 
   useEffect(() => {
     if (!contextMenu) return;
@@ -3700,151 +3684,81 @@ export default function App() {
     );
   }
 
-  const overflowItems: Array<{
+  const viewsRows: Array<{
+    key: string;
     label: string;
+    title?: string;
     icon: LucideIcon;
-    mode: Mode;
-    view: UtilityMode;
+    active: boolean;
+    onSelect: () => void;
   }> = [
-    { label: "Activity feed", icon: History, mode: "activity", view: "activity" },
-    { label: "Graph view", icon: Waypoints, mode: "graph", view: "graph" },
-    { label: "Note freshness", icon: HeartPulse, mode: "health", view: "health" },
-    { label: "Token usage", icon: TrendingUp, mode: "tokens", view: "tokens" },
-    { label: "Ticket dashboard", icon: ClipboardList, mode: "dashboard", view: "dashboard" },
-    { label: "Fleet graph", icon: Waypoints, mode: "fleet-graph", view: "fleet-graph" },
+    { key: "new-note", label: "New note", icon: SquarePen, active: false, onSelect: startNewNote },
+    { key: "files", label: "Files", icon: FolderIcon, active: sidebarTab === "files", onSelect: () => setSidebarTab("files") },
+    { key: "search", label: "Search", icon: Search, active: sidebarTab === "search", onSelect: () => setSidebarTab("search") },
+    { key: "agent-list", label: "Agent list", icon: SquareTerminal, active: sidebarTab === "agents", onSelect: () => setSidebarTab("agents") },
+    { key: "new-terminal", label: "New terminal", title: "New terminal (C-a t)", icon: TerminalIcon, active: false, onSelect: createTerminalPane },
+    { key: "agents", label: "Agents", icon: Bot, active: mode === "agents", onSelect: () => openUtilityView("agents") },
+    { key: "activity", label: "Activity feed", icon: History, active: mode === "activity", onSelect: () => openUtilityView("activity") },
+    { key: "graph", label: "Graph view", icon: Waypoints, active: mode === "graph", onSelect: () => openUtilityView("graph") },
+    { key: "health", label: "Note freshness", icon: HeartPulse, active: mode === "health", onSelect: () => openUtilityView("health") },
+    { key: "tokens", label: "Token usage", icon: TrendingUp, active: mode === "tokens", onSelect: () => openUtilityView("tokens") },
+    { key: "dashboard", label: "Ticket dashboard", icon: ClipboardList, active: mode === "dashboard", onSelect: () => openUtilityView("dashboard") },
+    { key: "fleet-graph", label: "Fleet graph", icon: Waypoints, active: mode === "fleet-graph", onSelect: () => openUtilityView("fleet-graph") },
   ];
-  const overflowActive = overflowItems.some((entry) => entry.mode === mode);
 
   return (
     <div className={`app-container${sidebarVisible ? "" : " sidebar-hidden"}`}>
-      <div className="workspace-ribbon" data-testid="workspace-ribbon">
-        <div className="ribbon-zone" data-zone="content">
-          <button
-            aria-label="New note"
-            className="ribbon-action"
-            title="New note"
-            type="button"
-            onClick={startNewNote}
-          >
-            <SquarePen size={18} />
-          </button>
-          <button
-            aria-label="Files"
-            className={`ribbon-action${sidebarTab === "files" ? " is-active" : ""}`}
-            title="Files"
-            type="button"
-            onClick={() => setSidebarTab("files")}
-          >
-            <FolderIcon size={18} />
-          </button>
-          <button
-            aria-label="Search"
-            className={`ribbon-action${sidebarTab === "search" ? " is-active" : ""}`}
-            title="Search"
-            type="button"
-            onClick={() => setSidebarTab("search")}
-          >
-            <Search size={18} />
-          </button>
-          <button
-            aria-label="New terminal"
-            className="ribbon-action"
-            title="New terminal (C-a t)"
-            type="button"
-            onClick={createTerminalPane}
-          >
-            <TerminalIcon size={18} />
-          </button>
-        </div>
-        <div className="ribbon-zone" data-zone="run-management">
-          <button
-            aria-label="Agent list"
-            className={`ribbon-action${sidebarTab === "agents" ? " is-active" : ""}`}
-            title="Agent list"
-            type="button"
-            onClick={() => setSidebarTab("agents")}
-          >
-            <SquareTerminal size={18} />
-          </button>
-          <button
-            aria-label="Agents"
-            className={`ribbon-action${mode === "agents" ? " is-active" : ""}`}
-            title="Agents"
-            type="button"
-            onClick={() => openUtilityView("agents")}
-          >
-            <Bot size={18} />
-          </button>
-          <div className="ribbon-more-container">
-            <button
-              aria-expanded={ribbonMoreOpen}
-              aria-haspopup="menu"
-              aria-label="More views"
-              className={`ribbon-action${ribbonMoreOpen || overflowActive ? " is-active" : ""}`}
-              data-testid="ribbon-more-button"
-              title="More views"
-              type="button"
-              onClick={() => setRibbonMoreOpen((open) => !open)}
-            >
-              <MoreHorizontal size={18} />
-            </button>
-            {ribbonMoreOpen ? (
-              <div
-                className="ribbon-more-menu"
-                data-testid="ribbon-more-menu"
-                role="menu"
-              >
-                <div className="ribbon-more-title">More views</div>
-                {overflowItems.map((entry) => {
-                  const Icon = entry.icon;
-                  const isActive = mode === entry.mode;
-                  return (
-                    <button
-                      className={`ribbon-more-item${isActive ? " is-active" : ""}`}
-                      key={entry.view}
-                      role="menuitem"
-                      type="button"
-                      onClick={() => {
-                        setRibbonMoreOpen(false);
-                        openUtilityView(entry.view);
-                      }}
-                    >
-                      <Icon size={16} />
-                      <span>{entry.label}</span>
-                    </button>
-                  );
-                })}
-              </div>
-            ) : null}
-          </div>
-        </div>
-        <div className="ribbon-spacer" />
-        <div className="ribbon-zone" data-zone="app-controls">
-          <button
-            aria-label="Settings"
-            className="ribbon-action"
-            title="Settings"
-            type="button"
-            onClick={() => setSettingsOpen(true)}
-          >
-            <Settings size={18} />
-          </button>
-          <button
-            aria-label={currentThemeIsDark ? "Switch to light theme" : "Switch to dark theme"}
-            className="ribbon-action"
-            title={`Switch to ${themeToggleTargetLabel}`}
-            type="button"
-            onClick={() => setTheme((current) => toggleThemePolarity(current))}
-          >
-            <span className="theme-icon-stack">
-              <Sun className={`theme-icon${currentThemeIsDark ? " is-active" : ""}`} size={18} />
-              <Moon className={`theme-icon${currentThemeIsDark ? "" : " is-active"}`} size={18} />
-            </span>
-          </button>
-        </div>
-      </div>
-
       <aside className="workspace-sidebar">
+        <nav
+          aria-label="Views"
+          className="sidebar-views"
+          data-testid="sidebar-views"
+        >
+          <button
+            aria-controls="sidebar-views-list"
+            aria-expanded={sidebarViewsOpen}
+            className="sidebar-views-header"
+            data-testid="sidebar-views-header"
+            type="button"
+            onClick={() => setSidebarViewsOpen((open) => !open)}
+          >
+            <ChevronRight
+              aria-hidden="true"
+              className={`sidebar-views-chevron${sidebarViewsOpen ? " is-open" : ""}`}
+              size={12}
+            />
+            <span className="sidebar-views-header-label">Views</span>
+          </button>
+          {sidebarViewsOpen ? (
+            <ul
+              className="sidebar-views-list"
+              data-testid="sidebar-views-list"
+              id="sidebar-views-list"
+              role="list"
+            >
+              {viewsRows.map((row) => {
+                const Icon = row.icon;
+                return (
+                  <li className="sidebar-views-item" key={row.key}>
+                    <button
+                      aria-current={row.active ? "page" : undefined}
+                      aria-label={row.label}
+                      className={`sidebar-views-row${row.active ? " is-active" : ""}`}
+                      data-view={row.key}
+                      title={row.title ?? row.label}
+                      type="button"
+                      onClick={row.onSelect}
+                    >
+                      <Icon aria-hidden="true" className="sidebar-views-row-icon" size={14} />
+                      <span className="sidebar-views-row-label">{row.label}</span>
+                    </button>
+                  </li>
+                );
+              })}
+            </ul>
+          ) : null}
+        </nav>
+
         {sidebarTab === "files" ? (
           <div className="sidebar-mode" data-mode="files">
             <div className="sidebar-mode-title">
@@ -4048,6 +3962,29 @@ export default function App() {
             />
           </div>
         )}
+        <div className="sidebar-footer" data-testid="sidebar-footer">
+          <button
+            aria-label="Settings"
+            className="sidebar-footer-action"
+            title="Settings"
+            type="button"
+            onClick={() => setSettingsOpen(true)}
+          >
+            <Settings aria-hidden="true" size={16} />
+          </button>
+          <button
+            aria-label={currentThemeIsDark ? "Switch to light theme" : "Switch to dark theme"}
+            className="sidebar-footer-action"
+            title={`Switch to ${themeToggleTargetLabel}`}
+            type="button"
+            onClick={() => setTheme((current) => toggleThemePolarity(current))}
+          >
+            <span className="theme-icon-stack">
+              <Sun aria-hidden="true" className={`theme-icon${currentThemeIsDark ? " is-active" : ""}`} size={16} />
+              <Moon aria-hidden="true" className={`theme-icon${currentThemeIsDark ? "" : " is-active"}`} size={16} />
+            </span>
+          </button>
+        </div>
       </aside>
 
       <main className="workspace-leaf">

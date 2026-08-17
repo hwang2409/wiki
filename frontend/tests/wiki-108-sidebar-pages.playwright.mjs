@@ -70,24 +70,11 @@ async function waitForUtilityWindow(page, kind, expectedCount) {
   );
 }
 
-const OVERFLOW_LABELS = new Set([
-  "Activity feed",
-  "Graph view",
-  "Note freshness",
-  "Token usage",
-  "Ticket dashboard",
-]);
-
 async function openSidebarPage(page, label, kind, expectedCount) {
-  // WIKI-151 grouped secondary utilities under the ribbon overflow menu.
-  // Open it first for those labels; primary destinations still click directly.
-  if (OVERFLOW_LABELS.has(label)) {
-    await page.locator('[data-testid="ribbon-more-button"]').click();
-    await page.locator('[data-testid="ribbon-more-menu"]').waitFor();
-    await page.locator('[data-testid="ribbon-more-menu"]').getByText(label, { exact: true }).click();
-  } else {
-    await page.getByLabel(label, { exact: true }).click();
-  }
+  // WIKI-296 folded every destination into the sidebar's Views section, so
+  // every label — including the ones WIKI-151 had bucketed under a ribbon
+  // overflow menu — is one click on a Views row.
+  await page.locator(`[data-testid="sidebar-views"] [aria-label="${label}"]`).click();
   await waitForUtilityWindow(page, kind, expectedCount);
 }
 

@@ -47,10 +47,12 @@ try {
   });
   await page.goto(`${backend.baseUrl}/#/agent/${TICKET}`, { waitUntil: "domcontentloaded" });
   await page.waitForSelector(".app-container");
-  await page.waitForSelector(".workspace-ribbon");
   await page.waitForSelector(".workspace-sidebar");
+  await page.waitForSelector('[data-testid="sidebar-views"]');
   await page.waitForSelector(".workspace-panes, .workspace-leaf");
 
+  // WIKI-296 collapsed the shell to a two-column grid; the ribbon column is
+  // gone and destinations now live inside the sidebar's Views section.
   const columns = await page.evaluate(() => {
     const app = document.querySelector(".app-container");
     if (!(app instanceof HTMLElement)) return null;
@@ -59,10 +61,8 @@ try {
   });
   assert(columns, "app-container missing gridTemplateColumns");
   const parts = columns.split(/\s+/);
-  assert(parts.length === 3, `expected 3 grid columns, got ${parts.length}: ${columns}`);
-  const railPx = parseFloat(parts[0]);
-  const sidebarPx = parseFloat(parts[1]);
-  assert(railPx >= 38 && railPx <= 56, `ribbon rail expected 38-56px, got ${railPx}`);
+  assert(parts.length === 2, `expected 2 grid columns, got ${parts.length}: ${columns}`);
+  const sidebarPx = parseFloat(parts[0]);
   assert(
     sidebarPx >= 180 && sidebarPx <= 240,
     `workspace-sidebar expected 180-240px (calm rail), got ${sidebarPx}`,
