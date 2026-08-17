@@ -993,3 +993,307 @@
   --syntax-type: #74c7ec;
   --syntax-variable: #f5c2e7;
 }
+
+/* WIKI-316: bb's shipped light palette. This block stays separate from
+   mono-light so the existing theme keeps its prior contract. Neutral wiki
+   surfaces follow bb's canvas/ink ramp; chromatic values come from bb's
+   destructive, attention, warning, success, timeline, and diff tokens. */
+[data-theme="bb-light"] {
+  color-scheme: light;
+
+  --canvas: oklch(1 0 0);
+  --ink: oklch(0.3211 0 0);
+  --background-primary: var(--canvas);
+  --background-primary-alt: color-mix(in oklch, var(--ink) 2.2%, var(--canvas));
+  --background-secondary: color-mix(in oklch, var(--ink) 8%, var(--canvas));
+  --background-modifier-border: color-mix(in oklch, var(--ink) 14%, var(--canvas));
+  --background-modifier-border-hover: color-mix(in oklch, var(--ink) 24%, var(--canvas));
+  --background-modifier-hover: color-mix(in oklab, var(--ink) 5.9%, transparent);
+  --background-modifier-active: color-mix(in oklab, var(--ink) 11.8%, transparent);
+  --background-modifier-error: color-mix(in oklab, var(--destructive) 6%, transparent);
+  --background-modifier-success: color-mix(in oklab, var(--success) 14%, transparent);
+
+  --text-normal: var(--ink);
+  --text-muted: oklch(0.44 0 0);
+  --text-subtle-readable: oklch(0.5 0 0);
+  --text-faint: oklch(0.55 0 0);
+  --text-on-accent: var(--canvas);
+  --text-selection: color-mix(in oklab, var(--ink) 12%, transparent);
+  --destructive-text: oklch(0.45 0.19 25.8625);
+
+  --activity-metadata-color: var(--text-normal);
+  --activity-state-done-color: var(--text-muted);
+  --activity-state-working-color: var(--text-normal);
+  --activity-state-failed-color: var(--destructive-text);
+  --activity-state-interrupted-color: var(--destructive-text);
+  --activity-state-waiting-color: var(--warning-text);
+  --link-color: var(--text-normal);
+  --link-color-hover: var(--primary);
+  --link-unresolved-opacity: 0.6;
+
+  /* bb has no wiki-specific code token; muted is its nearest code surface. */
+  --code-background: color-mix(in oklch, var(--ink) 11%, var(--canvas));
+  --image-outline: rgba(0, 0, 0, 0.1);
+  --kanban-backdrop: color-mix(in oklab, var(--ink) 6%, var(--canvas));
+  --kanban-lane: color-mix(in oklch, var(--ink) 11%, var(--canvas));
+  --kanban-card: var(--canvas);
+  --kanban-card-shadow: 0px 2px 0px 0px hsl(0 0% 20% / 0.07);
+  --hr-color: var(--border);
+  --blockquote-border-color: var(--border-hairline);
+  --table-border-color: var(--border);
+  --checkbox-color: var(--text-normal);
+  --scrollbar-thumb: color-mix(in oklab, var(--ink) 20%, transparent);
+  --scrollbar-thumb-hover: color-mix(in oklab, var(--ink) 40%, transparent);
+
+  --primary: oklch(0.27 0 0);
+  --accent-primary: var(--primary);
+  --success: oklch(0.7 0.15 155);
+  --warning: oklch(0.7 0.16 50);
+  --destructive: oklch(0.45 0.19 25.8625);
+  --accent-success: var(--success);
+  --accent-warning: var(--warning);
+  --accent-danger: var(--destructive);
+  --attention: oklch(0.74 0.15 80);
+  --warning-text: oklch(0.55 0.14 50);
+  --success-foreground: color-mix(in oklch, var(--success) 45%, var(--ink));
+  --text-error: var(--destructive-text);
+  --text-warning: var(--warning-text);
+  --text-success: var(--success-foreground);
+
+  --background-overlay-soft: var(--surface-scrim);
+  --background-overlay-strong: color-mix(in oklab, var(--canvas) 86%, transparent);
+  --shadow-floating: 0px 2px 0px 0px hsl(0 0% 20% / 0.15),
+    0px 2px 4px -1px hsl(0 0% 20% / 0.15);
+  --shadow-modal: 0px 2px 0px 0px hsl(0 0% 20% / 0.15),
+    0px 4px 6px -1px hsl(0 0% 20% / 0.15);
+  --shadow-lifted: 0px 2px 0px 0px hsl(0 0% 20% / 0.15),
+    0px 2px 4px -1px hsl(0 0% 20% / 0.15);
+  --shadow-lift: 0px -4px 12px -4px hsl(0 0% 20% / 0.07);
+  --shadow-top: var(--shadow-lift);
+
+  --status-working-background: var(--surface-selected);
+  --status-working-border: var(--primary);
+  --status-working-color: var(--primary);
+  --status-merge-ready-background: var(--primary);
+  --status-merge-ready-border: var(--primary);
+  --status-merge-ready-color: var(--canvas);
+  --status-blocked-background: var(--surface-destructive);
+  --status-blocked-border: var(--destructive-text);
+  --status-blocked-color: var(--destructive-text);
+
+  --diff-added: oklch(0.4 0.13 163);
+  --diff-removed: oklch(0.4 0.17 28);
+  --diff-add-background: color-mix(in oklab, var(--diff-added) 12%, transparent);
+  --diff-add-foreground: var(--diff-added);
+  --diff-remove-background: color-mix(in oklab, var(--diff-removed) 10%, transparent);
+  --diff-remove-foreground: var(--diff-removed);
+  --diff-hatch-color: color-mix(in oklab, var(--diff-removed) 12%, transparent);
+
+  --selection-inverse-background: var(--primary);
+  --selection-inverse-color: var(--canvas);
+  --syntax-text: var(--text-normal);
+  --syntax-comment: var(--text-faint);
+  --syntax-keyword: var(--text-normal);
+  --syntax-function: var(--text-normal);
+  --syntax-string: var(--text-muted);
+  --syntax-number: var(--text-muted);
+  --syntax-type: var(--text-muted);
+  --syntax-variable: var(--text-normal);
+
+  --border: color-mix(in oklch, var(--ink) 14%, var(--canvas));
+  --border-seam: color-mix(in oklch, var(--ink) 9.5%, var(--canvas));
+  --border-seam-vertical: var(--border-seam);
+  --border-hairline: color-mix(in oklch, var(--ink) 14.7%, var(--canvas));
+  --input: color-mix(in oklch, var(--ink) 29.5%, var(--canvas));
+  --ring: var(--primary);
+  --state-hover: color-mix(in oklab, var(--ink) 5.9%, transparent);
+  --state-active: color-mix(in oklab, var(--ink) 11.8%, transparent);
+  --surface-recessed: color-mix(in oklab, var(--ink) 6%, transparent);
+  --surface-recessed-solid: color-mix(in oklab, var(--ink) 6%, var(--canvas));
+  --surface-recessed-soft-solid: color-mix(in oklch, var(--ink) 4.2%, var(--canvas));
+  --surface-raised: color-mix(in oklab, var(--ink) 2.5%, transparent);
+  --surface-raised-solid: color-mix(in oklab, var(--ink) 2.5%, var(--canvas));
+  --surface-scrim: color-mix(in oklab, var(--canvas) 92%, transparent);
+  --surface-destructive: color-mix(in oklab, var(--destructive) 6%, transparent);
+  --surface-destructive-border: color-mix(in oklab, var(--destructive) 25%, transparent);
+  --surface-attention: color-mix(in oklab, var(--attention) 14%, transparent);
+  --surface-selected: color-mix(in oklab, var(--primary) 16%, transparent);
+  --surface-selected-border: color-mix(in oklab, var(--primary) 35%, transparent);
+  --sidebar: color-mix(in oklch, var(--ink) 2.2%, var(--canvas));
+  --sidebar-foreground: var(--ink);
+  --sidebar-accent: color-mix(in oklch, var(--ink) 8%, var(--canvas));
+  --sidebar-accent-foreground: var(--ink);
+  --sidebar-border: var(--border);
+  --sidebar-search-match: color-mix(in oklab, oklch(0.8 0.13 88), var(--canvas) 76%);
+  --sidebar-search-match-border: color-mix(in oklab, oklch(0.8 0.13 88), var(--canvas) 60%);
+  --sidebar-ring: var(--primary);
+  --readback-foreground: oklch(0.47 0 0);
+  --timeline-accent: oklch(0.55 0.1 250);
+  --file-accent: var(--timeline-accent);
+  --pr-merged: oklch(0.53 0.2 295);
+  --pill-surface: linear-gradient(
+    to bottom,
+    color-mix(in oklch, var(--ink) 4.4%, var(--canvas)),
+    color-mix(in oklch, var(--ink) 4.7%, var(--canvas))
+  );
+  --pill-surface-border: var(--border);
+  --pill-foreground: var(--ink);
+  --pill-icon: var(--ink);
+  --pill-shadow: 0 1px 1px 0 oklch(0.2 0 0 / 0.02);
+  --pill-surface-selected: linear-gradient(
+    to bottom,
+    color-mix(in oklch, var(--ink) 11.8%, var(--canvas)),
+    color-mix(in oklch, var(--ink) 13%, var(--canvas))
+  );
+  --pill-surface-selected-border: color-mix(in oklch, var(--ink) 19.2%, var(--canvas));
+}
+
+/* WIKI-316: bb's shipped dark palette. */
+[data-theme="bb-dark"] {
+  color-scheme: dark;
+
+  --canvas: oklch(0.195 0 0);
+  --ink: oklch(0.81 0 0);
+  --background-primary: var(--canvas);
+  --background-primary-alt: color-mix(in oklch, var(--ink) 4.3%, var(--canvas));
+  --background-secondary: color-mix(in oklch, var(--ink) 13%, var(--canvas));
+  --background-modifier-border: color-mix(in oklch, var(--ink) 19.4%, var(--canvas));
+  --background-modifier-border-hover: color-mix(in oklch, var(--ink) 30%, var(--canvas));
+  --background-modifier-hover: color-mix(in oklab, var(--ink) 13.8%, transparent);
+  --background-modifier-active: color-mix(in oklab, var(--ink) 22.5%, transparent);
+  --background-modifier-error: color-mix(in oklab, var(--destructive) 8%, transparent);
+  --background-modifier-success: color-mix(in oklab, var(--success) 12%, transparent);
+
+  --text-normal: var(--ink);
+  --text-muted: oklch(0.78 0 0);
+  --text-subtle-readable: oklch(0.68 0 0);
+  --text-faint: oklch(0.55 0 0);
+  --text-on-accent: oklch(0.2178 0 0);
+  --text-selection: color-mix(in oklab, var(--ink) 16%, transparent);
+  --destructive-text: oklch(0.65 0.16 22);
+
+  --activity-metadata-color: var(--text-normal);
+  --activity-state-done-color: var(--text-muted);
+  --activity-state-working-color: var(--text-normal);
+  --activity-state-failed-color: var(--destructive-text);
+  --activity-state-interrupted-color: var(--destructive-text);
+  --activity-state-waiting-color: var(--warning-text);
+  --link-color: var(--text-normal);
+  --link-color-hover: var(--primary);
+  --link-unresolved-opacity: 0.6;
+
+  --code-background: color-mix(in oklch, var(--ink) 16%, var(--canvas));
+  --image-outline: rgba(255, 255, 255, 0.1);
+  --kanban-backdrop: color-mix(in oklab, var(--ink) 6%, var(--canvas));
+  --kanban-lane: color-mix(in oklch, var(--ink) 16%, var(--canvas));
+  --kanban-card: var(--canvas);
+  --kanban-card-shadow: 0px 2px 0px 0px hsl(0 0% 0% / 0.2);
+  --hr-color: var(--border);
+  --blockquote-border-color: var(--border-hairline);
+  --table-border-color: var(--border);
+  --checkbox-color: var(--text-normal);
+  --scrollbar-thumb: color-mix(in oklab, var(--ink) 20%, transparent);
+  --scrollbar-thumb-hover: color-mix(in oklab, var(--ink) 40%, transparent);
+
+  --primary: oklch(0.82 0 0);
+  --accent-primary: var(--primary);
+  --success: oklch(0.74 0.15 155);
+  --warning: oklch(0.75 0.16 50);
+  --destructive: oklch(0.56 0.19 22.1703);
+  --accent-success: var(--success);
+  --accent-warning: var(--warning);
+  --accent-danger: var(--destructive);
+  --attention: oklch(0.8 0.15 80);
+  --warning-text: oklch(0.75 0.16 50);
+  --success-foreground: color-mix(in oklch, var(--success) 45%, var(--ink));
+  --text-error: var(--destructive-text);
+  --text-warning: var(--warning-text);
+  --text-success: var(--success-foreground);
+
+  --background-overlay-soft: var(--surface-scrim);
+  --background-overlay-strong: color-mix(in oklab, var(--canvas) 86%, transparent);
+  --shadow-floating: 0px 2px 0px 0px hsl(0 0% 0% / 0.3),
+    0px 2px 4px -1px hsl(0 0% 0% / 0.5);
+  --shadow-modal: 0px 2px 0px 0px hsl(0 0% 0% / 0.3),
+    0px 4px 6px -1px hsl(0 0% 0% / 0.5);
+  --shadow-lifted: 0px 2px 0px 0px hsl(0 0% 0% / 0.3),
+    0px 2px 4px -1px hsl(0 0% 0% / 0.5);
+  --shadow-lift: 0px -4px 12px -4px hsl(0 0% 0% / 0.26);
+  --shadow-top: var(--shadow-lift);
+
+  --status-working-background: var(--surface-selected);
+  --status-working-border: var(--primary);
+  --status-working-color: var(--primary);
+  --status-merge-ready-background: var(--primary);
+  --status-merge-ready-border: var(--primary);
+  --status-merge-ready-color: var(--canvas);
+  --status-blocked-background: var(--surface-destructive);
+  --status-blocked-border: var(--destructive-text);
+  --status-blocked-color: var(--destructive-text);
+
+  --diff-added: oklch(0.77 0.17 163);
+  --diff-removed: oklch(0.72 0.19 22);
+  --diff-add-background: color-mix(in oklab, var(--diff-added) 16%, transparent);
+  --diff-add-foreground: var(--diff-added);
+  --diff-remove-background: color-mix(in oklab, var(--diff-removed) 14%, transparent);
+  --diff-remove-foreground: var(--diff-removed);
+  --diff-hatch-color: color-mix(in oklab, var(--diff-removed) 14%, transparent);
+
+  --selection-inverse-background: var(--primary);
+  --selection-inverse-color: var(--canvas);
+  --syntax-text: var(--text-normal);
+  --syntax-comment: var(--text-faint);
+  --syntax-keyword: var(--text-normal);
+  --syntax-function: var(--text-normal);
+  --syntax-string: var(--text-muted);
+  --syntax-number: var(--text-muted);
+  --syntax-type: var(--text-muted);
+  --syntax-variable: var(--text-normal);
+
+  --border: color-mix(in oklch, var(--ink) 19.4%, var(--canvas));
+  --border-seam: color-mix(in oklch, var(--ink) 11%, var(--canvas));
+  --border-seam-vertical: var(--border-seam);
+  --border-hairline: color-mix(in oklch, var(--ink) 21%, var(--canvas));
+  --input: color-mix(in oklch, var(--ink) 32.6%, var(--canvas));
+  --ring: var(--primary);
+  --state-hover: color-mix(in oklab, var(--ink) 13.8%, transparent);
+  --state-active: color-mix(in oklab, var(--ink) 22.5%, transparent);
+  --surface-recessed: color-mix(in oklab, var(--ink) 6%, transparent);
+  --surface-recessed-solid: color-mix(in oklab, var(--ink) 6%, var(--canvas));
+  --surface-recessed-soft-solid: color-mix(in oklch, var(--ink) 4.2%, var(--canvas));
+  --surface-raised: color-mix(in oklab, var(--ink) 2.5%, transparent);
+  --surface-raised-solid: color-mix(in oklab, var(--ink) 2.5%, var(--canvas));
+  --surface-scrim: color-mix(in oklab, var(--canvas) 92%, transparent);
+  --surface-destructive: color-mix(in oklab, var(--destructive) 8%, transparent);
+  --surface-destructive-border: color-mix(in oklab, var(--destructive) 30%, transparent);
+  --surface-attention: color-mix(in oklab, var(--attention) 12%, transparent);
+  --surface-selected: color-mix(in oklab, var(--primary) 12%, transparent);
+  --surface-selected-border: color-mix(in oklab, var(--primary) 35%, transparent);
+  --sidebar: color-mix(in oklch, var(--ink) 4.3%, var(--canvas));
+  --sidebar-foreground: var(--ink);
+  --sidebar-accent: color-mix(in oklch, var(--ink) 12%, var(--canvas));
+  --sidebar-accent-foreground: var(--ink);
+  --sidebar-border: color-mix(in oklch, var(--ink) 18.1%, var(--canvas));
+  --sidebar-search-match: color-mix(in oklab, oklch(0.8 0.13 88), var(--canvas) 80%);
+  --sidebar-search-match-border: color-mix(in oklab, oklch(0.8 0.13 88), var(--canvas) 67%);
+  --sidebar-ring: var(--primary);
+  --readback-foreground: oklch(0.715 0 0);
+  --timeline-accent: oklch(0.72 0.09 250);
+  --file-accent: var(--timeline-accent);
+  --pr-merged: oklch(0.68 0.18 295);
+  --pill-surface: linear-gradient(
+    to bottom,
+    color-mix(in oklch, var(--ink) 13%, var(--canvas)),
+    color-mix(in oklch, var(--ink) 11.9%, var(--canvas))
+  );
+  --pill-surface-border: var(--border);
+  --pill-foreground: var(--ink);
+  --pill-icon: var(--ink);
+  --pill-shadow: 0 1px 1px 0 oklch(0 0 0 / 0.08);
+  --pill-surface-selected: linear-gradient(
+    to bottom,
+    color-mix(in oklch, var(--ink) 20.7%, var(--canvas)),
+    color-mix(in oklch, var(--ink) 18.7%, var(--canvas))
+  );
+  --pill-surface-selected-border: color-mix(in oklch, var(--ink) 25.2%, var(--canvas));
+}
