@@ -1,7 +1,9 @@
 import { useEffect, useMemo, useRef, useState } from "react";
-import { ChevronDown, X } from "lucide-react";
+import { ChevronDown } from "lucide-react";
 import { THEMES, type ThemeId } from "./themes";
 import { applyLowercase, getStoredLowercase } from "./lowercase-mode";
+import { BbDialog, DialogRail } from "./dialogs";
+import { Button } from "./primitives";
 import {
   classifyEnumerated,
   fetchInstalledFamilies,
@@ -66,6 +68,7 @@ export const MONO_FONTS: FontChoice[] = [
 ];
 
 export const UI_FONTS: FontChoice[] = [
+  { label: "Inter Variable", family: "Inter Variable", stack: `"Inter Variable", ${SANS_TAIL}` },
   {
     label: "System",
     family: "-apple-system",
@@ -123,6 +126,12 @@ function dedupeByLabel(...pools: FontChoice[][]): FontChoice[] {
 export const ALL_FONTS: FontChoice[] = dedupeByLabel(UI_FONTS, TEXT_FONTS, MONO_FONTS);
 export const AGENT_FONTS: FontChoice[] = ALL_FONTS;
 
+type SettingsSection = "appearance" | "typography";
+
+function isSettingsSection(value: string): value is SettingsSection {
+  return value === "appearance" || value === "typography";
+}
+
 // Single storage keys — one font, one weight, and one base size. The base size
 // derives prose, control, and chrome tiers in styles.css (WIKI-318). Legacy
 // per-role keys are read once for migration then deleted.
@@ -137,6 +146,8 @@ const SIZE_KEY = "wiki-font-size";
 const SIZE_DEFAULT = 15;
 const SIZE_MIN = 11;
 const SIZE_MAX = 22;
+const DEFAULT_CHROME_FONT = "Inter Variable";
+const DEFAULT_MONO_FONT = "Fira Code";
 
 const LEGACY_FONT_KEYS = [
   "wiki-ui-font",
@@ -173,6 +184,16 @@ const WEIGHT_VARS = [
   "--font-agent-prose-weight",
   "--font-monospace-weight",
 ];
+const SIZE_VARS = [
+  "--font-single-size",
+  "--font-text-size",
+  "--font-ui-small",
+  "--font-ui-smaller",
+  "--font-monospace-size",
+];
+const CHROME_FAMILY_VARS = FAMILY_VARS.filter((cssVar) => cssVar !== "--font-monospace");
+const MONO_FAMILY_VARS = ["--font-monospace"];
+
 const MONO_SAMPLE = "→ const x = 0O1lIi";
 const PROP_SAMPLE = "The quick brown fox";
 
@@ -377,6 +398,17 @@ function applyFamilyEverywhere(choice: FontChoice) {
   }
 }
 
+function applyNewInstallFamilies() {
+  const chrome = pickChoice(ALL_FONTS, DEFAULT_CHROME_FONT);
+  const mono = pickChoice(ALL_FONTS, DEFAULT_MONO_FONT);
+  const root = document.documentElement.style;
+  for (const cssVar of CHROME_FAMILY_VARS) root.setProperty(cssVar, chrome.stack);
+  for (const cssVar of MONO_FAMILY_VARS) root.setProperty(cssVar, mono.stack);
+  if (localStorage.getItem(STACK_KEY) !== chrome.stack) {
+    localStorage.setItem(STACK_KEY, chrome.stack);
+  }
+}
+
 function applyWeightEverywhere(weight: number | null) {
   const root = document.documentElement.style;
   for (const cssVar of WEIGHT_VARS) {
@@ -423,7 +455,9 @@ function storedWeight(): number | null {
 
 export function applyStoredFonts() {
   migrateLegacyOnce();
-  applyFamilyEverywhere(pickChoice(ALL_FONTS, localStorage.getItem(FONT_KEY)));
+  const stored = localStorage.getItem(FONT_KEY);
+  if (stored === null) applyNewInstallFamilies();
+  else applyFamilyEverywhere(pickChoice(ALL_FONTS, stored));
   applyWeightEverywhere(storedWeight());
   applySizeEverywhere(storedSize());
   // Warm the backend font-enumeration cache so the settings modal is
@@ -433,7 +467,7 @@ export function applyStoredFonts() {
 }
 
 function currentLabel(): string {
-  return localStorage.getItem(FONT_KEY) ?? ALL_FONTS[0].label;
+  return localStorage.getItem(FONT_KEY) ?? DEFAULT_CHROME_FONT;
 }
 
 function persistFontLabel(label: string, fonts: FontChoice[]) {
@@ -766,6 +800,7 @@ export function SettingsModal({
   const [lowercase, setLowercase] = useState(() => getStoredLowercase());
   const [fontLabel, setFontLabel] = useState(() => currentLabel());
   const [fontWeight, setFontWeightState] = useState(() => storedWeight() ?? 400);
+  const [section, setSection] = useState<SettingsSection>("appearance");
   const fontPool = useInstalledFontPool();
 
   function updateSize(next: number) {
@@ -773,25 +808,42 @@ export function SettingsModal({
     setFontSize(next);
   }
 
-  useEffect(() => {
-    function onKeyDown(event: globalThis.KeyboardEvent) {
-      if (event.key === "Escape") onClose();
-    }
-    window.addEventListener("keydown", onKeyDown);
-    return () => window.removeEventListener("keydown", onKeyDown);
-  }, [onClose]);
-
   return (
-    <>
-      <div className="settings-backdrop" onClick={onClose} />
-      <div aria-modal className="dialog settings-modal" role="dialog">
-        <div className="settings-header">
-          <div className="dialog-title">Settings</div>
-          <button aria-label="Close settings" className="session-close" type="button" onClick={onClose}>
-            <X size={14} />
-          </button>
-        </div>
-        <div className="settings-section">
+    <BbDialog
+      title="Settings"
+      description="Applied immediately. Close when you are done."
+      size="lg"
+      onClose={onClose}
+      rail={
+        <DialogRail
+          active={section}
+          items={[
+            { id: "appearance", label: "Appearance" },
+            { id: "typography", label: "Typography" },
+          ]}
+          onSelect={(id) => {
+            if (isSettingsSection(id)) setSection(id);
+          }}
+        />
+      }
+      footer={
+        <>
+          <Button variant="ghost" onClick={onClose}>
+            Cancel
+          </Button>
+          <Button variant="default" onClick={onClose}>
+            Done
+          </Button>
+        </>
+      }
+    >
+      {section === "appearance" ? (
+        <div
+          id="bb-rail-panel-appearance"
+          role="tabpanel"
+          aria-labelledby="bb-rail-appearance"
+          className="bb-dialog__group"
+        >
           <div className="settings-row settings-row-stack">
             <div className="settings-row-info">
               <div className="settings-row-name">Theme</div>
@@ -845,6 +897,14 @@ export function SettingsModal({
               <span aria-hidden className="settings-toggle-thumb" />
             </button>
           </div>
+        </div>
+      ) : (
+        <div
+          id="bb-rail-panel-typography"
+          role="tabpanel"
+          aria-labelledby="bb-rail-typography"
+          className="bb-dialog__group"
+        >
           <FontRow
             fonts={fontPool}
             label={fontLabel}
@@ -895,7 +955,7 @@ export function SettingsModal({
             Reset size to default
           </button>
         </div>
-      </div>
-    </>
+      )}
+    </BbDialog>
   );
 }

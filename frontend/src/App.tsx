@@ -82,6 +82,8 @@ import {
   workspaceCacheKey,
 } from "./file-workspaces";
 import { SettingsModal, applyStoredFonts } from "./settings";
+import { BbDialog } from "./dialogs";
+import { Button } from "./primitives";
 import { ActivityFeed } from "./activity";
 import { AgentsSidebar, AgentsView, type AccountEvent, type AgentOpenTarget } from "./agents";
 import { isAgentRefreshEvent, isAgentTopologyEvent } from "./agent-events";
@@ -1034,6 +1036,7 @@ type ContextMenuState = {
 
 type DialogState = {
   title: string;
+  description?: string;
   input?: string;
   confirmLabel: string;
   danger?: boolean;
@@ -1049,47 +1052,44 @@ function Dialog({ dialog, onClose }: { dialog: DialogState; onClose: () => void 
   }
 
   return (
-    <div className="modal-backdrop" onClick={onClose}>
-      <div
-        aria-label={dialog.title}
-        className="dialog"
-        role="dialog"
-        onClick={(event) => event.stopPropagation()}
-      >
-        <div className="dialog-title">{dialog.title}</div>
-        {dialog.input !== undefined ? (
-          <input
-            autoFocus
-            className="dialog-input"
-            type="text"
-            value={value}
-            onChange={(event) => setValue(event.target.value)}
-            onKeyDown={(event) => {
-              if (event.key === "Enter") {
-                event.preventDefault();
-                confirm();
-              } else if (event.key === "Escape") {
-                event.preventDefault();
-                onClose();
-              }
-            }}
-          />
-        ) : null}
-        <div className="dialog-actions">
-          <button className="dialog-button" type="button" onClick={onClose}>
+    <BbDialog
+      role={dialog.danger ? "alertdialog" : "dialog"}
+      title={dialog.title}
+      description={dialog.description}
+      size="sm"
+      onClose={onClose}
+      footer={
+        <>
+          <Button variant="ghost" onClick={onClose}>
             Cancel
-          </button>
-          <button
+          </Button>
+          <Button
             autoFocus={dialog.input === undefined}
-            className={`dialog-button dialog-confirm${dialog.danger ? " is-danger" : ""}`}
-            type="button"
+            variant={dialog.danger ? "destructive" : "default"}
             onClick={confirm}
           >
             {dialog.confirmLabel}
-          </button>
-        </div>
-      </div>
-    </div>
+          </Button>
+        </>
+      }
+    >
+      {dialog.input !== undefined ? (
+        <input
+          autoFocus
+          aria-label={dialog.title}
+          className="bb-dialog-input"
+          type="text"
+          value={value}
+          onChange={(event) => setValue(event.target.value)}
+          onKeyDown={(event) => {
+            if (event.key === "Enter") {
+              event.preventDefault();
+              confirm();
+            }
+          }}
+        />
+      ) : null}
+    </BbDialog>
   );
 }
 
@@ -2914,7 +2914,8 @@ export default function App() {
 
   function promptDelete(path: string) {
     setDialog({
-      title: `Delete ${basename(path)}? Git is the undo.`,
+      title: `Delete ${basename(path)}?`,
+      description: `This removes ${basename(path)} from the vault. Recoverable from version history.`,
       confirmLabel: "Delete",
       danger: true,
       onConfirm: async () => {

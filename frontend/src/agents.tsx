@@ -11,8 +11,9 @@ import {
   Plus,
   RefreshCw,
   ScrollText,
-  X,
 } from "lucide-react";
+import { BbDialog } from "./dialogs";
+import { Button } from "./primitives";
 import {
   archiveAgent,
   controlAgent,
@@ -46,8 +47,6 @@ import type { SidebarTarget } from "./session";
 import { BranchPill } from "./branch-pill";
 import { StatusBadge } from "./status-badge";
 import { toast } from "./toast";
-import { useModalA11y } from "./modal-a11y";
-import { Button } from "./primitives";
 
 declare global {
   interface Window {
@@ -273,7 +272,6 @@ export function SpawnWorkerModal({
   const [confirming, setConfirming] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [advancedOpen, setAdvancedOpen] = useState(false);
-  const dialogRef = useModalA11y<HTMLFormElement>(true, requestClose);
 
   function requestClose() {
     if (submitting) return;
@@ -434,30 +432,31 @@ export function SpawnWorkerModal({
   }
 
   return (
-    <>
-      <div aria-hidden="true" className="settings-backdrop" onClick={requestClose} />
-      <form
-        aria-modal="true"
-        aria-labelledby="spawn-worker-dialog-title"
-        className="dialog agent-spawn-modal"
-        role="dialog"
-        ref={dialogRef}
-        tabIndex={-1}
-        onSubmit={submit}
-      >
-        <div className="settings-header">
-          <div className="dialog-title" id="spawn-worker-dialog-title">Spawn worker</div>
-          <button
-            aria-label="Close spawn dialog"
-            className="session-close"
-            type="button"
-            onClick={requestClose}
+    <BbDialog
+      as="form"
+      title="Spawn worker"
+      description="Kick off a worker with a ticket and prompt. Provider tuning lives under Advanced."
+      size="lg"
+      closeLabel="Close spawn dialog"
+      busy={submitting}
+      onClose={requestClose}
+      onSubmit={submit}
+      footer={
+        <>
+          <Button variant="ghost" onClick={requestClose} disabled={submitting}>
+            Cancel
+          </Button>
+          <Button
+            type="submit"
+            variant="default"
+            disabled={!canSubmit}
           >
-            <X size={14} />
-          </button>
-        </div>
-
-        <div className="agent-spawn-fields">
+            {submitting ? "Spawning…" : confirming ? "Confirm spawn" : "Spawn"}
+          </Button>
+        </>
+      }
+    >
+      <div className="agent-spawn-fields">
           {/* Lead: what task, and what the worker should do. */}
           <label className="agent-spawn-field">
             <span className="agent-spawn-label">Ticket</span>
@@ -728,23 +727,13 @@ export function SpawnWorkerModal({
           ) : null}
         </div>
 
-        {!ticketValid && normalizedTicket ? (
-          <div className="agent-spawn-error">Ticket ids must stay uppercase and match the worker pattern.</div>
-        ) : null}
-        {!workdirValid ? <div className="agent-spawn-error">Working dir is required.</div> : null}
-        {preludeError ? <div className="agent-spawn-error">{preludeError}</div> : null}
-        {error ? <div className="agent-spawn-error">{error}</div> : null}
-
-        <div className="dialog-actions">
-          <button className="dialog-button" type="button" onClick={requestClose}>
-            Cancel
-          </button>
-          <button className="dialog-button dialog-confirm" disabled={!canSubmit} type="submit">
-            {submitting ? "Spawning…" : confirming ? "Confirm spawn" : "Spawn"}
-          </button>
-        </div>
-      </form>
-    </>
+      {!ticketValid && normalizedTicket ? (
+        <div className="agent-spawn-error">Ticket ids must stay uppercase and match the worker pattern.</div>
+      ) : null}
+      {!workdirValid ? <div className="agent-spawn-error">Working dir is required.</div> : null}
+      {preludeError ? <div className="agent-spawn-error">{preludeError}</div> : null}
+      {error ? <div className="agent-spawn-error">{error}</div> : null}
+    </BbDialog>
   );
 }
 
@@ -771,7 +760,6 @@ export function SpawnOrchestratorModal({
   const [confirming, setConfirming] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [advancedOpen, setAdvancedOpen] = useState(false);
-  const dialogRef = useModalA11y<HTMLFormElement>(true, requestClose);
   const projectDirTouched = useRef(false);
   const workspaceRootProvided = workspaceRootReady && Boolean(workspaceRoot?.trim());
 
@@ -860,30 +848,27 @@ export function SpawnOrchestratorModal({
   }
 
   return (
-    <>
-      <div aria-hidden="true" className="settings-backdrop" onClick={requestClose} />
-      <form
-        aria-modal="true"
-        aria-labelledby="spawn-orchestrator-dialog-title"
-        className="dialog agent-spawn-modal"
-        role="dialog"
-        ref={dialogRef}
-        tabIndex={-1}
-        onSubmit={submit}
-      >
-        <div className="settings-header">
-          <div className="dialog-title" id="spawn-orchestrator-dialog-title">Spawn orchestrator</div>
-          <button
-            aria-label="Close orchestrator dialog"
-            className="session-close"
-            type="button"
-            onClick={requestClose}
-          >
-            <X size={14} />
-          </button>
-        </div>
-
-        <div className="agent-spawn-fields">
+    <BbDialog
+      as="form"
+      title="Spawn orchestrator"
+      description="Launch an orchestrator. Provider tuning lives under Advanced."
+      size="lg"
+      closeLabel="Close orchestrator dialog"
+      busy={submitting}
+      onClose={requestClose}
+      onSubmit={submit}
+      footer={
+        <>
+          <Button variant="ghost" onClick={requestClose} disabled={submitting}>
+            Cancel
+          </Button>
+          <Button type="submit" variant="default" disabled={!canSubmit}>
+            {submitting ? "Launching…" : confirming ? "Confirm launch" : "Launch"}
+          </Button>
+        </>
+      }
+    >
+      <div className="agent-spawn-fields">
           {/* Lead: who this orchestrator is and what it should do. Provider
               tuning lives inside Advanced (WIKI-154 finding 4 → round-5
               family sweep, orchestrator dialog). */}
@@ -1034,24 +1019,14 @@ export function SpawnOrchestratorModal({
           </div>
         </div>
 
-        {!idValid && normalizedId ? (
-          <div className="agent-spawn-error">
-            Orchestrator ids must start with a letter or number and only use letters, numbers, dashes, or underscores.
-          </div>
-        ) : null}
-        {!projectDirValid ? <div className="agent-spawn-error">Project directory is required.</div> : null}
-        {error ? <div className="agent-spawn-error">{error}</div> : null}
-
-        <div className="dialog-actions">
-          <button className="dialog-button" type="button" onClick={requestClose}>
-            Cancel
-          </button>
-          <button className="dialog-button dialog-confirm" disabled={!canSubmit} type="submit">
-            {submitting ? "Launching…" : confirming ? "Confirm launch" : "Launch"}
-          </button>
+      {!idValid && normalizedId ? (
+        <div className="agent-spawn-error">
+          Orchestrator ids must start with a letter or number and only use letters, numbers, dashes, or underscores.
         </div>
-      </form>
-    </>
+      ) : null}
+      {!projectDirValid ? <div className="agent-spawn-error">Project directory is required.</div> : null}
+      {error ? <div className="agent-spawn-error">{error}</div> : null}
+    </BbDialog>
   );
 }
 
@@ -1235,8 +1210,6 @@ export function AgentsView({
   refreshTick,
   openTicket,
   onOpenTicket,
-  startRunRequest = 0,
-  onStartRunRequestHandled,
 }: {
   data?: {
     workers: AgentWorker[] | null;
@@ -1251,8 +1224,6 @@ export function AgentsView({
   refreshTick: number;
   openTicket: AgentOpenTarget | null;
   onOpenTicket: (target: AgentOpenTarget | null) => void;
-  startRunRequest?: number;
-  onStartRunRequestHandled?: () => void;
 }) {
   const [fetchedWorkers, setFetchedWorkers] = useState<AgentWorker[] | null>(null);
   const [fetchedOrchestrators, setFetchedOrchestrators] = useState<Orchestrator[]>([]);
@@ -1339,12 +1310,6 @@ export function AgentsView({
       return next;
     });
   }
-
-  useEffect(() => {
-    if (startRunRequest === 0) return;
-    setSpawnWorkerOpen(true);
-    onStartRunRequestHandled?.();
-  }, [onStartRunRequestHandled, startRunRequest]);
 
   useEffect(() => {
     if (data) return;
@@ -2314,31 +2279,31 @@ export function AgentsView({
   } else {
     const activeCount = orchestrators.length + liveWorkers.length;
     body = (
-      <div className="agents-sections">
+      <>
         {activeCount > 0 ? (
-          <section className="agents-section agents-section-active" aria-labelledby="agents-section-active">
-            <div className="agents-section-head is-primary" data-testid="agents-section-active">
-              <span className="agents-section-title" id="agents-section-active">Active</span>
-              <span className="agents-section-count tabular-nums">{activeCount}</span>
-            </div>
-            {grouped.map(({ orch, owned }) => renderOrchGroup(orch, owned))}
-            {ungrouped.length > 0 && grouped.length > 0 ? (
-              <div className="agents-section-head">unassigned workers</div>
-            ) : null}
-            {ungrouped.map(renderWorker)}
-          </section>
+          <div className="agents-section-head is-primary" data-testid="agents-section-active">
+            <span className="agents-section-title">Active</span>
+            <span className="agents-section-count tabular-nums">{activeCount}</span>
+          </div>
         ) : null}
+        {grouped.map(({ orch, owned }) => renderOrchGroup(orch, owned))}
+
+        {ungrouped.length > 0 && grouped.length > 0 ? (
+          <div className="agents-section-head">unassigned workers</div>
+        ) : null}
+        {ungrouped.map(renderWorker)}
+
         {archived.length > 0 ? (
-          <section className="agents-section agents-section-history" aria-labelledby="agents-section-history">
+          <>
             <div className="agents-section-head is-primary" data-testid="agents-section-history">
               <Archive size={13} />
-              <span className="agents-section-title" id="agents-section-history">History</span>
+              <span className="agents-section-title">History</span>
               <span className="agents-section-count tabular-nums">{archived.length}</span>
             </div>
             {archived.map(renderHistoryRow)}
-          </section>
+          </>
         ) : null}
-      </div>
+      </>
     );
   }
 
@@ -2346,22 +2311,39 @@ export function AgentsView({
     <ScreencastProvider>
     <div className={`agents-layout${openWorker ? " has-sidebar" : ""}`}>
       <div className="agents-view">
-        <div className="agents-page-tools">
-          <span className="agents-run-count">
-            {orchestrators.length} orchestrator{orchestrators.length === 1 ? "" : "s"} ·{" "}
-            {liveWorkers.length} live worker{liveWorkers.length === 1 ? "" : "s"} ·{" "}
-            {archived.length} in history
-          </span>
-          <Button
-            className="agents-orchestrator-button"
-            disabled={workers === null}
-            leadingIcon={<Bot aria-hidden size={14} />}
-            size="sm"
-            variant="outline"
-            onClick={() => setSpawnOrchestratorOpen(true)}
-          >
-            Spawn orchestrator
-          </Button>
+        <div className="agents-toolbar">
+          <div>
+            <div className="agents-toolbar-title">Runs</div>
+            <div className="agents-toolbar-meta">
+              {orchestrators.length} orchestrator{orchestrators.length === 1 ? "" : "s"} ·{" "}
+              {liveWorkers.length} live worker{liveWorkers.length === 1 ? "" : "s"} ·{" "}
+              {archived.length} in history
+            </div>
+          </div>
+          <div className="dialog-actions">
+            <button
+              className="agents-spawn-button"
+              disabled={workers === null}
+              type="button"
+              onClick={() => {
+                setSpawnOrchestratorOpen(true);
+              }}
+            >
+              <Bot size={14} />
+              Spawn orchestrator
+            </button>
+            <button
+              className="agents-spawn-button"
+              disabled={workers === null}
+              type="button"
+              onClick={() => {
+                setSpawnWorkerOpen(true);
+              }}
+            >
+              <Plus size={14} />
+              Spawn worker
+            </button>
+          </div>
         </div>
         <AccountEventsBanner events={accountNotices} />
         {body}
