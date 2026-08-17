@@ -28,7 +28,7 @@ export function SlashMenu({ commands, activeIndex, onSelect, onHover }: SlashMen
     >
       {commands.map((command, index) => (
         <button
-          className={`composer-slash-item${index === activeIndex ? " is-active" : ""}`}
+          className={`bb-menu-row composer-slash-item${index === activeIndex ? " is-active" : ""}`}
           key={command.name}
           id={slashMenuOptionId(index)}
           role="option"
@@ -40,7 +40,7 @@ export function SlashMenu({ commands, activeIndex, onSelect, onHover }: SlashMen
             onSelect(command);
           }}
         >
-          <span className="composer-slash-name">/{command.name}</span>
+          <span className="composer-slash-name prompt-mention-pill">/{command.name}</span>
           <span className="composer-slash-args">
             {command.args
               .map((arg) => (arg.required ? `<${arg.name}>` : `[${arg.name}]`))

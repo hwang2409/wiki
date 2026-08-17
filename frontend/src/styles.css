@@ -9740,22 +9740,6 @@ textarea.composer-command-input {
   font-family: var(--font-monospace);
 }
 
-.session-composer-status {
-  display: flex;
-  align-items: center;
-  gap: 10px;
-  min-height: 22px;
-  padding: 0 2px;
-}
-
-.session-composer-status .session-subagents {
-  flex: 1;
-}
-
-.session-composer-status .session-vim-mode {
-  margin-left: auto;
-}
-
 .session-thinking-indicator {
   flex-shrink: 0;
   color: var(--text-muted);
@@ -16231,11 +16215,6 @@ textarea.composer-command-input {
   font-weight: var(--fw-semibold);
 }
 
-.session-composer-status {
-  min-height: 20px;
-  color: var(--text-muted);
-}
-
 /* Dialogs are panels on a scrim. They have no frame or movement. */
 .modal-backdrop,
 .settings-backdrop {
@@ -16706,6 +16685,144 @@ body {
   min-width: var(--send-diameter);
   width: var(--send-diameter);
 }
+
+/* ==================================================================== */
+/* WIKI-303: composer parity with bb PromptBox                          */
+/* -------------------------------------------------------------------- */
+/* Wraps the input row + a text-2xs metadata footer in one quiet card   */
+/* (bb apps/app/src/components/promptbox/PromptBoxInternal.tsx). The    */
+/* card owns border / radius / focus lift + --shadow-lift; the existing */
+/* .session-composer-row keeps its label/input/send grid unchanged. The */
+/* round send-button stays per WIKI-294 §6 W10 (Henry-locked).          */
+/* ==================================================================== */
+
+.session-composer-card {
+  display: flex;
+  flex-direction: column;
+  border: 1px solid var(--border-hairline);
+  border-radius: var(--composer-radius);
+  background-color: var(--background-primary);
+  box-shadow: var(--shadow-lift);
+  overflow: hidden;
+  transition-property: border-color, box-shadow;
+  transition-duration: var(--motion-duration);
+  transition-timing-function: var(--motion-easing);
+}
+
+.session-composer-card:focus-within {
+  border-color: color-mix(in srgb, var(--text-normal) 45%, var(--border-hairline));
+  box-shadow:
+    var(--shadow-lift),
+    0 0 0 1px color-mix(in srgb, var(--ring) 55%, transparent);
+}
+
+/* Neutralize the WIKI-293 card chrome that used to live on the row —
+   border, radius, shadow, and focus lift are the card's job now. */
+.session-composer-card .session-composer-row,
+.session-composer-card .session-composer-row:focus-within {
+  border: 0;
+  border-radius: 0;
+  background-color: transparent;
+  box-shadow: none;
+}
+
+/* text-2xs metadata footer INSIDE the card (bb PromptBox footerStart /
+   status region). Hosts model controls, shortcuts, thinking state, running
+   subagents, and vim mode; hairline separator from the input area above. */
+.session-composer-meta {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  min-height: 24px;
+  padding: 4px 12px 6px;
+  border-top: 1px solid var(--border-hairline);
+  color: var(--text-muted);
+  font-size: var(--fs-2xs);
+  line-height: 1.1;
+}
+
+.session-composer-meta .session-subagents {
+  flex: 1;
+  min-width: 0;
+}
+
+.session-composer-meta > .session-footer {
+  display: contents;
+  padding: 0;
+  color: inherit;
+  font-family: inherit;
+  font-size: inherit;
+  font-weight: inherit;
+}
+
+.session-composer-meta .session-vim-mode {
+  margin-left: auto;
+}
+
+.session-composer-meta .session-thinking-indicator,
+.session-composer-meta .session-vim-mode,
+.session-composer-meta .session-subagent-chip {
+  font-size: var(--fs-2xs);
+}
+
+/* Prompt mention pill — bb parity (bb apps/app/src/app.css:107-160).
+   Wiki composer is a plain textarea and does not yet render inline
+   ProseMirror mention nodes, so the class currently styles the slash /
+   skill menu preview names as bb-shaped chips; a future rich-editor
+   pass can apply the same class inline. */
+.prompt-mention-pill {
+  display: inline-flex;
+  align-items: baseline;
+  gap: 2px;
+  max-width: 100%;
+  padding: 2px 6px 2px 4px;
+  border: 1px solid var(--pill-surface-border);
+  border-radius: var(--radius-full);
+  color: var(--pill-foreground);
+  background: var(--pill-surface);
+  box-shadow: var(--pill-shadow);
+  font-family: inherit;
+  font-size: var(--fs-xs);
+  font-weight: 400;
+  line-height: 1rem;
+  white-space: nowrap;
+}
+
+.prompt-mention-pill svg {
+  color: var(--pill-icon);
+}
+
+/* Slash + skill suggestion menus adopt .bb-menu-row grammar (hover from
+   --state-hover, active/keyboard-selected from --surface-selected,
+   radius-sm, bb motion tokens). Their internal columns stay wiki-native:
+   slash rows keep the 3-column grid, skill rows keep the baseline flex. */
+.composer-slash-item.bb-menu-row {
+  display: grid;
+  grid-template-columns: max-content 1fr max-content;
+  align-items: baseline;
+  gap: 10px;
+  padding: 6px 10px;
+  border-radius: var(--radius-sm);
+}
+
+.session-skill-item.bb-menu-row {
+  display: flex;
+  align-items: baseline;
+  gap: 10px;
+  padding: 6px 10px;
+  border-radius: var(--radius-sm);
+}
+
+.composer-slash-item.bb-menu-row.is-active,
+.session-skill-item.bb-menu-row.is-active {
+  background: var(--surface-selected);
+  color: var(--text-normal);
+}
+
+/* The pill preview inside a suggestion row inherits its chrome from the
+   .prompt-mention-pill rules above; the old plain-text .session-skill-name /
+   .composer-slash-name paint (monospace bold, --text-normal) survives when
+   the pill class isn't applied. */
 
 /* Status bar: quiet chips row. Sits INSIDE the panel at the bottom;
    the panel's bottom rounding shows through because status-bar has no bg. */
