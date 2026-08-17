@@ -123,6 +123,25 @@
   --primary: var(--accent-primary);
   --text: var(--text-normal);
   --selected-list-item-text: var(--text-on-accent);
+
+  /* WIKI-293: bb-inspired shell language. Soft canvas + a rounded panel that
+     holds the pane grid, hairlines instead of full borders, a prominent
+     composer card, and quiet status chips. Themes that intentionally zero
+     radii (opencode, see themes.css) still square everything off because
+     these variables resolve through the radius scale. */
+  --canvas-inset: 8px;
+  --canvas-bg: color-mix(in srgb, var(--background-secondary) 60%, var(--background-primary));
+  --panel-radius: var(--radius-xl);
+  --panel-border: color-mix(in srgb, var(--background-modifier-border) 55%, transparent);
+  --panel-shadow: 0 1px 0 rgb(0 0 0 / 3%), 0 1px 2px rgb(0 0 0 / 3%),
+    0 6px 18px rgb(0 0 0 / 4%);
+  --hairline: color-mix(in srgb, var(--background-modifier-border) 55%, transparent);
+  --hairline-strong: color-mix(in srgb, var(--background-modifier-border) 75%, transparent);
+  --chip-radius: var(--radius-full);
+  --composer-radius: var(--radius-xl);
+  --send-diameter: 34px;
+  --section-label-tracking: 0.14em;
+  --section-label-size: var(--fs-2xs);
 }
 
 * {
@@ -16338,3 +16357,295 @@ textarea.composer-command-input {
 .session-thinking-head {
   min-height: 24px;
 }
+
+/* ================================================================== */
+/* WIKI-293: bb-inspired visual reskin.                                */
+/* Layered on top of the shell rules above without changing behavior:  */
+/* soft canvas + rounded panel, calm sidebar, minimal top bar,         */
+/* prominent composer card, quiet status chips, hairline hierarchy.    */
+/* Every rule uses semantic tokens so the 11 themes keep translating.  */
+/* opencode's zeroed radii (themes.css) still square everything off.   */
+/* ================================================================== */
+
+body {
+  background-color: var(--canvas-bg);
+}
+
+.app-container {
+  padding: var(--canvas-inset);
+  gap: var(--canvas-inset);
+  background-color: var(--canvas-bg);
+  grid-template-columns: 40px 216px minmax(0, 1fr);
+}
+
+.app-container.sidebar-hidden {
+  grid-template-columns: 40px 0 minmax(0, 1fr);
+}
+
+/* Ribbon: transparent, no hard border — it sits on the canvas. */
+.workspace-ribbon {
+  padding: 4px 0;
+  border-right: 0;
+  background-color: transparent;
+}
+
+.ribbon-zone + .ribbon-zone {
+  margin-top: 4px;
+  padding-top: 10px;
+  border-top: 1px solid var(--hairline);
+}
+
+.ribbon-action {
+  border-radius: var(--radius-md);
+  transition-property: background-color, color, scale;
+  transition-duration: 120ms;
+  transition-timing-function: cubic-bezier(0.2, 0, 0, 1);
+}
+
+.ribbon-action:active:not(:disabled) {
+  scale: 0.96;
+}
+
+/* Sidebar: quiet — no hard border, soft small-caps section headers. */
+.workspace-sidebar {
+  border-right: 0;
+  background-color: transparent;
+}
+
+.sidebar-mode-title {
+  height: 32px;
+  padding: 0 12px;
+  border-bottom: 0;
+}
+
+.sidebar-mode-title-label {
+  color: var(--text-faint);
+  font-size: var(--section-label-size);
+  letter-spacing: var(--section-label-tracking);
+}
+
+.nav-files-container,
+.search-results {
+  padding: 2px 6px 24px;
+}
+
+.tree-item-self {
+  padding: 4px 10px;
+  border-radius: var(--radius-md);
+  color: var(--text-muted);
+  transition-property: background-color, color;
+  transition-duration: 120ms;
+  transition-timing-function: cubic-bezier(0.2, 0, 0, 1);
+}
+
+.tree-item-self.is-active {
+  box-shadow: none;
+  background-color: color-mix(in srgb, var(--text-normal) 6%, transparent);
+  color: var(--text-normal);
+}
+
+/* Main panel: the rounded card that holds the pane grid.
+   .workspace-leaf is <main> — it stacks header + panes + status bar. */
+.workspace-leaf {
+  border-radius: var(--panel-radius);
+  border: 1px solid var(--panel-border);
+  background-color: var(--background-panel);
+  box-shadow: var(--panel-shadow);
+  overflow: hidden;
+}
+
+/* Top bar: minimal, hairline separator inside the panel. */
+.view-header {
+  height: 44px;
+  padding: 0 16px;
+  border-bottom: 1px solid var(--hairline);
+}
+
+.view-header-title-container {
+  font-size: var(--font-ui-small);
+  color: var(--text-muted);
+}
+
+.view-header-breadcrumb:last-child span {
+  color: var(--text-normal);
+  font-weight: var(--fw-medium);
+}
+
+.view-actions {
+  gap: 2px;
+}
+
+.view-action {
+  border-radius: var(--radius-md);
+}
+
+/* Panes area breathes inside the panel. */
+.workspace-panes {
+  background-color: transparent;
+}
+
+.workspace-panes .pane-frame,
+.workspace-panes .view-content {
+  background-color: transparent;
+}
+
+/* Agent surface head: quiet inside the panel, single hairline. */
+.agent-session-surface-head {
+  border-bottom: 1px solid var(--hairline);
+  background-color: transparent;
+}
+
+.agent-session-head-secondary {
+  border-top: 1px solid var(--hairline);
+  background-color: color-mix(in srgb, var(--background-element) 45%, transparent);
+}
+
+.agent-session-runtime > :not(:first-child)::before {
+  background-color: var(--hairline);
+}
+
+/* Transcript rows breathe. Tool events keep their compact chevron form. */
+.session-scroll-inner {
+  padding-block: 20px;
+}
+
+/* Composer: the standout card — prominent radius, quiet fill, dark round send. */
+.session-composer {
+  padding: 12px 16px 12px;
+  border-top: 1px solid var(--hairline);
+}
+
+.agent-session-surface.is-full .session-composer {
+  padding: 14px 20px 14px;
+  border-top: 1px solid var(--hairline);
+}
+
+/* Composer row: rounded card with a full hairline. The left-bar accent
+   doctrine from WIKI-247 gave way to bb's card shape — the focus lift
+   below is a full-perimeter ring around the same card. */
+.session-composer-row {
+  padding: 10px 12px;
+  border-top: 1px solid var(--hairline-strong);
+  border-right: 1px solid var(--hairline-strong);
+  border-bottom: 1px solid var(--hairline-strong);
+  border-left: 1px solid var(--hairline-strong);
+  border-radius: var(--composer-radius);
+  background-color: var(--background-panel);
+  box-shadow: 0 1px 0 rgb(0 0 0 / 2%), 0 1px 2px rgb(0 0 0 / 3%);
+}
+
+.session-composer-row:focus-within {
+  border-top-color: var(--border-active);
+  border-right-color: var(--border-active);
+  border-bottom-color: var(--border-active);
+  border-left-color: var(--border-active);
+  background-color: var(--background-panel);
+  box-shadow: 0 1px 0 rgb(0 0 0 / 3%), 0 2px 6px rgb(0 0 0 / 6%),
+    0 0 0 3px color-mix(in srgb, var(--text-normal) 6%, transparent);
+}
+
+/* Dark circular send button — the composer accent, the one strong shape. */
+.session-send {
+  min-width: var(--send-diameter);
+  width: var(--send-diameter);
+  height: var(--send-diameter);
+  padding: 0;
+  border-radius: var(--radius-full);
+  background-color: var(--background-element);
+  border-color: transparent;
+  color: var(--text-muted);
+  transition-property: background-color, color, scale;
+  transition-duration: 120ms;
+  transition-timing-function: cubic-bezier(0.2, 0, 0, 1);
+}
+
+.session-send:not(:disabled) {
+  background-color: var(--text-normal);
+  border-color: var(--text-normal);
+  color: var(--background-primary);
+}
+
+.session-send:not(:disabled):hover {
+  background-color: color-mix(in srgb, var(--text-normal) 85%, var(--background-primary));
+  border-color: transparent;
+  color: var(--background-primary);
+}
+
+.session-send:active:not(:disabled) {
+  scale: 0.96;
+}
+
+.session-send-label {
+  display: none;
+}
+
+.session-composer[data-compact="true"] .session-send {
+  min-width: var(--send-diameter);
+  width: var(--send-diameter);
+}
+
+/* Status bar: quiet chips row. Sits INSIDE the panel at the bottom;
+   the panel's bottom rounding shows through because status-bar has no bg. */
+.status-bar {
+  min-height: 30px;
+  padding: 0 14px;
+  border-top: 1px solid var(--hairline);
+  background-color: transparent;
+  font-size: var(--fs-xs);
+  color: var(--text-faint);
+}
+
+.tmux-status-item {
+  height: 22px;
+  padding: 0 8px;
+  border-radius: var(--chip-radius);
+  color: var(--text-muted);
+}
+
+.tmux-status-item:hover {
+  background-color: var(--background-modifier-hover);
+}
+
+.tmux-status-item.is-active {
+  background-color: var(--background-modifier-hover);
+  color: var(--text-normal);
+}
+
+.tmux-status-item.is-active::before {
+  content: "";
+  display: inline-block;
+  width: 5px;
+  height: 5px;
+  margin-right: 6px;
+  border-radius: 50%;
+  background-color: var(--accent-primary);
+  vertical-align: middle;
+}
+
+.status-bar-metrics {
+  gap: 14px;
+  color: var(--text-muted);
+}
+
+.status-bar-metrics > span {
+  color: var(--text-muted);
+}
+
+.status-bar-metrics > span::before {
+  color: var(--text-faint);
+}
+
+/* Agents view + dashboard: sit inside the panel; drop redundant chrome. */
+.agents-view,
+.agent-session-surface,
+.dashboard-view {
+  background-color: transparent;
+}
+
+/* Small compact-mode tweaks so panes at narrower widths still feel calm. */
+@container agent-session-row (max-width: 720px) {
+  .session-composer-row {
+    padding: 8px 10px;
+  }
+}
+
