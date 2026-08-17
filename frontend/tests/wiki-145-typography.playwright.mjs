@@ -68,7 +68,7 @@ try {
     `.inline-title font-weight expected 600 (semibold), got ${fs3xl.weight}`,
   );
 
-  // Sample 2: dashboard header <h2> uses --fs-2xl and semibold.
+  // Sample 2: dashboard section heading uses the control tier and semibold.
   const dashboardHead = await page.evaluate(() => {
     const wrap = document.createElement("div");
     wrap.className = "dashboard-header";
@@ -77,8 +77,12 @@ try {
     wrap.appendChild(h2);
     document.body.appendChild(wrap);
     const cs = getComputedStyle(h2);
-    const raw = getComputedStyle(document.documentElement).getPropertyValue("--fs-2xl").trim();
+    const controlProbe = document.createElement("div");
+    controlProbe.style.fontSize = "var(--font-control-size)";
+    document.body.appendChild(controlProbe);
+    const raw = getComputedStyle(controlProbe).fontSize;
     const out = { computed: cs.fontSize, weight: cs.fontWeight, raw };
+    controlProbe.remove();
     wrap.remove();
     return out;
   });
