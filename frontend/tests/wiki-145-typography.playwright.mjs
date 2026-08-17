@@ -105,7 +105,11 @@ try {
     el.appendChild(label);
     document.body.appendChild(el);
     const cs = getComputedStyle(el);
-    const raw = getComputedStyle(document.documentElement).getPropertyValue("--fs-xs").trim();
+    const tokenProbe = document.createElement("span");
+    tokenProbe.style.fontSize = "var(--fs-xs)";
+    document.body.append(tokenProbe);
+    const raw = getComputedStyle(tokenProbe).fontSize;
+    tokenProbe.remove();
     const out = {
       computed: cs.fontSize,
       raw,

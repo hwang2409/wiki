@@ -70,12 +70,6 @@ try {
   const tokens = await page.evaluate(() => {
     const style = getComputedStyle(document.documentElement);
     return {
-      fs2xs: style.getPropertyValue("--fs-2xs").trim(),
-      fsXs: style.getPropertyValue("--fs-xs").trim(),
-      fsSm: style.getPropertyValue("--fs-sm").trim(),
-      fsMd: style.getPropertyValue("--fs-md").trim(),
-      fsBase: style.getPropertyValue("--fs-base").trim(),
-      fsLg: style.getPropertyValue("--fs-lg").trim(),
       fsXl: style.getPropertyValue("--fs-xl").trim(),
       fs2xl: style.getPropertyValue("--fs-2xl").trim(),
       fs3xl: style.getPropertyValue("--fs-3xl").trim(),
@@ -99,12 +93,6 @@ try {
   });
 
   const expected = {
-    fs2xs: "10px",
-    fsXs: "11px",
-    fsSm: "12px",
-    fsMd: "13px",
-    fsBase: "14px",
-    fsLg: "15px",
     fsXl: "16px",
     fs2xl: "18px",
     fs3xl: "22px",
@@ -128,6 +116,28 @@ try {
       `token --${key} expected ${value}, got ${JSON.stringify(tokens[key])}`,
     );
   }
+
+  const legacyTierSizes = await page.evaluate(() => {
+    const host = document.createElement("div");
+    host.style.display = "contents";
+    document.body.append(host);
+    const names = ["2xs", "xs", "sm", "md", "base", "lg"];
+    const values = Object.fromEntries(
+      names.map((name) => {
+        const node = document.createElement("span");
+        node.style.fontSize = `var(--fs-${name})`;
+        host.append(node);
+        return [name, getComputedStyle(node).fontSize];
+      }),
+    );
+    host.remove();
+    return values;
+  });
+  assert(
+    JSON.stringify(legacyTierSizes) ===
+      JSON.stringify({ "2xs": "10px", xs: "10px", sm: "13px", md: "13px", base: "15px", lg: "15px" }),
+    `legacy size aliases drifted: ${JSON.stringify(legacyTierSizes)}`,
+  );
 
   const semanticSizes = await page.evaluate(() => {
     const classes = ["session-assistant", "session-tool", "metadata-property", "session-pane-log"];
@@ -195,6 +205,93 @@ try {
     scaleBinding.borderRadius === "8px",
     `--radius-md expected 8px, got ${scaleBinding.borderRadius}`,
   );
+
+  const surfaceSizes = await page.evaluate(() => {
+    const host = document.createElement("div");
+    host.style.display = "contents";
+    document.body.append(host);
+    const results = {};
+    const add = (surface, className, tag = "span", parent = host) => {
+      const node = document.createElement(tag);
+      node.className = className;
+      node.textContent = "probe";
+      parent.append(node);
+      (results[surface] ??= []).push({ className, fontSize: getComputedStyle(node).fontSize });
+      return node;
+    };
+
+    add("agents", "status-badge");
+    add("agents", "nav-agents-group-title");
+    const sessionStrip = document.createElement("div");
+    sessionStrip.className = "session-state-strip";
+    host.append(sessionStrip);
+    add("session", "session-state-meta", "span", sessionStrip);
+    const sessionHead = document.createElement("div");
+    sessionHead.className = "agent-session-surface-head";
+    host.append(sessionHead);
+    add("session", "session-state-pill", "span", sessionHead);
+
+    const dialog = document.createElement("div");
+    dialog.className = "bb-dialog";
+    host.append(dialog);
+    add("dialogs", "bb-dialog__title", "h2", dialog);
+    add("dialogs", "bb-dialog__description", "p", dialog);
+    add("dialogs", "bb-dialog__rail-item", "button", dialog);
+    add("dialogs", "bb-dialog__group-title", "h3", dialog);
+    add("dialogs", "bb-dialog__group-hint", "p", dialog);
+    add("dialogs", "bb-button bb-button--md", "button", dialog);
+
+    add("settings", "settings-row-name", "div");
+    add("settings", "settings-row-desc", "div");
+    add("settings", "settings-reset", "button");
+    add("settings", "theme-choice-name");
+    add("spawn", "agent-spawn-label");
+    add("spawn", "agent-spawn-select", "select");
+    add("spawn", "agent-spawn-hint");
+    add("spawn", "agent-spawn-preview-primary");
+    add("spawn", "agent-spawn-preview-line");
+
+    const dashboardTable = add("dashboard", "dashboard-table", "table");
+    add("dashboard", "dashboard-table-cell", "td", dashboardTable);
+    add("dashboard", "dashboard-stale-label");
+    add("dashboard", "dashboard-filter-option", "label");
+    add("dashboard", "cost-row", "div");
+    add("dashboard", "cost-panel-section-title", "div");
+    add("tokens", "tokens-chip", "button");
+    add("tokens", "tokens-filter-label");
+    add("tokens", "tokens-legend");
+    add("tokens", "tokens-total-value");
+    const kanbanContent = add("kanban", "markdown-preview-view kanban-card-content", "div");
+    add("kanban", "priority-badge", "span", kanbanContent);
+    add("kanban", "kanban-column-title");
+    add("kanban", "kanban-column-count");
+    add("kanban", "kanban-empty");
+    add("toasts", "bb-toast__title");
+    add("toasts", "bb-toast__description");
+    add("status-strip", "status-bar");
+    add("status-strip", "tmux-status-item");
+    host.remove();
+    return results;
+  });
+  const expectedSurfaceSizes = {
+    agents: ["10px", "10px"],
+    session: ["10px", "10px"],
+    dialogs: ["15px", "13px", "13px", "10px", "13px", "13px"],
+    settings: ["13px", "10px", "10px", "10px"],
+    spawn: ["10px", "13px", "10px", "13px", "10px"],
+    dashboard: ["13px", "13px", "10px", "10px", "13px", "10px"],
+    tokens: ["13px", "10px", "10px", "15px"],
+    kanban: ["13px", "13px", "13px", "10px", "13px"],
+    toasts: ["13px", "10px"],
+    "status-strip": ["10px", "10px"],
+  };
+  for (const [surface, expectedSizes] of Object.entries(expectedSurfaceSizes)) {
+    const actualSizes = surfaceSizes[surface].map(({ fontSize }) => fontSize);
+    assert(
+      JSON.stringify(actualSizes) === JSON.stringify(expectedSizes),
+      `${surface} semantic sizes changed: ${JSON.stringify(actualSizes)}`,
+    );
+  }
 
   const measureChatMaxWidth = () =>
     page.evaluate(() => {

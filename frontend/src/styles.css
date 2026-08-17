@@ -64,12 +64,14 @@
   --radius-m: 8px;
   --pane-focus-ring: color-mix(in srgb, var(--text-normal) 40%, transparent);
 
-  --fs-2xs: 10px;
-  --fs-xs: 11px;
-  --fs-sm: 12px;
-  --fs-md: 13px;
-  --fs-base: 14px;
-  --fs-lg: 15px;
+  /* WIKI-332: keep legacy names as compatibility aliases. Surface rules that
+     still use the old scale now resolve to the semantic 15/13/10 tiers. */
+  --fs-2xs: var(--font-chrome-size);
+  --fs-xs: var(--font-chrome-size);
+  --fs-sm: var(--font-control-size);
+  --fs-md: var(--font-control-size);
+  --fs-base: var(--font-prose-size);
+  --fs-lg: var(--font-prose-size);
   --fs-xl: 16px;
   --fs-2xl: 18px;
   --fs-3xl: 22px;
@@ -3460,7 +3462,7 @@ body.is-resizing-panes .pane-cell {
   padding: 0 6px;
   border-radius: var(--radius-s);
   font-family: var(--font-monospace);
-  font-size: 0.72em;
+  font-size: var(--font-control-size);
   font-weight: var(--fw-semibold);
   line-height: 1.65;
   vertical-align: 0.12em;

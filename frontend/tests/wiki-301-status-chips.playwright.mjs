@@ -103,8 +103,8 @@ try {
       if (chip.fontWeight !== "500") {
         throw new Error(`${theme}: chip font-weight ${chip.fontWeight} !== 500`);
       }
-      if (chip.fontSize !== "11px" && chip.fontSize !== "12px") {
-        throw new Error(`${theme}: chip font-size ${chip.fontSize} unexpected (want 11 or 12)`);
+      if (chip.fontSize !== "10px") {
+        throw new Error(`${theme}: chip font-size ${chip.fontSize} unexpected (want 10)`);
       }
     }
 
