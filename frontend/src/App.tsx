@@ -1,7 +1,6 @@
 import { useEffect, useMemo, useRef, useState } from "react";
 import type { MouseEvent as ReactMouseEvent, ReactNode } from "react";
 import {
-  AlertCircle,
   BookOpen,
   Bot,
   ClipboardList,
@@ -57,6 +56,7 @@ import {
   type Orchestrator,
   type Workspace,
 } from "./api";
+import { toast, Toaster } from "./toast";
 import {
   FleetSwitcher,
   QuickSwitcher,
@@ -1394,7 +1394,6 @@ export default function App() {
     setNotesLoaded(false);
     setNotesError(null);
     setNotes([]);
-    setError(null);
     setNotesRetryNonce((nonce) => nonce + 1);
   };
   const [contextMenu, setContextMenu] = useState<ContextMenuState | null>(null);
@@ -1406,7 +1405,6 @@ export default function App() {
   const leaderArmedRef = useRef(false);
   const [isLoading, setIsLoading] = useState(true);
   const [isSaving, setIsSaving] = useState(false);
-  const [error, setError] = useState<string | null>(null);
   const [theme, setTheme] = useState<ThemeId>(() => getStoredTheme());
   const [agentsOpenTicket, setAgentsOpenTicket] = useState<AgentOpenTarget | null>(null);
   const viewContentRef = useRef<HTMLDivElement | null>(null);
@@ -1638,7 +1636,6 @@ export default function App() {
 
     async function boot() {
       setIsLoading(true);
-      setError(null);
       setNotesError(null);
       try {
         const nextNotes = await listNotes();
@@ -1651,7 +1648,7 @@ export default function App() {
           const message = err instanceof Error ? err.message : "Could not load notes";
           setNotesLoaded(false);
           setNotesError(message);
-          setError(message);
+          toast.error(message);
         }
       } finally {
         if (!ignore) setIsLoading(false);
@@ -2129,7 +2126,6 @@ export default function App() {
     const syncHash = options?.syncHash ?? true;
     if (!path) {
       if (syncHash) navigate({ kind: "empty" });
-      setError(null);
       setActiveNote(null);
       setAgentPanel(null);
       setAgentTicket(null);
@@ -2140,7 +2136,6 @@ export default function App() {
     const ticket = ticketFromPanePath(path);
     if (ticket) {
       if (syncHash) navigate({ kind: "agent", panel: options?.panel ?? null, ticket });
-      setError(null);
       setActiveNote(null);
       setAgentPanel(options?.panel ?? null);
       setAgentTicket(ticket);
@@ -2151,7 +2146,6 @@ export default function App() {
     const terminalId = terminalIdFromPanePath(path);
     if (terminalId) {
       if (syncHash) navigate({ kind: "terminal", id: terminalId });
-      setError(null);
       setActiveNote(null);
       setAgentPanel(null);
       setAgentTicket(null);
@@ -2166,7 +2160,6 @@ export default function App() {
     }
     if (options?.resourceKind === "file") {
       if (syncHash) navigate({ kind: "file", path });
-      setError(null);
       setActiveNote(null);
       setAgentPanel(null);
       setAgentTicket(null);
@@ -2198,7 +2191,6 @@ export default function App() {
     const { edit = false, syncHash = true } = options;
     if (resourceKind === "file") {
       if (syncHash) navigate({ kind: "file", path });
-      setError(null);
       setActiveNote(null);
       setAgentTicket(null);
       setAgentPanel(null);
@@ -2207,7 +2199,6 @@ export default function App() {
       return;
     }
     if (syncHash) navigate({ kind: edit ? "edit" : "note", path });
-    setError(null);
     setAgentTicket(null);
     setAgentPanel(null);
     setTerminalRouteId(null);
@@ -2224,7 +2215,7 @@ export default function App() {
       if (err instanceof ApiError && (err.status === 404 || err.status === 410)) {
         forgetRecentResource("note", path);
       }
-      setError(err instanceof Error ? err.message : "Could not open note");
+      toast.error(err instanceof Error ? err.message : "Could not open note");
     }
   }
 
@@ -2313,8 +2304,8 @@ export default function App() {
         if (error instanceof ApiError && (error.status === 404 || error.status === 410)) {
           forgetRecentResource("file", item.path, item.workspace);
         }
-        if (error instanceof Error) setError(error.message);
-        else setError("Could not open file");
+        if (error instanceof Error) toast.error(error.message);
+        else toast.error("Could not open file");
         return;
       }
     }
@@ -2335,7 +2326,6 @@ export default function App() {
 
   function showUtilityRoute(kind: UtilityMode, options: { syncHash?: boolean } = {}) {
     if (options.syncHash ?? true) navigate({ kind });
-    setError(null);
     setActiveNote(null);
     setAgentTicket(null);
     setAgentPanel(null);
@@ -2375,7 +2365,6 @@ export default function App() {
     }
 
     if (syncHash) navigate({ kind: "agent", panel, ticket });
-    setError(null);
     setActiveNote(null);
     setAgentPanel(panel);
     setAgentTicket(ticket);
@@ -2533,7 +2522,6 @@ export default function App() {
     }
     if (launch) bumpTerminalLaunchNonce(terminalId);
     if (syncHash) navigate({ kind: "terminal", id: terminalId });
-    setError(null);
     setActiveNote(null);
     setAgentPanel(null);
     setAgentTicket(null);
@@ -2858,7 +2846,6 @@ export default function App() {
 
   function startNewNote() {
     navigate({ kind: "new" });
-    setError(null);
     setActiveNote(null);
     setDraft(emptyDraft);
     setMode("new");
@@ -2867,7 +2854,6 @@ export default function App() {
   function startEditing() {
     if (!activeNote) return;
     navigate({ kind: "edit", path: activeNote.path });
-    setError(null);
     setDraft({
       title: activeNote.title,
       path: activeNote.path,
@@ -2878,7 +2864,6 @@ export default function App() {
 
   function cancelEditing() {
     navigate(activeNote ? { kind: "note", path: activeNote.path } : { kind: "empty" });
-    setError(null);
     setDraft(emptyDraft);
     setMode(activeNote ? "view" : "empty");
   }
@@ -2895,7 +2880,6 @@ export default function App() {
 
   async function doRename(oldPath: string, newPathRaw: string) {
     const newPath = newPathRaw.endsWith(".md") ? newPathRaw : `${newPathRaw}.md`;
-    setError(null);
     try {
       const result = await renameNote(oldPath, newPath);
       setWindowState((current) =>
@@ -2910,7 +2894,7 @@ export default function App() {
       setNotes(await listNotes());
       if (activeNote?.path === oldPath) void openNote(result.path);
     } catch (err) {
-      setError(err instanceof Error ? err.message : "Could not rename note");
+      toast.error(err instanceof Error ? err.message : "Could not rename note");
     }
   }
 
@@ -2931,7 +2915,6 @@ export default function App() {
       confirmLabel: "Delete",
       danger: true,
       onConfirm: async () => {
-        setError(null);
         try {
           await deleteNote(path);
           setWindowState((current) =>
@@ -2961,7 +2944,7 @@ export default function App() {
             setMode("empty");
           }
         } catch (err) {
-          setError(err instanceof Error ? err.message : "Could not delete note");
+          toast.error(err instanceof Error ? err.message : "Could not delete note");
         }
       }
     });
@@ -2974,13 +2957,12 @@ export default function App() {
     const topic = path.includes("/") ? path.split("/")[0] : "meta";
     const today = new Intl.DateTimeFormat("en-CA").format(new Date());
     const content = `---\ntype: reference\ntags: [${topic}]\ncreated: ${today}\nupdated: ${today}\n---\n\n# ${title}\n`;
-    setError(null);
     try {
       const created = await createNote({ title, path, content });
       setNotes(await listNotes());
       openNote(created.path);
     } catch (err) {
-      setError(err instanceof Error ? err.message : "Could not create note");
+      toast.error(err instanceof Error ? err.message : "Could not create note");
     }
   }
 
@@ -3027,18 +3009,16 @@ export default function App() {
 
   async function saveKanbanContent(next: string) {
     if (!activeNote) return;
-    setError(null);
     try {
       const updated = await updateNote(activeNote.path, next);
       setActiveNote(updated);
     } catch (err) {
-      setError(err instanceof Error ? err.message : "Could not save board change");
+      toast.error(err instanceof Error ? err.message : "Could not save board change");
     }
   }
 
   async function completeKanbanCard(card: { start: number; end: number; text: string }) {
     if (!activeNote) return;
-    setError(null);
     try {
       const date = new Intl.DateTimeFormat("en-CA").format(new Date());
       const summary = card.text.replace(/^\[P\d\]\s*/, "");
@@ -3050,12 +3030,11 @@ export default function App() {
       const updated = await updateNote(activeNote.path, lines.join("\n"));
       setActiveNote(updated);
     } catch (err) {
-      setError(err instanceof Error ? err.message : "Could not complete card");
+      toast.error(err instanceof Error ? err.message : "Could not complete card");
     }
   }
 
   async function saveDraft() {
-    setError(null);
     setIsSaving(true);
 
     try {
@@ -3071,7 +3050,7 @@ export default function App() {
         await openNote(updated.path, { focusExisting: true });
       }
     } catch (err) {
-      setError(err instanceof Error ? err.message : "Could not save note");
+      toast.error(err instanceof Error ? err.message : "Could not save note");
     } finally {
       setIsSaving(false);
     }
@@ -3099,7 +3078,6 @@ export default function App() {
       appliedHashRef.current = hash;
       const route = parseRoute(hash);
 
-      setError(null);
       if (route.kind === "empty") {
         const currentActive = activeWindowRef.current;
         const activePane = currentActive
@@ -4094,13 +4072,6 @@ export default function App() {
           </div>
         </header>
 
-        {error ? (
-          <div className="notice" role="alert">
-            <AlertCircle size={16} />
-            <span>{error}</span>
-          </div>
-        ) : null}
-
         <div className="workspace-panes">
           {activeWindow ? (
             renderLayout(activeWindow.layout, [])
@@ -4330,6 +4301,7 @@ export default function App() {
         />
       ) : null}
       {leaderArmed ? <div className="leader-indicator">C-a</div> : null}
+      <Toaster />
     </div>
   );
 }

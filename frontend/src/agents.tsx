@@ -27,7 +27,6 @@ import type {
   AccountEvent,
   AgentModelOption,
   AgentControlAction,
-  AgentControlResult,
   AgentWorker,
   ArchivedWorker,
   Orchestrator,
@@ -46,6 +45,7 @@ import { SessionSidebar } from "./session";
 import type { SidebarTarget } from "./session";
 import { BranchPill } from "./branch-pill";
 import { StatusBadge } from "./status-badge";
+import { toast } from "./toast";
 import { useModalA11y } from "./modal-a11y";
 
 declare global {
@@ -97,8 +97,6 @@ type OrchestratorSpawnNotice = {
   promptPath: string | null;
   note: string;
 };
-
-type SpawnNotice = WorkerSpawnNotice | OrchestratorSpawnNotice;
 
 function defaultOrchestratorModel(models: AgentModelOption[], kind: SpawnWorkerKind): string {
   const byKind = modelsForKind(models, kind);
@@ -1062,6 +1060,20 @@ function countWorkers(count: number): string {
   return `${count} worker${count === 1 ? "" : "s"}`;
 }
 
+function describeRun(runId: string, log?: string | null): string {
+  const parts = [`run ${runId.slice(0, 8)}`];
+  if (log) parts.push(`log ${log}`);
+  return parts.join(" · ");
+}
+
+function describeReplacement(result: ReplaceAgentResult): string | undefined {
+  const parts: string[] = [];
+  if (result.run_id) parts.push(`run ${result.run_id.slice(0, 8)}`);
+  if (result.window) parts.push(`tmux ${result.window}`);
+  if (result.log) parts.push(`log ${result.log}`);
+  return parts.length > 0 ? parts.join(" · ") : undefined;
+}
+
 // Impact-first copy: what happened to the fleet, then the next action.
 function accountBannerCopy(event: AccountEvent): { impact: string; action: string | null } {
   switch (event.type) {
@@ -1243,19 +1255,11 @@ export function AgentsView({
   const [fetchedNotices, setFetchedNotices] = useState<AccountEvent[]>([]);
   const [fetchedError, setFetchedError] = useState<string | null>(null);
   const [availableModels, setAvailableModels] = useState<AgentModelOption[]>([]);
-  const [modelsError, setModelsError] = useState<string | null>(null);
   const [spawnWorkerOpen, setSpawnWorkerOpen] = useState(false);
   const [spawnOrchestratorOpen, setSpawnOrchestratorOpen] = useState(false);
-  const [spawnNotice, setSpawnNotice] = useState<SpawnNotice | null>(null);
   const [replaceTarget, setReplaceTarget] = useState<ReplaceAgentTarget | null>(null);
-  const [replaceNotice, setReplaceNotice] = useState<ReplaceAgentResult | null>(null);
   const [controlConfirm, setControlConfirm] = useState<string | null>(null);
   const [controlPending, setControlPending] = useState<string | null>(null);
-  const [controlNotice, setControlNotice] = useState<{
-    action: AgentControlAction;
-    result: AgentControlResult;
-  } | null>(null);
-  const [controlError, setControlError] = useState<string | null>(null);
   const [archivePending, setArchivePending] = useState<string | null>(null);
   const [archiveErrors, setArchiveErrors] = useState<Record<string, string>>({});
   const [overrideData, setOverrideData] = useState<{
@@ -1360,12 +1364,11 @@ export function AgentsView({
       .then((result) => {
         if (!ignore) {
           setAvailableModels(result.models ?? []);
-          setModelsError(null);
         }
       })
       .catch((err) => {
         if (!ignore) {
-          setModelsError(err instanceof Error ? err.message : "Could not load models");
+          toast.error(err instanceof Error ? err.message : "Could not load models");
         }
       });
     return () => {
@@ -1465,19 +1468,15 @@ export function AgentsView({
     const key = `${id}:${action}`;
     if (confirm && controlConfirm !== key) {
       setControlConfirm(key);
-      setControlNotice(null);
-      setControlError(null);
       return;
     }
     setControlPending(key);
-    setControlError(null);
     try {
       const result = await controlAgent(id, action);
-      setControlNotice({ action, result });
-      setReplaceNotice(null);
+      toast.success(`${action} ${result.agent_id}`, { description: `state ${result.state}` });
       setControlConfirm(null);
     } catch (err) {
-      setControlError(err instanceof Error ? err.message : `Could not ${action} agent`);
+      toast.error(err instanceof Error ? err.message : `Could not ${action} agent`);
     } finally {
       setControlPending(null);
     }
@@ -1492,8 +1491,6 @@ export function AgentsView({
       return next;
     });
     setControlConfirm(null);
-    setControlNotice(null);
-    setControlError(null);
     try {
       await archiveAgent(id);
       const result = await getAgents(true);
@@ -1528,7 +1525,6 @@ export function AgentsView({
         title={disabled ? "Registered runtime is not live" : "Stop this run and spawn a replacement"}
         type="button"
         onClick={() => {
-          setReplaceNotice(null);
           setReplaceTarget(target);
         }}
       >
@@ -1791,7 +1787,6 @@ export function AgentsView({
         : "Stop this run and spawn a replacement",
       run: () => {
         if (replaceDisabled) return;
-        setReplaceNotice(null);
         setReplaceTarget(replaceTarget);
       },
     });
@@ -2040,7 +2035,6 @@ export function AgentsView({
         : "Stop this run and spawn a replacement",
       run: () => {
         if (replaceDisabled) return;
-        setReplaceNotice(null);
         setReplaceTarget(replaceTargetForCard);
       },
     });
@@ -2354,7 +2348,6 @@ export function AgentsView({
               disabled={workers === null}
               type="button"
               onClick={() => {
-                setSpawnNotice(null);
                 setSpawnOrchestratorOpen(true);
               }}
             >
@@ -2366,7 +2359,6 @@ export function AgentsView({
               disabled={workers === null}
               type="button"
               onClick={() => {
-                setSpawnNotice(null);
                 setSpawnWorkerOpen(true);
               }}
             >
@@ -2376,56 +2368,6 @@ export function AgentsView({
           </div>
         </div>
         <AccountEventsBanner events={accountNotices} />
-        {spawnNotice ? (
-          spawnNotice.kind === "worker" ? (
-            <div className="agents-notice">
-              spawned <code>{spawnNotice.ticket}</code> as run{" "}
-              <code>{spawnNotice.runId.slice(0, 8)}</code>
-              {spawnNotice.log ? (
-                <>
-                  {" "}· log <code>{spawnNotice.log}</code>
-                </>
-              ) : null}
-            </div>
-          ) : (
-            <div className="agents-notice">
-              {spawnNotice.note} · run <code>{spawnNotice.runId.slice(0, 8)}</code>
-              {spawnNotice.log ? (
-                <>
-                  {" "}· log <code>{spawnNotice.log}</code>
-                </>
-              ) : null}
-            </div>
-          )
-        ) : null}
-        {replaceNotice ? (
-          <div className="agents-notice">
-            replaced <code>{replaceNotice.id}</code>
-            {replaceNotice.run_id ? (
-              <>
-                {" "}· run <code>{replaceNotice.run_id.slice(0, 8)}</code>
-              </>
-            ) : null}
-            {replaceNotice.window ? (
-              <>
-                {" "}· tmux <code>{replaceNotice.window}</code>
-              </>
-            ) : null}
-            {replaceNotice.log ? (
-              <>
-                {" "}· log <code>{replaceNotice.log}</code>
-              </>
-            ) : null}
-          </div>
-        ) : null}
-        {controlNotice ? (
-          <div className="agents-notice">
-            {controlNotice.action} <code>{controlNotice.result.agent_id}</code> · state{" "}
-            <code>{controlNotice.result.state}</code>
-          </div>
-        ) : null}
-        {controlError ? <div className="agents-notice is-error">{controlError}</div> : null}
-        {modelsError ? <div className="agents-notice is-error">{modelsError}</div> : null}
         {body}
       </div>
       {openWorker ? (
@@ -2441,7 +2383,9 @@ export function AgentsView({
           orchestrators={orchestrators}
           onClose={() => setSpawnWorkerOpen(false)}
           onSpawn={(notice) => {
-            setSpawnNotice(notice);
+            toast.success(`Spawned ${notice.ticket}`, {
+              description: describeRun(notice.runId, notice.log),
+            });
             setSpawnWorkerOpen(false);
             onOpenTicket(notice.ticket);
           }}
@@ -2454,7 +2398,9 @@ export function AgentsView({
           workspaceRootReady={workspaceRootReady}
           onClose={() => setSpawnOrchestratorOpen(false)}
           onSpawn={(notice) => {
-            setSpawnNotice(notice);
+            toast.success(notice.note, {
+              description: describeRun(notice.runId, notice.log),
+            });
             setSpawnOrchestratorOpen(false);
           }}
         />
@@ -2465,8 +2411,9 @@ export function AgentsView({
           target={replaceTarget}
           onClose={() => setReplaceTarget(null)}
           onReplaced={(result) => {
-            setReplaceNotice(result);
-            setSpawnNotice(null);
+            toast.success(`Replaced ${result.id}`, {
+              description: describeReplacement(result),
+            });
             onOpenTicket(result.id);
           }}
         />
