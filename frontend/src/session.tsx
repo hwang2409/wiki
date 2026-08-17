@@ -1095,7 +1095,7 @@ export function ProviderActionRequired({
         <div className="session-action-required-body" id="session-action-required-body">
           {pendingRequests.map((request) => (
             <ProviderPendingRequestCard
-              key={`${typeof request.request_id}:${request.request_id}`}
+              key={String(request.request_id)}
               request={request}
               ticket={ticket}
             />
@@ -1109,15 +1109,19 @@ export function ProviderActionRequired({
 const IMG_TOKEN_PATTERN = /\u27e6img:([^\u27e7]+)\u27e7/g;
 const PROMPT_MENTION_PATTERN = /(^|[\s([{])(@(?:thread|project|section):[^\s.,!?;)}\]]+|@[A-Za-z0-9_.-]+\/[^\s.,!?;)}\]]+)/g;
 
-function splitImgTokens(text: string): (string | { url: string })[] {
-  const parts: (string | { url: string })[] = [];
+type UserTextPart =
+  | { kind: "text"; text: string }
+  | { kind: "image"; url: string };
+
+function splitImgTokens(text: string): UserTextPart[] {
+  const parts: UserTextPart[] = [];
   let last = 0;
   for (const match of text.matchAll(IMG_TOKEN_PATTERN)) {
-    if (match.index! > last) parts.push(text.slice(last, match.index));
-    parts.push({ url: match[1] });
+    if (match.index! > last) parts.push({ kind: "text", text: text.slice(last, match.index) });
+    parts.push({ kind: "image", url: match[1] });
     last = match.index! + match[0].length;
   }
-  if (last < text.length) parts.push(text.slice(last));
+  if (last < text.length) parts.push({ kind: "text", text: text.slice(last) });
   return parts;
 }
 
@@ -1153,21 +1157,21 @@ function UserText({
   imageNums?: number[];
 }) {
   const parts = splitImgTokens(text);
-  const hasImages = parts.some((part) => typeof part !== "string");
-  if (!hasImages) return <div className="session-text">{renderUserText(text, "plain")}</div>;
   let imgIndex = -1;
   return (
     <div className="session-text">
       {parts.map((part, i) => {
-        if (typeof part === "string") return <span key={i}>{renderUserText(part, `part-${i}`)}</span>;
-        imgIndex += 1;
-        return (
-          <ImageChip
-            key={i}
-            num={imageNums[imgIndex] ?? 0}
-            url={part.url}
-          />
-        );
+        if (part.kind === "image") {
+          imgIndex += 1;
+          return (
+            <ImageChip
+              key={i}
+              num={imageNums[imgIndex] ?? 0}
+              url={part.url}
+            />
+          );
+        }
+        return <span key={i}>{renderUserText(part.text, `part-${i}`)}</span>;
       })}
     </div>
   );
