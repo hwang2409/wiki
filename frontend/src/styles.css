@@ -152,6 +152,8 @@
   --border-hairline: color-mix(in srgb, var(--text-normal) 15%, var(--background-primary));
   --surface-recessed: color-mix(in srgb, var(--text-normal) 6%, transparent);
   --surface-raised: color-mix(in srgb, var(--text-normal) 2.5%, transparent);
+  --surface-destructive: color-mix(in oklab, var(--accent-danger) 8%, var(--background-primary));
+  --destructive-text: var(--accent-danger);
   --surface-selected: color-mix(in srgb, var(--accent-primary) 16%, transparent);
   /* bb-language state fills alias the wiki modifier tokens so they cannot
      drift as themes customize their hover/active tints. */
@@ -280,7 +282,7 @@ button:disabled {
   flex-direction: column;
   gap: 8px;
   width: min(100%, 420px);
-  opacity: 0;
+  opacity: 1;
 }
 
 .loading-line {
@@ -289,9 +291,9 @@ button:disabled {
   border-radius: var(--radius-full);
   background: linear-gradient(
     90deg,
-    var(--background-secondary) 0%,
-    var(--code-background) 45%,
-    var(--background-secondary) 100%
+    color-mix(in oklab, var(--text-normal) 8%, var(--background-primary)) 0%,
+    color-mix(in oklab, var(--text-normal) 16%, var(--background-primary)) 45%,
+    color-mix(in oklab, var(--text-normal) 8%, var(--background-primary)) 100%
   );
   background-size: 200% 100%;
   animation: loading-pulse 1.4s ease-in-out infinite;
@@ -6794,27 +6796,60 @@ body.is-resizing-panes .pane-cell {
 }
 
 .session-empty {
-  padding: 24px 16px;
+  display: flex;
+  flex: 1;
+  align-items: center;
+  justify-content: center;
+  padding: 32px 20px;
   color: var(--text-faint);
   font-size: var(--font-ui-small);
 }
 
 .session-empty-error {
+  align-items: flex-start;
+  justify-content: flex-start;
+  padding-top: clamp(32px, 12vh, 120px);
+}
+
+.session-empty-loading {
+  align-items: flex-start;
+  justify-content: flex-start;
+  padding-top: clamp(32px, 14vh, 136px);
+}
+
+.session-error-card {
+  display: grid;
+  grid-template-columns: 16px minmax(0, 1fr);
+  gap: 10px;
+  width: min(100%, 560px);
+  padding: 12px 14px;
+  border: 1px solid color-mix(in oklab, var(--destructive-text) 35%, var(--border-hairline));
+  border-radius: var(--radius-md);
+  background: var(--surface-destructive);
+  color: var(--destructive-text);
+  box-shadow: 0 1px 0 rgb(0 0 0 / 3%);
+}
+
+.session-error-icon {
+  margin-top: 2px;
+}
+
+.session-error-content {
   display: flex;
+  min-width: 0;
   flex-direction: column;
   align-items: flex-start;
   gap: 8px;
-  color: var(--text-normal);
 }
 
 .session-empty-title {
-  color: var(--text-normal);
+  color: inherit;
   font-weight: var(--fw-semibold);
   font-size: var(--font-ui-medium);
 }
 
 .session-empty-body {
-  color: var(--text-muted);
+  color: color-mix(in oklab, currentColor 78%, var(--background-primary));
   font-size: var(--font-ui-small);
   line-height: 1.4;
 }
@@ -6824,20 +6859,28 @@ body.is-resizing-panes .pane-cell {
   display: inline-flex;
   align-items: center;
   gap: 6px;
-  padding: 4px 10px;
-  border: 1px solid var(--background-modifier-border);
-  border-radius: var(--radius-xs);
-  background: var(--background-secondary);
-  color: var(--text-normal);
+  min-height: 32px;
+  padding: 5px 10px;
+  border: 1px solid color-mix(in oklab, currentColor 32%, var(--border-hairline));
+  border-radius: var(--radius-md);
+  background: transparent;
+  color: inherit;
   font: inherit;
   font-size: var(--font-ui-smaller);
   cursor: pointer;
+  transition-property: background-color, color, scale;
+  transition-duration: var(--motion-duration);
+  transition-timing-function: var(--motion-easing);
 }
 
 .session-empty-retry:hover:not(:disabled),
 .session-stale-retry:hover:not(:disabled) {
-  border-color: var(--background-modifier-border-hover);
-  background: var(--background-modifier-hover);
+  background: color-mix(in oklab, currentColor 10%, transparent);
+}
+
+.session-empty-retry:active:not(:disabled),
+.session-stale-retry:active:not(:disabled) {
+  scale: 0.96;
 }
 
 .session-empty-retry:disabled,
@@ -6876,21 +6919,60 @@ body.is-resizing-panes .pane-cell {
 .session-zero-events {
   display: flex;
   flex-direction: column;
-  gap: 4px;
-  padding: 32px 4px 24px;
+  align-items: center;
+  justify-content: center;
+  gap: 8px;
+  width: min(100%, 560px);
+  min-height: clamp(240px, 42vh, 360px);
+  margin: 0 auto;
+  padding: 40px 20px 32px;
+  text-align: center;
   color: var(--text-muted);
+}
+
+.session-zero-events-mark {
+  display: grid;
+  width: 40px;
+  height: 40px;
+  place-items: center;
+  margin-bottom: 4px;
+  border: 1px solid var(--border-hairline);
+  border-radius: var(--radius-lg);
+  background: var(--surface-raised);
+  color: var(--text-subtle-readable);
 }
 
 .session-zero-events-title {
   color: var(--text-normal);
   font-size: var(--font-ui-medium);
   font-weight: var(--fw-semibold);
+  text-wrap: balance;
 }
 
 .session-zero-events-body {
   color: var(--text-muted);
   font-size: var(--font-ui-small);
   line-height: 1.5;
+  text-wrap: pretty;
+}
+
+.session-zero-events-suggestions {
+  display: flex;
+  flex-wrap: wrap;
+  justify-content: center;
+  gap: 6px;
+  margin-top: 8px;
+}
+
+.session-zero-events-chip {
+  padding: 5px 9px;
+  border: 1px solid var(--pill-surface-border);
+  border-radius: var(--radius-full);
+  background: var(--pill-surface);
+  box-shadow: var(--pill-shadow);
+  color: var(--pill-foreground);
+  font-size: var(--fs-xs);
+  line-height: 1.2;
 }
 
 .session-tab {
