@@ -23,15 +23,12 @@ import {
   Hourglass,
   ListTodo,
   MessageCircleQuestion,
-  Radio,
   RefreshCw,
   ScrollText,
   SendHorizontal,
   SlashSquare,
-  Wrench,
   X,
 } from "lucide-react";
-import type { LucideIcon } from "lucide-react";
 import ReactMarkdown from "react-markdown";
 import rehypeKatex from "rehype-katex";
 import remarkGfm from "remark-gfm";
@@ -2299,10 +2296,13 @@ function PrRow({ pr, text }: { pr: SessionPr | undefined; text: string }) {
   );
 }
 
-const MARKER_ICON: Record<MarkerSeverity, LucideIcon> = {
-  info: Radio,
-  warn: AlertTriangle,
-  error: AlertTriangle,
+// WIKI-304: bb info-row grammar drops the leading icon in favor of a
+// text-2xs uppercase severity label. Icons collide with the compact row
+// height and the label carries the semantic weight on its own.
+const MARKER_LABEL: Record<MarkerSeverity, string> = {
+  info: "info",
+  warn: "warn",
+  error: "error",
 };
 
 function SyntheticSourceRow({ source, text }: { source: string; text: string }) {
@@ -2324,20 +2324,19 @@ function MarkerRow({ text, marker }: { text: string; marker?: string }) {
   if (!rule) {
     // Non-whitelisted markers still render as a visible info row (Henry
     // prefers verbose "tool reference"-style detail over hidden chips).
-    const FallbackIcon = marker === "tool_reference" ? Wrench : Radio;
+    const label = marker === "tool_reference" ? "tool" : MARKER_LABEL.info;
     return (
       <div className="session-marker is-info" data-marker={marker}>
-        <FallbackIcon size={12} />
-        <span>{text}</span>
+        <span className="session-marker-label">{label}</span>
+        <span className="session-marker-text">{text}</span>
       </div>
     );
   }
-  const Icon = MARKER_ICON[rule.severity];
   const rendered = rule.verb ? `${rule.verb} · ${text}` : text;
   return (
     <div className={`session-marker is-${rule.severity}`} data-marker={marker}>
-      <Icon size={12} />
-      <span>{rendered}</span>
+      <span className="session-marker-label">{MARKER_LABEL[rule.severity]}</span>
+      <span className="session-marker-text">{rendered}</span>
     </div>
   );
 }
