@@ -123,9 +123,9 @@ function dedupeByLabel(...pools: FontChoice[][]): FontChoice[] {
 export const ALL_FONTS: FontChoice[] = dedupeByLabel(UI_FONTS, TEXT_FONTS, MONO_FONTS);
 export const AGENT_FONTS: FontChoice[] = ALL_FONTS;
 
-// Single storage keys — one font, one weight, one size, applied to every
-// surface of the app (WIKI-279). Legacy per-role keys are read once for
-// migration then deleted.
+// Single storage keys — one font, one weight, and one base size. The base size
+// derives prose, control, and chrome tiers in styles.css (WIKI-318). Legacy
+// per-role keys are read once for migration then deleted.
 const FONT_KEY = "wiki-font";
 // Resolved CSS stack for cross-document rendering (dashboard). Persisted so
 // the dashboard doesn't need to re-import the FontChoice pool to map a label
@@ -134,7 +134,7 @@ const FONT_KEY = "wiki-font";
 const STACK_KEY = "wiki-font-stack";
 const WEIGHT_KEY = "wiki-font-weight";
 const SIZE_KEY = "wiki-font-size";
-const SIZE_DEFAULT = 14.5;
+const SIZE_DEFAULT = 15;
 const SIZE_MIN = 11;
 const SIZE_MAX = 22;
 
@@ -156,8 +156,8 @@ const LEGACY_SIZE_KEYS = [
   "wiki-font-size-mono",
 ];
 
-// Every legacy CSS var that read a per-role font/weight/size now points at the
-// single choice. Keeping the vars keeps the ~200 CSS callsites unchanged.
+// Family and weight roles remain aliases of the single user choice. Size is
+// written only to the base token; styles.css derives the semantic tiers.
 const FAMILY_VARS = [
   "--font-single",
   "--font-interface",
@@ -173,14 +173,6 @@ const WEIGHT_VARS = [
   "--font-agent-prose-weight",
   "--font-monospace-weight",
 ];
-const SIZE_VARS = [
-  "--font-single-size",
-  "--font-text-size",
-  "--font-ui-small",
-  "--font-ui-smaller",
-  "--font-monospace-size",
-];
-
 const MONO_SAMPLE = "→ const x = 0O1lIi";
 const PROP_SAMPLE = "The quick brown fox";
 
@@ -396,7 +388,7 @@ function applyWeightEverywhere(weight: number | null) {
 function applySizeEverywhere(size: number) {
   const root = document.documentElement.style;
   const value = `${size}px`;
-  for (const cssVar of SIZE_VARS) root.setProperty(cssVar, value);
+  root.setProperty("--font-single-size", value);
 }
 
 function storedSize(): number {
@@ -879,7 +871,8 @@ export function SettingsModal({
             <div className="settings-row-info">
               <div className="settings-row-name">Size</div>
               <div className="settings-row-desc">
-                One pixel size for every surface — prose, chat, code, chrome.
+                One base size derives 15px prose, 13px controls, and 10px chrome.
+                All tiers scale together.
               </div>
             </div>
             <div className="settings-slider">
@@ -906,4 +899,3 @@ export function SettingsModal({
     </>
   );
 }
-

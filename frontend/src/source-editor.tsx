@@ -21,7 +21,7 @@ const sourceEditorTheme = EditorView.theme({
     backgroundColor: "var(--background-primary)",
     color: "var(--text-normal)",
     fontFamily: "var(--font-text)",
-    fontSize: "var(--font-text-size)",
+    fontSize: "var(--font-control-size)",
     fontWeight: "var(--font-text-weight, 400)",
     lineHeight: "1.6",
   },
@@ -53,7 +53,7 @@ const sourceEditorTheme = EditorView.theme({
 
 const sourceEditorHighlighting = syntaxHighlighting(
   HighlightStyle.define([
-    { tag: [tags.heading, tags.strong], color: "var(--syntax-keyword)", fontWeight: "700" },
+    { tag: [tags.heading, tags.strong], color: "var(--syntax-keyword)", fontWeight: "var(--fw-semibold)" },
     { tag: tags.emphasis, color: "var(--syntax-function)", fontStyle: "italic" },
     { tag: [tags.link, tags.url], color: "var(--link-color)" },
     { tag: tags.quote, color: "var(--syntax-comment)" },

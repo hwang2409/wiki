@@ -85,6 +85,9 @@ try {
       fwMedium: style.getPropertyValue("--fw-medium").trim(),
       fwSemibold: style.getPropertyValue("--fw-semibold").trim(),
       fwDisplay: style.getPropertyValue("--fw-display").trim(),
+      proseSize: style.getPropertyValue("--font-prose-size").trim(),
+      controlSize: style.getPropertyValue("--font-control-size").trim(),
+      chromeSize: style.getPropertyValue("--font-chrome-size").trim(),
       radiusXs: style.getPropertyValue("--radius-xs").trim(),
       radiusSm: style.getPropertyValue("--radius-sm").trim(),
       radiusMd: style.getPropertyValue("--radius-md").trim(),
@@ -110,7 +113,7 @@ try {
     fwRegular: "400",
     fwMedium: "500",
     fwSemibold: "600",
-    fwDisplay: "700",
+    fwDisplay: "600",
     radiusXs: "4px",
     radiusSm: "6px",
     radiusMd: "8px",
@@ -125,6 +128,47 @@ try {
       `token --${key} expected ${value}, got ${JSON.stringify(tokens[key])}`,
     );
   }
+
+  const semanticSizes = await page.evaluate(() => {
+    const classes = ["session-assistant", "session-tool", "metadata-property", "session-pane-log"];
+    const nodes = classes.map((className) => {
+      const node = document.createElement("div");
+      node.className = className;
+      document.body.append(node);
+      return node;
+    });
+    const values = nodes.map((node) => getComputedStyle(node).fontSize);
+    const families = [getComputedStyle(document.body).fontFamily, getComputedStyle(nodes[3]).fontFamily];
+    nodes.forEach((node) => node.remove());
+    return { values, families };
+  });
+  assert(
+    JSON.stringify(semanticSizes.values) === JSON.stringify(["15px", "13px", "10px", "13px"]),
+    `semantic type tiers changed: ${JSON.stringify(semanticSizes.values)}`,
+  );
+  assert(
+    semanticSizes.families[0] === semanticSizes.families[1],
+    `code family changed independently from the selected family: ${JSON.stringify(semanticSizes.families)}`,
+  );
+
+  const scaledSizes = await page.evaluate(() => {
+    document.documentElement.style.setProperty("--font-single-size", "18px");
+    const classes = ["session-assistant", "session-tool", "metadata-property"];
+    const nodes = classes.map((className) => {
+      const node = document.createElement("div");
+      node.className = className;
+      document.body.append(node);
+      return node;
+    });
+    const values = nodes.map((node) => getComputedStyle(node).fontSize);
+    nodes.forEach((node) => node.remove());
+    document.documentElement.style.removeProperty("--font-single-size");
+    return values;
+  });
+  assert(
+    JSON.stringify(scaledSizes) === JSON.stringify(["18px", "15.6px", "12px"]),
+    `semantic tiers did not scale together: ${JSON.stringify(scaledSizes)}`,
+  );
 
   const scaleBinding = await page.evaluate(() => {
     const probe = document.createElement("div");
