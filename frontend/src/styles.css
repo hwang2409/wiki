@@ -6649,7 +6649,7 @@ body.is-resizing-panes .pane-cell {
 }
 
 .session-provider-request + .session-provider-request {
-  border-top: 1px solid color-mix(in srgb, var(--accent-warning) 30%, var(--background-modifier-border));
+  border-top: 1px solid var(--border-hairline, var(--background-modifier-border));
 }
 
 .session-provider-request-actions {
@@ -6695,31 +6695,6 @@ body.is-resizing-panes .pane-cell {
 .session-provider-request-actions {
   justify-content: flex-end;
   margin-top: 8px;
-}
-
-.session-provider-request-actions details {
-  margin-right: auto;
-}
-
-.session-provider-request-actions summary,
-.session-provider-request-actions button {
-  cursor: pointer;
-  color: var(--text-muted);
-}
-
-.session-provider-request-actions button {
-  padding: 3px 7px;
-  border: 1px solid var(--background-modifier-border);
-  border-radius: var(--radius-xs);
-}
-
-.session-provider-request-actions button:hover {
-  color: var(--text-normal);
-}
-
-.session-provider-request-actions button:disabled {
-  cursor: default;
-  opacity: 0.55;
 }
 
 .session-provider-request-actions pre {
@@ -7515,20 +7490,45 @@ body.is-resizing-panes .pane-cell {
   gap: 10px;
 }
 
-/* WIKI-234: opencode-style accent-bar block — user turns read as flat
-   full-width panels marked by a left accent bar, not floating bubbles.
-   Square corners: panels are background rectangles, never rounded boxes
-   (opencode ui/border.ts:15-21). */
+/* WIKI-305: bb thread-body user turn — subtly-recessed card with a hairline
+   border and 8px radius, right-aligned in the transcript column and capped at
+   a comfortable reading width so it reads as an addressed message, not a
+   full-bleed panel. Radius is literal (bb card family = 8px); WIKI-235 scopes
+   --radius-md down to 2px on the surrounding agent-session-surface for flat
+   chrome, and this card opts out of that collapse. Composer pending copies
+   (below) inherit the card face and only override alignment to fill the
+   composer. */
 .session-user {
-  align-self: stretch;
-  padding: 8px 12px;
-  border-left: 3px solid var(--accent-primary);
-  background-color: var(--background-secondary);
+  padding: 10px 14px;
+  border: 1px solid var(--border-hairline, var(--background-modifier-border));
+  border-radius: 8px;
+  background-color: var(--surface-recessed, var(--background-secondary));
   color: var(--text-normal);
   font-family: var(--font-monospace);
   font-weight: var(--font-monospace-weight);
   font-size: var(--font-ui-smaller);
   line-height: 1.55;
+}
+
+.prompt-mention-pill {
+  display: inline-flex;
+  max-width: 100%;
+  align-items: baseline;
+  padding: 2px 6px;
+  border: 1px solid var(--pill-surface-border, var(--border-hairline, var(--background-modifier-border)));
+  border-radius: var(--radius-full, 999px);
+  background: var(--pill-surface, var(--surface-raised, var(--background-primary)));
+  box-shadow: var(--pill-shadow, none);
+  color: var(--text-normal);
+  font: inherit;
+  line-height: 1rem;
+  overflow-wrap: anywhere;
+  vertical-align: baseline;
+}
+
+.session-virtual-row[data-align="end"] > .session-user {
+  align-self: flex-end;
+  max-width: min(72ch, 85%);
 }
 
 .session-text {
@@ -7552,13 +7552,15 @@ body.is-resizing-panes .pane-cell {
   color: var(--text-normal);
 }
 
+/* WIKI-305: assistant prose stays full-width and card-less at bb's 15px /
+   1.375rem body rhythm. */
 .session-assistant {
   padding: 2px 0;
   color: var(--text-normal);
   font-family: var(--font-agent-prose);
   font-weight: var(--font-agent-prose-weight, var(--font-text-weight));
-  font-size: var(--font-text-size);
-  line-height: 1.65;
+  font-size: 15px;
+  line-height: 1.375rem;
   overflow-wrap: break-word;
 }
 
@@ -15508,11 +15510,16 @@ textarea.composer-command-input {
   }
 }
 
+/* WIKI-305: bb detail-card grammar — hairline border, 8px radius, raised
+   surface. Warning tint retreats to the icon and count chip so the card reads
+   as "attention needed" without staining the whole surface amber. Literal
+   radius opts out of the WIKI-235 flat-chrome collapse scoped on the parent
+   agent-session-surface. */
 .session-tab > .session-action-required {
   margin: 6px 12px 0;
-  border: 1px solid color-mix(in srgb, var(--accent-warning) 55%, var(--background-modifier-border));
-  border-radius: var(--radius-xs);
-  background-color: color-mix(in srgb, var(--accent-warning) 8%, var(--background-primary));
+  border: 1px solid var(--border-hairline, var(--background-modifier-border));
+  border-radius: 8px;
+  background-color: var(--surface-raised, var(--background-primary));
   overflow: hidden;
 }
 
@@ -15520,25 +15527,33 @@ textarea.composer-command-input {
   display: flex;
   align-items: center;
   gap: 8px;
-  padding: 6px 12px;
-  border-bottom: 1px solid color-mix(in srgb, var(--accent-warning) 40%, var(--background-modifier-border));
-  background-color: color-mix(in srgb, var(--accent-warning) 14%, var(--background-primary));
+  padding: 8px 12px;
+  border-bottom: 1px solid var(--border-hairline, var(--background-modifier-border));
   color: var(--accent-warning);
-  font-family: var(--font-monospace);
+  font-family: var(--font-chrome);
   font-weight: var(--fw-semibold);
-  font-size: var(--font-ui-smaller);
+  font-size: var(--fs-2xs, 11px);
   text-transform: uppercase;
   letter-spacing: 0.06em;
 }
 
+.session-tab > .session-action-required .session-action-required-title {
+  color: var(--text-normal);
+}
+
 .session-tab > .session-action-required .session-action-required-count {
-  margin-left: auto;
+  margin-left: 0;
   padding: 1px 6px;
-  border: 1px solid color-mix(in srgb, var(--accent-warning) 55%, var(--background-modifier-border));
+  border: 1px solid color-mix(in srgb, var(--accent-warning) 55%, var(--border-hairline, var(--background-modifier-border)));
   border-radius: var(--radius-full);
-  background-color: var(--background-primary);
+  background-color: color-mix(in srgb, var(--accent-warning) 12%, transparent);
   color: var(--accent-warning);
-  font-size: 10px;
+  font-size: var(--fs-2xs, 11px);
+  font-variant-numeric: tabular-nums;
+}
+
+.session-tab > .session-action-required .session-action-required-head > .bb-button {
+  margin-left: auto;
 }
 
 /* Video / audio artifacts (WIKI-190/191) */
@@ -16103,14 +16118,14 @@ textarea.composer-command-input {
   box-shadow: none;
 }
 
-/* Semantic left rails replace framed chrome. */
+/* Semantic left rails replace framed chrome. WIKI-305: pending user opts out
+   of this treatment and keeps the bb-parity card face from .session-user. */
 .nav-inline-error,
 .nav-files-retry,
 .agent-inline-error,
 .agent-spawn-preview,
 .agent-tech,
-.session-composer-row,
-.session-pending-user {
+.session-composer-row {
   border-top: 0;
   border-right: 0;
   border-bottom: 0;
@@ -17713,4 +17728,3 @@ body {
 .agents-account-banner-diagnostics {
   border-left-color: color-mix(in oklab, currentColor 30%, transparent);
 }
-

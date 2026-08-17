@@ -263,7 +263,7 @@ try {
   await page.reload({ waitUntil: "domcontentloaded" });
   await page.waitForSelector('[data-testid="nav-orch-workers-wiki"]');
 
-  logStep("state 3: accent-bar user block + quiet composer strip");
+  logStep("state 3: WIKI-305 user turn card + quiet composer strip");
   // The "wiki" orchestrator shares the native transcript fixture, which the
   // backend serves without a live provider attached.
   await page.goto(`${backend.baseUrl}/#/agent/wiki`, { waitUntil: "domcontentloaded" });
@@ -272,15 +272,24 @@ try {
   await userBlock.waitFor();
   const blockStyle = await userBlock.evaluate((el) => {
     const style = getComputedStyle(el);
-    return { borderLeftWidth: style.borderLeftWidth, alignSelf: style.alignSelf };
+    return {
+      borderLeftWidth: style.borderLeftWidth,
+      borderTopWidth: style.borderTopWidth,
+      borderRadius: style.borderRadius,
+      alignSelf: style.alignSelf,
+    };
   });
   assert(
-    blockStyle.borderLeftWidth === "3px",
-    `user block must carry a 3px left accent bar, got ${blockStyle.borderLeftWidth}`,
+    blockStyle.borderLeftWidth === "1px" && blockStyle.borderTopWidth === "1px",
+    `user block must carry a hairline border on every side, got L:${blockStyle.borderLeftWidth} T:${blockStyle.borderTopWidth}`,
   );
   assert(
-    blockStyle.alignSelf === "stretch",
-    `user block must stretch full width, got ${blockStyle.alignSelf}`,
+    Number.parseFloat(blockStyle.borderRadius) >= 6,
+    `user block must have a card radius, got ${blockStyle.borderRadius}`,
+  );
+  assert(
+    blockStyle.alignSelf === "flex-end",
+    `user block must right-align inside the transcript row, got ${blockStyle.alignSelf}`,
   );
 
   await page.waitForSelector(".session-composer-row");

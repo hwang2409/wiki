@@ -10,7 +10,7 @@ import {
   useRef,
   useState,
 } from "react";
-import type { ComponentProps, CSSProperties } from "react";
+import type { ComponentProps, CSSProperties, ReactNode } from "react";
 import {
   AlertTriangle,
   Bell,
@@ -91,6 +91,7 @@ import {
 import { LoadingPlaceholder } from "./loading";
 import { createStateKeyWriteBarrier, deletePaneStateEntries } from "./pane-state-cache";
 import { Timestamp } from "./timestamp";
+import { Button } from "./primitives";
 import { StatusBadge } from "./status-badge";
 import { BoundedPreview } from "./transcript-preview";
 import {
@@ -603,7 +604,12 @@ function ProviderPendingRequestCard({
         </label>
       )}
       <div className="session-provider-request-actions">
-        <button disabled={sending || sent} type="button" onClick={() => void submit()}>
+        <Button
+          disabled={sending || sent}
+          size="sm"
+          variant="default"
+          onClick={() => void submit()}
+        >
           {sent
             ? "Response sent"
             : sending
@@ -611,7 +617,7 @@ function ProviderPendingRequestCard({
               : questions.length
                 ? "Send answers"
                 : "Send response"}
-        </button>
+        </Button>
       </div>
       {/* R1-04/WIKI-235: request kind, id, and raw payload do not render in
           default session chrome. They remain available through event APIs. */}
@@ -1065,30 +1071,43 @@ export function ProviderActionRequired({
   ticket: string;
 }) {
   const pendingRequests = inspector.pending_requests ?? [];
+  const [dismissed, setDismissed] = useState(false);
   if (pendingRequests.length === 0) return null;
   return (
-    <div className="session-action-required" data-testid="session-action-required">
+    <div className="session-action-required bb-detail-card" data-testid="session-action-required">
       <div className="session-action-required-head">
         <AlertTriangle size={13} />
         <span className="session-action-required-title">Action required</span>
         {pendingRequests.length > 1 ? (
           <span className="session-action-required-count">{pendingRequests.length}</span>
         ) : null}
+        <Button
+          aria-controls="session-action-required-body"
+          aria-expanded={!dismissed}
+          size="sm"
+          variant="ghost"
+          onClick={() => setDismissed((current) => !current)}
+        >
+          {dismissed ? "Show requests" : "Dismiss"}
+        </Button>
       </div>
-      <div className="session-action-required-body">
-        {pendingRequests.map((request) => (
-          <ProviderPendingRequestCard
-            key={`${typeof request.request_id}:${request.request_id}`}
-            request={request}
-            ticket={ticket}
-          />
-        ))}
-      </div>
+      {!dismissed ? (
+        <div className="session-action-required-body" id="session-action-required-body">
+          {pendingRequests.map((request) => (
+            <ProviderPendingRequestCard
+              key={`${typeof request.request_id}:${request.request_id}`}
+              request={request}
+              ticket={ticket}
+            />
+          ))}
+        </div>
+      ) : null}
     </div>
   );
 }
 
 const IMG_TOKEN_PATTERN = /\u27e6img:([^\u27e7]+)\u27e7/g;
+const PROMPT_MENTION_PATTERN = /(^|[\s([{])(@(?:thread|project|section):[^\s.,!?;)}\]]+|@[A-Za-z0-9_.-]+\/[^\s.,!?;)}\]]+)/g;
 
 function splitImgTokens(text: string): (string | { url: string })[] {
   const parts: (string | { url: string })[] = [];
@@ -1102,6 +1121,30 @@ function splitImgTokens(text: string): (string | { url: string })[] {
   return parts;
 }
 
+function renderUserText(text: string, keyPrefix: string): ReactNode {
+  const nodes: ReactNode[] = [];
+  let last = 0;
+  for (const match of text.matchAll(PROMPT_MENTION_PATTERN)) {
+    const mention = match[2];
+    if (!mention || match.index === undefined) continue;
+    const mentionStart = match.index + match[1].length;
+    if (mentionStart > last) nodes.push(text.slice(last, mentionStart));
+    nodes.push(
+      <span
+        className="prompt-mention-pill"
+        data-mention={mention}
+        key={`${keyPrefix}-${mentionStart}`}
+        title={mention}
+      >
+        {mention}
+      </span>,
+    );
+    last = mentionStart + mention.length;
+  }
+  if (last < text.length) nodes.push(text.slice(last));
+  return nodes.length ? nodes : text;
+}
+
 function UserText({
   text,
   imageNums = [],
@@ -1111,12 +1154,12 @@ function UserText({
 }) {
   const parts = splitImgTokens(text);
   const hasImages = parts.some((part) => typeof part !== "string");
-  if (!hasImages) return <div className="session-text">{text}</div>;
+  if (!hasImages) return <div className="session-text">{renderUserText(text, "plain")}</div>;
   let imgIndex = -1;
   return (
     <div className="session-text">
       {parts.map((part, i) => {
-        if (typeof part === "string") return <span key={i}>{part}</span>;
+        if (typeof part === "string") return <span key={i}>{renderUserText(part, `part-${i}`)}</span>;
         imgIndex += 1;
         return (
           <ImageChip
