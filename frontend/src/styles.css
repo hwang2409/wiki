@@ -175,6 +175,14 @@
   --pill-foreground: var(--text-normal);
   --pill-icon: var(--text-normal);
   --pill-shadow: 0 1px 1px 0 rgba(0, 0, 0, 0.06);
+
+  /* WIKI-298: one motion family (bb app.css:88-105) + one focus ring.
+     Every `transition-*` in this file resolves to these tokens; non
+     background-color/color survivors carry a one-line WHY at their
+     call site. Reduced-motion collapses further down. */
+  --motion-duration: 120ms;
+  --motion-easing: cubic-bezier(0.2, 0, 0, 1);
+  --ring: var(--accent-primary, var(--text-normal));
 }
 
 * {
@@ -244,9 +252,12 @@ button:disabled {
   -webkit-tap-highlight-color: transparent;
 }
 
+/* WIKI-298: bb's default focus ring — 2px `--ring`, 1px offset. Per-
+   component rules below override offset for inset inputs (negative) and
+   image thumbnails (larger); the color always flows through `--ring`. */
 :where(button, input, textarea, select, a, [role="button"]):focus-visible {
-  outline: 2px solid var(--accent-primary, var(--text-normal));
-  outline-offset: 2px;
+  outline: 2px solid var(--ring);
+  outline-offset: 1px;
   box-shadow: none;
 }
 
@@ -354,8 +365,8 @@ button:disabled {
   text-transform: uppercase;
   cursor: pointer;
   transition-property: background-color, color;
-  transition-duration: 120ms;
-  transition-timing-function: cubic-bezier(0.2, 0, 0, 1);
+  transition-duration: var(--motion-duration);
+  transition-timing-function: var(--motion-easing);
 }
 
 .sidebar-views-header:hover {
@@ -365,9 +376,10 @@ button:disabled {
 
 .sidebar-views-chevron {
   color: var(--text-faint);
+  /* WIKI-298 survivor: `transform` rotates the section chevron on collapse. */
   transition-property: transform;
-  transition-duration: 120ms;
-  transition-timing-function: cubic-bezier(0.2, 0, 0, 1);
+  transition-duration: var(--motion-duration);
+  transition-timing-function: var(--motion-easing);
 }
 
 .sidebar-views-chevron.is-open {
@@ -401,8 +413,8 @@ button:disabled {
   font-size: var(--fs-sm);
   text-align: left;
   transition-property: background-color, color;
-  transition-duration: 120ms;
-  transition-timing-function: cubic-bezier(0.2, 0, 0, 1);
+  transition-duration: var(--motion-duration);
+  transition-timing-function: var(--motion-easing);
 }
 
 .sidebar-views-row-icon {
@@ -459,8 +471,8 @@ button:disabled {
   border-radius: var(--radius-md);
   color: var(--text-muted);
   transition-property: background-color, color;
-  transition-duration: 120ms;
-  transition-timing-function: cubic-bezier(0.2, 0, 0, 1);
+  transition-duration: var(--motion-duration);
+  transition-timing-function: var(--motion-easing);
 }
 
 .sidebar-footer-action:hover {
@@ -1807,7 +1819,9 @@ body.is-resizing-panes .pane-cell {
   border-radius: 999px;
   background-color: var(--background-secondary);
   cursor: pointer;
-  transition: background-color 120ms ease, border-color 120ms ease;
+  transition-property: background-color, border-color;
+  transition-duration: var(--motion-duration);
+  transition-timing-function: var(--motion-easing);
 }
 
 .settings-toggle:hover {
@@ -1833,7 +1847,10 @@ body.is-resizing-panes .pane-cell {
   border-radius: 50%;
   background-color: var(--text-normal);
   transform: translateY(-50%);
-  transition: left 140ms ease, background-color 140ms ease;
+  /* WIKI-298 survivor: `left` slides the toggle thumb — geometry, not color. */
+  transition-property: left, background-color;
+  transition-duration: var(--motion-duration);
+  transition-timing-function: var(--motion-easing);
 }
 
 .settings-toggle.is-on .settings-toggle-thumb {
@@ -2204,7 +2221,7 @@ body.is-resizing-panes .pane-cell {
 .dialog-input:focus-visible {
   border-color: var(--text-faint);
   box-shadow: 0 0 0 3px color-mix(in srgb, var(--text-normal) 8%, transparent);
-  outline: 2px solid var(--accent-primary, var(--text-normal));
+  outline: 2px solid var(--ring);
   outline-offset: 2px;
 }
 
@@ -2368,7 +2385,7 @@ body.is-resizing-panes .pane-cell {
 .agent-spawn-select:focus-visible {
   border-color: var(--text-faint);
   box-shadow: 0 0 0 3px color-mix(in srgb, var(--text-normal) 8%, transparent);
-  outline: 2px solid var(--accent-primary, var(--text-normal));
+  outline: 2px solid var(--ring);
   outline-offset: 2px;
 }
 
@@ -2491,7 +2508,7 @@ body.is-resizing-panes .pane-cell {
 }
 
 .quick-switcher input:focus-visible {
-  outline: 2px solid var(--accent-primary, var(--text-normal));
+  outline: 2px solid var(--ring);
   outline-offset: -2px;
 }
 
@@ -3108,7 +3125,7 @@ body.is-resizing-panes .pane-cell {
 
 .kanban-edit-input:focus-visible,
 .kanban-add-input:focus-visible {
-  outline: 2px solid var(--accent-primary, var(--text-normal));
+  outline: 2px solid var(--ring);
   outline-offset: -2px;
 }
 
@@ -3127,7 +3144,7 @@ body.is-resizing-panes .pane-cell {
 }
 
 .kanban-add-input:focus-visible {
-  outline: 2px solid var(--accent-primary, var(--text-normal));
+  outline: 2px solid var(--ring);
   outline-offset: -2px;
 }
 
@@ -4076,7 +4093,7 @@ body.is-resizing-panes .pane-cell {
 }
 
 .utility-state-retry:focus-visible {
-  outline: 2px solid var(--accent-primary, var(--text-normal));
+  outline: 2px solid var(--ring);
   outline-offset: 2px;
 }
 
@@ -6292,7 +6309,7 @@ body.is-resizing-panes .pane-cell {
 }
 
 .codex-stream-diagnostic-head:focus-visible {
-  outline: 2px solid var(--accent-primary);
+  outline: 2px solid var(--ring);
   outline-offset: -2px;
 }
 
@@ -6472,7 +6489,10 @@ body.is-resizing-panes .pane-cell {
 
 .codex-stream-diff-chevron {
   flex: 0 0 auto;
-  transition: transform 120ms ease;
+  /* WIKI-298 survivor: `transform` rotates the chevron on expand. */
+  transition-property: transform;
+  transition-duration: var(--motion-duration);
+  transition-timing-function: var(--motion-easing);
 }
 
 .codex-stream-diff-toggle[aria-expanded="true"] .codex-stream-diff-chevron {
@@ -7931,7 +7951,9 @@ body.is-resizing-panes .pane-cell {
   font-size: var(--font-ui-smaller);
   text-align: left;
   cursor: pointer;
-  transition: color 120ms ease;
+  transition-property: color;
+  transition-duration: var(--motion-duration);
+  transition-timing-function: var(--motion-easing);
 }
 
 .session-tool-output-peek:hover,
@@ -7943,7 +7965,10 @@ body.is-resizing-panes .pane-cell {
 .session-tool-output-peek-chevron {
   flex: 0 0 auto;
   color: var(--text-faint);
-  transition: transform 120ms ease, color 120ms ease;
+  /* WIKI-298 survivor: `transform` rotates the chevron on hover. */
+  transition-property: transform, color;
+  transition-duration: var(--motion-duration);
+  transition-timing-function: var(--motion-easing);
 }
 
 .session-tool-output-peek:hover .session-tool-output-peek-chevron,
@@ -7972,7 +7997,10 @@ body.is-resizing-panes .pane-cell {
   color: var(--text-faint);
   font-size: var(--fs-xs);
   opacity: 0;
-  transition: opacity 120ms ease;
+  /* WIKI-298 survivor: `opacity` reveals the hint on hover. */
+  transition-property: opacity;
+  transition-duration: var(--motion-duration);
+  transition-timing-function: var(--motion-easing);
 }
 
 .session-tool-output-peek:hover .session-tool-output-peek-hint,
@@ -8011,7 +8039,10 @@ body.is-resizing-panes .pane-cell {
   font-family: var(--font-monospace);
   font-size: var(--fs-xs);
   cursor: pointer;
-  transition: opacity 120ms ease, background-color 120ms ease, border-color 120ms ease, color 120ms ease;
+  /* WIKI-298 survivor: `opacity` reveals the toggle on head hover. */
+  transition-property: opacity, background-color, border-color, color;
+  transition-duration: var(--motion-duration);
+  transition-timing-function: var(--motion-easing);
 }
 
 .session-tool-head:hover .session-tool-polished-toggle,
@@ -8516,27 +8547,27 @@ body.is-resizing-panes .pane-cell {
 /* Scrollbars + misc                                                   */
 /* ------------------------------------------------------------------ */
 
+/* WIKI-298: bb's thin translucent scrollbar (app.css:62-85). The per-theme
+   `--scrollbar-thumb`/`--scrollbar-thumb-hover` variables still feed the
+   xterm terminal (terminal-theme.ts); app chrome overrides them here. */
 * {
   scrollbar-width: thin;
-  scrollbar-color: var(--scrollbar-thumb) transparent;
+  scrollbar-color: color-mix(in oklab, var(--text-normal) 20%, transparent) transparent;
 }
 
 ::-webkit-scrollbar {
-  width: 10px;
-  height: 10px;
+  width: 8px;
+  height: 8px;
 }
 
 ::-webkit-scrollbar-thumb {
-  border: 3px solid transparent;
-  border-radius: var(--radius-full);
-  background-clip: padding-box;
-  background-color: var(--scrollbar-thumb);
-  min-height: 40px;
+  background-color: color-mix(in oklab, var(--text-normal) 20%, transparent);
+  border-radius: 9999px;
 }
 
 ::-webkit-scrollbar-thumb:hover,
 ::-webkit-scrollbar-thumb:active {
-  background-color: var(--scrollbar-thumb-hover);
+  background-color: color-mix(in oklab, var(--text-normal) 40%, transparent);
 }
 
 ::-webkit-scrollbar-corner,
@@ -8550,13 +8581,18 @@ body.is-resizing-panes .pane-cell {
   height: 0;
 }
 
+/* WIKI-298: canonical reduced-motion collapse. 0.01ms (not 0ms) so
+   `transitionend`/`animationend` still fire. Scoped blocks below layer
+   on top for per-element gating. */
 @media (prefers-reduced-motion: reduce) {
   *,
   *::before,
   *::after {
-    transition-duration: 0ms !important;
-    animation-duration: 0ms !important;
+    animation-duration: 0.01ms !important;
+    animation-iteration-count: 1 !important;
     animation-delay: 0ms !important;
+    scroll-behavior: auto !important;
+    transition-duration: 0.01ms !important;
   }
 }
 
@@ -9573,7 +9609,7 @@ body.is-resizing-panes .pane-cell {
 
 .composer-command-input:focus,
 .composer-command-input:focus-visible {
-  outline: 2px solid var(--accent-primary, var(--text-normal));
+  outline: 2px solid var(--ring);
   outline-offset: 1px;
   border-color: var(--interactive-accent);
   box-shadow: 0 0 0 1px var(--interactive-accent);
@@ -10095,7 +10131,7 @@ textarea.composer-command-input {
 }
 
 .artifact-block:focus-visible {
-  outline: 2px solid var(--accent-primary);
+  outline: 2px solid var(--ring);
   outline-offset: 2px;
   border-radius: 6px;
 }
@@ -10221,7 +10257,7 @@ textarea.composer-command-input {
 .artifact-table th button:focus-visible,
 .artifact-copy-options button:focus-visible,
 .artifact-inspect-panel button:focus-visible {
-  outline: 2px solid var(--accent-primary);
+  outline: 2px solid var(--ring);
   outline-offset: 1px;
 }
 
@@ -12240,7 +12276,7 @@ textarea.composer-command-input {
 .artifact-file-list-button:hover,
 .artifact-file-list-button:focus-visible {
   background-color: var(--background-modifier-hover);
-  outline: 2px solid var(--accent-primary, var(--text-normal));
+  outline: 2px solid var(--ring);
   outline-offset: 1px;
 }
 
@@ -12754,8 +12790,10 @@ textarea.composer-command-input {
 
 .transcript-preview.is-compact .transcript-preview-actions {
   opacity: 0;
+  /* WIKI-298 survivor: `opacity` reveals the compact-preview actions on hover. */
   transition-property: opacity;
-  transition-duration: 120ms;
+  transition-duration: var(--motion-duration);
+  transition-timing-function: var(--motion-easing);
 }
 
 .transcript-preview.is-compact:hover .transcript-preview-actions,
@@ -14306,7 +14344,9 @@ textarea.composer-command-input {
   display: block;
   /* Fade in when decode completes. Only opacity animates — the full-
      resolution bitmap never runs through a filter chain, which used to
-     spike frame time on scroll when many images were on screen. WIKI-200. */
+     spike frame time on scroll when many images were on screen. WIKI-200.
+     WIKI-298 survivor: 220ms (not 120ms) — WIKI-189 tests measure this
+     shape and every WIKI-200 blur→sharp crossfade below must match it. */
   opacity: 0;
   transition-property: opacity;
   transition-duration: 220ms;
@@ -14453,7 +14493,7 @@ textarea.composer-command-input {
 }
 
 .artifact-image-expand:focus-visible {
-  outline: 2px solid var(--accent-primary);
+  outline: 2px solid var(--ring);
   outline-offset: 3px;
   border-radius: var(--radius-xs);
 }
@@ -14545,7 +14585,7 @@ textarea.composer-command-input {
 }
 
 .artifact-gallery-tile:focus-visible {
-  outline: 2px solid var(--accent-primary);
+  outline: 2px solid var(--ring);
   outline-offset: 3px;
 }
 
@@ -14643,7 +14683,7 @@ textarea.composer-command-input {
 }
 
 .markdown-image-frame:focus-visible {
-  outline: 2px solid var(--accent-primary);
+  outline: 2px solid var(--ring);
   outline-offset: 3px;
 }
 
@@ -14781,7 +14821,7 @@ textarea.composer-command-input {
 }
 
 .artifact-lightbox-action:focus-visible {
-  outline: 2px solid var(--accent-primary);
+  outline: 2px solid var(--ring);
   outline-offset: 2px;
 }
 
@@ -14879,7 +14919,7 @@ textarea.composer-command-input {
 .artifact-lightbox-nav.is-next { right: 20px; }
 
 .artifact-lightbox-nav:focus-visible {
-  outline: 2px solid var(--accent-primary);
+  outline: 2px solid var(--ring);
   outline-offset: 2px;
 }
 
@@ -15017,7 +15057,7 @@ textarea.composer-command-input {
 }
 
 .artifact-inspector-action:focus-visible {
-  outline: 2px solid var(--accent-primary);
+  outline: 2px solid var(--ring);
   outline-offset: 2px;
 }
 
@@ -16376,17 +16416,6 @@ textarea.composer-command-input {
   color: var(--text-muted);
 }
 
-@media (prefers-reduced-motion: reduce) {
-  *,
-  *::before,
-  *::after {
-    animation-duration: 0.01ms !important;
-    animation-iteration-count: 1 !important;
-    scroll-behavior: auto !important;
-    transition-duration: 0.01ms !important;
-  }
-}
-
 /* WIKI-242 baseline: small transcript controls keep a 24px minimum target.
    Real box size (no negative insets) so adjacent head controls cannot steal
    each other's clicks across the 6px gaps. */
@@ -16454,8 +16483,8 @@ body {
   border-radius: var(--radius-md);
   color: var(--text-muted);
   transition-property: background-color, color;
-  transition-duration: 120ms;
-  transition-timing-function: cubic-bezier(0.2, 0, 0, 1);
+  transition-duration: var(--motion-duration);
+  transition-timing-function: var(--motion-easing);
 }
 
 .tree-item-self.is-active {
@@ -16574,9 +16603,10 @@ body {
   background-color: var(--background-element);
   border-color: transparent;
   color: var(--text-muted);
+  /* WIKI-298 survivor: `scale` powers the 0.96 send-button press. */
   transition-property: background-color, color, scale;
-  transition-duration: 120ms;
-  transition-timing-function: cubic-bezier(0.2, 0, 0, 1);
+  transition-duration: var(--motion-duration);
+  transition-timing-function: var(--motion-easing);
 }
 
 .session-send:not(:disabled) {
@@ -16693,14 +16723,14 @@ body {
   line-height: 1;
   white-space: nowrap;
   cursor: pointer;
-  transition: background-color 120ms cubic-bezier(0.2, 0, 0, 1),
-    color 120ms cubic-bezier(0.2, 0, 0, 1),
-    border-color 120ms cubic-bezier(0.2, 0, 0, 1);
+  transition-property: background-color, color, border-color;
+  transition-duration: var(--motion-duration);
+  transition-timing-function: var(--motion-easing);
   user-select: none;
 }
 
 .bb-button:focus-visible {
-  outline: 2px solid var(--accent-primary, var(--text-normal));
+  outline: 2px solid var(--ring);
   outline-offset: 2px;
 }
 
@@ -16824,9 +16854,9 @@ body {
   background: transparent;
   color: var(--text-muted);
   cursor: pointer;
-  transition: background-color 120ms cubic-bezier(0.2, 0, 0, 1),
-    color 120ms cubic-bezier(0.2, 0, 0, 1),
-    border-color 120ms cubic-bezier(0.2, 0, 0, 1);
+  transition-property: background-color, color, border-color;
+  transition-duration: var(--motion-duration);
+  transition-timing-function: var(--motion-easing);
 }
 
 .bb-icon-button:hover:not(:disabled) {
@@ -16840,7 +16870,7 @@ body {
 }
 
 .bb-icon-button:focus-visible {
-  outline: 2px solid var(--accent-primary, var(--text-normal));
+  outline: 2px solid var(--ring);
   outline-offset: 2px;
 }
 
@@ -16867,8 +16897,9 @@ body {
   height: 28px;
   border-radius: var(--radius-md);
   color: var(--text-muted);
-  transition: background-color 120ms cubic-bezier(0.2, 0, 0, 1),
-    color 120ms cubic-bezier(0.2, 0, 0, 1);
+  transition-property: background-color, color;
+  transition-duration: var(--motion-duration);
+  transition-timing-function: var(--motion-easing);
 }
 
 .bb-tab-pill:hover:not(.bb-tab-pill--active) {
@@ -16897,7 +16928,7 @@ body {
 }
 
 .bb-tab-pill__button:focus-visible {
-  outline: 2px solid var(--accent-primary, var(--text-normal));
+  outline: 2px solid var(--ring);
   outline-offset: 2px;
 }
 
@@ -16942,8 +16973,10 @@ body {
   opacity: 0;
   pointer-events: none;
   cursor: pointer;
-  transition: opacity 120ms cubic-bezier(0.2, 0, 0, 1),
-    background-color 120ms cubic-bezier(0.2, 0, 0, 1);
+  /* WIKI-298 survivor: `opacity` reveals the tab close-button on hover. */
+  transition-property: opacity, background-color;
+  transition-duration: var(--motion-duration);
+  transition-timing-function: var(--motion-easing);
 }
 
 .bb-tab-pill:hover .bb-tab-pill__close,
@@ -17079,8 +17112,9 @@ body {
   text-align: left;
   text-decoration: none;
   cursor: pointer;
-  transition: background-color 120ms cubic-bezier(0.2, 0, 0, 1),
-    color 120ms cubic-bezier(0.2, 0, 0, 1);
+  transition-property: background-color, color;
+  transition-duration: var(--motion-duration);
+  transition-timing-function: var(--motion-easing);
 }
 
 .bb-menu-row:hover,
