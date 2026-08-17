@@ -3,6 +3,7 @@ from __future__ import annotations
 import argparse
 import asyncio
 import fcntl
+import logging
 import os
 import signal
 import time
@@ -18,6 +19,7 @@ from .fleet_monitor_ids import (
     fleet_monitor_request_id,
 )
 from .autopilot import AutopilotController
+from ..nofile_limit import raise_nofile_limit
 from .protocol import UnixSupervisorServer
 from .store import RunStore, RuntimePaths
 from .supervisor import Supervisor
@@ -142,6 +144,7 @@ async def _shutdown(
 
 
 async def run_daemon(args: argparse.Namespace) -> None:
+    raise_nofile_limit()
     paths = _paths_from_args(args)
     lock = _acquire_single_instance(paths)
     fixture_dir = args.fake_fixture_dir or os.environ.get(
@@ -197,6 +200,7 @@ async def run_daemon(args: argparse.Namespace) -> None:
 
 
 def main() -> None:
+    logging.basicConfig(level=logging.INFO)
     asyncio.run(run_daemon(parse_args()))
 
 

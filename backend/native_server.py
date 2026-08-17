@@ -7,7 +7,6 @@ import os
 import platform
 import plistlib
 import re
-import resource
 import secrets
 import signal
 import socket
@@ -22,6 +21,9 @@ from pathlib import Path
 import uvicorn
 
 from backend.app import native_trust
+from backend.app import nofile_limit
+
+raise_nofile_limit = nofile_limit.raise_nofile_limit
 
 DAEMON_AUTH_SOCKET_NAME = "wiki-app-secret.sock"
 DAEMON_AUTH_LOCK_NAME = "wiki-app-secret.lock"
@@ -49,51 +51,6 @@ TAURI_BUNDLE_PATH = Path(
 DAEMON_LOG_MAX_BYTES = 10 * 1024 * 1024
 DAEMON_LOG_BACKUPS = 5
 _LOG_REDIRECT_LOCK = threading.Lock()
-
-
-def _darwin_nofile_ceiling(hard: int) -> int:
-    try:
-        raw_limit = subprocess.check_output(
-            ["/usr/sbin/sysctl", "-n", "kern.maxfilesperproc"],
-            stderr=subprocess.DEVNULL,
-            text=True,
-        )
-        maxfiles_per_process = int(raw_limit.strip())
-    except (OSError, ValueError, subprocess.SubprocessError):
-        return hard
-    return min(hard, maxfiles_per_process)
-
-
-def raise_nofile_limit() -> tuple[int, int]:
-    """Raise the soft file-descriptor limit and report the resulting limits."""
-
-    try:
-        soft, hard = resource.getrlimit(resource.RLIMIT_NOFILE)
-    except (OSError, ValueError) as exc:
-        sys.stderr.write(f"unable to read RLIMIT_NOFILE: {exc}\n")
-        sys.stderr.flush()
-        return (-1, -1)
-
-    target_soft = hard
-    if sys.platform == "darwin":
-        target_soft = _darwin_nofile_ceiling(hard)
-
-    if soft < target_soft:
-        try:
-            resource.setrlimit(resource.RLIMIT_NOFILE, (target_soft, hard))
-        except (OSError, ValueError) as exc:
-            sys.stderr.write(f"unable to raise RLIMIT_NOFILE: {exc}\n")
-            sys.stderr.flush()
-        try:
-            soft, hard = resource.getrlimit(resource.RLIMIT_NOFILE)
-        except (OSError, ValueError) as exc:
-            sys.stderr.write(f"unable to read resulting RLIMIT_NOFILE: {exc}\n")
-            sys.stderr.flush()
-            return (-1, -1)
-
-    sys.stderr.write(f"RLIMIT_NOFILE soft={soft} hard={hard}\n")
-    sys.stderr.flush()
-    return soft, hard
 
 
 def parse_args() -> argparse.Namespace:
@@ -743,7 +700,6 @@ def main() -> None:
     log_path = Path(args.log_path).expanduser().absolute() if args.log_path else None
     if args.daemon and log_path:
         configure_daemon_log(log_path)
-    raise_nofile_limit()
 
     from backend.app.main import app, set_wiki_app_secret, wiki_app_secret
 

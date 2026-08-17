@@ -82,6 +82,7 @@ from .agent_runtime.version import RUNTIME_FINGERPRINT
 from .agent_runtime.wk_feature import WK_KINDS, is_wk_kind, wk_enabled
 from .frontend_static import mount_frontend_static
 from .next_review_schema import NextReviewIn
+from .nofile_limit import raise_nofile_limit
 from .rebase_schema import RebaseDirtyPrIn
 
 
@@ -174,6 +175,7 @@ def _rebase_bot_notification_sender(
 @asynccontextmanager
 async def lifespan(_app: FastAPI):
     global UNKNOWN_KIND_TELEMETRY, _MAIN_EVENT_LOOP
+    raise_nofile_limit()
     _MAIN_EVENT_LOOP = asyncio.get_running_loop()
     runtime_paths = RuntimePaths.from_env()
     from .agent_runtime import rebase_bot
