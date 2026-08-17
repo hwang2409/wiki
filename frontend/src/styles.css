@@ -16637,7 +16637,7 @@ body {
 /* Status bar: quiet chips row. Sits INSIDE the panel at the bottom;
    the panel's bottom rounding shows through because status-bar has no bg. */
 .status-bar {
-  min-height: 30px;
+  min-height: 36px;
   padding: 0 14px;
   border-top: 1px solid var(--hairline);
   background-color: transparent;
@@ -16645,19 +16645,26 @@ body {
   color: var(--text-faint);
 }
 
+/* WIKI-301: chip grammar mirrors .bb-tab-pill — 28px, radius-full, chrome
+   font-family at fs-xs/500, muted at rest, --state-hover on hover,
+   --surface-selected + text-normal when the window is active. Keeps the
+   5px --accent-primary pip prescribed by the bb tab-pill census. */
 .tmux-status-item {
-  height: 22px;
-  padding: 0 8px;
-  border-radius: var(--chip-radius);
+  height: 28px;
+  padding: 0 10px;
+  border-radius: var(--radius-full);
+  font-family: var(--font-chrome);
+  font-weight: 500;
+  font-size: var(--fs-xs, 12px);
   color: var(--text-muted);
 }
 
-.tmux-status-item:hover {
-  background-color: var(--background-modifier-hover);
+.tmux-status-item:hover:not(.is-active) {
+  background-color: var(--state-hover);
 }
 
 .tmux-status-item.is-active {
-  background-color: var(--background-modifier-hover);
+  background-color: var(--surface-selected);
   color: var(--text-normal);
 }
 
