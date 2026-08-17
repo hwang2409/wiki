@@ -131,7 +131,7 @@ type Mode =
   | "agent"
   | "terminal";
 type UtilityMode = "activity" | "graph" | "health" | "agents" | "tokens" | "dashboard" | "fleet-graph";
-type SidebarTab = "files" | "search" | "agents";
+type SidebarTab = "files" | "agents";
 type SplitPosition = "left" | "right" | "top" | "bottom";
 type DropZone = SplitPosition | "center";
 type ResourceKind = "note" | "file";
@@ -1226,7 +1226,13 @@ function FolderTree({
           <div className="tree-item" key={child.path}>
             <button
               className="tree-item-self nav-folder-title"
-              style={{ paddingInlineStart: `${depth * 17 + 4}px` }}
+              // WIKI-299: --folder-depth drives the sticky-tier top offset
+              // so ancestor folder rows pin as their subtree scrolls past.
+              // Padding still indents by the same 17px per level.
+              style={{
+                paddingInlineStart: `${depth * 17 + 4}px`,
+                ["--folder-depth" as never]: depth,
+              }}
               type="button"
               onClick={() => onToggleFolder(child.path)}
               onContextMenu={(event) => onContextMenu(event, "folder", child.path)}
@@ -1321,8 +1327,11 @@ export default function App() {
   const [draft, setDraft] = useState<NoteDraft>(emptyDraft);
   const [query, setQuery] = useState("");
   const [sidebarTab, setSidebarTab] = useState<SidebarTab>(() => {
+    // WIKI-299: search is no longer a sidebar tab; it is an inline
+    // persistent field at the top of the sidebar. Coerce any stored
+    // "search" value from prior versions back to "files".
     const stored = localStorage.getItem("wiki-sidebar-tab");
-    return stored === "search" || stored === "agents" ? stored : "files";
+    return stored === "agents" ? stored : "files";
   });
   const [agentTicket, setAgentTicket] = useState<string | null>(null);
   const [terminalRouteId, setTerminalRouteId] = useState<string | null>(null);
@@ -3695,7 +3704,6 @@ export default function App() {
   }> = [
     { key: "new-note", label: "New note", icon: SquarePen, active: false, onSelect: startNewNote },
     { key: "files", label: "Files", icon: FolderIcon, active: sidebarTab === "files", onSelect: () => setSidebarTab("files") },
-    { key: "search", label: "Search", icon: Search, active: sidebarTab === "search", onSelect: () => setSidebarTab("search") },
     { key: "agent-list", label: "Agent list", icon: SquareTerminal, active: sidebarTab === "agents", onSelect: () => setSidebarTab("agents") },
     { key: "new-terminal", label: "New terminal", title: "New terminal (C-a t)", icon: TerminalIcon, active: false, onSelect: createTerminalPane },
     { key: "agents", label: "Agents", icon: Bot, active: mode === "agents", onSelect: () => openUtilityView("agents") },
@@ -3710,6 +3718,32 @@ export default function App() {
   return (
     <div className={`app-container${sidebarVisible ? "" : " sidebar-hidden"}`}>
       <aside className="workspace-sidebar">
+        {/* WIKI-299: persistent inline note search — always visible,
+            no longer a separate tab. When query.trim() is non-empty
+            the results overlay replaces the mode body below. */}
+        <div className="sidebar-search" data-testid="sidebar-search">
+          <Search aria-hidden="true" className="sidebar-search-icon" size={14} />
+          <input
+            aria-label="Search notes"
+            className="sidebar-search-input"
+            data-testid="sidebar-search-input"
+            placeholder="Search notes"
+            type="search"
+            value={query}
+            onChange={(event) => setQuery(event.target.value)}
+          />
+          {query ? (
+            <button
+              aria-label="Clear search"
+              className="sidebar-search-clear"
+              data-testid="sidebar-search-clear"
+              type="button"
+              onClick={() => setQuery("")}
+            >
+              <X aria-hidden="true" size={12} />
+            </button>
+          ) : null}
+        </div>
         <nav
           aria-label="Views"
           className="sidebar-views"
@@ -3760,7 +3794,36 @@ export default function App() {
           ) : null}
         </nav>
 
-        {sidebarTab === "files" ? (
+        {query.trim() !== "" ? (
+          // WIKI-299: search results overlay. Same row shape as the file
+          // tree, manilla search-match tint via --wiki-sidebar-search-match.
+          // Preserves query across mode switches; clearing the input
+          // returns the currently selected tab (files or agents).
+          <div
+            className="sidebar-search-overlay"
+            data-mode="search"
+            data-testid="sidebar-search-overlay"
+          >
+            {searchResults.length > 0 ? (
+              searchResults.map((note) => (
+                <button
+                  className="search-result"
+                  key={note.id}
+                  type="button"
+                  onClick={() => openNote(note.path)}
+                >
+                  <span className="search-result-title">{basename(note.path)}</span>
+                  <span className="search-result-path">{note.path}</span>
+                  {note.excerpt ? (
+                    <span className="search-result-excerpt">{note.excerpt}</span>
+                  ) : null}
+                </button>
+              ))
+            ) : (
+              <div className="nav-empty">No matches for &ldquo;{query.trim()}&rdquo;</div>
+            )}
+          </div>
+        ) : sidebarTab === "files" ? (
           <div className="sidebar-mode" data-mode="files">
             <div className="sidebar-mode-title">
               <span className="sidebar-mode-title-label">Files</span>
@@ -3908,44 +3971,6 @@ export default function App() {
                   ) : null}
                 </>
               )}
-            </div>
-          </div>
-        ) : sidebarTab === "search" ? (
-          <div className="sidebar-mode" data-mode="search">
-            <div className="sidebar-mode-title">
-              <span className="sidebar-mode-title-label">Search</span>
-            </div>
-            <div className="search-panel">
-              <div className="search-input-container">
-                <input
-                  placeholder="Search..."
-                  type="search"
-                  value={query}
-                  onChange={(event) => setQuery(event.target.value)}
-                />
-              </div>
-              <div className="search-results">
-                {query.trim() === "" ? (
-                  <div className="nav-empty">Type to start searching</div>
-                ) : searchResults.length > 0 ? (
-                  searchResults.map((note) => (
-                    <button
-                      className="search-result"
-                      key={note.id}
-                      type="button"
-                      onClick={() => openNote(note.path)}
-                    >
-                      <span className="search-result-title">{basename(note.path)}</span>
-                      <span className="search-result-path">{note.path}</span>
-                      {note.excerpt ? (
-                        <span className="search-result-excerpt">{note.excerpt}</span>
-                      ) : null}
-                    </button>
-                  ))
-                ) : (
-                  <div className="nav-empty">No matches found</div>
-                )}
-              </div>
             </div>
           </div>
         ) : (
