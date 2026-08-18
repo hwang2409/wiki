@@ -69,7 +69,7 @@ from .agent_runtime import costs
 from .agent_runtime import graph_health
 from .agent_runtime.loop_state import derive_loop_state
 from .agent_runtime.archive_protocol import archive_is_committed
-from .agent_runtime.event_store import SQLiteEventStore, runtime_event_db_path
+from .agent_runtime.event_store import RuntimeEventStore, SQLiteEventStore
 from .agent_runtime.store import RuntimePaths
 from .agent_runtime.ticket import (
     base_ticket,
@@ -1163,8 +1163,8 @@ class SQLiteReadUnavailable(RuntimeError):
     """The default SQLite view cannot serve a visible response."""
 
 
-def _sqlite_event_store() -> SQLiteEventStore:
-    return SQLiteEventStore(runtime_event_db_path(AGENT_RUNTIME_DIR), migrate=False)
+def _sqlite_event_store() -> RuntimeEventStore:
+    return RuntimeEventStore(AGENT_RUNTIME_DIR, migrate=False)
 
 
 def _sqlite_ready_store(run_id: str) -> tuple[SQLiteEventStore, Any] | None:

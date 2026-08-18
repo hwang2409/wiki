@@ -24,7 +24,11 @@ from uuid import NAMESPACE_URL, UUID, uuid4, uuid5
 from .. import accounts, provider_health
 from .. import transcripts
 from .command_log import AgentCommand, CommandConflict, CommandQueue, CommandRetryable
-from .event_store import EventReducerAdapter, SQLiteEventStore, runtime_event_db_path
+from .event_store import (
+    EventReducerAdapter,
+    RuntimeEventStore,
+    SQLiteEventStore,
+)
 from .normalizer import NormalizedProviderEvent, normalize_provider_event
 from .process import (
     ProviderProcessStatus,
@@ -364,10 +368,7 @@ class Supervisor:
             raise ValueError("idempotency_cache_size must be positive")
         self.store = store
         self.adapter_factory = adapter_factory
-        self.event_store = SQLiteEventStore(
-            runtime_event_db_path(store.paths.runtime_dir),
-            migrate=False,
-        )
+        self.event_store = RuntimeEventStore(store.paths.runtime_dir)
         self.store.set_archive_events_exporter(
             lambda run_id, destination, legacy_source: self.event_store.export_events_jsonl(
                 run_id,
@@ -3038,7 +3039,8 @@ Preserve the same identity, role, worktree, orchestrator grouping, PR gates, and
                 continue
             # A new run has no SQLite file until its first dual write. There
             # is no unhealthy database to recover in that state.
-            if not raw_rows and not self.event_store.path.exists():
+            run_event_store = self.event_store.for_run(run_id)
+            if not raw_rows and not run_event_store.path.exists():
                 continue
             try:
                 materialized_seqs = self.event_store.materialized_raw_seqs(run_id)
@@ -3278,14 +3280,14 @@ Preserve the same identity, role, worktree, orchestrator grouping, PR gates, and
         return True
 
     async def _rebuild_materializer_database(self) -> None:
-        database_path = self.event_store.path
-        temp_directory = Path(
-            tempfile.mkdtemp(prefix="events-rebuild-", dir=database_path.parent)
-        )
-        temporary_path = temp_directory / database_path.name
-        try:
-            rebuilt = SQLiteEventStore(temporary_path)
-            for record in self.store.list_runs():
+        for record in self.store.list_runs():
+            target = self.event_store.for_run(record.run_id)
+            temp_directory = Path(
+                tempfile.mkdtemp(prefix="events-rebuild-", dir=target.path.parent)
+            )
+            temporary_path = temp_directory / target.path.name
+            try:
+                rebuilt = SQLiteEventStore(temporary_path)
                 raw_rows = sorted(
                     self.store.iter_raw_events(record.run_id),
                     key=lambda item: int(item["seq"]),
@@ -3336,19 +3338,15 @@ Preserve the same identity, role, worktree, orchestrator grouping, PR gates, and
                         normalized=normalized,
                     )
                 if not rebuilt.run_is_healthy(record.run_id):
-                    raise RuntimeError(f"rebuilt event store failed validation for {record.run_id}")
-            with rebuilt.connection() as connection:
-                connection.execute("PRAGMA wal_checkpoint(TRUNCATE)")
-            os.replace(temporary_path, database_path)
-            for suffix in ("-wal", "-shm"):
-                database_path.with_name(database_path.name + suffix).unlink(
-                    missing_ok=True
-                )
-            self.event_store = SQLiteEventStore(database_path, migrate=False)
-            self.event_store.ensure_schema()
-            self.materializer_reducers.clear()
-        finally:
-            shutil.rmtree(temp_directory, ignore_errors=True)
+                    raise RuntimeError(
+                        f"rebuilt event store failed validation for {record.run_id}"
+                    )
+                with rebuilt.connection() as connection:
+                    connection.execute("PRAGMA wal_checkpoint(TRUNCATE)")
+                target.replace_run_from(temporary_path, record.run_id)
+            finally:
+                shutil.rmtree(temp_directory, ignore_errors=True)
+        self.materializer_reducers.clear()
 
     async def _reconcile_sending_steer_effects(self) -> None:
         """Resolve every steer effect left at status='sending' by a prior boot.

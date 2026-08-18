@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import sqlite3
 from pathlib import Path
 from tempfile import TemporaryDirectory
 from unittest import mock
@@ -9,11 +10,15 @@ import pytest
 
 from backend.app.agent_runtime.event_store import (
     EventReducerAdapter,
+    RuntimeEventStore,
     SCHEMA_VERSION,
     SQLiteEventStore,
     migrate_event_db,
     replay_raw_jsonl,
+    runtime_event_db_path,
 )
+from backend.app.agent_runtime.normalizer import NormalizedProviderEvent
+from backend.app.agent_runtime.types import EventDisposition
 
 
 def _raw(seq: int, method: str, params: dict, *, received_at: str) -> dict:
@@ -473,3 +478,102 @@ def test_half_applied_migration_is_idempotent() -> None:
             }
         assert versions == [(version,) for version in range(1, SCHEMA_VERSION + 1)]
         assert "unread_event_seq" in columns
+
+
+def test_runtime_event_store_isolates_runs_in_separate_files() -> None:
+    with TemporaryDirectory() as tmp:
+        runtime = RuntimeEventStore(Path(tmp))
+        for run_id in ("run-a", "run-b"):
+            runtime.create_run(
+                run_id,
+                agent_id=run_id,
+                provider="codex",
+                created_at="2026-08-18T00:00:00Z",
+            )
+
+        assert runtime_event_db_path(tmp, "run-a").is_file()
+        assert runtime_event_db_path(tmp, "run-b").is_file()
+        assert runtime_event_db_path(tmp, "run-a") != runtime_event_db_path(
+            tmp, "run-b"
+        )
+
+        runtime.record_parity_record(
+            "run-a",
+            normalizer_version="test",
+            record_type="test",
+            path="test",
+            detail={},
+        )
+        assert runtime.parity_records("run-a")[0]["run_id"] == "run-a"
+        assert runtime.parity_records("run-b") == []
+
+
+def test_runtime_event_store_migrates_shared_database_and_resumes_partial_shard() -> None:
+    with TemporaryDirectory() as tmp:
+        runtime_path = Path(tmp)
+        legacy = SQLiteEventStore(runtime_event_db_path(runtime_path))
+        for run_id in ("run-a", "run-b"):
+            legacy.create_run(
+                run_id,
+                agent_id=run_id,
+                provider="codex",
+                created_at="2026-08-18T00:00:00Z",
+            )
+        partial = runtime_event_db_path(runtime_path, "run-a")
+        partial.parent.mkdir(parents=True)
+        partial.touch()
+
+        runtime = RuntimeEventStore(runtime_path)
+
+        assert not runtime_event_db_path(runtime_path).exists()
+        assert runtime.cursor("run-a").run_id == "run-a"
+        assert runtime.cursor("run-b").run_id == "run-b"
+        assert list(runtime_path.glob("events.sqlite3.legacy-*"))
+
+        reopened = RuntimeEventStore(runtime_path)
+        assert reopened.cursor("run-a").run_id == "run-a"
+
+
+def test_runtime_event_store_failure_is_limited_to_one_run() -> None:
+    with TemporaryDirectory() as tmp:
+        runtime_path = Path(tmp)
+        runtime = RuntimeEventStore(runtime_path)
+        for run_id in ("run-a", "run-b"):
+            runtime.create_run(
+                run_id,
+                agent_id=run_id,
+                provider="codex",
+                created_at="2026-08-18T00:00:00Z",
+            )
+
+        runtime_event_db_path(runtime_path, "run-a").write_bytes(b"")
+        normalized = NormalizedProviderEvent(
+            EventDisposition.UNKNOWN,
+            "unknown",
+            {},
+            None,
+        )
+        with pytest.raises(sqlite3.DatabaseError):
+            runtime.materialize(
+                "run-a",
+                {
+                    "seq": 1,
+                    "received_at": "now",
+                    "provider": "codex",
+                    "payload": {},
+                },
+                EventReducerAdapter("codex"),
+                normalized=normalized,
+            )
+        runtime.materialize(
+            "run-b",
+            {
+                "seq": 1,
+                "received_at": "now",
+                "provider": "codex",
+                "payload": {},
+            },
+            EventReducerAdapter("codex"),
+            normalized=normalized,
+        )
+        assert runtime.cursor("run-b").raw_seq == 1

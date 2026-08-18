@@ -798,10 +798,10 @@ class RunStore:
         exporter = self._archive_events_exporter
         if exporter is None:
             try:
-                from .event_store import SQLiteEventStore, runtime_event_db_path
+                from .event_store import RuntimeEventStore
 
-                exporter = SQLiteEventStore(
-                    runtime_event_db_path(self.paths.runtime_dir),
+                exporter = RuntimeEventStore(
+                    self.paths.runtime_dir,
                     migrate=False,
                 ).export_events_jsonl
             except Exception:

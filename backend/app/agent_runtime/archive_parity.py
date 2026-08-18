@@ -582,17 +582,10 @@ def _cursor_metadata(
     run_id: str,
 ) -> tuple[str, str] | None:
     try:
-        with event_store.connection(read_only=True) as connection:
-            row = connection.execute(
-                "SELECT normalizer_version, rebuild_state FROM run_cursors "
-                "WHERE run_id = ?",
-                (run_id,),
-            ).fetchone()
+        cursor = event_store.cursor(run_id)
     except Exception:
         return None
-    if row is None:
-        return None
-    return str(row[0]), str(row[1])
+    return cursor.normalizer_version, cursor.rebuild_state
 
 
 def _record_backfill_skip(
@@ -722,7 +715,9 @@ def backfill_headless_runs(
                 )
                 continue
             with tempfile.TemporaryDirectory(prefix="wiki-282-backfill-") as directory:
-                temporary_path = Path(directory) / "events.sqlite3"
+                temporary_path = (
+                    Path(directory) / "runs" / record.run_id / "events.sqlite3"
+                )
                 replay_raw_jsonl(
                     raw_path,
                     temporary_path,
