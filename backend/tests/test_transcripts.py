@@ -4096,10 +4096,13 @@ class ClientEchoRowTests(unittest.TestCase):
                     "kind": "codex_client_message",
                     "payload": {
                         "id": 3,
-                        "method": "turn/start",
+                        "method": "item/completed",
                         "params": {
-                            "threadId": "thread-1",
-                            "input": [{"type": "text", "text": "hello codex"}],
+                            "item": {
+                                "type": "userMessage",
+                                "id": "client-item",
+                                "content": [{"type": "text", "text": "client echo"}],
+                            },
                         },
                     },
                 },
@@ -4127,6 +4130,10 @@ class ClientEchoRowTests(unittest.TestCase):
         user = [event for event in parsed["events"] if event["kind"] == "user"]
         self.assertEqual(len(user), 1)
         self.assertEqual(user[0]["text"], "hello codex")
+        self.assertEqual(
+            parsed["dispositions"],
+            {"rendered": 1, "summarized": 0, "ignored": 1, "unknown": 0},
+        )
 
 
 class RegistryIdBeatsDiscoveryTests(unittest.TestCase):

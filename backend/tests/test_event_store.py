@@ -409,10 +409,13 @@ def test_codex_client_request_rows_never_render_events() -> None:
                 "direction": "client",
                 "payload": {
                     "id": 7,
-                    "method": "turn/start",
+                    "method": "item/completed",
                     "params": {
-                        "threadId": "thread-1",
-                        "input": [{"type": "text", "text": "hello codex"}],
+                        "item": {
+                            "type": "userMessage",
+                            "id": "client-item",
+                            "content": [{"type": "text", "text": "client echo"}],
+                        },
                     },
                 },
             },
@@ -441,6 +444,11 @@ def test_codex_client_request_rows_never_render_events() -> None:
         user_events = _user_events(store, "run-1")
         assert len(user_events) == 1
         assert user_events[0]["text"] == "hello codex"
+        dispositions = [
+            row[1] for row in store.view_rows("run-1")["dispositions"]
+        ]
+        assert dispositions.count("intentionally_ignored") == 1
+        assert dispositions.count("rendered") == 1
         assert store.run_is_healthy("run-1")
 
 
