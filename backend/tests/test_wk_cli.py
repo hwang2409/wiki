@@ -501,7 +501,7 @@ def test_idle_sigint_exits_with_stdin_blocked(tmp_path: Path) -> None:
             assert stderr_selector.select(timeout=5), "wk did not reach its input barrier"
             marker = process.stderr.readline()
             assert marker, "wk exited before reaching its input barrier"
-            if "[wk] ready" in marker:
+            if "[wk] readers-ready" in marker:
                 break
         process.send_signal(signal.SIGINT)
         try:
@@ -676,6 +676,51 @@ def test_shutdown_reaps_after_base_exception_from_close() -> None:
     assert lane.process.terminate_calls == 1
     assert lane.process.kill_calls == 1
     assert lane.process.wait_calls == 2
+
+
+def test_main_forces_kill_and_final_wait_before_loop_stop(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    release_shutdown = threading.Event()
+
+    class FakeProcess:
+        def __init__(self) -> None:
+            self.returncode: int | None = None
+            self.killed = False
+            self.wait_finished = threading.Event()
+
+        def kill(self) -> None:
+            self.killed = True
+            self.returncode = -9
+            release_shutdown.set()
+
+        async def wait(self) -> None:
+            self.wait_finished.set()
+
+    class SignalLane:
+        def __init__(self) -> None:
+            self.process = FakeProcess()
+            self._process = self.process
+
+        async def events(self) -> AsyncIterator[Mapping[str, Any]]:
+            if False:
+                yield {}
+
+    lane = SignalLane()
+
+    async def delayed_shutdown(*_args: Any, **_kwargs: Any) -> None:
+        await asyncio.to_thread(release_shutdown.wait)
+
+    monkeypatch.setattr(wk_feature, "_WK_ENABLED", True)
+    monkeypatch.setattr(wk_cli, "build_lane", lambda **_kwargs: lane)
+    monkeypatch.setattr(wk_cli, "one_shot", lambda *_args, **_kwargs: 0)
+    monkeypatch.setattr(wk_cli, "shutdown_lane", delayed_shutdown)
+    monkeypatch.setattr(wk_cli, "SHUTDOWN_WAIT_TIMEOUT", 0.01)
+    monkeypatch.setattr(wk_cli, "SHUTDOWN_PROCESS_TIMEOUT", 0.01)
+
+    assert wk_cli.main(["--workdir", str(tmp_path), "-p", "hello"]) == 0
+    assert lane.process.killed
+    assert lane.process.wait_finished.is_set()
 
 
 def test_shutdown_cancels_receive_task_before_close() -> None:

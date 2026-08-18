@@ -25,6 +25,9 @@ LANE_KINDS = {"claude": "wk-claude", "codex": "wk-codex"}
 EFFORT_LEVELS = ("minimal", "low", "medium", "high", "xhigh")
 MAX_LINE = 240
 _INPUT_SHUTDOWN = object()
+SHUTDOWN_CLOSE_TIMEOUT = 30
+SHUTDOWN_PROCESS_TIMEOUT = 5
+SHUTDOWN_WAIT_TIMEOUT = SHUTDOWN_CLOSE_TIMEOUT + (2 * SHUTDOWN_PROCESS_TIMEOUT) + 5
 
 
 class _InputShutdown(Exception):
@@ -32,9 +35,10 @@ class _InputShutdown(Exception):
 
 
 class _StdinReader:
-    def __init__(self, shutdown_fd: int) -> None:
+    def __init__(self, shutdown_fd: int, readers_ready: Callable[[], None] | None = None) -> None:
         self._fd = sys.stdin.fileno()
         self._shutdown_fd = shutdown_fd
+        self._readers_ready = readers_ready
         self._buffer = bytearray()
 
     def _take_line(self) -> str | None:
@@ -81,6 +85,8 @@ class _StdinReader:
 
         loop.add_reader(self._fd, read_ready)
         loop.add_reader(self._shutdown_fd, shutdown_ready)
+        if self._readers_ready is not None:
+            self._readers_ready()
         try:
             return await line_future
         finally:
@@ -390,12 +396,27 @@ async def _reap_provider_process(process: Any | None, timeout: float = 5) -> Non
         pass
 
 
+def _force_kill_provider_process(process: Any | None) -> bool:
+    if process is None:
+        return False
+    try:
+        if getattr(process, "returncode", None) is not None:
+            return False
+        kill = getattr(process, "kill", None)
+        if not callable(kill):
+            return False
+        kill()
+        return True
+    except BaseException:
+        return True
+
+
 async def shutdown_lane(
     lane: Any,
     *,
     active_turn: Any = None,
-    close_timeout: float = 30,
-    process_timeout: float = 5,
+    close_timeout: float = SHUTDOWN_CLOSE_TIMEOUT,
+    process_timeout: float = SHUTDOWN_PROCESS_TIMEOUT,
 ) -> None:
     """Cancel CLI work, close the lane, and reap its provider child."""
 
@@ -447,8 +468,13 @@ def repl(
     turn_state: Callable[[Any], None] | None = None,
     should_shutdown: Callable[[], bool] | None = None,
     shutdown_fd: int | None = None,
+    readers_ready: Callable[[], None] | None = None,
 ) -> None:
-    stdin_reader = _StdinReader(shutdown_fd) if input_fn is None and shutdown_fd is not None else None
+    stdin_reader = (
+        _StdinReader(shutdown_fd, readers_ready)
+        if input_fn is None and shutdown_fd is not None
+        else None
+    )
     started = False
     while True:
         if should_shutdown is not None and should_shutdown():
@@ -631,7 +657,7 @@ def main(argv: Sequence[str] | None = None) -> int:
                     )
                 else:
                     print(f"wk {args.lane} lane | model {model} | workdir {args.workdir}")
-                    print("Ctrl-C interrupts the current turn. Ctrl-D exits.")
+                    print("Ctrl-C exits. Ctrl-D exits.")
                     print("[wk] ready", file=sys.stderr, flush=True)
                     repl(
                         lane,
@@ -640,6 +666,9 @@ def main(argv: Sequence[str] | None = None) -> int:
                         turn_state=set_active_turn,
                         should_shutdown=shutdown_requested.is_set,
                         shutdown_fd=shutdown_read_fd,
+                        readers_ready=lambda: print(
+                            "[wk] readers-ready", file=sys.stderr, flush=True
+                        ),
                     )
                     code = 0
             if shutdown_requested.is_set():
@@ -653,9 +682,19 @@ def main(argv: Sequence[str] | None = None) -> int:
             try:
                 schedule_shutdown()
                 if shutdown_future is not None:
-                    shutdown_future.result(35)
+                    shutdown_future.result(SHUTDOWN_WAIT_TIMEOUT)
             except BaseException as exc:
                 print(f"[warn] lane shutdown failed: {exc}", file=sys.stderr)
+            try:
+                process = _provider_process(lane)
+                if _force_kill_provider_process(process):
+                    _run_on_loop(
+                        loop,
+                        _wait_for_process(process, SHUTDOWN_PROCESS_TIMEOUT),
+                        SHUTDOWN_PROCESS_TIMEOUT + 1,
+                    )
+            except BaseException as exc:
+                print(f"[warn] forced provider reap failed: {exc}", file=sys.stderr)
             try:
                 for signum in (signal.SIGINT, signal.SIGTERM):
                     try:
