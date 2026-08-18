@@ -428,6 +428,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     active_turn: Any = None
     shutdown_future: Any = None
     shutdown_requested = threading.Event()
+    shutdown_lock = threading.Lock()
 
     def set_active_turn(value: Any) -> None:
         nonlocal active_turn
@@ -435,22 +436,20 @@ def main(argv: Sequence[str] | None = None) -> int:
 
     def schedule_shutdown() -> None:
         nonlocal shutdown_future
-        if lane is None or shutdown_future is not None:
-            return
-        shutdown_future = asyncio.run_coroutine_threadsafe(
-            shutdown_lane(lane, active_turn=active_turn), loop
-        )
+        with shutdown_lock:
+            if lane is None or shutdown_future is not None:
+                return
+            shutdown_future = asyncio.run_coroutine_threadsafe(
+                shutdown_lane(lane, active_turn=active_turn), loop
+            )
 
-    def handle_signal(_signum: int, _frame: Any) -> None:
+    def handle_signal() -> None:
         shutdown_requested.set()
         schedule_shutdown()
-        if active_turn is None:
-            raise KeyboardInterrupt
 
-    previous_handlers: dict[int, Any] = {}
     for signum in (signal.SIGINT, signal.SIGTERM):
         try:
-            previous_handlers[signum] = signal.signal(signum, handle_signal)
+            loop.add_signal_handler(signum, handle_signal)
         except (OSError, ValueError):
             pass
     with tempfile.TemporaryDirectory(prefix="wk-cli-") as state:
@@ -497,8 +496,11 @@ def main(argv: Sequence[str] | None = None) -> int:
                         shutdown_future.result(35)
                 except Exception as exc:
                     print(f"[warn] lane shutdown failed: {exc}", file=sys.stderr)
-            for signum, handler in previous_handlers.items():
-                signal.signal(signum, handler)
+            for signum in (signal.SIGINT, signal.SIGTERM):
+                try:
+                    loop.remove_signal_handler(signum)
+                except (OSError, ValueError):
+                    pass
             loop.call_soon_threadsafe(loop.stop)
             thread.join(timeout=5)
             if not thread.is_alive():

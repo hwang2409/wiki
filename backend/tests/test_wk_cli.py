@@ -429,6 +429,65 @@ def test_sigint_during_turn_closes_lane_and_reaps_child(
     assert lane.process.killed
 
 
+def test_repeated_signal_during_close_uses_one_shutdown_task(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    class FakeProcess:
+        def __init__(self) -> None:
+            self.returncode: int | None = None
+            self.terminate_calls = 0
+            self.wait_calls = 0
+
+        def terminate(self) -> None:
+            self.terminate_calls += 1
+            self.returncode = 0
+
+        async def wait(self) -> None:
+            self.wait_calls += 1
+
+    class SignalLane:
+        def __init__(self) -> None:
+            self.process = FakeProcess()
+            self._process = self.process
+            self.close_started = threading.Event()
+            self.release_close = threading.Event()
+            self.close_calls = 0
+
+        async def start(self, _prompt: str) -> None:
+            await asyncio.Event().wait()
+
+        async def events(self) -> AsyncIterator[Mapping[str, Any]]:
+            if False:
+                yield {}
+
+        async def close(self) -> None:
+            self.close_calls += 1
+            self.close_started.set()
+            await asyncio.to_thread(self.release_close.wait)
+
+    monkeypatch.setattr(wk_feature, "_WK_ENABLED", True)
+    lane = SignalLane()
+    monkeypatch.setattr(wk_cli, "build_lane", lambda **_kwargs: lane)
+
+    def interrupt_process() -> None:
+        os.kill(os.getpid(), signal.SIGINT)
+        assert lane.close_started.wait(2)
+        os.kill(os.getpid(), signal.SIGTERM)
+        threading.Event().wait(0.1)
+        lane.release_close.set()
+
+    timer = threading.Timer(0.1, interrupt_process)
+    timer.start()
+    try:
+        assert wk_cli.main(["--workdir", str(tmp_path), "-p", "hello"]) == 130
+    finally:
+        timer.cancel()
+
+    assert lane.close_calls == 1
+    assert lane.process.terminate_calls == 1
+    assert lane.process.wait_calls == 1
+
+
 def test_shutdown_cancels_receive_task_before_close() -> None:
     class HangingLane:
         def __init__(self) -> None:
