@@ -1167,6 +1167,7 @@ class WkClaudeLane:
         self._client: ClaudeSdkClient | None = None
         self._receive_task: asyncio.Task[None] | None = None
         self._closed = False
+        self._bootstrap_policy_verified = False
         self._startup_ready = asyncio.Event()
         self._startup_error: BaseException | None = None
         self._auth_identity: dict[str, str] | None = None
@@ -1216,7 +1217,7 @@ class WkClaudeLane:
             transport=transport_type(prompt=None, options=transport_options),
         )
 
-    def _verify_turn_boundary(self) -> None:
+    def _verify_turn_boundary(self, *, require_policy: bool = True) -> None:
         self._settings_guard.verify_unchanged()
         if self._auth_identity is None and (
             self._client_factory is None and self._options_factory is None
@@ -1228,7 +1229,8 @@ class WkClaudeLane:
             )
             if current != self._auth_identity:
                 raise WkClaudePlanAuthError("Claude plan auth identity changed during the run")
-        self.translator.verify_runtime_policy()
+        if require_policy:
+            self.translator.verify_runtime_policy()
 
     async def _receive(self) -> None:
         assert self._client is not None
@@ -1265,11 +1267,13 @@ class WkClaudeLane:
             {"raw": self.translator.raw_events[-1], "event": event.to_dict()}
         )
 
-    async def _query_provider(self, prompt: str) -> None:
+    async def _query_provider(self, prompt: str, *, require_policy: bool = True) -> None:
         if self._client is None:
             raise WkClaudeError("Claude lane is not started")
         try:
-            self._verify_turn_boundary()
+            self._verify_turn_boundary(
+                require_policy=require_policy or self._bootstrap_policy_verified
+            )
             await self._client.query(prompt)
         except asyncio.CancelledError:
             raise
@@ -1331,8 +1335,17 @@ class WkClaudeLane:
     async def start(self, prompt: str) -> None:
         try:
             await self._ensure_client()
+            # Claude Code emits its system/init record only after the first
+            # user message, so the first query must go out before the lane
+            # can verify the init-derived tool policy.  Plan auth is already
+            # proven pre-connect; init verification still fails the run when
+            # the record arrives with a bad auth source or tool set.
+            await self._query_provider(
+                prompt, require_policy=self._bootstrap_policy_verified
+            )
             await self._await_startup()
-            await self._query_provider(prompt)
+            self.translator.verify_runtime_policy()
+            self._bootstrap_policy_verified = True
         except asyncio.CancelledError:
             raise
         except Exception as exc:
@@ -1346,6 +1359,7 @@ class WkClaudeLane:
             await self._ensure_client(resume=session_id)
             await self._await_startup()
             await self._verify_boundary()
+            self._bootstrap_policy_verified = True
             await self._deliver_pending()
         except asyncio.CancelledError:
             raise

@@ -374,6 +374,7 @@ class WkCodexLane:
         model: str,
         loop: WkLoop,
         role: str = "review",
+        effort: str | None = None,
         command: Sequence[str] = ("codex", "app-server", "--stdio"),
         auth_command: Sequence[str] | None = None,
         environment: Mapping[str, str] | None = None,
@@ -392,6 +393,7 @@ class WkCodexLane:
         self.worktree = worktree
         self.model = model
         self.role = role
+        self.effort = effort
         self.loop = loop
         self.environment = codex_plan_auth_environment(environment)
         del auth_command
@@ -430,6 +432,7 @@ class WkCodexLane:
             worktree=str(worktree),
             prompt="",
             execution_kind="wk-codex",
+            effort=effort,
             run_id=run_id,
         )
         self._adapter = CodexAppServerAdapter(
@@ -603,7 +606,7 @@ class WkCodexLane:
                 StartRequest(
                     prompt=prompt,
                     model=self.model,
-                    effort=None,
+                    effort=self.effort,
                     worktree=str(self.worktree),
                     run_id=self.run_id,
                     agent_id=self.agent_id,
