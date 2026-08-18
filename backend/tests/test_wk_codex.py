@@ -145,6 +145,25 @@ def test_codex_inner_record_preserves_lane_role(monkeypatch: pytest.MonkeyPatch,
     assert lane._adapter.env["WIKI_AGENT_ROLE"] == "review"
 
 
+def test_codex_lane_passes_effort_to_the_adapter(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    monkeypatch.setattr(wk_feature, "_WK_ENABLED", True)
+    lane = WkCodexLane(
+        metadata=WkRunMetadata("wk-codex"),
+        run_id="run-codex-effort",
+        agent_id="WIKI-289",
+        worktree=tmp_path,
+        model="gpt-5.6-sol",
+        loop=WkLoop(status_path=tmp_path / "status.json"),
+        effort="high",
+        command=(sys.executable, str(FIXTURE)),
+        environment=_environment(tmp_path),
+    )
+    assert lane.effort == "high"
+    assert lane._adapter.effort == "high"
+
+
 def test_plan_auth_environment_rejects_api_credentials() -> None:
     from backend.app.agent_runtime.wk_codex import codex_plan_auth_environment
 

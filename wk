@@ -1,0 +1,21 @@
+#!/usr/bin/env bash
+# Terminal driver for the wk provider lanes (backend/app/agent_runtime/wk_cli.py).
+# WIKI_ENABLE_WK must be exported before Python starts: the flag is frozen when
+# wk_feature is imported, which happens during backend package import.
+set -euo pipefail
+
+root="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+python="$root/.venv/bin/python"
+if [[ ! -x "$python" ]]; then
+  # Worktrees have no .venv; borrow the main checkout's venv.
+  common="$(git -C "$root" rev-parse --git-common-dir 2>/dev/null || true)"
+  if [[ -n "$common" && -x "$common/../.venv/bin/python" ]]; then
+    python="$common/../.venv/bin/python"
+  else
+    python="$(command -v python3)"
+  fi
+fi
+
+export WIKI_ENABLE_WK=1
+export PYTHONPATH="$root${PYTHONPATH:+:$PYTHONPATH}"
+exec "$python" -m backend.app.agent_runtime.wk_cli "$@"
