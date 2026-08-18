@@ -218,6 +218,34 @@ def test_recorded_sdk_frames_cross_lane_transport_boundary(monkeypatch: pytest.M
     assert client.queries == ["start"]
 
 
+def test_repeated_start_rechecks_runtime_policy(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    async def run() -> tuple[_RecordedClient, WkClaudeLane]:
+        monkeypatch.setattr(wk_feature, "_WK_ENABLED", True)
+        client = _RecordedClient(_fixture_events())
+        lane = WkClaudeLane(
+            metadata=WkRunMetadata("wk-claude"),
+            run_id="run-repeat-start",
+            agent_id="WIKI-336",
+            worktree=tmp_path,
+            model="sonnet",
+            loop=WkLoop(status_path=tmp_path / "status.json"),
+            client_factory=lambda _options: client,
+            options_factory=lambda **_kwargs: object(),
+            steering_path=tmp_path / "steering.json",
+        )
+        await lane.start("start")
+        lane.translator._effective_tools = frozenset()
+        with pytest.raises(WkClaudeError, match="effective tool policy drifted"):
+            await lane.start("retry")
+        await lane.close()
+        return client, lane
+
+    client, _lane = asyncio.run(run())
+    assert client.queries == ["start"]
+
+
 def test_real_sdk_subprocess_transport_receives_sanitized_env(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:

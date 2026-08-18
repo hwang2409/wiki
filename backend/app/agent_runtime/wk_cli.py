@@ -9,8 +9,10 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import inspect
 import json
 import os
+import signal
 import sys
 import tempfile
 import threading
@@ -18,7 +20,6 @@ import uuid
 from collections.abc import AsyncIterator, Callable, Mapping, Sequence
 from pathlib import Path
 from typing import Any
-
 
 LANE_KINDS = {"claude": "wk-claude", "codex": "wk-codex"}
 EFFORT_LEVELS = ("minimal", "low", "medium", "high", "xhigh")
@@ -255,6 +256,88 @@ def _run_on_loop(loop: asyncio.AbstractEventLoop, coro: Any, timeout: float | No
     return asyncio.run_coroutine_threadsafe(coro, loop).result(timeout)
 
 
+def _provider_process(lane: Any) -> Any | None:
+    pending = [lane]
+    seen: set[int] = set()
+    while pending:
+        owner = pending.pop()
+        if owner is None or id(owner) in seen:
+            continue
+        seen.add(id(owner))
+        process = getattr(owner, "_process", None)
+        if process is not None:
+            return process
+        for name in ("_client", "_adapter", "_transport", "transport"):
+            child = getattr(owner, name, None)
+            if child is not None:
+                pending.append(child)
+    return None
+
+
+async def _wait_for_process(process: Any, timeout: float) -> None:
+    wait = getattr(process, "wait", None)
+    if not callable(wait):
+        return
+    result = wait()
+    if inspect.isawaitable(result):
+        await asyncio.wait_for(result, timeout)
+
+
+async def _reap_provider_process(process: Any | None, timeout: float = 5) -> None:
+    if process is None:
+        return
+    if getattr(process, "returncode", None) is None:
+        terminate = getattr(process, "terminate", None)
+        if callable(terminate):
+            result = terminate()
+            if inspect.isawaitable(result):
+                await result
+    timed_out = False
+    try:
+        await _wait_for_process(process, timeout)
+    except TimeoutError:
+        timed_out = True
+    except ProcessLookupError:
+        return
+    if not timed_out and getattr(process, "returncode", None) is not None:
+        return
+    kill = getattr(process, "kill", None)
+    if callable(kill):
+        result = kill()
+        if inspect.isawaitable(result):
+            await result
+    try:
+        await _wait_for_process(process, timeout)
+    except (TimeoutError, ProcessLookupError):
+        return
+
+
+async def shutdown_lane(
+    lane: Any,
+    *,
+    active_turn: Any = None,
+    close_timeout: float = 30,
+    process_timeout: float = 5,
+) -> None:
+    """Cancel CLI work, close the lane, and reap its provider child."""
+
+    if active_turn is not None and not active_turn.done():
+        active_turn.cancel()
+    process = _provider_process(lane)
+    for name in ("_receive_task", "_pump_task"):
+        task = getattr(lane, name, None)
+        if isinstance(task, asyncio.Task) and not task.done():
+            task.cancel()
+    close_error: BaseException | None = None
+    try:
+        await asyncio.wait_for(lane.close(), close_timeout)
+    except Exception as exc:
+        close_error = exc
+    await _reap_provider_process(process, timeout=process_timeout)
+    if close_error is not None:
+        raise close_error
+
+
 def repl(
     lane: Any,
     events: AsyncIterator[Mapping[str, Any]],
@@ -262,9 +345,13 @@ def repl(
     *,
     input_fn: Callable[[str], str] = input,
     out: Callable[[str], None] = print,
+    turn_state: Callable[[Any], None] | None = None,
+    should_shutdown: Callable[[], bool] | None = None,
 ) -> None:
     started = False
     while True:
+        if should_shutdown is not None and should_shutdown():
+            return
         try:
             line = input_fn("wk> ")
         except EOFError:
@@ -272,6 +359,8 @@ def repl(
             return
         except KeyboardInterrupt:
             out("")
+            if should_shutdown is not None and should_shutdown():
+                return
             continue
         text = line.strip()
         if not text:
@@ -279,10 +368,18 @@ def repl(
         fut = asyncio.run_coroutine_threadsafe(
             run_turn(lane, events, text, first=not started, out=out), loop
         )
-        status = wait_for_turn(
-            fut, lambda: _run_on_loop(loop, lane.interrupt(), 10), out
-        )
+        if turn_state is not None:
+            turn_state(fut)
+        try:
+            status = wait_for_turn(
+                fut, lambda: _run_on_loop(loop, lane.interrupt(), 10), out
+            )
+        finally:
+            if turn_state is not None:
+                turn_state(None)
         started = started or status is not None
+        if should_shutdown is not None and should_shutdown():
+            return
         if status == "closed":
             out("[session] event stream ended")
             return
@@ -295,11 +392,18 @@ def one_shot(
     prompt: str,
     *,
     out: Callable[[str], None] = print,
+    turn_state: Callable[[Any], None] | None = None,
 ) -> int:
     fut = asyncio.run_coroutine_threadsafe(
         run_turn(lane, events, prompt, first=True, out=out), loop
     )
-    status = wait_for_turn(fut, lambda: _run_on_loop(loop, lane.interrupt(), 10), out)
+    if turn_state is not None:
+        turn_state(fut)
+    try:
+        status = wait_for_turn(fut, lambda: _run_on_loop(loop, lane.interrupt(), 10), out)
+    finally:
+        if turn_state is not None:
+            turn_state(None)
     return 0 if status == "ok" else 1
 
 
@@ -320,6 +424,35 @@ def main(argv: Sequence[str] | None = None) -> int:
     thread = threading.Thread(target=loop.run_forever, name="wk-cli-loop", daemon=True)
     thread.start()
     code = 1
+    lane = None
+    active_turn: Any = None
+    shutdown_future: Any = None
+    shutdown_requested = threading.Event()
+
+    def set_active_turn(value: Any) -> None:
+        nonlocal active_turn
+        active_turn = value
+
+    def schedule_shutdown() -> None:
+        nonlocal shutdown_future
+        if lane is None or shutdown_future is not None:
+            return
+        shutdown_future = asyncio.run_coroutine_threadsafe(
+            shutdown_lane(lane, active_turn=active_turn), loop
+        )
+
+    def handle_signal(_signum: int, _frame: Any) -> None:
+        shutdown_requested.set()
+        schedule_shutdown()
+        if active_turn is None:
+            raise KeyboardInterrupt
+
+    previous_handlers: dict[int, Any] = {}
+    for signum in (signal.SIGINT, signal.SIGTERM):
+        try:
+            previous_handlers[signum] = signal.signal(signum, handle_signal)
+        except (OSError, ValueError):
+            pass
     with tempfile.TemporaryDirectory(prefix="wk-cli-") as state:
 
         async def make_lane() -> Any:
@@ -331,26 +464,41 @@ def main(argv: Sequence[str] | None = None) -> int:
                 state_dir=Path(state),
             )
 
-        lane = None
         try:
             lane = _run_on_loop(loop, make_lane(), 60)
             events = lane.events().__aiter__()
             if args.prompt is not None:
-                code = one_shot(lane, events, loop, args.prompt)
+                code = one_shot(
+                    lane, events, loop, args.prompt, turn_state=set_active_turn
+                )
             else:
                 print(f"wk {args.lane} lane | model {model} | workdir {args.workdir}")
                 print("Ctrl-C interrupts the current turn. Ctrl-D exits.")
-                repl(lane, events, loop)
+                repl(
+                    lane,
+                    events,
+                    loop,
+                    turn_state=set_active_turn,
+                    should_shutdown=shutdown_requested.is_set,
+                )
                 code = 0
+            if shutdown_requested.is_set():
+                code = 130
+        except KeyboardInterrupt:
+            code = 130
         except Exception as exc:
             print(f"[error] {type(exc).__name__}: {exc}", file=sys.stderr)
             code = 1
         finally:
             if lane is not None:
                 try:
-                    _run_on_loop(loop, lane.close(), 30)
+                    schedule_shutdown()
+                    if shutdown_future is not None:
+                        shutdown_future.result(35)
                 except Exception as exc:
-                    print(f"[warn] lane close failed: {exc}", file=sys.stderr)
+                    print(f"[warn] lane shutdown failed: {exc}", file=sys.stderr)
+            for signum, handler in previous_handlers.items():
+                signal.signal(signum, handler)
             loop.call_soon_threadsafe(loop.stop)
             thread.join(timeout=5)
             if not thread.is_alive():

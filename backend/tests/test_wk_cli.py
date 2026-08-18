@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import asyncio
 import json
+import os
+import signal
 import threading
 from collections.abc import AsyncIterator, Mapping
 from pathlib import Path
@@ -9,6 +11,7 @@ from typing import Any
 
 import pytest
 
+from backend.app.agent_runtime import wk_cli, wk_feature
 from backend.app.agent_runtime.wk_cli import (
     default_model_id,
     one_shot,
@@ -16,10 +19,10 @@ from backend.app.agent_runtime.wk_cli import (
     render_item,
     repl,
     run_turn,
+    shutdown_lane,
     turn_end_status,
     wait_for_turn,
 )
-
 
 FIXTURE = Path(__file__).parent / "fixtures" / "agent_runtime" / "claude_sdk_lane_events.jsonl"
 
@@ -358,3 +361,92 @@ def test_wait_for_turn_reports_exceptions() -> None:
     out: list[str] = []
     assert wait_for_turn(FailedFuture(), lambda: None, out.append) is None
     assert any("lane exploded" in line for line in out)
+
+
+def test_sigint_during_turn_closes_lane_and_reaps_child(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    class FakeProcess:
+        def __init__(self) -> None:
+            self.returncode: int | None = None
+            self.terminated = False
+            self.killed = False
+
+        def terminate(self) -> None:
+            self.terminated = True
+
+        def kill(self) -> None:
+            self.killed = True
+            self.returncode = -9
+
+        async def wait(self) -> None:
+            if self.returncode is None:
+                await asyncio.Event().wait()
+
+    class SignalLane:
+        def __init__(self) -> None:
+            self.process = FakeProcess()
+            self._process = self.process
+            self.closed = False
+            self.interrupts = 0
+            self.turn_cancelled = False
+
+        async def start(self, _prompt: str) -> None:
+            try:
+                await asyncio.Event().wait()
+            except asyncio.CancelledError:
+                self.turn_cancelled = True
+                raise
+
+        async def interrupt(self) -> None:
+            self.interrupts += 1
+
+        async def close(self) -> None:
+            self.closed = True
+
+        async def events(self) -> AsyncIterator[Mapping[str, Any]]:
+            if False:
+                yield {}
+
+    monkeypatch.setattr(wk_feature, "_WK_ENABLED", True)
+    lane = SignalLane()
+    monkeypatch.setattr(wk_cli, "build_lane", lambda **_kwargs: lane)
+
+    def interrupt_process() -> None:
+        os.kill(os.getpid(), signal.SIGINT)
+
+    timer = threading.Timer(0.1, interrupt_process)
+    timer.start()
+    try:
+        assert wk_cli.main(["--workdir", str(tmp_path), "-p", "hello"]) == 130
+    finally:
+        timer.cancel()
+
+    assert lane.closed
+    assert lane.turn_cancelled
+    assert lane.interrupts == 0
+    assert lane.process.terminated
+    assert lane.process.killed
+
+
+def test_shutdown_cancels_receive_task_before_close() -> None:
+    class HangingLane:
+        def __init__(self) -> None:
+            self.close_called = False
+            self.receive_task = asyncio.create_task(self._wait())
+            self._receive_task = self.receive_task
+
+        async def _wait(self) -> None:
+            await asyncio.Event().wait()
+
+        async def close(self) -> None:
+            self.close_called = True
+
+    async def run() -> HangingLane:
+        lane = HangingLane()
+        await shutdown_lane(lane, process_timeout=0.01)
+        return lane
+
+    lane = asyncio.run(run())
+    assert lane.close_called
+    assert lane.receive_task.cancelled()
