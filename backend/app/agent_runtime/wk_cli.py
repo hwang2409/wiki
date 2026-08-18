@@ -34,7 +34,7 @@ def default_model_id(lane: str) -> str:
     raise ValueError(f"no default wk model for lane: {lane}")
 
 
-def build_parser() -> argparse.ArgumentParser:
+def parse_cli(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         prog="wk",
         description="Chat with a wk provider lane from a plain terminal.",
@@ -44,11 +44,6 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--effort", choices=EFFORT_LEVELS, help="reasoning effort (codex lane only)")
     parser.add_argument("--workdir", type=Path, default=Path.cwd(), help="lane worktree (default: current directory)")
     parser.add_argument("-p", "--prompt", help="one-shot mode: run a single turn and exit")
-    return parser
-
-
-def parse_cli(argv: Sequence[str] | None = None) -> argparse.Namespace:
-    parser = build_parser()
     args = parser.parse_args(argv)
     if args.lane == "claude" and args.effort is not None:
         parser.error("wk-claude workers do not accept reasoning effort")
