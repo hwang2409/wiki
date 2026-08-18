@@ -332,6 +332,126 @@ def test_health_check_covers_every_derived_table(table: str, predicate: str) -> 
         assert not store.run_is_healthy("run-1")
 
 
+def _user_events(store: SQLiteEventStore, run_id: str) -> list[dict]:
+    return [
+        event
+        for event in (
+            json.loads(row[3]) for row in store.view_rows(run_id)["events"]
+        )
+        if event.get("kind") == "user"
+    ]
+
+
+def test_claude_stdin_echo_does_not_duplicate_replayed_user_event() -> None:
+    """WIKI-337: the supervisor's stdin write is echoed as an ignored
+    claude_client_message row, then the CLI replays the same message on
+    stdout (--replay-user-messages). Only the replay may render."""
+
+    with TemporaryDirectory() as tmp:
+        store = SQLiteEventStore(Path(tmp) / "events.sqlite3")
+        store.create_run(
+            "run-1",
+            agent_id="WIKI-337",
+            provider="claude",
+            created_at="2026-08-18T00:00:00Z",
+        )
+        reducer = EventReducerAdapter("claude")
+        message = {
+            "role": "user",
+            "content": [{"type": "text", "text": "steer: tighten scope"}],
+        }
+        store.materialize(
+            "run-1",
+            {
+                "seq": 1,
+                "received_at": "2026-08-18T00:00:01Z",
+                "provider": "claude",
+                "direction": "stdin",
+                "payload": {"type": "user", "session_id": "", "message": message},
+            },
+            reducer,
+        )
+        store.materialize(
+            "run-1",
+            {
+                "seq": 2,
+                "received_at": "2026-08-18T00:00:02Z",
+                "provider": "claude",
+                "direction": "stdout",
+                "payload": {"type": "user", "message": message},
+            },
+            reducer,
+        )
+        user_events = _user_events(store, "run-1")
+        assert len(user_events) == 1
+        assert user_events[0]["text"] == "steer: tighten scope"
+        # The survivor is the stdout replay, not the stdin echo.
+        assert user_events[0]["ts"] == "2026-08-18T00:00:02Z"
+        assert store.run_is_healthy("run-1")
+
+
+def test_codex_client_request_rows_never_render_events() -> None:
+    with TemporaryDirectory() as tmp:
+        store = SQLiteEventStore(Path(tmp) / "events.sqlite3")
+        store.create_run(
+            "run-1",
+            agent_id="WIKI-337",
+            provider="codex",
+            created_at="2026-08-18T00:00:00Z",
+        )
+        reducer = EventReducerAdapter("codex")
+        store.materialize(
+            "run-1",
+            {
+                "seq": 1,
+                "received_at": "2026-08-18T00:00:01Z",
+                "provider": "codex",
+                "direction": "client",
+                "payload": {
+                    "id": 7,
+                    "method": "item/completed",
+                    "params": {
+                        "item": {
+                            "type": "userMessage",
+                            "id": "client-item",
+                            "content": [{"type": "text", "text": "client echo"}],
+                        },
+                    },
+                },
+            },
+            reducer,
+        )
+        store.materialize(
+            "run-1",
+            {
+                "seq": 2,
+                "received_at": "2026-08-18T00:00:02Z",
+                "provider": "codex",
+                "direction": "server",
+                "payload": {
+                    "method": "item/completed",
+                    "params": {
+                        "item": {
+                            "type": "userMessage",
+                            "id": "item-1",
+                            "content": [{"type": "text", "text": "hello codex"}],
+                        }
+                    },
+                },
+            },
+            reducer,
+        )
+        user_events = _user_events(store, "run-1")
+        assert len(user_events) == 1
+        assert user_events[0]["text"] == "hello codex"
+        dispositions = [
+            row[1] for row in store.view_rows("run-1")["dispositions"]
+        ]
+        assert dispositions.count("intentionally_ignored") == 1
+        assert dispositions.count("rendered") == 1
+        assert store.run_is_healthy("run-1")
+
+
 def test_half_applied_migration_is_idempotent() -> None:
     with TemporaryDirectory() as tmp:
         path = Path(tmp) / "events.sqlite3"
