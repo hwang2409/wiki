@@ -429,6 +429,106 @@ def test_sigint_during_turn_closes_lane_and_reaps_child(
     assert lane.process.killed
 
 
+def test_idle_sigint_wakes_stdin_and_closes_lane(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    class SignalLane:
+        def __init__(self) -> None:
+            self.close_started = threading.Event()
+            self.closed = False
+
+        async def close(self) -> None:
+            self.closed = True
+            self.close_started.set()
+
+        async def events(self) -> AsyncIterator[Mapping[str, Any]]:
+            if False:
+                yield {}
+
+    input_started = threading.Event()
+    release_input = threading.Event()
+    main_done = threading.Event()
+    forced_release = threading.Event()
+    lane = SignalLane()
+
+    def read_input(_prompt: str) -> str:
+        input_started.set()
+        release_input.wait(5)
+        return ""
+
+    def send_signal() -> None:
+        input_started.wait(5)
+        os.kill(os.getpid(), signal.SIGINT)
+        lane.close_started.wait(5)
+        if not main_done.wait(2):
+            forced_release.set()
+            release_input.set()
+
+    monkeypatch.setattr(wk_feature, "_WK_ENABLED", True)
+    monkeypatch.setattr(wk_cli, "build_lane", lambda **_kwargs: lane)
+    monkeypatch.setattr("builtins.input", read_input)
+    sender = threading.Thread(target=send_signal)
+    sender.start()
+    try:
+        assert wk_cli.main(["--workdir", str(tmp_path)]) == 130
+    finally:
+        main_done.set()
+        release_input.set()
+        sender.join(timeout=5)
+
+    assert input_started.is_set()
+    assert lane.closed
+    assert not forced_release.is_set()
+
+
+def test_sigint_during_lane_creation_reaches_shutdown_funnel(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    creation_started = threading.Event()
+    release_creation = threading.Event()
+
+    class SignalLane:
+        def __init__(self) -> None:
+            self.closed = False
+            self.started = False
+
+        async def start(self, _prompt: str) -> None:
+            self.started = True
+
+        async def close(self) -> None:
+            self.closed = True
+
+        async def events(self) -> AsyncIterator[Mapping[str, Any]]:
+            if False:
+                yield {}
+
+    lane = SignalLane()
+
+    def build_during_signal(**_kwargs: Any) -> SignalLane:
+        creation_started.set()
+        release_creation.wait(5)
+        return lane
+
+    def send_signal() -> None:
+        creation_started.wait(5)
+        os.kill(os.getpid(), signal.SIGINT)
+        release_creation.set()
+
+    monkeypatch.setattr(wk_feature, "_WK_ENABLED", True)
+    monkeypatch.setattr(wk_cli, "build_lane", build_during_signal)
+    sender = threading.Thread(target=send_signal)
+    sender.start()
+    try:
+        assert wk_cli.main(["--workdir", str(tmp_path), "-p", "hello"]) == 130
+    finally:
+        release_creation.set()
+        sender.join(timeout=5)
+
+    assert creation_started.is_set()
+    assert lane.closed
+    assert not lane.started
+
+
 def test_repeated_signal_during_close_uses_one_shutdown_task(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
@@ -468,12 +568,23 @@ def test_repeated_signal_during_close_uses_one_shutdown_task(
     monkeypatch.setattr(wk_feature, "_WK_ENABLED", True)
     lane = SignalLane()
     monkeypatch.setattr(wk_cli, "build_lane", lambda **_kwargs: lane)
+    shutdown_entered = threading.Event()
+    shutdown_calls = 0
+    real_shutdown_lane = wk_cli.shutdown_lane
+
+    async def observed_shutdown_lane(*args: Any, **kwargs: Any) -> None:
+        nonlocal shutdown_calls
+        shutdown_calls += 1
+        shutdown_entered.set()
+        await real_shutdown_lane(*args, **kwargs)
+
+    monkeypatch.setattr(wk_cli, "shutdown_lane", observed_shutdown_lane)
 
     def interrupt_process() -> None:
         os.kill(os.getpid(), signal.SIGINT)
         assert lane.close_started.wait(2)
+        assert shutdown_entered.wait(2)
         os.kill(os.getpid(), signal.SIGTERM)
-        threading.Event().wait(0.1)
         lane.release_close.set()
 
     timer = threading.Timer(0.1, interrupt_process)
@@ -486,6 +597,44 @@ def test_repeated_signal_during_close_uses_one_shutdown_task(
     assert lane.close_calls == 1
     assert lane.process.terminate_calls == 1
     assert lane.process.wait_calls == 1
+    assert shutdown_calls == 1
+
+
+def test_shutdown_reaps_after_base_exception_from_close() -> None:
+    class FakeProcess:
+        def __init__(self) -> None:
+            self.returncode: int | None = None
+            self.terminate_calls = 0
+            self.kill_calls = 0
+            self.wait_calls = 0
+
+        def terminate(self) -> None:
+            self.terminate_calls += 1
+
+        def kill(self) -> None:
+            self.kill_calls += 1
+            self.returncode = -9
+
+        async def wait(self) -> None:
+            self.wait_calls += 1
+            if self.wait_calls == 1:
+                raise KeyboardInterrupt
+
+    class BrokenLane:
+        def __init__(self) -> None:
+            self.process = FakeProcess()
+            self._process = self.process
+
+        async def close(self) -> None:
+            raise KeyboardInterrupt
+
+    lane = BrokenLane()
+    with pytest.raises(KeyboardInterrupt):
+        asyncio.run(shutdown_lane(lane))
+
+    assert lane.process.terminate_calls == 1
+    assert lane.process.kill_calls == 1
+    assert lane.process.wait_calls == 2
 
 
 def test_shutdown_cancels_receive_task_before_close() -> None:
