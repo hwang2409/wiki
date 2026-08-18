@@ -51,12 +51,6 @@ class _StdinReader:
 
     async def read_line(self, prompt: str) -> str:
         loop = asyncio.get_running_loop()
-        sys.stdout.write(prompt)
-        sys.stdout.flush()
-        line = self._take_line()
-        if line is not None:
-            return line
-
         line_future: asyncio.Future[str] = loop.create_future()
 
         def read_ready() -> None:
@@ -83,11 +77,20 @@ class _StdinReader:
             if not line_future.done():
                 line_future.set_exception(_InputShutdown)
 
-        loop.add_reader(self._fd, read_ready)
-        loop.add_reader(self._shutdown_fd, shutdown_ready)
+        readers_ready: Callable[[], None] | None = None
         if self._readers_ready is not None:
-            self._readers_ready()
+            readers_ready = self._readers_ready
+            self._readers_ready = None
         try:
+            loop.add_reader(self._fd, read_ready)
+            loop.add_reader(self._shutdown_fd, shutdown_ready)
+            if readers_ready is not None:
+                readers_ready()
+            sys.stdout.write(prompt)
+            sys.stdout.flush()
+            line = self._take_line()
+            if line is not None:
+                return line
             return await line_future
         finally:
             loop.remove_reader(self._fd)
@@ -525,7 +528,6 @@ def one_shot(
     *,
     out: Callable[[str], None] = print,
     turn_state: Callable[[Any], None] | None = None,
-    turn_gate: asyncio.Lock | None = None,
     shutdown_event: asyncio.Event | None = None,
 ) -> int:
     async def guarded_turn() -> str:
@@ -534,18 +536,9 @@ def one_shot(
         return await run_turn(lane, events, prompt, first=True, out=out)
 
     async def register_turn() -> asyncio.Task[str] | None:
-        if turn_gate is None:
-            if shutdown_event is not None and shutdown_event.is_set():
-                return None
-            turn = asyncio.create_task(guarded_turn())
-        else:
-            async with turn_gate:
-                if shutdown_event is not None and shutdown_event.is_set():
-                    return None
-                turn = asyncio.create_task(guarded_turn())
-                if turn_state is not None:
-                    turn_state(turn)
-                return turn
+        if shutdown_event is not None and shutdown_event.is_set():
+            return None
+        turn = asyncio.create_task(guarded_turn())
         if turn_state is not None:
             turn_state(turn)
         return turn
@@ -588,7 +581,6 @@ def main(argv: Sequence[str] | None = None) -> int:
     shutdown_future: Any = None
     shutdown_requested = threading.Event()
     shutdown_event = asyncio.Event()
-    turn_gate = asyncio.Lock()
     shutdown_lock = threading.Lock()
     shutdown_read_fd, shutdown_write_fd = os.pipe()
     os.set_blocking(shutdown_read_fd, False)
@@ -606,9 +598,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             current_lane = lane
 
             async def shutdown_current_lane() -> None:
-                async with turn_gate:
-                    current_turn = active_turn
-                await shutdown_lane(current_lane, active_turn=current_turn)
+                await shutdown_lane(current_lane, active_turn=active_turn)
 
             shutdown_future = asyncio.run_coroutine_threadsafe(shutdown_current_lane(), loop)
 
@@ -652,7 +642,6 @@ def main(argv: Sequence[str] | None = None) -> int:
                         loop,
                         args.prompt,
                         turn_state=set_active_turn,
-                        turn_gate=turn_gate,
                         shutdown_event=shutdown_event,
                     )
                 else:

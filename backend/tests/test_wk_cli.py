@@ -3,10 +3,13 @@ from __future__ import annotations
 import asyncio
 import json
 import os
+import pty
 import selectors
 import signal
 import subprocess
+import sys
 import threading
+import tty
 from collections.abc import AsyncIterator, Mapping
 from pathlib import Path
 from typing import Any
@@ -275,54 +278,6 @@ def test_one_shot_start_failure_exits_nonzero(loop_thread: _LoopThread) -> None:
     assert any("no provider" in line for line in out)
 
 
-def test_one_shot_signal_barrier_blocks_start(loop_thread: _LoopThread) -> None:
-    class BarrierGate:
-        def __init__(self) -> None:
-            self.entered = threading.Event()
-            self.release = threading.Event()
-
-        async def __aenter__(self) -> None:
-            self.entered.set()
-            await asyncio.to_thread(self.release.wait)
-
-        async def __aexit__(self, *_args: object) -> None:
-            return None
-
-    lane = FakeLane([[_claude_item(dict(_OK_RESULT))]])
-    events = lane.events().__aiter__()
-    gate = BarrierGate()
-    shutdown_event = asyncio.Event()
-    result: list[int] = []
-
-    def run_one_shot() -> None:
-        result.append(
-            one_shot(
-                lane,
-                events,
-                loop_thread.loop,
-                "go",
-                out=lambda _line: None,
-                turn_gate=gate,  # type: ignore[arg-type]
-                shutdown_event=shutdown_event,
-            )
-        )
-
-    worker = threading.Thread(target=run_one_shot)
-    worker.start()
-    assert gate.entered.wait(2)
-
-    async def request_shutdown() -> None:
-        shutdown_event.set()
-
-    loop_thread.run(request_shutdown())
-    gate.release.set()
-    worker.join(timeout=2)
-
-    assert not worker.is_alive()
-    assert result == [1]
-    assert lane.calls == []
-
-
 def test_repl_dispatches_start_then_send_and_exits_on_eof(loop_thread: _LoopThread) -> None:
     lane = FakeLane(
         [
@@ -490,19 +445,18 @@ def test_idle_sigint_exits_with_stdin_blocked(tmp_path: Path) -> None:
         stdin=subprocess.PIPE,
         stdout=subprocess.PIPE,
         stderr=subprocess.PIPE,
-        text=True,
-        bufsize=1,
+        bufsize=0,
     )
     assert process.stderr is not None
     stderr_selector = selectors.DefaultSelector()
     stderr_selector.register(process.stderr, selectors.EVENT_READ)
+    stderr_buffer = bytearray()
     try:
-        while True:
+        while b"[wk] readers-ready" not in stderr_buffer:
             assert stderr_selector.select(timeout=5), "wk did not reach its input barrier"
-            marker = process.stderr.readline()
-            assert marker, "wk exited before reaching its input barrier"
-            if "[wk] readers-ready" in marker:
-                break
+            chunk = os.read(process.stderr.fileno(), 4096)
+            assert chunk, "wk exited before reaching its input barrier"
+            stderr_buffer.extend(chunk)
         process.send_signal(signal.SIGINT)
         try:
             assert process.wait(timeout=2) == 130
@@ -520,6 +474,61 @@ def test_idle_sigint_exits_with_stdin_blocked(tmp_path: Path) -> None:
             process.stdout.close()
         if process.stderr is not None:
             process.stderr.close()
+
+
+def test_stdin_reader_prints_one_barrier_before_two_prompts() -> None:
+    master_fd, slave_fd = pty.openpty()
+    tty.setraw(slave_fd)
+    stdin = open(os.dup(slave_fd), "r", encoding="utf-8", buffering=1)
+    terminal = open(os.dup(slave_fd), "w", encoding="utf-8", buffering=1)
+    shutdown_read_fd, shutdown_write_fd = os.pipe()
+    output = bytearray()
+    master_selector = selectors.DefaultSelector()
+    master_selector.register(master_fd, selectors.EVENT_READ)
+
+    async def read_lines() -> tuple[str, str]:
+        reader = wk_cli._StdinReader(
+            shutdown_read_fd,
+            lambda: print("[wk] readers-ready", file=sys.stderr, flush=True),
+        )
+        return await reader.read_line("wk> "), await reader.read_line("wk> ")
+
+    def run_reader() -> None:
+        asyncio.run(read_lines())
+
+    original_stdin, original_stdout, original_stderr = sys.stdin, sys.stdout, sys.stderr
+    sys.stdin, sys.stdout, sys.stderr = stdin, terminal, terminal
+    worker = threading.Thread(target=run_reader)
+    worker.start()
+    try:
+        while output.count(b"wk> ") < 1:
+            assert master_selector.select(timeout=2), "wk did not print its first prompt"
+            output.extend(os.read(master_fd, 4096))
+        assert output.count(b"[wk] readers-ready") == 1
+        assert output.index(b"[wk] readers-ready") < output.index(b"wk> ")
+
+        os.write(master_fd, b"first\n")
+        while output.count(b"wk> ") < 2:
+            assert master_selector.select(timeout=2), "wk did not print its second prompt"
+            output.extend(os.read(master_fd, 4096))
+        assert output.count(b"[wk] readers-ready") == 1
+
+        os.write(master_fd, b"second\n")
+        worker.join(timeout=2)
+        assert not worker.is_alive()
+        assert output == b"[wk] readers-ready\nwk> wk> "
+    finally:
+        if worker.is_alive():
+            os.write(shutdown_write_fd, b"\0")
+            worker.join(timeout=2)
+        master_selector.close()
+        sys.stdin, sys.stdout, sys.stderr = original_stdin, original_stdout, original_stderr
+        terminal.close()
+        stdin.close()
+        os.close(shutdown_read_fd)
+        os.close(shutdown_write_fd)
+        os.close(master_fd)
+        os.close(slave_fd)
 
 
 def test_sigint_during_lane_creation_reaches_shutdown_funnel(
