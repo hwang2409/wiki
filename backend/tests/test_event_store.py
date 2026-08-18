@@ -16,6 +16,7 @@ from backend.app.agent_runtime.event_store import (
     SQLiteEventStore,
     _migrate_legacy_event_db,
     migrate_event_db,
+    migrate_legacy_event_db,
     replay_raw_jsonl,
     runtime_event_db_path,
 )
@@ -592,6 +593,22 @@ def test_legacy_migration_reopens_after_mid_shard_crash_and_copies_all_tables() 
                 provider="codex",
                 created_at="2026-08-18T00:00:00Z",
             )
+        legacy.materialize(
+            "run-a",
+            _raw(
+                1,
+                "item/completed",
+                {
+                    "item": {
+                        "type": "userMessage",
+                        "id": "user-1",
+                        "content": [{"type": "text", "text": "hello"}],
+                    }
+                },
+                received_at="now",
+            ),
+            EventReducerAdapter("codex"),
+        )
         with legacy.connection() as connection:
             connection.execute(
                 "INSERT INTO backfill_progress(normalizer_version, cursor_run_id) "
@@ -607,12 +624,52 @@ def test_legacy_migration_reopens_after_mid_shard_crash_and_copies_all_tables() 
                 "path, detail_json, recorded_at) VALUES "
                 "('run-a', 'test', 'test', 'migration', '{}', 'now')"
             )
+            connection.executemany(
+                "INSERT INTO parity_records(run_id, normalizer_version, record_type, "
+                "path, detail_json, recorded_at) VALUES "
+                "('run-a', 'test', 'rebuild_generation', 'migration', '{}', ?)",
+                [("generation-1",), ("generation-2",)],
+            )
+        with legacy.connection(read_only=True) as connection:
+            expected_shard_rows = {
+                table: connection.execute(
+                    f"SELECT * FROM {table} WHERE run_id = ?",
+                    ("run-a",),
+                ).fetchall()
+                for table in (
+                    "runs",
+                    "events",
+                    "patches",
+                    "run_cursors",
+                    "run_projections",
+                    "dispositions",
+                )
+            }
+            expected_schema_migrations = connection.execute(
+                "SELECT version, applied_at FROM schema_migrations ORDER BY version"
+            ).fetchall()
+            expected_parity = connection.execute(
+                "SELECT * FROM parity_records ORDER BY record_id"
+            ).fetchall()
+            expected_backfill = connection.execute(
+                "SELECT * FROM backfill_progress ORDER BY normalizer_version"
+            ).fetchall()
+            expected_children = connection.execute(
+                "SELECT * FROM child_runs ORDER BY parent_run_id, child_id"
+            ).fetchall()
         original_replace = os.replace
         failed = False
 
-        def fail_mid_shard(source: str | os.PathLike[str], destination: str | os.PathLike[str]) -> None:
+        def fail_mid_shard(
+            source: str | os.PathLike[str],
+            destination: str | os.PathLike[str],
+        ) -> None:
             nonlocal failed
-            if not failed and Path(source).name == ".events.sqlite3.migration":
+            if (
+                not failed
+                and Path(source).name == ".events.sqlite3.migration"
+                and Path(destination).parent.name == "run-b"
+            ):
                 failed = True
                 raise OSError("crash during shard rename")
             original_replace(source, destination)
@@ -625,6 +682,7 @@ def test_legacy_migration_reopens_after_mid_shard_crash_and_copies_all_tables() 
                 _migrate_legacy_event_db(runtime_path)
         assert runtime_event_db_path(runtime_path).is_file()
         assert _migrate_legacy_event_db(runtime_path)
+        reopened = RuntimeEventStore(runtime_path)
 
         for run_id in ("run-a", "run-b"):
             path = runtime_event_db_path(runtime_path, run_id)
@@ -649,6 +707,117 @@ def test_legacy_migration_reopens_after_mid_shard_crash_and_copies_all_tables() 
                 "rebuild_generations",
             } <= tables
         assert not runtime_event_db_path(runtime_path).exists()
+        assert reopened.rebuild_generation("run-a") == 2
+        with reopened.for_run("run-a").connection(read_only=True) as connection:
+            for table, expected in expected_shard_rows.items():
+                assert connection.execute(
+                    f"SELECT * FROM {table} WHERE run_id = ?",
+                    ("run-a",),
+                ).fetchall() == expected
+            assert connection.execute(
+                "SELECT version, applied_at FROM schema_migrations ORDER BY version"
+            ).fetchall() == expected_schema_migrations
+        with reopened.metadata_store.connection(read_only=True) as connection:
+            assert connection.execute(
+                "SELECT * FROM parity_records ORDER BY record_id"
+            ).fetchall() == expected_parity
+            assert connection.execute(
+                "SELECT * FROM backfill_progress ORDER BY normalizer_version"
+            ).fetchall() == expected_backfill
+            assert connection.execute(
+                "SELECT * FROM child_runs ORDER BY parent_run_id, child_id"
+            ).fetchall() == expected_children
+
+
+def test_legacy_migration_moves_stale_destination_sidecars_before_swap() -> None:
+    with TemporaryDirectory() as tmp:
+        runtime_path = Path(tmp)
+        legacy = SQLiteEventStore(runtime_event_db_path(runtime_path))
+        legacy.create_run(
+            "run-a",
+            agent_id="run-a",
+            provider="codex",
+            created_at="now",
+        )
+        target = runtime_event_db_path(runtime_path, "run-a")
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.with_name(target.name + "-wal").write_bytes(b"stale wal")
+        target.with_name(target.name + "-shm").write_bytes(b"stale shm")
+
+        assert _migrate_legacy_event_db(runtime_path)
+        assert not target.with_name(target.name + "-wal").exists()
+        assert not target.with_name(target.name + "-shm").exists()
+
+        reopened = SQLiteEventStore(target, migrate=False)
+        assert reopened.run_is_healthy("run-a")
+        wal_path = target.with_name(target.name + "-wal")
+        assert not wal_path.exists() or wal_path.stat().st_size == 0
+        assert not list(target.parent.glob(f".{target.name}.stale*"))
+
+
+def _write_recovery_run(run_dir: Path, run_id: str, raw: str) -> None:
+    run_dir.mkdir(parents=True, exist_ok=True)
+    (run_dir / "run.json").write_text(
+        json.dumps(
+            {
+                "run_id": run_id,
+                "agent_id": run_id,
+                "provider": "codex",
+                "created_at": "now",
+                "state": "starting",
+            }
+        ),
+        encoding="utf-8",
+    )
+    (run_dir / "raw.jsonl").write_text(raw, encoding="utf-8")
+
+
+def test_corrupt_legacy_boot_rebuilds_each_raw_shard() -> None:
+    with TemporaryDirectory() as tmp:
+        runtime_path = Path(tmp)
+        _write_recovery_run(
+            runtime_path / "runs" / "run-a",
+            "run-a",
+            json.dumps(_raw(1, "warning", {"message": "a"}, received_at="now")) + "\n",
+        )
+        _write_recovery_run(
+            runtime_path / "runs" / "run-b",
+            "run-b",
+            json.dumps(_raw(1, "warning", {"message": "b"}, received_at="now")) + "\n",
+        )
+        runtime_event_db_path(runtime_path).parent.mkdir(parents=True, exist_ok=True)
+        runtime_event_db_path(runtime_path).write_bytes(b"corrupt legacy")
+
+        assert migrate_legacy_event_db(runtime_path)
+        assert SQLiteEventStore(
+            runtime_event_db_path(runtime_path, "run-a"), migrate=False
+        ).run_is_healthy("run-a")
+        assert SQLiteEventStore(
+            runtime_event_db_path(runtime_path, "run-b"), migrate=False
+        ).run_is_healthy("run-b")
+
+
+def test_corrupt_raw_boot_skips_only_the_corrupt_run() -> None:
+    with TemporaryDirectory() as tmp:
+        runtime_path = Path(tmp)
+        _write_recovery_run(
+            runtime_path / "runs" / "run-a",
+            "run-a",
+            '{"seq":1}\nnot-json\n',
+        )
+        _write_recovery_run(
+            runtime_path / "runs" / "run-b",
+            "run-b",
+            json.dumps(_raw(1, "warning", {"message": "b"}, received_at="now")) + "\n",
+        )
+        runtime_event_db_path(runtime_path).parent.mkdir(parents=True, exist_ok=True)
+        runtime_event_db_path(runtime_path).write_bytes(b"corrupt legacy")
+
+        assert migrate_legacy_event_db(runtime_path)
+        assert not runtime_event_db_path(runtime_path, "run-a").exists()
+        assert SQLiteEventStore(
+            runtime_event_db_path(runtime_path, "run-b"), migrate=False
+        ).run_is_healthy("run-b")
 
 
 def test_legacy_migration_survives_crash_after_legacy_rename() -> None:

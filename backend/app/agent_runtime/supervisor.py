@@ -368,10 +368,24 @@ class Supervisor:
             raise ValueError("idempotency_cache_size must be positive")
         self.store = store
         self.adapter_factory = adapter_factory
+        self.materializer_failed_runs: dict[str, str] = {}
         self.event_store = RuntimeEventStore(
             store.paths.runtime_dir,
             archive_dir=store.paths.archive_dir,
         )
+        for run_id in self.event_store.corrupt_raw_run_ids:
+            reason = "raw event log is corrupt"
+            self.materializer_failed_runs[run_id] = reason
+            try:
+                record = self.store.get(run_id)
+                recovery_state = record.recovery_from_state or record.state
+                self.store.mark_automatic_resume_failed(
+                    run_id,
+                    reason=reason,
+                    recovery_state=recovery_state,
+                )
+            except Exception:
+                logger.exception("could not block corrupt raw run %s", run_id)
         self.store.set_archive_events_exporter(
             lambda run_id, destination, legacy_source: self.event_store.export_events_jsonl(
                 run_id,
@@ -3013,6 +3027,8 @@ Preserve the same identity, role, worktree, orchestrator grouping, PR gates, and
             return
         for record in self.store.list_runs():
             run_id = record.run_id
+            if run_id in self.materializer_failed_runs:
+                continue
             # WIKI-243: stream both logs to detect orphans instead of
             # materializing full raw + normalized dict lists per run.
             # Startup used to hold every event of every run in RAM just
@@ -3119,10 +3135,16 @@ Preserve the same identity, role, worktree, orchestrator grouping, PR gates, and
                         await self._rebuild_materializer_database(run_id)
                     except Exception as exc:
                         reason = f"event materializer rebuild failed: {exc}"
+                        self.materializer_failed_runs[run_id] = reason
                         try:
-                            self.store.mark_recovery_blocked(
+                            record = self.store.get(run_id)
+                            recovery_state = (
+                                record.recovery_from_state or record.state
+                            )
+                            self.store.mark_automatic_resume_failed(
                                 run_id,
                                 reason=reason,
+                                recovery_state=recovery_state,
                             )
                         except Exception:
                             logger.exception(
@@ -3365,6 +3387,7 @@ Preserve the same identity, role, worktree, orchestrator grouping, PR gates, and
             with rebuilt.connection() as connection:
                 connection.execute("PRAGMA wal_checkpoint(TRUNCATE)")
             target.replace_run_from(temporary_path, run_id)
+            self.materializer_failed_runs.pop(run_id, None)
         finally:
             shutil.rmtree(temp_directory, ignore_errors=True)
         self.materializer_reducers.clear()
@@ -4081,7 +4104,20 @@ Preserve the same identity, role, worktree, orchestrator grouping, PR gates, and
         async with self.codex_fleet_lock:
             await self._recover_codex_rotation_locked()
         results: list[dict[str, str]] = []
-        for snapshot in self.store.list_runs():
+        snapshots = self.store.list_runs()
+        for snapshot in snapshots:
+            reason = self.materializer_failed_runs.get(snapshot.run_id)
+            if reason is not None:
+                results.append(
+                    {
+                        "run_id": snapshot.run_id,
+                        "action": RecoveryAction.BLOCK.value,
+                        "reason": reason,
+                    }
+                )
+        for snapshot in snapshots:
+            if snapshot.run_id in self.materializer_failed_runs:
+                continue
             if snapshot.provider is ProviderKind.CODEX:
                 async with self.codex_fleet_lock:
                     async with self._agent_lock(snapshot.agent_id):

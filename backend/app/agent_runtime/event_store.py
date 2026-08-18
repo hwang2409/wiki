@@ -2523,6 +2523,32 @@ def _rebuild_run_shards_from_raw(runtime_dir: Path) -> None:
             )
 
 
+def _corrupt_raw_run_ids(runtime_dir: Path) -> set[str]:
+    """Return runs whose raw JSONL contains a malformed record."""
+
+    corrupt: set[str] = set()
+    runs_dir = runtime_dir / "runs"
+    if not runs_dir.is_dir():
+        return corrupt
+    for run_dir in runs_dir.iterdir():
+        if not run_dir.is_dir() or run_dir.is_symlink():
+            continue
+        raw_path = run_dir / "raw.jsonl"
+        if not raw_path.is_file():
+            continue
+        try:
+            with raw_path.open(encoding="utf-8") as handle:
+                for line in handle:
+                    if not line.strip():
+                        continue
+                    value = json.loads(line)
+                    if not isinstance(value, dict):
+                        raise ValueError("raw JSONL row must be an object")
+        except (OSError, UnicodeError, TypeError, ValueError, json.JSONDecodeError):
+            corrupt.add(run_dir.name)
+    return corrupt
+
+
 def _migrate_legacy_event_db(runtime_dir: Path) -> bool:
     """Shard a legacy shared database into crash-resumable run databases."""
 
@@ -2545,6 +2571,23 @@ def _migrate_legacy_event_db(runtime_dir: Path) -> bool:
             "SELECT record_id, run_id, normalizer_version, record_type, path, "
             "expected_json, actual_json, detail_json, recorded_at, raw_seq "
             "FROM parity_records"
+        ).fetchall()
+        legacy_generation_rows = legacy.execute(
+            "SELECT run_id, generation FROM rebuild_generations"
+        ).fetchall()
+        generation_by_run_id = {
+            str(row[0]): int(row[1]) for row in legacy_generation_rows
+        }
+        parity_generation_rows = legacy.execute(
+            "SELECT run_id, COUNT(*) FROM parity_records "
+            "WHERE record_type = 'rebuild_generation' GROUP BY run_id"
+        ).fetchall()
+        for row in parity_generation_rows:
+            generation_by_run_id[str(row[0])] = max(
+                generation_by_run_id.get(str(row[0]), 0), int(row[1])
+            )
+        schema_migration_rows = legacy.execute(
+            "SELECT version, applied_at FROM schema_migrations ORDER BY version"
         ).fetchall()
         backfill_rows = legacy.execute(
             "SELECT normalizer_version, cursor_run_id FROM backfill_progress"
@@ -2579,7 +2622,12 @@ def _migrate_legacy_event_db(runtime_dir: Path) -> bool:
             target = runtime_event_db_path(runtime_path, run_id)
             if target.is_file():
                 try:
-                    if SQLiteEventStore(target, migrate=False).run_is_healthy(run_id):
+                    existing = SQLiteEventStore(target, migrate=False)
+                    if (
+                        existing.run_is_healthy(run_id)
+                        and existing.rebuild_generation(run_id)
+                        >= generation_by_run_id.get(run_id, 0)
+                    ):
                         continue
                 except (OSError, sqlite3.DatabaseError, KeyError, ValueError):
                     pass
@@ -2590,6 +2638,11 @@ def _migrate_legacy_event_db(runtime_dir: Path) -> bool:
             SQLiteEventStore(temporary).ensure_schema()
             with connect_event_db(temporary) as destination:
                 destination.execute("ATTACH DATABASE ? AS legacy", (str(legacy_path),))
+                destination.executemany(
+                    "INSERT OR REPLACE INTO schema_migrations(version, applied_at) "
+                    "VALUES (?, ?)",
+                    schema_migration_rows,
+                )
                 for table, columns in (
                     (
                         "runs",
@@ -2643,6 +2696,12 @@ def _migrate_legacy_event_db(runtime_dir: Path) -> bool:
                         f"SELECT {columns} FROM legacy.{table} WHERE run_id = ?",
                         (run_id,),
                     )
+                generation = generation_by_run_id.get(run_id, 0)
+                destination.execute(
+                    "INSERT INTO rebuild_generations(run_id, generation) "
+                    "VALUES (?, ?)",
+                    (run_id, generation),
+                )
                 destination.commit()
                 destination.execute("DETACH DATABASE legacy")
                 destination.execute("PRAGMA wal_checkpoint(TRUNCATE)")
@@ -2650,7 +2709,27 @@ def _migrate_legacy_event_db(runtime_dir: Path) -> bool:
                 temporary.with_name(temporary.name + suffix).unlink(missing_ok=True)
             runtime_store._fsync_file(temporary)
             runtime_store._fsync_directory(temporary.parent)
-            os.replace(temporary, target)
+            stale_sidecars: list[tuple[Path, Path]] = []
+            for suffix in ("-wal", "-shm"):
+                original = target.with_name(target.name + suffix)
+                if not original.exists():
+                    continue
+                stale = target.with_name(f".{target.name}.stale{suffix}")
+                stale.unlink(missing_ok=True)
+                os.replace(original, stale)
+                stale_sidecars.append((original, stale))
+            runtime_store._fsync_directory(target.parent)
+            try:
+                os.replace(temporary, target)
+                runtime_store._fsync_directory(target.parent)
+            except BaseException:
+                for original, stale in reversed(stale_sidecars):
+                    if stale.exists():
+                        os.replace(stale, original)
+                runtime_store._fsync_directory(target.parent)
+                raise
+            for _original, stale in stale_sidecars:
+                stale.unlink(missing_ok=True)
             runtime_store._fsync_directory(target.parent)
 
     legacy_target = legacy_path.with_name(
@@ -2717,6 +2796,7 @@ class RuntimeEventStore:
         self._stores: dict[str, SQLiteEventStore] = {}
         if migrate:
             migrate_legacy_event_db(self.runtime_dir)
+        self.corrupt_raw_run_ids = _corrupt_raw_run_ids(self.runtime_dir)
 
     def ensure_schema(self) -> None:
         self.metadata_store.ensure_schema()

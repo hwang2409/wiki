@@ -610,6 +610,11 @@ def restart_recovery_decision(
         return RecoveryDecision(RecoveryAction.SKIP, "run was replaced")
     if record.state in TERMINAL_STATES:
         return RecoveryDecision(RecoveryAction.SKIP, f"run is {record.state.value}")
+    if record.automatic_resume_suppressed:
+        return RecoveryDecision(
+            RecoveryAction.BLOCK,
+            record.state_reason or "automatic resume is suppressed",
+        )
     recovery_state = record.recovery_from_state or record.state
     if provider_pid_alive and provider_control_attached:
         return RecoveryDecision(RecoveryAction.RETAIN, "provider PID is still alive")
