@@ -10,26 +10,25 @@ from contextlib import contextmanager
 from pathlib import Path
 from typing import Any
 
-from . import store as runtime_store
-from .event_store import (
-    ChildRunMapping,
-    EventPatch,
-    OlderReadSnapshot,
-    ReducerResult,
-    RunCursor,
-    SQLiteEventStore,
-    SessionReadSnapshot,
-    connect_event_db,
-    runtime_event_db_path,
-    runtime_metadata_db_path,
-)
+from .event_store_metadata import SQLiteMetadataStore
 from .event_store_migration import (
     _corrupt_raw_run_ids,
     _quarantine_sqlite_set,
     _sqlite_corruption_confirmed,
     migrate_legacy_event_db,
 )
-from .event_store_metadata import SQLiteMetadataStore
+from .event_store_shard import (
+    ChildRunMapping,
+    EventPatch,
+    OlderReadSnapshot,
+    ReducerResult,
+    RunCursor,
+    SessionReadSnapshot,
+    SQLiteEventStore,
+    connect_event_db,
+    runtime_event_db_path,
+    runtime_metadata_db_path,
+)
 
 
 class EventStoreRouter:

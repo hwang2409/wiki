@@ -3,25 +3,15 @@
 from __future__ import annotations
 
 import json
+import sqlite3
 import threading
 from collections.abc import Iterator
 from contextlib import contextmanager
-from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
+from .event_store_shard import SCHEMA_VERSION, ChildRunMapping, connect_event_db
 from .types import utc_now
-
-SCHEMA_VERSION = 8
-
-_METADATA_LOCKS: dict[tuple[str, str], threading.RLock] = {}
-_METADATA_LOCKS_GUARD = threading.Lock()
-
-
-def _connect_event_db(path: Path | str, *, read_only: bool = False):
-    from .event_store import connect_event_db
-
-    return connect_event_db(path, read_only=read_only)
 
 
 def _json_bytes(value: Any) -> str:
@@ -34,22 +24,10 @@ def _json_bytes(value: Any) -> str:
     )
 
 
-@dataclass(frozen=True)
-class ChildRunMapping:
-    """Durable parent-to-child identity used by child session reads."""
-
-    parent_run_id: str
-    child_id: str
-    child_run_id: str
-    source_path: str
-    source_size: int
-    created_at: str
-
-
 def migrate_metadata_db(path: Path | str) -> None:
     """Create the low-write cross-run metadata database."""
 
-    with _connect_event_db(path) as connection:
+    with connect_event_db(path) as connection:
         connection.execute(
             "CREATE TABLE IF NOT EXISTS schema_migrations "
             "(version INTEGER PRIMARY KEY, applied_at TEXT NOT NULL)"
@@ -133,7 +111,7 @@ class SQLiteMetadataStore:
 
     @contextmanager
     def connection(self, *, read_only: bool = False) -> Iterator[sqlite3.Connection]:
-        connection = _connect_event_db(self.path, read_only=read_only)
+        connection = connect_event_db(self.path, read_only=read_only)
         try:
             yield connection
             if not read_only:
@@ -144,11 +122,6 @@ class SQLiteMetadataStore:
             raise
         finally:
             connection.close()
-
-    def run_lock(self, run_id: str) -> threading.RLock:
-        key = (str(self.path.absolute()), run_id)
-        with _RUN_LOCKS_GUARD:
-            return _RUN_LOCKS.setdefault(key, threading.RLock())
 
     def backfill_completed_run_ids(self, normalizer_version: str) -> set[str]:
         self.ensure_schema()

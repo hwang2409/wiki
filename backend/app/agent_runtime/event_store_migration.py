@@ -9,12 +9,10 @@ from pathlib import Path
 
 from . import store as runtime_store
 from .event_store_metadata import SQLiteMetadataStore
-from .event_store import (
+from .event_store_shard import (
     NORMALIZER_VERSION,
-    SCHEMA_VERSION,
     SQLiteEventStore,
     connect_event_db,
-    migrate_event_db,
     replay_raw_jsonl,
     runtime_event_db_path,
     runtime_metadata_db_path,

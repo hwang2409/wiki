@@ -4,6 +4,8 @@ import errno
 import json
 import os
 import sqlite3
+import subprocess
+import sys
 from pathlib import Path
 from tempfile import TemporaryDirectory
 from unittest import mock
@@ -23,6 +25,31 @@ from backend.app.agent_runtime.event_store import (
 )
 from backend.app.agent_runtime.normalizer import NormalizedProviderEvent
 from backend.app.agent_runtime.types import EventDisposition
+
+
+@pytest.mark.parametrize(
+    "module",
+    (
+        "event_store_shard",
+        "event_store_metadata",
+        "event_store_migration",
+        "event_store_router",
+        "event_store",
+    ),
+)
+def test_event_store_modules_import_independently(module: str) -> None:
+    result = subprocess.run(
+        [
+            sys.executable,
+            "-c",
+            f"import backend.app.agent_runtime.{module}",
+        ],
+        cwd=Path(__file__).resolve().parents[2],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    assert result.returncode == 0, result.stderr
 
 
 def _raw(seq: int, method: str, params: dict, *, received_at: str) -> dict:
@@ -848,9 +875,15 @@ def test_legacy_migration_keeps_source_after_enospc_swap_failure() -> None:
             "backend.app.agent_runtime.event_store.os.replace",
             side_effect=fail_second_swap,
         ), pytest.raises(OSError) as raised:
-            _migrate_legacy_event_db(runtime_path)
+            migrate_legacy_event_db(runtime_path)
         assert raised.value.errno == errno.ENOSPC
-        assert runtime_event_db_path(runtime_path).is_file()
+        legacy_path = runtime_event_db_path(runtime_path)
+        assert legacy_path.is_file()
+        with sqlite3.connect(legacy_path) as connection:
+            assert connection.execute(
+                "SELECT run_id FROM runs ORDER BY run_id"
+            ).fetchall() == [("run-a",), ("run-b",)]
+        assert not list(runtime_path.glob("events.sqlite3.corrupt-*"))
         assert SQLiteEventStore(
             runtime_event_db_path(runtime_path), migrate=False
         ).run_is_healthy("run-a")
