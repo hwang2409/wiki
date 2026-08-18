@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import errno
 import json
 import os
 import sqlite3
@@ -755,6 +756,169 @@ def test_legacy_migration_moves_stale_destination_sidecars_before_swap() -> None
         assert not list(target.parent.glob(f".{target.name}.stale*"))
 
 
+def test_legacy_schema_without_generation_table_preserves_metadata() -> None:
+    with TemporaryDirectory() as tmp:
+        runtime_path = Path(tmp)
+        legacy = SQLiteEventStore(runtime_event_db_path(runtime_path))
+        for run_id in ("parent", "child"):
+            legacy.create_run(
+                run_id,
+                agent_id=run_id,
+                provider="codex",
+                created_at="now",
+            )
+        legacy.materialize(
+            "parent",
+            _raw(1, "warning", {"message": "parent"}, received_at="now"),
+            EventReducerAdapter("codex"),
+        )
+        with legacy.connection() as connection:
+            connection.executemany(
+                "INSERT INTO parity_records "
+                "(run_id, normalizer_version, record_type, path, detail_json, "
+                "recorded_at) VALUES (?, ?, ?, ?, ?, ?)",
+                [
+                    ("parent", "test", "rebuild_generation", "migration", "{}", "one"),
+                    ("parent", "test", "rebuild_generation", "migration", "{}", "two"),
+                ],
+            )
+            connection.execute(
+                "INSERT INTO backfill_progress(normalizer_version, cursor_run_id) "
+                "VALUES ('test', 'parent')"
+            )
+            connection.execute(
+                "INSERT INTO child_runs(parent_run_id, child_id, child_run_id, "
+                "source_path, source_size, created_at) VALUES "
+                "('parent', 'child', 'child', 'child.jsonl', 7, 'now')"
+            )
+            expected_parity = connection.execute(
+                "SELECT * FROM parity_records ORDER BY record_id"
+            ).fetchall()
+            expected_backfill = connection.execute(
+                "SELECT * FROM backfill_progress ORDER BY normalizer_version"
+            ).fetchall()
+            expected_children = connection.execute(
+                "SELECT * FROM child_runs ORDER BY parent_run_id, child_id"
+            ).fetchall()
+            connection.execute("DROP TABLE rebuild_generations")
+
+        assert _migrate_legacy_event_db(runtime_path)
+        runtime = RuntimeEventStore(runtime_path)
+        assert runtime.rebuild_generation("parent") == 2
+        assert runtime.cursor("parent").raw_seq == 1
+        with runtime.metadata_store.connection(read_only=True) as connection:
+            assert connection.execute(
+                "SELECT * FROM parity_records ORDER BY record_id"
+            ).fetchall() == expected_parity
+            assert connection.execute(
+                "SELECT * FROM backfill_progress ORDER BY normalizer_version"
+            ).fetchall() == expected_backfill
+            assert connection.execute(
+                "SELECT * FROM child_runs ORDER BY parent_run_id, child_id"
+            ).fetchall() == expected_children
+
+
+def test_legacy_migration_keeps_source_after_enospc_swap_failure() -> None:
+    with TemporaryDirectory() as tmp:
+        runtime_path = Path(tmp)
+        legacy = SQLiteEventStore(runtime_event_db_path(runtime_path))
+        for run_id in ("run-a", "run-b"):
+            legacy.create_run(
+                run_id,
+                agent_id=run_id,
+                provider="codex",
+                created_at="now",
+            )
+            legacy.materialize(
+                run_id,
+                _raw(1, "warning", {"message": run_id}, received_at="now"),
+                EventReducerAdapter("codex"),
+            )
+        original_replace = os.replace
+
+        def fail_second_swap(source: str | os.PathLike[str], destination: str | os.PathLike[str]) -> None:
+            if (
+                Path(source).name == ".events.sqlite3.migration"
+                and Path(destination).parent.name == "run-b"
+            ):
+                raise OSError(errno.ENOSPC, "no space left on device")
+            original_replace(source, destination)
+
+        with mock.patch(
+            "backend.app.agent_runtime.event_store.os.replace",
+            side_effect=fail_second_swap,
+        ), pytest.raises(OSError) as raised:
+            _migrate_legacy_event_db(runtime_path)
+        assert raised.value.errno == errno.ENOSPC
+        assert runtime_event_db_path(runtime_path).is_file()
+        assert SQLiteEventStore(
+            runtime_event_db_path(runtime_path), migrate=False
+        ).run_is_healthy("run-a")
+        assert SQLiteEventStore(
+            runtime_event_db_path(runtime_path, "run-a"), migrate=False
+        ).run_is_healthy("run-a")
+        assert not runtime_event_db_path(runtime_path, "run-b").is_file()
+
+        assert _migrate_legacy_event_db(runtime_path)
+        assert SQLiteEventStore(
+            runtime_event_db_path(runtime_path, "run-b"), migrate=False
+        ).run_is_healthy("run-b")
+
+
+def test_schema_only_shard_does_not_skip_legacy_run() -> None:
+    with TemporaryDirectory() as tmp:
+        runtime_path = Path(tmp)
+        legacy = SQLiteEventStore(runtime_event_db_path(runtime_path))
+        legacy.create_run(
+            "run-a",
+            agent_id="run-a",
+            provider="codex",
+            created_at="now",
+        )
+        legacy.materialize(
+            "run-a",
+            _raw(1, "warning", {"message": "legacy"}, received_at="now"),
+            EventReducerAdapter("codex"),
+        )
+        partial = SQLiteEventStore(
+            runtime_event_db_path(runtime_path, "run-a"),
+            migrate=True,
+        )
+        assert not partial.run_is_healthy("run-a")
+
+        assert _migrate_legacy_event_db(runtime_path)
+        migrated = SQLiteEventStore(
+            runtime_event_db_path(runtime_path, "run-a"),
+            migrate=False,
+        )
+        assert migrated.run_is_healthy("run-a")
+        assert migrated.cursor("run-a").raw_seq == 1
+
+
+def test_cursor_snapshot_reads_generation_from_supplied_connection() -> None:
+    with TemporaryDirectory() as tmp:
+        store = SQLiteEventStore(Path(tmp) / "events.sqlite3")
+        store.create_run(
+            "run-a",
+            agent_id="run-a",
+            provider="codex",
+            created_at="now",
+        )
+        with store.connection() as connection:
+            connection.execute(
+                "INSERT INTO rebuild_generations(run_id, generation) VALUES (?, 3)",
+                ("run-a",),
+            )
+        with store.connection(read_only=True) as connection:
+            with mock.patch.object(
+                store,
+                "rebuild_generation",
+                side_effect=AssertionError("opened a second connection"),
+            ):
+                cursor = store._cursor_from_connection(connection, "run-a")
+        assert cursor.rebuild_generation == 3
+
+
 def _write_recovery_run(run_dir: Path, run_id: str, raw: str) -> None:
     run_dir.mkdir(parents=True, exist_ok=True)
     (run_dir / "run.json").write_text(
@@ -919,6 +1083,67 @@ def test_artifact_index_merges_archived_events_with_live_events() -> None:
         events = RuntimeEventStore(runtime_path, archive_dir=archive_path).read_artifact_events()
         assert {event["id"] for _run_id, event in events} == {
             "live-artifact",
+            "archived-artifact",
+        }
+
+
+def test_artifact_index_skips_malformed_shard_rows() -> None:
+    with TemporaryDirectory() as tmp:
+        runtime_path = Path(tmp) / "runtime"
+        archive_path = Path(tmp) / "archive"
+        healthy = SQLiteEventStore(runtime_event_db_path(runtime_path, "healthy"))
+        healthy.create_run(
+            "healthy",
+            agent_id="healthy",
+            provider="codex",
+            created_at="now",
+        )
+        healthy_artifact = {
+            "id": "healthy-artifact",
+            "kind": "artifact",
+            "artifact": {"kind": "table", "filename": "healthy.html"},
+        }
+        with healthy.connection() as connection:
+            connection.execute(
+                "INSERT INTO events(run_id, event_id, raw_seq, kind, event_json, "
+                "created_at, updated_at, revision, deleted) VALUES "
+                "('healthy', 0, 1, 'artifact', ?, 'now', 'now', 1, 0)",
+                (_json_bytes_for_test(healthy_artifact),),
+            )
+
+        damaged = SQLiteEventStore(runtime_event_db_path(runtime_path, "damaged"))
+        damaged.create_run(
+            "damaged",
+            agent_id="damaged",
+            provider="codex",
+            created_at="now",
+        )
+        with damaged.connection() as connection:
+            connection.execute(
+                "INSERT INTO events(run_id, event_id, raw_seq, kind, event_json, "
+                "created_at, updated_at, revision, deleted) VALUES "
+                "('damaged', 0, 1, 'artifact', '{malformed', 'now', 'now', 1, 0)"
+            )
+
+        session = archive_path / "ticket" / "20260818-000000"
+        session.mkdir(parents=True)
+        (session / "archive-complete.json").write_text("{}")
+        (session / "run.json").write_text(json.dumps({"run_id": "archived"}))
+        archived_artifact = {
+            "id": "archived-artifact",
+            "kind": "artifact",
+            "artifact": {"kind": "table", "filename": "archived.html"},
+        }
+        (session / "events.jsonl").write_text(
+            json.dumps(archived_artifact) + "\n"
+        )
+
+        events = RuntimeEventStore(
+            runtime_path,
+            archive_dir=archive_path,
+        ).read_artifact_events()
+        assert {event["id"] for _run_id, event in events} == {
+            "healthy-artifact",
             "archived-artifact",
         }
 
