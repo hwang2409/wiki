@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import os
 import sqlite3
 from pathlib import Path
 from tempfile import TemporaryDirectory
@@ -9,10 +10,11 @@ from unittest import mock
 import pytest
 
 from backend.app.agent_runtime.event_store import (
+    SCHEMA_VERSION,
     EventReducerAdapter,
     RuntimeEventStore,
-    SCHEMA_VERSION,
     SQLiteEventStore,
+    _migrate_legacy_event_db,
     migrate_event_db,
     replay_raw_jsonl,
     runtime_event_db_path,
@@ -577,3 +579,180 @@ def test_runtime_event_store_failure_is_limited_to_one_run() -> None:
             normalized=normalized,
         )
         assert runtime.cursor("run-b").raw_seq == 1
+
+
+def test_legacy_migration_reopens_after_mid_shard_crash_and_copies_all_tables() -> None:
+    with TemporaryDirectory() as tmp:
+        runtime_path = Path(tmp)
+        legacy = SQLiteEventStore(runtime_event_db_path(runtime_path))
+        for run_id in ("run-a", "run-b"):
+            legacy.create_run(
+                run_id,
+                agent_id=run_id,
+                provider="codex",
+                created_at="2026-08-18T00:00:00Z",
+            )
+        with legacy.connection() as connection:
+            connection.execute(
+                "INSERT INTO backfill_progress(normalizer_version, cursor_run_id) "
+                "VALUES ('test', 'run-a')"
+            )
+            connection.execute(
+                "INSERT INTO child_runs(parent_run_id, child_id, child_run_id, "
+                "source_path, source_size, created_at) VALUES "
+                "('run-a', 'child', 'run-b', 'child.jsonl', 1, 'now')"
+            )
+            connection.execute(
+                "INSERT INTO parity_records(run_id, normalizer_version, record_type, "
+                "path, detail_json, recorded_at) VALUES "
+                "('run-a', 'test', 'test', 'migration', '{}', 'now')"
+            )
+        original_replace = os.replace
+        failed = False
+
+        def fail_mid_shard(source: str | os.PathLike[str], destination: str | os.PathLike[str]) -> None:
+            nonlocal failed
+            if not failed and Path(source).name == ".events.sqlite3.migration":
+                failed = True
+                raise OSError("crash during shard rename")
+            original_replace(source, destination)
+
+        with mock.patch(
+            "backend.app.agent_runtime.event_store.os.replace",
+            side_effect=fail_mid_shard,
+        ):
+            with pytest.raises(OSError, match="crash during shard rename"):
+                _migrate_legacy_event_db(runtime_path)
+        assert runtime_event_db_path(runtime_path).is_file()
+        assert _migrate_legacy_event_db(runtime_path)
+
+        for run_id in ("run-a", "run-b"):
+            path = runtime_event_db_path(runtime_path, run_id)
+            assert SQLiteEventStore(path, migrate=False).run_is_healthy(run_id)
+            with sqlite3.connect(path) as connection:
+                tables = {
+                    str(row[0])
+                    for row in connection.execute(
+                        "SELECT name FROM sqlite_master WHERE type = 'table'"
+                    )
+                }
+            assert {
+                "runs",
+                "events",
+                "patches",
+                "dispositions",
+                "run_cursors",
+                "run_projections",
+                "parity_records",
+                "backfill_progress",
+                "child_runs",
+                "rebuild_generations",
+            } <= tables
+        assert not runtime_event_db_path(runtime_path).exists()
+
+
+def test_legacy_migration_survives_crash_after_legacy_rename() -> None:
+    with TemporaryDirectory() as tmp:
+        runtime_path = Path(tmp)
+        legacy = SQLiteEventStore(runtime_event_db_path(runtime_path))
+        legacy.create_run(
+            "run-a",
+            agent_id="run-a",
+            provider="codex",
+            created_at="2026-08-18T00:00:00Z",
+        )
+        original_replace = os.replace
+        crashed = False
+
+        def rename_then_crash(source: str | os.PathLike[str], destination: str | os.PathLike[str]) -> None:
+            nonlocal crashed
+            original_replace(source, destination)
+            if not crashed and Path(source) == runtime_event_db_path(runtime_path):
+                crashed = True
+                raise OSError("crash during legacy rename")
+
+        with mock.patch(
+            "backend.app.agent_runtime.event_store.os.replace",
+            side_effect=rename_then_crash,
+        ):
+            with pytest.raises(OSError, match="crash during legacy rename"):
+                _migrate_legacy_event_db(runtime_path)
+        assert SQLiteEventStore(
+            runtime_event_db_path(runtime_path, "run-a"), migrate=False
+        ).run_is_healthy("run-a")
+        assert not list(runtime_path.glob("runs/run-a/.events.sqlite3.migration*"))
+
+
+def test_legacy_migration_reopens_after_shards_before_legacy_rename() -> None:
+    with TemporaryDirectory() as tmp:
+        runtime_path = Path(tmp)
+        legacy = SQLiteEventStore(runtime_event_db_path(runtime_path))
+        legacy.create_run(
+            "run-a",
+            agent_id="run-a",
+            provider="codex",
+            created_at="2026-08-18T00:00:00Z",
+        )
+        original_replace = os.replace
+
+        def fail_before_legacy_rename(source: str | os.PathLike[str], destination: str | os.PathLike[str]) -> None:
+            if Path(source) == runtime_event_db_path(runtime_path):
+                raise OSError("crash before legacy rename")
+            original_replace(source, destination)
+
+        with mock.patch(
+            "backend.app.agent_runtime.event_store.os.replace",
+            side_effect=fail_before_legacy_rename,
+        ), pytest.raises(OSError, match="crash before legacy rename"):
+            _migrate_legacy_event_db(runtime_path)
+        assert SQLiteEventStore(
+            runtime_event_db_path(runtime_path, "run-a"), migrate=False
+        ).run_is_healthy("run-a")
+        assert runtime_event_db_path(runtime_path).is_file()
+        assert _migrate_legacy_event_db(runtime_path)
+        assert not runtime_event_db_path(runtime_path).exists()
+
+
+def test_artifact_index_merges_archived_events_with_live_events() -> None:
+    with TemporaryDirectory() as tmp:
+        runtime_path = Path(tmp) / "runtime"
+        archive_path = Path(tmp) / "archive"
+        live = SQLiteEventStore(runtime_event_db_path(runtime_path, "live"))
+        live.create_run(
+            "live",
+            agent_id="live",
+            provider="codex",
+            created_at="now",
+        )
+        artifact = {
+            "id": "live-artifact",
+            "kind": "artifact",
+            "artifact": {"kind": "table", "filename": "live.html"},
+        }
+        with live.connection() as connection:
+            connection.execute(
+                "INSERT INTO events(run_id, event_id, raw_seq, kind, event_json, "
+                "created_at, updated_at, revision, deleted) VALUES "
+                "('live', 0, 1, 'artifact', ?, 'now', '2026-08-18T00:00:02Z', 1, 0)",
+                (_json_bytes_for_test(artifact),),
+            )
+        session = archive_path / "ticket" / "20260818-000000"
+        session.mkdir(parents=True)
+        (session / "archive-complete.json").write_text("{}")
+        (session / "run.json").write_text(json.dumps({"run_id": "archived"}))
+        archived = {
+            "id": "archived-artifact",
+            "kind": "artifact",
+            "artifact": {"kind": "table", "filename": "archived.html"},
+        }
+        (session / "events.jsonl").write_text(json.dumps(archived) + "\n")
+
+        events = RuntimeEventStore(runtime_path, archive_dir=archive_path).read_artifact_events()
+        assert {event["id"] for _run_id, event in events} == {
+            "live-artifact",
+            "archived-artifact",
+        }
+
+
+def _json_bytes_for_test(value: dict[str, object]) -> str:
+    return json.dumps(value, separators=(",", ":"), sort_keys=True)

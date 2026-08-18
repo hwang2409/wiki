@@ -737,6 +737,11 @@ def migrate_event_db(path: Path | str) -> None:
                 "VALUES (?, ?)",
                 (version, "schema-v" + str(version)),
             )
+        connection.execute(
+            "CREATE TABLE IF NOT EXISTS rebuild_generations ("
+            "run_id TEXT PRIMARY KEY, generation INTEGER NOT NULL DEFAULT 0"
+            ")"
+        )
 
 
 def migrate_metadata_db(path: Path | str) -> None:
@@ -1927,12 +1932,19 @@ class SQLiteEventStore:
     def rebuild_generation(self, run_id: str) -> int:
         """Return the durable number of atomic replacements for one run."""
 
+        try:
+            with self.connection(read_only=True) as connection:
+                row = connection.execute(
+                    "SELECT generation FROM rebuild_generations "
+                    "WHERE run_id = ?",
+                    (run_id,),
+                ).fetchone()
+        except sqlite3.DatabaseError:
+            return 0
+        if row is not None:
+            return int(row[0])
         if self.metadata_store is not None:
-            return sum(
-                1
-                for record in self.metadata_store.parity_records(run_id)
-                if record["record_type"] == "rebuild_generation"
-            )
+            return 0
         with self.connection(read_only=True) as connection:
             row = connection.execute(
                 "SELECT COUNT(*) FROM parity_records WHERE run_id = ? "
@@ -2267,6 +2279,57 @@ class SQLiteEventStore:
     ) -> None:
         """Atomically replace one run from a validated temporary database."""
 
+        if self.metadata_store is not None:
+            with self.run_lock(run_id):
+                source_path = Path(source).absolute()
+                if not source_path.is_file():
+                    raise FileNotFoundError(source_path)
+                generation = self.rebuild_generation(run_id) + 1
+                with connect_event_db(source_path) as connection:
+                    connection.execute(
+                        "CREATE TABLE IF NOT EXISTS rebuild_generations ("
+                        "run_id TEXT PRIMARY KEY, generation INTEGER NOT NULL"
+                        ")"
+                    )
+                    connection.execute(
+                        "INSERT INTO rebuild_generations(run_id, generation) "
+                        "VALUES (?, ?) ON CONFLICT(run_id) DO UPDATE SET "
+                        "generation = excluded.generation",
+                        (run_id, generation),
+                    )
+                    connection.commit()
+                    connection.execute("PRAGMA wal_checkpoint(TRUNCATE)")
+                runtime_store._fsync_file(source_path)
+                runtime_store._fsync_directory(source_path.parent)
+                self.path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+                stale_sidecars: list[tuple[Path, Path]] = []
+                for suffix in ("-wal", "-shm"):
+                    original = self.path.with_name(self.path.name + suffix)
+                    if not original.exists():
+                        continue
+                    stale = self.path.with_name(
+                        f".{self.path.name}.stale{suffix}"
+                    )
+                    stale.unlink(missing_ok=True)
+                    os.rename(original, stale)
+                    stale_sidecars.append((original, stale))
+                runtime_store._fsync_directory(self.path.parent)
+                try:
+                    os.replace(source_path, self.path)
+                except BaseException:
+                    for original, stale in reversed(stale_sidecars):
+                        if stale.exists():
+                            os.rename(stale, original)
+                    raise
+                for _original, stale in stale_sidecars:
+                    stale.unlink(missing_ok=True)
+                for suffix in ("-wal", "-shm"):
+                    source_path.with_name(source_path.name + suffix).unlink(
+                        missing_ok=True
+                    )
+                runtime_store._fsync_directory(self.path.parent)
+            return
+
         with self.run_lock(run_id):
             self.ensure_schema()
             source_path = Path(source).absolute()
@@ -2377,7 +2440,90 @@ class SQLiteEventStore:
                 )
 
 
-def migrate_legacy_event_db(runtime_dir: Path | str) -> bool:
+def _quarantine_sqlite_set(path: Path, label: str) -> None:
+    """Move a SQLite database and its sidecars out of the active path."""
+
+    stamp = utc_now()[:10].replace("-", "")
+    destination = path.with_name(f"{path.name}.{label}-{stamp}")
+    suffix = 1
+    while destination.exists():
+        destination = path.with_name(f"{path.name}.{label}-{stamp}-{suffix}")
+        suffix += 1
+    moved = False
+    for sidecar in ("", "-wal", "-shm"):
+        source = path.with_name(path.name + sidecar)
+        if not source.exists():
+            continue
+        target = destination.with_name(destination.name + sidecar)
+        os.replace(source, target)
+        moved = True
+    if moved:
+        runtime_store._fsync_directory(path.parent)
+
+
+def _rebuild_run_shards_from_raw(runtime_dir: Path) -> None:
+    """Rebuild every run shard from raw JSONL after cache corruption."""
+
+    runs_dir = runtime_dir / "runs"
+    if not runs_dir.is_dir():
+        return
+    for run_dir in sorted(runs_dir.iterdir()):
+        if not run_dir.is_dir() or run_dir.is_symlink():
+            continue
+        try:
+            run_value = json.loads((run_dir / "run.json").read_text(encoding="utf-8"))
+            run_id = str(run_value.get("run_id") or run_dir.name)
+            agent_id = str(run_value.get("agent_id") or run_id)
+            provider = str(run_value.get("provider") or "codex")
+            created_at = str(run_value.get("created_at") or utc_now())
+            state = str(run_value.get("state") or LifecycleState.STARTING.value)
+            target = runtime_event_db_path(runtime_dir, run_id)
+            temporary = target.with_name(f".{target.name}.raw-rebuild")
+            for suffix in ("", "-wal", "-shm"):
+                temporary.with_name(temporary.name + suffix).unlink(missing_ok=True)
+            raw_path = run_dir / "raw.jsonl"
+            if raw_path.is_file() and raw_path.stat().st_size:
+                replay_raw_jsonl(
+                    raw_path,
+                    temporary,
+                    run_id=run_id,
+                    agent_id=agent_id,
+                    provider=provider,
+                    created_at=created_at,
+                    normalizer_version=NORMALIZER_VERSION,
+                )
+            else:
+                rebuilt = SQLiteEventStore(temporary)
+                rebuilt.create_run(
+                    run_id,
+                    agent_id=agent_id,
+                    provider=provider,
+                    created_at=created_at,
+                    state=state,
+                )
+            with connect_event_db(temporary) as connection:
+                connection.execute("PRAGMA wal_checkpoint(TRUNCATE)")
+            for suffix in ("-wal", "-shm"):
+                temporary.with_name(temporary.name + suffix).unlink(missing_ok=True)
+            runtime_store._fsync_file(temporary)
+            runtime_store._fsync_directory(temporary.parent)
+            os.replace(temporary, target)
+            runtime_store._fsync_directory(target.parent)
+        except (
+            OSError,
+            sqlite3.DatabaseError,
+            KeyError,
+            TypeError,
+            ValueError,
+            json.JSONDecodeError,
+        ):
+            _quarantine_sqlite_set(
+                runtime_event_db_path(runtime_dir, run_dir.name),
+                "raw-rebuild-failed",
+            )
+
+
+def _migrate_legacy_event_db(runtime_dir: Path) -> bool:
     """Shard a legacy shared database into crash-resumable run databases."""
 
     runtime_path = Path(runtime_dir)
@@ -2386,6 +2532,10 @@ def migrate_legacy_event_db(runtime_dir: Path | str) -> bool:
         return False
     metadata = SQLiteMetadataStore(runtime_metadata_db_path(runtime_path))
     runtime_path.joinpath("runs").mkdir(mode=0o700, parents=True, exist_ok=True)
+    with connect_event_db(legacy_path) as checkpoint:
+        checkpoint.execute("PRAGMA wal_checkpoint(TRUNCATE)")
+    for suffix in ("-wal", "-shm"):
+        legacy_path.with_name(legacy_path.name + suffix).unlink(missing_ok=True)
     with connect_event_db(legacy_path, read_only=True) as legacy:
         run_rows = legacy.execute(
             "SELECT run_id, agent_id, provider, format, normalizer_version, "
@@ -2435,7 +2585,8 @@ def migrate_legacy_event_db(runtime_dir: Path | str) -> bool:
                     pass
             target.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
             temporary = target.with_name(f".{target.name}.migration")
-            temporary.unlink(missing_ok=True)
+            for suffix in ("", "-wal", "-shm"):
+                temporary.with_name(temporary.name + suffix).unlink(missing_ok=True)
             SQLiteEventStore(temporary).ensure_schema()
             with connect_event_db(temporary) as destination:
                 destination.execute("ATTACH DATABASE ? AS legacy", (str(legacy_path),))
@@ -2495,9 +2646,12 @@ def migrate_legacy_event_db(runtime_dir: Path | str) -> bool:
                 destination.commit()
                 destination.execute("DETACH DATABASE legacy")
                 destination.execute("PRAGMA wal_checkpoint(TRUNCATE)")
-            os.replace(temporary, target)
             for suffix in ("-wal", "-shm"):
                 temporary.with_name(temporary.name + suffix).unlink(missing_ok=True)
+            runtime_store._fsync_file(temporary)
+            runtime_store._fsync_directory(temporary.parent)
+            os.replace(temporary, target)
+            runtime_store._fsync_directory(target.parent)
 
     legacy_target = legacy_path.with_name(
         f"events.sqlite3.legacy-{utc_now()[:10].replace('-', '')}"
@@ -2508,32 +2662,58 @@ def migrate_legacy_event_db(runtime_dir: Path | str) -> bool:
             f"events.sqlite3.legacy-{utc_now()[:10].replace('-', '')}-{suffix}"
         )
         suffix += 1
-    os.replace(legacy_path, legacy_target)
+    for sidecar in ("", "-wal", "-shm"):
+        source = legacy_path.with_name(legacy_path.name + sidecar)
+        if source.exists():
+            os.replace(
+                source,
+                legacy_target.with_name(legacy_target.name + sidecar),
+            )
+    runtime_store._fsync_directory(runtime_path)
     return True
+
+
+def migrate_legacy_event_db(runtime_dir: Path | str) -> bool:
+    """Shard legacy SQLite, falling back to raw logs after corruption."""
+
+    runtime_path = Path(runtime_dir)
+    legacy_path = runtime_event_db_path(runtime_path)
+    if not legacy_path.is_file():
+        for suffix in ("-wal", "-shm"):
+            legacy_path.with_name(legacy_path.name + suffix).unlink(missing_ok=True)
+        return False
+    try:
+        return _migrate_legacy_event_db(runtime_path)
+    except (OSError, sqlite3.DatabaseError, KeyError, TypeError, ValueError, json.JSONDecodeError):
+        _quarantine_sqlite_set(legacy_path, "corrupt")
+        _rebuild_run_shards_from_raw(runtime_path)
+        return True
 
 
 class RuntimeEventStore:
     """Route the existing event-store API to one database per run."""
 
-    _METADATA_METHODS = frozenset(
-        {
-            "backfill_completed_run_ids",
-            "backfill_cursor",
-            "advance_backfill_cursor",
-            "record_parity_record",
-            "parity_records",
-            "child_run_for",
-        }
-    )
-
-    def __init__(self, runtime_dir: Path | str, *, migrate: bool = True) -> None:
+    def __init__(
+        self,
+        runtime_dir: Path | str,
+        *,
+        migrate: bool = True,
+        archive_dir: Path | str | None = None,
+    ) -> None:
         self.runtime_dir = Path(runtime_dir)
+        self.archive_dir = Path(archive_dir) if archive_dir is not None else None
         self.path = runtime_event_db_path(self.runtime_dir)
         self.metadata_path = runtime_metadata_db_path(self.runtime_dir)
-        self.metadata_store = SQLiteMetadataStore(
-            self.metadata_path,
-            migrate=migrate,
-        )
+        try:
+            self.metadata_store = SQLiteMetadataStore(
+                self.metadata_path,
+                migrate=migrate,
+            )
+        except (OSError, sqlite3.DatabaseError, ValueError):
+            if not migrate:
+                raise
+            _quarantine_sqlite_set(self.metadata_path, "corrupt")
+            self.metadata_store = SQLiteMetadataStore(self.metadata_path)
         self._stores: dict[str, SQLiteEventStore] = {}
         if migrate:
             migrate_legacy_event_db(self.runtime_dir)
@@ -2543,15 +2723,13 @@ class RuntimeEventStore:
 
     @contextmanager
     def connection(self, *, read_only: bool = False) -> Iterator[sqlite3.Connection]:
-        """Keep the old raw-connection helper useful for single-run callers."""
+        """Keep the raw-connection helper useful for one-run callers."""
 
         run_paths = list(self.runtime_dir.joinpath("runs").glob("*/events.sqlite3"))
-        store = (
-            SQLiteEventStore(
-                run_paths[0], migrate=False, metadata_path=self.metadata_path
-            )
-            if len(run_paths) == 1
-            else self._legacy_store()
+        if len(run_paths) != 1:
+            raise RuntimeError("select a run with RuntimeEventStore.for_run")
+        store = SQLiteEventStore(
+            run_paths[0], migrate=False, metadata_path=self.metadata_path
         )
         with store.connection(read_only=read_only) as connection:
             yield connection
@@ -2581,32 +2759,142 @@ class RuntimeEventStore:
             events.extend(
                 (str(row[0]), json.loads(row[1]), str(row[2])) for row in rows
             )
+        if self.archive_dir is not None and self.archive_dir.is_dir():
+            for session_dir in self.archive_dir.glob("*/*"):
+                marker = session_dir / "archive-complete.json"
+                events_path = session_dir / "events.jsonl"
+                if (
+                    not marker.is_file()
+                    or not events_path.is_file()
+                    or events_path.is_symlink()
+                ):
+                    continue
+                try:
+                    run_value = json.loads(
+                        (session_dir / "run.json").read_text(encoding="utf-8")
+                    )
+                    run_id = str(run_value["run_id"])
+                    with events_path.open(encoding="utf-8") as handle:
+                        for line in handle:
+                            if not line.strip():
+                                continue
+                            value = json.loads(line)
+                            if isinstance(value, dict):
+                                events.append(
+                                    (
+                                        run_id,
+                                        value,
+                                        str(
+                                            value.get("normalized_at")
+                                            or value.get("updated_at")
+                                            or ""
+                                        ),
+                                    )
+                                )
+                except (OSError, TypeError, ValueError, KeyError):
+                    continue
         events.sort(key=lambda item: item[2], reverse=True)
         return [(run_id, event) for run_id, event, _updated_at in events]
 
-    def __getattr__(self, name: str) -> Any:
-        if name in self._METADATA_METHODS:
-            return getattr(self.metadata_store, name)
-        def routed(*args: Any, **kwargs: Any) -> Any:
-            if name == "ensure_child_run":
-                run_id = str(kwargs["parent_run_id"])
-            elif name == "replace_run_from":
-                run_id = str(args[1])
-            elif args:
-                run_id = str(args[0])
-            else:
-                raise TypeError(f"{name} requires a run_id")
-            return getattr(self.for_run(run_id), name)(*args, **kwargs)
+    def create_run(self, run_id: str, **kwargs: Any) -> None:
+        self.for_run(run_id).create_run(run_id, **kwargs)
 
-        return routed
-
-    def _legacy_store(self) -> SQLiteEventStore:
-        return SQLiteEventStore(
-            self.path,
-            migrate=False,
-            metadata_path=self.metadata_path,
+    def ensure_child_run(self, *, parent_run_id: str, **kwargs: Any) -> ChildRunMapping:
+        return self.for_run(parent_run_id).ensure_child_run(
+            parent_run_id=parent_run_id,
+            **kwargs,
         )
 
+    def cursor(self, run_id: str) -> RunCursor:
+        return self.for_run(run_id).cursor(run_id)
+
+    def has_disposition(self, run_id: str, raw_seq: int) -> bool:
+        return self.for_run(run_id).has_disposition(run_id, raw_seq)
+
+    def materialized_raw_seqs(self, run_id: str) -> set[int]:
+        return self.for_run(run_id).materialized_raw_seqs(run_id)
+
+    def run_lock(self, run_id: str) -> threading.RLock:
+        return self.for_run(run_id).run_lock(run_id)
+
+    def materialize(self, run_id: str, *args: Any, **kwargs: Any) -> ReducerResult:
+        return self.for_run(run_id).materialize(run_id, *args, **kwargs)
+
+    def materialize_raw_rows(self, run_id: str, *args: Any, **kwargs: Any) -> None:
+        self.for_run(run_id).materialize_raw_rows(run_id, *args, **kwargs)
+
+    def restore_reducer(self, run_id: str, *args: Any, **kwargs: Any) -> None:
+        self.for_run(run_id).restore_reducer(run_id, *args, **kwargs)
+
+    def run_format(self, run_id: str) -> str:
+        return self.for_run(run_id).run_format(run_id)
+
+    def run_is_healthy(self, run_id: str) -> bool:
+        return self.for_run(run_id).run_is_healthy(run_id)
+
+    def rebuild_generation(self, run_id: str) -> int:
+        return self.for_run(run_id).rebuild_generation(run_id)
+
+    def read_events(self, run_id: str, *args: Any, **kwargs: Any) -> list[dict[str, Any]]:
+        return self.for_run(run_id).read_events(run_id, *args, **kwargs)
+
+    def read_normalized_events(
+        self, run_id: str, *args: Any, **kwargs: Any
+    ) -> list[dict[str, Any]]:
+        return self.for_run(run_id).read_normalized_events(run_id, *args, **kwargs)
+
+    def read_older_snapshot(self, run_id: str, *args: Any, **kwargs: Any) -> OlderReadSnapshot:
+        return self.for_run(run_id).read_older_snapshot(run_id, *args, **kwargs)
+
+    def read_patches(self, run_id: str, *args: Any, **kwargs: Any) -> list[EventPatch]:
+        return self.for_run(run_id).read_patches(run_id, *args, **kwargs)
+
+    def read_session_snapshot(
+        self, run_id: str, *args: Any, **kwargs: Any
+    ) -> SessionReadSnapshot:
+        return self.for_run(run_id).read_session_snapshot(run_id, *args, **kwargs)
+
+    def view_rows(self, run_id: str) -> dict[str, list[tuple[Any, ...]]]:
+        return self.for_run(run_id).view_rows(run_id)
+
+    def _expected_view_rows(self, run_id: str, **kwargs: Any) -> dict[str, list[tuple[Any, ...]]]:
+        return self.for_run(run_id)._expected_view_rows(run_id, **kwargs)
+
+    def replace_run_from(self, source: Path | str, run_id: str) -> None:
+        self.for_run(run_id).replace_run_from(source, run_id)
+
+    def export_events_jsonl(self, run_id: str, destination: Path | str, **kwargs: Any) -> bool:
+        return self.for_run(run_id).export_events_jsonl(run_id, destination, **kwargs)
+
+    def backfill_completed_run_ids(self, normalizer_version: str) -> set[str]:
+        return self.metadata_store.backfill_completed_run_ids(normalizer_version)
+
+    def backfill_cursor(self, normalizer_version: str) -> str:
+        return self.metadata_store.backfill_cursor(normalizer_version)
+
+    def advance_backfill_cursor(self, normalizer_version: str, run_id: str) -> None:
+        self.metadata_store.advance_backfill_cursor(normalizer_version, run_id)
+
+    def record_parity_record(self, run_id: str, **kwargs: Any) -> None:
+        self.metadata_store.record_parity_record(run_id, **kwargs)
+
+    def parity_records(self, run_id: str | None = None) -> list[dict[str, Any]]:
+        return self.metadata_store.parity_records(run_id)
+
+    def child_run_for(self, parent_run_id: str, child_id: str) -> ChildRunMapping | None:
+        return self.metadata_store.child_run_for(parent_run_id, child_id)
+
+    def refresh_child_source_fingerprint(
+        self, parent_run_id: str, child_id: str, source_size: int
+    ) -> None:
+        self.metadata_store.refresh_child_source_fingerprint(
+            parent_run_id, child_id, source_size
+        )
+
+    def invalidate_child_source_fingerprint(
+        self, parent_run_id: str, child_id: str
+    ) -> None:
+        self.metadata_store.invalidate_child_source_fingerprint(parent_run_id, child_id)
 
 def replay_raw_jsonl(
     raw_path: Path | str,

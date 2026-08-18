@@ -368,7 +368,10 @@ class Supervisor:
             raise ValueError("idempotency_cache_size must be positive")
         self.store = store
         self.adapter_factory = adapter_factory
-        self.event_store = RuntimeEventStore(store.paths.runtime_dir)
+        self.event_store = RuntimeEventStore(
+            store.paths.runtime_dir,
+            archive_dir=store.paths.archive_dir,
+        )
         self.store.set_archive_events_exporter(
             lambda run_id, destination, legacy_source: self.event_store.export_events_jsonl(
                 run_id,
@@ -3112,7 +3115,25 @@ Preserve the same identity, role, worktree, orchestrator grouping, PR gates, and
                     int(event.get("seq", 0)) for event in raw_rows
                     }
                 ):
-                    await self._rebuild_materializer_database()
+                    try:
+                        await self._rebuild_materializer_database(run_id)
+                    except Exception as exc:
+                        reason = f"event materializer rebuild failed: {exc}"
+                        try:
+                            self.store.mark_recovery_blocked(
+                                run_id,
+                                reason=reason,
+                            )
+                        except Exception:
+                            logger.exception(
+                                "could not block failed materializer run %s",
+                                run_id,
+                            )
+                        logger.exception(
+                            "event materializer rebuild failed for %s",
+                            run_id,
+                        )
+                        continue
                     # Recovered orphans get appended after later normalized
                     # rows, so any projection built by walking normalized
                     # events in file order (lifecycle state,
@@ -3279,73 +3300,73 @@ Preserve the same identity, role, worktree, orchestrator grouping, PR gates, and
             )
         return True
 
-    async def _rebuild_materializer_database(self) -> None:
-        for record in self.store.list_runs():
-            target = self.event_store.for_run(record.run_id)
-            temp_directory = Path(
-                tempfile.mkdtemp(prefix="events-rebuild-", dir=target.path.parent)
+    async def _rebuild_materializer_database(self, run_id: str) -> None:
+        record = self.store.get(run_id)
+        target = self.event_store.for_run(run_id)
+        temp_directory = Path(
+            tempfile.mkdtemp(prefix="events-rebuild-", dir=target.path.parent)
+        )
+        temporary_path = temp_directory / target.path.name
+        try:
+            rebuilt = SQLiteEventStore(temporary_path)
+            raw_rows = sorted(
+                self.store.iter_raw_events(run_id),
+                key=lambda item: int(item["seq"]),
             )
-            temporary_path = temp_directory / target.path.name
-            try:
-                rebuilt = SQLiteEventStore(temporary_path)
-                raw_rows = sorted(
-                    self.store.iter_raw_events(record.run_id),
-                    key=lambda item: int(item["seq"]),
-                )
-                normalized_rows = {
-                    int(row["raw_seq"]): row
-                    for row in self.store.iter_normalized_events(record.run_id)
-                }
-                rebuilt.create_run(
-                    record.run_id,
-                    agent_id=record.agent_id,
-                    provider=record.provider,
-                    created_at=record.created_at,
-                    state=record.state,
-                )
-                reducer = EventReducerAdapter(record.provider)
-                for raw in raw_rows:
-                    row = normalized_rows.get(int(raw["seq"]))
-                    normalized = None
-                    materialize_raw = dict(raw)
-                    if row is not None:
-                        materialize_raw["normalized_seq"] = int(row["seq"])
-                        disposition = row.get("disposition")
-                        event_disposition = (
-                            EventDisposition.IGNORED
-                            if disposition in {
-                                "ignored",
-                                "intentionally_ignored",
-                                EventDisposition.IGNORED.value,
-                            }
-                            else EventDisposition(str(disposition))
-                        )
-                        lifecycle_value = row.get("lifecycle_state")
-                        normalized = NormalizedProviderEvent(
-                            event_disposition,
-                            str(row["kind"]),
-                            row.get("payload")
-                            if isinstance(row.get("payload"), dict)
-                            else {},
-                            LifecycleState(str(lifecycle_value))
-                            if lifecycle_value is not None
-                            else None,
-                        )
-                    rebuilt.materialize(
-                        record.run_id,
-                        materialize_raw,
-                        reducer,
-                        normalized=normalized,
+            normalized_rows = {
+                int(row["raw_seq"]): row
+                for row in self.store.iter_normalized_events(run_id)
+            }
+            rebuilt.create_run(
+                run_id,
+                agent_id=record.agent_id,
+                provider=record.provider,
+                created_at=record.created_at,
+                state=record.state,
+            )
+            reducer = EventReducerAdapter(record.provider)
+            for raw in raw_rows:
+                row = normalized_rows.get(int(raw["seq"]))
+                normalized = None
+                materialize_raw = dict(raw)
+                if row is not None:
+                    materialize_raw["normalized_seq"] = int(row["seq"])
+                    disposition = row.get("disposition")
+                    event_disposition = (
+                        EventDisposition.IGNORED
+                        if disposition in {
+                            "ignored",
+                            "intentionally_ignored",
+                            EventDisposition.IGNORED.value,
+                        }
+                        else EventDisposition(str(disposition))
                     )
-                if not rebuilt.run_is_healthy(record.run_id):
-                    raise RuntimeError(
-                        f"rebuilt event store failed validation for {record.run_id}"
+                    lifecycle_value = row.get("lifecycle_state")
+                    normalized = NormalizedProviderEvent(
+                        event_disposition,
+                        str(row["kind"]),
+                        row.get("payload")
+                        if isinstance(row.get("payload"), dict)
+                        else {},
+                        LifecycleState(str(lifecycle_value))
+                        if lifecycle_value is not None
+                        else None,
                     )
-                with rebuilt.connection() as connection:
-                    connection.execute("PRAGMA wal_checkpoint(TRUNCATE)")
-                target.replace_run_from(temporary_path, record.run_id)
-            finally:
-                shutil.rmtree(temp_directory, ignore_errors=True)
+                rebuilt.materialize(
+                    run_id,
+                    materialize_raw,
+                    reducer,
+                    normalized=normalized,
+                )
+            if not rebuilt.run_is_healthy(run_id):
+                raise RuntimeError(
+                    f"rebuilt event store failed validation for {run_id}"
+                )
+            with rebuilt.connection() as connection:
+                connection.execute("PRAGMA wal_checkpoint(TRUNCATE)")
+            target.replace_run_from(temporary_path, run_id)
+        finally:
+            shutil.rmtree(temp_directory, ignore_errors=True)
         self.materializer_reducers.clear()
 
     async def _reconcile_sending_steer_effects(self) -> None:

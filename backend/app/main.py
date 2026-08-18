@@ -1164,7 +1164,11 @@ class SQLiteReadUnavailable(RuntimeError):
 
 
 def _sqlite_event_store() -> RuntimeEventStore:
-    return RuntimeEventStore(AGENT_RUNTIME_DIR, migrate=False)
+    return RuntimeEventStore(
+        AGENT_RUNTIME_DIR,
+        migrate=False,
+        archive_dir=AGENT_ARCHIVE_DIR,
+    )
 
 
 def _sqlite_ready_store(run_id: str) -> tuple[SQLiteEventStore, Any] | None:

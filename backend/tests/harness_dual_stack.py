@@ -16,7 +16,12 @@ from fastapi.testclient import TestClient
 
 from backend.app import main
 from backend.app.agent_runtime.client import SupervisorClient
-from backend.app.agent_runtime.event_store import EventReducerAdapter, SQLiteEventStore, replay_raw_jsonl
+from backend.app.agent_runtime.event_store import (
+    EventReducerAdapter,
+    SQLiteEventStore,
+    replay_raw_jsonl,
+    runtime_event_db_path,
+)
 from backend.app.agent_runtime.fake import FixtureAdapterFactory
 from backend.app.agent_runtime.normalizer import normalize_provider_event
 from backend.app.agent_runtime.provider import ProviderEvent
@@ -120,7 +125,7 @@ class DualStackHarness:
         )
         self.raw_path = self.root / "legacy" / "raw.jsonl"
         self.artifact_raw_path = self.root / "legacy" / "artifact-raw.jsonl"
-        self.sqlite_path = self.root / "runtime" / "events.sqlite3"
+        self.sqlite_path = runtime_event_db_path(self.root / "runtime", self.run_id)
         self.store: RunStore | None = None
         self.supervisor: Supervisor | None = None
         self.supervisor_thread: _SupervisorThread | None = None
@@ -420,10 +425,11 @@ class DualStackHarness:
             provider=ProviderKind.CLAUDE,
         )
         if self.include_index_artifact:
+            artifact_run_id = str(uuid4())
             replay_raw_jsonl(
                 self.artifact_raw_path,
-                self.sqlite_path,
-                run_id=str(uuid4()),
+                runtime_event_db_path(self.root / "runtime", artifact_run_id),
+                run_id=artifact_run_id,
                 agent_id="WIKI-282-artifacts",
                 provider=ProviderKind.CODEX,
             )
