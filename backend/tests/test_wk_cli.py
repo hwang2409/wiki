@@ -3,7 +3,9 @@ from __future__ import annotations
 import asyncio
 import json
 import os
+import selectors
 import signal
+import subprocess
 import threading
 from collections.abc import AsyncIterator, Mapping
 from pathlib import Path
@@ -273,6 +275,54 @@ def test_one_shot_start_failure_exits_nonzero(loop_thread: _LoopThread) -> None:
     assert any("no provider" in line for line in out)
 
 
+def test_one_shot_signal_barrier_blocks_start(loop_thread: _LoopThread) -> None:
+    class BarrierGate:
+        def __init__(self) -> None:
+            self.entered = threading.Event()
+            self.release = threading.Event()
+
+        async def __aenter__(self) -> None:
+            self.entered.set()
+            await asyncio.to_thread(self.release.wait)
+
+        async def __aexit__(self, *_args: object) -> None:
+            return None
+
+    lane = FakeLane([[_claude_item(dict(_OK_RESULT))]])
+    events = lane.events().__aiter__()
+    gate = BarrierGate()
+    shutdown_event = asyncio.Event()
+    result: list[int] = []
+
+    def run_one_shot() -> None:
+        result.append(
+            one_shot(
+                lane,
+                events,
+                loop_thread.loop,
+                "go",
+                out=lambda _line: None,
+                turn_gate=gate,  # type: ignore[arg-type]
+                shutdown_event=shutdown_event,
+            )
+        )
+
+    worker = threading.Thread(target=run_one_shot)
+    worker.start()
+    assert gate.entered.wait(2)
+
+    async def request_shutdown() -> None:
+        shutdown_event.set()
+
+    loop_thread.run(request_shutdown())
+    gate.release.set()
+    worker.join(timeout=2)
+
+    assert not worker.is_alive()
+    assert result == [1]
+    assert lane.calls == []
+
+
 def test_repl_dispatches_start_then_send_and_exits_on_eof(loop_thread: _LoopThread) -> None:
     lane = FakeLane(
         [
@@ -429,56 +479,47 @@ def test_sigint_during_turn_closes_lane_and_reaps_child(
     assert lane.process.killed
 
 
-def test_idle_sigint_wakes_stdin_and_closes_lane(
-    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
-) -> None:
-    class SignalLane:
-        def __init__(self) -> None:
-            self.close_started = threading.Event()
-            self.closed = False
-
-        async def close(self) -> None:
-            self.closed = True
-            self.close_started.set()
-
-        async def events(self) -> AsyncIterator[Mapping[str, Any]]:
-            if False:
-                yield {}
-
-    input_started = threading.Event()
-    release_input = threading.Event()
-    main_done = threading.Event()
-    forced_release = threading.Event()
-    lane = SignalLane()
-
-    def read_input(_prompt: str) -> str:
-        input_started.set()
-        release_input.wait(5)
-        return ""
-
-    def send_signal() -> None:
-        input_started.wait(5)
-        os.kill(os.getpid(), signal.SIGINT)
-        lane.close_started.wait(5)
-        if not main_done.wait(2):
-            forced_release.set()
-            release_input.set()
-
-    monkeypatch.setattr(wk_feature, "_WK_ENABLED", True)
-    monkeypatch.setattr(wk_cli, "build_lane", lambda **_kwargs: lane)
-    monkeypatch.setattr("builtins.input", read_input)
-    sender = threading.Thread(target=send_signal)
-    sender.start()
+def test_idle_sigint_exits_with_stdin_blocked(tmp_path: Path) -> None:
+    root = Path(__file__).resolve().parents[2]
+    environment = os.environ.copy()
+    environment.update({"PYTHONUNBUFFERED": "1", "WIKI_ENABLE_WK": "1"})
+    process = subprocess.Popen(
+        [str(root / "wk"), "--workdir", str(tmp_path)],
+        cwd=root,
+        env=environment,
+        stdin=subprocess.PIPE,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+        bufsize=1,
+    )
+    assert process.stderr is not None
+    stderr_selector = selectors.DefaultSelector()
+    stderr_selector.register(process.stderr, selectors.EVENT_READ)
     try:
-        assert wk_cli.main(["--workdir", str(tmp_path)]) == 130
+        while True:
+            assert stderr_selector.select(timeout=5), "wk did not reach its input barrier"
+            marker = process.stderr.readline()
+            assert marker, "wk exited before reaching its input barrier"
+            if "[wk] ready" in marker:
+                break
+        process.send_signal(signal.SIGINT)
+        try:
+            assert process.wait(timeout=2) == 130
+        except subprocess.TimeoutExpired:
+            process.kill()
+            pytest.fail("wk stayed alive after idle SIGINT with stdin blocked")
     finally:
-        main_done.set()
-        release_input.set()
-        sender.join(timeout=5)
-
-    assert input_started.is_set()
-    assert lane.closed
-    assert not forced_release.is_set()
+        stderr_selector.close()
+        if process.poll() is None:
+            process.kill()
+            process.wait(timeout=2)
+        if process.stdin is not None:
+            process.stdin.close()
+        if process.stdout is not None:
+            process.stdout.close()
+        if process.stderr is not None:
+            process.stderr.close()
 
 
 def test_sigint_during_lane_creation_reaches_shutdown_funnel(

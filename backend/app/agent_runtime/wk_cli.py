@@ -27,6 +27,67 @@ MAX_LINE = 240
 _INPUT_SHUTDOWN = object()
 
 
+class _InputShutdown(Exception):
+    pass
+
+
+class _StdinReader:
+    def __init__(self, shutdown_fd: int) -> None:
+        self._fd = sys.stdin.fileno()
+        self._shutdown_fd = shutdown_fd
+        self._buffer = bytearray()
+
+    def _take_line(self) -> str | None:
+        newline = self._buffer.find(b"\n")
+        if newline < 0:
+            return None
+        line = bytes(self._buffer[:newline])
+        del self._buffer[: newline + 1]
+        return line.decode(errors="replace")
+
+    async def read_line(self, prompt: str) -> str:
+        loop = asyncio.get_running_loop()
+        sys.stdout.write(prompt)
+        sys.stdout.flush()
+        line = self._take_line()
+        if line is not None:
+            return line
+
+        line_future: asyncio.Future[str] = loop.create_future()
+
+        def read_ready() -> None:
+            try:
+                chunk = os.read(self._fd, 4096)
+            except OSError as exc:
+                if not line_future.done():
+                    line_future.set_exception(exc)
+                return
+            if not chunk:
+                if not line_future.done():
+                    line_future.set_exception(EOFError)
+                return
+            self._buffer.extend(chunk)
+            line = self._take_line()
+            if line is not None and not line_future.done():
+                line_future.set_result(line)
+
+        def shutdown_ready() -> None:
+            try:
+                os.read(self._shutdown_fd, 4096)
+            except OSError:
+                pass
+            if not line_future.done():
+                line_future.set_exception(_InputShutdown)
+
+        loop.add_reader(self._fd, read_ready)
+        loop.add_reader(self._shutdown_fd, shutdown_ready)
+        try:
+            return await line_future
+        finally:
+            loop.remove_reader(self._fd)
+            loop.remove_reader(self._shutdown_fd)
+
+
 def default_model_id(lane: str) -> str:
     from ..agent_models import WK_MODEL_OPTIONS
 
@@ -362,25 +423,18 @@ async def shutdown_lane(
 
 
 async def _read_input_or_shutdown(
-    input_fn: Callable[[str], str],
+    input_fn: Callable[[str], str] | None,
     prompt: str,
-    shutdown_event: asyncio.Event | None,
+    stdin_reader: _StdinReader | None,
 ) -> str | object:
-    if shutdown_event is None:
-        return await asyncio.to_thread(input_fn, prompt)
-
-    input_task = asyncio.create_task(asyncio.to_thread(input_fn, prompt))
-    shutdown_task = asyncio.create_task(shutdown_event.wait())
-    done, _ = await asyncio.wait(
-        (input_task, shutdown_task), return_when=asyncio.FIRST_COMPLETED
-    )
-    if shutdown_task in done:
-        input_task.cancel()
-        await asyncio.gather(input_task, return_exceptions=True)
+    if input_fn is not None:
+        return input_fn(prompt)
+    if stdin_reader is None:
+        raise RuntimeError("stdin reader is not configured")
+    try:
+        return await stdin_reader.read_line(prompt)
+    except _InputShutdown:
         return _INPUT_SHUTDOWN
-    shutdown_task.cancel()
-    await asyncio.gather(shutdown_task, return_exceptions=True)
-    return await input_task
 
 
 def repl(
@@ -392,9 +446,9 @@ def repl(
     out: Callable[[str], None] = print,
     turn_state: Callable[[Any], None] | None = None,
     should_shutdown: Callable[[], bool] | None = None,
-    shutdown_event: asyncio.Event | None = None,
+    shutdown_fd: int | None = None,
 ) -> None:
-    reader = input if input_fn is None else input_fn
+    stdin_reader = _StdinReader(shutdown_fd) if input_fn is None and shutdown_fd is not None else None
     started = False
     while True:
         if should_shutdown is not None and should_shutdown():
@@ -402,7 +456,7 @@ def repl(
         try:
             line = _run_on_loop(
                 loop,
-                _read_input_or_shutdown(reader, "wk> ", shutdown_event),
+                _read_input_or_shutdown(input_fn, "wk> ", stdin_reader),
             )
             if line is _INPUT_SHUTDOWN:
                 return
@@ -445,18 +499,45 @@ def one_shot(
     *,
     out: Callable[[str], None] = print,
     turn_state: Callable[[Any], None] | None = None,
+    turn_gate: asyncio.Lock | None = None,
+    shutdown_event: asyncio.Event | None = None,
 ) -> int:
-    fut = asyncio.run_coroutine_threadsafe(
-        run_turn(lane, events, prompt, first=True, out=out), loop
-    )
-    if turn_state is not None:
-        turn_state(fut)
+    async def guarded_turn() -> str:
+        if shutdown_event is not None and shutdown_event.is_set():
+            return "shutdown"
+        return await run_turn(lane, events, prompt, first=True, out=out)
+
+    async def register_turn() -> asyncio.Task[str] | None:
+        if turn_gate is None:
+            if shutdown_event is not None and shutdown_event.is_set():
+                return None
+            turn = asyncio.create_task(guarded_turn())
+        else:
+            async with turn_gate:
+                if shutdown_event is not None and shutdown_event.is_set():
+                    return None
+                turn = asyncio.create_task(guarded_turn())
+                if turn_state is not None:
+                    turn_state(turn)
+                return turn
+        if turn_state is not None:
+            turn_state(turn)
+        return turn
+
+    turn = _run_on_loop(loop, register_turn())
+    if turn is None:
+        return 1
+    fut = asyncio.run_coroutine_threadsafe(_await_task(turn), loop)
     try:
         status = wait_for_turn(fut, lambda: _run_on_loop(loop, lane.interrupt(), 10), out)
     finally:
         if turn_state is not None:
             turn_state(None)
     return 0 if status == "ok" else 1
+
+
+async def _await_task(task: asyncio.Task[str]) -> str:
+    return await task
 
 
 def main(argv: Sequence[str] | None = None) -> int:
@@ -481,7 +562,11 @@ def main(argv: Sequence[str] | None = None) -> int:
     shutdown_future: Any = None
     shutdown_requested = threading.Event()
     shutdown_event = asyncio.Event()
+    turn_gate = asyncio.Lock()
     shutdown_lock = threading.Lock()
+    shutdown_read_fd, shutdown_write_fd = os.pipe()
+    os.set_blocking(shutdown_read_fd, False)
+    os.set_blocking(shutdown_write_fd, False)
 
     def set_active_turn(value: Any) -> None:
         nonlocal active_turn
@@ -493,13 +578,21 @@ def main(argv: Sequence[str] | None = None) -> int:
             if shutdown_future is not None or lane is None:
                 return
             current_lane = lane
-            shutdown_future = asyncio.run_coroutine_threadsafe(
-                shutdown_lane(current_lane, active_turn=active_turn), loop
-            )
+
+            async def shutdown_current_lane() -> None:
+                async with turn_gate:
+                    current_turn = active_turn
+                await shutdown_lane(current_lane, active_turn=current_turn)
+
+            shutdown_future = asyncio.run_coroutine_threadsafe(shutdown_current_lane(), loop)
 
     def handle_signal() -> None:
         shutdown_requested.set()
         shutdown_event.set()
+        try:
+            os.write(shutdown_write_fd, b"\0")
+        except OSError:
+            pass
         schedule_shutdown()
 
     for signum in (signal.SIGINT, signal.SIGTERM):
@@ -528,18 +621,25 @@ def main(argv: Sequence[str] | None = None) -> int:
                 events = lane.events().__aiter__()
                 if args.prompt is not None:
                     code = one_shot(
-                        lane, events, loop, args.prompt, turn_state=set_active_turn
+                        lane,
+                        events,
+                        loop,
+                        args.prompt,
+                        turn_state=set_active_turn,
+                        turn_gate=turn_gate,
+                        shutdown_event=shutdown_event,
                     )
                 else:
                     print(f"wk {args.lane} lane | model {model} | workdir {args.workdir}")
                     print("Ctrl-C interrupts the current turn. Ctrl-D exits.")
+                    print("[wk] ready", file=sys.stderr, flush=True)
                     repl(
                         lane,
                         events,
                         loop,
                         turn_state=set_active_turn,
                         should_shutdown=shutdown_requested.is_set,
-                        shutdown_event=shutdown_event,
+                        shutdown_fd=shutdown_read_fd,
                     )
                     code = 0
             if shutdown_requested.is_set():
@@ -569,6 +669,8 @@ def main(argv: Sequence[str] | None = None) -> int:
                     thread.join(timeout=5)
                     if not thread.is_alive():
                         loop.close()
+                    os.close(shutdown_read_fd)
+                    os.close(shutdown_write_fd)
     return code
 
 
