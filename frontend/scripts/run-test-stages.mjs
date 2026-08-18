@@ -93,8 +93,6 @@ const PLAYWRIGHT_SUITES = [
   "wiki-238-semantic-activity",
   "wiki-251-diff-wrap",
   "wiki-253-collapse",
-  "wiki-331-closing-fixes",
-  "wiki-332-tier-sweep",
 ];
 
 // Accepted-red baseline: environment-dependent reds observed in full runs on

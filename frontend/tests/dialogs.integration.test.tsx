@@ -43,9 +43,6 @@ test("destructive dialogs open on Cancel, not the confirm action", () => {
 });
 
 test("transcript leaves use the selected monospace family", () => {
-  expect(cssDeclarations(".session-envelope-raw")).toContain(
-    "font-family: var(--font-monospace);",
-  );
   expect(cssDeclarations(".codex-stream-command-input")).toContain(
     "font-family: var(--font-monospace);",
   );

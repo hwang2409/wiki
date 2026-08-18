@@ -157,30 +157,25 @@ describe("per-event transcript units", () => {
 });
 
 describe("quiet composer", () => {
-  test("the composer row is a rounded 4-sided card (WIKI-293 bb reskin)", () => {
-    // WIKI-247 originally locked the composer to a left-bar strip. The
-    // WIKI-293 bb reskin replaces that with a rounded card: a full 1px
-    // hairline on all four edges, matching border-radius, and a card
-    // shadow. The left-bar accent is gone — focus lifts the whole ring.
+  test("the composer row is a left-bar strip, never a 4-sided box", () => {
     const row = cssDeclarations(".session-composer-row");
-    expect(row).toMatch(/border-top:\s*1px/);
-    expect(row).toMatch(/border-right:\s*1px/);
-    expect(row).toMatch(/border-bottom:\s*1px/);
-    expect(row).toMatch(/border-left:\s*1px/);
-    expect(row).toMatch(/border-radius:\s*var\(--composer-radius\)/);
+    expect(row).toContain("border-left: 3px");
+    // A shorthand border or any non-zero top/right/bottom edge would close
+    // the box; explicit `border-*: 0` declarations are the point.
+    expect(row).not.toMatch(/(?:^|\n)\s*border\s*:/);
+    const closedEdges = row.match(/border-(?:top|right|bottom)\s*:\s*[^;]+/g) ?? [];
+    expect(closedEdges.every((declaration) => /:\s*0\s*$/.test(declaration))).toBe(true);
     expect(row).not.toMatch(/(?:^|\n)\s*outline\s*:/);
   });
 
-  test("textarea focus never draws the outline box; focus lifts the card", () => {
+  test("textarea focus never draws the outline box, resting or focused", () => {
     const focusRules = cssDeclarations(".session-composer textarea:focus");
     expect(focusRules).toContain("outline: none;");
     expect(focusRules).toContain("outline: auto;");
-    // WIKI-293: the visible focus state lives on the card — every edge
-    // shifts to the active border color, plus a soft ring via box-shadow.
+    // The visible focus state lives on the row: left bar to full accent
+    // plus a background lift.
     const focusWithin = cssDeclarations(".session-composer-row:focus-within");
-    expect(focusWithin).toMatch(/border-top-color:\s*var\(--border-active\)/);
-    expect(focusWithin).toMatch(/border-left-color:\s*var\(--border-active\)/);
-    expect(focusWithin).toMatch(/box-shadow:/);
+    expect(focusWithin).toContain("border-left-color: var(--accent-primary);");
     expect(focusWithin).toMatch(/background-color:/);
   });
 });

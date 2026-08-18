@@ -190,13 +190,16 @@ describe("session model accessibility", () => {
     expect(dialog.isConnected).toBe(false);
   });
 
-  test("restores focus after cancel and after a successful switch", async () => {
+  test("restores focus to the trigger after cancel and after a successful switch", async () => {
     renderFooter();
-    const first = await openConfirmation();
+    await openConfirmation();
     fireEvent.click(screen.getByRole("button", { name: "Cancel" }));
     await waitFor(() => expect(screen.queryByRole("dialog")).toBeNull());
-    expect(document.activeElement).toBe(first.option);
+    // Focus returns to the model trigger — the keyboard user's anchor point.
+    expect(document.activeElement).toBe(screen.getByRole("button", { name: "Change model" }));
 
+    // Re-open the menu explicitly since cancel closed it.
+    fireEvent.click(screen.getByRole("button", { name: "Change model" }));
     const second = await openConfirmation();
     fireEvent.click(screen.getByRole("button", { name: "Switch model" }));
     await waitFor(() => expect(screen.queryByRole("dialog")).toBeNull());
