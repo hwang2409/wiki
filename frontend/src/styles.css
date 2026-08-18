@@ -5379,17 +5379,20 @@ body.is-resizing-panes .pane-cell {
   margin-left: auto;
 }
 
-.agent-log-toggle {
+.agent-log-toggle,
+.agent-primary-action {
   display: inline-flex;
   align-items: center;
   gap: 2px;
-  margin-left: auto;
-  color: var(--text-faint);
+  min-height: 28px;
+  padding: 2px 8px;
+  border: 1px solid var(--background-modifier-border);
+  border-radius: var(--radius-s);
+  background-color: transparent;
+  color: var(--text-muted);
   font-family: var(--font-monospace);
   font-weight: var(--font-monospace-weight);
   font-size: var(--font-chrome-size);
-  min-height: 28px;
-  padding: 4px 6px;
 }
 
 .agent-actions .agent-log-toggle,
@@ -5397,11 +5400,17 @@ body.is-resizing-panes .pane-cell {
   margin-left: 0;
 }
 
-.agent-log-toggle:hover {
+.agent-log-toggle:hover,
+.agent-primary-action:hover {
+  border-color: color-mix(in srgb, var(--accent-primary) 45%, var(--background-modifier-border));
+  background-color: color-mix(in srgb, var(--accent-primary) 8%, transparent);
   color: var(--text-normal);
 }
 
-.agent-log-toggle.is-active {
+.agent-log-toggle.is-active,
+.agent-primary-action.is-active {
+  border-color: color-mix(in srgb, var(--accent-primary) 55%, var(--background-modifier-border));
+  background-color: color-mix(in srgb, var(--accent-primary) 10%, transparent);
   color: var(--text-normal);
 }
 
@@ -5430,24 +5439,6 @@ body.is-resizing-panes .pane-cell {
 .agent-replace-button:disabled {
   cursor: not-allowed;
   opacity: 0.45;
-}
-
-.agent-primary-action {
-  display: inline-flex;
-  align-items: center;
-  gap: 4px;
-  min-height: 28px;
-  padding: 2px 10px;
-  border: 1px solid color-mix(in srgb, var(--accent-primary) 45%, var(--background-modifier-border));
-  border-radius: var(--radius-s);
-  color: var(--accent-primary);
-  font-family: var(--font-monospace);
-  font-weight: var(--fw-semibold);
-  font-size: var(--font-chrome-size);
-}
-
-.agent-primary-action:hover {
-  background-color: color-mix(in srgb, var(--accent-primary) 10%, transparent);
 }
 
 .agent-primary-action:disabled {
@@ -17331,6 +17322,48 @@ body {
   transition-property: background-color, border-color, box-shadow, opacity;
   transition-duration: var(--motion-duration, 160ms);
   transition-timing-function: var(--motion-easing, ease-out);
+}
+
+/* Archived runs are settled history. Keep metadata and its action on one
+   compact line; expanded technical details still earn a row. */
+.agent-activity-row.is-archived {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto;
+  align-items: center;
+  column-gap: 12px;
+  min-height: 32px;
+  padding: 2px 0;
+}
+
+.agent-activity-row.is-archived > .agent-card-header {
+  min-width: 0;
+  flex-wrap: nowrap;
+  overflow: hidden;
+}
+
+.agent-activity-row.is-archived .agent-ticket {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.agent-activity-row.is-archived .agent-state,
+.agent-activity-row.is-archived .agent-age {
+  flex-shrink: 0;
+}
+
+.agent-activity-row.is-archived > .agent-meta {
+  margin: 0;
+  justify-self: end;
+}
+
+.agent-activity-row.is-archived > .disclosure-wrap {
+  grid-column: 1 / -1;
+}
+
+.agent-activity-row.is-archived .agent-actions {
+  margin-left: 0;
 }
 
 .agent-activity-row[data-state="working"],
