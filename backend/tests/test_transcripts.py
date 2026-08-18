@@ -4036,6 +4036,99 @@ class NormalizedUserSourceTests(unittest.TestCase):
         self.assertEqual(user[0]["source"], "supervisor-steer")
 
 
+class ClientEchoRowTests(unittest.TestCase):
+    """WIKI-337: archived events.jsonl keeps the ignored stdin echo of every
+    supervisor user send next to the stdout replay of the same message. The
+    normalized ingest must render the replay only."""
+
+    def _parse_rows(self, kind: str, rows: list[dict]) -> dict:
+        with TemporaryDirectory() as tmp:
+            path = Path(tmp) / "events.jsonl"
+            path.write_text(
+                "".join(json.dumps(row) + "\n" for row in rows),
+                encoding="utf-8",
+            )
+            return transcripts.read_session_events(kind, path)
+
+    def test_claude_stdin_echo_renders_once(self) -> None:
+        message = {
+            "role": "user",
+            "content": [{"type": "text", "text": "please fix the flaky test"}],
+        }
+        parsed = self._parse_rows(
+            "claude-normalized",
+            [
+                {
+                    "seq": 1,
+                    "raw_seq": 1,
+                    "normalized_at": "2026-08-18T10:00:00+00:00",
+                    "disposition": "ignored",
+                    "kind": "claude_client_message",
+                    "payload": {
+                        "type": "user",
+                        "session_id": "",
+                        "message": message,
+                    },
+                },
+                {
+                    "seq": 2,
+                    "raw_seq": 2,
+                    "normalized_at": "2026-08-18T10:00:01+00:00",
+                    "disposition": "rendered",
+                    "kind": "claude_user",
+                    "payload": {"type": "user", "message": message},
+                },
+            ],
+        )
+        user = [event for event in parsed["events"] if event["kind"] == "user"]
+        self.assertEqual(len(user), 1)
+        self.assertEqual(user[0]["ts"], "2026-08-18T10:00:01+00:00")
+
+    def test_codex_client_request_renders_nothing(self) -> None:
+        parsed = self._parse_rows(
+            "codex-normalized",
+            [
+                {
+                    "seq": 1,
+                    "raw_seq": 1,
+                    "normalized_at": "2026-08-18T10:00:00+00:00",
+                    "disposition": "ignored",
+                    "kind": "codex_client_message",
+                    "payload": {
+                        "id": 3,
+                        "method": "turn/start",
+                        "params": {
+                            "threadId": "thread-1",
+                            "input": [{"type": "text", "text": "hello codex"}],
+                        },
+                    },
+                },
+                {
+                    "seq": 2,
+                    "raw_seq": 2,
+                    "normalized_at": "2026-08-18T10:00:01+00:00",
+                    "disposition": "rendered",
+                    "kind": "item_completed",
+                    "payload": {
+                        "method": "item/completed",
+                        "params": {
+                            "item": {
+                                "type": "userMessage",
+                                "id": "item-1",
+                                "content": [
+                                    {"type": "text", "text": "hello codex"}
+                                ],
+                            }
+                        },
+                    },
+                },
+            ],
+        )
+        user = [event for event in parsed["events"] if event["kind"] == "user"]
+        self.assertEqual(len(user), 1)
+        self.assertEqual(user[0]["text"], "hello codex")
+
+
 class RegistryIdBeatsDiscoveryTests(unittest.TestCase):
     def test_registry_id_confines_result_to_anchor_cwd(self) -> None:
         """Discovery mode has a stale-worker foot-gun: a NEWER rollout in a

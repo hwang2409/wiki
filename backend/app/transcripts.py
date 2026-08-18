@@ -4779,7 +4779,24 @@ def _apply_normalized_payload(
     _record_row_disposition(state, _normalized_disposition(row))
 
 
+# Stdin echo rows are audit copies of supervisor writes to the provider CLI,
+# never provider transcript output. The claude CLI replays accepted user sends
+# on stdout (--replay-user-messages, stamped with pending_id by the
+# supervisor), so parsing the stdin echo too would render every composer or
+# steer message twice (WIKI-337). Codex client requests happen to match no
+# parser branch today; skipping them keeps that a guarantee instead of an
+# accident of method naming.
+_CLIENT_ECHO_KINDS = {
+    "approval_response",
+    "claude_client_message",
+    "codex_client_message",
+}
+
+
 def _codex_normalized_apply(state: dict, row: dict) -> None:
+    if row.get("kind") in _CLIENT_ECHO_KINDS:
+        _record_row_disposition(state, _normalized_disposition(row))
+        return
     payload = row.get("payload")
     if not isinstance(payload, dict):
         _apply_normalized_payload(state, row, _codex_apply, None)
@@ -4992,6 +5009,9 @@ def _codex_normalized_apply(state: dict, row: dict) -> None:
 
 
 def _claude_normalized_apply(state: dict, row: dict) -> None:
+    if row.get("kind") in _CLIENT_ECHO_KINDS:
+        _record_row_disposition(state, _normalized_disposition(row))
+        return
     payload = row.get("payload")
     native_row = dict(payload) if isinstance(payload, dict) else None
     if native_row is not None and not native_row.get("timestamp"):
