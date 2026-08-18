@@ -10,11 +10,10 @@ import {
   useRef,
   useState,
 } from "react";
-import type { ComponentProps, CSSProperties, ReactNode } from "react";
+import type { ComponentProps, CSSProperties } from "react";
 import {
   AlertTriangle,
   Bell,
-  Bot,
   ChevronRight,
   Circle,
   CircleCheck,
@@ -24,12 +23,15 @@ import {
   Hourglass,
   ListTodo,
   MessageCircleQuestion,
+  Radio,
   RefreshCw,
   ScrollText,
   SendHorizontal,
   SlashSquare,
+  Wrench,
   X,
 } from "lucide-react";
+import type { LucideIcon } from "lucide-react";
 import ReactMarkdown from "react-markdown";
 import rehypeKatex from "rehype-katex";
 import remarkGfm from "remark-gfm";
@@ -80,7 +82,7 @@ import {
   slashMenuOptionId,
 } from "./composer-slash-menu";
 import { externalLinkProps } from "./external-links";
-import { useModalA11y, type FocusReturnRef } from "./modal-a11y";
+import { useModalA11y } from "./modal-a11y";
 import {
   GhPreviewCard,
   GhPreviewInline,
@@ -92,7 +94,6 @@ import {
 import { LoadingPlaceholder } from "./loading";
 import { createStateKeyWriteBarrier, deletePaneStateEntries } from "./pane-state-cache";
 import { Timestamp } from "./timestamp";
-import { Button } from "./primitives";
 import { StatusBadge } from "./status-badge";
 import { BoundedPreview } from "./transcript-preview";
 import {
@@ -107,7 +108,7 @@ import {
   parseEmbeddedScripts,
   thoughtDurations,
   toolDiffIsTruncated,
-  toolIcon,
+  toolGlyph,
   toolInlineResult,
   toolDiffSource,
   toolOutputPeek,
@@ -121,7 +122,7 @@ import {
   type ToolPresentation,
   type TraceRow,
 } from "./transcript-event-utils";
-import { HighlightedCode, NumberedReadHighlight, ShikiCode, languageForPath, languageFromContent } from "./shiki";
+import { HighlightedCode, NumberedReadHighlight, languageForPath, languageFromContent } from "./shiki";
 import { parseNumberedPayload, type NumberedPayload } from "./read-gutter";
 import {
   HarnessOutput,
@@ -159,7 +160,6 @@ import {
 import {
   buildVirtualLayoutIncremental,
   eventRowsIncremental,
-  rowEventRefs,
   sameEventRefs,
   type EventRow,
   type EventRowsCache,
@@ -606,12 +606,7 @@ function ProviderPendingRequestCard({
         </label>
       )}
       <div className="session-provider-request-actions">
-        <Button
-          disabled={sending || sent}
-          size="sm"
-          variant="default"
-          onClick={() => void submit()}
-        >
+        <button disabled={sending || sent} type="button" onClick={() => void submit()}>
           {sent
             ? "Response sent"
             : sending
@@ -619,7 +614,7 @@ function ProviderPendingRequestCard({
               : questions.length
                 ? "Send answers"
                 : "Send response"}
-        </Button>
+        </button>
       </div>
       {/* R1-04/WIKI-235: request kind, id, and raw payload do not render in
           default session chrome. They remain available through event APIs. */}
@@ -867,14 +862,13 @@ export function SessionModelFooter({
   const [loading, setLoading] = useState(false);
   const [confirmModel, setConfirmModel] = useState<string | null>(null);
   const modelTriggerRef = useRef<HTMLButtonElement | null>(null);
-  const modelConfirmFallbackRef = useRef<FocusReturnRef>({ current: null });
   const modelA11yId = useId();
   const modelMenuId = `session-model-menu-${modelA11yId}`;
   const modelConfirmTitleId = `session-model-confirm-title-${modelA11yId}`;
   const modelConfirmRef = useModalA11y<HTMLDivElement>(
     Boolean(confirmModel),
     () => setConfirmModel(null),
-    modelConfirmFallbackRef.current,
+    modelTriggerRef,
   );
   const modelMenuRef = useRef<HTMLDivElement | null>(null);
   const modelOptionRefs = useRef<Array<HTMLButtonElement | null>>([]);
@@ -947,7 +941,6 @@ export function SessionModelFooter({
         ticket,
         result.desired_model === undefined ? confirmModel : result.desired_model,
       );
-      modelConfirmFallbackRef.current.current = modelTriggerRef.current;
       setConfirmModel(null);
       setOpen(false);
       invalidateTranscript(ticket, "session");
@@ -1031,10 +1024,7 @@ export function SessionModelFooter({
               role="menuitem"
               tabIndex={index === menuActiveIndex ? 0 : -1}
               type="button"
-              onClick={(event) => {
-                modelConfirmFallbackRef.current.current = event.currentTarget;
-                setConfirmModel(option.id);
-              }}
+              onClick={() => setConfirmModel(option.id)}
             >
               <span>{option.label}</span>
               <code>{option.id}</code>
@@ -1078,180 +1068,68 @@ export function ProviderActionRequired({
   ticket: string;
 }) {
   const pendingRequests = inspector.pending_requests ?? [];
-  const [dismissed, setDismissed] = useState(false);
   if (pendingRequests.length === 0) return null;
   return (
-    <div className="session-action-required bb-detail-card" data-testid="session-action-required">
+    <div className="session-action-required" data-testid="session-action-required">
       <div className="session-action-required-head">
         <AlertTriangle size={13} />
         <span className="session-action-required-title">Action required</span>
         {pendingRequests.length > 1 ? (
           <span className="session-action-required-count">{pendingRequests.length}</span>
         ) : null}
-        <Button
-          aria-controls="session-action-required-body"
-          aria-expanded={!dismissed}
-          size="sm"
-          variant="ghost"
-          onClick={() => setDismissed((current) => !current)}
-        >
-          {dismissed ? "Show requests" : "Dismiss"}
-        </Button>
       </div>
-      {!dismissed ? (
-        <div className="session-action-required-body" id="session-action-required-body">
-          {pendingRequests.map((request) => (
-            <ProviderPendingRequestCard
-              key={String(request.request_id)}
-              request={request}
-              ticket={ticket}
-            />
-          ))}
-        </div>
-      ) : null}
+      <div className="session-action-required-body">
+        {pendingRequests.map((request) => (
+          <ProviderPendingRequestCard
+            key={`${typeof request.request_id}:${request.request_id}`}
+            request={request}
+            ticket={ticket}
+          />
+        ))}
+      </div>
     </div>
   );
 }
 
 const IMG_TOKEN_PATTERN = /\u27e6img:([^\u27e7]+)\u27e7/g;
-const PROMPT_MENTION_PATTERN = /(^|[\s([{])(@(?:thread|project|section):[^\s.,!?;)}\]]+|@[A-Za-z0-9_.-]+\/[^\s.,!?;)}\]]+)/g;
-const expandedThoughtGroups = new Map<string, boolean>();
 
-type UserTextPart =
-  | { kind: "text"; text: string }
-  | { kind: "image"; url: string }
-  | { kind: "envelope"; label: string; text: string };
-type RenderedUserTextPart = Exclude<UserTextPart, { kind: "envelope" }>;
-
-const KNOWN_ENVELOPE_PATTERN = /<(recommended_plugins|WIKI_RUNTIME_CARD)(?:\s[^>]*)?>[\s\S]*?<\/\1>/gi;
-
-function splitKnownEnvelopes(text: string): UserTextPart[] {
-  const parts: UserTextPart[] = [];
-  let last = 0;
-  for (const match of text.matchAll(KNOWN_ENVELOPE_PATTERN)) {
-    const index = match.index ?? 0;
-    const raw = match[0];
-    const tag = match[1]?.toLowerCase();
-    if (!raw || !tag) continue;
-    if (index > last) parts.push({ kind: "text", text: text.slice(last, index) });
-    parts.push({
-      kind: "envelope",
-      label: tag === "recommended_plugins" ? "recommended plugins" : "runtime card",
-      text: raw,
-    });
-    last = index + raw.length;
-  }
-  if (last < text.length) parts.push({ kind: "text", text: text.slice(last) });
-  return parts.length ? parts : [{ kind: "text", text }];
-}
-
-function splitImgTokens(text: string): RenderedUserTextPart[] {
-  const parts: RenderedUserTextPart[] = [];
+function splitImgTokens(text: string): (string | { url: string })[] {
+  const parts: (string | { url: string })[] = [];
   let last = 0;
   for (const match of text.matchAll(IMG_TOKEN_PATTERN)) {
-    if (match.index! > last) parts.push({ kind: "text", text: text.slice(last, match.index) });
-    parts.push({ kind: "image", url: match[1] });
+    if (match.index! > last) parts.push(text.slice(last, match.index));
+    parts.push({ url: match[1] });
     last = match.index! + match[0].length;
   }
-  if (last < text.length) parts.push({ kind: "text", text: text.slice(last) });
+  if (last < text.length) parts.push(text.slice(last));
   return parts;
 }
 
-function renderUserText(text: string, keyPrefix: string): ReactNode {
-  const nodes: ReactNode[] = [];
-  let last = 0;
-  for (const match of text.matchAll(PROMPT_MENTION_PATTERN)) {
-    const mention = match[2];
-    if (!mention || match.index === undefined) continue;
-    const mentionStart = match.index + match[1].length;
-    if (mentionStart > last) nodes.push(text.slice(last, mentionStart));
-    nodes.push(
-      <span
-        className="prompt-mention-pill"
-        data-mention={mention}
-        key={`${keyPrefix}-${mentionStart}`}
-        title={mention}
-      >
-        {mention}
-      </span>,
-    );
-    last = mentionStart + mention.length;
-  }
-  if (last < text.length) nodes.push(text.slice(last));
-  return nodes.length ? nodes : text;
-}
-
-export function UserText({
+function UserText({
   text,
   imageNums = [],
 }: {
   text: string;
   imageNums?: number[];
 }) {
-  const contentRef = useRef<HTMLDivElement | null>(null);
-  const contentId = useId();
-  const [expanded, setExpanded] = useState(false);
-  const [measured, setMeasured] = useState(false);
-  const [overflowing, setOverflowing] = useState(false);
+  const parts = splitImgTokens(text);
+  const hasImages = parts.some((part) => typeof part !== "string");
+  if (!hasImages) return <div className="session-text">{text}</div>;
   let imgIndex = -1;
-
-  useLayoutEffect(() => {
-    if (expanded) return;
-    const content = contentRef.current;
-    if (!content) return;
-    const measure = () => {
-      setOverflowing(content.scrollHeight > content.clientHeight + 1);
-      setMeasured(true);
-    };
-    measure();
-    const observer = new ResizeObserver(measure);
-    observer.observe(content);
-    return () => observer.disconnect();
-  }, [expanded, text]);
-
-  const parts = splitKnownEnvelopes(text);
-  const isClamped = !expanded && (!measured || overflowing);
-  const renderTextPart = (value: string, keyPrefix: string) => splitImgTokens(value).map((part, index) => {
-    if (part.kind === "image") {
-      imgIndex += 1;
-      return <ImageChip key={`${keyPrefix}-image-${index}`} num={imageNums[imgIndex] ?? 0} url={part.url} />;
-    }
-    return <span key={`${keyPrefix}-text-${index}`}>{renderUserText(part.text, keyPrefix)}</span>;
-  });
   return (
-    <>
-      <div
-        aria-busy={!measured}
-        className={`session-user-content session-text${isClamped ? " is-clamped" : ""}`}
-        data-rendered-overflow={overflowing ? "true" : "false"}
-        id={contentId}
-        ref={contentRef}
-      >
-      {parts.map((part, index) => {
-        if (part.kind === "envelope") {
-          return (
-            <details className="session-envelope" key={`envelope-${index}`}>
-              <summary>{part.label}</summary>
-              <pre className="session-envelope-raw">{part.text}</pre>
-            </details>
-          );
-        }
-        if (part.kind !== "text") return null;
-        return <span key={`text-${index}`}>{renderTextPart(part.text, `part-${index}`)}</span>;
+    <div className="session-text">
+      {parts.map((part, i) => {
+        if (typeof part === "string") return <span key={i}>{part}</span>;
+        imgIndex += 1;
+        return (
+          <ImageChip
+            key={i}
+            num={imageNums[imgIndex] ?? 0}
+            url={part.url}
+          />
+        );
       })}
-      </div>
-      {overflowing ? (
-        <button
-          aria-controls={contentId}
-          aria-expanded={expanded}
-          className="session-expand"
-          type="button"
-          onClick={() => setExpanded((value) => !value)}
-        >
-          {expanded ? "Show less" : "Show more"}
-        </button>
-      ) : null}
-    </>
+    </div>
   );
 }
 
@@ -1781,46 +1659,7 @@ function normalizeCodexThinkingMarkdown(text: string): string {
     .join("\n");
 }
 
-export function groupSettledThoughtRows(rows: readonly EventRow[]): EventRow[] {
-  const grouped: EventRow[] = [];
-  let index = 0;
-  while (index < rows.length) {
-    const row = rows[index];
-    if (row.event.kind !== "thinking" || row.event.partial) {
-      grouped.push(row.event.kind === "thinking" ? { ...row, live: true } : row);
-      index += 1;
-      continue;
-    }
-    const settled: EventRow[] = [];
-    while (index < rows.length) {
-      const candidate = rows[index];
-      if (candidate.event.kind !== "thinking" || candidate.event.partial) break;
-      settled.push(candidate);
-      index += 1;
-    }
-    const latest = settled.pop();
-    if (!latest) continue;
-    if (settled.length > 1) {
-      grouped.push({ ...settled[0], thoughts: settled });
-    } else {
-      grouped.push(...settled);
-    }
-    grouped.push({ ...latest, live: true });
-  }
-  return grouped;
-}
-
-export function ThinkingRow({
-  event,
-  durationMs = null,
-  initiallyExpanded = false,
-  live = false,
-}: {
-  event: SessionEvent;
-  durationMs?: number | null;
-  initiallyExpanded?: boolean;
-  live?: boolean;
-}) {
+export function ThinkingRow({ event, durationMs = null }: { event: SessionEvent; durationMs?: number | null }) {
   // Provider capability markers can arrive as truthy wire values after an
   // app-server round trip. Do not require a strict boolean identity.
   const codexSummary = Boolean(event.encrypted);
@@ -1828,11 +1667,11 @@ export function ThinkingRow({
     ? normalizeCodexThinkingPreview(event.text)
     : event.text.split("\n", 1)[0].trim();
   const markdown = codexSummary ? normalizeCodexThinkingMarkdown(event.text) : event.text;
-  const [expanded, setExpanded] = useState(initiallyExpanded);
+  const [expanded, setExpanded] = useState(false);
   const title = preview.slice(0, 120);
   const duration = durationMs !== null ? formatEventDuration(durationMs) : null;
   return (
-    <div className={`session-activity-row is-reasoning${live ? " is-live" : ""}`}>
+    <div className="session-activity-row is-reasoning">
       <button
         className="session-thinking-head"
         type="button"
@@ -1869,56 +1708,6 @@ export function ThinkingRow({
   );
 }
 
-export function ThoughtGroupRow({
-  events,
-  groupId = String(events[0]?.key ?? ""),
-  durations,
-}: {
-  groupId?: string;
-  events: readonly EventRow[];
-  durations: ReadonlyMap<number, number>;
-}) {
-  const [expanded, setExpanded] = useState(() => expandedThoughtGroups.get(groupId) ?? false);
-  const totalDuration = events.reduce(
-    (total, row) => total + (durations.get(row.key) ?? 0),
-    0,
-  );
-  const encrypted = events.some((row) => Boolean(row.event.encrypted));
-  return (
-    <div className="session-thinking-group">
-      <button
-        aria-expanded={expanded}
-        className="session-thinking-head session-thinking-group-head"
-        type="button"
-        onClick={() => setExpanded((value) => {
-          const next = !value;
-          expandedThoughtGroups.set(groupId, next);
-          return next;
-        })}
-      >
-        <span aria-hidden="true" className="session-thinking-prefix">{expanded ? "-" : "+"}</span>
-        <span className="session-thinking-line">
-          {events.length} thoughts
-          {totalDuration > 0 ? ` · ${formatEventDuration(totalDuration)}` : ""}
-        </span>
-        {encrypted ? <span className="session-thinking-chip">encrypted</span> : null}
-      </button>
-      {expanded ? (
-        <div className="session-thinking-group-rows">
-          {events.map((row) => (
-            <ThinkingRow
-              event={row.event}
-              initiallyExpanded
-              key={row.key}
-              durationMs={durations.get(row.key) ?? null}
-            />
-          ))}
-        </div>
-      ) : null}
-    </div>
-  );
-}
-
 export function ToolCallRow({
   event,
   nested = false,
@@ -1934,7 +1723,6 @@ export function ToolCallRow({
 }) {
   const tool = event.tool!;
   const status = toolStatus(tool);
-  const ToolIcon = toolIcon(tool, status);
   const running = status === "working";
   const detail = toolInlineDetail(tool);
   const { verb, target } = toolSummaryParts(tool);
@@ -1993,9 +1781,11 @@ export function ToolCallRow({
       data-tool-event-id={nested ? undefined : event.id}
     >
       <div className="session-tool-head">
-        {/* The icon carries the tool family. State remains in row color and
-            the screen-reader-only status text. */}
-        <ToolIcon aria-hidden="true" className="session-tool-icon" size={14} />
+        {/* OpenCode's glyph micro-vocabulary in a fixed 2-char column; state
+            is the row's COLOR (muted done, error failed), never a word. */}
+        <span aria-hidden="true" className="session-tool-icon session-tool-icon-text">
+          {toolGlyph(tool, status)}
+        </span>
         <span className="session-tool-summary" title={toolSummaryLine(tool)}>
           <span className="session-tool-verb">{verb}</span>
           {target ? <><span aria-hidden="true">{" "}</span><span className="session-tool-target">{target}</span></> : null}
@@ -2530,7 +2320,7 @@ function ClaudeRateLimitRow({ event }: { event: SessionEvent }) {
 function InterruptRow({ text }: { text: string }) {
   return (
     <div className="session-interrupt">
-      <CircleSlash size={14} />
+      <CircleSlash size={12} />
       <span>{text}</span>
     </div>
   );
@@ -2540,19 +2330,16 @@ function PrRow({ pr, text }: { pr: SessionPr | undefined; text: string }) {
   if (!pr) return null;
   return (
     <a className="session-pr-chip" href={pr.url} {...externalLinkProps(pr.url)}>
-      <GitPullRequest size={14} />
+      <GitPullRequest size={12} />
       <span>{text}</span>
     </a>
   );
 }
 
-// WIKI-304: bb info-row grammar drops the leading icon in favor of a
-// text-2xs uppercase severity label. Icons collide with the compact row
-// height and the label carries the semantic weight on its own.
-const MARKER_LABEL: Record<MarkerSeverity, string> = {
-  info: "info",
-  warn: "warn",
-  error: "error",
+const MARKER_ICON: Record<MarkerSeverity, LucideIcon> = {
+  info: Radio,
+  warn: AlertTriangle,
+  error: AlertTriangle,
 };
 
 function SyntheticSourceRow({ source, text }: { source: string; text: string }) {
@@ -2574,19 +2361,20 @@ function MarkerRow({ text, marker }: { text: string; marker?: string }) {
   if (!rule) {
     // Non-whitelisted markers still render as a visible info row (Henry
     // prefers verbose "tool reference"-style detail over hidden chips).
-    const label = marker === "tool_reference" ? "tool" : MARKER_LABEL.info;
+    const FallbackIcon = marker === "tool_reference" ? Wrench : Radio;
     return (
       <div className="session-marker is-info" data-marker={marker}>
-        <span className="session-marker-label">{label}</span>
-        <span className="session-marker-text">{text}</span>
+        <FallbackIcon size={12} />
+        <span>{text}</span>
       </div>
     );
   }
+  const Icon = MARKER_ICON[rule.severity];
   const rendered = rule.verb ? `${rule.verb} · ${text}` : text;
   return (
     <div className={`session-marker is-${rule.severity}`} data-marker={marker}>
-      <span className="session-marker-label">{MARKER_LABEL[rule.severity]}</span>
-      <span className="session-marker-text">{rendered}</span>
+      <Icon size={12} />
+      <span>{rendered}</span>
     </div>
   );
 }
@@ -2768,7 +2556,7 @@ const MessageBlock = memo(function MessageBlock({
   if (event.kind === "notification") {
     return (
       <div className="session-notification">
-        <Bell size={14} />
+        <Bell size={12} />
         <span>{event.text}</span>
       </div>
     );
@@ -2776,7 +2564,7 @@ const MessageBlock = memo(function MessageBlock({
   if (event.kind === "command") {
     return (
       <div className="session-command">
-        <SlashSquare size={14} />
+        <SlashSquare size={12} />
         <span>{event.text}</span>
       </div>
     );
@@ -2834,32 +2622,19 @@ export function ActivityEventRow({
   rowKey,
   onInspect,
   thoughtDurationMs = null,
-  thoughtDurationsByKey,
-  thoughts,
-  live = false,
   ticket,
 }: {
   event: SessionEvent;
   rowKey: number;
   onInspect?: (agentId: string) => void;
   thoughtDurationMs?: number | null;
-  thoughtDurationsByKey?: ReadonlyMap<number, number>;
-  thoughts?: readonly EventRow[];
-  live?: boolean;
   ticket: string;
 }) {
   const rows = useMemo(() => traceRows(activityTimeline([event])), [event]);
-  if (thoughts && thoughtDurationsByKey) {
-    return (
-      <div className="session-activity">
-        <ThoughtGroupRow durations={thoughtDurationsByKey} events={thoughts} groupId={`${ticket}:${rowKey}`} />
-      </div>
-    );
-  }
   if (event.kind === "thinking" && event.text) {
     return (
       <div className="session-activity">
-        <ThinkingRow durationMs={thoughtDurationMs} event={event} live={live} />
+        <ThinkingRow durationMs={thoughtDurationMs} event={event} />
       </div>
     );
   }
@@ -2941,12 +2716,13 @@ export type TurnMeta = {
   durationMs: number | null;
 };
 
-// OpenCode's turn boundary (session/index.tsx:1534-1559): agent, model, and
-// duration after the final part of each completed turn.
+// OpenCode's turn boundary (session/index.tsx:1534-1559): `▣ Build · model ·
+// duration` after the final part of each completed turn — glyph in the agent
+// color, name in text, the rest muted.
 export function TurnMetaRow({ meta }: { meta: TurnMeta }) {
   return (
     <div className="session-turn-meta" data-testid="session-turn-meta">
-      <Bot aria-hidden="true" className="session-turn-meta-glyph" size={14} />
+      <span aria-hidden="true" className="session-turn-meta-glyph">▣</span>
       <span className="session-turn-meta-agent">{meta.agent}</span>
       {meta.model ? <span className="session-turn-meta-detail"> · {meta.model}</span> : null}
       {meta.durationMs !== null ? (
@@ -2978,7 +2754,6 @@ const VirtualSessionRow = memo(function VirtualSessionRow({
   sessionKey,
   showTimestamp,
   thoughtDurationMs = null,
-  thoughtDurationsByKey,
   top,
   ticket,
   turnMeta = null,
@@ -2994,7 +2769,6 @@ const VirtualSessionRow = memo(function VirtualSessionRow({
   sessionKey: string;
   showTimestamp: boolean;
   thoughtDurationMs?: number | null;
-  thoughtDurationsByKey: ReadonlyMap<number, number>;
   top: number;
   ticket: string;
   turnMeta?: TurnMeta | null;
@@ -3020,9 +2794,6 @@ const VirtualSessionRow = memo(function VirtualSessionRow({
           rowKey={row.key}
           onInspect={onInspect}
           thoughtDurationMs={thoughtDurationMs}
-          thoughtDurationsByKey={thoughtDurationsByKey}
-          thoughts={row.thoughts}
-          live={row.live}
           ticket={ticket}
         />
       ) : (
@@ -3054,7 +2825,6 @@ const VirtualSessionRow = memo(function VirtualSessionRow({
     prev.onOpenArtifact !== next.onOpenArtifact ||
     prev.showTimestamp !== next.showTimestamp ||
     prev.thoughtDurationMs !== next.thoughtDurationMs ||
-    prev.thoughtDurationsByKey !== next.thoughtDurationsByKey ||
     prev.ticket !== next.ticket ||
     prev.turnMeta !== next.turnMeta ||
     prev.uiState !== next.uiState
@@ -3063,8 +2833,6 @@ const VirtualSessionRow = memo(function VirtualSessionRow({
   }
   return prev.row.key === next.row.key &&
     prev.row.event === next.row.event &&
-    prev.row.live === next.row.live &&
-    prev.row.thoughts === next.row.thoughts &&
     sameImageNums(prev.imageNums, next.imageNums);
 });
 
@@ -3153,60 +2921,6 @@ function resolveScrollAnchorTarget(
   return { index, key, target };
 }
 
-const EMPTY_THREAD_SUGGESTIONS = [
-  "ask a question",
-  "summarize a note",
-  "search the vault",
-] as const;
-
-interface SessionEmptyWelcomeProps {
-  showComposer: boolean;
-  subagent: boolean;
-  working: boolean;
-}
-
-function SessionEmptyWelcome({
-  showComposer,
-  subagent,
-  working,
-}: SessionEmptyWelcomeProps) {
-  const title = working
-    ? "Waiting for the first event…"
-    : subagent
-      ? "No events yet"
-      : "Start a conversation";
-  const body = working
-    ? "The agent is running but has not produced output yet."
-    : subagent
-      ? "This subagent hasn't emitted any events."
-      : showComposer
-        ? "Send a message below to start the session."
-        : "This session has no events.";
-
-  return (
-    <div
-      className="session-zero-events"
-      role="status"
-      data-testid="session-zero-events"
-    >
-      <div className="session-zero-events-mark" aria-hidden="true">
-        <MessageCircleQuestion size={18} />
-      </div>
-      <div className="session-zero-events-title">{title}</div>
-      <div className="session-zero-events-body">{body}</div>
-      {!working && !subagent && showComposer ? (
-        <div className="session-zero-events-suggestions" role="group" aria-label="Suggested prompts">
-          {EMPTY_THREAD_SUGGESTIONS.map((suggestion) => (
-            <span className="session-zero-events-chip" key={suggestion}>
-              {suggestion}
-            </span>
-          ))}
-        </div>
-      ) : null}
-    </div>
-  );
-}
-
 export function SessionTab({
   ticket,
   subagent,
@@ -3236,6 +2950,7 @@ export function SessionTab({
   const rowHeightsRef = useRef<Map<number, RowMeasurement>>(new Map());
   const eventRowsCacheRef = useRef<EventRowsCache | null>(null);
   const layoutCacheRef = useRef<VirtualLayoutCache | null>(null);
+  const layoutDirtyFromRef = useRef(Number.POSITIVE_INFINITY);
   const layoutRef = useRef<VirtualLayout | null>(null);
   const layoutResetKeyRef = useRef(resetKey);
   const [containerNode, setContainerNode] = useState<HTMLDivElement | null>(null);
@@ -3256,6 +2971,7 @@ export function SessionTab({
     rowHeightsRef.current = new Map();
     eventRowsCacheRef.current = null;
     layoutCacheRef.current = null;
+    layoutDirtyFromRef.current = 0;
   }
 
   const target = useMemo(
@@ -3521,19 +3237,20 @@ export function SessionTab({
     eventRowsCacheRef.current = result.cache;
     return result;
   }, [displayEvents, session?.base, session?.eventsChangedFrom]);
-  const rawRows = rowResult.rows;
-  const rows = useMemo(() => groupSettledThoughtRows(rawRows), [rawRows]);
+  const rows = rowResult.rows;
   const layout = useMemo(() => {
+    const changedFrom = Math.min(rowResult.changedFrom, layoutDirtyFromRef.current);
     const result = buildVirtualLayoutIncremental(
       rows,
       rowHeightsRef.current,
       rowHeightVersion,
       layoutCacheRef.current,
-      0,
+      Number.isFinite(changedFrom) ? changedFrom : undefined,
     );
     layoutCacheRef.current = result.cache;
+    layoutDirtyFromRef.current = Number.POSITIVE_INFINITY;
     return result.layout;
-  }, [rows, resetKey, rowHeightVersion]);
+  }, [rowResult.changedFrom, rows, resetKey, rowHeightVersion]);
   const [visibleRange, setVisibleRange] = useState<{ start: number; end: number }>({ start: 0, end: -1 });
   const visibleRangeViewportRef = useRef<{ top: number; height: number } | null>(null);
   const syncVisibleRange = useCallback((viewport: { top: number; height: number }, force = false) => {
@@ -3586,13 +3303,17 @@ export function SessionTab({
   const reportRowHeight = useCallback((row: EventRow, height: number) => {
     const measurement: RowMeasurement = {
       height,
-      refs: rowEventRefs(row),
+      refs: [row.event],
     };
     const current = rowHeightsRef.current.get(row.key);
     if (current && current.height === measurement.height && sameEventRefs(current.refs, measurement.refs)) {
       return;
     }
     rowHeightsRef.current.set(row.key, measurement);
+    const index = layoutCacheRef.current?.layout.keyToIndex.get(row.key);
+    if (index !== undefined) {
+      layoutDirtyFromRef.current = Math.min(layoutDirtyFromRef.current, index);
+    }
     setRowHeightVersion((version) => version + 1);
   }, []);
 
@@ -3752,16 +3473,16 @@ export function SessionTab({
   const sessionWorking = session?.working ?? false;
   const sessionModel = session?.model ?? null;
   const sessionAgentName = session?.sessionMeta.agent_name ?? session?.kind ?? null;
-  const thoughtDurationByKey = useMemo(() => thoughtDurations(rawRows), [rawRows]);
+  const thoughtDurationByKey = useMemo(() => thoughtDurations(rows), [rows]);
   // Stable per-key TurnMeta objects so row memoization holds between renders.
   const turnMetaByKey = useMemo(() => {
     const metas = new Map<number, TurnMeta>();
     if (!sessionAgentName && !sessionModel) return metas;
-    for (const [key, durationMs] of turnMetaDurations(rawRows, sessionWorking)) {
+    for (const [key, durationMs] of turnMetaDurations(rows, sessionWorking)) {
       metas.set(key, { agent: sessionAgentName ?? "agent", model: sessionModel, durationMs });
     }
     return metas;
-  }, [rawRows, sessionAgentName, sessionModel, sessionWorking]);
+  }, [rows, sessionAgentName, sessionModel, sessionWorking]);
 
   const imageNumbers = useMemo(() => {
     const map = new Map<SessionEvent, number[]>();
@@ -3818,31 +3539,25 @@ export function SessionTab({
     if (error && !loading) {
       return (
         <div className="session-tab" ref={setContainerNode}>
-          <div className="session-empty session-empty-error" role="alert" data-testid="session-load-error">
-            <div className="session-error-card">
-              <AlertTriangle aria-hidden="true" className="session-error-icon" size={16} />
-              <div className="session-error-content">
-                <div className="session-empty-title">Could not load transcript</div>
-                <div className="session-empty-body">{error}</div>
-                <button
-                  type="button"
-                  className="session-empty-retry"
-                  onClick={retry}
-                  disabled={retrying}
-                  aria-busy={retrying}
-                >
-                  <RefreshCw size={12} />
-                  {retrying ? "Retrying…" : "Try again"}
-                </button>
-              </div>
-            </div>
+          <div className="session-empty session-empty-error" role="alert">
+            <div className="session-empty-title">Could not load transcript</div>
+            <div className="session-empty-body">{error}</div>
+            <button
+              type="button"
+              className="session-empty-retry"
+              onClick={retry}
+              disabled={retrying}
+            >
+              <RefreshCw size={12} />
+              {retrying ? "Retrying…" : "Try again"}
+            </button>
           </div>
         </div>
       );
     }
     return (
       <div className="session-tab" ref={setContainerNode}>
-        <div className="session-empty session-empty-loading" role="status" aria-busy="true" aria-label="Loading transcript">
+        <div className="session-empty">
           <LoadingPlaceholder className="session-loading" lines={[82, 96, 74, 88]} />
         </div>
       </div>
@@ -3928,11 +3643,24 @@ export function SessionTab({
             </div>
           ) : null}
           {displayEvents.length === 0 && pendingUserMessages.length === 0 ? (
-            <SessionEmptyWelcome
-              showComposer={showComposer}
-              subagent={Boolean(subagent)}
-              working={session.working}
-            />
+            <div
+              className="session-zero-events"
+              role="status"
+              data-testid="session-zero-events"
+            >
+              <div className="session-zero-events-title">
+                {session.working ? "Waiting for the first event…" : "No events yet"}
+              </div>
+              <div className="session-zero-events-body">
+                {session.working
+                  ? "The agent is running but has not produced output yet."
+                  : subagent
+                    ? "This subagent hasn't emitted any events."
+                    : showComposer
+                      ? "Send a message below to start the session."
+                      : "This session has no events."}
+              </div>
+            </div>
           ) : null}
           <div className="session-virtual-list" style={{ height: layout.totalHeight }}>
             {visibleRows.map(({ row, top }) => (
@@ -3952,7 +3680,6 @@ export function SessionTab({
                 sessionKey={inlineArtifactKey}
                 showTimestamp={timestampKeys.has(row.key)}
                 thoughtDurationMs={thoughtDurationByKey.get(row.key) ?? null}
-                thoughtDurationsByKey={thoughtDurationByKey}
                 ticket={ticket}
                 top={top}
                 turnMeta={turnMetaByKey.get(row.key) ?? null}
@@ -3973,26 +3700,21 @@ export function SessionTab({
           ticket={ticket}
           guidance={composerGuidance}
           onInspect={onInspect}
-          footer={
-            <div className="session-footer tabular-nums">
-              <SessionModelFooter session={session} ticket={ticket} />
-              <div aria-hidden="true" className="session-footer-hints">
-                {composerGuidance.shortcuts.map((shortcut) => (
-                  <span className="session-hint" key={shortcut.key}>
-                    <span className="session-hint-key">{shortcut.key}</span>{" "}
-                    {shortcut.action}
-                  </span>
-                ))}
-              </div>
-            </div>
-          }
         />
       )}
-      {subagent || !showComposer ? (
-        <div className="session-footer tabular-nums">
-          <SessionModelFooter session={session} ticket={ticket} />
-        </div>
-      ) : null}
+      <div className="session-footer tabular-nums">
+        <SessionModelFooter session={session} ticket={ticket} />
+        {subagent || !showComposer ? null : (
+          <div aria-hidden="true" className="session-footer-hints">
+            {composerGuidance.shortcuts.map((shortcut) => (
+              <span className="session-hint" key={shortcut.key}>
+                <span className="session-hint-key">{shortcut.key}</span>{" "}
+                {shortcut.action}
+              </span>
+            ))}
+          </div>
+        )}
+      </div>
       </div>
       </SessionUiStateContext.Provider>
     </QuestionUiContext.Provider>
@@ -4046,7 +3768,6 @@ function MessageComposer({
   thinking = false,
   guidance,
   onInspect,
-  footer,
 }: {
   stateKey: string;
   ticket: string;
@@ -4057,7 +3778,6 @@ function MessageComposer({
   thinking?: boolean;
   guidance: ComposerGuidance;
   onInspect?: (agentId: string) => void;
-  footer: ReactNode;
 }) {
   const cachedComposer = getComposerState(stateKey);
   const selectionRef = useRef({
@@ -4912,7 +4632,7 @@ function MessageComposer({
         <div className="session-skill-menu">
           {menuItems.map((skill, i) => (
             <button
-              className={`bb-menu-row session-skill-item${i === menuIndex ? " is-active" : ""}`}
+              className={`session-skill-item${i === menuIndex ? " is-active" : ""}`}
               key={skill.name}
               type="button"
               onMouseDown={(event) => {
@@ -4920,7 +4640,7 @@ function MessageComposer({
                 acceptSkill(skill.name);
               }}
             >
-              <span className="session-skill-name prompt-mention-pill">
+              <span className="session-skill-name">
                 {trigger?.sigil === "$" ? "$" : "/"}
                 {skill.name}
               </span>
@@ -4978,25 +4698,19 @@ function MessageComposer({
         </div>
       ) : null}
       {activeCommand ? (
-        <>
-          <CommandForm
-            command={activeCommand}
-            values={commandValues}
-            onChange={(name, value) =>
-              setCommandValues((current) => ({ ...current, [name]: value }))
-            }
-            onSubmit={() => void runCommand()}
-            onCancel={() => cancelCommand()}
-            busy={commandBusy}
-            error={commandError}
-          />
-          {footer}
-        </>
+        <CommandForm
+          command={activeCommand}
+          values={commandValues}
+          onChange={(name, value) =>
+            setCommandValues((current) => ({ ...current, [name]: value }))
+          }
+          onSubmit={() => void runCommand()}
+          onCancel={() => cancelCommand()}
+          busy={commandBusy}
+          error={commandError}
+        />
       ) : (
-        // WIKI-303: bb PromptBox parity — quiet outer card holds the input row
-        // + a text-2xs metadata footer. Card owns border / radius / focus lift;
-        // the row keeps its label/input/send grid.
-        <div className="session-composer-card">
+        <>
           <div className="session-composer-row">
             <label className="session-composer-target" htmlFor={composerInputId}>
               <span>ask or steer</span>
@@ -5173,38 +4887,37 @@ function MessageComposer({
               <SendHorizontal aria-hidden="true" size={14} />
             </button>
           </div>
-          <div className="session-composer-meta">
-            {thinking ? <span className="session-thinking-indicator">thinking</span> : null}
-            <div className="session-subagents">
-              {runningSubagents.map((entry) => (
-                <button
-                  className="session-subagent-chip"
-                  disabled={!onInspect}
-                  key={entry.id}
-                  title={entry.head}
-                  type="button"
-                  onClick={() => onInspect?.(entry.id)}
-                >
-                  <span className="session-tool-running" />
-                  subagent {entry.id.slice(0, 8)}
-                </button>
-              ))}
-            </div>
-            {vimMode !== "insert" ? (
-              <span className={`session-vim-mode is-${vimMode}`}>
-                {vimMode === "visual"
-                  ? "-- VISUAL --"
-                  : vimMode === "pane"
-                    ? "-- PANE --"
-                    : "-- NORMAL --"}
-              </span>
-            ) : null}
-            {footer}
-          </div>
-        </div>
+        </>
       )}
       <div id={composerHelpId} className="session-composer-help">
         {guidance.accessibleText}
+      </div>
+      <div className="session-composer-status">
+        {thinking ? <span className="session-thinking-indicator">thinking</span> : null}
+        <div className="session-subagents">
+          {runningSubagents.map((entry) => (
+            <button
+              className="session-subagent-chip"
+              disabled={!onInspect}
+              key={entry.id}
+              title={entry.head}
+              type="button"
+              onClick={() => onInspect?.(entry.id)}
+            >
+              <span className="session-tool-running" />
+              subagent {entry.id.slice(0, 8)}
+            </button>
+          ))}
+        </div>
+        {vimMode !== "insert" ? (
+          <span className={`session-vim-mode is-${vimMode}`}>
+            {vimMode === "visual"
+              ? "-- VISUAL --"
+              : vimMode === "pane"
+                ? "-- PANE --"
+                : "-- NORMAL --"}
+          </span>
+        ) : null}
       </div>
     </div>
   );

@@ -92,11 +92,10 @@
 
   --readable-col: var(--file-line-width);
 
-  /* WIKI-334: one size for every surface (Henry 2026-08-17, supersedes the
-     WIKI-318 15/13/10 tiers). The single picker size drives prose, controls,
-     and chrome alike; the tier token names survive as aliases because
-     hundreds of rules consume them. The selected family still applies to
-     every surface, including code and terminal output. */
+  /* WIKI-334 ruling stands: the single Settings size picker drives every
+     surface — prose, controls, and chrome all resolve to --font-single-size.
+     The legacy tier and per-role tokens remain as aliases so restored
+     opencode-era run-view rules keep referencing familiar names. */
   --font-single: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, "Helvetica Neue",
     Helvetica, Arial, sans-serif;
   --font-single-size: 15px;
@@ -107,6 +106,12 @@
   --font-control-line-height: var(--font-prose-line-height);
   --font-chrome-size: var(--font-single-size);
   --font-chrome-line-height: var(--font-prose-line-height);
+  --font-ui-small: var(--font-single-size);
+  --font-ui-smaller: var(--font-single-size);
+  --font-ui-medium: var(--font-single-size);
+  --font-ui-large: var(--font-single-size);
+  --font-text-size: var(--font-single-size);
+  --font-monospace-size: var(--font-single-size);
 
   --font-interface: var(--font-single);
   --font-text: var(--font-single);
@@ -141,8 +146,7 @@
   --hairline: color-mix(in srgb, var(--background-modifier-border) 55%, transparent);
   --hairline-strong: color-mix(in srgb, var(--background-modifier-border) 75%, transparent);
   --chip-radius: var(--radius-full);
-  /* WIKI-334: square composer, flush with the pane background (Henry). */
-  --composer-radius: 0;
+  --composer-radius: var(--radius-xl);
   --send-diameter: 34px;
   --section-label-tracking: 0.14em;
   --section-label-size: var(--fs-2xs);
@@ -156,8 +160,6 @@
   --border-hairline: color-mix(in srgb, var(--text-normal) 15%, var(--background-primary));
   --surface-recessed: color-mix(in srgb, var(--text-normal) 6%, transparent);
   --surface-raised: color-mix(in srgb, var(--text-normal) 2.5%, transparent);
-  --surface-destructive: color-mix(in oklab, var(--accent-danger) 8%, var(--background-primary));
-  --destructive-text: var(--accent-danger);
   --surface-selected: color-mix(in srgb, var(--accent-primary) 16%, transparent);
   --surface-scrim: rgb(0 0 0 / 8%);
   --surface-scrim: color-mix(in oklab, var(--canvas, var(--background-primary, #fff)) 92%, transparent);
@@ -303,7 +305,6 @@ button:disabled {
   .status-bar,
   .activity-feed,
   .agents-view,
-  .session-scroll,
   .session-tab,
   .dialog
 ) :where(.lucide[width="10"], .lucide[width="11"], .lucide[width="12"], .lucide[width="13"]) {
@@ -320,7 +321,7 @@ button:disabled {
   flex-direction: column;
   gap: 8px;
   width: min(100%, 420px);
-  opacity: 1;
+  opacity: 0;
 }
 
 .loading-line {
@@ -329,9 +330,9 @@ button:disabled {
   border-radius: var(--radius-full);
   background: linear-gradient(
     90deg,
-    color-mix(in oklab, var(--text-normal) 8%, var(--background-primary)) 0%,
-    color-mix(in oklab, var(--text-normal) 16%, var(--background-primary)) 45%,
-    color-mix(in oklab, var(--text-normal) 8%, var(--background-primary)) 100%
+    var(--background-secondary) 0%,
+    var(--code-background) 45%,
+    var(--background-secondary) 100%
   );
   background-size: 200% 100%;
   animation: loading-pulse 1.4s ease-in-out infinite;
@@ -3193,7 +3194,7 @@ body.is-resizing-panes .pane-cell {
 }
 
 .markdown-preview-view.kanban-card-content .priority-badge {
-  line-height: 1.4;
+  line-height: 14px;
   vertical-align: 0;
 }
 
@@ -3564,7 +3565,7 @@ body.is-resizing-panes .pane-cell {
   border: 1px solid var(--background-modifier-border);
   border-radius: var(--radius-m);
   background-color: var(--code-background);
-  line-height: var(--font-control-line-height);
+  line-height: 1.5;
   min-width: 0;
 }
 
@@ -3596,7 +3597,7 @@ body.is-resizing-panes .pane-cell {
   border: 1px solid var(--background-modifier-border);
   border-radius: var(--radius-m);
   font-size: var(--font-control-size);
-  line-height: var(--font-control-line-height);
+  line-height: 1.5;
   min-width: 0;
 }
 
@@ -4874,15 +4875,15 @@ body.is-resizing-panes .pane-cell {
   display: flex;
   flex-direction: column;
   justify-content: flex-end;
-  height: calc(var(--fleet-screencast-lines) * var(--font-control-size) * var(--fleet-screencast-line-height) + 12px);
-  min-height: calc(var(--fleet-screencast-lines) * var(--font-control-size) * var(--fleet-screencast-line-height) + 12px);
-  max-height: calc(var(--fleet-screencast-lines) * var(--font-control-size) * var(--fleet-screencast-line-height) + 12px);
+  height: calc(var(--fleet-screencast-lines) * var(--font-chrome-size) * var(--fleet-screencast-line-height) + 12px);
+  min-height: calc(var(--fleet-screencast-lines) * var(--font-chrome-size) * var(--fleet-screencast-line-height) + 12px);
+  max-height: calc(var(--fleet-screencast-lines) * var(--font-chrome-size) * var(--fleet-screencast-line-height) + 12px);
   padding: 6px 8px;
   overflow: hidden;
   background-color: var(--background-primary);
   color: var(--text-muted);
   font-family: var(--font-monospace);
-  font-size: var(--font-control-size);
+  font-size: var(--font-chrome-size);
   line-height: var(--fleet-screencast-line-height);
   white-space: nowrap;
   contain: layout paint size;
@@ -4904,7 +4905,6 @@ body.is-resizing-panes .pane-cell {
 
 .fleet-screencast-line[data-kind="assistant"] .fleet-screencast-text {
   color: var(--text-normal);
-  font-size: var(--font-prose-size);
 }
 
 .fleet-screencast-line[data-kind="tool"] .fleet-screencast-text {
@@ -4913,7 +4913,6 @@ body.is-resizing-panes .pane-cell {
 
 .fleet-screencast-line[data-kind="user"] .fleet-screencast-text {
   color: var(--text-accent);
-  font-size: var(--font-prose-size);
 }
 
 .fleet-screencast-line[data-kind="marker"] .fleet-screencast-text {
@@ -4922,8 +4921,7 @@ body.is-resizing-panes .pane-cell {
 
 .fleet-screencast-glyph {
   flex: 0 0 auto;
-  width: var(--icon-chrome-size);
-  height: var(--icon-chrome-size);
+  width: 10px;
   color: var(--text-faint);
   text-align: center;
 }
@@ -5673,27 +5671,19 @@ body.is-resizing-panes .pane-cell {
   color: var(--text-muted);
   font-family: var(--font-monospace);
   font-weight: var(--font-monospace-weight);
+  font-size: var(--font-chrome-size);
   overflow-wrap: anywhere;
 }
 
 .session-notification {
   color: var(--text-faint);
-  font-size: var(--font-prose-size);
-  line-height: var(--font-prose-line-height);
   border-style: dashed;
   background-color: transparent;
-}
-
-.session-command {
-  font-size: var(--font-control-size);
-  line-height: var(--font-control-line-height);
 }
 
 .session-notification svg,
 .session-command svg {
   flex-shrink: 0;
-  width: var(--icon-chrome-size);
-  height: var(--icon-chrome-size);
   align-self: center;
 }
 
@@ -5707,7 +5697,7 @@ body.is-resizing-panes .pane-cell {
   font-family: var(--font-monospace);
   font-weight: var(--font-monospace-weight);
   font-size: var(--font-control-size);
-  line-height: var(--font-control-line-height);
+  line-height: 1.55;
   white-space: pre-wrap;
   overflow-wrap: anywhere;
 }
@@ -5976,12 +5966,6 @@ body.is-resizing-panes .pane-cell {
   font-size: var(--font-chrome-size);
 }
 
-.session-interrupt svg,
-.session-pr-chip svg {
-  width: var(--icon-chrome-size);
-  height: var(--icon-chrome-size);
-}
-
 .session-pr-chip {
   display: inline-flex;
   align-items: center;
@@ -6151,58 +6135,41 @@ body.is-resizing-panes .pane-cell {
   text-overflow: ellipsis;
 }
 
-/* WIKI-304: bb info-row grammar — text-2xs uppercase label chip + one-line
-   body in --readback-foreground; info state is chromeless (label carries the
-   type), warn/error keep tinted borders + severity-toned text. Shared
-   severity vocabulary (info/warn/error) drives both color and label. */
 .session-marker {
+  /* Stretch to the transcript column so marker rows and synthetic-source
+     rows share one uniform width (Henry 2026-07-22). */
   display: flex;
   align-items: center;
-  gap: 10px;
+  gap: 6px;
   align-self: stretch;
   padding: 2px 8px;
-  border: 1px solid transparent;
+  border: 1px solid var(--background-modifier-border);
   border-radius: var(--radius-xs);
   background-color: transparent;
-  color: var(--readback-foreground);
+  color: var(--text-muted);
   font-family: var(--font-monospace);
   font-weight: var(--font-monospace-weight);
-  font-size: var(--font-control-size);
-  line-height: var(--font-control-line-height);
+  font-size: var(--font-chrome-size);
   overflow-wrap: anywhere;
 }
 
-.session-marker-label {
-  flex: 0 0 auto;
+.session-marker.is-info {
+  color: var(--text-muted);
+  border-color: var(--background-modifier-border);
+}
+
+.session-marker.is-info svg {
   color: var(--text-faint);
-  font-size: var(--font-control-size);
-  font-weight: var(--fw-semibold);
-  letter-spacing: var(--section-label-tracking);
-  text-transform: uppercase;
-}
-
-.session-marker-text {
-  min-width: 0;
-  flex: 1 1 auto;
-  overflow-wrap: anywhere;
 }
 
 .session-marker.is-warn {
-  border-color: color-mix(in srgb, var(--accent-warning, var(--accent-danger)) 45%, var(--background-modifier-border));
   color: color-mix(in srgb, var(--accent-warning, var(--accent-danger)) 85%, var(--text-normal));
-}
-
-.session-marker.is-warn .session-marker-label {
-  color: color-mix(in srgb, var(--accent-warning, var(--accent-danger)) 75%, var(--text-normal));
+  border-color: color-mix(in srgb, var(--accent-warning, var(--accent-danger)) 45%, var(--background-modifier-border));
 }
 
 .session-marker.is-error {
+  color: var(--accent-danger);
   border-color: color-mix(in srgb, var(--accent-danger) 50%, var(--background-modifier-border));
-  color: var(--accent-danger);
-}
-
-.session-marker.is-error .session-marker-label {
-  color: var(--accent-danger);
 }
 
 .session-synthetic-source {
@@ -6218,14 +6185,13 @@ body.is-resizing-panes .pane-cell {
   color: var(--text-muted);
   font-family: var(--font-monospace);
   font-weight: var(--font-monospace-weight);
-  font-size: var(--font-prose-size);
-  line-height: var(--font-prose-line-height);
+  font-size: var(--font-chrome-size);
+  line-height: 1.55;
 }
 
 .session-synthetic-source-chip {
   flex-shrink: 0;
   color: var(--text-faint);
-  font-size: var(--font-chrome-size);
   letter-spacing: 0.02em;
   text-transform: none;
 }
@@ -6239,7 +6205,7 @@ body.is-resizing-panes .pane-cell {
   align-self: flex-start;
   font-family: var(--font-monospace);
   font-weight: var(--font-monospace-weight);
-  font-size: var(--font-control-size);
+  font-size: var(--font-chrome-size);
   color: var(--text-faint);
 }
 
@@ -6297,8 +6263,6 @@ body.is-resizing-panes .pane-cell {
   border-radius: var(--radius-xs);
   background-color: var(--background-primary);
   color: var(--text-muted);
-  font-size: var(--font-control-size);
-  line-height: var(--font-control-line-height);
   overflow-wrap: anywhere;
 }
 
@@ -6312,7 +6276,7 @@ body.is-resizing-panes .pane-cell {
 .codex-stream-artifact-count,
 .codex-stream-diff-kind {
   color: var(--text-faint);
-  font-size: var(--font-chrome-size);
+  font-size: var(--fs-2xs);
 }
 
 /* Coalesced provider diagnostics (WIKI-239). One row per stable
@@ -6359,8 +6323,6 @@ body.is-resizing-panes .pane-cell {
   background: transparent;
   color: var(--text-normal);
   font: inherit;
-  font-size: var(--font-control-size);
-  line-height: var(--font-control-line-height);
   text-align: left;
   cursor: pointer;
 }
@@ -6395,7 +6357,7 @@ body.is-resizing-panes .pane-cell {
 .codex-stream-diagnostic-flag {
   flex-shrink: 0;
   color: var(--text-faint);
-  font-size: var(--font-chrome-size);
+  font-size: var(--fs-2xs);
   text-transform: lowercase;
 }
 
@@ -6415,7 +6377,7 @@ body.is-resizing-panes .pane-cell {
   border-radius: var(--radius-full);
   background-color: color-mix(in srgb, var(--text-normal) 12%, transparent);
   color: var(--text-normal);
-  font-size: var(--font-chrome-size);
+  font-size: var(--fs-2xs);
   font-weight: var(--fw-semibold);
   text-align: center;
 }
@@ -6450,8 +6412,7 @@ body.is-resizing-panes .pane-cell {
   margin: 0;
   color: var(--text-normal);
   font-family: inherit;
-  font-size: var(--font-control-size);
-  line-height: var(--font-control-line-height);
+  font-size: var(--fs-xs);
   white-space: pre-wrap;
   overflow-wrap: anywhere;
 }
@@ -6460,7 +6421,6 @@ body.is-resizing-panes .pane-cell {
   min-width: 0;
   overflow: hidden;
   color: var(--text-normal);
-  font-size: var(--font-control-size);
   text-overflow: ellipsis;
   white-space: pre;
 }
@@ -6484,7 +6444,6 @@ body.is-resizing-panes .pane-cell {
   border: 1px solid color-mix(in srgb, var(--accent-primary) 50%, var(--background-modifier-border));
   border-radius: var(--radius-full);
   color: var(--accent-primary);
-  font-size: var(--font-chrome-size);
   white-space: nowrap;
 }
 
@@ -6576,7 +6535,7 @@ body.is-resizing-panes .pane-cell {
   color: var(--text-muted);
   font-family: var(--font-monospace);
   font-weight: var(--font-monospace-weight);
-  font-size: var(--font-control-size);
+  font-size: var(--fs-xs);
   text-transform: lowercase;
   cursor: pointer;
 }
@@ -6622,8 +6581,8 @@ body.is-resizing-panes .pane-cell {
   min-width: 0;
   border-top: 1px solid var(--background-modifier-border);
   color: var(--text-muted);
-  font-size: var(--font-control-size);
-  line-height: var(--font-control-line-height);
+  font-size: var(--fs-2xs);
+  line-height: 1.45;
 }
 
 .codex-stream-diff-hunk + .codex-stream-diff-hunk {
@@ -6633,7 +6592,6 @@ body.is-resizing-panes .pane-cell {
 .codex-stream-diff-hunk-head {
   padding: 3px 7px;
   color: var(--text-faint);
-  font-size: var(--font-chrome-size);
 }
 
 .codex-stream-diff-line {
@@ -6709,7 +6667,7 @@ body.is-resizing-panes .pane-cell {
 }
 
 .session-provider-request + .session-provider-request {
-  border-top: 1px solid var(--border-hairline, var(--background-modifier-border));
+  border-top: 1px solid color-mix(in srgb, var(--accent-warning) 30%, var(--background-modifier-border));
 }
 
 .session-provider-request-actions {
@@ -6755,6 +6713,31 @@ body.is-resizing-panes .pane-cell {
 .session-provider-request-actions {
   justify-content: flex-end;
   margin-top: 8px;
+}
+
+.session-provider-request-actions details {
+  margin-right: auto;
+}
+
+.session-provider-request-actions summary,
+.session-provider-request-actions button {
+  cursor: pointer;
+  color: var(--text-muted);
+}
+
+.session-provider-request-actions button {
+  padding: 3px 7px;
+  border: 1px solid var(--background-modifier-border);
+  border-radius: var(--radius-xs);
+}
+
+.session-provider-request-actions button:hover {
+  color: var(--text-normal);
+}
+
+.session-provider-request-actions button:disabled {
+  cursor: default;
+  opacity: 0.55;
 }
 
 .session-provider-request-actions pre {
@@ -6888,61 +6871,28 @@ body.is-resizing-panes .pane-cell {
 }
 
 .session-empty {
-  display: flex;
-  flex: 1;
-  align-items: center;
-  justify-content: center;
-  padding: 32px 20px;
+  padding: 24px 16px;
   color: var(--text-faint);
   font-size: var(--font-control-size);
 }
 
 .session-empty-error {
-  align-items: flex-start;
-  justify-content: flex-start;
-  padding-top: clamp(32px, 12vh, 120px);
-}
-
-.session-empty-loading {
-  align-items: flex-start;
-  justify-content: flex-start;
-  padding-top: clamp(32px, 14vh, 136px);
-}
-
-.session-error-card {
-  display: grid;
-  grid-template-columns: 16px minmax(0, 1fr);
-  gap: 10px;
-  width: min(100%, 560px);
-  padding: 12px 14px;
-  border: 1px solid color-mix(in oklab, var(--destructive-text) 35%, var(--border-hairline));
-  border-radius: var(--radius-md);
-  background: var(--surface-destructive);
-  color: var(--destructive-text);
-  box-shadow: 0 1px 0 rgb(0 0 0 / 3%);
-}
-
-.session-error-icon {
-  margin-top: 2px;
-}
-
-.session-error-content {
   display: flex;
-  min-width: 0;
   flex-direction: column;
   align-items: flex-start;
   gap: 8px;
+  color: var(--text-normal);
 }
 
 .session-empty-title {
-  color: inherit;
+  color: var(--text-normal);
   font-weight: var(--fw-semibold);
   font-size: var(--font-ui-medium);
 }
 
 .session-empty-body {
-  color: color-mix(in oklab, currentColor 78%, var(--background-primary));
-  font-size: var(--font-control-size);
+  color: var(--text-muted);
+  font-size: var(--font-ui-small);
   line-height: 1.4;
 }
 
@@ -6951,28 +6901,20 @@ body.is-resizing-panes .pane-cell {
   display: inline-flex;
   align-items: center;
   gap: 6px;
-  min-height: 32px;
-  padding: 5px 10px;
-  border: 1px solid color-mix(in oklab, currentColor 32%, var(--border-hairline));
-  border-radius: var(--radius-md);
-  background: transparent;
-  color: inherit;
+  padding: 4px 10px;
+  border: 1px solid var(--background-modifier-border);
+  border-radius: var(--radius-xs);
+  background: var(--background-secondary);
+  color: var(--text-normal);
   font: inherit;
   font-size: var(--font-chrome-size);
   cursor: pointer;
-  transition-property: background-color, color, scale;
-  transition-duration: var(--motion-duration);
-  transition-timing-function: var(--motion-easing);
 }
 
 .session-empty-retry:hover:not(:disabled),
 .session-stale-retry:hover:not(:disabled) {
-  background: color-mix(in oklab, currentColor 10%, transparent);
-}
-
-.session-empty-retry:active:not(:disabled),
-.session-stale-retry:active:not(:disabled) {
-  scale: 0.96;
+  border-color: var(--background-modifier-border-hover);
+  background: var(--background-modifier-hover);
 }
 
 .session-empty-retry:disabled,
@@ -7011,60 +6953,21 @@ body.is-resizing-panes .pane-cell {
 .session-zero-events {
   display: flex;
   flex-direction: column;
-  align-items: center;
-  justify-content: center;
-  gap: 8px;
-  width: min(100%, 560px);
-  min-height: clamp(240px, 42vh, 360px);
-  margin: 0 auto;
-  padding: 40px 20px 32px;
-  text-align: center;
+  gap: 4px;
+  padding: 32px 4px 24px;
   color: var(--text-muted);
-}
-
-.session-zero-events-mark {
-  display: grid;
-  width: 40px;
-  height: 40px;
-  place-items: center;
-  margin-bottom: 4px;
-  border: 1px solid var(--border-hairline);
-  border-radius: var(--radius-lg);
-  background: var(--surface-raised);
-  color: var(--text-subtle-readable);
 }
 
 .session-zero-events-title {
   color: var(--text-normal);
   font-size: var(--font-ui-medium);
   font-weight: var(--fw-semibold);
-  text-wrap: balance;
 }
 
 .session-zero-events-body {
   color: var(--text-muted);
   font-size: var(--font-control-size);
   line-height: 1.5;
-  text-wrap: pretty;
-}
-
-.session-zero-events-suggestions {
-  display: flex;
-  flex-wrap: wrap;
-  justify-content: center;
-  gap: 6px;
-  margin-top: 8px;
-}
-
-.session-zero-events-chip {
-  padding: 5px 9px;
-  border: 1px solid var(--pill-surface-border);
-  border-radius: var(--radius-full);
-  background: var(--pill-surface);
-  box-shadow: var(--pill-shadow);
-  color: var(--pill-foreground);
-  font-size: var(--fs-xs);
-  line-height: 1.2;
 }
 
 .session-tab {
@@ -7630,19 +7533,15 @@ body.is-resizing-panes .pane-cell {
   gap: 10px;
 }
 
-/* WIKI-305: bb thread-body user turn — subtly-recessed card with a hairline
-   border and 8px radius, right-aligned in the transcript column and capped at
-   a comfortable reading width so it reads as an addressed message, not a
-   full-bleed panel. Radius is literal (bb card family = 8px); WIKI-235 scopes
-   --radius-md down to 2px on the surrounding agent-session-surface for flat
-   chrome, and this card opts out of that collapse. Composer pending copies
-   (below) inherit the card face and only override alignment to fill the
-   composer. */
+/* WIKI-234: opencode-style accent-bar block — user turns read as flat
+   full-width panels marked by a left accent bar, not floating bubbles.
+   Square corners: panels are background rectangles, never rounded boxes
+   (opencode ui/border.ts:15-21). */
 .session-user {
-  padding: 10px 14px;
-  border: 1px solid var(--border-hairline, var(--background-modifier-border));
-  border-radius: 8px;
-  background-color: var(--surface-recessed, var(--background-secondary));
+  align-self: stretch;
+  padding: 8px 12px;
+  border-left: 3px solid var(--accent-primary);
+  background-color: var(--background-secondary);
   color: var(--text-normal);
   font-family: var(--font-monospace);
   font-weight: var(--font-monospace-weight);
@@ -7650,76 +7549,9 @@ body.is-resizing-panes .pane-cell {
   line-height: 1.55;
 }
 
-.prompt-mention-pill {
-  display: inline-flex;
-  max-width: 100%;
-  align-items: baseline;
-  padding: 2px 6px;
-  border: 1px solid var(--pill-surface-border, var(--border-hairline, var(--background-modifier-border)));
-  border-radius: var(--radius-full, 999px);
-  background: var(--pill-surface, var(--surface-raised, var(--background-primary)));
-  box-shadow: var(--pill-shadow, none);
-  color: var(--text-normal);
-  font: inherit;
-  line-height: 1rem;
-  overflow-wrap: anywhere;
-  vertical-align: baseline;
-}
-
-.session-virtual-row[data-align="end"] > .session-user {
-  align-self: flex-end;
-  max-width: min(70%, 72ch);
-}
-
-@media (max-width: 760px) {
-  .session-virtual-row[data-align="end"] > .session-user {
-    max-width: min(92%, 72ch);
-  }
-}
-
 .session-text {
   white-space: pre-wrap;
   overflow-wrap: break-word;
-}
-
-.session-user-content {
-  position: relative;
-}
-
-.session-user-content.is-clamped {
-  max-height: calc(15 * 1.55em);
-  overflow: hidden;
-}
-
-.session-user-content.is-clamped::after {
-  position: absolute;
-  right: 0;
-  bottom: 0;
-  left: 0;
-  height: 2.5em;
-  background: linear-gradient(to bottom, transparent, var(--surface-recessed, var(--background-secondary)));
-  content: "";
-  pointer-events: none;
-}
-
-.session-envelope {
-  margin: 0 0 8px;
-  color: var(--text-muted);
-  font-family: var(--font-monospace);
-  font-size: var(--font-chrome-size);
-}
-
-.session-envelope summary {
-  min-height: 24px;
-  cursor: pointer;
-  list-style-position: inside;
-}
-
-.session-envelope-raw {
-  margin: 4px 0 0 1.5ch;
-  white-space: pre-wrap;
-  overflow-wrap: anywhere;
-  font-family: var(--font-monospace);
 }
 
 .session-expand {
@@ -7730,7 +7562,7 @@ body.is-resizing-panes .pane-cell {
   color: var(--text-faint);
   font-family: var(--font-monospace);
   font-weight: var(--font-monospace-weight);
-  font-size: var(--font-control-size);
+  font-size: var(--font-chrome-size);
   text-decoration: underline;
 }
 
@@ -7738,15 +7570,13 @@ body.is-resizing-panes .pane-cell {
   color: var(--text-normal);
 }
 
-/* WIKI-305: assistant prose stays full-width and card-less at bb's 15px /
-   1.375rem body rhythm. */
 .session-assistant {
   padding: 2px 0;
   color: var(--text-normal);
   font-family: var(--font-agent-prose);
   font-weight: var(--font-agent-prose-weight, var(--font-text-weight));
-  font-size: var(--font-prose-size);
-  line-height: var(--font-prose-line-height);
+  font-size: var(--font-text-size);
+  line-height: 1.65;
   overflow-wrap: break-word;
 }
 
@@ -7969,8 +7799,7 @@ body.is-resizing-panes .pane-cell {
   color: inherit;
   font-family: var(--font-monospace);
   font-weight: var(--font-monospace-weight);
-  font-size: var(--font-control-size);
-  line-height: var(--font-control-line-height);
+  font-size: var(--font-chrome-size);
   text-align: left;
 }
 
@@ -8045,7 +7874,7 @@ body.is-resizing-panes .pane-cell {
   background: transparent;
   color: var(--text-muted);
   font: inherit;
-  font-size: var(--font-control-size);
+  font-size: var(--fs-xs);
   cursor: pointer;
 }
 
@@ -8061,23 +7890,13 @@ body.is-resizing-panes .pane-cell {
   gap: 4px;
   margin: 3px 0 5px;
   padding: 2px 0 2px 8px;
-  border-left: 1px solid var(--border-hairline);
-  background-color: transparent;
+  border-left: 1px solid var(--background-modifier-border);
+  background-color: var(--background-primary-alt);
   /* WIKI-247: block interiors are mono, full stop — pin the stack here so a
      prose font on any ancestor can never leak into diff or output text. */
   font-family: var(--font-monospace);
   font-weight: var(--font-monospace-weight);
   font-size: var(--font-control-size);
-}
-
-/* WIKI-304: --timeline-accent left rail ONLY for streaming/pending state.
-   Settled rows keep the quiet hairline indent guide; a running tool call
-   promotes the rail to the timeline color so scanning the transcript picks
-   out live work at a glance. */
-.session-tool.is-working > .session-trace-indent > .session-tool-body {
-  border-left-color: var(--timeline-accent);
-  border-left-width: 2px;
-  padding-left: 7px;
 }
 
 /* WIKI-247: transcript diffs are quiet interiors — no box around the diff,
@@ -8117,20 +7936,12 @@ body.is-resizing-panes .pane-cell {
 }
 
 /* WIKI-247: the bash command line is content, not chrome — it reads in text
-   color while the output below recedes to the muted row color. WIKI-304
-   adds a bb-parity hairline separator whenever content follows the command
-   so the eye can hop from `$ …` to output without a jump. */
+   color while the output below recedes to the muted row color. */
 .session-tool-block-title.is-command {
   color: var(--text-normal);
   white-space: pre-wrap;
   overflow-wrap: anywhere;
   text-overflow: clip;
-}
-
-.session-tool-block-body .session-tool-block-title.is-command:not(:last-child) {
-  padding-bottom: 4px;
-  border-bottom: 1px solid var(--border-hairline);
-  margin-bottom: 2px;
 }
 
 .session-tool-block-preview {
@@ -8170,10 +7981,6 @@ body.is-resizing-panes .pane-cell {
 
 .session-tool-output-peek-chevron {
   flex: 0 0 auto;
-  display: inline-flex;
-  align-items: center;
-  justify-content: center;
-  width: 1ch;
   color: var(--text-faint);
   /* WIKI-298 survivor: `transform` rotates the chevron on hover. */
   transition-property: transform, color;
@@ -8181,12 +7988,9 @@ body.is-resizing-panes .pane-cell {
   transition-timing-function: var(--motion-easing);
 }
 
-/* WIKI-304 bb-parity: on hover the chevron nudges toward the peek preview,
-   telegraphing "expand" without a full spin. */
 .session-tool-output-peek:hover .session-tool-output-peek-chevron,
 .session-tool-output-peek:focus-visible .session-tool-output-peek-chevron {
   color: var(--text-muted);
-  transform: translateX(1px);
 }
 
 .session-tool-output-peek-preview {
@@ -8201,14 +8005,14 @@ body.is-resizing-panes .pane-cell {
 .session-tool-output-peek-meta {
   flex: 0 0 auto;
   color: var(--text-faint);
-  font-size: var(--font-chrome-size);
+  font-size: var(--fs-xs);
   font-variant-numeric: tabular-nums;
 }
 
 .session-tool-output-peek-hint {
   flex: 0 0 auto;
   color: var(--text-faint);
-  font-size: var(--font-control-size);
+  font-size: var(--fs-xs);
   opacity: 0;
   /* WIKI-298 survivor: `opacity` reveals the hint on hover. */
   transition-property: opacity;
@@ -8230,7 +8034,7 @@ body.is-resizing-panes .pane-cell {
   color: var(--text-faint);
   font: inherit;
   font-family: var(--font-monospace);
-  font-size: var(--font-control-size);
+  font-size: var(--fs-xs);
   font-style: italic;
   cursor: pointer;
 }
@@ -8250,7 +8054,7 @@ body.is-resizing-panes .pane-cell {
   background: transparent;
   color: inherit;
   font-family: var(--font-monospace);
-  font-size: var(--font-control-size);
+  font-size: var(--fs-xs);
   cursor: pointer;
   /* WIKI-298 survivor: `opacity` reveals the toggle on head hover. */
   transition-property: opacity, background-color, border-color, color;
@@ -8307,7 +8111,7 @@ body.is-resizing-panes .pane-cell {
 .session-tool-result-state {
   flex-shrink: 0;
   color: var(--activity-metadata-color);
-  font-size: var(--font-chrome-size);
+  font-size: var(--fs-xs);
   letter-spacing: 0.04em;
   text-transform: uppercase;
 }
@@ -8341,7 +8145,7 @@ body.is-resizing-panes .pane-cell {
   color: var(--text-muted);
   font-family: var(--font-monospace);
   font-weight: var(--font-monospace-weight);
-  font-size: var(--font-control-size);
+  font-size: var(--fs-xs);
 }
 
 .session-subtrace-more {
@@ -8349,7 +8153,7 @@ body.is-resizing-panes .pane-cell {
   color: var(--text-faint);
   font-family: var(--font-monospace);
   font-weight: var(--font-monospace-weight);
-  font-size: var(--font-control-size);
+  font-size: var(--fs-xs);
 }
 
 .session-tool-body pre {
@@ -8361,7 +8165,7 @@ body.is-resizing-panes .pane-cell {
   font-family: var(--font-monospace);
   font-weight: var(--font-monospace-weight);
   font-size: var(--font-control-size);
-  line-height: var(--font-control-line-height);
+  line-height: 1.5;
   white-space: pre-wrap;
   overflow-wrap: break-word;
 }
@@ -8401,7 +8205,7 @@ body.is-resizing-panes .pane-cell {
   font-weight: var(--font-agent-prose-weight, var(--font-text-weight));
   font-size: var(--font-control-size);
   font-style: normal;
-  line-height: var(--font-control-line-height);
+  line-height: 1.6;
   white-space: pre-wrap;
   overflow-wrap: break-word;
 }
@@ -8421,8 +8225,7 @@ body.is-resizing-panes .pane-cell {
   color: var(--activity-state-working-color);
   font: inherit;
   font-family: var(--font-monospace);
-  font-size: var(--font-control-size);
-  line-height: var(--font-control-line-height);
+  font-size: var(--font-chrome-size);
   text-align: left;
   cursor: pointer;
 }
@@ -8454,45 +8257,19 @@ body.is-resizing-panes .pane-cell {
   color: inherit;
 }
 
-.session-thinking-duration {
-  font-size: var(--font-chrome-size);
-}
-
 .session-thinking-chip {
   display: inline-flex;
   margin-right: 8px;
-  padding: 0;
-  border: 0;
-  border-radius: 0;
+  padding: 1px 6px;
+  border: 1px solid var(--background-modifier-border);
+  border-radius: var(--radius-xs);
   color: var(--text-muted);
   font-family: var(--font-monospace);
   font-weight: var(--font-monospace-weight);
-  font-size: var(--font-chrome-size);
+  font-size: var(--fs-xs);
   font-style: normal;
-  letter-spacing: 0.02em;
-  text-transform: none;
-  opacity: 0.72;
-}
-
-.session-thinking-group {
-  min-width: 0;
-}
-
-.session-thinking-group-head {
-  font-size: var(--font-control-size);
-}
-
-.session-thinking-group-rows {
-  margin: 3px 0 8px;
-  padding-left: 2ch;
-}
-
-.session-thinking-group-rows .session-thinking {
-  margin-bottom: 8px;
-}
-
-.session-thinking-head.is-live {
-  color: var(--text-normal);
+  letter-spacing: 0.03em;
+  text-transform: uppercase;
 }
 
 .session-question {
@@ -8647,8 +8424,7 @@ body.is-resizing-panes .pane-cell {
   gap: 2px;
   font-family: var(--font-monospace);
   font-weight: var(--font-monospace-weight);
-  font-size: var(--font-control-size);
-  line-height: var(--font-control-line-height);
+  font-size: var(--font-chrome-size);
 }
 
 /* ANSI (SGR) — colored terminal-style output inside bash/tool/pane-log pres.
@@ -9205,9 +8981,9 @@ body.is-resizing-panes .pane-cell {
   padding: 0 3px;
   color: var(--text-muted);
   font-family: var(--font-monospace);
-  font-size: var(--font-control-size);
+  font-size: var(--font-chrome-size);
   font-weight: var(--font-monospace-weight);
-  line-height: var(--font-control-line-height);
+  line-height: 1.3;
   cursor: text;
   text-wrap: pretty;
 }
@@ -9244,13 +9020,8 @@ body.is-resizing-panes .pane-cell {
   font-family: var(--font-monospace);
   font-weight: var(--font-monospace-weight);
   font-size: var(--font-control-size);
-  line-height: var(--font-control-line-height);
+  line-height: 1.5;
   resize: none;
-}
-
-.session-composer textarea::placeholder {
-  color: var(--text-faint);
-  opacity: 0.75;
 }
 
 /* WIKI-247: no 4-sided outline on the composer, resting or focused. Focus
@@ -9312,7 +9083,7 @@ body.is-resizing-panes .pane-cell {
   font-family: var(--font-monospace);
   font-weight: var(--font-monospace-weight);
   font-size: var(--font-control-size);
-  line-height: var(--font-control-line-height);
+  line-height: 1.5;
   pointer-events: none;
 }
 
@@ -9512,7 +9283,7 @@ body.is-resizing-panes .pane-cell {
   border: 1px solid var(--background-modifier-border);
   border-radius: var(--radius-xs);
   color: var(--text-muted);
-  font-size: var(--font-control-size);
+  font-size: var(--fs-xs);
   cursor: pointer;
 }
 
@@ -9930,6 +9701,22 @@ textarea.composer-command-input {
   color: var(--text-faint);
   font-size: var(--font-chrome-size);
   font-family: var(--font-monospace);
+}
+
+.session-composer-status {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  min-height: 22px;
+  padding: 0 2px;
+}
+
+.session-composer-status .session-subagents {
+  flex: 1;
+}
+
+.session-composer-status .session-vim-mode {
+  margin-left: auto;
 }
 
 .session-thinking-indicator {
@@ -11560,8 +11347,8 @@ textarea.composer-command-input {
   color: var(--text-normal);
   font-family: var(--font-monospace);
   font-weight: var(--font-monospace-weight);
-  font-size: var(--font-control-size);
-  line-height: var(--font-control-line-height);
+  font-size: var(--font-chrome-size);
+  line-height: 1.55;
 }
 
 .artifact-code-line {
@@ -12746,8 +12533,7 @@ textarea.composer-command-input {
   --diff-font-family: var(--font-monospace);
   font-family: var(--font-monospace);
   font-weight: var(--font-monospace-weight);
-  font-size: var(--font-control-size);
-  line-height: var(--font-control-line-height);
+  font-size: var(--font-chrome-size);
   color: var(--text-normal);
 }
 
@@ -12810,7 +12596,7 @@ textarea.composer-command-input {
   display: block;
   min-width: 0;
   padding: 4px 0;
-  line-height: var(--font-control-line-height);
+  line-height: 1.55;
 }
 
 /* WIKI-251: side-by-side split — deletions LEFT / insertions RIGHT, aligned
@@ -15448,8 +15234,8 @@ textarea.composer-command-input {
   border: 0;
 }
 
-/* WIKI-152/240/323: agent-session chrome. One compact row keeps identity,
-   current work, runtime metadata, and actions in the same scan path. */
+/* WIKI-152/240: agent-session chrome. Two rectangular levels put identity
+   and current work before runtime metadata and actions. */
 
 /* WIKI-235: keep runs chrome anchored and rectangular without changing
    radius tokens in note, search, or utility surfaces. */
@@ -15468,12 +15254,10 @@ textarea.composer-command-input {
 .agent-session-surface-head {
   display: flex;
   align-items: stretch;
-  flex-direction: row;
+  flex-direction: column;
   flex-wrap: nowrap;
-  gap: 12px;
-  height: 40px;
-  min-height: 40px;
-  padding: 0 10px 0 14px;
+  gap: 0;
+  padding: 0;
   border-bottom: 1px solid var(--background-modifier-border);
 }
 
@@ -15485,53 +15269,50 @@ textarea.composer-command-input {
 }
 
 .agent-session-head-primary {
-  flex: 1 1 auto;
   gap: 10px;
-  min-height: 40px;
-  padding: 4px 0;
+  min-height: 44px;
+  padding: 7px 14px;
 }
 
 .agent-session-head-secondary {
-  flex: 0 1 auto;
   gap: 12px;
   min-height: 40px;
-  padding: 0;
+  padding: 4px 10px 4px 14px;
+  border-top: 1px solid var(--background-modifier-border);
+  background-color: color-mix(in srgb, var(--background-secondary) 62%, transparent);
 }
 
 .agent-session-head-primary .session-ticket {
   flex-shrink: 0;
-  font-size: var(--font-control-size);
+  font-size: var(--font-ui-medium);
   letter-spacing: 0.01em;
 }
 
 .agent-session-runtime {
   display: flex;
   align-items: center;
-  flex-wrap: nowrap;
+  flex-wrap: wrap;
   min-width: 0;
   color: var(--text-muted);
   font-family: var(--font-monospace);
   font-weight: var(--font-monospace-weight);
   font-size: var(--font-chrome-size);
-  line-height: var(--font-chrome-line-height);
-  font-variant-numeric: tabular-nums;
 }
 
 .agent-session-runtime-item {
   display: inline-flex;
   align-items: center;
-  min-height: 24px;
+  min-height: 32px;
   white-space: nowrap;
 }
 
 .agent-session-runtime > :not(:first-child)::before {
-  content: "·";
+  content: "";
   align-self: center;
-  width: auto;
-  height: auto;
-  margin: 0 8px;
-  color: var(--text-faint);
-  background-color: transparent;
+  width: 1px;
+  height: 14px;
+  margin: 0 10px;
+  background-color: var(--background-modifier-border);
 }
 
 .agent-session-surface-head .session-state-pill {
@@ -15631,7 +15412,6 @@ textarea.composer-command-input {
 
 .agent-session-head-secondary .agent-surface-actions {
   flex-shrink: 0;
-  margin-left: 0;
 }
 
 .agent-session-head-secondary .agent-surface-action,
@@ -15672,14 +15452,6 @@ textarea.composer-command-input {
 }
 
 @container agent-session (max-width: 720px) {
-  .agent-session-surface-head {
-    align-items: stretch;
-    flex-direction: column;
-    gap: 0;
-    height: auto;
-    padding: 0;
-  }
-
   .agent-session-head-primary {
     display: grid;
     grid-template-columns: auto minmax(0, 1fr);
@@ -15722,7 +15494,6 @@ textarea.composer-command-input {
   }
 
   .agent-session-runtime {
-    flex-wrap: wrap;
     width: 100%;
   }
 
@@ -15800,16 +15571,11 @@ textarea.composer-command-input {
   }
 }
 
-/* WIKI-305: bb detail-card grammar — hairline border, 8px radius, raised
-   surface. Warning tint retreats to the icon and count chip so the card reads
-   as "attention needed" without staining the whole surface amber. Literal
-   radius opts out of the WIKI-235 flat-chrome collapse scoped on the parent
-   agent-session-surface. */
 .session-tab > .session-action-required {
   margin: 6px 12px 0;
-  border: 1px solid var(--border-hairline, var(--background-modifier-border));
-  border-radius: 8px;
-  background-color: var(--surface-raised, var(--background-primary));
+  border: 1px solid color-mix(in srgb, var(--accent-warning) 55%, var(--background-modifier-border));
+  border-radius: var(--radius-xs);
+  background-color: color-mix(in srgb, var(--accent-warning) 8%, var(--background-primary));
   overflow: hidden;
 }
 
@@ -15817,33 +15583,25 @@ textarea.composer-command-input {
   display: flex;
   align-items: center;
   gap: 8px;
-  padding: 8px 12px;
-  border-bottom: 1px solid var(--border-hairline, var(--background-modifier-border));
+  padding: 6px 12px;
+  border-bottom: 1px solid color-mix(in srgb, var(--accent-warning) 40%, var(--background-modifier-border));
+  background-color: color-mix(in srgb, var(--accent-warning) 14%, var(--background-primary));
   color: var(--accent-warning);
-  font-family: var(--font-chrome);
+  font-family: var(--font-monospace);
   font-weight: var(--fw-semibold);
-  font-size: var(--fs-2xs, 11px);
+  font-size: var(--font-ui-smaller);
   text-transform: uppercase;
   letter-spacing: 0.06em;
 }
 
-.session-tab > .session-action-required .session-action-required-title {
-  color: var(--text-normal);
-}
-
 .session-tab > .session-action-required .session-action-required-count {
-  margin-left: 0;
-  padding: 1px 6px;
-  border: 1px solid color-mix(in srgb, var(--accent-warning) 55%, var(--border-hairline, var(--background-modifier-border)));
-  border-radius: var(--radius-full);
-  background-color: color-mix(in srgb, var(--accent-warning) 12%, transparent);
-  color: var(--accent-warning);
-  font-size: var(--fs-2xs, 11px);
-  font-variant-numeric: tabular-nums;
-}
-
-.session-tab > .session-action-required .session-action-required-head > .bb-button {
   margin-left: auto;
+  padding: 1px 6px;
+  border: 1px solid color-mix(in srgb, var(--accent-warning) 55%, var(--background-modifier-border));
+  border-radius: var(--radius-full);
+  background-color: var(--background-primary);
+  color: var(--accent-warning);
+  font-size: 10px;
 }
 
 /* Video / audio artifacts (WIKI-190/191) */
@@ -16408,14 +16166,14 @@ textarea.composer-command-input {
   box-shadow: none;
 }
 
-/* Semantic left rails replace framed chrome. WIKI-305: pending user opts out
-   of this treatment and keeps the bb-parity card face from .session-user. */
+/* Semantic left rails replace framed chrome. */
 .nav-inline-error,
 .nav-files-retry,
 .agent-inline-error,
 .agent-spawn-preview,
 .agent-tech,
-.session-composer-row {
+.session-composer-row,
+.session-pending-user {
   border-top: 0;
   border-right: 0;
   border-bottom: 0;
@@ -16484,6 +16242,11 @@ textarea.composer-command-input {
 .session-composer-target strong {
   color: var(--accent-primary);
   font-weight: var(--fw-semibold);
+}
+
+.session-composer-status {
+  min-height: 20px;
+  color: var(--text-muted);
 }
 
 /* Dialogs are panels on a scrim. They have no frame or movement. */
@@ -16861,242 +16624,9 @@ body {
   background-color: transparent;
 }
 
-/* Agent surface head: quiet inside the panel, single hairline. */
-.agent-session-surface-head {
-  border-bottom: 1px solid var(--hairline);
-  background-color: transparent;
-}
-
-.agent-session-head-secondary {
-  border-top: 0;
-  background-color: transparent;
-}
-
-.agent-session-runtime > :not(:first-child)::before {
-  background-color: transparent;
-}
-
-.agent-session-surface-head .loop-chrome-chip {
-  border-right: 0;
-}
-
-/* Transcript rows breathe. Tool events keep their compact chevron form. */
-.session-scroll-inner {
-  padding-block: 20px;
-}
-
-/* Composer: the standout card — prominent radius, quiet fill, dark round send. */
-.session-composer {
-  padding: 12px 16px 12px;
-  border-top: 1px solid var(--hairline);
-}
-
-.agent-session-surface.is-full .session-composer {
-  padding: 14px 20px 14px;
-  border-top: 1px solid var(--hairline);
-}
-
-/* Composer row: rounded card with a full hairline. The left-bar accent
-   doctrine from WIKI-247 gave way to bb's card shape — the focus lift
-   below is a full-perimeter ring around the same card. */
-.session-composer-row {
-  padding: 10px 12px;
-  border-top: 1px solid var(--hairline-strong);
-  border-right: 1px solid var(--hairline-strong);
-  border-bottom: 1px solid var(--hairline-strong);
-  border-left: 1px solid var(--hairline-strong);
-  border-radius: var(--composer-radius);
-  background-color: var(--background-panel);
-  box-shadow: 0 1px 0 rgb(0 0 0 / 2%), 0 1px 2px rgb(0 0 0 / 3%);
-}
-
-.session-composer-row:focus-within {
-  border-top-color: var(--border-active);
-  border-right-color: var(--border-active);
-  border-bottom-color: var(--border-active);
-  border-left-color: var(--border-active);
-  background-color: var(--background-panel);
-  box-shadow: 0 1px 0 rgb(0 0 0 / 3%), 0 2px 6px rgb(0 0 0 / 6%),
-    0 0 0 3px color-mix(in srgb, var(--text-normal) 6%, transparent);
-}
-
-/* Dark circular send button — the composer accent, the one strong shape. */
-.session-send {
-  min-width: var(--send-diameter);
-  width: var(--send-diameter);
-  height: var(--send-diameter);
-  padding: 0;
-  border-radius: 50%;
-  background-color: var(--background-element);
-  border-color: transparent;
-  color: var(--text-muted);
-  /* WIKI-298 survivor: `scale` powers the 0.96 send-button press. */
-  transition-property: background-color, color, scale;
-  transition-duration: var(--motion-duration);
-  transition-timing-function: var(--motion-easing);
-}
-
-.session-send:not(:disabled) {
-  background-color: var(--text-normal);
-  border-color: var(--text-normal);
-  color: var(--background-primary);
-}
-
-.session-send:not(:disabled):hover {
-  background-color: color-mix(in srgb, var(--text-normal) 85%, var(--background-primary));
-  border-color: transparent;
-  color: var(--background-primary);
-}
-
-.session-send:active:not(:disabled) {
-  scale: 0.96;
-}
-
-.session-send-label {
-  display: none;
-}
-
-.session-composer[data-compact="true"] .session-send {
-  min-width: var(--send-diameter);
-  width: var(--send-diameter);
-}
-
-/* ==================================================================== */
-/* WIKI-303: composer parity with bb PromptBox                          */
-/* -------------------------------------------------------------------- */
-/* Wraps the input row + a text-2xs metadata footer in one quiet card   */
-/* (bb apps/app/src/components/promptbox/PromptBoxInternal.tsx). The    */
-/* card owns border / radius / focus lift + --shadow-lift; the existing */
-/* .session-composer-row keeps its label/input/send grid unchanged. The */
-/* round send-button stays per WIKI-294 §6 W10 (Henry-locked).          */
-/* ==================================================================== */
-
-/* WIKI-334: square card, transparent fill (flush with the pane), no lift
-   shadow. Focus shifts the hairline only. */
-.session-composer-card {
-  display: flex;
-  flex-direction: column;
-  border: 1px solid var(--border-hairline);
-  border-radius: var(--composer-radius);
-  background-color: transparent;
-  overflow: hidden;
-  transition-property: border-color;
-  transition-duration: var(--motion-duration);
-  transition-timing-function: var(--motion-easing);
-}
-
-.session-composer-card:focus-within {
-  border-color: color-mix(in srgb, var(--text-normal) 45%, var(--border-hairline));
-}
-
-/* Neutralize the WIKI-293 card chrome that used to live on the row —
-   border, radius, shadow, and focus lift are the card's job now. */
-.session-composer-card .session-composer-row,
-.session-composer-card .session-composer-row:focus-within {
-  border: 0;
-  border-radius: 0;
-  background-color: transparent;
-  box-shadow: none;
-}
-
-/* text-2xs metadata footer INSIDE the card (bb PromptBox footerStart /
-   status region). Hosts model controls, shortcuts, thinking state, running
-   subagents, and vim mode; hairline separator from the input area above. */
-.session-composer-meta {
-  display: flex;
-  align-items: center;
-  gap: 10px;
-  min-height: 24px;
-  padding: 4px 12px 6px;
-  border-top: 1px solid var(--border-hairline);
-  color: var(--text-muted);
-  font-size: var(--font-chrome-size);
-  line-height: var(--font-chrome-line-height);
-  font-variant-numeric: tabular-nums;
-}
-
-.session-composer-meta .session-subagents {
-  flex: 1;
-  min-width: 0;
-}
-
-.session-composer-meta > .session-footer {
-  display: contents;
-  padding: 0;
-  color: inherit;
-  font-family: inherit;
-  font-size: inherit;
-  font-weight: inherit;
-}
-
-.session-composer-meta .session-vim-mode {
-  margin-left: auto;
-}
-
-.session-composer-meta .session-thinking-indicator,
-.session-composer-meta .session-vim-mode,
-.session-composer-meta .session-subagent-chip {
-  font-size: var(--font-chrome-size);
-}
-
-/* Prompt mention pill — bb parity (bb apps/app/src/app.css:107-160).
-   Wiki composer is a plain textarea and does not yet render inline
-   ProseMirror mention nodes, so the class currently styles the slash /
-   skill menu preview names as bb-shaped chips; a future rich-editor
-   pass can apply the same class inline. */
-.prompt-mention-pill {
-  display: inline-flex;
-  align-items: baseline;
-  gap: 2px;
-  max-width: 100%;
-  padding: 2px 6px 2px 4px;
-  border: 1px solid var(--pill-surface-border);
-  border-radius: var(--radius-full);
-  color: var(--pill-foreground);
-  background: var(--pill-surface);
-  box-shadow: var(--pill-shadow);
-  font-family: inherit;
-  font-size: var(--fs-xs);
-  font-weight: 400;
-  line-height: 1rem;
-  white-space: nowrap;
-}
-
-.prompt-mention-pill svg {
-  color: var(--pill-icon);
-}
-
-/* Slash + skill suggestion menus adopt .bb-menu-row grammar (hover from
-   --state-hover, active/keyboard-selected from --surface-selected,
-   radius-sm, bb motion tokens). Their internal columns stay wiki-native:
-   slash rows keep the 3-column grid, skill rows keep the baseline flex. */
-.composer-slash-item.bb-menu-row {
-  display: grid;
-  grid-template-columns: max-content 1fr max-content;
-  align-items: baseline;
-  gap: 10px;
-  padding: 6px 10px;
-  border-radius: var(--radius-sm);
-}
-
-.session-skill-item.bb-menu-row {
-  display: flex;
-  align-items: baseline;
-  gap: 10px;
-  padding: 6px 10px;
-  border-radius: var(--radius-sm);
-}
-
-.composer-slash-item.bb-menu-row.is-active,
-.session-skill-item.bb-menu-row.is-active {
-  background: var(--surface-selected);
-  color: var(--text-normal);
-}
-
-/* The pill preview inside a suggestion row inherits its chrome from the
-   .prompt-mention-pill rules above; the old plain-text .session-skill-name /
-   .composer-slash-name paint (monospace bold, --text-normal) survives when
-   the pill class isn't applied. */
+/* WIKI-335: WIKI-293 composer / session-scroll / agent-session-head bb
+   overrides removed. The composer reverts to the raw opencode envelope
+   defined earlier in this file; run-view chrome renders flat again. */
 
 /* Status bar: quiet chips row. Sits INSIDE the panel at the bottom;
    the panel's bottom rounding shows through because status-bar has no bg. */

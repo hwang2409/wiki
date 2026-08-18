@@ -1,16 +1,4 @@
 import type { SessionEvent, SessionTool } from "./api";
-import {
-  ArrowLeft,
-  ArrowRight,
-  Bot,
-  Check,
-  CircleDashed,
-  Globe,
-  Search,
-  Terminal,
-  Wrench,
-} from "lucide-react";
-import type { LucideIcon } from "lucide-react";
 import { editDiffFromInput, editDiffIsTruncated } from "./transcript-output";
 
 const UNIFIED_DIFF_HEAD = /^\s*(?:diff --git |--- [ab]?\/|\*\*\* )/m;
@@ -173,7 +161,7 @@ function rowEndTs(row: KeyedEventRow): number | null {
   return parseTs(row.event.tool?.completed_at ?? row.event.ts);
 }
 
-// OpenCode ends every completed turn with an agent, model, and duration row
+// OpenCode ends every completed turn with `▣ Agent · model · duration`
 // (session/index.tsx:1534-1559; duration = assistant completed − parent user
 // created). Wiki equivalent: the LAST row of each turn opened by a real user
 // message. The live turn is excluded — its final row carries the live-state
@@ -205,20 +193,21 @@ export function turnMetaDurations(
   return metas;
 }
 
-/** Open icon equivalents for the transcript tool vocabulary. */
-export function toolIcon(tool: SessionTool, status: string): LucideIcon {
-  if (isBashTool(tool)) return Terminal;
+// OpenCode's per-tool icon micro-vocabulary (session/index.tsx:2090,2138,
+// 2162,2186,2198,2206,2291,1808). State lives in the row COLOR; the glyph
+// carries the verb family.
+export function toolGlyph(tool: SessionTool, status: string): string {
+  if (isBashTool(tool)) return "$";
   const name = toolName(tool);
   if (tool.archetype === "agent" || ["task", "agent"].includes(name)) {
-    return status === "working" ? CircleDashed : Check;
+    return status === "working" ? "│" : "✓";
   }
-  if (tool.archetype === "read" || ["read", "notebookread"].includes(name)) return ArrowRight;
-  if (tool.archetype === "edit" || ["edit", "multiedit", "notebookedit", "apply_patch", "write", "writefile"].includes(name)) {
-    return ArrowLeft;
-  }
-  if (tool.archetype === "search" || ["grep", "glob"].includes(name)) return Search;
-  if (["webfetch", "web_fetch", "fetch", "websearch", "web_search"].includes(name)) return Globe;
-  return name === "bot" ? Bot : Wrench;
+  if (tool.archetype === "read" || ["read", "notebookread"].includes(name)) return "→";
+  if (tool.archetype === "edit" || ["edit", "multiedit", "notebookedit", "apply_patch", "write", "writefile"].includes(name)) return "←";
+  if (tool.archetype === "search" || ["grep", "glob"].includes(name)) return "✱";
+  if (["webfetch", "web_fetch", "fetch"].includes(name)) return "%";
+  if (["websearch", "web_search"].includes(name)) return "◈";
+  return "⚙";
 }
 
 const INTERPRETER_LANGS: Record<string, string> = {
