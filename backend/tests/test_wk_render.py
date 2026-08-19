@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 from collections.abc import Iterable, Mapping
+from pathlib import Path
 from typing import Any
 
 import pytest
@@ -26,6 +27,33 @@ def _capture(renderables: Iterable[object]) -> str:
     for renderable in renderables:
         console.print(renderable)
     return console.export_text()
+
+
+def _known_codex_item_types() -> set[str]:
+    item_types = set(getattr(normalizer, "_CODEX_ITEM_TYPES", ()))
+    for fixture in (Path(__file__).parent / "fixtures").rglob("*.jsonl"):
+        for line in fixture.read_text().splitlines():
+            try:
+                value = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+            _collect_item_types(value, item_types)
+    return item_types
+
+
+def _collect_item_types(value: object, item_types: set[str]) -> None:
+    if isinstance(value, Mapping):
+        if value.get("method") in {"item/started", "item/completed"}:
+            params = value.get("params")
+            item = params.get("item") if isinstance(params, Mapping) else None
+            item_type = item.get("type") if isinstance(item, Mapping) else None
+            if isinstance(item_type, str):
+                item_types.add(item_type)
+        for child in value.values():
+            _collect_item_types(child, item_types)
+    elif isinstance(value, list):
+        for child in value:
+            _collect_item_types(child, item_types)
 
 
 def test_claude_events_render_markdown_and_lifecycle() -> None:
@@ -410,11 +438,7 @@ def test_known_methods_and_item_starts_never_use_unknown_fallback() -> None:
             render_item(_item({"method": method, "params": {}}))
         )
 
-    known_item_types = (
-        render_module._CODEX_ITEM_STARTED_RENDERED_TYPES
-        | render_module._IGNORED_CODEX_ITEM_STARTED_TYPES
-    )
-    for item_type in known_item_types:
+    for item_type in _known_codex_item_types():
         assert "[event] " not in _capture(
             render_item(
                 _item(

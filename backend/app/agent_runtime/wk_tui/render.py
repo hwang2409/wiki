@@ -10,6 +10,8 @@ from rich.console import RenderableType
 from rich.markdown import Markdown
 from rich.text import Text
 
+from .. import normalizer
+
 MAX_LINE = 240
 _CODEX_ERROR_METHODS = {
     "error",
@@ -18,92 +20,25 @@ _CODEX_ERROR_METHODS = {
     "provider/processExited",
     "wk.codex.tool_policy_unavailable",
 }
-# These sets mirror backend/app/agent_runtime/normalizer.py. The renderer tests
-# compare them directly so provider classifications cannot drift silently.
-_CODEX_RENDERED_METHODS = {
-    "thread/started",
-    "turn/started",
-    "turn/completed",
-    "item/started",
-    "item/completed",
-    "item/fileChange/outputDelta",
-    "item/commandExecution/outputDelta",
-    "item/mcpToolCall/outputDelta",
-    "item/dynamicToolCall/outputDelta",
-    "item/commandExecution/terminalInteraction",
-    "item/delta",
-    "turn/diff/updated",
-    "warning",
-    "skills/changed",
-    "turn/plan/updated",
-    "error",
-    "account/rateLimits/updated",
-    "context/compacted",
-    "account/chatgptAuthTokens/refresh",
-    "serverRequest/resolved",
-    "thread/archived",
-    "thread/closed",
-}
-_CODEX_SUMMARIZED_METHODS = {
-    "item/agentMessage/delta",
-    "item/reasoning/summaryTextDelta",
-    "item/reasoning/summaryPartAdded",
-    "hook/started",
-    "hook/completed",
-    "thread/tokenUsage/updated",
-    "thread/status/changed",
-}
-_CODEX_IGNORED_METHODS = {
-    "rawResponseItem/completed",
-    "rawResponse/completed",
-    "mcpServer/startupStatus/updated",
-    "remoteControl/status/changed",
-    "thread/settings/updated",
-    "thread/goal/cleared",
-    "turn/moderationMetadata",
-}
-_CODEX_APPROVAL_METHODS = {
-    "item/commandExecution/requestApproval",
-    "item/fileChange/requestApproval",
-    "item/permissions/requestApproval",
-    "item/tool/requestUserInput",
-    "mcpServer/elicitation/request",
-    "execCommandApproval",
-    "applyPatchApproval",
-}
-_CLAUDE_IGNORED_TYPES = {
-    "ai-title",
-    "file-history-snapshot",
-    "last-prompt",
-    "mode",
-    "queue-operation",
-    "started",
-}
+_CODEX_RENDERED_METHODS = normalizer._CODEX_RENDERED_METHODS
+_CODEX_SUMMARIZED_METHODS = normalizer._CODEX_SUMMARIZED_METHODS
+_CODEX_IGNORED_METHODS = normalizer._CODEX_IGNORED_METHODS
+_CODEX_APPROVAL_METHODS = normalizer._CODEX_APPROVAL_METHODS
+_CLAUDE_IGNORED_TYPES = normalizer._CLAUDE_IGNORED_TYPES
 _CODEX_DELTA_METHODS = {
-    "item/agentMessage/delta",
-    "item/reasoning/summaryTextDelta",
-    "item/reasoning/summaryPartAdded",
-    "item/fileChange/outputDelta",
-    "item/commandExecution/outputDelta",
-    "item/mcpToolCall/outputDelta",
-    "item/dynamicToolCall/outputDelta",
-    "item/commandExecution/terminalInteraction",
-    "item/delta",
+    method
+    for method in _CODEX_RENDERED_METHODS | _CODEX_SUMMARIZED_METHODS
+    if method.startswith("item/")
+    and (
+        method.endswith("Delta")
+        or method.endswith("delta")
+        or method.endswith("summaryPartAdded")
+        or method.endswith("terminalInteraction")
+    )
 }
 _CODEX_SILENT_METHODS = _CODEX_DELTA_METHODS | {
     "item/userMessage",
     "thread/closed",
-}
-_CODEX_ITEM_STARTED_RENDERED_TYPES = {
-    "commandExecution",
-    "fileChange",
-    "mcpToolCall",
-    "dynamicToolCall",
-}
-_IGNORED_CODEX_ITEM_STARTED_TYPES = {
-    "agentMessage",
-    "reasoning",
-    "userMessage",
 }
 _NATIVE_TOOL_TYPES = {"commandExecution", "fileChange", "mcpToolCall"}
 
@@ -220,6 +155,12 @@ def _native_tool_input(item: Mapping[str, Any]) -> object:
         return item.get("command", item.get("cmd", item.get("input", {})))
     if item_type == "fileChange":
         return item.get("changes", item.get("input", item.get("patch", {})))
+    if item_type == "webSearch":
+        return item.get("query", item.get("input", {}))
+    if item_type == "imageView":
+        return item.get("path", item.get("input", {}))
+    if item_type in {"collabToolCall", "collabAgentToolCall"}:
+        return item.get("input", item.get("arguments", item.get("action", {})))
     return item.get("arguments", item.get("input", {}))
 
 
@@ -274,6 +215,22 @@ def _native_tool_start_line(item: Mapping[str, Any]) -> Text:
         (" status=started input=", "dim"),
         (_one_line(_native_tool_input(item)), "dim"),
     )
+
+
+_IGNORED_CODEX_ITEM_START = object()
+_CODEX_ITEM_STARTED_RENDERERS = {
+    "commandExecution": _native_tool_start_line,
+    "fileChange": _native_tool_start_line,
+    "mcpToolCall": _native_tool_start_line,
+    "dynamicToolCall": _native_tool_start_line,
+    "webSearch": _native_tool_start_line,
+    "collabToolCall": _native_tool_start_line,
+    "collabAgentToolCall": _native_tool_start_line,
+    "imageView": _native_tool_start_line,
+    "agentMessage": _IGNORED_CODEX_ITEM_START,
+    "reasoning": _IGNORED_CODEX_ITEM_START,
+    "userMessage": _IGNORED_CODEX_ITEM_START,
+}
 
 
 def _native_tool_result_line(item: Mapping[str, Any]) -> Text:
@@ -380,16 +337,12 @@ def render_codex(raw: Mapping[str, Any], verbose: bool = False) -> list[Renderab
         rendered.append(_line("[approval] ", params, "yellow"))
     elif method == "item/started":
         item = params.get("item")
-        if (
-            isinstance(item, Mapping)
-            and item.get("type") in _CODEX_ITEM_STARTED_RENDERED_TYPES
-        ):
-            rendered.append(_native_tool_start_line(item))
-        elif (
-            isinstance(item, Mapping)
-            and item.get("type") in _IGNORED_CODEX_ITEM_STARTED_TYPES
-        ):
+        item_type = item.get("type") if isinstance(item, Mapping) else None
+        item_renderer = _CODEX_ITEM_STARTED_RENDERERS.get(item_type)
+        if item_renderer is _IGNORED_CODEX_ITEM_START:
             pass
+        elif item_renderer is not None and isinstance(item, Mapping):
+            rendered.append(item_renderer(item))
         elif item is None:
             rendered.append(_line("[codex] ", method, "dim"))
         else:
