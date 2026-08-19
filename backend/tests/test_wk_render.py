@@ -448,16 +448,18 @@ def test_normalizer_handles_malformed_codex_item_types(item_type: object) -> Non
 
 @pytest.mark.parametrize("item_type", sorted(CODEX_ITEM_TYPES))
 def test_normalizer_known_codex_item_types_are_rendered(item_type: str) -> None:
+    raw = {
+        "method": "item/started",
+        "params": {"item": {"type": item_type}},
+    }
     normalized = normalize_provider_event(
         ProviderKind.CODEX,
-        {
-            "method": "item/started",
-            "params": {"item": {"type": item_type}},
-        },
+        raw,
     )
 
     assert normalized.disposition is EventDisposition.RENDERED
     assert normalized.kind == "item_started"
+    assert normalized.payload == raw
 
 
 def test_normalizer_item_type_set_controls_dispatch(
