@@ -156,12 +156,11 @@ def _codex_moderation_is_warning(params: object) -> bool:
     return bool(_codex_moderation_flags(params))
 
 
-def _codex_item_method_kind(method: object, item: object) -> str:
-    if method in _CODEX_ITEM_METHODS and isinstance(item, dict):
-        item_type = item.get("type")
-        if item_type in CODEX_ITEM_TYPES:
-            return str(method).replace("/", "_")
-    return str(method).replace("/", "_")
+def _codex_item_type(item: object) -> str | None:
+    if not isinstance(item, dict):
+        return None
+    item_type = item.get("type")
+    return item_type if isinstance(item_type, str) else None
 
 
 def _normalize_codex(payload: dict[str, Any]) -> NormalizedProviderEvent:
@@ -185,9 +184,15 @@ def _normalize_codex(payload: dict[str, Any]) -> NormalizedProviderEvent:
     elif method == "turn/moderationMetadata" and _codex_moderation_is_warning(params):
         disposition = EventDisposition.RENDERED
         kind = "turn_moderationMetadata_warning"
+    elif (
+        method in _CODEX_ITEM_METHODS
+        and _codex_item_type(item) in CODEX_ITEM_TYPES
+    ):
+        disposition = EventDisposition.RENDERED
+        kind = str(method).replace("/", "_")
     elif method in _CODEX_RENDERED_METHODS:
         disposition = EventDisposition.RENDERED
-        kind = _codex_item_method_kind(method, item)
+        kind = str(method).replace("/", "_")
     elif method in _CODEX_SUMMARIZED_METHODS:
         disposition = EventDisposition.SUMMARIZED
         kind = str(method).replace("/", "_")

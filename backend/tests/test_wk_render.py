@@ -19,7 +19,9 @@ from backend.app.agent_runtime.normalizer import (
     _CODEX_IGNORED_METHODS,
     _CODEX_RENDERED_METHODS,
     _CODEX_SUMMARIZED_METHODS,
+    normalize_provider_event,
 )
+from backend.app.agent_runtime.types import EventDisposition, ProviderKind
 from backend.app.agent_runtime.wk_tui import render as render_module
 from backend.app.agent_runtime.wk_tui.render import render_event, render_item
 
@@ -427,6 +429,20 @@ def test_known_methods_and_item_starts_never_use_unknown_fallback() -> None:
                 )
             )
         )
+
+
+@pytest.mark.parametrize("item_type", [{}, [], None])
+def test_normalizer_handles_malformed_codex_item_types(item_type: object) -> None:
+    normalized = normalize_provider_event(
+        ProviderKind.CODEX,
+        {
+            "method": "item/started",
+            "params": {"item": {"type": item_type}},
+        },
+    )
+
+    assert normalized.disposition is EventDisposition.RENDERED
+    assert normalized.kind == "item_started"
 
 
 def test_native_tool_lines_include_inputs_and_results() -> None:
