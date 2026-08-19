@@ -10175,26 +10175,32 @@ class SupervisorTests(unittest.IsolatedAsyncioTestCase):
         record = self._create_terminal_archive_run("WIKI-ARCHIVE-PING")
         started = threading.Event()
         release = threading.Event()
-        archive_current = self.store.archive_current
+        store_request_done = threading.Event()
+        real_copy = self.store._copy_archive_file
 
-        def blocked_archive(
-            run_id: str,
-            *,
-            outcome: str | None = None,
-        ) -> tuple[RunRecord, Path]:
+        def paused_copy(source: Path, destination: Path) -> None:
             started.set()
             if not release.wait(timeout=5):
-                raise AssertionError("archive worker was not released")
-            return archive_current(run_id, outcome=outcome)
+                raise AssertionError("archive copy was not released")
+            real_copy(source, destination)
 
-        archive_task = asyncio.create_task(self.supervisor.archive(record.run_id))
+        def store_request() -> None:
+            try:
+                self.store.list_runs()
+            finally:
+                store_request_done.set()
+
+        archive_task: asyncio.Task[RunRecord] | None = None
+        store_task: asyncio.Task[None] | None = None
         try:
             with mock.patch.object(
                 self.store,
-                "archive_current",
-                side_effect=blocked_archive,
+                "_copy_archive_file",
+                side_effect=paused_copy,
             ):
+                archive_task = asyncio.create_task(self.supervisor.archive(record.run_id))
                 self.assertTrue(await asyncio.to_thread(started.wait, 2))
+                store_task = asyncio.create_task(asyncio.to_thread(store_request))
                 latencies: list[float] = []
                 for _ in range(20):
                     probe_started = time.perf_counter()
@@ -10203,11 +10209,75 @@ class SupervisorTests(unittest.IsolatedAsyncioTestCase):
                         "ok",
                     )
                     latencies.append(time.perf_counter() - probe_started)
+                self.assertTrue(await asyncio.to_thread(store_request_done.wait, 2))
                 self.assertLess(max(latencies), 3)
         finally:
             release.set()
+        assert archive_task is not None
+        assert store_task is not None
         archived = await archive_task
         self.assertEqual(archived.run_id, record.run_id)
+        await store_task
+
+    async def test_archive_worker_rejects_excess_queue(self) -> None:
+        records: list[RunRecord] = []
+        for index in range(self.supervisor.archive_queue_limit + 1):
+            record = self.store.create(
+                RunRecord.new(
+                    agent_id=f"WIKI-ARCHIVE-QUEUE-{index}",
+                    provider=ProviderKind.CODEX,
+                    role="implement",
+                    model="fixture-codex",
+                    worktree=str(self.worktree),
+                    prompt="archive queue fixture",
+                )
+            )
+            records.append(
+                self.store.transition(record.run_id, LifecycleState.COMPLETED)
+            )
+
+        started = threading.Event()
+        release = threading.Event()
+        real_copy = self.store._copy_archive_file
+
+        def paused_copy(source: Path, destination: Path) -> None:
+            started.set()
+            if not release.wait(timeout=5):
+                raise AssertionError("archive copy was not released")
+            real_copy(source, destination)
+
+        tasks: list[asyncio.Task[RunRecord]] = []
+        results: list[object] = []
+        try:
+            with mock.patch.object(
+                self.store,
+                "_copy_archive_file",
+                side_effect=paused_copy,
+            ):
+                tasks = [
+                    asyncio.create_task(self.supervisor.archive(record.run_id))
+                    for record in records
+                ]
+                self.assertTrue(await asyncio.to_thread(started.wait, 2))
+
+                async def wait_for_rejection() -> None:
+                    while not tasks[-1].done():
+                        await asyncio.sleep(0)
+
+                await asyncio.wait_for(wait_for_rejection(), timeout=2)
+                self.assertEqual(
+                    self.supervisor.archive_pending,
+                    self.supervisor.archive_queue_limit,
+                )
+                release.set()
+                results = await asyncio.gather(*tasks, return_exceptions=True)
+        finally:
+            release.set()
+        rejected = [
+            result for result in results if isinstance(result, CommandRetryable)
+        ]
+        self.assertEqual(len(rejected), 1)
+        self.assertIn("archive worker queue is full", str(rejected[0]))
 
     async def test_archive_worker_failure_leaves_run_retryable(self) -> None:
         record = self._create_terminal_archive_run("WIKI-ARCHIVE-RETRY")

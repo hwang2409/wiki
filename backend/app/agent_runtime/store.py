@@ -745,6 +745,7 @@ class RunStore:
         self._start_registry_snapshots: dict[str, dict[str, Any]] = {}
         self._terminal_run_prune_guard: Callable[[RunRecord], bool] | None = None
         self._archive_events_exporter: Callable[[str, Path, Path], bool] | None = None
+        self._archive_inflight: set[str] = set()
         _ensure_private_dir(paths.runtime_dir)
         _ensure_private_dir(paths.runs_dir)
         staging_dir = paths.runs_dir / ".staging"
@@ -877,64 +878,23 @@ class RunStore:
         """Resume archive cleanup and return only after live state is gone."""
 
         with self._lock:
+            if run_id in self._archive_inflight:
+                raise StoreConflict("archive is already in progress")
             archived_entry = self._find_archived_run_entry(run_id)
             if archived_entry is None:
                 return None
             archived, session_dir = archived_entry
-            if not archive_is_committed(session_dir):
-                raise StoreConflict("archive is no longer committed")
-
-            live_path = self.run_path(run_id)
-            if live_path.is_file():
-                try:
-                    live = RunRecord.from_dict(_read_json(live_path))
-                except (OSError, StoreError, TypeError, ValueError) as exc:
-                    raise StoreConflict(
-                        "archive marker has an unreadable live run"
-                    ) from exc
-                if live.created_at != archived.created_at:
-                    raise StoreConflict(
-                        "older archive marker cannot remove a newer live run"
-                    )
-            registry = self._read_registry()
-            entry = registry.get(archived.agent_id)
-            current = entry.get("current") if isinstance(entry, dict) else None
-            if isinstance(current, dict) and current.get("run_id") not in {
-                None,
+            self._validate_committed_archive_locked(
                 run_id,
-            }:
-                raise StoreConflict("older archive marker cannot remove a live current run")
-
-            if archived.implicit_start_request and archived.start_request_id:
-                # Repair this index before deleting the implicit receipt. A
-                # restart can otherwise reuse the old deterministic run id.
-                self.command_log.archive_start_request(
-                    archived.start_request_id,
-                    archived.run_id,
-                    str(session_dir),
-                )
-
-            run_dir = self.run_dir(run_id)
-            if run_dir.exists():
-                shutil.rmtree(run_dir)
-            if run_dir.exists():
-                raise StoreConflict("archived run directory remains after cleanup")
-            self.command_log.forget_implicit_for_run(run_id)
-
-            if isinstance(current, dict) and current.get("run_id") == run_id:
-                registry.pop(archived.agent_id, None)
-                self._write_registry(registry)
-                self.command_log.replace_projection(archived.agent_id, {})
-            elif not isinstance(current, dict):
-                self.command_log.replace_projection(archived.agent_id, {})
-
-            entry = self._read_registry().get(archived.agent_id)
-            current = entry.get("current") if isinstance(entry, dict) else None
-            if run_dir.exists() or (
-                isinstance(current, dict) and current.get("run_id") == run_id
-            ):
-                raise StoreConflict("archived run remains live after cleanup")
+                archived,
+                session_dir,
+            )
+            self._admit_archive_locked(run_id)
+        try:
+            self._finish_archive_cleanup(archived, session_dir)
             return archived
+        finally:
+            self._release_archive_admission(run_id)
 
     def discover_provider_process(self, run_id: str) -> RunRecord:
         """Persist a provider found by its exact inherited run identity."""
@@ -1871,6 +1831,8 @@ class RunStore:
         outcome: str | None = None,
     ) -> tuple[RunRecord, Path]:
         with self._lock:
+            if run_id in self._archive_inflight:
+                raise StoreConflict("archive is already in progress")
             record = self.get(run_id)
             archived_entry = self._find_archived_run_entry(run_id)
             if (
@@ -1881,135 +1843,214 @@ class RunStore:
                     "older archive marker cannot remove a newer live run"
                 )
             if archived_entry is not None:
-                archived = self.finalize_archived_run(run_id)
-                if archived is None:
-                    raise StoreConflict("committed archive could not be finalized")
-                return archived, archived_entry[1]
-            registry = self._read_registry()
-            entry = registry.get(record.agent_id)
-            current = entry.get("current") if isinstance(entry, dict) else None
-            if not isinstance(current, dict) or current.get("run_id") != run_id:
-                raise StoreConflict("archive target is no longer current")
-            if record.state not in TERMINAL_STATES:
-                raise StoreConflict("archive target must be terminal before finalization")
+                archived, session_dir = archived_entry
+                self._validate_committed_archive_locked(
+                    run_id,
+                    archived,
+                    session_dir,
+                )
+                self._admit_archive_locked(run_id)
+                existing_archive = True
+                history: list[dict[str, Any]] = []
+            else:
+                registry = self._read_registry()
+                entry = registry.get(record.agent_id)
+                current = entry.get("current") if isinstance(entry, dict) else None
+                if not isinstance(current, dict) or current.get("run_id") != run_id:
+                    raise StoreConflict("archive target is no longer current")
+                if record.state not in TERMINAL_STATES:
+                    raise StoreConflict(
+                        "archive target must be terminal before finalization"
+                    )
+
+                history = [
+                    dict(item)
+                    for item in (entry.get("history") or [])
+                    if isinstance(item, dict)
+                ]
+                archive_worker = dict(current)
+                self._admit_archive_locked(run_id)
+                existing_archive = False
+        try:
+            if existing_archive:
+                self._finish_archive_cleanup(archived, session_dir)
+                return archived, session_dir
 
             ended_at = utc_now()
             if outcome is not None:
                 record.outcome = outcome
             record.updated_at = ended_at
-            entry_dict = entry if isinstance(entry, dict) else {}
-            history = [
-                dict(item)
-                for item in (entry_dict.get("history") or [])
-                if isinstance(item, dict)
-            ]
             session_dir = self._next_archive_session_dir(record.agent_id)
-            log_name = f"{record.provider.legacy_kind}-{record.agent_id}.log"
-            prompt_name = f"{record.provider.legacy_kind}-{record.agent_id}-prompt.md"
-            archive_worker = {**current, "ended_at": ended_at}
-            if record.outcome is not None:
-                archive_worker["outcome"] = record.outcome
-            expected_paths = [session_dir / "run.json", session_dir / "meta.json"]
-            _atomic_write_json(session_dir / "run.json", record.to_dict())
-            _atomic_write_json(
-                session_dir / "meta.json",
-                {
-                    "outcome": record.outcome,
-                    "ended_at": ended_at,
-                    "worker": archive_worker,
-                    "history": history,
-                    "source": "headless-supervisor",
-                },
-            )
-            for source, destination in (
-                (self.raw_events_path(run_id), session_dir / log_name),
-                (self.raw_events_path(run_id), session_dir / "raw.jsonl"),
-                (self.normalized_events_path(run_id), session_dir / "events.jsonl"),
-                (
-                    self.current_turn_diff_path(run_id),
-                    session_dir / "current-turn-diff.json",
-                ),
-            ):
-                if destination.name == "events.jsonl" and self._export_archive_events(
-                    run_id,
-                    source,
-                    destination,
-                ):
-                    expected_paths.append(destination)
-                    continue
-                if source.is_file():
-                    expected_paths.append(destination)
-                self._copy_archive_file(source, destination)
-            # The normalized transcript is durable before the background index
-            # hook is enqueued. A cache failure can never block archive
-            # finalization or provider cleanup.
-            knowledge.enqueue_refresh(runtime_dir=self.paths.runtime_dir)
-            provider_log = self.provider_log_path(run_id)
-            if provider_log.is_file():
-                expected_paths.append(session_dir / "provider.log")
-            self._copy_archive_file(provider_log, session_dir / "provider.log")
-            status_path_to_remove: Path | None = None
-            if record.initial_prompt:
-                prompt_path = session_dir / prompt_name
-                expected_paths.append(prompt_path)
-                _atomic_write_bytes(prompt_path, record.initial_prompt.encode("utf-8"))
-            status_path = self.status_path(record.agent_id)
-            if status_path.is_file():
-                status_path_to_remove = status_path
-                if record.execution_kind in {"wk-claude", "wk-codex"}:
-                    status = {
-                        "state": record.wk_status_state,
-                        "pr": record.wk_status_pr,
-                        "step": record.wk_status_step,
-                        "blocker": record.wk_status_blocker,
-                    }
-                else:
-                    try:
-                        status = json.loads(status_path.read_text(encoding="utf-8"))
-                    except (OSError, ValueError):
-                        status = None
-                if isinstance(status, dict):
-                    final_status_path = session_dir / "final-status.json"
-                    expected_paths.append(final_status_path)
-                    _atomic_write_json(final_status_path, status)
-
-            artifact_dir = self.run_dir(run_id) / "artifacts"
-            if artifact_dir.is_symlink():
-                raise StoreError(f"refusing symlink artifact directory: {artifact_dir}")
-            if artifact_dir.is_dir():
-                expected_paths.extend(
-                    _archive_tree_expected_paths(artifact_dir, session_dir / "artifacts")
-                )
-                self._copy_archive_tree(artifact_dir, session_dir / "artifacts")
-
-            # Publish the archive only after every file is complete. Telemetry
-            # scans sessions with this marker and never observes a copy in
-            # progress.
-            commit_archive(
+            status_path = self._write_archive_files(
+                record,
                 session_dir,
-                run_id=run_id,
-                completed_at=ended_at,
-                expected_paths=expected_paths,
+                ended_at=ended_at,
+                history=history,
+                archive_worker=archive_worker,
             )
-            if not archive_is_committed(session_dir):
-                raise StoreError("archive commit failed verification")
-
-            if record.start_request_id and record.implicit_start_request:
-                self.command_log.archive_start_request(
-                    record.start_request_id,
-                    run_id,
-                    str(session_dir),
-                )
-            # The marker is the durable commit point. Remove every live
-            # source only after it is durable.
-            if status_path_to_remove is not None:
-                status_path_to_remove.unlink(missing_ok=True)
-            shutil.rmtree(self.run_dir(run_id))
-            self.command_log.forget_implicit_for_run(run_id)
-            registry.pop(record.agent_id, None)
-            self._write_registry(registry)
-            self.command_log.replace_projection(record.agent_id, {})
+            self._finish_archive_cleanup(record, session_dir, status_path)
             return record, session_dir
+        finally:
+            self._release_archive_admission(run_id)
+
+    def _admit_archive_locked(self, run_id: str) -> None:
+        if run_id in self._archive_inflight:
+            raise StoreConflict("archive is already in progress")
+        self._archive_inflight.add(run_id)
+
+    def _release_archive_admission(self, run_id: str) -> None:
+        with self._lock:
+            self._archive_inflight.discard(run_id)
+
+    def _validate_committed_archive_locked(
+        self,
+        run_id: str,
+        archived: RunRecord,
+        session_dir: Path,
+    ) -> None:
+        if not archive_is_committed(session_dir):
+            raise StoreConflict("archive is no longer committed")
+        live_path = self.run_path(run_id)
+        if live_path.is_file():
+            try:
+                live = RunRecord.from_dict(_read_json(live_path))
+            except (OSError, StoreError, TypeError, ValueError) as exc:
+                raise StoreConflict("archive marker has an unreadable live run") from exc
+            if live.created_at != archived.created_at:
+                raise StoreConflict("older archive marker cannot remove a newer live run")
+        registry = self._read_registry()
+        entry = registry.get(archived.agent_id)
+        current = entry.get("current") if isinstance(entry, dict) else None
+        if isinstance(current, dict) and current.get("run_id") not in {None, run_id}:
+            raise StoreConflict("older archive marker cannot remove a live current run")
+
+    def _write_archive_files(
+        self,
+        record: RunRecord,
+        session_dir: Path,
+        *,
+        ended_at: str,
+        history: list[dict[str, Any]],
+        archive_worker: dict[str, Any],
+    ) -> Path | None:
+        run_id = record.run_id
+        log_name = f"{record.provider.legacy_kind}-{record.agent_id}.log"
+        prompt_name = f"{record.provider.legacy_kind}-{record.agent_id}-prompt.md"
+        archive_worker = {**archive_worker, "ended_at": ended_at}
+        if record.outcome is not None:
+            archive_worker["outcome"] = record.outcome
+        expected_paths = [session_dir / "run.json", session_dir / "meta.json"]
+        _atomic_write_json(session_dir / "run.json", record.to_dict())
+        _atomic_write_json(
+            session_dir / "meta.json",
+            {
+                "outcome": record.outcome,
+                "ended_at": ended_at,
+                "worker": archive_worker,
+                "history": history,
+                "source": "headless-supervisor",
+            },
+        )
+        for source, destination in (
+            (self.raw_events_path(run_id), session_dir / log_name),
+            (self.raw_events_path(run_id), session_dir / "raw.jsonl"),
+            (self.normalized_events_path(run_id), session_dir / "events.jsonl"),
+            (self.current_turn_diff_path(run_id), session_dir / "current-turn-diff.json"),
+        ):
+            if destination.name == "events.jsonl" and self._export_archive_events(
+                run_id, source, destination
+            ):
+                expected_paths.append(destination)
+                continue
+            if source.is_file():
+                expected_paths.append(destination)
+            self._copy_archive_file(source, destination)
+        knowledge.enqueue_refresh(runtime_dir=self.paths.runtime_dir)
+        provider_log = self.provider_log_path(run_id)
+        if provider_log.is_file():
+            expected_paths.append(session_dir / "provider.log")
+        self._copy_archive_file(provider_log, session_dir / "provider.log")
+        status_path_to_remove: Path | None = None
+        if record.initial_prompt:
+            prompt_path = session_dir / prompt_name
+            expected_paths.append(prompt_path)
+            _atomic_write_bytes(prompt_path, record.initial_prompt.encode("utf-8"))
+        status_path = self.status_path(record.agent_id)
+        if status_path.is_file():
+            status_path_to_remove = status_path
+            if record.execution_kind in {"wk-claude", "wk-codex"}:
+                status = {
+                    "state": record.wk_status_state,
+                    "pr": record.wk_status_pr,
+                    "step": record.wk_status_step,
+                    "blocker": record.wk_status_blocker,
+                }
+            else:
+                try:
+                    status = json.loads(status_path.read_text(encoding="utf-8"))
+                except (OSError, ValueError):
+                    status = None
+            if isinstance(status, dict):
+                final_status_path = session_dir / "final-status.json"
+                expected_paths.append(final_status_path)
+                _atomic_write_json(final_status_path, status)
+        artifact_dir = self.run_dir(run_id) / "artifacts"
+        if artifact_dir.is_symlink():
+            raise StoreError(f"refusing symlink artifact directory: {artifact_dir}")
+        if artifact_dir.is_dir():
+            expected_paths.extend(
+                _archive_tree_expected_paths(artifact_dir, session_dir / "artifacts")
+            )
+            self._copy_archive_tree(artifact_dir, session_dir / "artifacts")
+        commit_archive(
+            session_dir,
+            run_id=run_id,
+            completed_at=ended_at,
+            expected_paths=expected_paths,
+        )
+        if not archive_is_committed(session_dir):
+            raise StoreError("archive commit failed verification")
+        return status_path_to_remove
+
+    def _finish_archive_cleanup(
+        self,
+        record: RunRecord,
+        session_dir: Path,
+        status_path: Path | None = None,
+    ) -> None:
+        run_dir = self.run_dir(record.run_id)
+        if record.start_request_id and record.implicit_start_request:
+            self.command_log.archive_start_request(
+                record.start_request_id,
+                record.run_id,
+                str(session_dir),
+            )
+        if status_path is not None:
+            status_path.unlink(missing_ok=True)
+        if run_dir.exists():
+            shutil.rmtree(run_dir)
+        if run_dir.exists():
+            raise StoreConflict("archived run directory remains after cleanup")
+        self.command_log.forget_implicit_for_run(record.run_id)
+        with self._lock:
+            registry = self._read_registry()
+            entry = registry.get(record.agent_id)
+            current = entry.get("current") if isinstance(entry, dict) else None
+            if isinstance(current, dict) and current.get("run_id") not in {None, record.run_id}:
+                raise StoreConflict("older archive marker cannot remove a live current run")
+            if isinstance(current, dict) and current.get("run_id") == record.run_id:
+                registry.pop(record.agent_id, None)
+                self._write_registry(registry)
+                projection = True
+                current = None
+            else:
+                projection = not isinstance(current, dict)
+            if run_dir.exists() or (
+                isinstance(current, dict) and current.get("run_id") == record.run_id
+            ):
+                raise StoreConflict("archived run remains live after cleanup")
+        if projection:
+            self.command_log.replace_projection(record.agent_id, {})
 
     def create(
         self,

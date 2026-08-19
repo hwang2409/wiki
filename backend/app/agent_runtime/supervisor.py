@@ -68,6 +68,7 @@ DEFAULT_AUTO_ARCHIVE_GRACE_SECONDS = 10 * 60.0
 DEFAULT_ADAPTER_DETACH_GRACE_SECONDS = 1.0
 DEFAULT_IDEMPOTENCY_CACHE_SIZE = 256
 DEFAULT_WORKER_SOFT_CAP = 5
+DEFAULT_ARCHIVE_QUEUE_LIMIT = 4
 _IDEMPOTENT_METHODS = frozenset({"run/start", "run/send_now", "run/send_on_idle"})
 _COMMAND_METHODS = frozenset(
     {"run/start", "run/send_now", "run/send_on_idle", "run/archive", "run/replace"}
@@ -365,9 +366,12 @@ class Supervisor:
         orphan_archive_grace_seconds: float = 0.5,
         idempotency_cache_size: int = DEFAULT_IDEMPOTENCY_CACHE_SIZE,
         worker_soft_cap: int | None = None,
+        archive_queue_limit: int = DEFAULT_ARCHIVE_QUEUE_LIMIT,
     ):
         if idempotency_cache_size < 1:
             raise ValueError("idempotency_cache_size must be positive")
+        if archive_queue_limit < 1:
+            raise ValueError("archive_queue_limit must be positive")
         self.store = store
         self.adapter_factory = adapter_factory
         self.materializer_failed_runs: dict[str, str] = {}
@@ -480,6 +484,8 @@ class Supervisor:
             max_workers=1,
             thread_name_prefix="wiki-archive",
         )
+        self.archive_queue_limit = archive_queue_limit
+        self.archive_pending = 0
         self.archive_inflight: set[str] = set()
         self.archive_inflight_agents: dict[str, str] = {}
         self.archive_tasks: set[asyncio.Task[Any]] = set()
@@ -5214,23 +5220,29 @@ Preserve the same identity, role, worktree, orchestrator grouping, PR gates, and
         command_hash: str | None = None,
         command_hash_payload: Mapping[str, Any] | None = None,
     ) -> tuple[RunRecord, Path]:
+        if self.archive_pending >= self.archive_queue_limit:
+            raise CommandRetryable("archive worker queue is full; retry later")
+        self.archive_pending += 1
         loop = asyncio.get_running_loop()
-        future = loop.run_in_executor(
-            self.archive_executor,
-            partial(
-                self._archive_finalize_sync,
-                run_id,
-                outcome=outcome,
-                effect_id=effect_id,
-                command_hash=command_hash,
-                command_hash_payload=command_hash_payload,
-            ),
-        )
+        try:
+            future = loop.run_in_executor(
+                self.archive_executor,
+                partial(
+                    self._archive_finalize_sync,
+                    run_id,
+                    outcome=outcome,
+                    effect_id=effect_id,
+                    command_hash=command_hash,
+                    command_hash_payload=command_hash_payload,
+                ),
+            )
 
-        async def wait_for_archive() -> tuple[RunRecord, Path]:
-            return await asyncio.shield(future)
+            async def wait_for_archive() -> tuple[RunRecord, Path]:
+                return await asyncio.shield(future)
 
-        return await self._await_cleanup(wait_for_archive())
+            return await self._await_cleanup(wait_for_archive())
+        finally:
+            self.archive_pending -= 1
 
     def _archive_finalize_sync(
         self,
