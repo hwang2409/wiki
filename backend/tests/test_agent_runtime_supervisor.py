@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import argparse
 import asyncio
 import fcntl
 import json
@@ -10831,6 +10832,26 @@ class UnixClientTests(unittest.IsolatedAsyncioTestCase):
 
 
 class RecoveryLoopTests(unittest.IsolatedAsyncioTestCase):
+    async def test_daemon_startup_raises_nofile_before_path_setup(self) -> None:
+        args = argparse.Namespace(
+            runtime_dir=None,
+            socket=None,
+            registry=None,
+            fake_fixture_dir=None,
+        )
+        with (
+            mock.patch.object(agent_daemon, "raise_nofile_limit") as raise_limit,
+            mock.patch.object(
+                agent_daemon,
+                "_paths_from_args",
+                side_effect=RuntimeError("stop startup after limit setup"),
+            ),
+        ):
+            with self.assertRaisesRegex(RuntimeError, "stop startup"):
+                await agent_daemon.run_daemon(args)
+
+        raise_limit.assert_called_once_with()
+
     async def test_missing_run_is_logged_without_traceback(self) -> None:
         stop = asyncio.Event()
         calls = 0
