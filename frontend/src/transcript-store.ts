@@ -639,7 +639,12 @@ export function updatePendingUserMessage(
   emit(entry);
 }
 
-export function retryPendingUserMessage(ticket: string, id: string) {
+export function getPendingUserMessage(ticket: string, id: string): PendingUserMessage | null {
+  const entry = getEntry({ mode: "live", ticket });
+  return entry.snapshot.pendingUserMessages.find((message) => message.id === id) ?? null;
+}
+
+export function retryPendingUserMessage(ticket: string, id: string, requestId?: string) {
   const entry = getEntry({ mode: "live", ticket });
   const events = entry.snapshot.session?.events ?? [];
   const eventIdFloor = events.length > 0 ? events[events.length - 1].id : -1;
@@ -649,6 +654,7 @@ export function retryPendingUserMessage(ticket: string, id: string) {
     changed = true;
     return {
       ...message,
+      requestId: requestId ?? message.requestId,
       status: "sending" as const,
       error: undefined,
       eventIdFloor,

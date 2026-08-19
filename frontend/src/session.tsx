@@ -145,6 +145,7 @@ import {
   composerTextMatches,
   invalidateTranscript,
   clearInlineArtifactStates,
+  getPendingUserMessage,
   loadOlderEvents,
   removePendingUserMessage,
   pendingUserMessageIsAcknowledged,
@@ -2545,7 +2546,7 @@ const MessageBlock = memo(function MessageBlock({
         <PendingUserMessageRow
           message={{
             id: event.pending_id,
-            requestId: event.pending_id,
+            requestId: event.pending_request_id ?? event.pending_id,
             text: event.text,
             status: event.pending_status,
             mode: event.pending_mode,
@@ -3126,12 +3127,17 @@ export function SessionTab({
   const [pendingEditRequest, setPendingEditRequest] = useState<PendingUserMessage | null>(null);
   const retryPending = useCallback(async (message: PendingUserMessage) => {
     try {
-      if (message.status === "uncertain") {
+      let currentMessage = getPendingUserMessage(ticket, message.id) ?? message;
+      if (currentMessage.status === "uncertain") {
         await retryTranscript(target);
         if (pendingUserMessageIsAcknowledged(ticket, message.id)) return;
+        currentMessage = getPendingUserMessage(ticket, message.id) ?? currentMessage;
       }
-      retryPendingUserMessage(ticket, message.id);
-      await deliverPendingMessage(ticket, message);
+      const retryMessage = currentMessage.status === "failed"
+        ? { ...currentMessage, requestId: crypto.randomUUID() }
+        : currentMessage;
+      retryPendingUserMessage(ticket, message.id, retryMessage.requestId);
+      await deliverPendingMessage(ticket, retryMessage);
     } catch {
       // deliverPendingMessage preserves the delivery state and error detail.
     }
@@ -3376,6 +3382,7 @@ export function SessionTab({
         text: message.text,
         disposition: "rendered",
         pending_id: message.id,
+        pending_request_id: message.requestId,
         pending_status: message.status,
         pending_mode: message.mode,
         pending_error: message.error,

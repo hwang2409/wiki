@@ -15,6 +15,13 @@ function delay(ms) {
   return new Promise((resolve) => setTimeout(resolve, ms));
 }
 
+async function waitForComposerEnabled(page) {
+  await page.waitForFunction(() => {
+    const composer = document.querySelector(".session-composer textarea");
+    return composer !== null && !composer.matches(":disabled");
+  });
+}
+
 async function main() {
   const fixtures = makeFixtureRoot("wiki-373-instant-send-");
   const transcript = fixtures.root + "/codex-empty.jsonl";
@@ -136,8 +143,8 @@ async function main() {
         return;
       }
       if (sendCount === 3) {
-        if (body.request_id !== firstFailedRequestId) {
-          throw new Error("retry changed the logical message request id");
+        if (body.request_id === firstFailedRequestId) {
+          throw new Error("confirmed failure retry reused the failed request id");
         }
         sessionEvents.push({
           id: sessionEvents.length,
@@ -278,6 +285,7 @@ async function main() {
     const authoritative = page.locator(".session-scroll .session-user:not(.session-pending-user)", { hasText: "instant hello" });
     await authoritative.waitFor({ state: "visible", timeout: 8_000 });
     await pending.waitFor({ state: "detached", timeout: 5_000 });
+    await waitForComposerEnabled(page);
     if (await authoritative.count() !== 1) throw new Error("authoritative message was duplicated");
     if (await authoritative.locator("..").getAttribute("data-row-key") !== pendingKey) {
       throw new Error("authoritative message changed its transcript row position");
@@ -290,7 +298,9 @@ async function main() {
     await failed.getByText("send failed: fixture send failure").waitFor({ state: "visible", timeout: 5_000 });
     if (!firstFailedRequestId) throw new Error("fixture did not capture failed request id");
     await failed.getByRole("button", { name: "Retry send" }).click();
-    await page.getByText("failed hello", { exact: true }).last().waitFor({ state: "visible", timeout: 5_000 });
+    await page.locator(".session-scroll .session-user:not(.session-pending-user)", { hasText: "failed hello" })
+      .waitFor({ state: "visible", timeout: 5_000 });
+    await waitForComposerEnabled(page);
     if (await page.locator(".session-scroll .session-user", { hasText: "failed hello" }).count() !== 1) {
       throw new Error("retry duplicated the user message");
     }
@@ -302,7 +312,9 @@ async function main() {
     await editable.getByRole("button", { name: "Edit message" }).click();
     await composer.fill("edited hello");
     await composer.press("Enter");
-    await page.getByText("edited hello", { exact: true }).last().waitFor({ state: "visible", timeout: 5_000 });
+    await page.locator(".session-scroll .session-user:not(.session-pending-user)", { hasText: "edited hello" })
+      .waitFor({ state: "visible", timeout: 5_000 });
+    await waitForComposerEnabled(page);
     if (!editedRequestId || editedRequestId === firstFailedRequestId) {
       throw new Error("fixture did not capture a new request id for the edit");
     }
@@ -316,9 +328,13 @@ async function main() {
     await ambiguous.waitFor({ state: "visible", timeout: 5_000 });
     await ambiguous.getByText("delivery uncertain").waitFor({ state: "visible", timeout: 20_000 });
     const verify = ambiguous.getByRole("button", { name: "Verify delivery" });
-    await Promise.all([verify.click(), verify.click()]);
+    await verify.evaluate((button) => {
+      button.click();
+      button.click();
+    });
     await page.locator(".session-scroll .session-user:not(.session-pending-user)", { hasText: "ambiguous hello" })
       .waitFor({ state: "visible", timeout: 8_000 });
+    await waitForComposerEnabled(page);
     if (sendCount !== 7) throw new Error(`expected one ambiguous retry POST, got ${sendCount - 6}`);
     if (await page.locator(".session-scroll .session-user", { hasText: "ambiguous hello" }).count() !== 1) {
       throw new Error("concurrent ambiguous retries duplicated the user message");

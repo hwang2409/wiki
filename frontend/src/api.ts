@@ -784,6 +784,7 @@ export type SessionEvent = {
   artifact?: SessionArtifact;
   source?: string | null;
   pending_id?: string | null;
+  pending_request_id?: string | null;
   pending_status?: "sending" | "sent" | "uncertain" | "failed";
   pending_mode?: "now" | "on-idle";
   pending_error?: string;
