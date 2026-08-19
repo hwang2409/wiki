@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import json
-from collections.abc import Mapping
+from collections.abc import Mapping, Sequence
 from typing import Any
 
 from rich.console import RenderableType
@@ -14,8 +14,16 @@ MAX_LINE = 240
 _CODEX_ERROR_METHODS = {
     "error",
     "codex.provider_error",
+    "provider/protocolError",
+    "provider/processExited",
     "wk.codex.tool_policy_unavailable",
 }
+_IGNORED_CODEX_METHODS = {
+    "item/agentMessage/delta",
+    "item/userMessage",
+    "thread/closed",
+}
+_NATIVE_TOOL_TYPES = {"commandExecution", "fileChange", "mcpToolCall"}
 
 
 def _one_line(value: object, limit: int = MAX_LINE) -> str:
@@ -33,7 +41,10 @@ def _line(prefix: str, body: object, style: str) -> Text:
 
 
 def _raw_line(raw: Mapping[str, Any]) -> Text:
-    return Text(f"[raw] {_one_line(raw)}", style="dim")
+    return Text(
+        f"[raw] {json.dumps(raw, default=str, sort_keys=True)}",
+        style="dim",
+    )
 
 
 def _append_verbose(
@@ -68,6 +79,121 @@ def _turn_line(status: object, duration: object = None) -> Text:
     return Text(f"[turn] {_one_line(status or '?')}{suffix}", style="dim")
 
 
+def _is_sequence(value: object) -> bool:
+    return isinstance(value, Sequence) and not isinstance(value, (str, bytes, bytearray))
+
+
+def _claude_blocks(
+    message: object, event_kind: str, rendered: list[RenderableType]
+) -> Sequence[object]:
+    if not isinstance(message, Mapping):
+        return ()
+    content = message.get("content")
+    if content is None:
+        return ()
+    if not _is_sequence(content):
+        rendered.append(_line("[event] ", {"type": event_kind, "content": content}, "dim"))
+        return ()
+    return content
+
+
+def _codex_error_line(method: str, params: Mapping[str, Any]) -> Text:
+    if method == "provider/protocolError":
+        prefix = "protocol error"
+        detail = params.get("error") or params.get("message") or params
+    elif method == "provider/processExited":
+        prefix = "process exited"
+        detail = params.get("error") or params.get("message") or params
+    elif method == "turn/completed":
+        prefix = "turn failed"
+        turn = params.get("turn")
+        detail = turn.get("error") if isinstance(turn, Mapping) else None
+        detail = detail or turn or params
+    else:
+        detail = params.get("error") or params
+        prefix = params.get("error_class") or "error"
+    return Text(f"[error] {prefix}: {_one_line(detail)}", style="bold red")
+
+
+def _failed_codex_turn(params: Mapping[str, Any]) -> bool:
+    turn = params.get("turn")
+    if not isinstance(turn, Mapping):
+        return False
+    status = str(turn.get("status") or "").lower()
+    return status == "failed" or turn.get("error") is not None
+
+
+def _native_tool_name(item: Mapping[str, Any]) -> str:
+    item_type = str(item.get("type") or "tool")
+    if item_type == "mcpToolCall":
+        server = item.get("server") or "?"
+        tool = item.get("tool") or "?"
+        return f"{item_type} {server}.{tool}"
+    return item_type
+
+
+def _native_tool_input(item: Mapping[str, Any]) -> object:
+    item_type = item.get("type")
+    if item_type == "commandExecution":
+        return item.get("command", item.get("cmd", item.get("input", {})))
+    if item_type == "fileChange":
+        return item.get("changes", item.get("input", item.get("patch", {})))
+    return item.get("arguments", item.get("input", {}))
+
+
+def _native_tool_result(item: Mapping[str, Any]) -> object:
+    item_type = item.get("type")
+    if item_type == "commandExecution":
+        result = item.get("aggregatedOutput", item.get("output"))
+        if result is None and (item.get("stdout") is not None or item.get("stderr") is not None):
+            result = "\n".join(
+                str(part) for part in (item.get("stdout"), item.get("stderr")) if part
+            )
+        return result
+    if item_type == "fileChange":
+        return item.get("output", item.get("result", item.get("error")))
+    return item.get("error") or item.get("result")
+
+
+def _native_tool_status(item: Mapping[str, Any]) -> tuple[str, bool]:
+    if item.get("error") is not None:
+        return "error", True
+    result = item.get("result")
+    if isinstance(result, Mapping) and result.get("isError") is True:
+        return "error", True
+    success = item.get("success")
+    if isinstance(success, bool):
+        return ("success" if success else "error"), not success
+    status = item.get("status")
+    if isinstance(status, str) and status:
+        failed = status.lower() in {"failed", "error", "cancelled"}
+        return status, failed
+    exit_code = item.get("exitCode")
+    if isinstance(exit_code, int):
+        return ("success" if exit_code == 0 else "error"), exit_code != 0
+    return "completed", False
+
+
+def _native_tool_start_line(item: Mapping[str, Any]) -> Text:
+    return Text.assemble(
+        ("[tool] ", "dim"),
+        (_native_tool_name(item), "bold cyan"),
+        (" status=started input=", "dim"),
+        (_one_line(_native_tool_input(item)), "dim"),
+    )
+
+
+def _native_tool_result_line(item: Mapping[str, Any]) -> Text:
+    status, error = _native_tool_status(item)
+    style = "bold red" if error else "dim green"
+    return Text.assemble(
+        ("[tool result] ", "dim"),
+        (status, style),
+        (f" {_native_tool_name(item)} status={status} result=", style),
+        (_one_line(_native_tool_result(item)), style),
+    )
+
+
 def render_claude(
     raw: Mapping[str, Any], verbose: bool = False
 ) -> list[RenderableType]:
@@ -89,8 +215,7 @@ def render_claude(
             rendered.append(_line("[system] ", subtype or dict(raw), "dim"))
     elif kind == "assistant":
         message = raw.get("message")
-        content = message.get("content") if isinstance(message, Mapping) else []
-        for block in content or []:
+        for block in _claude_blocks(message, kind, rendered):
             if not isinstance(block, Mapping):
                 continue
             block_type = block.get("type")
@@ -105,8 +230,7 @@ def render_claude(
                 rendered.append(_tool_line(block.get("name"), block.get("input")))
     elif kind == "user":
         message = raw.get("message")
-        content = message.get("content") if isinstance(message, Mapping) else []
-        for block in content or []:
+        for block in _claude_blocks(message, kind, rendered):
             if isinstance(block, Mapping) and block.get("type") == "tool_result":
                 rendered.append(
                     _tool_result_line(
@@ -135,12 +259,10 @@ def render_codex(raw: Mapping[str, Any], verbose: bool = False) -> list[Renderab
     method = str(raw.get("method") or "")
     params = raw.get("params") if isinstance(raw.get("params"), Mapping) else {}
     rendered: list[RenderableType] = []
-    if method in _CODEX_ERROR_METHODS:
-        detail = params.get("error") or params
-        prefix = params.get("error_class") or "error"
-        rendered.append(
-            Text(f"[error] {prefix}: {_one_line(detail)}", style="bold red")
-        )
+    if method in _CODEX_ERROR_METHODS or (
+        method == "turn/completed" and _failed_codex_turn(params)
+    ):
+        rendered.append(_codex_error_line(method, params))
     elif method == "thread/started":
         rendered.append(Text("[thread] started", style="cyan"))
     elif method == "turn/started":
@@ -159,15 +281,27 @@ def render_codex(raw: Mapping[str, Any], verbose: bool = False) -> list[Renderab
                 params.get("arguments"),
             )
         )
+    elif method == "item/started":
+        item = params.get("item")
+        if isinstance(item, Mapping) and item.get("type") in _NATIVE_TOOL_TYPES:
+            rendered.append(_native_tool_start_line(item))
+        else:
+            rendered.append(_line("[event] ", method or dict(raw), "dim"))
     elif method == "item/completed":
         item = params.get("item") if isinstance(params.get("item"), Mapping) else {}
         item_type = item.get("type")
-        if item_type == "agentMessage":
+        if item_type in _NATIVE_TOOL_TYPES:
+            rendered.append(_native_tool_result_line(item))
+        elif item_type == "agentMessage":
             text = str(item.get("text") or "")
             if text:
                 rendered.append(Markdown(text, code_theme="monokai"))
         elif item_type == "reasoning":
-            summary = " ".join(str(part) for part in item.get("summary") or [])
+            summary_value = item.get("summary")
+            if summary_value is not None and not _is_sequence(summary_value):
+                rendered.append(_line("[item] ", item, "dim"))
+                return _append_verbose(rendered, raw, verbose)
+            summary = " ".join(str(part) for part in summary_value or [])
             if summary:
                 rendered.append(Text(f"[thinking] {_one_line(summary)}", style="dim"))
         elif item_type == "dynamicToolCall":
@@ -185,7 +319,7 @@ def render_codex(raw: Mapping[str, Any], verbose: bool = False) -> list[Renderab
             params.get("status") if isinstance(params.get("status"), Mapping) else {}
         )
         rendered.append(_line("[status] ", status.get("type") or "?", "dim"))
-    elif not (method.startswith("item/") or method.startswith("thread/")):
+    elif method not in _IGNORED_CODEX_METHODS:
         rendered.append(_line("[event] ", method or dict(raw), "dim"))
     return _append_verbose(rendered, raw, verbose)
 

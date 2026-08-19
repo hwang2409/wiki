@@ -1,9 +1,15 @@
 from __future__ import annotations
 
+import json
 from collections.abc import Iterable, Mapping
 from typing import Any
 
+import pytest
+
+pytest.importorskip("rich")
+
 from rich.console import Console
+from rich.markdown import Markdown
 from rich.text import Text
 
 from backend.app.agent_runtime.wk_tui.render import render_event, render_item
@@ -81,6 +87,34 @@ def test_claude_events_render_markdown_and_lifecycle() -> None:
     assert "[event] unseen" in text
     assert _capture(render_item(_item({"type": "stream_event"}))) == ""
 
+    thinking = render_item(
+        _item(
+            {
+                "type": "assistant",
+                "message": {
+                    "content": [{"type": "thinking", "thinking": "private"}]
+                },
+            }
+        )
+    )
+    assert isinstance(thinking[0], Text)
+    assert str(thinking[0].style) == "dim"
+
+
+def test_claude_markdown_renders_nested_fences() -> None:
+    nested = "Here is a sample:\n\n````markdown\n```python\nprint('ok')\n```\n````"
+    rendered = render_item(
+        _item(
+            {
+                "type": "assistant",
+                "message": {"content": [{"type": "text", "text": nested}]},
+            }
+        )
+    )
+
+    assert isinstance(rendered[0], Markdown)
+    assert "print('ok')" in _capture(rendered)
+
 
 def test_raw_events_can_render_without_an_envelope() -> None:
     assert "answer" in _capture(
@@ -107,6 +141,27 @@ def test_codex_events_render_every_branch() -> None:
                 "params": {"error": "blocked"},
             },
             "blocked",
+        ),
+        (
+            {
+                "method": "provider/protocolError",
+                "params": {"error": "invalid frame"},
+            },
+            "[error] protocol error: invalid frame",
+        ),
+        (
+            {
+                "method": "provider/processExited",
+                "params": {"returncode": 137},
+            },
+            "[error] process exited",
+        ),
+        (
+            {
+                "method": "turn/completed",
+                "params": {"turn": {"status": "failed", "error": "timed out"}},
+            },
+            "[error] turn failed: timed out",
         ),
         ({"method": "thread/started", "params": {}}, "[thread] started"),
         ({"method": "turn/started", "params": {}}, "[turn] started"),
@@ -168,6 +223,83 @@ def test_codex_events_render_every_branch() -> None:
         ),
         (
             {
+                "method": "item/started",
+                "params": {
+                    "item": {"type": "commandExecution", "command": "echo hi"}
+                },
+            },
+            "[tool] commandExecution status=started input=echo hi",
+        ),
+        (
+            {
+                "method": "item/completed",
+                "params": {
+                    "item": {
+                        "type": "commandExecution",
+                        "command": "echo hi",
+                        "status": "completed",
+                        "aggregatedOutput": "hi",
+                    }
+                },
+            },
+            "[tool result] completed commandExecution status=completed result=hi",
+        ),
+        (
+            {
+                "method": "item/started",
+                "params": {
+                    "item": {
+                        "type": "fileChange",
+                        "changes": {"README.md": "updated"},
+                    }
+                },
+            },
+            "[tool] fileChange status=started input=",
+        ),
+        (
+            {
+                "method": "item/completed",
+                "params": {
+                    "item": {
+                        "type": "fileChange",
+                        "status": "completed",
+                        "output": "updated README.md",
+                    }
+                },
+            },
+            "[tool result] completed fileChange status=completed result=updated README.md",
+        ),
+        (
+            {
+                "method": "item/started",
+                "params": {
+                    "item": {
+                        "type": "mcpToolCall",
+                        "server": "filesystem",
+                        "tool": "list_dir",
+                        "arguments": {"path": "/tmp"},
+                    }
+                },
+            },
+            "[tool] mcpToolCall filesystem.list_dir status=started input=",
+        ),
+        (
+            {
+                "method": "item/completed",
+                "params": {
+                    "item": {
+                        "type": "mcpToolCall",
+                        "server": "filesystem",
+                        "tool": "list_dir",
+                        "status": "completed",
+                        "result": {"content": [{"text": "a.txt"}]},
+                    }
+                },
+            },
+            "[tool result] completed mcpToolCall filesystem.list_dir status=completed result=",
+        ),
+        (
+            {
                 "method": "item/completed",
                 "params": {"item": {"type": "other", "id": "x"}},
             },
@@ -177,9 +309,17 @@ def test_codex_events_render_every_branch() -> None:
             {"method": "thread/status/changed", "params": {"status": {"type": "idle"}}},
             "[status] idle",
         ),
-        ({"method": "item/started", "params": {}}, ""),
+        ({"method": "item/started", "params": {}}, "[event] item/started"),
         ({"method": "thread/closed", "params": {}}, ""),
         ({"method": "custom/event", "params": {}}, "[event] custom/event"),
+        (
+            {"method": "item/novel", "params": {"value": 1}},
+            "[event] item/novel",
+        ),
+        (
+            {"method": "thread/novel", "params": {"value": 1}},
+            "[event] thread/novel",
+        ),
     ]
 
     for raw, expected in cases:
@@ -188,7 +328,45 @@ def test_codex_events_render_every_branch() -> None:
     assert render_item(_item({"method": "item/userMessage", "params": {}})) == []
 
 
-def test_verbose_adds_truncated_raw_dump_after_output() -> None:
+def test_codex_errors_use_error_style() -> None:
+    cases = [
+        {"method": "provider/protocolError", "params": {"error": "bad"}},
+        {"method": "provider/processExited", "params": {"returncode": 1}},
+        {
+            "method": "turn/completed",
+            "params": {"turn": {"status": "failed", "error": "bad"}},
+        },
+    ]
+
+    for raw in cases:
+        rendered = render_item(_item(raw))
+        assert isinstance(rendered[0], Text)
+        assert str(rendered[0].style) == "bold red"
+
+
+def test_malformed_content_and_reasoning_render_fallbacks() -> None:
+    claude = render_item(
+        _item(
+            {
+                "type": "assistant",
+                "message": {"content": 12},
+            }
+        )
+    )
+    reasoning = render_item(
+        _item(
+            {
+                "method": "item/completed",
+                "params": {"item": {"type": "reasoning", "summary": 12}},
+            }
+        )
+    )
+
+    assert "[event]" in _capture(claude)
+    assert "[item]" in _capture(reasoning)
+
+
+def test_verbose_adds_complete_raw_json_after_output() -> None:
     raw = {
         "type": "assistant",
         "message": {"content": [{"type": "text", "text": "answer"}]},
@@ -201,7 +379,8 @@ def test_verbose_adds_truncated_raw_dump_after_output() -> None:
     assert text.index("answer") < text.index("[raw]")
     assert '"large":' in text
     assert isinstance(renderables[1], Text)
-    assert len(renderables[1].plain.removeprefix("[raw] ")) <= 243
+    payload = json.loads(renderables[1].plain.removeprefix("[raw] "))
+    assert payload == raw
 
     assert "[raw]" in _capture(
         render_item(_item({"type": "stream_event"}), verbose=True)
