@@ -10852,9 +10852,9 @@ class RecoveryLoopTests(unittest.IsolatedAsyncioTestCase):
                 "_paths_from_args",
                 side_effect=RuntimeError("stop startup after limit setup"),
             ),
+            self.assertRaisesRegex(RuntimeError, "stop startup"),
         ):
-            with self.assertRaisesRegex(RuntimeError, "stop startup"):
-                await agent_daemon.run_daemon(args)
+            await agent_daemon.run_daemon(args)
 
         raise_limit.assert_called_once_with()
 
