@@ -1523,6 +1523,29 @@ class RunStoreTests(unittest.TestCase):
             self.assertEqual(current["log"], str(store.raw_events_path(record.run_id)))
             self.assertFalse(current["control_attached"])
 
+    def test_failed_run_json_replace_preserves_readable_state(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            store = RunStore(_paths(root))
+            record = store.create(_record(root))
+            original = store.get(record.run_id)
+
+            with mock.patch.object(
+                store_module.os,
+                "replace",
+                side_effect=OSError("simulated partial write"),
+            ):
+                with self.assertRaises(OSError):
+                    _atomic_write_json(store.run_path(record.run_id), {"state": "partial"})
+
+            readable = store.get(record.run_id)
+            self.assertEqual(readable.run_id, original.run_id)
+            self.assertEqual(readable.state, original.state)
+
+            store.run_path(record.run_id).write_bytes(b"\xffpartial")
+            with self.assertRaisesRegex(StoreError, "could not read"):
+                store.get(record.run_id)
+
     def test_control_attachment_is_projected_and_resets_on_restart(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
