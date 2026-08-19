@@ -74,11 +74,11 @@ class EventStoreRouter:
         run_paths = list(self.runtime_dir.joinpath("runs").glob("*/events.sqlite3"))
         if len(run_paths) != 1:
             raise RuntimeError("select a run with RuntimeEventStore.for_run")
-        store = SQLiteEventStore(
+        with SQLiteEventStore(
             run_paths[0], self.metadata_store, migrate=False
-        )
-        with store.connection(read_only=read_only) as connection:
-            yield connection
+        ) as store:
+            with store.connection(read_only=read_only) as connection:
+                yield connection
 
     def for_run(self, run_id: str) -> SQLiteEventStore:
         store = self._stores.get(run_id)
@@ -90,6 +90,15 @@ class EventStoreRouter:
             )
             self._stores[run_id] = store
         return store
+
+    def close_run(self, run_id: str) -> None:
+        store = self._stores.pop(run_id, None)
+        if store is not None:
+            store.close()
+
+    def close(self) -> None:
+        for run_id in tuple(self._stores):
+            self.close_run(run_id)
 
     def read_artifact_events(
         self,

@@ -7,6 +7,8 @@ import os
 import sqlite3
 import subprocess
 import sys
+import threading
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from tempfile import TemporaryDirectory
 from unittest import mock
@@ -15,10 +17,12 @@ import pytest
 
 from backend.app.agent_runtime.event_store import (
     SCHEMA_VERSION,
+    WAL_AUTOCHECKPOINT_PAGES,
     EventReducerAdapter,
     RuntimeEventStore,
     SQLiteEventStore,
     _migrate_legacy_event_db,
+    connect_event_db,
     migrate_event_db,
     migrate_legacy_event_db,
     replay_raw_jsonl,
@@ -157,6 +161,11 @@ def test_sqlite_schema_uses_wal_and_foreign_keys() -> None:
         store = SQLiteEventStore(Path(tmp) / "events.sqlite3")
         with store.connection(read_only=True) as connection:
             assert connection.execute("PRAGMA journal_mode").fetchone()[0] == "wal"
+            assert connection.execute("PRAGMA synchronous").fetchone()[0] == 1
+            assert (
+                connection.execute("PRAGMA wal_autocheckpoint").fetchone()[0]
+                == WAL_AUTOCHECKPOINT_PAGES
+            )
             assert connection.execute("PRAGMA foreign_keys").fetchone()[0] == 1
         store.create_run(
             "run-1",
@@ -165,6 +174,271 @@ def test_sqlite_schema_uses_wal_and_foreign_keys() -> None:
             created_at="2026-08-13T00:00:00Z",
         )
         assert store.cursor("run-1").rebuild_state == "ready"
+
+
+def test_event_store_reuses_one_connection_for_a_database_path() -> None:
+    with TemporaryDirectory() as tmp:
+        path = Path(tmp) / "events.sqlite3"
+        first = SQLiteEventStore(path)
+        second = SQLiteEventStore(path, migrate=False)
+        with (
+            first.connection(read_only=True) as first_connection,
+            second.connection(read_only=True) as second_connection,
+        ):
+            assert second_connection is first_connection
+
+
+def test_event_store_close_releases_persistent_connection() -> None:
+    with TemporaryDirectory() as tmp:
+        store = SQLiteEventStore(Path(tmp) / "events.sqlite3")
+        with store.connection(read_only=True) as connection:
+            connection.execute("SELECT 1")
+        state = store._connection_state  # noqa: SLF001
+        store.close()
+        assert store.closed
+        assert state.connection is None
+        with pytest.raises(RuntimeError, match="event store is closed"):
+            with store.connection(read_only=True):
+                pass
+
+
+def test_close_waits_for_an_inflight_write() -> None:
+    for _ in range(3):
+        with TemporaryDirectory() as tmp:
+            store = SQLiteEventStore(Path(tmp) / "events.sqlite3")
+            with store.connection() as connection:
+                connection.execute(
+                    "CREATE TABLE close_race (value INTEGER NOT NULL)"
+                )
+            entered = threading.Event()
+            release = threading.Event()
+            close_done = threading.Event()
+            errors: list[BaseException] = []
+
+            def writer() -> None:
+                try:
+                    with store.connection() as connection:
+                        connection.execute("INSERT INTO close_race VALUES (1)")
+                        entered.set()
+                        assert release.wait(5)
+                except BaseException as exc:
+                    errors.append(exc)
+
+            writer_thread = threading.Thread(target=writer)
+            writer_thread.start()
+            assert entered.wait(5)
+            close_thread = threading.Thread(
+                target=lambda: (store.close(), close_done.set())
+            )
+            close_thread.start()
+            assert not close_done.wait(0.05)
+            release.set()
+            writer_thread.join(5)
+            close_thread.join(5)
+
+            assert not writer_thread.is_alive()
+            assert not close_thread.is_alive()
+            assert not errors
+            assert close_done.is_set()
+            with sqlite3.connect(Path(tmp) / "events.sqlite3") as connection:
+                assert connection.execute(
+                    "SELECT value FROM close_race"
+                ).fetchall() == [(1,)]
+
+
+def test_read_context_closes_explicit_snapshot_transactions() -> None:
+    with TemporaryDirectory() as tmp:
+        store = SQLiteEventStore(Path(tmp) / "events.sqlite3")
+        with store.connection() as connection:
+            connection.execute("CREATE TABLE snapshot_rows (value INTEGER)")
+        with store.connection(read_only=True) as connection:
+            connection.execute("BEGIN")
+            assert connection.execute("SELECT 1").fetchone() == (1,)
+        with store.connection() as connection:
+            connection.execute("INSERT INTO snapshot_rows VALUES (1)")
+
+
+def test_writer_started_after_close_is_rejected_without_losing_rows() -> None:
+    with TemporaryDirectory() as tmp:
+        path = Path(tmp) / "events.sqlite3"
+        store = SQLiteEventStore(path)
+        with store.connection() as connection:
+            connection.execute(
+                "CREATE TABLE close_started (value INTEGER NOT NULL)"
+            )
+        state = store._connection_state  # noqa: SLF001
+        state.lock.acquire()
+        close_done = threading.Event()
+        close_thread = threading.Thread(
+            target=lambda: (store.close(), close_done.set())
+        )
+        close_thread.start()
+        for _ in range(100):
+            if store.closed:
+                break
+            threading.Event().wait(0.001)
+        assert store.closed
+
+        errors: list[BaseException] = []
+
+        def writer() -> None:
+            try:
+                with store.connection() as connection:
+                    connection.execute("INSERT INTO close_started VALUES (1)")
+            except BaseException as exc:
+                errors.append(exc)
+
+        writer_thread = threading.Thread(target=writer)
+        writer_thread.start()
+        writer_thread.join(5)
+        state.lock.release()
+        close_thread.join(5)
+
+        assert not writer_thread.is_alive()
+        assert not close_thread.is_alive()
+        assert len(errors) == 1
+        assert isinstance(errors[0], RuntimeError)
+        assert close_done.is_set()
+        with sqlite3.connect(path) as connection:
+            assert connection.execute("SELECT * FROM close_started").fetchall() == []
+
+
+def test_concurrent_writers_on_two_runs_contend_on_the_path_lock() -> None:
+    with TemporaryDirectory() as tmp:
+        store = SQLiteEventStore(Path(tmp) / "events.sqlite3")
+        for run_id in ("run-1", "run-2"):
+            store.create_run(
+                run_id,
+                agent_id="WIKI-352",
+                provider="codex",
+                created_at="2026-08-19T00:00:00Z",
+            )
+        barrier = threading.Barrier(2)
+
+        def write_row(run_id: str) -> None:
+            barrier.wait()
+            store.materialize(
+                run_id,
+                _raw(
+                    1,
+                    "item/started",
+                    {
+                        "item": {
+                            "type": "commandExecution",
+                            "id": f"command-{run_id}",
+                            "command": f"printf {run_id}",
+                        }
+                    },
+                    received_at="2026-08-19T00:00:00Z",
+                ),
+                EventReducerAdapter("codex"),
+            )
+
+        with ThreadPoolExecutor(max_workers=8) as executor:
+            list(executor.map(write_row, ("run-1", "run-2")))
+        assert store.materialized_raw_seqs("run-1") == {1}
+        assert store.materialized_raw_seqs("run-2") == {1}
+
+
+def test_blocked_same_run_writer_preserves_sequence_order() -> None:
+    with TemporaryDirectory() as tmp:
+        store = SQLiteEventStore(Path(tmp) / "events.sqlite3")
+        store.create_run(
+            "run-1",
+            agent_id="WIKI-352",
+            provider="codex",
+            created_at="2026-08-19T00:00:00Z",
+        )
+        reducer = EventReducerAdapter("codex")
+        first_entered = threading.Event()
+        release_first = threading.Event()
+        second_done = threading.Event()
+
+        def write_first() -> None:
+            with store.run_lock("run-1"):
+                first_entered.set()
+                assert release_first.wait(5)
+                store.materialize(
+                    "run-1",
+                    _raw(
+                        1,
+                        "item/started",
+                        {
+                            "item": {
+                                "type": "commandExecution",
+                                "id": "command-1",
+                                "command": "printf 1",
+                            }
+                        },
+                        received_at="2026-08-19T00:00:00Z",
+                    ),
+                    reducer,
+                )
+
+        def write_second() -> None:
+            assert first_entered.wait(5)
+            store.materialize(
+                "run-1",
+                _raw(
+                    2,
+                    "item/started",
+                    {
+                        "item": {
+                            "type": "commandExecution",
+                            "id": "command-2",
+                            "command": "printf 2",
+                        }
+                    },
+                    received_at="2026-08-19T00:00:00Z",
+                ),
+                reducer,
+            )
+            second_done.set()
+
+        first_thread = threading.Thread(target=write_first)
+        second_thread = threading.Thread(target=write_second)
+        first_thread.start()
+        assert first_entered.wait(5)
+        second_thread.start()
+        assert not second_done.wait(0.05)
+        release_first.set()
+        first_thread.join(5)
+        second_thread.join(5)
+        assert not first_thread.is_alive()
+        assert not second_thread.is_alive()
+
+        with store.connection(read_only=True) as connection:
+            assert [
+                row[0]
+                for row in connection.execute(
+                    "SELECT raw_seq FROM dispositions WHERE run_id = ? "
+                    "ORDER BY rowid",
+                    ("run-1",),
+                )
+            ] == [1, 2]
+
+
+def test_sqlite_write_failure_reopens_once_and_fails_upward() -> None:
+    with TemporaryDirectory() as tmp:
+        path = Path(tmp) / "events.sqlite3"
+        store = SQLiteEventStore(path)
+        with store.connection(read_only=True) as connection:
+            original_connection = connection
+
+        with mock.patch(
+            "backend.app.agent_runtime.event_store_shard.connect_event_db",
+            wraps=connect_event_db,
+        ) as connect:
+            with pytest.raises(
+                sqlite3.OperationalError,
+                match="no such table",
+            ), store.connection() as connection:
+                connection.execute("INSERT INTO missing_table VALUES (1)")
+            assert connect.call_count == 1
+
+        with store.connection(read_only=True) as connection:
+            assert connection is not original_connection
+            assert connection.execute("PRAGMA journal_mode").fetchone()[0] == "wal"
 
 
 def test_replay_is_byte_identical_for_the_same_raw_input() -> None:
@@ -670,6 +944,7 @@ def test_runtime_event_store_failure_is_limited_to_one_run() -> None:
                 created_at="2026-08-18T00:00:00Z",
             )
 
+        runtime.close_run("run-a")
         runtime_event_db_path(runtime_path, "run-a").write_bytes(b"")
         normalized = NormalizedProviderEvent(
             EventDisposition.UNKNOWN,

@@ -21,6 +21,7 @@ from .event_store_router import EventStoreRouter
 from .event_store_shard import (
     NORMALIZER_VERSION,
     SCHEMA_VERSION,
+    WAL_AUTOCHECKPOINT_PAGES,
     ChildRunMapping,
     EventPatch,
     EventReducerAdapter,
@@ -103,6 +104,7 @@ replay = replay_raw_jsonl
 __all__ = [
     "NORMALIZER_VERSION",
     "SCHEMA_VERSION",
+    "WAL_AUTOCHECKPOINT_PAGES",
     "ChildRunMapping",
     "EventPatch",
     "EventReducerAdapter",
