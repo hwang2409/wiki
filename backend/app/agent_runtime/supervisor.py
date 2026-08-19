@@ -3328,6 +3328,7 @@ Preserve the same identity, role, worktree, orchestrator grouping, PR gates, and
         temp_directory = Path(
             tempfile.mkdtemp(prefix="events-rebuild-", dir=target.path.parent)
         )
+        rebuilt: SQLiteEventStore | None = None
         temporary_path = temp_directory / target.path.name
         try:
             rebuilt = SQLiteEventStore(temporary_path)
@@ -3386,9 +3387,13 @@ Preserve the same identity, role, worktree, orchestrator grouping, PR gates, and
                 )
             with rebuilt.connection() as connection:
                 connection.execute("PRAGMA wal_checkpoint(TRUNCATE)")
+            rebuilt.close()
+            rebuilt = None
             target.replace_run_from(temporary_path, run_id)
             self.materializer_failed_runs.pop(run_id, None)
         finally:
+            if rebuilt is not None:
+                rebuilt.close()
             shutil.rmtree(temp_directory, ignore_errors=True)
         self.materializer_reducers.clear()
 
@@ -5197,6 +5202,7 @@ Preserve the same identity, role, worktree, orchestrator grouping, PR gates, and
                     reason="archived",
                 )
             archived, _ = self.store.archive_current(run_id, outcome=outcome)
+            self.event_store.close_run(run_id)
             self._record_archive_edge(archived, outcome)
             if effect_id is not None:
                 effect_payload = {
@@ -5246,6 +5252,7 @@ Preserve the same identity, role, worktree, orchestrator grouping, PR gates, and
             raise StoreConflict("provider archive returned no status")
         record = self.store.update_adapter_status(run_id, status)
         archived, _ = self.store.archive_current(run_id, outcome=outcome)
+        self.event_store.close_run(run_id)
         self._record_archive_edge(archived, outcome)
         if effect_id is not None:
             effect_payload = {
@@ -6414,8 +6421,22 @@ Preserve the same identity, role, worktree, orchestrator grouping, PR gates, and
             await asyncio.gather(*self.monitor_tasks, return_exceptions=True)
         self.monitor_tasks.clear()
         worker = self.archive_backfill_worker
-        if worker is not None and not worker.done():
-            await worker
+        worker_error: BaseException | None = None
+        if worker is not None:
+            try:
+                await asyncio.shield(worker)
+            except asyncio.CancelledError as exc:
+                if worker.cancelled():
+                    worker_error = None
+                else:
+                    try:
+                        await worker
+                    except BaseException as worker_exc:
+                        worker_error = worker_exc
+                    else:
+                        worker_error = exc
+            except BaseException as exc:
+                worker_error = exc
         self.archive_backfill_worker = None
         self.event_routes.clear()
         self.event_processing_locks.clear()
@@ -6437,4 +6458,9 @@ Preserve the same identity, role, worktree, orchestrator grouping, PR gates, and
         self.implicit_idempotency_runs.clear()
         self.detached_at_monotonic.clear()
         self.adapters.clear()
-        await self.command_queue.close()
+        try:
+            await self.command_queue.close()
+        finally:
+            self.event_store.close()
+        if worker_error is not None:
+            raise worker_error

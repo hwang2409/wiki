@@ -3,12 +3,17 @@ from __future__ import annotations
 import asyncio
 import json
 import os
+import sqlite3
 import tempfile
 import unittest
 from pathlib import Path
 from unittest import mock
 
-from backend.app.agent_runtime.event_store import NORMALIZER_VERSION, replay_raw_jsonl
+from backend.app.agent_runtime.event_store import (
+    NORMALIZER_VERSION,
+    SQLiteEventStore,
+    replay_raw_jsonl,
+)
 from backend.app.agent_runtime.fake import FixtureAdapterFactory
 from backend.app.agent_runtime.provider import ProviderEvent
 from backend.app.agent_runtime.store import RunStore, RuntimePaths
@@ -160,6 +165,45 @@ class SupervisorDualWriteTests(unittest.IsolatedAsyncioTestCase):
             batch_size=32,
         )
 
+    async def test_close_releases_event_store_after_archive_backfill_failure(self) -> None:
+        async def fail_backfill() -> None:
+            raise RuntimeError("archive backfill failed")
+
+        shard = self.supervisor.event_store.for_run(self.record.run_id)
+        self.supervisor.archive_backfill_worker = asyncio.create_task(fail_backfill())
+        with self.assertRaisesRegex(RuntimeError, "archive backfill failed"):
+            await self.supervisor.close()
+        self.assertTrue(shard.closed)
+
+    async def test_archive_closes_the_run_event_store_shard(self) -> None:
+        await self._apply(
+            self._event("turn/started", {"turn": {"id": "turn-1"}})
+        )
+        shard = self.supervisor.event_store.for_run(self.record.run_id)
+        await self.supervisor.archive(self.record.run_id)
+        self.assertTrue(shard.closed)
+        self.assertNotIn(self.record.run_id, self.supervisor.event_store._stores)  # noqa: SLF001
+
+    async def test_close_drains_archive_backfill_after_cancellation(self) -> None:
+        started = asyncio.Event()
+        release = asyncio.Event()
+
+        async def wait_backfill() -> None:
+            started.set()
+            await release.wait()
+
+        shard = self.supervisor.event_store.for_run(self.record.run_id)
+        self.supervisor.archive_backfill_worker = asyncio.create_task(wait_backfill())
+        close_task = asyncio.create_task(self.supervisor.close())
+        await started.wait()
+        close_task.cancel()
+        await asyncio.sleep(0)
+        self.assertFalse(shard.closed)
+        release.set()
+        with self.assertRaises(asyncio.CancelledError):
+            await close_task
+        self.assertTrue(shard.closed)
+
     async def test_legacy_append_survives_materializer_failure(self) -> None:
         adapter = self.factory(self.record)
         with mock.patch.object(
@@ -181,6 +225,34 @@ class SupervisorDualWriteTests(unittest.IsolatedAsyncioTestCase):
             len(list(self.store.iter_normalized_events(self.record.run_id))),
             1,
         )
+
+    async def test_sqlite_pipeline_write_failure_blocks_and_transitions(self) -> None:
+        adapter = self.factory(self.record)
+        with mock.patch.object(
+            self.supervisor.event_store,
+            "materialize",
+            side_effect=sqlite3.OperationalError("database disk image is malformed"),
+        ) as materialize:
+            await adapter._events.put(  # noqa: SLF001
+                self._event("turn/started", {"turn": {"id": "turn-1"}})
+            )
+            task = asyncio.create_task(
+                self.supervisor._pump_events(self.record.run_id, adapter)
+            )
+            for _ in range(100):
+                if self.store.get(self.record.run_id).state is LifecycleState.BLOCKED:
+                    break
+                await asyncio.sleep(0.01)
+            await asyncio.wait_for(task, timeout=5)
+
+        materialize.assert_called_once()
+        blocked = self.store.get(self.record.run_id)
+        self.assertEqual(blocked.state, LifecycleState.BLOCKED)
+        self.assertEqual(
+            blocked.state_reason,
+            "provider event persistence failed: database disk image is malformed",
+        )
+        self.assertTrue(adapter.closed)
 
     async def test_gap_recovery_rebuilds_to_clean_replay(self) -> None:
         await self._apply(
@@ -348,6 +420,67 @@ class SupervisorDualWriteTests(unittest.IsolatedAsyncioTestCase):
             self.supervisor.event_store.run_is_healthy(self.record.run_id)
         )
 
+    async def test_rebuild_reopens_new_database_for_post_swap_writes(self) -> None:
+        await self._apply(
+            self._event("turn/started", {"turn": {"id": "turn-1"}})
+        )
+        target = self.supervisor.event_store.for_run(self.record.run_id)
+        database_path = target.path
+        old_inode = database_path.stat().st_ino
+
+        await self.supervisor._rebuild_materializer_database(self.record.run_id)  # noqa: SLF001
+
+        self.assertNotEqual(database_path.stat().st_ino, old_inode)
+        with target.connection() as connection:
+            connection.execute(
+                "UPDATE run_cursors SET rebuild_state = 'ready' WHERE run_id = ?",
+                (self.record.run_id,),
+            )
+        with sqlite3.connect(database_path) as connection:
+            self.assertEqual(
+                connection.execute(
+                    "SELECT rebuild_state FROM run_cursors WHERE run_id = ?",
+                    (self.record.run_id,),
+                ).fetchone()[0],
+                "ready",
+            )
+
+    async def test_rebuild_invalidates_all_pooled_store_handles(self) -> None:
+        await self._apply(
+            self._event("turn/started", {"turn": {"id": "turn-1"}})
+        )
+        target = self.supervisor.event_store.for_run(self.record.run_id)
+        database_path = target.path
+        other_store = SQLiteEventStore(database_path, migrate=False)
+        old_handles = []
+        try:
+            with self.assertRaises(sqlite3.ProgrammingError):
+                with target.connection() as first_connection:
+                    with other_store.connection() as second_connection:
+                        old_handles.extend((first_connection, second_connection))
+                        await self.supervisor._rebuild_materializer_database(
+                            self.record.run_id
+                        )  # noqa: SLF001
+                        for connection in old_handles:
+                            with self.assertRaises(sqlite3.ProgrammingError):
+                                connection.execute("SELECT 1")
+
+            with other_store.connection() as connection:
+                connection.execute(
+                    "UPDATE run_cursors SET rebuild_state = 'ready' WHERE run_id = ?",
+                    (self.record.run_id,),
+                )
+            with sqlite3.connect(database_path) as connection:
+                self.assertEqual(
+                    connection.execute(
+                        "SELECT rebuild_state FROM run_cursors WHERE run_id = ?",
+                        (self.record.run_id,),
+                    ).fetchone()[0],
+                    "ready",
+                )
+        finally:
+            other_store.close()
+
     async def test_unhealthy_zero_event_database_rebuilds(self) -> None:
         self.supervisor.event_store.for_run(self.record.run_id).ensure_schema()
         self.supervisor.event_store.create_run(
@@ -390,6 +523,7 @@ class SupervisorDualWriteTests(unittest.IsolatedAsyncioTestCase):
             )
             self.store.transition(record.run_id, LifecycleState.WORKING)
         damaged_path = self.supervisor.event_store.for_run(self.record.run_id).path
+        self.supervisor.event_store.close_run(self.record.run_id)
         damaged_path.write_bytes(b"damaged")
         for suffix in ("-wal", "-shm"):
             damaged_path.with_name(damaged_path.name + suffix).unlink(missing_ok=True)
@@ -433,6 +567,7 @@ class SupervisorDualWriteTests(unittest.IsolatedAsyncioTestCase):
             )
 
         damaged_path = self.supervisor.event_store.for_run(self.record.run_id).path
+        self.supervisor.event_store.close_run(self.record.run_id)
         damaged_path.write_bytes(b"damaged")
         for suffix in ("-wal", "-shm"):
             damaged_path.with_name(damaged_path.name + suffix).unlink(missing_ok=True)
@@ -441,9 +576,11 @@ class SupervisorDualWriteTests(unittest.IsolatedAsyncioTestCase):
             damaged_store,
             "replace_run_from",
             side_effect=OSError("damaged run cannot be replaced"),
-        ):
-            results = await self.supervisor.recover_on_start()
+        ) as replace_run:
+            await self.supervisor._normalize_orphan_raw_events()  # noqa: SLF001
+            results = await self.supervisor._recover_once()  # noqa: SLF001
 
+        self.assertTrue(replace_run.called)
         failed_result = next(
             result for result in results if result["run_id"] == self.record.run_id
         )

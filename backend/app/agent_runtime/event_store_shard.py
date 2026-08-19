@@ -11,11 +11,12 @@ import os
 import sqlite3
 import tempfile
 import threading
+import weakref
 from collections.abc import Iterator, Mapping
 from contextlib import contextmanager
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Protocol
+from typing import Any, Protocol, Self
 
 from .. import transcripts
 from . import store as runtime_store
@@ -29,6 +30,7 @@ from .types import (
 
 SCHEMA_VERSION = 8
 NORMALIZER_VERSION = "wiki-282-1"
+WAL_AUTOCHECKPOINT_PAGES = 4096
 
 
 _RUN_LOCKS: dict[tuple[str, str], threading.RLock] = {}
@@ -720,14 +722,97 @@ def connect_event_db(path: Path | str, *, read_only: bool = False) -> sqlite3.Co
     db_path = Path(path)
     if read_only:
         uri = f"file:{db_path.absolute()}?mode=ro"
-        connection = sqlite3.connect(uri, uri=True)
+        connection = sqlite3.connect(uri, uri=True, check_same_thread=False)
     else:
         db_path.parent.mkdir(parents=True, exist_ok=True)
-        connection = sqlite3.connect(db_path)
+        connection = sqlite3.connect(db_path, check_same_thread=False)
         connection.execute("PRAGMA journal_mode=WAL")
+        connection.execute("PRAGMA synchronous=NORMAL")
+        connection.execute(
+            f"PRAGMA wal_autocheckpoint={WAL_AUTOCHECKPOINT_PAGES}"
+        )
     connection.execute("PRAGMA foreign_keys=ON")
     connection.execute("PRAGMA busy_timeout=5000")
     return connection
+
+
+class _PersistentEventConnection:
+    """Own one locked, reusable connection for one database path."""
+
+    def __init__(self, path: Path) -> None:
+        self.path = path.absolute()
+        self.lock = threading.RLock()
+        self.connection: sqlite3.Connection | None = None
+        self._database_identity: tuple[int, int] | None = None
+        self._owners = 0
+
+    def acquire(self) -> None:
+        with self.lock:
+            self._owners += 1
+
+    def release(self) -> None:
+        with self.lock:
+            self._owners -= 1
+            if self._owners == 0:
+                self._close_unlocked()
+
+    def _identity(self) -> tuple[int, int] | None:
+        try:
+            stat = self.path.stat()
+        except OSError:
+            return None
+        return (stat.st_dev, stat.st_ino)
+
+    def _close_unlocked(self) -> None:
+        connection = self.connection
+        self.connection = None
+        self._database_identity = None
+        if connection is not None:
+            try:
+                connection.close()
+            except (sqlite3.Error, OSError):
+                pass
+
+    def invalidate(self) -> None:
+        """Close every pooled handle while the caller holds ``lock``."""
+
+        self._close_unlocked()
+
+    def get(self) -> sqlite3.Connection:
+        identity = self._identity()
+        if (
+            self.connection is None
+            or (
+                identity is not None
+                and self._database_identity is not None
+                and identity != self._database_identity
+            )
+        ):
+            self._close_unlocked()
+            self.connection = connect_event_db(self.path)
+            self._database_identity = self._identity()
+        return self.connection
+
+    def reopen(self) -> None:
+        self._close_unlocked()
+        self.connection = connect_event_db(self.path)
+        self._database_identity = self._identity()
+
+
+_EVENT_CONNECTIONS: weakref.WeakValueDictionary[
+    str, _PersistentEventConnection
+] = weakref.WeakValueDictionary()
+_EVENT_CONNECTIONS_GUARD = threading.Lock()
+
+
+def _persistent_event_connection(path: Path) -> _PersistentEventConnection:
+    key = str(path.absolute())
+    with _EVENT_CONNECTIONS_GUARD:
+        state = _EVENT_CONNECTIONS.get(key)
+        if state is None:
+            state = _PersistentEventConnection(path)
+            _EVENT_CONNECTIONS[key] = state
+        return state
 
 
 def migrate_event_db(path: Path | str) -> None:
@@ -809,30 +894,86 @@ class SQLiteEventStore:
         self.metadata_store = metadata_store
         self._schema_ready = False
         self._schema_lock = threading.Lock()
-        if migrate:
-            self.ensure_schema()
+        # SQLite connections cross the supervisor's asyncio and worker
+        # threads, so the shared handle uses an explicit lock.
+        self._connection_state = _persistent_event_connection(self.path)
+        self._closed = False
+        self._connection_state.acquire()
+        self._connection_finalizer = weakref.finalize(
+            self, self._connection_state.release
+        )
+        try:
+            if migrate:
+                self.ensure_schema()
+        except BaseException:
+            self._closed = True
+            self._connection_finalizer()
+            raise
+
+    @property
+    def closed(self) -> bool:
+        return self._closed
+
+    def close(self) -> None:
+        """Close this shard and release its shared persistent connection."""
+
+        if self._closed:
+            return
+        self._closed = True
+        self._connection_finalizer()
+
+    def __enter__(self) -> Self:
+        if self._closed:
+            raise RuntimeError("event store is closed")
+        return self
+
+    def __exit__(self, _exc_type: object, _exc: object, _traceback: object) -> None:
+        self.close()
+
+    @contextmanager
+    def swapping_database(self) -> Iterator[None]:
+        """Fence all operations while this shard file is replaced."""
+
+        with self._connection_state.lock:
+            self._connection_state.invalidate()
+            yield
 
     def ensure_schema(self) -> None:
         if self._schema_ready:
             return
         with self._schema_lock:
             if not self._schema_ready:
-                migrate_event_db(self.path)
+                with self._connection_state.lock:
+                    migrate_event_db(self.path)
                 self._schema_ready = True
 
     @contextmanager
     def connection(self, *, read_only: bool = False) -> Iterator[sqlite3.Connection]:
-        connection = connect_event_db(self.path, read_only=read_only)
-        try:
-            yield connection
-            if not read_only:
-                connection.commit()
-        except Exception:
-            if not read_only:
-                connection.rollback()
-            raise
-        finally:
-            connection.close()
+        if self._closed:
+            raise RuntimeError("event store is closed")
+        with self._connection_state.lock:
+            if self._closed:
+                raise RuntimeError("event store is closed")
+            connection = self._connection_state.get()
+            try:
+                yield connection
+                if not read_only:
+                    connection.commit()
+                else:
+                    connection.rollback()
+            except BaseException as exc:
+                try:
+                    connection.rollback()
+                except sqlite3.Error:
+                    pass
+                if not read_only and isinstance(exc, (sqlite3.Error, OSError)):
+                    try:
+                        self._connection_state.reopen()
+                    except (sqlite3.Error, OSError) as reopen_error:
+                        exc.add_note(
+                            f"event-store connection reopen failed: {reopen_error}"
+                        )
+                raise
 
     def run_lock(self, run_id: str) -> threading.RLock:
         """Return the process-wide lock for one database run view."""
@@ -1886,28 +2027,31 @@ class SQLiteEventStore:
             runtime_store._fsync_file(source_path)
             runtime_store._fsync_directory(source_path.parent)
             self.path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
-            stale_sidecars: list[tuple[Path, Path]] = []
-            for suffix in ("-wal", "-shm"):
-                original = self.path.with_name(self.path.name + suffix)
-                if not original.exists():
-                    continue
-                stale = self.path.with_name(f".{self.path.name}.stale{suffix}")
-                stale.unlink(missing_ok=True)
-                os.rename(original, stale)
-                stale_sidecars.append((original, stale))
-            runtime_store._fsync_directory(self.path.parent)
-            try:
-                os.replace(source_path, self.path)
-            except BaseException:
-                for original, stale in reversed(stale_sidecars):
-                    if stale.exists():
-                        os.rename(stale, original)
-                raise
-            for _original, stale in stale_sidecars:
-                stale.unlink(missing_ok=True)
-            for suffix in ("-wal", "-shm"):
-                source_path.with_name(source_path.name + suffix).unlink(missing_ok=True)
-            runtime_store._fsync_directory(self.path.parent)
+            with self.swapping_database():
+                stale_sidecars: list[tuple[Path, Path]] = []
+                for suffix in ("-wal", "-shm"):
+                    original = self.path.with_name(self.path.name + suffix)
+                    if not original.exists():
+                        continue
+                    stale = self.path.with_name(f".{self.path.name}.stale{suffix}")
+                    stale.unlink(missing_ok=True)
+                    os.rename(original, stale)
+                    stale_sidecars.append((original, stale))
+                runtime_store._fsync_directory(self.path.parent)
+                try:
+                    os.replace(source_path, self.path)
+                except BaseException:
+                    for original, stale in reversed(stale_sidecars):
+                        if stale.exists():
+                            os.rename(stale, original)
+                    raise
+                for _original, stale in stale_sidecars:
+                    stale.unlink(missing_ok=True)
+                for suffix in ("-wal", "-shm"):
+                    source_path.with_name(source_path.name + suffix).unlink(
+                        missing_ok=True
+                    )
+                runtime_store._fsync_directory(self.path.parent)
             self._invalidate_connections()
             self.record_parity_record(
                 run_id,
@@ -1920,8 +2064,6 @@ class SQLiteEventStore:
     def _invalidate_connections(self) -> None:
         """Force future operations to reopen after an atomic database swap."""
 
-        # Connections are per-operation today. Persistent connection work must
-        # close and reopen its handle here after replace_run_from swaps the file.
         self._schema_ready = False
 
 
