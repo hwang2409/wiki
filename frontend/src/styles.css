@@ -237,9 +237,32 @@ body {
   font-weight: var(--font-interface-weight);
   font-size: var(--font-control-size);
   line-height: var(--font-control-line-height);
-  -webkit-font-smoothing: antialiased;
-  -moz-osx-font-smoothing: grayscale;
   text-rendering: optimizeLegibility;
+}
+
+/* Keep code and terminal glyphs close to Terminal.app's unsynthesized shaping.
+   Mono labels in the surrounding chrome stay on the normal body rendering. */
+pre,
+code,
+.font-monospace,
+.code-file-source,
+.code-file-highlighted,
+.diff-code,
+.split-diff-grid,
+.terminal-pane-host,
+.terminal-pane-host *,
+.terminal-pane-size-flash,
+.terminal-pane-notice,
+.fleet-screencast-tape,
+.agent-context-prelude {
+  -webkit-font-smoothing: unset;
+  -moz-osx-font-smoothing: unset;
+  font-synthesis: none;
+  font-variant-ligatures: none;
+  font-kerning: none;
+  font-feature-settings: normal;
+  font-optical-sizing: none;
+  text-rendering: geometricPrecision;
 }
 
 ::selection {
