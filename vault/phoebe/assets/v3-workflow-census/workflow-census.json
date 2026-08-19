@@ -1,0 +1,264 @@
+{
+  "report_version": "v3-workflow-census-1",
+  "window": {
+    "start_utc": "2026-07-24T00:00:00Z",
+    "end_utc_exclusive": "2026-08-08T00:00:00Z",
+    "calendar_days": 14,
+    "last_day_partial": true
+  },
+  "pii_policy": {
+    "status": "enforced",
+    "excluded_fields": [
+      "names",
+      "phone_numbers",
+      "message_contents",
+      "organization_names",
+      "uuids",
+      "urls",
+      "raw_trace_payloads"
+    ]
+  },
+  "source": {
+    "tables": [
+      "app.phoebe_agent_runs",
+      "app.agent_items",
+      "app.phoebe_agent_run_event_items",
+      "app.admin_agent_action_audits"
+    ],
+    "unit": "persisted Phoebe agent run",
+    "included": {
+      "mode": "live",
+      "activity_types": ["chat", "workflow"],
+      "run_types": ["general", "outreach_analysis"],
+      "sources": ["web_or_unspecified", "slack", "linq_imessage"]
+    },
+    "excluded": {
+      "source_names": [
+        "slack_notification",
+        "slack_proactive",
+        "admin_operational_slack_report"
+      ],
+      "run_classes": [
+        "internal",
+        "sandbox",
+        "automation",
+        "subagent",
+        "agent_trace_llm_judge"
+      ],
+      "reason": "not real user requests for the customer-facing v3 workflow"
+    }
+  },
+  "counts": {
+    "eligible_runs": 7821,
+    "general_runs": 1294,
+    "outreach_analysis_runs": 6527,
+    "excluded_general_synthetic_or_system_runs": 3566,
+    "wider_window_internal_runs": 1334,
+    "wider_window_automation_runs": 515,
+    "wider_window_sandbox_runs": 17,
+    "wider_window_subagent_runs": 2,
+    "wider_window_judge_conversations": 8356
+  },
+  "current_v3_surface": {
+    "basis": "source inspection and prior v3 surface metadata; prior cases were not used as the census dataset",
+    "retrieve": "one SELECT-only query over caregivers, clients, and shifts",
+    "workspace": "isolated workspace commands only",
+    "monitoring": "no agency outreach-monitor read domain",
+    "writes": "no agency data writes or customer communication writes"
+  },
+  "workflow_clusters": [
+    {
+      "rank": 1,
+      "id": "outreach_recommendations_and_monitoring",
+      "run_types": ["outreach_analysis"],
+      "runs": 6527,
+      "share_of_eligible": 0.8344,
+      "coverage": "mixed",
+      "coverage_reason": "needs outreach and recommendation context, plus agency and customer writes",
+      "replay_priority": "p0"
+    },
+    {
+      "rank": 2,
+      "id": "shift_lookup_and_scheduling",
+      "run_types": ["general"],
+      "runs": 433,
+      "share_of_eligible": 0.0554,
+      "coverage": "mixed",
+      "coverage_reason": "basic shift reads are covered; schedule writes are missing",
+      "replay_priority": "p0"
+    },
+    {
+      "rank": 3,
+      "id": "caregiver_lookup_and_memory",
+      "run_types": ["general"],
+      "runs": 218,
+      "share_of_eligible": 0.0279,
+      "coverage": "mixed",
+      "coverage_reason": "basic caregiver reads are covered; memory and availability writes are missing",
+      "replay_priority": "p1"
+    },
+    {
+      "rank": 4,
+      "id": "outreach_drafting_and_management",
+      "run_types": ["general"],
+      "runs": 166,
+      "share_of_eligible": 0.0212,
+      "coverage": "mixed",
+      "coverage_reason": "needs outreach context, draft state, and management writes",
+      "replay_priority": "p1"
+    },
+    {
+      "rank": 5,
+      "id": "client_lookup",
+      "run_types": ["general"],
+      "runs": 162,
+      "share_of_eligible": 0.0207,
+      "coverage": "covered_read_only",
+      "coverage_reason": "basic client retrieval fits the current query surface",
+      "replay_priority": "p1"
+    },
+    {
+      "rank": 6,
+      "id": "activity_and_alert_handling",
+      "run_types": ["general"],
+      "runs": 103,
+      "share_of_eligible": 0.0132,
+      "coverage": "missing_read_context",
+      "coverage_reason": "activity events, alert state, and Slack context are not in the current read surface",
+      "replay_priority": "p1"
+    },
+    {
+      "rank": 7,
+      "id": "docs_playbooks_settings_and_reports",
+      "run_types": ["general"],
+      "runs": 80,
+      "share_of_eligible": 0.0102,
+      "coverage": "skill_prompt_gap",
+      "coverage_reason": "the v3 surface has no product-doc, playbook, settings, or reporting skill",
+      "replay_priority": "p2"
+    },
+    {
+      "rank": 8,
+      "id": "no_domain_tool",
+      "run_types": ["general"],
+      "runs": 53,
+      "share_of_eligible": 0.0068,
+      "coverage": "skill_prompt_gap",
+      "coverage_reason": "answer-only or framework-only runs need intent classification before replay",
+      "replay_priority": "p2"
+    },
+    {
+      "rank": 9,
+      "id": "ehr_sync",
+      "run_types": ["general"],
+      "runs": 41,
+      "share_of_eligible": 0.0052,
+      "coverage": "missing_write",
+      "coverage_reason": "sync status is not in the read surface and sync is a write-side effect",
+      "replay_priority": "p1"
+    },
+    {
+      "rank": 10,
+      "id": "messaging_and_history",
+      "run_types": ["general"],
+      "runs": 21,
+      "share_of_eligible": 0.0027,
+      "coverage": "mixed",
+      "coverage_reason": "conversation context and customer communication writes are missing",
+      "replay_priority": "p1"
+    },
+    {
+      "rank": 11,
+      "id": "other",
+      "run_types": ["general"],
+      "runs": 17,
+      "share_of_eligible": 0.0022,
+      "coverage": "mixed",
+      "coverage_reason": "low-volume tools need a separate review before promotion",
+      "replay_priority": "p2"
+    }
+  ],
+  "representative_sequences": [
+    {"workflow": "outreach", "sequence": ["get_recommendations", "get_recommendations", "add_outreach_suggestions"], "runs": 1118},
+    {"workflow": "outreach", "sequence": ["get_recommendations", "get_recommendations", "get_recommendations", "add_outreach_suggestions"], "runs": 428},
+    {"workflow": "outreach", "sequence": ["get_recommendations"], "runs": 410},
+    {"workflow": "outreach", "sequence": ["get_recommendations", "monitor_outreach"], "runs": 77},
+    {"workflow": "general", "sequence": ["draft_agent_outreach", "callouts_details"], "runs": 48},
+    {"workflow": "general", "sequence": ["draft_agent_outreach", "callouts_details", "get_caregiver_recommendation_details"], "runs": 40},
+    {"workflow": "general", "sequence": ["shifts_search"], "runs": 35},
+    {"workflow": "general", "sequence": ["shifts_search", "draft_agent_outreach", "callouts_details", "get_caregiver_recommendation_details"], "runs": 35},
+    {"workflow": "general", "sequence": ["shifts_details", "draft_agent_outreach", "callouts_details", "get_caregiver_recommendation_details"], "runs": 32},
+    {"workflow": "general", "sequence": ["get_activity_feed"], "runs": 20},
+    {"workflow": "general", "sequence": ["trigger_ehr_sync"], "runs": 15},
+    {"workflow": "general", "sequence": ["trigger_ehr_sync", "post_to_slack_thread"], "runs": 15}
+  ],
+  "write_tool_audit": [
+    {"rank": 1, "tool": "add_outreach_suggestions", "calls": 6818, "runs": 4747, "pending_approval": 0, "completed_outputs": 6476, "incomplete_outputs": 342, "risk": "medium", "risk_note": "agency outreach state mutation; no pending approval observed"},
+    {"rank": 2, "tool": "manage_outreach_add_contact_attempts", "calls": 3469, "runs": 912, "pending_approval": 2766, "completed_outputs": 2973, "incomplete_outputs": 261, "risk": "high", "risk_note": "customer outreach side effect"},
+    {"rank": 3, "tool": "send_one_off_sms_in_conversation", "calls": 2287, "runs": 254, "pending_approval": 1654, "completed_outputs": 1885, "incomplete_outputs": 154, "risk": "high", "risk_note": "direct customer message"},
+    {"rank": 4, "tool": "manage_outreach_remove_suggestions", "calls": 984, "runs": 700, "pending_approval": 0, "completed_outputs": 952, "incomplete_outputs": 32, "risk": "medium", "risk_note": "agency outreach state mutation; no pending approval observed"},
+    {"rank": 5, "tool": "draft_agent_outreach", "calls": 921, "runs": 611, "pending_approval": 858, "completed_outputs": 615, "incomplete_outputs": 253, "risk": "high", "risk_note": "draft can lead to customer outreach"},
+    {"rank": 6, "tool": "schedule_self_poke", "calls": 852, "runs": 216, "pending_approval": 206, "completed_outputs": 800, "incomplete_outputs": 13, "risk": "medium", "risk_note": "deferred agent action"},
+    {"rank": 7, "tool": "manage_outreach_start_with_contacts", "calls": 768, "runs": 675, "pending_approval": 717, "completed_outputs": 658, "incomplete_outputs": 58, "risk": "high", "risk_note": "starts customer outreach"},
+    {"rank": 8, "tool": "place_one_off_voice_call_in_conversation", "calls": 680, "runs": 43, "pending_approval": 458, "completed_outputs": 644, "incomplete_outputs": 28, "risk": "high", "risk_note": "direct customer call"},
+    {"rank": 9, "tool": "save_caregiver_memory_instruction", "calls": 570, "runs": 263, "pending_approval": 523, "completed_outputs": 527, "incomplete_outputs": 24, "risk": "medium", "risk_note": "durable caregiver record"},
+    {"rank": 10, "tool": "manage_outreach_set_status", "calls": 498, "runs": 454, "pending_approval": 0, "completed_outputs": 448, "incomplete_outputs": 50, "risk": "medium", "risk_note": "agency outreach state mutation"},
+    {"rank": 11, "tool": "update_outreach_metadata", "calls": 434, "runs": 317, "pending_approval": 406, "completed_outputs": 354, "incomplete_outputs": 41, "risk": "medium", "risk_note": "agency outreach state mutation"},
+    {"rank": 12, "tool": "update_shift", "calls": 352, "runs": 156, "pending_approval": 340, "completed_outputs": 276, "incomplete_outputs": 57, "risk": "high", "risk_note": "schedule mutation"},
+    {"rank": 13, "tool": "update_agent_outreach", "calls": 298, "runs": 266, "pending_approval": 0, "completed_outputs": 264, "incomplete_outputs": 34, "risk": "medium", "risk_note": "agency outreach state mutation; no pending approval observed"},
+    {"rank": 14, "tool": "save_client_memory_instruction", "calls": 258, "runs": 179, "pending_approval": 246, "completed_outputs": 231, "incomplete_outputs": 13, "risk": "medium", "risk_note": "durable client record"},
+    {"rank": 15, "tool": "fill_callout_shifts", "calls": 218, "runs": 140, "pending_approval": 215, "completed_outputs": 159, "incomplete_outputs": 40, "risk": "high", "risk_note": "changes callout coverage and may contact customers"},
+    {"rank": 16, "tool": "notify_caregivers", "calls": 201, "runs": 174, "pending_approval": 193, "completed_outputs": 123, "incomplete_outputs": 43, "risk": "high", "risk_note": "customer outreach side effect"},
+    {"rank": 17, "tool": "trigger_ehr_sync", "calls": 172, "runs": 138, "pending_approval": 172, "completed_outputs": 148, "incomplete_outputs": 9, "risk": "high", "risk_note": "external data synchronization side effect"},
+    {"rank": 18, "tool": "update_outreach_filter_rule", "calls": 149, "runs": 41, "pending_approval": 143, "completed_outputs": 116, "incomplete_outputs": 18, "risk": "medium", "risk_note": "changes future outreach behavior"},
+    {"rank": 19, "tool": "cancel_callout_shifts", "calls": 128, "runs": 71, "pending_approval": 128, "completed_outputs": 95, "incomplete_outputs": 22, "risk": "high", "risk_note": "changes customer coverage state"},
+    {"rank": 20, "tool": "assign_shifts_to_caregiver", "calls": 72, "runs": 39, "pending_approval": 72, "completed_outputs": 41, "incomplete_outputs": 29, "risk": "high", "risk_note": "schedule mutation"},
+    {"rank": 21, "tool": "apply_playbook_natural_language_edit", "calls": 65, "runs": 52, "pending_approval": 65, "completed_outputs": 59, "incomplete_outputs": 2, "risk": "medium", "risk_note": "changes operational rules"},
+    {"rank": 22, "tool": "add_caregiver_weekly_availability", "calls": 24, "runs": 4, "pending_approval": 24, "completed_outputs": 21, "incomplete_outputs": 0, "risk": "medium", "risk_note": "changes caregiver availability"},
+    {"rank": 23, "tool": "cancel_shift", "calls": 12, "runs": 7, "pending_approval": 12, "completed_outputs": 5, "incomplete_outputs": 6, "risk": "high", "risk_note": "schedule mutation"},
+    {"rank": 24, "tool": "update_playbook_item_tool", "calls": 11, "runs": 9, "pending_approval": 11, "completed_outputs": 10, "incomplete_outputs": 0, "risk": "medium", "risk_note": "changes operational rules"},
+    {"rank": 25, "tool": "add_caregiver_one_off_availability", "calls": 7, "runs": 7, "pending_approval": 7, "completed_outputs": 5, "incomplete_outputs": 1, "risk": "medium", "risk_note": "changes caregiver availability"},
+    {"rank": 26, "tool": "update_recommendation_defaults", "calls": 4, "runs": 2, "pending_approval": 4, "completed_outputs": 4, "incomplete_outputs": 0, "risk": "medium", "risk_note": "changes recommendation behavior"},
+    {"rank": 27, "tool": "add_shift_note_to_wellsky", "calls": 3, "runs": 3, "pending_approval": 3, "completed_outputs": 0, "incomplete_outputs": 3, "risk": "high", "risk_note": "external EHR write"},
+    {"rank": 28, "tool": "update_callout_excluded_caregivers", "calls": 1, "runs": 1, "pending_approval": 1, "completed_outputs": 0, "incomplete_outputs": 1, "risk": "medium", "risk_note": "changes callout behavior"},
+    {"rank": 29, "tool": "update_caregiver_record", "calls": 1, "runs": 1, "pending_approval": 1, "completed_outputs": 1, "incomplete_outputs": 0, "risk": "medium", "risk_note": "durable caregiver record"},
+    {"rank": 30, "tool": "update_shift_triage_stage", "calls": 1, "runs": 1, "pending_approval": 0, "completed_outputs": 0, "incomplete_outputs": 1, "risk": "medium", "risk_note": "changes shift triage state"}
+  ],
+  "internal_action_audit_summary": {
+    "window_audits": 557,
+    "succeeded": 556,
+    "failed": 1,
+    "note": "separate internal-admin audit stream; not included in the customer-facing run census"
+  },
+  "replay_dataset": {
+    "sampling_rule": "sample by workflow cluster runs; preserve observed sequence repetition and approval states",
+    "cases": [
+      {"id": "replay-01", "cluster": "outreach_recommendations_and_monitoring", "weight_runs": 6527, "seed": ["open shifts", "synthetic clients", "caregiver constraints", "recommendation rows", "contact attempts", "monitor state"], "coverage": "mixed"},
+      {"id": "replay-02", "cluster": "shift_lookup_and_scheduling", "weight_runs": 433, "seed": ["open and filled shifts", "recurring group", "caregiver conflicts", "approval decision", "write receipt"], "coverage": "mixed"},
+      {"id": "replay-03", "cluster": "caregiver_lookup_and_memory", "weight_runs": 218, "seed": ["varied roles", "languages", "availability", "tags", "durable memory", "one-time exception"], "coverage": "mixed"},
+      {"id": "replay-04", "cluster": "outreach_drafting_and_management", "weight_runs": 166, "seed": ["draft outreach", "suggestions", "contact attempts", "retry state", "approval state"], "coverage": "mixed"},
+      {"id": "replay-05", "cluster": "client_lookup", "weight_runs": 162, "seed": ["client profile", "care-plan constraints", "office", "tags"], "coverage": "covered_read_only"},
+      {"id": "replay-06", "cluster": "activity_and_alert_handling", "weight_runs": 103, "seed": ["activity events", "alert state", "synthetic Slack thread", "resolution state"], "coverage": "missing_read_context"},
+      {"id": "replay-07", "cluster": "docs_playbooks_settings_and_reports", "weight_runs": 80, "seed": ["playbook rules", "edit history", "settings", "report rows", "product docs"], "coverage": "skill_prompt_gap"},
+      {"id": "replay-08", "cluster": "ehr_sync", "weight_runs": 41, "seed": ["sync status", "stale record", "approval decision", "retry result"], "coverage": "missing_write"},
+      {"id": "replay-09", "cluster": "messaging_and_history", "weight_runs": 21, "seed": ["synthetic conversations", "message history", "approved draft", "send result"], "coverage": "mixed"},
+      {"id": "replay-10", "cluster": "no_domain_tool", "weight_runs": 53, "seed": ["paraphrased answer-only request", "unsupported-write refusal expectation"], "coverage": "skill_prompt_gap"}
+    ],
+    "seed_requirements": [
+      "mixed caregiver roles, languages, genders, tags, distance, overtime, and schedule conflicts",
+      "client care-plan constraints and environment limits",
+      "recurring shift groups and an extra shift to add",
+      "outreach suggestions, no-response attempts, pending responses, and retries",
+      "durable caregiver and client memory fragments",
+      "synthetic conversations and approval states",
+      "playbook rules, settings, filter rules, reports, activity events, and sync state",
+      "write receipts, idempotency keys, cancellation, retry, and false-success cases",
+      "synthetic monitoring state and notification recipients"
+    ]
+  },
+  "limitations": [
+    "Intent clusters are first-tool proxies, not natural-language classifications.",
+    "Persisted runs and items are used instead of raw Logfire spans.",
+    "The last calendar day is partial at query time."
+  ]
+}

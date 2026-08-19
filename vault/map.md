@@ -46,6 +46,7 @@ Topic → note index. **Agents: read this file first, before grepping.** Every n
 - [[llm-rigorous-proving]] — LLMs on rigorous mathematical proving: current SOTA, failure modes, benchmarks
 - [[graph-engineering]] — graph engineering as next layer after loop engineering; org-graph + work-graph, nodes/edges/shared-state, maps onto orchestrator/worker stack
 - [[t3code]] — prior art for the wiki agent-control surface: theo/ping's open-source multi-provider harness controller
+- [[kickoff-defect-classes]] — recurring worker defect classes to name in kickoff contracts (stale caches, seam leaks)
 
 ## Design
 
@@ -69,9 +70,16 @@ Topic → note index. **Agents: read this file first, before grepping.** Every n
 - [[admin-redesign]] — full /admin/* redesign decision (2026-07-27): Ramp×Linear×wiki direction, scrap 14461 primitives, signal-tier IA per laws-of-ux, one mega-PR after in-flight admin set lands
 - [[admin-agent-audit-2026-07-30]] — full admin-agent audit @main 7a3a01e1e2: 182 tools, 5H/11M/4L, remediation order
 - [[v3-harness-design]] — v3 harness design (2026-07-31): implicit sandbox, artifact spill, single retrieve/write/describe doors, per-conversation workspace; Linear project Phoebe Agent V3
+- [[agent-engineering-reading-2026-08]] — ten-agent-engineering-source synthesis against Phoebe v3: durability, context, evals, automations, and approvals
 - [[llm-judge-auto-taggers]] — Phoebe LLM judge survey (2026-08-05): two-layer continuous reviewer (conversation judge + episode classifier), Agent Court routing; gaps: no judge goldens, fail-open edges, unredacted PII to providers.
 - [[env-vars-sync-for-credentials]] — phoebe: creds/env missing locally? env-vars sync-local first — synced .env.local files carry Modal tokens, LLM keys, etc.
 - [[debug-loop-pathologies]] — long debug loops: suspect own instrumentation first, full-bisect to last-good, verify probe channels, enumerate not pattern-match, fresh-eyes pass every ~5 rounds
+- [[v3-workflow-census-2026-08]] — production workflow census (7,821 runs) + 30 golden eval cases for v3; taxonomy, write-tool risk audit, replay seeds
+- [[v3-subagent-design-decisions]] — the 4 decisions unlocking org skill files (PHO-15434): subagent fate, fan-out, capability library, TTL retention
+- [[agent-write-tools-audit-2026-08-18]] — customer-facing agent write-tools audit (SMS/voice/in-app): exposure, gating, 30d usage counts
+- [[agent-write-tools-audit-epic]] — code-grounded customer-facing write-tools audit: 90 tools, DB footprints, gates, side effects, and source reconciliation
+- [[write-tools-consolidation-design]] — v3 write-tools consolidation design: seven consolidation patterns, two side-effect tools, 90 migration mappings from the customer-facing audit
+- [[admin-v3-tools-plan-2026-08-19]] — PHO-15864 admin agent v3 tools rewrite plan: inventory, core query/write/bash design, compaction+artifacts rethink, revised ladder, 12 open decisions for Henry
 
 ## Phoebe/til
 
@@ -103,6 +111,10 @@ Topic → note index. **Agents: read this file first, before grepping.** Every n
 ## Wiki
 
 - [[polish-census]] — WIKI-150 systematic polish audit of Wiki.app surfaces (rubric + tags + census tables); fans out into 8-12 small polish tickets
+- [[bb-parity-census]] — bb->wiki surface-by-surface parity map + WIKI-295-311 ticket decomposition + orchestrator rulings
+- [[agent-runtime-recovery]] — runbook for ~/.wiki/agent-runtime: 2026-08-17 SQLite-corruption RCA, park/rebuild recipes, supervisor boot-loop recovery
+- [[formatting-delta-census]] — WIKI-317 audit: why bb still looks cleaner (type rank, box noise, envelopes); WIKI-318-325 ladder + R1-R8 rulings
+- [[closing-audit-2026-08-17]] — WIKI-329 closing audit: 5-item punch list (P0 thought-group overlap, P0 destructive focus, tier stragglers, mono fallback, theme grid)
 
 ## Mitm-inspector
 
@@ -120,6 +132,11 @@ Topic → note index. **Agents: read this file first, before grepping.** Every n
 - [[opencode-tui-design-notes]] — OpenCode TUI design language extraction — color roles, elevation, dialogs, composer, motion; 21 web-transfer rules (feeds WIKI-245/246)
 - [[opencode-transcript-doctrine]] — OpenCode two-tier transcript rendering doctrine (InlineTool/BlockTool, density, thinking) — landed via WIKI-245/#182
 - [[tool-outputs-render-raw]] — wiki-app: tool outputs render raw; rich rendering only via explicit render_artifact
+- [[per-run-event-store]] — SQLite event-store contention → per-run event DB design
+- [[wk-tui-design]] — wk TUI design decisions (Henry 2026-08-19): inline renderer + sticky composer, daily-driver bar; feeds WIKI-345..351
+- [[terminal-parity-fonts]] — layered plan to close Wiki.app-vs-Terminal.app font rendering gap (CSS AA parity → bundled .ttf → pixel discipline → native Core Text)
+- [[supervisor-timeout-diagnosis-2026-08-19]] — why supervisor commands time out under load: single-loop reactor + synchronous persistence/archive; ranked fixes
+- [[wk-owned-agent-loop-design]] — WIKI-361 design: wk owns the claude/codex agent loops; provider seams, pi prior art, migration ladder WIKI-362..371
 
 ## Wiki/til
 

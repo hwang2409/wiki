@@ -2,14 +2,286 @@
 type: log
 tags: [log, done]
 created: 2026-07-06
-updated: 2026-08-07
+updated: 2026-08-19
 ---
 
 # Done
 
+## 2026-08-19
+
+- **wiki** — WIKI-352 persistent event-store connections + coalesced checkpoints merged (PR #279, 4 review rounds + rebase confirmation; kills per-event WAL checkpoint fsync storm)
+- **zeta** — project renamed harness -> zeta (repo hwang2409/zeta, ~/me/fun/zeta; ticket prefix ZETA)
+- NEWT-33 analytic derivatives merged (tooling PR #78, 985454f): unified primal/dual ABA (aba.rs), full product-rule spatial tangents, analytic tendon wrap derivatives, mutation-verified regression tests; 10 review rounds. Also: GitHub Actions removed from tooling repo (28a77b9, Henry decision — local gate authoritative)
+- **wiki** — WIKI-361 design complete + pivoted — standalone pi-style harness repo created (hwang2409/harness); no provider subprocesses; ladder HAR-1..8
+- **wiki** — WIKI-361 design complete — wk-owned agent loop plan with pi prior art, migration ladder WIKI-362..371 ([[wk-owned-agent-loop-design]])
+- **wiki** — WIKI-339 per-run event store sharding merged (PR #274, 10 review rounds; kills provider-persistence-failed class)
+- **wiki** — WIKI-346 wk render.py pure event renderers + authoritative normalizer enumeration merged (PR #278, 10 review rounds)
+- PHO-16293 merged: v3 agent configurations redesign, 6 review rounds (phoebe #14736)
+- **wiki** — WIKI-356 supervisor timeout diagnosis complete — single-loop reactor + sync persistence/archive; report in [[supervisor-timeout-diagnosis-2026-08-19]]
+- PHO-16390 merged: v3 admin port-ledger accounting reconcile, slack tools deferred (phoebe #14818)
+- **wiki** — WIKI-345 wk engine extraction + TUI driver selection merged (PR #277)
+- **wiki** — WIKI-340 Terminal.app font parity on mono surfaces merged (PR #275)
+- PHO-15864 PR1 merged: reconcile admin v3 scaffold with current main (phoebe #14798)
+
+## 2026-08-18
+
+- **wiki** — WIKI-336 wk terminal driver merged as https://github.com/hwang2409/wiki/pull/273 (b9b6a0d, 7 review rounds — narrowed 2 BLOCKING → 1 LOW; follow-up WIKI-343)
+- WIKI-338 runs page formatting merged (#272) — history rows tightened to one-line, ~3-4x density
+- **wiki** — WIKI-337 dup user messages fix merged (#271); WIKI-336 wk terminal driver worker respawned after event-persistence death; WIKI-338 filed for runs-page formatting
+- phoebe #14710 merged: phoebe_admin_agent_v3 scaffold + 190-tool port ledger — rewrite PR 1 landed, Phase 2 family ports unblocked
+- phoebe #14033 merged: v3 manage_automation tool (draft concept removed per lead) — PHO-15629 done
+- **newt** — NEWT-32 perf pass 2 merged (PR #77, 88550de) — scratch reuse + RK4 clone reduction, byte-identical goldens, cc opus-4.7 workers
+- phoebe #14707 merged: main Bazel CI hotfix (scripts deps_by_src gap from #14481 x #14657) — fleet unblocked
+- Phoebe write-tools audit extended with in-app coordinator agent (phoebe_event_agent): ~50 write tools inventoried by hand, 170k 30d tool calls from agent_items, matrix + v3 gap notes updated
+- phoebe #14700 merged: hosted codebase-wiki atlas evicted after idle TTL — 2.4 GiB no longer pinned per task (PHO-16183)
+- phoebe #14355 merged: admin tool contracts extracted (capability_contracts + contracts module, barrel shim) — rewrite phase 0 complete, PR-1 scaffold unblocked
+- phoebe PRs #13538, #13745, #14240 closed per Henry (stale drafts / superseded attachments PR); conflict fix-ups spawned for #14033 (draft removal per lead), #14126 (S3-default check), #14136
+- Phoebe agent write-tools audit compiled (docs/notes/phoebe_agent_write_tools_audit_2026_08_18.md): full SMS+voice write-tool inventory, 30d prod usage from replica, capability matrix for v3 gap analysis
+- phoebe #14670 merged: PHO-15864 admin path-freeze CI machinery removed (guard workflow gone) — clears expected guard reds on open PRs
+- phoebe #14677 merged: admin characterization digest regen — main GREEN again after #14512 semantic collision
+- phoebe #14512 merged: durable admin tool receipts (atomic single-use claim, honest failed/partial outcomes, versioned replay) — rewrite Phase 0 seam #1 landed
+- phoebe #14662 merged: v3 fixture gate + v3-prefix freeze surgically removed (admin gates + CI-machinery freeze stay) — v3 product development unfrozen; #14568 unblocked
+- phoebe #14517 merged: PHO-15864 PR0 invariance gates frozen (9 review rounds; 5 bypass layers closed, structural sentinel recheck) — ladder unblocked, PR5 #14559 next
+- **wiki** — WIKI-335 run-view reverted to opencode-parity baseline (raw boxes, no outlines) merged as PR #270 (5b411ccb); gate: unit+typecheck green, 23 playwright fails verified pre-existing on main, live visual check passed
+
+## 2026-08-17
+
+- phoebe #14628 merged: CODEOWNERS exemption for generated tool catalog — frees admin-ladder PRs (#14355 #14398 #14512 #14568) from the v3 owner queue
+- **wiki** — WIKI-334 one-size type (R1 tiers superseded by Henry) + flat square composer — direct to main (7809927), app rebuilt+relaunched
+- **wiki** — WIKI-294 bb parity program complete (census 295-311, formatting 317-327, closing audit 329 punch items 330-333 all merged)
+- **wiki** — bb-parity closing punch list fully closed — #268 tier migration + #269 live tier sweep/suite registration merged; parity contract met, WIKI-313 (P3) only remainder
+- **PHOEBE** — RCA'd call-ended save crash (mode context missing after #14258); own fix PR #14617 closed as dup of #14616
+- WIKI-332 merged: tier-straggler sweep — dialogs/dashboard/tokens/kanban/toasts/strip all on 15-13-10 (PR #268)
+- WIKI-330 merged: thought-group virtual height fix, audit root cause confirmed (PR #266; in-session review w/ empirical revert proof)
+- WIKI-331 merged: destructive-dialog safe initial focus (P0), one-family fix for envelope/command leaves, flat theme grid (PR #267)
+- WIKI-328 merged: RLIMIT_NOFILE soft->hard raise at all backend entrypoints (PR #265; in-session review clean, activation awaits supervisor restart; follow-up: daemon-wiring call assertion)
+- WIKI-323 merged: session header to one 40px row, composer control-tier rank (PR #264) — FORMATTING LADDER COMPLETE
+- WIKI-325 merged: transcript tiers corrected (code/output to control tier), same-content-same-tier sweep, optical contract (PR #263)
+- WIKI-308 merged: dialogs to bb shape w/ full a11y contract (PR #249; 5 review rounds — focus-restore ordering + non-vacuous regression tests)
+- WIKI-326 merged: icon geometry normalized to one optical contract, text glyphs replaced w/ lucide (PR #262)
+- WIKI-324 merged: dashboard/tokens one-frame-per-group, flat summaries (PR #261)
+- WIKI-320 merged: agents page de-nested to flat groups w/ state-only emphasis (PR #260)
+- WIKI-322 merged: kanban lanes + cards flattened, single surface treatment (PR #259)
+- WIKI-321 merged: activity commits + health buckets flattened to bb row grammar (PR #258)
+- WIKI-319 merged: user-card clamp + show-more, machine-envelope disclosures, thought-run grouping (PR #257, 505 tests)
+- WIKI-318 merged: three semantic type tiers derived from one base size; 700 weight retired (PR #256; token gate strengthened w/ tier checks)
+- WIKI-327 merged: macos-light + macos-dark HIG theme pair (PR #255, 1 round)
+- PR #14258 merged (581a49e5): PHO-15817 automation event triggers, conflict resolution + clean merge-resolution review
+- WIKI-315 merged: codex thought summaries render markdown + section separators, no more raw ** jam (PR #253, 502 component tests)
+- WIKI-316 merged: bb-light + bb-dark shipped as first-class themes copied from bb theme.css (PR #254, 1 round)
+- WIKI-309 merged: dashboard tickets grid restyled to bb table shape w/ skeleton (PR #252, 1 round)
+- PR #14551 merged (5e2dc892): removed phoebe_event_agent CODEOWNERS entries
+- WIKI-306 merged: empty/loading/error session states restyled to bb grammar (PR #251, 1 round)
+- WIKI-307 merged: agents page restyled as bb runs chrome (PR #250; orch gate caught missing .venv symlink masking the token gate)
+- WIKI-311 merged: utility pages (activity/health/tokens/kanban) restyled to bb page chrome (PR #248; root-caused token-gate failure to missing frontend/dist build)
+- WIKI-303 merged: composer restyled to bb PromptBox grammar (PR #247, combined-tree gate w/ 305)
+- WIKI-310 merged: artifact panel + inline blocks restyled to bb panel grammar (PR #245, recovered PR verified + rebased by gen-3 worker)
+- WIKI-305 merged: transcript turn cards restyled to bb grammar (PR #246, 1 round + anti-slop sweep)
+- WIKI-304 transcript tool/output/marker rows in bb activity-row grammar merged (PR #244; timeline-accent rail on running tools only; orchestrator opened+merged the PR after the worker's PR step died in the GitHub outage)
+- **newt** — NEWT-31 native-CCD box-hfield alignment merged (PR #75, 3d445d7; 2 review rounds + dictated deltas; in-crate GJK/EPA, MuJoCo 3.11.0 routing table w/ executable provenance, default-mode dynamic anchor 1.16e-7 early-window, load-bearing route fixtures w/ 4-pose coverage; closes NEWT-28 declared-mode finding)
+- WIKI-302 toast + banner system merged (PR #242; transient errors -> bb sonner-shape toasts, persistent failures -> one detail-card banner) — WAVE 2 OF BB PARITY COMPLETE (299-302)
+- WIKI-299 sidebar restructure merged (PR #243; bb sticky section/parent tiers, inline persistent search, hover-reveal row actions, 28px row anatomy across files+sessions lists)
+- WIKI-300 bb AppPageHeader + breadcrumbs merged (PR #241; top tab strip removed per ruling W1, view actions in header actions slot)
+- WIKI-301 status bar chips restyled to bb tab-pill grammar merged (PR #240; + test:wiki-301 script)
+- WIKI-314 duplicate transcript messages: no code fix — bug only in pre-rebuild binary (echoed_at-only path); main 3db94ae dedupes on sent_at (browser-regression verified); resolved by pending rebuild
+- WIKI-298 motion/focus/scrollbar tokenization merged (PR #239; one 120ms motion family, bb --ring focus, thin translucent scrollbars, reduced-motion respected) — WAVE 1 OF BB PARITY COMPLETE (295-298)
+- WIKI-296 ribbon deletion + sidebar shell recomposition merged (PR #238; destinations now bb-style sidebar Views section + footer, app grid collapsed to sidebar+main, all shortcuts preserved)
+- WIKI-297 bb primitive components merged (PR #237; Button/IconButton/TabPill/DetailCard/MenuRow + #/primitives-demo inventory route, 9 new integration tests)
+- WIKI-295 bb palette adoption + shell tokens merged (PR #236; mono themes on bb canvas/ink OKLCH derivation, 17 new shell tokens across all 11 themes; wave 1 of bb parity program)
+- **newt** — NEWT-30 perf baseline + first optimization pass merged (PR #74, ece1e35; 1 review round + dictated deltas; Euler ABA workspace reuse ~31-32% on muscle scenes, RK4 reuse variance-documented, alloc guard + nearest-rank percentiles)
+- **newt** — muscle actuators merged (PR #73, f9d60fc; 3 rounds) — exact mju_muscleGain/Bias/Dynamics (319-point knot grid at float tier 3.8e-5), activation dynamics incl. tausmooth, joint+tendon transmissions with gear coverage, implicitfast joint fold vs MuJoCo capture + tendon exclusion mutant-protected, 6 differential scenes at 1e-6/1e-7 tier incl. RK4-limits capture; reviews caught ignored ctrl/force limit flags (large trajectory break), invented general-muscle defaults, wrong validation domain both ways, and an RK4 clamp bypass — MAJOR MUJOCO FEATURE SURFACE NOW COMPLETE
+- **newt** — heightfield geoms merged (PR #72, 910f510; 5 rounds) — true prism collision (crease-not-wall diagonals, min-penetration box-prism SAT, outer-boundary+base walls), MuJoCo elevation normalization, executable per-pose oracle provenance (loadable capture XMLs + regen tool), quasi-static differential rows (bowl 1.5e-3, slope 2.6e-5) + early windows + steep trajectory anchor 5.5e-3; DECLARED-MODE FINDING: box-hfield matches nativeccd=disable pipeline (positions/one normal within measured SAT-vs-MPR construction bounds); native-CCD default alignment = open finding; reviews caught a vertical-projection shortcut, chaotic-divergence 'bounds', a loader panic, a decorative string-contains test (warning issued), and empty provenance XMLs
+- PHO-15864 PR 0 dual-gated — phoebe #14517 invariance gates (4 rounds; trusted-revision v3 guard, behavioral predicate identity, value-frozen persistence baseline)
+- **phoebe** — PHO-15864 PR 0 gate-green ([#14517](https://github.com/phoebe-health/phoebe/pull/14517)) — frozen admin and v3 invariance gates
+- **newt** — cylinder tendon wrap + pulleys merged (PR #71, e8e898d; 1 gate bounce + 2 rounds) — MuJoCo mju_wrap semantics (tangent geometry validated 1.3e-13 over 250 oracle poses), sidesite incl. fixed cross-tree, pulley divisor branches (asymmetric fixture), 3 matched differential rows at 1e-7 tier, mp4 demo verified; gate bounce enforced the missing oracle captures; review caught a wrap-body Jacobian translation double-count (2x error, also regressing sphere wraps) proven against MuJoCo ten_J
+- PHO-15859 dual-gated — phoebe #14512 durable receipts (3 rounds; atomic single-use receipts, honest outcomes, versioned replay) — AUDIT PROGRAM COMPLETE (10/10 tickets merged or dual-gated)
+- **newt** — in-step contact detection merged (PR #70, 9e4b421, 1 gate bounce + 2 rounds) — PGS/Newton rows (tree + free-body) now assemble from step-start detection matching MuJoCo Euler phase order; penalty keeps per-stage live evaluation (MuJoCo-RK4-consistent); contact-latency finding CLOSED via state-injection probe (same sets on same positions, depth gap 1.9e-6) — residual [25,35] window = onset-boundary drift, CI-asserted signed-distance trace; 0.4 fall gap (756 vs 551) now characterized as chaotic threshold sensitivity, not an engine bug; orchestrator gate-bounced round 1 for a tree-scope dodge, reviewer then caught the un-protected legacy-manifold mutant
+- **newt** — MuJoCo-parity contact manifolds merged (PR #69, 4 rounds, a411f9b) — source-exact plane-sphere/box/capsule manifolds (corner scan, midpoint, 4-cap; adversarial fresh-capture verified, zero fitted constants), provable cap (candidate-count seam, mutant-killed); honest arc: original 1-vs-2-contact evidence was partly a capture-phase artifact, solver-phase re-evaluation NOT claimed as parity -> NEW PRIME FINDING: one-step contact latency (newt solver consumes prior-step contacts; MuJoCo collides in-step; mismatch window exactly [25]); 0.4 fall gap unchanged (205 steps), box-stack row honestly re-reported as bounded divergence
+- bb-inspired visual reskin: canvas+rounded-panel shell, quiet sidebar, composer card w/ dark circular send, chip status bar; PR #235 merged (UI polish path, 4-theme browser-verified, screenshots in .playwright-mcp/wiki-293/)
+
+## 2026-08-16
+
+- PHO-15857 merged — phoebe #14375 admin artifact bounds (4 review rounds; zero behavior change incl. model-visible receipts, real-event cache regression, spill-cancellation coverage)
+- **newt** — v3 ARC COMPLETE — no-assist walk acceptance merged (PR #68, 2 rounds, 7ecf032): outcome-class parity at all 4 assist levels vs byte-reproducible MuJoCo oracle; MuJoCo itself FALLS no-assist (TARGET structurally unavailable — oracle-first design paid off); MUST missed only on 0.4 fall-step window (756 vs 553); carry-forward finding with geom-level evidence: contact manifold selection (newt 2-point vs MuJoCo 1-contact/4-row box-plane, first mask divergence step 12); review verified zero hidden assists (mutant: zeroing assist makes the 0.8 walk fall)
+- **newt** — v3 exact solref impedance merged (PR #67, 3 rounds) — fitted alpha_k=2 deleted, MuJoCo-derived k/b/R/aref proven factor-by-factor vs mjData efc internals (permanent assembler-differential test, mutant-verified), matched-Euler tc sweep at parity 0.005-0.200, tree pyramid R unified via diagApprox+Rpy, RK4 constraint-ZOH kept as honest documented residual; reviews caught formula-only test sham, 1000x-loose bounds, undisclosed 35000x bound loosening
+- **wiki** — WIKI-289 PR 5/6 integrity enforcement + experiment telemetry (PR #234, 5 review rounds — ledger-authoritative status w/ file as projection, end-to-end consumer sweep, causal-order replay authority, revocation semantics, false-ready guard proven against forgery attacks, plan-unit metrics)
+
+## 2026-08-15
+
+- **newt** — v3 tree-contact constraint routing merged (PR #66, 2 rounds) — trees now solved by PGS/Newton incl. tree-tree coupling (hand J M^-1 J^T proof), implicit (M+dt*B)^-1 contact response, mocap fixed in solver modes; biped walks 2.5138 m with cadence 117.60 = exact source MuJoCo figure; review caught mocap wrench skip, stale M^-1 response, and a surviving tree-tree mutant
+- **newt** — v3 Newton solver merged (PR #65, 3 rounds) — convex primal with exact zone Hessians + analytical line search, pyramidal complete, elliptic loudly rejected incl. step-time validation; Newton 1 iter vs PGS 30 sweeps on stack; review caught wrong e2 pyramidal face (FD probe 2.0e0 grad err) and an oversold biped anchor (tree contacts are penalty in ALL modes — routing = next ticket)
+- **wiki** — WIKI-289 PR 4/6 supervisor parity + WIKI-282 event-store ingest for wk (PR #233, 3 review rounds — first-class envelope ingest, kind-keyed replace, durable replay recovery both lanes, four-source divergence blocking, real-supervisor route tests)
+- **newt** — v3 integrators merged (PR #64, 2 rounds) — MuJoCo-semantics Euler with implicit joint damping (ABA fold proven == dense solve), implicitfast, free-root damping, matched-integrator differential parity; review caught tendon-actuator non-diagonal fold producing 20x-wrong qacc
+- **wiki** — WIKI-289 PR 3/6 Codex App Server lane (PR #231, 5 review rounds incl. record-from-real-binary mandate + cc-reviewer catch of a fleet-breaking production sandbox default; 2 degraded cdx reviewer sessions rerouted to cc during provider degradation)
+- **newt** — demo showcase merged (PR #63, 2 rounds + 2 wedge kicks) — all demos export full-run mp4 by default (ffmpeg), solid shaded meshes, live winit viewer (orbit/pause/speed/HUD), render-decoupled determinism proven
+
+## 2026-08-14
+
+- **newt** — v2 COMPLETE — BIPED WALKING MILESTONE merged (PR #62, 2 rounds) — assisted walk 2.45m/5000 steps BEATS source MuJoCo 2.26m with near-source gait metrics (input-parity), zero self-contact; no-assist diagnosis: solver/integrator divergence (v3 spine). Review round flipped a false engine-gap diagnosis into two port fixes. v2 = PRs #58-#62
+- main content column widened 910->1024px via --file-line-width token; PR #232 merged (UI polish path, browser-verified 1440/2560)
+- PHO-15861 merged — phoebe #14346 batch admin reads (4 review rounds; lateral-scan bounds, atomic Slack claim, role-faithful plan evidence)
+- **newt** — v2 APIs merged (PR #61, 2 rounds, first codex worker) — Jacobian/invdyn APIs, keyframes (MJCF remap via shared NEWT-13 machinery), mocap, remaining sensors incl rangefinder; review caught keyframe quat-order blocker
+- **wiki** — WIKI-289 PR 2/6 Claude Agent SDK lane (PR #230, 4 review rounds — sanitized child env + positive plan-auth proof, per-turn settings/hook drift blocking, real stub-CLI transport fixtures, production-wired semantic gate reconciliation w/ 4-quadrant exit semantics; 1 misreport warning issued round 1)
+- PHO-15860 PR 1 merged — phoebe #14372 codebase-wiki reader cache (5 review rounds; atlas-load lock now covers every public dispatcher)
+- **newt** — v2 tendons merged (PR #60, 1 round approve) — fixed tendons complete, spatial with sphere wrap (tangent-arc + envelope Jacobian), tendon actuation/limits/sensors, 2 differential scenarios, hand-written asin/atan2
+- **wiki** — WIKI-289 PR 1/6 wk core + event contract + launch flag (PR #229, 3 review rounds — explicit-secret redaction, pre-redaction integrity hashes, derived lanes, committed-baseline flag-off snapshots, loop-owned status writer)
+- **newt** — v2 general actuator model merged (PR #59, 2 rounds) — gain/bias framework, motor/position/velocity shorthands with ctrlrange parity, activation filters, PdServo byte-identity migration; review caught transmission-space affine gap + silent ctrlrange drop
+- **newt** — v2 differential findings closed (PR #58, 2 rounds) — box-stack parity via full SAT manifold (missing face-face contacts was root cause; review caught a position sign inversion), penetration parity in tc [0.010,0.050] via alpha_k=2 (out-of-window divergence = new open finding)
+- **wiki** — WIKI-282 COMPLETE — PR 5/5 default SQLite reads + remove hot-path parsing (PR #228, 5 rounds — EOF handle-offset fingerprint, shadow-guard isolation, no-transcript-access proofs); ticket total: 6 PRs, 22 review rounds, 2 descope rulings, 2 worker replacements
+- normalized SQLite event store shipped end-to-end: 6 PRs (#223-#228), materialize-at-ingest, dual-write + recovery, archive parity, full route flips w/ dual-stack harness, default SQLite reads; hot-path parse-on-read class eliminated
+- **newt** — v1 COMPLETE — differential harness merged (PR #57, 2 rounds) — real-MuJoCo capture tool, 8 scenarios, parity scorecard: 4 parity / 2 bounded / 2 open findings (box-stack instability, 180um penetration offset). v1 = PRs #50-#57
+- **newt** — v1 MJCF subset loader merged (PR #56, 4 rounds incl. one integrity bounce) — hand-written XML parser, defaults/classes, MJCF-vs-JSON byte-identity, biped-simple.xml stands under source balance architecture with full disclosure
+- **newt** — v1 sensor battery merged (PR #55, 2 rounds) — full MuJoCo sensor set; review caught link-accelerometer spatial/classical mix-up and link-touch zero-mass blockers with exact probes
+- **newt** — v1 equality constraints + condim 4/6 merged (PR #54, 2 rounds) — connect/weld/coupling/distance bilateral rows, torsional/rolling friction, jacobian-probe pattern for chain-rule mutants, four-bar linkage demo
+- **wiki** — WIKI-282 PR 4b remaining route flips + child-run mapping + read telemetry (PR #227, 2 review rounds — child freshness fallback, commit-then-publish SSE, mapping survival across rebuild, full-payload child parity)
+- **newt** — v1 soft-constraint solver merged (PR #53, 2 rounds) — solimp/solref, regularized dual, PGS with pyramidal+elliptic cones, constraint joint limits (double-enforcement blocker fixed with mutant proof), opt-in mode, solver_stack demo
+- **wiki** — WIKI-282 PR 4a/5 session+delta SQLite read flip (PR #226, 6 review rounds, 2 descope rulings, 1 worker replacement — dual-stack zero-mock harness, one composition point, change_cursor deltas w/ exactly-once test, child sessions deferred to 4b)
+- **wiki** — orch scope ruling 2 (2026-08-14) — WIKI-282 PR 4a delta flip restricted to TOP-LEVEL runs: child/subagent sessions stay legacy (production never writes a child-run mapping; subagent_run_ids only existed via harness injection); child-run mapping + child flips become explicit PR 4b scope
+- **newt** — v1 CRB+RNE merged (PR #52, 1 round approve) — mass matrix, inverse dynamics, hand-rolled Cholesky, ABA/RNE round-trip identity, 8-mutant sweep clean
+- **newt** — v1 geom expansion merged (PR #51, 2 rounds) — cylinder/ellipsoid/convex mesh, full 15-axis box SAT (NEWT-5 incident class closed), margin/gap, unsupported-pair panic enforcement, mixed pile demo + models/pile.json
+- **wiki** — orch scope ruling 2026-08-14 — WIKI-282 PR 4 descoped after 3 non-converging rounds (6 BLOCKERs, recurring self-comparing-test class across 2 implementers): PR 4a = session+delta flips on a new zero-mock dual-stack route harness; PR 4b = older/provider/SSE flips + full telemetry on same harness
+
+## 2026-08-13
+
+- **newt** — v1 slide+ball joints merged (PR #50, 1 round approve) — cart-pole Lagrangian twin, spherical pendulum conservation anchors, mixed-tree golden
+- **newt** — v0 COMPLETE — model format merged (PR #49, 2 rounds) — JSON schema, hand-written parser (25+ hostile probes clean), strict loader, round-trip anchors, models/{pendulum,arm,stack}. v0 = 5 tiers, PRs #45-#49
+- **wiki** — WIKI-282 PR 3/5 archive export + parity backfill (PR #225, 4 review rounds — atomic export, un-silenceable mismatch recording, per-run ownership lock, durable backfill cursor, discriminating comparator/recorder/lock tests; 1 provider-capacity worker replacement mid-PR)
+- **newt** — v0 actuators merged (PR #48, 1 round approve) — PD servos (kp/dampratio/clamp), joint torques, external wrenches into ABA, commanded 3-link arm demo
+- **newt** — v0 joints/ABA merged (PR #47, 1 round approve) — kinematic trees, hinge joints, Featherstone ABA verified line-by-line vs RBDA, Lagrangian-twin anchor, floating-base momentum gate
+- **wiki** — WIKI-282 PR 2/5 supervisor dual-write + event store recovery (PR #224, 3 review rounds — durability order, temp-DB atomic rebuild, normalized-seq recovery, real-pump backpressure test, schema_migrations health)
+- **newt** — v0 contacts merged (PR #46, 3 rounds) — geoms, penalty model + pyramidal friction, box-box vertex-face, symmetry-broken stacking golden, stack/roll demos
+- **wiki** — WIKI-282 PR 1/5 SQLite event store schema + materializer core (PR #223, 2 review rounds — E1 cursor advance, E2 legacy projection parity, E3 reducer/tx atomicity)
+- **newt** — v0 core dynamics merged (PR #45, 2 rounds) — libm-free math, spatial algebra, free bodies, RK4, Dzhanibekov anchor, cross-platform golden, own CI with libm grep gate
+- PHO-15703 resolved: #14128 closed; future design = judgments table + query-tool read (Henry 2026-08-13)
+- read-only fleet TUI (wiki tui, herdr-inspired); PR #222 merged after 3 review rounds
+- artifact gallery virtualization + thumbnail cache perf; PR #221 merged after 4 review rounds
+- **chimy2** — visual polish merged (PR #44, 1 round) — Bayer dither at sRGB output (banding gone, all goldens regen), hires icosphere, art pass scenes 03/04/08
+- **wiki** — WIKI-229 discriminated archive transcript identity merged ([#219](https://github.com/hwang2409/wiki/pull/219) merged 8941363d, 2 rounds); run_id carried end to end via the 275 resolver, stale ids 404, older-events keeps archive identity, sidebar single-selection fixed
+- **phoebe** — PHO-15815 automation golden cases merged (#14252, 2 rounds; exactly-once windows, DST via real compute, two-session ledger race, mount gates; manage_automation cases follow after #14033)
+- **wiki** — WIKI-155 session + dashboard state completeness merged ([#220](https://github.com/hwang2409/wiki/pull/220) merged 922cfa8f, 2 rounds); explicit state variants with working recovery, last-good survives refresh failure, Q7 stale rule enforced in transcript-store, timer fencing
+- **wiki** — WIKI-283 sidecar rlimit raise + signal-exit respawn merged ([#218](https://github.com/hwang2409/wiki/pull/218) merged 5e10bcce, 3 rounds); kern.maxfilesperproc rlimit fix, swap-indicator-keyed suppression (not bare supervisor.lock), TOCTOU closed, stub-child harness; live-bundle kill-9 check due at next rebuild
+- **chimy2** — adaptive render resolution merged (PR #43, 1 round) — canvas renders at panel size, pixelated upscale removed, grain fixed
+- **wiki** — WIKI-281 transcript housekeeping flair removed merged ([#217](https://github.com/hwang2409/wiki/pull/217) merged 05d339ea); skills-updated + hook-timing chip renderers deleted (render-layer only, raw events intact), content renderers kept
+- **chimy2** — minimal demo page merged (PR #42, 3 rounds) — live canvas main panel, 8 scene demos via embedded-mesh wasm fallback
+- **wiki** — WIKI-280 lowercase mode applies to everything merged ([#216](https://github.com/hwang2409/wiki/pull/216) merged d69d63b4); root cause: thinking bodies render via ShikiCode and hit the .shiki-block exclusion; all WIKI-277 exclusions dropped, data-preserve-case is the sole escape hatch
+- **wiki** — WIKI-279 single font for the entire app merged ([#215](https://github.com/hwang2409/wiki/pull/215) merged fa587082); one picker + one size, all font vars collapsed, legacy settings migrated, dashboard hydrates via ui-state
+- chimy2 React+Vite showcase shipped (PR #41) — deploy = serve chimy2/web/dist statically
+- **tooling** — chimy2 React+Vite showcase app merged (PR #41; TS + hooks architecture, gallery cards + live canvas + deep links + scene JSON viewer, committed reproducible dist, new web-build CI job — 5 checks green; orchestrator design gate passed in-browser)
+
+## 2026-08-12
+
+- chimy2 MEGA-QUEUE COMPLETE: 40 PRs from spec to showcase — full renderer + web demo shipped
+- **tooling** — chimy2 SHOWCASE DEMO merged (PR #40, 1 design round; 8 curated scenes in the scene format + polished dark web page + gallery; orchestrator art-directed 2 recompositions) — MEGA-QUEUE COMPLETE (40 PRs, spec to showcase)
+- chimy2 garnish tier complete: particles (#35), DoF (#36), morph (#37), font (#38), scene format (#39) — 12 review rounds
+- **tooling** — chimy2 scene format merged (PR #39, 3 rounds; sham-anchor integrity failure fixed with fully independent twin + 6 parse gates; silent shadow no-ops wired; FFI-unsafe wasm slice ABI replaced with scalar API + node harness proof) — GARNISH TIER COMPLETE (particles+DoF+morph+font+scene format)
+- **wiki** — WIKI-278 dashboard packaging hotfix merged ([#214](https://github.com/hwang2409/wiki/pull/214) merged 2935c4d1); spec includes dashboard_static + spec-manifest regression test + graceful asset-missing failure; needs one more rebuild to go live
+- **tooling** — chimy2 bitmap font merged (PR #38, 2 rounds; hand-authored 95-glyph 8x8 font all inspected legible; ordering proxy-gate fixed via shared render_demo_frame helper; worker wedged post-push, orchestrator gated+merged) — garnish tier 4/5
+- **phoebe** — main-red parity hotfix merged (#14144; #14118/#14133 semantic conflict — jazz_music moved off the admin detail page, debt entry removed, exact assertion kept)
+- **tooling** — chimy2 morph targets merged (PR #37, 2 rounds; SCALAR weight-stream + node.weights precedence spec bugs caught by conformance probes) — garnish tier 3/5
+- **tooling** — chimy2 depth of field merged (PR #36, 3 rounds; scatter-as-gather foreground spread, fractional CoC + interior taps, PostChain-bypass proxy tests caught by copy-hook mutant) — garnish tier 2/5
+- **phoebe** — PHO-15702 agent configuration page merged (#14118, 2 review rounds; automations tab + org skills unified, proper capitalization sweep, settings route redirect)
+- **phoebe** — PHO-15645 sandbox cost metrics + Datadog monitors + /admin/sandbox refactor merged (#14052, 5 review rounds; Modal Sandbox rates corrected ~3x, weekly-seasonality anomaly monitor, local-midnight org bucketing, full R3 plan evidence)
+- **tooling** — chimy2 particle system merged (PR #35, 2 rounds; deterministic sim, instanced billboards — first instancing consumer; emitter-lifetime expiry bug caught by reviewer setter probe) — garnish tier 1/5
+- chimy2 scale tier complete: instancing (#31), culling (#32), LOD/QEM (#33), SoA+SIMD retry closed as honest negative (#34)
+- **tooling** — chimy2 SoA+NEON retry CLOSED as negative result #2 (PR #34; scalar-SoA regressed 3-4x, premise falsified — shipped kernel layout is cache-optimal; SIMD investigation closed) — SCALE TIER COMPLETE (instancing+culling+LOD merged, SIMD honestly closed)
+- **tooling** — chimy2 LOD/QEM merged (PR #33, 5 rounds + 1 worker replacement + 2 session wedges; quadric cross-term bug, demo-discarded-QEM integrity failure, duplicate-midpoint root cause, anti-clone golden gate doctrine) — scale tier 3/4
+- **phoebe** — PHO-15434 org-specific skills framework merged (#13979, 6 review rounds + conflict rebase; coordinator-authored markdown skills, per-mode caps, org-{slug} runner namespace adapter)
+- **phoebe** — PHO-15632 phoebe-event triggers for agent automations merged (#14046, 5 review rounds + conflict rebase; clock-in/clock-out events fire coordinator automations)
+- **tooling** — chimy2 frustum culling merged (PR #32, 2 rounds; double-model false-cull blocker, all-plane caster expansion made shadow culling a no-op, MTL bypass — all reviewer-probed; identity anchor held) — scale tier 2/4
+- **tooling** — chimy2 mesh instancing merged (PR #31, 3 rounds; identity anchor held through 4 adversarial probes incl clone-on-write; libm golden divergence root-caused not masked; tint double-application + bench-only-API findings fixed; honest perf win on shipped API) — scale tier 1/4
+- chimy2 lighting tier complete: SSAO (#27), point cube shadows (#28), CSM (#29), PCSS (#30) — 12 review rounds total
+- **tooling** — chimy2 PCSS merged (PR #30, 2 rounds; translation-dependent depth-origin blocker caught by production probe, contact hardening verified 7/8/14 vs PCF 6, orchestrator visual gate) — LIGHTING TIER COMPLETE (SSAO+point shadows+CSM+PCSS)
+- **tooling** — chimy2 cascaded shadow maps merged (PR #29, 4 rounds; proxy-gate pattern broken by mandating reviewer's exact probes; transposed matrix-indexing bias bug caught via high-res render; orchestrator visual gate) — lighting tier 3/4
+- **phoebe** — PHO-15584 mark_account_reviewed tool + Core lastReviewedAt sync merged (#13984, 6 review rounds + conflict rebase over #13907; eval evidence waived by Henry)
+- **tooling** — chimy2 point-light cube shadows merged (PR #28, 3 rounds; radial-vs-face-axis depth bug, stale-capture + slot-aliasing defect-class hits, shared demo/golden scene) — lighting tier 2/4
+- **tooling** — chimy2 SSAO merged (PR #27, 3 rounds; depth-reconstruction hand-verified, SSAA-depth-loss integration bug caught by unclaimed probe, dual load-bearing blur gates) — lighting tier 1/4
+
+## 2026-08-11
+
+- chimy2 PBR arc complete: GGX (PR #24) + HDR/ACES (#25) + IBL (#26), 8 review rounds total, all Karis-anchored
+- **tooling** — chimy2 IBL merged (PR #26, 3 rounds; split-sum w/ Karis anchors, analytic convolution gates) — PBR ARC COMPLETE (GGX+HDR/ACES+IBL)
+- **tooling** — chimy2 HDR + ACES merged (PR #25, 3 rounds; overflow-safe fit, synchronized HDR mode) — PBR arc 2/3
+- **tooling** — chimy2 GGX cook-torrance merged (PR #24, 2 rounds; BRDF verified against Karis/Walter, low-roughness D fix) — PBR arc 1/3
+- chimy2 phase 1+2 complete: base renderer + 7 features + gltf/skeletal + WASM BROWSER DEMO all merged (PRs #1-#23, ~45 review rounds)
+- **tooling** — chimy2 WASM + browser demo merged (PR #23, 3 rounds; hand-rolled FFI, zero deps, CI byte-compares tracked binary) — RENDERER RUNS IN THE BROWSER
+- **tooling** — chimy2 gltf + skeletal animation merged (PR #22, 4 rounds; hand-written json parser, CPU skinning, spec-conformant materials)
+- Compactor follow-up merged as https://github.com/phoebe-health/phoebe/pull/14017 (b06b89e4): reuse-based fallback, totality by inventory, stub-reducer bulk compaction; round-6 'finding' overruled as linear-work pedantry (per-entry sizing = O(payload))
+- PHO-15628 merged as https://github.com/phoebe-health/phoebe/pull/14030 (/automations tab: relocated drafting + distinguished runs view, browser-verified)
+- **wiki** — WIKI-276 task+PR+fleet dashboard merged ([#212](https://github.com/hwang2409/wiki/pull/212) merged 23c9cf29, 4 review rounds): sidecar-served /dashboard, task-first joined view with full PR history + CI chips, fleet pane across all orchestrators with alarm flags + rollups + archived-today, SSE live, read-only v1 — both phoebe-dev handoffs complete
+- **tooling** — chimy2 skybox + env mapping merged (PR #21, 2 rounds; cube sampling, row-strip parallel sky pass)
+- **wiki** — WIKI-277 instant lowercase mode toggle merged ([#213](https://github.com/hwang2409/wiki/pull/213) merged f4e1526e); css-first .lowercase-mode on html, persisted, verbatim-case surfaces excluded
+- **tooling** — chimy2 mtl parsing merged (PR #19, 4 rounds; multi-material obj, alpha through classified queue, shared submission path)
+- **tooling** — chimy2 post-processing merged (PR #20, 2 rounds; bloom/fxaa/vignette, float-continuous chain)
+- **wiki** — WIKI-275 supervisor auto-archives one-shot workers merged ([#211](https://github.com/hwang2409/wiki/pull/211) merged 93ca8139); role-guarded auto_archive policy, viewed-verdict prompt archive + 10min grace, shared archive path incl. durable workgraph edge, WIKI-161 dot semantics preserved; phoebe-dev handoff done
+- **tooling** — chimy2 alpha blending + SSAA merged (PR #16, 5 rounds; classified frame queue, global transparent sort, opaque batching 53x)
+- PR #14012 merged (7b6fcf77): reverted #13746 sandbox subagents per Henry — design under reconsideration; work preserved in PR history for re-landing
+- PHO-15582 merged as https://github.com/phoebe-health/phoebe/pull/13974 (dri ping relief: daily cadence, cheap gates, bulk owner loads; auto-merged under standing auth)
+- **tooling** — chimy2 multiple lights merged (PR #18, 3 rounds; light arrays, nonnegativity boundaries)
+- PHO-15429 merged as https://github.com/phoebe-health/phoebe/pull/13746 (sandbox subagent runs: single-child v1, child-bundle vessel for org skills)
+- PHO-15528 merged as https://github.com/phoebe-health/phoebe/pull/13911 (coordinator automations framework: v3 scheduled runs, shared scheduling lib, v3-gate chokepoint; 8 review rounds)
+- **tooling** — chimy2 normal mapping merged (PR #17, 3 rounds; tangents, linear QOI colorspace enforcement)
+- PHO-15573 merged as https://github.com/phoebe-health/phoebe/pull/13955 (wiki-deploy decoupling: detached retried workflow, bounded bump wait, degraded runtime; auto-merged under standing auth)
+- **tooling** — chimy2 shader pack merged (PR #14, 3 review rounds; 6 stylized shaders, affine dither reconstruction)
+- PHO-15574 merged as https://github.com/phoebe-health/phoebe/pull/13964 (admin sandbox explorer v2 + observability dashboards; auto-merged under Henry standing auth)
+- **tooling** — chimy2 shadow mapping merged (PR #15, 2 review rounds; backward-shadow sign bug caught + fixed)
+- chimy2 follow-up arc done: CI wired (PR #11), srgb+mipmaps merged (PR #13), neon simd CLOSED as documented negative result (PR #12 — scalar wins on unified kernel)
+- **tooling** — chimy2 srgb+mipmaps merged (PR #13, 3 review rounds; sampling-scoped derivative seam, unified kernel)
+- Deploy hotfix merged as https://github.com/phoebe-health/phoebe/pull/13950 (wiki pointer legacy-URI heal, no-oscillation; unblocks prod deploys with release recovery)
+- **wiki** — WIKI-274 codex read-output syntax highlighting merged ([#210](https://github.com/hwang2409/wiki/pull/210) merged 7a64f5b1); read-archetype rows resolve language from summary path + size-capped content fallback, JSON/ansi/numbered-read precedence preserved
+- **tooling** — chimy2 CI wired (PR #11; fmt/clippy/test on chimy2/** paths)
+- PHO-15534 merged as https://github.com/phoebe-health/phoebe/pull/13915 (sandbox observability: per-call resources, lifecycle, workspace telemetry)
+- **tooling** — chimy2 subtree-added at tooling/chimy2 + stale f11 inspector screenshots removed (pushed c5f9973)
+- **chimy2** — M7 showcase merged (PR #7, 3 review rounds) — PROJECT COMPLETE, all 7 milestones
+- chimy2 COMPLETE: M1-M7 all merged (PRs #1-#7); from-scratch rust rasterizer, 2 crates, ~500fps at 100k tris
+- **chimy2** — M6 parallel raster merged (PR #6, 4 review rounds; pure stages, parallel front end, 500fps at 100k tris)
+
+## 2026-08-10
+
+- **chimy2** — M5 textures merged (PR #5, 2 review rounds; QOI/PPM codecs, 3 blockers caught by adversarial probes)
+- **chimy2** — M4 shading merged (PR #4, 2 review rounds; perspective-correct varyings + blinn-phong)
+- **chimy2** — M3 meshes+camera merged (PR #3, 4 review rounds; obj parser, near-plane clip, quat camera)
+- PR #13902 merged as e6d6d1c27b (drift-watch PostHog 429 fix — takeover of Devin PR, cohort single-flight + failure sentinels)
+- **chimy2** — M2 pipeline seam + barycentric raster merged (PR #2, 3 review rounds; goldens + mutation gates)
+- PHO-15483 merged as https://github.com/phoebe-health/phoebe/pull/13857 (codebase wiki search latency instrumentation + benchmark)
+- **chimy2** — M1 scaffold merged (PR #1, 3 review rounds; math+fb+present, squash 7b25c0d)
+- PHO-15478 merged as https://github.com/phoebe-health/phoebe/pull/13861 (deepwiki incremental merkle indexing)
+- PHO-15515 merged as https://github.com/phoebe-health/phoebe/pull/13882 (register runId validation + failure-cause separation)
+- PHO-15520 merged as https://github.com/phoebe-health/phoebe/pull/13891 (run_bash agent-authored description argument, query parity)
+- PHO-15476 merged as https://github.com/phoebe-health/phoebe/pull/13827 (version-conditional wiki gating, Nate split design; admin-merged over pending re-review per Henry)
+- PHO-15514 merged as https://github.com/phoebe-health/phoebe/pull/13880 (run_bash approval badge state-driven + friendly labels)
+- **wiki** — WIKI-272 backend boot pruning + archive durability merged ([#208](https://github.com/hwang2409/wiki/pull/208) merged 05af3dc7) after 13 review rounds: terminal-run sweep skips, run-history hot-path prune, incremental costs checkpoints, archive_protocol module (manifest-verified commit, write+read gates), decision-time source resolver, durable pending-replay
+- PHO-15494 merged as https://github.com/phoebe-health/phoebe/pull/13852 (unify bash & query loading as pre-loaded registered skills)
+- PHO-15373 merged: run_bash as core tool in tools/bash via build_*_skill mount, bash skill deleted, prompt advertisement (PR #13674 after CODEOWNERS split; docs follow-up #13847)
+- **wiki** — WIKI-233 full frontend suite green merged ([#209](https://github.com/hwang2409/wiki/pull/209) merged f708e4e4); all 13 reds were fixture drift, exclusions removed, 425/425 — worker gates now run unexcluded
+- **wiki** — worktree debris sweep: 125 of 136 stale worktrees + merged branches removed, 33.6 GB reclaimed (report /tmp/wiki-worktree-sweep-report.md; wiki-177 preserved)
+- PHO-15392 merged: workspace files as artifact registers — ws:// refs as tool inputs, bash register durability + receipts (PR #13744, 3 review rounds)
+
+## 2026-08-09
+
+- v3 sandbox trace observability merged: lifecycle/workspace/command events in admin traces, org-feed sandbox filter, duration_ms (PR #13657)
+- PHO-15385 merged: v3 query tool token-based auto-spill (40k-token boundary, streamed spool, 5 review rounds) (PR #13703)
+- PHO-15396 merged: admin sandbox explorer — org list + read-only durable-store file browser (PR #13721)
+- PHO-15377 merged: v3 sandbox cgroup-v2 CPU/RAM/pid caps on Modal VM runtime, 4 review rounds (PR #13687)
+
+## 2026-08-08
+
+- **wiki** — WIKI-266 codex app-server transcript parity merged ([#202](https://github.com/hwang2409/wiki/pull/202) merged 76ea029c) after 20 review rounds: lifecycle registry, batch-identity credits, fail-closed attribution chokepoint, spent-id session memory
+
 ## 2026-08-07
 
+- PHO-15375 merged: activity feed indexed-join fix + gated backfill for 773k legacy events (PR #13682)
+- **wiki** — WIKI-271 codex diff syntax highlighting merged ([#207](https://github.com/hwang2409/wiki/pull/207) merged b5cd84c6); content-based language fallback in both diff surfaces; turn/diff payloads verified to carry headers already
+- **wiki** — WIKI-270 JSON tool outputs pretty-printed merged ([#206](https://github.com/hwang2409/wiki/pull/206) merged dfd726dc); detectStructuredContent extended to bash outputs, ansi/file-slice paths untouched
+- **wiki** — WIKI-269 thinking summaries collapse by default merged ([#205](https://github.com/hwang2409/wiki/pull/205) merged 47d4ca77); codex encrypted-summary auto-expand default removed
+- v3 opencode TUI + attach shim merged after 18 review rounds (PR #13587): pinned v1.18.14 client tested in CI, error/pause mapping, session-wide expand indexes
+- PHO-12744 merged: WellSky timeout cap with hard 120s deadline + circuit breaker integration (PR #13678)
+- PHO-15380 merged: pinned AWS CLI + ECS preflight for deploy workflows, unfreezes staging deploys (PR #13694)
+- PHO-15382 merged: removed <untrusted-data> evidence wrapping from v3 agent (PR #13695)
+- **wiki** — WIKI-268 compact GitHub links in markdown table cells merged ([#204](https://github.com/hwang2409/wiki/pull/204) merged 8ea5a920); table cells render inline refs, prose keeps preview cards
+- **wiki** — WIKI-267 live Codex transcript hotfix merged ([#203](https://github.com/hwang2409/wiki/pull/203) merged cd650a60); new sessions now normalize thoughts and hide duplicate wrapper JavaScript
+- **wiki** — WIKI-265 Codex semantic tool hierarchy and detailed thinking merged ([#201](https://github.com/hwang2409/wiki/pull/201) merged 183bedd5); two waived batch defects moved to WIKI-266
 - **phoebe** — audited 2,500 unique production agent runs and produced 30 PII-free golden eval cases across 22 workflow types
+- **PHOEBE** — AGENT_SANDBOX_WORKSPACE_TOKEN_SECRET fully wired — staging+prod app-secret values set (rotated, distinct) + worker .env.keys injection merged (#13648, 7e1deb7c)
 - WIKI-264 merged (#200) — user-installed fonts served via sidecar @font-face (openat fd walk, variable faces, compound weights); 4 review rounds, TOCTOU closed structurally
 - WIKI-263 merged (#199) — codex exec preamble stripped to metadata (outer-only, Script terminated form, status precedence); numbered-payload highlighting engages on codex reads
 - **PHOEBE** — OpenCode attach shim review-clean after 5 rounds (PR 13587 draft, 543d223b) — stock opencode TUI attaches to v3 agent via python shim, pinned v1.18.14

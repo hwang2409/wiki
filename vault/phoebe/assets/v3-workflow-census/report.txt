@@ -1,0 +1,156 @@
+# phoebe v3 workflow census
+
+## scope
+
+- window: 2026-07-24 00:00:00 UTC through 2026-08-08 00:00:00 UTC
+- source: production `app.phoebe_agent_runs`, `app.agent_items`,
+  `app.phoebe_agent_run_event_items`, and `app.admin_agent_action_audits`
+- included: live `general` chat and live `outreach_analysis` workflows
+- included sources: web or unspecified source, Slack requests, and iMessage
+  requests
+- excluded: internal runs, sandbox runs, automation runs, subagent runs,
+  LLM-judge conversations, Slack notifications, proactive Slack runs, and
+  admin operational reports
+- unit: one persisted Phoebe agent run
+- PII policy: this report contains no names, phone numbers, message text,
+  organization names, UUIDs, URLs, or raw trace payloads
+
+The window is 14 calendar days. The last day is partial at the query time.
+Counts are exact database counts for the stated filters.
+
+## census totals
+
+| workflow type | runs | share |
+| --- | ---: | ---: |
+| outreach analysis | 6,527 | 83.5% |
+| general sidebar or chat | 1,294 | 16.5% |
+| total eligible | 7,821 | 100.0% |
+
+The run table also held 3,566 excluded general runs from synthetic or
+system-generated sources. The wider production window held 1,334 internal
+runs, 515 automation runs, 17 sandbox runs, and 2 subagent runs.
+
+## ranked workflow clusters
+
+Clusters use the first non-framework tool as an intent proxy. This avoids
+copying user requests or message contents. Outreach-analysis runs use their
+stored run type as the workflow label.
+
+| rank | cluster | runs | v3 coverage | replay priority |
+| ---: | --- | ---: | --- | --- |
+| 1 | outreach recommendations and monitoring | 6,527 | mixed: missing outreach context and writes | p0 |
+| 2 | shift lookup and scheduling | 433 | mixed: read path is covered; writes are missing | p0 |
+| 3 | caregiver lookup and memory | 218 | mixed: basic reads are covered; memory writes are missing | p1 |
+| 4 | outreach drafting and management | 166 | mixed: missing outreach context and writes | p1 |
+| 5 | client lookup | 162 | covered read-only for basic client lookup | p1 |
+| 6 | activity and alert handling | 103 | missing read/context for activity and alert state | p1 |
+| 7 | docs, playbooks, settings, and reports | 80 | skill/prompt gap plus missing context | p2 |
+| 8 | no domain tool | 53 | skill/prompt gap or answer-only request; unresolved | p2 |
+| 9 | ehr sync | 41 | missing write and approval workflow | p1 |
+| 10 | messaging and history | 21 | mixed: missing conversation context and customer writes | p1 |
+| 11 | other | 17 | mixed; low evidence volume | p2 |
+
+The current v3 read surface is one SELECT-only query over caregivers, clients,
+and shifts. It has isolated workspace commands, but no agency database write,
+message, outreach-monitor, activity-feed, sync, playbook, or settings tools.
+
+## observed tool sequences
+
+These are the highest-frequency non-framework sequences. Repeated calls are
+kept because retries and multi-shift work are part of the real workflow.
+
+| workflow | sequence | runs |
+| --- | --- | ---: |
+| outreach | get_recommendations > get_recommendations > add_outreach_suggestions | 1,118 |
+| outreach | get_recommendations > get_recommendations > get_recommendations > add_outreach_suggestions | 428 |
+| outreach | get_recommendations | 410 |
+| outreach | get_recommendations > get_recommendations > get_recommendations > get_recommendations > add_outreach_suggestions | 179 |
+| outreach | get_recommendations > get_recommendations | 120 |
+| outreach | get_recommendations > monitor_outreach | 77 |
+| general | draft_agent_outreach > callouts_details | 48 |
+| general | draft_agent_outreach > callouts_details > get_caregiver_recommendation_details | 40 |
+| general | shifts_search | 35 |
+| general | shifts_search > draft_agent_outreach > callouts_details > get_caregiver_recommendation_details | 35 |
+| general | shifts_details > draft_agent_outreach > callouts_details > get_caregiver_recommendation_details | 32 |
+| general | shifts_details > draft_agent_outreach > callouts_details | 24 |
+| general | shifts_search > draft_agent_outreach > callouts_details | 22 |
+| general | get_activity_feed | 20 |
+| general | trigger_ehr_sync | 15 |
+| general | trigger_ehr_sync > post_to_slack_thread | 15 |
+
+## write-tool audit
+
+The full ranked audit is in `workflow-census.json`. The highest-volume writes
+are recommendation persistence, contact-attempt management, direct SMS, and
+outreach-suggestion removal. Pending-approval counts are persisted tool-call
+states, not proof that a human approved the action.
+
+| rank | tool | calls | runs | pending approval | risk |
+| ---: | --- | ---: | ---: | ---: | --- |
+| 1 | add_outreach_suggestions | 6,818 | 4,747 | 0 | medium: agency outreach state mutation |
+| 2 | manage_outreach_add_contact_attempts | 3,469 | 912 | 2,766 | high: customer outreach side effect |
+| 3 | send_one_off_sms_in_conversation | 2,287 | 254 | 1,654 | high: direct customer message |
+| 4 | manage_outreach_remove_suggestions | 984 | 700 | 0 | medium: agency outreach state mutation |
+| 5 | draft_agent_outreach | 921 | 611 | 858 | high: draft can lead to customer outreach |
+| 6 | schedule_self_poke | 852 | 216 | 206 | medium: deferred agent action |
+| 7 | manage_outreach_start_with_contacts | 768 | 675 | 717 | high: starts customer outreach |
+| 8 | place_one_off_voice_call_in_conversation | 680 | 43 | 458 | high: direct customer call |
+| 9 | save_caregiver_memory_instruction | 570 | 263 | 523 | medium: durable caregiver record |
+| 10 | manage_outreach_set_status | 498 | 454 | 0 | medium: agency outreach state mutation |
+| 11 | update_outreach_metadata | 434 | 317 | 406 | medium: agency outreach state mutation |
+| 12 | update_shift | 352 | 156 | 340 | high: schedule mutation |
+
+Approval-risk notes:
+
+- Direct SMS, voice, contact attempts, start-with-contacts, and caregiver
+  notifications can affect customers. They need explicit approval and a
+  write-then-read verification path.
+- Shift, outreach, memory, filter, playbook, sync, and availability tools can
+  change agency state. They need scoped writes, idempotency, and audit receipts.
+- Suggestion add/remove and outreach status tools show no pending approval in
+  this sample. Confirm whether their current policy intentionally permits this.
+- Incomplete outputs are common in high-volume workflows. A replay must test
+  cancellation, retry, and false-success handling.
+
+## v3 coverage findings
+
+- covered read-only: basic caregiver, client, and shift retrieval.
+- missing read/context: outreach records, contact attempts, recommendation
+  state, conversation history, activity events, callouts, monitoring state,
+  EHR state, playbooks, settings, and reports.
+- missing write: every agency mutation and every customer communication write.
+- skill/prompt gap: docs, playbooks, reporting, answer-only requests, and
+  safe refusal language for unsupported writes.
+- mixed: recommendation, scheduling, caregiver memory, outreach management,
+  messaging, and EHR sync workflows need both context and writes.
+
+## frequency-weighted replay dataset
+
+Phase 2 should sample by the cluster weights above. Seed synthetic data only.
+Do not replay production names, numbers, message contents, IDs, or URLs.
+
+Required seed dimensions:
+
+- open, filled, cancelled, recurring, and conflicting shifts
+- caregivers with varied roles, languages, availability, tags, distance,
+  overtime, and schedule conflicts
+- clients with care-plan constraints, tags, offices, and environment limits
+- outreach records with suggestions, contact attempts, no-response states,
+  retries, response states, monitoring state, and staged messages
+- durable caregiver and client memory rows
+- conversations with synthetic recipients and approval states
+- playbook rules, settings, filter rules, reports, activity events, and sync
+  state
+- write receipts, idempotency keys, approval decisions, cancellation, and
+  retry outcomes
+
+The machine-readable replay cases and seed requirements are in
+`workflow-census.json`.
+
+## limitations
+
+Natural-language intent is not reconstructed. The database evidence stores
+tool calls and run metadata, so clusters are tool-sequence proxies.
+
+The census does not count raw Logfire spans. It uses persisted run and item
+records, which provide unique-run counts and avoid retry inflation.
