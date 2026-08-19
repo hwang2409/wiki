@@ -234,6 +234,19 @@ def test_codex_events_render_every_branch() -> None:
         ),
         (
             {
+                "method": "item/started",
+                "params": {
+                    "item": {
+                        "type": "dynamicToolCall",
+                        "tool": "lookup",
+                        "arguments": {"query": "needle"},
+                    }
+                },
+            },
+            "[tool] dynamicToolCall status=started input=",
+        ),
+        (
+            {
                 "method": "item/completed",
                 "params": {
                     "item": {
@@ -311,7 +324,7 @@ def test_codex_events_render_every_branch() -> None:
             {"method": "thread/status/changed", "params": {"status": {"type": "idle"}}},
             "[status] idle",
         ),
-        ({"method": "item/started", "params": {}}, "[event] item/started"),
+        ({"method": "item/started", "params": {}}, "[codex] item/started"),
         ({"method": "thread/closed", "params": {}}, ""),
         ({"method": "custom/event", "params": {}}, "[event] custom/event"),
         (
@@ -365,12 +378,53 @@ def test_renderer_classification_sets_match_normalizer() -> None:
     assert render_module._CODEX_IGNORED_METHODS == normalizer._CODEX_IGNORED_METHODS
     assert render_module._CODEX_APPROVAL_METHODS == normalizer._CODEX_APPROVAL_METHODS
     assert render_module._CLAUDE_IGNORED_TYPES == normalizer._CLAUDE_IGNORED_TYPES
-    assert render_module._CODEX_DELTA_METHODS <= (
-        normalizer._CODEX_RENDERED_METHODS | normalizer._CODEX_SUMMARIZED_METHODS
-    )
+    authoritative_delta_methods = {
+        method
+        for method in normalizer._CODEX_RENDERED_METHODS
+        | normalizer._CODEX_SUMMARIZED_METHODS
+        if method.startswith("item/")
+        and (
+            method.endswith("Delta")
+            or method.endswith("delta")
+            or method.endswith("summaryPartAdded")
+            or method.endswith("terminalInteraction")
+        )
+    }
+    assert render_module._CODEX_DELTA_METHODS == authoritative_delta_methods
 
     for event_type in normalizer._CLAUDE_IGNORED_TYPES:
         assert render_item(_item({"type": event_type})) == []
+
+
+def test_known_methods_and_item_starts_never_use_unknown_fallback() -> None:
+    known_methods = (
+        normalizer._CODEX_RENDERED_METHODS
+        | normalizer._CODEX_SUMMARIZED_METHODS
+        | normalizer._CODEX_IGNORED_METHODS
+        | normalizer._CODEX_APPROVAL_METHODS
+    )
+    for method in known_methods:
+        if method == "item/started":
+            continue
+        assert "[event] " not in _capture(
+            render_item(_item({"method": method, "params": {}}))
+        )
+
+    known_item_types = (
+        render_module._CODEX_ITEM_STARTED_RENDERED_TYPES
+        | render_module._IGNORED_CODEX_ITEM_STARTED_TYPES
+    )
+    for item_type in known_item_types:
+        assert "[event] " not in _capture(
+            render_item(
+                _item(
+                    {
+                        "method": "item/started",
+                        "params": {"item": {"type": item_type}},
+                    }
+                )
+            )
+        )
 
 
 def test_native_tool_lines_include_inputs_and_results() -> None:

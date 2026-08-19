@@ -94,6 +94,12 @@ _CODEX_SILENT_METHODS = _CODEX_DELTA_METHODS | {
     "item/userMessage",
     "thread/closed",
 }
+_CODEX_ITEM_STARTED_RENDERED_TYPES = {
+    "commandExecution",
+    "fileChange",
+    "mcpToolCall",
+    "dynamicToolCall",
+}
 _IGNORED_CODEX_ITEM_STARTED_TYPES = {
     "agentMessage",
     "reasoning",
@@ -374,13 +380,18 @@ def render_codex(raw: Mapping[str, Any], verbose: bool = False) -> list[Renderab
         rendered.append(_line("[approval] ", params, "yellow"))
     elif method == "item/started":
         item = params.get("item")
-        if isinstance(item, Mapping) and item.get("type") in _NATIVE_TOOL_TYPES:
+        if (
+            isinstance(item, Mapping)
+            and item.get("type") in _CODEX_ITEM_STARTED_RENDERED_TYPES
+        ):
             rendered.append(_native_tool_start_line(item))
         elif (
             isinstance(item, Mapping)
             and item.get("type") in _IGNORED_CODEX_ITEM_STARTED_TYPES
         ):
             pass
+        elif item is None:
+            rendered.append(_line("[codex] ", method, "dim"))
         else:
             rendered.append(_line("[event] ", method or dict(raw), "dim"))
     elif method == "item/completed":
@@ -420,7 +431,7 @@ def render_codex(raw: Mapping[str, Any], verbose: bool = False) -> list[Renderab
     elif method in _CODEX_IGNORED_METHODS:
         pass
     elif method in _CODEX_RENDERED_METHODS:
-        rendered.append(_line("[event] ", method, "dim"))
+        rendered.append(_line("[codex] ", method, "dim"))
     else:
         rendered.append(_line("[event] ", method or dict(raw), "dim"))
     return _append_verbose(rendered, raw, verbose)
