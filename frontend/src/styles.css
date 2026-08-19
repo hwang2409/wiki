@@ -143,7 +143,9 @@
   --font-single-size: 15px;
 
   --font-prose-size: var(--font-single-size);
-  --font-prose-line-height: calc(var(--font-prose-size) * 22 / 15);
+  /* WIKI-342: snap the shared 22/15 rhythm up to a whole pixel at every
+     supported font size. The settings range is 11px through 22px. */
+  --font-prose-line-height: 22px;
   --font-control-size: var(--font-single-size);
   --font-control-line-height: var(--font-prose-line-height);
   --font-chrome-size: var(--font-single-size);
@@ -154,6 +156,7 @@
   --font-ui-large: var(--font-single-size);
   --font-text-size: var(--font-single-size);
   --font-monospace-size: var(--font-single-size);
+  --font-monospace-line-height: 22px;
 
   --font-interface: var(--font-single);
   --font-text: var(--font-single);
@@ -269,10 +272,18 @@ body,
   height: 100%;
 }
 
+@supports (line-height: round(up, 22px, 1px)) {
+  :root {
+    --font-prose-line-height: round(up, calc(var(--font-prose-size) * 22 / 15), 1px);
+    --font-monospace-line-height: round(up, calc(var(--font-monospace-size) * 22 / 15), 1px);
+  }
+}
+
 body {
   margin: 0;
   min-width: 320px;
   overflow: hidden;
+  zoom: 1;
   background-color: var(--background-canvas);
   color: var(--text-normal);
   font-family: var(--font-chrome);
@@ -305,6 +316,25 @@ code,
   font-feature-settings: normal;
   font-optical-sizing: none;
   text-rendering: geometricPrecision;
+  line-height: var(--font-monospace-line-height);
+}
+
+@supports (line-height: round(up, 22px, 1px)) {
+  pre,
+  code,
+  .font-monospace,
+  .code-file-source,
+  .code-file-highlighted,
+  .diff-code,
+  .split-diff-grid,
+  .terminal-pane-host,
+  .terminal-pane-host *,
+  .terminal-pane-size-flash,
+  .terminal-pane-notice,
+  .fleet-screencast-tape,
+  .agent-context-prelude {
+    line-height: round(up, 1.4666667em, 1px);
+  }
 }
 
 ::selection {
@@ -1221,7 +1251,7 @@ body.is-resizing-panes .pane-cell {
   font-family: var(--font-monospace);
   font-weight: var(--font-monospace-weight);
   font-size: var(--font-control-size);
-  line-height: 1.4;
+  line-height: var(--font-monospace-line-height);
 }
 
 .code-file-source {
@@ -1231,7 +1261,7 @@ body.is-resizing-panes .pane-cell {
 .code-file-line,
 .code-file-highlighted .line {
   display: block;
-  min-height: 1.4em;
+  min-height: var(--font-monospace-line-height);
   line-height: inherit;
   counter-increment: code-line;
 }
@@ -1483,7 +1513,7 @@ body.is-resizing-panes .pane-cell {
 .terminal-pane-find {
   display: inline-flex;
   position: absolute;
-  top: 50%;
+  top: 5px;
   right: 8px;
   z-index: 2;
   width: min(300px, calc(100% - 16px));
@@ -1495,7 +1525,6 @@ body.is-resizing-panes .pane-cell {
   border: 1px solid var(--terminal-border);
   border-radius: var(--radius-full);
   background: var(--terminal-surface);
-  transform: translateY(-50%);
 }
 
 .terminal-pane-find input {
@@ -1554,7 +1583,7 @@ body.is-resizing-panes .pane-cell {
   font-family: var(--font-monospace);
   font-weight: var(--font-monospace-weight);
   font-size: var(--font-chrome-size);
-  line-height: 1;
+  line-height: var(--font-monospace-line-height);
   white-space: nowrap;
   text-transform: lowercase;
 }
@@ -1629,8 +1658,24 @@ body.is-resizing-panes .pane-cell {
   padding: 8px 10px;
   border: 1px solid var(--terminal-border);
   border-radius: var(--radius-sm);
+  isolation: isolate;
+  overflow: hidden;
+  background-color: transparent;
+}
+
+.terminal-pane-overlay::before {
+  position: absolute;
+  inset: 0;
+  z-index: 0;
   background-color: var(--terminal-overlay);
+  content: "";
   backdrop-filter: blur(6px);
+  -webkit-backdrop-filter: blur(6px);
+}
+
+.terminal-pane-overlay > * {
+  position: relative;
+  z-index: 1;
 }
 
 .terminal-pane-notice {
@@ -2251,7 +2296,7 @@ body.is-resizing-panes .pane-cell {
   font-family: var(--font-monospace);
   font-size: var(--font-chrome-size);
   font-weight: var(--fw-semibold);
-  line-height: 1.35;
+  line-height: var(--font-monospace-line-height);
 }
 
 @media (max-width: 640px) {
@@ -2487,7 +2532,7 @@ body.is-resizing-panes .pane-cell {
   min-height: 130px;
   padding: 10px 12px;
   resize: vertical;
-  line-height: 1.5;
+  line-height: var(--font-monospace-line-height);
 }
 
 .agent-context-prelude {
@@ -2675,7 +2720,7 @@ body.is-resizing-panes .pane-cell {
   color: var(--text-faint);
   font-family: var(--font-monospace);
   font-size: var(--font-chrome-size);
-  line-height: 1.2;
+  line-height: var(--font-monospace-line-height);
 }
 
 .quick-switcher-empty {
@@ -2685,8 +2730,23 @@ body.is-resizing-panes .pane-cell {
 }
 
 .command-palette-backdrop {
+  isolation: isolate;
+  background-color: transparent;
+}
+
+.command-palette-backdrop::before {
+  position: absolute;
+  inset: 0;
+  z-index: 0;
+  background-color: var(--background-overlay-strong);
+  content: "";
   backdrop-filter: blur(4px);
   -webkit-backdrop-filter: blur(4px);
+}
+
+.command-palette-backdrop > * {
+  position: relative;
+  z-index: 1;
 }
 
 .command-palette {
@@ -3270,7 +3330,7 @@ body.is-resizing-panes .pane-cell {
 }
 
 .markdown-preview-view.kanban-card-content code {
-  line-height: 1;
+  line-height: var(--font-monospace-line-height);
 }
 
 .markdown-preview-view.kanban-card-content .priority-badge {
@@ -3531,7 +3591,7 @@ body.is-resizing-panes .pane-cell {
   font-family: var(--font-monospace);
   font-size: var(--font-control-size);
   font-weight: var(--fw-semibold);
-  line-height: 1.65;
+  line-height: var(--font-monospace-line-height);
   vertical-align: 0.12em;
   text-align: center;
   text-transform: lowercase;
@@ -3600,7 +3660,7 @@ body.is-resizing-panes .pane-cell {
 /* Code */
 
 .markdown-preview-view code {
-  padding: 0.05em 0.35em;
+  padding: 1px 5px;
   border-radius: var(--radius-s);
   background-color: var(--background-modifier-hover);
   color: var(--text-normal);
@@ -3618,19 +3678,19 @@ body.is-resizing-panes .pane-cell {
 .markdown-preview-view h4 code,
 .markdown-preview-view h5 code,
 .markdown-preview-view h6 code {
-  padding: 0.06em 0.3em;
+  padding: 1px 4px;
   font-size: 0.68em;
   font-weight: var(--fw-medium);
   vertical-align: 0.12em;
 }
 
 .markdown-preview-view pre {
-  margin: 0 0 1em;
+  margin: 0 0 16px;
   padding: 12px 16px;
   border: 1px solid var(--background-modifier-border);
   border-radius: var(--radius-m);
   background-color: var(--code-background);
-  line-height: 1.5;
+  line-height: var(--font-monospace-line-height);
   min-width: 0;
 }
 
@@ -3648,7 +3708,7 @@ body.is-resizing-panes .pane-cell {
 }
 
 .shiki-block {
-  margin: 0 0 1em;
+  margin: 0 0 16px;
   min-width: 0;
 }
 
@@ -3662,7 +3722,7 @@ body.is-resizing-panes .pane-cell {
   border: 1px solid var(--background-modifier-border);
   border-radius: var(--radius-m);
   font-size: var(--font-control-size);
-  line-height: 1.5;
+  line-height: var(--font-monospace-line-height);
   min-width: 0;
 }
 
@@ -4446,7 +4506,7 @@ body.is-resizing-panes .pane-cell {
   font-family: var(--font-monospace);
   font-weight: var(--font-monospace-weight);
   font-size: var(--font-chrome-size);
-  line-height: 1.7;
+  line-height: var(--font-monospace-line-height);
 }
 
 .split-cell {
@@ -4936,22 +4996,22 @@ body.is-resizing-panes .pane-cell {
 
 .fleet-screencast-tape {
   --fleet-screencast-lines: 20;
-  --fleet-screencast-line-height: 1.35;
+  --fleet-screencast-line-height: var(--font-monospace-line-height);
   display: flex;
   flex-direction: column;
   justify-content: flex-end;
-  height: calc(var(--fleet-screencast-lines) * var(--font-chrome-size) * var(--fleet-screencast-line-height) + 12px);
-  min-height: calc(var(--fleet-screencast-lines) * var(--font-chrome-size) * var(--fleet-screencast-line-height) + 12px);
-  max-height: calc(var(--fleet-screencast-lines) * var(--font-chrome-size) * var(--fleet-screencast-line-height) + 12px);
+  height: calc(var(--fleet-screencast-lines) * var(--fleet-screencast-line-height) + 12px);
+  min-height: calc(var(--fleet-screencast-lines) * var(--fleet-screencast-line-height) + 12px);
+  max-height: calc(var(--fleet-screencast-lines) * var(--fleet-screencast-line-height) + 12px);
   padding: 6px 8px;
   overflow: hidden;
   background-color: var(--background-primary);
   color: var(--text-muted);
   font-family: var(--font-monospace);
   font-size: var(--font-chrome-size);
-  line-height: var(--fleet-screencast-line-height);
+  line-height: var(--font-monospace-line-height);
   white-space: nowrap;
-  contain: layout paint size;
+  contain: layout size;
 }
 
 .fleet-screencast-line {
@@ -5753,7 +5813,7 @@ body.is-resizing-panes .pane-cell {
   font-family: var(--font-monospace);
   font-weight: var(--font-monospace-weight);
   font-size: var(--font-control-size);
-  line-height: 1.55;
+  line-height: var(--font-monospace-line-height);
   white-space: pre-wrap;
   overflow-wrap: anywhere;
 }
@@ -5964,7 +6024,7 @@ body.is-resizing-panes .pane-cell {
   font-family: var(--font-monospace);
   font-weight: var(--font-monospace-weight);
   font-size: var(--font-chrome-size);
-  line-height: 1.5;
+  line-height: var(--font-monospace-line-height);
 }
 
 .session-task .task-icon {
@@ -6107,7 +6167,7 @@ body.is-resizing-panes .pane-cell {
   font-family: var(--font-monospace);
   font-weight: var(--font-monospace-weight);
   font-size: var(--fs-xs);
-  line-height: 1;
+  line-height: var(--font-monospace-line-height);
   text-transform: lowercase;
   white-space: nowrap;
 }
@@ -6158,7 +6218,7 @@ body.is-resizing-panes .pane-cell {
   font-family: var(--font-monospace);
   font-weight: var(--font-monospace-weight);
   font-size: var(--font-chrome-size);
-  line-height: 1.4;
+  line-height: var(--font-monospace-line-height);
   text-decoration: none;
   vertical-align: baseline;
   white-space: nowrap;
@@ -6242,7 +6302,7 @@ body.is-resizing-panes .pane-cell {
   font-family: var(--font-monospace);
   font-weight: var(--font-monospace-weight);
   font-size: var(--font-chrome-size);
-  line-height: 1.55;
+  line-height: var(--font-monospace-line-height);
 }
 
 .session-synthetic-source-chip {
@@ -6638,7 +6698,7 @@ body.is-resizing-panes .pane-cell {
   border-top: 1px solid var(--background-modifier-border);
   color: var(--text-muted);
   font-size: var(--fs-2xs);
-  line-height: 1.45;
+  line-height: var(--font-monospace-line-height);
 }
 
 .codex-stream-diff-hunk + .codex-stream-diff-hunk {
@@ -7102,8 +7162,7 @@ body.is-resizing-panes .pane-cell {
   display: flex;
   flex-direction: column;
   min-width: 0;
-  contain: content;
-  will-change: transform;
+  contain: layout style;
 }
 
 .session-ts {
@@ -7114,7 +7173,7 @@ body.is-resizing-panes .pane-cell {
   font-family: var(--font-monospace);
   font-weight: var(--font-monospace-weight);
   font-size: var(--font-chrome-size);
-  line-height: 1.4;
+  line-height: var(--font-monospace-line-height);
   cursor: default;
   white-space: nowrap;
 }
@@ -7458,7 +7517,7 @@ body.is-resizing-panes .pane-cell {
   text-decoration: none;
   font-family: var(--font-monospace);
   font-weight: var(--font-monospace-weight);
-  line-height: 1.1;
+  line-height: var(--font-monospace-line-height);
   overflow: hidden;
 }
 
@@ -7602,7 +7661,7 @@ body.is-resizing-panes .pane-cell {
   font-family: var(--font-monospace);
   font-weight: var(--font-monospace-weight);
   font-size: var(--font-prose-size);
-  line-height: 1.55;
+  line-height: var(--font-monospace-line-height);
 }
 
 .session-text {
@@ -8221,7 +8280,7 @@ body.is-resizing-panes .pane-cell {
   font-family: var(--font-monospace);
   font-weight: var(--font-monospace-weight);
   font-size: var(--font-control-size);
-  line-height: 1.5;
+  line-height: var(--font-monospace-line-height);
   white-space: pre-wrap;
   overflow-wrap: break-word;
 }
@@ -8352,7 +8411,7 @@ body.is-resizing-panes .pane-cell {
 
 .session-question-prompt {
   color: var(--text-normal);
-  line-height: 1.55;
+  line-height: var(--font-monospace-line-height);
 }
 
 .session-question-options {
@@ -8471,7 +8530,7 @@ body.is-resizing-panes .pane-cell {
 .session-question-error {
   color: var(--text-error);
   font-size: var(--font-chrome-size);
-  line-height: 1.45;
+  line-height: var(--font-monospace-line-height);
 }
 
 .session-bash {
@@ -8920,7 +8979,7 @@ body.is-resizing-panes .pane-cell {
   font-family: var(--font-monospace);
   font-weight: var(--font-monospace-weight);
   font-size: var(--font-chrome-size);
-  line-height: 1.45;
+  line-height: var(--font-monospace-line-height);
   overflow-wrap: anywhere;
 }
 
@@ -9039,7 +9098,7 @@ body.is-resizing-panes .pane-cell {
   font-family: var(--font-monospace);
   font-size: var(--font-chrome-size);
   font-weight: var(--font-monospace-weight);
-  line-height: 1.3;
+  line-height: var(--font-monospace-line-height);
   cursor: text;
   text-wrap: pretty;
 }
@@ -9076,7 +9135,7 @@ body.is-resizing-panes .pane-cell {
   font-family: var(--font-monospace);
   font-weight: var(--font-monospace-weight);
   font-size: var(--font-control-size);
-  line-height: 1.5;
+  line-height: var(--font-monospace-line-height);
   resize: none;
 }
 
@@ -9139,7 +9198,7 @@ body.is-resizing-panes .pane-cell {
   font-family: var(--font-monospace);
   font-weight: var(--font-monospace-weight);
   font-size: var(--font-control-size);
-  line-height: 1.5;
+  line-height: var(--font-monospace-line-height);
   pointer-events: none;
 }
 
@@ -10245,7 +10304,7 @@ textarea.composer-command-input {
   color: var(--text-normal);
   font-size: var(--font-control-size);
   font-weight: var(--fw-semibold);
-  line-height: 1.25;
+  line-height: var(--font-monospace-line-height);
   text-overflow: ellipsis;
   text-transform: none;
   white-space: nowrap;
@@ -10300,12 +10359,16 @@ textarea.composer-command-input {
   position: relative;
   flex: 0 0 auto;
   gap: 2px;
+  opacity: 1;
+}
+
+.artifact-actions .artifact-action {
   opacity: 0;
 }
 
-.artifact-block-shell:hover .artifact-actions,
-.artifact-block-shell:focus-within .artifact-actions,
-.artifact-actions:focus-within {
+.artifact-block-shell:hover .artifact-actions .artifact-action,
+.artifact-block-shell:focus-within .artifact-actions .artifact-action,
+.artifact-actions:focus-within .artifact-action {
   opacity: 1;
 }
 
@@ -10335,7 +10398,7 @@ textarea.composer-command-input {
 }
 
 @media (hover: none) {
-  .artifact-actions {
+  .artifact-actions .artifact-action {
     opacity: 1;
   }
 }
@@ -10439,7 +10502,7 @@ textarea.composer-command-input {
   font-family: var(--font-monospace);
   font-weight: var(--font-monospace-weight);
   font-size: var(--font-chrome-size);
-  line-height: 1.5;
+  line-height: var(--font-monospace-line-height);
 }
 
 .artifact-compact-image {
@@ -11031,7 +11094,7 @@ textarea.composer-command-input {
   font-family: var(--font-monospace);
   font-weight: var(--font-monospace-weight);
   font-size: var(--fs-2xs);
-  line-height: 1.5;
+  line-height: var(--font-monospace-line-height);
   white-space: pre-wrap;
   overflow-wrap: anywhere;
   word-break: break-word;
@@ -11404,7 +11467,7 @@ textarea.composer-command-input {
   font-family: var(--font-monospace);
   font-weight: var(--font-monospace-weight);
   font-size: var(--font-chrome-size);
-  line-height: 1.55;
+  line-height: var(--font-monospace-line-height);
 }
 
 .artifact-code-line {
@@ -12075,7 +12138,7 @@ textarea.composer-command-input {
   font-family: var(--font-monospace);
   font-size: var(--fs-xs);
   font-weight: var(--fw-medium);
-  line-height: 1.4;
+  line-height: var(--font-monospace-line-height);
   text-transform: lowercase;
   letter-spacing: 0.01em;
   font-variant-numeric: tabular-nums;
@@ -12205,7 +12268,7 @@ textarea.composer-command-input {
   font-family: var(--font-monospace);
   font-size: var(--fs-xs);
   font-weight: var(--fw-medium);
-  line-height: 1.4;
+  line-height: var(--font-monospace-line-height);
   vertical-align: baseline;
   white-space: nowrap;
   overflow: hidden;
@@ -12463,7 +12526,7 @@ textarea.composer-command-input {
   word-break: break-word;
   font-family: var(--font-monospace);
   font-size: var(--fs-sm);
-  line-height: 1.5;
+  line-height: var(--font-monospace-line-height);
   color: var(--text-normal);
 }
 
@@ -12471,7 +12534,7 @@ textarea.composer-command-input {
 
 .markdown-code-block-wrap {
   position: relative;
-  margin: 0 0 1em;
+  margin: 0 0 16px;
 }
 
 .markdown-code-block-wrap .shiki-block {
@@ -12479,18 +12542,35 @@ textarea.composer-command-input {
 }
 
 .copy-pill {
+  position: relative;
+  isolation: isolate;
   padding: 3px 8px;
   border: 1px solid var(--background-modifier-border);
   border-radius: var(--radius-xs);
-  background-color: color-mix(in srgb, var(--background-primary) 88%, transparent);
+  background-color: transparent;
   color: var(--text-muted);
   font-family: var(--font-monospace);
   font-weight: var(--font-monospace-weight);
   font-size: 11px;
-  line-height: 1;
+  line-height: var(--font-monospace-line-height);
   letter-spacing: 0.02em;
   cursor: pointer;
+}
+
+.copy-pill::before {
+  position: absolute;
+  inset: 0;
+  z-index: 0;
+  border-radius: inherit;
+  background-color: color-mix(in srgb, var(--background-primary) 88%, transparent);
+  content: "";
   backdrop-filter: blur(4px);
+  -webkit-backdrop-filter: blur(4px);
+}
+
+.copy-pill > * {
+  position: relative;
+  z-index: 1;
 }
 
 .copy-pill:hover {
@@ -12574,7 +12654,7 @@ textarea.composer-command-input {
   font-weight: var(--font-monospace-weight);
   font-size: var(--font-chrome-size);
   font-style: italic;
-  line-height: 1.55;
+  line-height: var(--font-monospace-line-height);
 }
 
 .diff-file-meta-line + .diff-file-meta-line {
@@ -12652,7 +12732,7 @@ textarea.composer-command-input {
   display: block;
   min-width: 0;
   padding: 4px 0;
-  line-height: 1.55;
+  line-height: var(--font-monospace-line-height);
 }
 
 /* WIKI-251: side-by-side split — deletions LEFT / insertions RIGHT, aligned
@@ -12822,9 +12902,24 @@ textarea.composer-command-input {
   padding: 4px 6px;
   border: 1px solid var(--background-modifier-border);
   border-radius: var(--radius-xs);
+  isolation: isolate;
+  background-color: transparent;
+}
+
+.transcript-preview.is-expanded .transcript-preview-head::before {
+  position: absolute;
+  inset: 0;
+  z-index: 0;
+  border-radius: inherit;
   background-color: color-mix(in srgb, var(--background-primary) 92%, transparent);
+  content: "";
   backdrop-filter: blur(6px);
   -webkit-backdrop-filter: blur(6px);
+}
+
+.transcript-preview.is-expanded .transcript-preview-head > * {
+  position: relative;
+  z-index: 1;
 }
 
 .transcript-preview-label {
@@ -12899,7 +12994,7 @@ textarea.composer-command-input {
   font-family: var(--font-monospace);
   font-weight: var(--font-monospace-weight);
   font-size: var(--font-chrome-size);
-  line-height: 1.5;
+  line-height: var(--font-monospace-line-height);
   min-width: 0;
   overflow-wrap: anywhere;
   word-break: break-word;
@@ -13203,7 +13298,7 @@ textarea.composer-command-input {
   font-weight: 600;
   font-size: var(--font-control-size);
   font-variant-numeric: tabular-nums;
-  line-height: 1;
+  line-height: var(--font-monospace-line-height);
 }
 
 .workgraph-health-label {
@@ -14241,7 +14336,7 @@ textarea.composer-command-input {
   color: var(--text-muted);
   font-family: var(--font-monospace);
   font-size: 11px;
-  line-height: 1.5;
+  line-height: var(--font-monospace-line-height);
   white-space: pre-wrap;
   overflow-wrap: anywhere;
 }
@@ -14885,9 +14980,23 @@ textarea.composer-command-input {
   z-index: 1000;
   display: grid;
   grid-template-rows: auto 1fr;
-  background: color-mix(in srgb, #05070c 92%, transparent);
-  backdrop-filter: blur(12px);
+  isolation: isolate;
+  background: transparent;
   outline: 0;
+}
+
+.artifact-lightbox::before {
+  position: absolute;
+  inset: 0;
+  z-index: 0;
+  background: color-mix(in srgb, #05070c 92%, transparent);
+  content: "";
+  backdrop-filter: blur(12px);
+}
+
+.artifact-lightbox > * {
+  position: relative;
+  z-index: 1;
 }
 
 .artifact-lightbox-topbar {
