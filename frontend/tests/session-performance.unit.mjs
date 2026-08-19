@@ -296,6 +296,14 @@ test("events that render nothing produce no virtual rows", () => {
   assert.equal(layout.totalHeight, 20 + (20 + VIRTUAL_ROW_GAP) + 20);
 });
 
+test("claude init stays indexed while its transcript row is hidden", () => {
+  const events = [event(0, "claude_init", ""), event(1, "assistant", "reply")];
+  const result = eventRowsIncremental(events, 0, null);
+
+  assert.deepEqual(result.rows.map((row) => row.key), [1]);
+  assert.equal(result.rows[0].event.id, 1);
+});
+
 test("a hidden thinking event becomes a row when its text streams in", () => {
   let events = [toolEvent(0, "read", "Read"), event(1, "thinking", ""), toolEvent(2, "read", "Read")];
   let result = eventRowsIncremental(events, 0, null);
