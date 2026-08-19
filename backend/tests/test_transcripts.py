@@ -4135,7 +4135,7 @@ class ClientEchoRowTests(unittest.TestCase):
             {"rendered": 1, "summarized": 0, "ignored": 1, "unknown": 0},
         )
 
-    def test_approval_response_does_not_render_as_user_event(self) -> None:
+    def test_approval_response_stdin_echo_does_not_render_as_user_event(self) -> None:
         parsed = self._parse_rows(
             "claude-normalized",
             [
@@ -4146,8 +4146,11 @@ class ClientEchoRowTests(unittest.TestCase):
                     "disposition": "ignored",
                     "kind": "approval_response",
                     "payload": {
-                        "type": "control_response",
-                        "response": {"request_id": "approval-1"},
+                        "type": "user",
+                        "message": {
+                            "role": "user",
+                            "content": [{"type": "text", "text": "approve"}],
+                        },
                     },
                 }
             ],

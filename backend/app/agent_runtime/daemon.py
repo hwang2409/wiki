@@ -3,7 +3,6 @@ from __future__ import annotations
 import argparse
 import asyncio
 import fcntl
-import logging
 import os
 import signal
 import time
@@ -21,12 +20,8 @@ from .fleet_monitor_ids import (
     fleet_monitor_request_id,
 )
 from .protocol import UnixSupervisorServer
-from .store import RunNotFound, RunStore, RuntimePaths
+from .store import RunStore, RuntimePaths
 from .supervisor import Supervisor
-
-
-logger = logging.getLogger(__name__)
-
 
 def build_fleet_monitor_dispatch(supervisor: Supervisor):
     """Return the durable dispatch callable that ``FleetMonitor`` uses.
@@ -115,8 +110,6 @@ async def _recovery_loop(supervisor: Supervisor, stop: asyncio.Event) -> None:
         except TimeoutError:
             try:
                 await supervisor.recover_on_start()
-            except RunNotFound as exc:
-                logger.info("recovery skipped missing run: %s", exc)
             except Exception:
                 # stderr is the daemon's private supervisor.log; polling must
                 # survive a corrupt sibling run or transient filesystem error.

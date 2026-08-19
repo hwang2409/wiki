@@ -16,6 +16,7 @@ import unittest
 import warnings
 from datetime import datetime, timezone
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Any, cast
 from unittest import mock
 from uuid import uuid4
@@ -10858,33 +10859,50 @@ class RecoveryLoopTests(unittest.IsolatedAsyncioTestCase):
 
         raise_limit.assert_called_once_with()
 
-    async def test_missing_run_is_logged_without_traceback(self) -> None:
-        stop = asyncio.Event()
-        calls = 0
+    async def test_recovery_skips_missing_snapshot_and_continues(self) -> None:
+        supervisor = object.__new__(Supervisor)
+        supervisor.materializer_failed_runs = {}
+        supervisor.store = mock.Mock()
+        supervisor.store.read_codex_rotation_journal.return_value = None
+        supervisor.store.list_runs.return_value = [
+            SimpleNamespace(
+                agent_id="WIKI-MISSING",
+                run_id="run-missing",
+                provider=ProviderKind.CLAUDE,
+            ),
+            SimpleNamespace(
+                agent_id="WIKI-NEXT",
+                run_id="run-next",
+                provider=ProviderKind.CLAUDE,
+            ),
+        ]
 
-        class MissingThenStopped:
-            async def recover_on_start(self) -> None:
-                nonlocal calls
-                calls += 1
-                if calls == 1:
-                    raise RunNotFound("run disappeared during recovery")
-                stop.set()
+        class AgentLock:
+            async def __aenter__(self) -> None:
+                return None
 
-        async def timeout_wait(awaitable: Any, timeout: float) -> None:
-            del timeout
-            awaitable.close()
-            raise TimeoutError
+            async def __aexit__(self, *args: object) -> None:
+                return None
 
-        with (
-            mock.patch.object(agent_daemon.asyncio, "wait_for", timeout_wait),
-            self.assertLogs(agent_daemon.logger, level="INFO") as logs,
-        ):
-            await agent_daemon._recovery_loop(MissingThenStopped(), stop)
+        supervisor.codex_fleet_lock = AgentLock()
+        supervisor._agent_lock = lambda agent_id: AgentLock()
 
-        self.assertEqual(calls, 2)
+        async def recover(run_id: str) -> dict[str, str]:
+            if run_id == "run-missing":
+                raise RunNotFound("run disappeared during recovery")
+            return {"run_id": run_id, "action": "skip", "reason": "already complete"}
+
+        supervisor._recover_run = recover
+        with self.assertLogs(supervisor_module.logger, level="INFO") as logs:
+            results = await Supervisor._recover_once(supervisor)
+
+        self.assertEqual(results, [{"run_id": "run-next", "action": "skip", "reason": "already complete"}])
         self.assertEqual(
             logs.output,
-            ["INFO:backend.app.agent_runtime.daemon:recovery skipped missing run: run disappeared during recovery"],
+            [
+                "INFO:backend.app.agent_runtime.supervisor:"
+                "recovery skipped missing run agent_id=WIKI-MISSING run_id=run-missing"
+            ],
         )
 
 
