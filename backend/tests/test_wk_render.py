@@ -326,6 +326,121 @@ def test_codex_events_render_every_branch() -> None:
         assert expected in _capture(render_item(_item(raw)))
 
     assert render_item(_item({"method": "item/userMessage", "params": {}})) == []
+    for item_type in ("agentMessage", "reasoning", "userMessage"):
+        assert (
+            render_item(
+                _item({"method": "item/started", "params": {"item": {"type": item_type}}})
+            )
+            == []
+        )
+
+
+def test_known_codex_noise_is_ignored_but_unknown_methods_are_visible() -> None:
+    ignored_methods = (
+        "item/agentMessage/delta",
+        "item/commandExecution/outputDelta",
+        "item/commandExecution/terminalInteraction",
+        "item/delta",
+        "item/dynamicToolCall/outputDelta",
+        "item/fileChange/outputDelta",
+        "item/mcpToolCall/outputDelta",
+        "item/reasoning/summaryPartAdded",
+        "item/reasoning/summaryTextDelta",
+        "hook/completed",
+        "hook/started",
+    )
+
+    for method in ignored_methods:
+        assert render_item(_item({"method": method, "params": {}})) == []
+    assert "[event] item/started" in _capture(
+        render_item(_item({"method": "item/started", "params": {"item": {"type": "new"}}}))
+    )
+
+
+def test_native_tool_lines_include_inputs_and_results() -> None:
+    file_start = _capture(
+        render_item(
+            _item(
+                {
+                    "method": "item/started",
+                    "params": {
+                        "item": {
+                            "type": "fileChange",
+                            "changes": {"README.md": "updated"},
+                        }
+                    },
+                }
+            )
+        )
+    )
+    mcp_start = _capture(
+        render_item(
+            _item(
+                {
+                    "method": "item/started",
+                    "params": {
+                        "item": {
+                            "type": "mcpToolCall",
+                            "server": "filesystem",
+                            "tool": "list_dir",
+                            "arguments": {"path": "/tmp"},
+                        }
+                    },
+                }
+            )
+        )
+    )
+    mcp_result = _capture(
+        render_item(
+            _item(
+                {
+                    "method": "item/completed",
+                    "params": {
+                        "item": {
+                            "type": "mcpToolCall",
+                            "server": "filesystem",
+                            "tool": "list_dir",
+                            "status": "completed",
+                            "result": {"content": [{"text": "a.txt"}]},
+                        }
+                    },
+                }
+            )
+        )
+    )
+
+    assert "README.md" in file_start
+    assert "updated" in file_start
+    assert "/tmp" in mcp_start
+    assert "a.txt" in mcp_result
+
+
+@pytest.mark.parametrize(
+    ("item_update", "status_text"),
+    [
+        ({"status": "canceled"}, "canceled"),
+        ({"status": "declined"}, "declined"),
+        ({"status": "interrupted"}, "interrupted"),
+        ({"exit_code": 1}, "error"),
+    ],
+)
+def test_native_tool_failure_states_use_error_style(
+    item_update: Mapping[str, Any], status_text: str
+) -> None:
+    item = {"type": "commandExecution", "command": "echo hi", **item_update}
+    rendered = render_item(
+        _item({"method": "item/completed", "params": {"item": item}})
+    )
+
+    assert isinstance(rendered[0], Text)
+    assert status_text in rendered[0].plain
+    offset = rendered[0].plain.index(status_text)
+    style = next(
+        span.style
+        for span in rendered[0].spans
+        if span.start <= offset < span.end
+    )
+    assert str(style) == "bold red"
 
 
 def test_codex_errors_use_error_style() -> None:

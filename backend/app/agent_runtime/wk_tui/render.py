@@ -20,8 +20,31 @@ _CODEX_ERROR_METHODS = {
 }
 _IGNORED_CODEX_METHODS = {
     "item/agentMessage/delta",
+    "item/commandExecution/outputDelta",
+    "item/commandExecution/terminalInteraction",
+    "item/delta",
+    "item/dynamicToolCall/outputDelta",
+    "item/fileChange/outputDelta",
+    "item/mcpToolCall/outputDelta",
+    "item/reasoning/summaryPartAdded",
+    "item/reasoning/summaryTextDelta",
     "item/userMessage",
+    "hook/completed",
+    "hook/started",
+    "mcpServer/startupStatus/updated",
+    "rawResponse/completed",
+    "rawResponseItem/completed",
+    "remoteControl/status/changed",
     "thread/closed",
+    "thread/goal/cleared",
+    "thread/settings/updated",
+    "thread/tokenUsage/updated",
+    "turn/moderationMetadata",
+}
+_IGNORED_CODEX_ITEM_STARTED_TYPES = {
+    "agentMessage",
+    "reasoning",
+    "userMessage",
 }
 _NATIVE_TOOL_TYPES = {"commandExecution", "fileChange", "mcpToolCall"}
 
@@ -161,15 +184,26 @@ def _native_tool_status(item: Mapping[str, Any]) -> tuple[str, bool]:
     result = item.get("result")
     if isinstance(result, Mapping) and result.get("isError") is True:
         return "error", True
+    status = item.get("status")
+    if isinstance(status, str) and status:
+        if status.lower() in {
+            "failed",
+            "error",
+            "declined",
+            "cancelled",
+            "canceled",
+            "interrupted",
+        }:
+            return status, True
+    exit_code = item.get("exit_code", item.get("exitCode"))
+    if isinstance(exit_code, int) and not isinstance(exit_code, bool) and exit_code != 0:
+        return "error", True
     success = item.get("success")
     if isinstance(success, bool):
         return ("success" if success else "error"), not success
-    status = item.get("status")
     if isinstance(status, str) and status:
-        failed = status.lower() in {"failed", "error", "cancelled"}
-        return status, failed
-    exit_code = item.get("exitCode")
-    if isinstance(exit_code, int):
+        return status, False
+    if isinstance(exit_code, int) and not isinstance(exit_code, bool):
         return ("success" if exit_code == 0 else "error"), exit_code != 0
     return "completed", False
 
@@ -285,6 +319,11 @@ def render_codex(raw: Mapping[str, Any], verbose: bool = False) -> list[Renderab
         item = params.get("item")
         if isinstance(item, Mapping) and item.get("type") in _NATIVE_TOOL_TYPES:
             rendered.append(_native_tool_start_line(item))
+        elif (
+            isinstance(item, Mapping)
+            and item.get("type") in _IGNORED_CODEX_ITEM_STARTED_TYPES
+        ):
+            pass
         else:
             rendered.append(_line("[event] ", method or dict(raw), "dim"))
     elif method == "item/completed":
