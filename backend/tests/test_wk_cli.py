@@ -114,6 +114,11 @@ def test_parse_defaults_claude_lane(tmp_path: Path) -> None:
     assert args.prompt is None
 
 
+def test_parse_preserves_prompt_p_abbreviation(tmp_path: Path) -> None:
+    args = parse_cli(["--p", "hello", "--workdir", str(tmp_path)])
+    assert args.prompt == "hello"
+
+
 def test_parse_codex_lane_defaults_effort(tmp_path: Path) -> None:
     args = parse_cli(["--lane", "codex", "--workdir", str(tmp_path)])
     assert args.effort == "medium"
