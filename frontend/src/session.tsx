@@ -4689,9 +4689,10 @@ function MessageComposer({
     setText("");
     setAttachments([]);
     rememberSelection(0);
+    const id = crypto.randomUUID();
     const message = {
-      id: crypto.randomUUID(),
-      requestId: crypto.randomUUID(),
+      id,
+      requestId: id,
       text: value,
       mode,
     };

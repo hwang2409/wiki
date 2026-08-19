@@ -11,6 +11,10 @@ import {
 
 const TICKET = "WIKI-373";
 
+function delay(ms) {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
 async function main() {
   const fixtures = makeFixtureRoot("wiki-373-instant-send-");
   const transcript = fixtures.root + "/codex-empty.jsonl";
@@ -53,6 +57,9 @@ async function main() {
   const firstSendReleased = new Promise((resolve) => { releaseFirstSend = resolve; });
   let firstRequestBody;
   let firstFailedRequestId;
+  let editedRequestId;
+  let ambiguousRequestId;
+  let uncertainEditRequestId;
   const backend = await startBackend(fixtures);
   const browser = await chromium.launch({ headless: true });
   const page = await browser.newPage({ viewport: { width: 1280, height: 900 } });
@@ -120,6 +127,7 @@ async function main() {
       }
       if (sendCount === 2 || sendCount === 4) {
         if (sendCount === 2) firstFailedRequestId = body.request_id;
+        if (sendCount === 4) editedRequestId = body.request_id;
         await route.fulfill({
           status: 400,
           contentType: "application/json",
@@ -147,8 +155,69 @@ async function main() {
         return;
       }
       if (sendCount === 5) {
-        if (body.request_id === firstFailedRequestId) {
+        if (body.request_id === editedRequestId) {
           throw new Error("editing reused the old logical message request id");
+        }
+        sessionEvents.push({
+          id: sessionEvents.length,
+          kind: "user",
+          ts: new Date().toISOString(),
+          text: body.text,
+          pending_id: body.pending_id,
+          disposition: "rendered",
+        });
+        await route.fulfill({
+          status: 200,
+          contentType: "application/json",
+          body: JSON.stringify({ status: "sent", pending_id: body.pending_id }),
+        });
+        return;
+      }
+      if (sendCount === 6) {
+        ambiguousRequestId = body.request_id;
+        await delay(16_000);
+        try {
+          await route.fulfill({
+            status: 200,
+            contentType: "application/json",
+            body: JSON.stringify({ status: "uncertain", pending_id: body.pending_id }),
+          });
+        } catch {
+          // The browser timeout intentionally aborts this ambiguous request.
+        }
+        return;
+      }
+      if (sendCount === 7) {
+        if (body.request_id !== ambiguousRequestId) {
+          throw new Error("ambiguous delivery retry changed the request id");
+        }
+        sessionEvents.push({
+          id: sessionEvents.length,
+          kind: "user",
+          ts: new Date().toISOString(),
+          text: body.text,
+          pending_id: body.pending_id,
+          disposition: "rendered",
+        });
+        await route.fulfill({
+          status: 200,
+          contentType: "application/json",
+          body: JSON.stringify({ status: "sent", pending_id: body.pending_id }),
+        });
+        return;
+      }
+      if (sendCount === 8) {
+        uncertainEditRequestId = body.request_id;
+        await route.fulfill({
+          status: 200,
+          contentType: "application/json",
+          body: JSON.stringify({ status: "uncertain", pending_id: body.pending_id }),
+        });
+        return;
+      }
+      if (sendCount === 9) {
+        if (body.request_id === uncertainEditRequestId) {
+          throw new Error("editing an uncertain message reused its request id");
         }
         sessionEvents.push({
           id: sessionEvents.length,
@@ -199,6 +268,9 @@ async function main() {
     const pending = page.locator(".session-scroll .session-pending-user", { hasText: "instant hello" });
     await pending.waitFor({ state: "visible", timeout: 5_000 });
     if (!firstRequestBody?.request_id) throw new Error("send did not include a request id");
+    if (firstRequestBody.pending_id !== firstRequestBody.request_id) {
+      throw new Error("initial send used separate pending and request identities");
+    }
     const pendingRow = pending.locator("..");
     const pendingKey = await pendingRow.getAttribute("data-row-key");
     releaseFirstSend();
@@ -231,8 +303,40 @@ async function main() {
     await composer.fill("edited hello");
     await composer.press("Enter");
     await page.getByText("edited hello", { exact: true }).last().waitFor({ state: "visible", timeout: 5_000 });
+    if (!editedRequestId || editedRequestId === firstFailedRequestId) {
+      throw new Error("fixture did not capture a new request id for the edit");
+    }
     if (await page.locator(".session-scroll .session-user", { hasText: "edit me" }).count() !== 0) {
       throw new Error("edited message left the old logical row visible");
+    }
+
+    await composer.fill("ambiguous hello");
+    await composer.press("Enter");
+    const ambiguous = page.locator(".session-scroll .session-pending-user", { hasText: "ambiguous hello" });
+    await ambiguous.waitFor({ state: "visible", timeout: 5_000 });
+    await ambiguous.getByText("delivery uncertain").waitFor({ state: "visible", timeout: 20_000 });
+    const verify = ambiguous.getByRole("button", { name: "Verify delivery" });
+    await Promise.all([verify.click(), verify.click()]);
+    await page.locator(".session-scroll .session-user:not(.session-pending-user)", { hasText: "ambiguous hello" })
+      .waitFor({ state: "visible", timeout: 8_000 });
+    if (sendCount !== 7) throw new Error(`expected one ambiguous retry POST, got ${sendCount - 6}`);
+    if (await page.locator(".session-scroll .session-user", { hasText: "ambiguous hello" }).count() !== 1) {
+      throw new Error("concurrent ambiguous retries duplicated the user message");
+    }
+
+    await composer.fill("uncertain edit me");
+    await composer.press("Enter");
+    const uncertainEdit = page.locator(".session-scroll .session-pending-user", { hasText: "uncertain edit me" });
+    await uncertainEdit.getByText("delivery uncertain").waitFor({ state: "visible", timeout: 5_000 });
+    await uncertainEdit.getByRole("button", { name: "Edit message" }).click();
+    await composer.fill("uncertain edited");
+    await composer.press("Enter");
+    await page.getByText("uncertain edited", { exact: true }).last().waitFor({ state: "visible", timeout: 5_000 });
+    if (!uncertainEditRequestId || uncertainEditRequestId === editedRequestId) {
+      throw new Error("fixture did not capture the uncertain edit request id");
+    }
+    if (await page.locator(".session-scroll .session-user", { hasText: "uncertain edit me" }).count() !== 0) {
+      throw new Error("uncertain edit left the old logical row visible");
     }
   } finally {
     await page.close();

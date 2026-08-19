@@ -118,6 +118,7 @@ type Entry = {
   dirty: boolean;
   lastLoadedAt: number;
   cleanupHandle: number | null;
+  pendingRecoveryHandle: number | null;
 };
 
 const entries = new Map<string, Entry>();
@@ -205,6 +206,7 @@ function createEntry(target: TranscriptTarget): Entry {
     dirty: false,
     lastLoadedAt: 0,
     cleanupHandle: null,
+    pendingRecoveryHandle: null,
   };
 }
 
@@ -290,8 +292,47 @@ function scheduleEntryCleanup(entry: Entry) {
       scheduleEntryCleanup(entry);
       return;
     }
+    if (entry.pendingRecoveryHandle !== null) {
+      window.clearTimeout(entry.pendingRecoveryHandle);
+      entry.pendingRecoveryHandle = null;
+    }
     entries.delete(entry.key);
   }, ENTRY_RETENTION_MS);
+}
+
+function schedulePendingRecovery(entry: Entry) {
+  if (entry.pendingRecoveryHandle !== null) {
+    window.clearTimeout(entry.pendingRecoveryHandle);
+    entry.pendingRecoveryHandle = null;
+  }
+  const next = entry.snapshot.pendingUserMessages
+    .filter((message) => message.status === "sent")
+    .reduce<number | null>((earliest, message) => {
+      const dueAt = message.firstSeenTs + PENDING_RECOVERY_MS;
+      return earliest === null ? dueAt : Math.min(earliest, dueAt);
+    }, null);
+  if (next === null) return;
+  entry.pendingRecoveryHandle = window.setTimeout(() => {
+    entry.pendingRecoveryHandle = null;
+    const now = Date.now();
+    let changed = false;
+    const pendingUserMessages = entry.snapshot.pendingUserMessages.map((message) => {
+      if (message.status !== "sent" || now - message.firstSeenTs < PENDING_RECOVERY_MS) {
+        return message;
+      }
+      changed = true;
+      return {
+        ...message,
+        status: "uncertain" as const,
+        error: "Delivery is uncertain. Verify it before sending again.",
+      };
+    });
+    if (changed) {
+      entry.snapshot = { ...entry.snapshot, pendingUserMessages };
+      emit(entry);
+    }
+    schedulePendingRecovery(entry);
+  }, Math.max(0, next - Date.now()));
 }
 
 function emit(entry: Entry) {
@@ -381,6 +422,7 @@ function fetchEntry(entry: Entry): Promise<void> {
         refreshError: null,
         loading: false,
       };
+      schedulePendingRecovery(entry);
       entry.lastLoadedAt = Date.now();
     } catch (error) {
       const message = error instanceof Error ? error.message : "No session transcript found.";
@@ -553,6 +595,7 @@ export function replaceTranscriptQueue(
         queue: mergeQueueSources(entry.snapshot.session.queue, annotated),
       },
     };
+    schedulePendingRecovery(entry);
     emit(entry);
   });
 }
@@ -574,6 +617,7 @@ export function addPendingUserMessage(
     ...entry.snapshot,
     pendingUserMessages: [...entry.snapshot.pendingUserMessages, pending],
   };
+  schedulePendingRecovery(entry);
   emit(entry);
 }
 
@@ -591,6 +635,7 @@ export function updatePendingUserMessage(
   });
   if (!changed) return;
   entry.snapshot = { ...entry.snapshot, pendingUserMessages };
+  schedulePendingRecovery(entry);
   emit(entry);
 }
 
@@ -611,6 +656,7 @@ export function retryPendingUserMessage(ticket: string, id: string) {
   });
   if (!changed) return;
   entry.snapshot = { ...entry.snapshot, pendingUserMessages };
+  schedulePendingRecovery(entry);
   emit(entry);
 }
 
@@ -619,6 +665,7 @@ export function removePendingUserMessage(ticket: string, id: string) {
   const pendingUserMessages = entry.snapshot.pendingUserMessages.filter((message) => message.id !== id);
   if (pendingUserMessages.length === entry.snapshot.pendingUserMessages.length) return;
   entry.snapshot = { ...entry.snapshot, pendingUserMessages };
+  schedulePendingRecovery(entry);
   emit(entry);
 }
 
