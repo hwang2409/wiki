@@ -784,6 +784,9 @@ export type SessionEvent = {
   artifact?: SessionArtifact;
   source?: string | null;
   pending_id?: string | null;
+  pending_status?: "sending" | "sent" | "failed";
+  pending_mode?: "now" | "on-idle";
+  pending_error?: string;
   claude_init?: SessionInit;
   claude_task?: SessionTaskNotification;
   claude_api_retry?: SessionApiRetry;

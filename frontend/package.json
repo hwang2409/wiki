@@ -57,7 +57,8 @@
     "preview": "vite preview",
     "test:wiki-244": "node tests/wiki-244-opencode-transcript.playwright.mjs && node tests/wiki-244-runner-regression.mjs && node tests/wiki-105-font-weights.playwright.mjs",
     "test:wiki-301": "node tests/wiki-301-status-chips.playwright.mjs",
-    "test:wiki-342": "node tests/wiki-342-pixel-discipline.playwright.mjs"
+    "test:wiki-342": "node tests/wiki-342-pixel-discipline.playwright.mjs",
+    "test:wiki-373": "node tests/wiki-373-instant-send.playwright.mjs"
   },
   "dependencies": {
     "@codemirror/commands": "^6.10.4",

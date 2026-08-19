@@ -2520,6 +2520,8 @@ const MessageBlock = memo(function MessageBlock({
   sessionKey,
   ticket,
   uiState,
+  onEditPending,
+  onRetryPending,
 }: {
   event: SessionEvent;
   imageNums?: number[];
@@ -2529,11 +2531,30 @@ const MessageBlock = memo(function MessageBlock({
   sessionKey: string;
   ticket: string;
   uiState: SessionUiState;
+  onEditPending?: (message: PendingUserMessage) => void;
+  onRetryPending?: (message: PendingUserMessage) => void;
 }) {
   if (event.kind === "artifact") {
     return <ArtifactBlock event={event} onInspect={onInspectArtifact} onOpen={onOpenArtifact} sessionKey={sessionKey} ticket={ticket} />;
   }
   if (event.kind === "user") {
+    if (event.pending_id && event.pending_status && event.pending_mode) {
+      return (
+        <PendingUserMessageRow
+          message={{
+            id: event.pending_id,
+            text: event.text,
+            status: event.pending_status,
+            mode: event.pending_mode,
+            firstSeenTs: event.ts ? Date.parse(event.ts) : Date.now(),
+            eventIdFloor: -1,
+            error: event.pending_error,
+          }}
+          onEdit={onEditPending}
+          onRetry={onRetryPending}
+        />
+      );
+    }
     if (event.source) {
       return <SyntheticSourceRow source={event.source} text={event.text} />;
     }
@@ -2612,8 +2633,50 @@ const MessageBlock = memo(function MessageBlock({
   prev.onOpenArtifact === next.onOpenArtifact &&
   prev.ticket === next.ticket &&
   prev.uiState === next.uiState &&
+  prev.onEditPending === next.onEditPending &&
+  prev.onRetryPending === next.onRetryPending &&
   sameImageNums(prev.imageNums, next.imageNums)
 );
+
+function PendingUserMessageRow({
+  message,
+  onEdit,
+  onRetry,
+}: {
+  message: PendingUserMessage;
+  onEdit?: (message: PendingUserMessage) => void;
+  onRetry?: (message: PendingUserMessage) => void;
+}) {
+  return (
+    <div
+      className={`session-user session-pending-user is-${message.status}`}
+      data-status={message.status}
+      data-pending-id={message.id}
+    >
+      <UserText text={message.text} />
+      <div className="session-pending-status">
+        {message.status === "sending" ? (
+          <>
+            <CircleDashed className="session-pending-spinner" size={11} />
+            <span>sending…</span>
+          </>
+        ) : message.status === "sent" ? (
+          <>
+            <CircleCheck size={11} />
+            <span>sent · waiting for transcript</span>
+          </>
+        ) : (
+          <>
+            <AlertTriangle size={11} />
+            <span title={message.error}>send failed: {message.error ?? "unknown error"}</span>
+            <button type="button" onClick={() => onRetry?.(message)}>Retry send</button>
+            <button type="button" onClick={() => onEdit?.(message)}>Edit message</button>
+          </>
+        )}
+      </div>
+    </div>
+  );
+}
 
 // WIKI-247: one virtual row owns one activity event. Tool output stays paired
 // with its call inside ToolCallRow, but adjacent events never share a row.
@@ -2762,6 +2825,8 @@ const VirtualSessionRow = memo(function VirtualSessionRow({
   ticket,
   turnMeta = null,
   uiState,
+  onEditPending,
+  onRetryPending,
 }: {
   activityRunState: ActivityRunState;
   row: EventRow;
@@ -2777,6 +2842,8 @@ const VirtualSessionRow = memo(function VirtualSessionRow({
   ticket: string;
   turnMeta?: TurnMeta | null;
   uiState: SessionUiState;
+  onEditPending?: (message: PendingUserMessage) => void;
+  onRetryPending?: (message: PendingUserMessage) => void;
 }) {
   const rowRef = useMeasuredRow(row, onHeightChange);
   const style: CSSProperties = { top: `${top}px` };
@@ -2811,6 +2878,8 @@ const VirtualSessionRow = memo(function VirtualSessionRow({
             sessionKey={sessionKey}
             ticket={ticket}
             uiState={uiState}
+            onEditPending={onEditPending}
+            onRetryPending={onRetryPending}
           />
         </>
       )}
@@ -2832,6 +2901,8 @@ const VirtualSessionRow = memo(function VirtualSessionRow({
     prev.ticket !== next.ticket ||
     prev.turnMeta !== next.turnMeta ||
     prev.uiState !== next.uiState
+    || prev.onEditPending !== next.onEditPending
+    || prev.onRetryPending !== next.onRetryPending
   ) {
     return false;
   }
@@ -2862,6 +2933,25 @@ type ScrollState = {
   scrollTop: number;
   anchor: ScrollAnchor | null;
 };
+
+async function deliverPendingMessage(
+  ticket: string,
+  message: Pick<PendingUserMessage, "id" | "text" | "mode">,
+) {
+  const result = await sendAgentMessage(ticket, message.text, message.mode, message.id);
+  if (result.messages) {
+    replaceTranscriptQueue(ticket, result.messages, {
+      pendingId: message.id,
+      source: message.mode === "now" ? "auto" : "explicit",
+      text: message.text,
+      position: result.position,
+    });
+  }
+  if (result.status !== "queued") {
+    updatePendingUserMessage(ticket, message.id, { status: "sent", error: undefined });
+    refreshTranscript(ticket);
+  }
+}
 
 const composerStateCache = new Map<string, ComposerState>();
 const sessionUiStateCache = new Map<string, SessionUiState>();
@@ -2990,6 +3080,21 @@ export function SessionTab({
   const visible = useElementVisible(containerNode);
   const { session, pendingUserMessages, error, refreshError, loading } = useTranscriptSession(target, visible);
   const [retrying, setRetrying] = useState(false);
+  const [pendingEditRequest, setPendingEditRequest] = useState<PendingUserMessage | null>(null);
+  const retryPending = useCallback(async (message: PendingUserMessage) => {
+    retryPendingUserMessage(ticket, message.id);
+    try {
+      await deliverPendingMessage(ticket, message);
+    } catch (sendError) {
+      updatePendingUserMessage(ticket, message.id, {
+        status: "failed",
+        error: sendError instanceof Error ? sendError.message : "Send failed",
+      });
+    }
+  }, [ticket]);
+  const editPending = useCallback((message: PendingUserMessage) => {
+    setPendingEditRequest(message);
+  }, []);
   const retry = useCallback(() => {
     setRetrying(true);
     retryTranscript(target).finally(() => setRetrying(false));
@@ -3220,15 +3325,28 @@ export function SessionTab({
   const displayEvents = useMemo(
     () => {
       if (!session) return [];
+      const transcriptEvents = session.events.filter((event) => event.kind !== "claude_init");
+      const pendingEvents: SessionEvent[] = pendingUserMessages.map((message, index) => ({
+        id: 3_000_000 + index,
+        kind: "user",
+        ts: new Date(message.firstSeenTs).toISOString(),
+        text: message.text,
+        disposition: "rendered",
+        pending_id: message.id,
+        pending_status: message.status,
+        pending_mode: message.mode,
+        pending_error: message.error,
+      }));
       return [
         ...mergeComposerEvents(
-          applyComposerSources(session.events, session.composerMessages),
+          applyComposerSources(transcriptEvents, session.composerMessages),
           composerMessageEvents(session),
         ),
+        ...pendingEvents,
         ...modelChangedMarkers(session),
       ];
     },
-    [session?.events, session?.providerInspector, session?.composerMessages],
+    [pendingUserMessages, session?.events, session?.providerInspector, session?.composerMessages],
   );
 
   const rowResult = useMemo(() => {
@@ -3688,6 +3806,8 @@ export function SessionTab({
                 top={top}
                 turnMeta={turnMetaByKey.get(row.key) ?? null}
                 uiState={uiState}
+                onEditPending={editPending}
+                onRetryPending={retryPending}
               />
             ))}
           </div>
@@ -3696,7 +3816,6 @@ export function SessionTab({
       {subagent || !showComposer ? null : (
         <MessageComposer
           history={userHistory}
-          pending={pendingUserMessages}
           queued={session.queue}
           runningSubagents={runningSubagents}
           stateKey={composerStateKeyForSession(ticket, subagent)}
@@ -3704,6 +3823,7 @@ export function SessionTab({
           ticket={ticket}
           guidance={composerGuidance}
           onInspect={onInspect}
+          editRequest={pendingEditRequest}
         />
       )}
       <div className="session-footer tabular-nums">
@@ -3766,22 +3886,22 @@ function MessageComposer({
   stateKey,
   ticket,
   history = [],
-  pending = [],
   queued = [],
   runningSubagents = [],
   thinking = false,
   guidance,
   onInspect,
+  editRequest = null,
 }: {
   stateKey: string;
   ticket: string;
   history?: string[];
-  pending?: PendingUserMessage[];
   queued?: QueuedMessage[];
   runningSubagents?: SubagentInfo[];
   thinking?: boolean;
   guidance: ComposerGuidance;
   onInspect?: (agentId: string) => void;
+  editRequest?: PendingUserMessage | null;
 }) {
   const cachedComposer = getComposerState(stateKey);
   const selectionRef = useRef({
@@ -3835,6 +3955,7 @@ function MessageComposer({
   const [caretPos, setCaretPos] = useState(selectionRef.current.start);
   const [narrowComposer, setNarrowComposer] = useState(false);
   const [overlayPos, setOverlayPos] = useState<{ top: number; left: number; char: string } | null>(null);
+  const handledEditRef = useRef<string | null>(null);
 
   useLayoutEffect(() => {
     const node = composerRef.current;
@@ -3863,6 +3984,12 @@ function MessageComposer({
     restoreSelectionRef.current = true;
     setCaretPos(selectionRef.current.start);
   }, [stateKey]);
+
+  useEffect(() => {
+    if (!editRequest || handledEditRef.current === editRequest.id) return;
+    handledEditRef.current = editRequest.id;
+    edit(editRequest);
+  }, [editRequest]);
 
   useEffect(() => {
     const start = Math.max(0, Math.min(selectionRef.current.start, text.length));
@@ -4500,20 +4627,8 @@ function MessageComposer({
     setBusy(true);
     setError(null);
     try {
-      const result = await sendAgentMessage(ticket, message.text, message.mode, message.id);
+      await deliverPendingMessage(ticket, message);
       historyPosRef.current = null;
-      if (result.messages) {
-        replaceTranscriptQueue(ticket, result.messages, {
-          pendingId: message.id,
-          source: message.mode === "now" ? "auto" : "explicit",
-          text: message.text,
-          position: result.position,
-        });
-      }
-      if (result.status !== "queued") {
-        updatePendingUserMessage(ticket, message.id, { status: "sent", error: undefined });
-        refreshTranscript(ticket);
-      }
     } catch (err) {
       updatePendingUserMessage(ticket, message.id, {
         status: "failed",
@@ -4543,12 +4658,6 @@ function MessageComposer({
     await deliverPending(message);
   }
 
-  async function retry(message: PendingUserMessage) {
-    if (busy) return;
-    retryPendingUserMessage(ticket, message.id);
-    await deliverPending(message);
-  }
-
   function edit(message: PendingUserMessage) {
     if (busy) return;
     removePendingUserMessage(ticket, message.id);
@@ -4574,35 +4683,6 @@ function MessageComposer({
       data-history-count={history.length}
       ref={composerRef}
     >
-      {pending.map((message) => (
-        <div
-          className={`session-user session-pending-user is-${message.status}`}
-          data-status={message.status}
-          key={message.id}
-        >
-          <UserText text={message.text} />
-          <div className="session-pending-status">
-            {message.status === "sending" ? (
-              <>
-                <CircleDashed className="session-pending-spinner" size={11} />
-                <span>sending…</span>
-              </>
-            ) : message.status === "sent" ? (
-              <>
-                <CircleCheck size={11} />
-                <span>sent · waiting for transcript</span>
-              </>
-            ) : (
-              <>
-                <AlertTriangle size={11} />
-                <span title={message.error}>send failed</span>
-                <button type="button" onClick={() => void retry(message)}>Retry send</button>
-                <button type="button" onClick={() => edit(message)}>Edit message</button>
-              </>
-            )}
-          </div>
-        </div>
-      ))}
       {queued.map((message, i) => (
         <div
           className={`session-queued is-${message.source ?? "explicit"}`}
