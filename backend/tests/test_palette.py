@@ -416,6 +416,48 @@ class PaletteSearchTests(unittest.TestCase):
             ):
                 self.assertIn(expected, kinds_seen, f"missing artifact kind {expected} in {kinds_seen}")
 
+    def test_indexed_archived_artifact_after_old_limit_ranks_by_outer_timestamp(self):
+        class IndexedEvents:
+            def read_artifact_events(self, **_kwargs):
+                old_events = [
+                    {
+                        "kind": "artifact",
+                        "normalized_at": "2026-08-01T00:00:00+00:00",
+                        "payload": {
+                            "kind": "artifact",
+                            "id": f"old-{index}",
+                            "title": f"old {index}",
+                            "artifact": {"kind": "table"},
+                        },
+                    }
+                    for index in range(801)
+                ]
+                old_events.append(
+                    {
+                        "kind": "artifact",
+                        "normalized_at": "2026-08-19T00:00:00+00:00",
+                        "payload": {
+                            "kind": "artifact",
+                            "id": "new-archived",
+                            "title": "new archived",
+                            "artifact": {"kind": "table"},
+                        },
+                    }
+                )
+                return iter(("archived", event) for event in old_events)
+
+        items = palette.collect_artifact_items_from_index(
+            IndexedEvents(),
+            archive_by_run={"archived": ("WIKI-1", "2026-08-19T00:00:00+00:00")},
+        )
+
+        self.assertIsNotNone(items)
+        self.assertEqual(items[0].artifact_id, "new-archived")
+        self.assertEqual(
+            items[0].updated_at,
+            datetime(2026, 8, 19, tzinfo=timezone.utc),
+        )
+
     def test_symlink_outside_vault_ignored(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)

@@ -60,7 +60,9 @@ class EventStoreRouter:
         self._stores: dict[str, SQLiteEventStore] = {}
         if migrate:
             migrate_legacy_event_db(self.runtime_dir)
-        self.corrupt_raw_run_ids = _corrupt_raw_run_ids(self.runtime_dir)
+        self.corrupt_raw_run_ids = (
+            _corrupt_raw_run_ids(self.runtime_dir) if migrate else set()
+        )
 
     def ensure_schema(self) -> None:
         self.metadata_store.ensure_schema()

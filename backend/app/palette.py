@@ -539,7 +539,10 @@ def _artifact_payload_from_event(event: dict[str, Any]) -> tuple[str, dict[str, 
             artifact = payload.get("artifact")
             artifact_id = payload.get("id") or event.get("artifact_id")
             if isinstance(artifact, dict) and isinstance(artifact_id, str):
-                return artifact_id, {**payload, "artifact": artifact}
+                unwrapped = {**payload, "artifact": artifact}
+                if event.get("normalized_at") is not None:
+                    unwrapped["normalized_at"] = event["normalized_at"]
+                return artifact_id, unwrapped
         payload = event
         artifact = payload.get("artifact")
         artifact_id = payload.get("id") or event.get("artifact_id")

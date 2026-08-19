@@ -101,6 +101,16 @@ def test_event_store_module_dependency_graph_is_acyclic() -> None:
         visit(module)
 
 
+def test_router_migrate_false_does_not_scan_raw_logs() -> None:
+    with TemporaryDirectory() as tmp, mock.patch(
+        "backend.app.agent_runtime.event_store_router._corrupt_raw_run_ids"
+    ) as scan:
+        router = RuntimeEventStore(tmp, migrate=False)
+
+    scan.assert_not_called()
+    assert router.corrupt_raw_run_ids == set()
+
+
 def _raw(seq: int, method: str, params: dict, *, received_at: str) -> dict:
     return {
         "seq": seq,
