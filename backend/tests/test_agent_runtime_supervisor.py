@@ -9136,6 +9136,9 @@ class SupervisorTests(unittest.IsolatedAsyncioTestCase):
                 )
 
         adapter = self.supervisor.adapters[record.run_id]
+        self.supervisor.auth_dead_alert_at[record.run_id] = (
+            time.monotonic() - accounts.AUTH_DEAD_ALERT_INTERVAL_SECONDS - 1
+        )
         await self.supervisor._recover_codex_auth_dead(  # noqa: SLF001
             record.run_id,
             adapter,
@@ -9175,6 +9178,9 @@ class SupervisorTests(unittest.IsolatedAsyncioTestCase):
             now - 500,
             now - 600,
         ]
+        self.supervisor.auth_dead_alert_at[record.run_id] = (
+            now - accounts.AUTH_DEAD_ALERT_INTERVAL_SECONDS - 1
+        )
 
         await self.supervisor._handle_provider_event(  # noqa: SLF001
             record.run_id,
