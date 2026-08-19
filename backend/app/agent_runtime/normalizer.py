@@ -19,8 +19,6 @@ _CODEX_RENDERED_METHODS = {
     "thread/started",
     "turn/started",
     "turn/completed",
-    "item/started",
-    "item/completed",
     "item/fileChange/outputDelta",
     "item/commandExecution/outputDelta",
     "item/mcpToolCall/outputDelta",
@@ -66,6 +64,20 @@ _CODEX_APPROVAL_METHODS = {
     "execCommandApproval",
     "applyPatchApproval",
 }
+CODEX_ITEM_TYPES = {
+    "agentMessage",
+    "collabAgentToolCall",
+    "collabToolCall",
+    "commandExecution",
+    "dynamicToolCall",
+    "fileChange",
+    "imageView",
+    "mcpToolCall",
+    "reasoning",
+    "userMessage",
+    "webSearch",
+}
+_CODEX_ITEM_METHODS = {"item/started", "item/completed"}
 
 
 def _codex_state(payload: dict[str, Any]) -> LifecycleState | None:
@@ -142,18 +154,18 @@ def _codex_moderation_is_warning(params: object) -> bool:
     return bool(_codex_moderation_flags(params))
 
 
+def _codex_item_type(item: object) -> str | None:
+    if not isinstance(item, dict):
+        return None
+    item_type = item.get("type")
+    return item_type if isinstance(item_type, str) else None
+
+
 def _normalize_codex(payload: dict[str, Any]) -> NormalizedProviderEvent:
     method = payload.get("method")
     lifecycle = _codex_state(payload)
     params = payload.get("params")
     item = params.get("item") if isinstance(params, dict) else None
-    artifact = (
-        artifact_from_codex_mcp_tool_result(item)
-        if method == "item/completed"
-        else None
-    )
-    if artifact is not None:
-        return NormalizedProviderEvent(EventDisposition.RENDERED, "artifact", artifact)
     if method in _CODEX_APPROVAL_METHODS:
         disposition = EventDisposition.RENDERED
         kind = "approval"
@@ -163,6 +175,22 @@ def _normalize_codex(payload: dict[str, Any]) -> NormalizedProviderEvent:
     elif method == "turn/moderationMetadata" and _codex_moderation_is_warning(params):
         disposition = EventDisposition.RENDERED
         kind = "turn_moderationMetadata_warning"
+    elif (
+        method in _CODEX_ITEM_METHODS
+        and _codex_item_type(item) in CODEX_ITEM_TYPES
+    ):
+        artifact = (
+            artifact_from_codex_mcp_tool_result(item)
+            if method == "item/completed"
+            else None
+        )
+        if artifact is not None:
+            return NormalizedProviderEvent(EventDisposition.RENDERED, "artifact", artifact)
+        disposition = EventDisposition.RENDERED
+        kind = str(method).replace("/", "_")
+    elif method in _CODEX_ITEM_METHODS:
+        disposition = EventDisposition.UNKNOWN
+        kind = str(method or "unknown")
     elif method in _CODEX_RENDERED_METHODS:
         disposition = EventDisposition.RENDERED
         kind = str(method).replace("/", "_")
