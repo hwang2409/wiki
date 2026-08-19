@@ -1230,5 +1230,31 @@ def test_artifact_index_skips_malformed_shard_rows() -> None:
         }
 
 
+def test_artifact_index_stops_when_the_reader_is_cancelled() -> None:
+    with TemporaryDirectory() as tmp:
+        runtime_path = Path(tmp) / "runtime"
+        archive_path = Path(tmp) / "archive"
+        session = archive_path / "ticket" / "20260818-000000"
+        session.mkdir(parents=True)
+        (session / "archive-complete.json").write_text("{}")
+        (session / "run.json").write_text(json.dumps({"run_id": "archived"}))
+        (session / "events.jsonl").write_text(
+            json.dumps(
+                {
+                    "kind": "artifact",
+                    "id": "archived-artifact",
+                }
+            )
+            + "\n"
+        )
+
+        events = RuntimeEventStore(
+            runtime_path,
+            archive_dir=archive_path,
+        ).read_artifact_events(should_cancel=lambda: True)
+
+        assert events == []
+
+
 def _json_bytes_for_test(value: dict[str, object]) -> str:
     return json.dumps(value, separators=(",", ":"), sort_keys=True)

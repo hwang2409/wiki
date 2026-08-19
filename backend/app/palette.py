@@ -25,11 +25,12 @@ import math
 import os
 import re
 import threading
-from urllib.parse import quote
+from collections.abc import Callable, Iterable
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Callable, Iterable
+from typing import Any
+from urllib.parse import quote
 
 from .agent_runtime.archive_protocol import archive_is_committed
 
@@ -752,6 +753,7 @@ def collect_artifact_items_from_index(
     *,
     ticket_by_run: dict[str, str] | None = None,
     archive_by_run: dict[str, tuple[str, str]] | None = None,
+    should_cancel: Callable[[], bool] | None = None,
 ) -> list[PaletteItem] | None:
     """Build palette artifacts from SQLite without walking event JSONL files.
 
@@ -760,7 +762,9 @@ def collect_artifact_items_from_index(
     """
 
     try:
-        indexed_events = event_store.read_artifact_events()
+        indexed_events = event_store.read_artifact_events(
+            should_cancel=should_cancel,
+        )
     except Exception:
         return None
     items: list[PaletteItem] = []

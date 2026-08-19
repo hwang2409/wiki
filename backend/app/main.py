@@ -2698,6 +2698,7 @@ async def palette_search(
             event_store,
             ticket_by_run=ticket_by_run,
             archive_by_run=archive_by_run,
+            should_cancel=cancelled.is_set,
         )
         indexed_artifacts = _palette_artifacts_or_legacy_scan(
             event_store,

@@ -44,6 +44,11 @@ RuntimeEventStore = EventStoreRouter
 
 def _standalone_metadata_path(path: Path | str) -> Path:
     database_path = Path(path)
+    if (
+        database_path.name == "events.sqlite3"
+        and database_path.parent.parent.name == "runs"
+    ):
+        return database_path.parent.parent.parent / "metadata.sqlite3"
     return database_path.with_name(
         f"{database_path.stem}.metadata{database_path.suffix}"
     )
