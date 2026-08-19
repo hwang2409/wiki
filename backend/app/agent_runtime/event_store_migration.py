@@ -170,6 +170,9 @@ def _migrate_legacy_event_db(runtime_dir: Path) -> bool:
             "SELECT run_id, agent_id, provider, format, normalizer_version, "
             "created_at, state, archive_state FROM runs ORDER BY run_id"
         ).fetchall()
+        live_run_ids = {
+            str(row[0]) for row in run_rows if str(row[7]) == "live"
+        }
         parity_rows = legacy.execute(
             "SELECT record_id, run_id, normalizer_version, record_type, path, "
             "expected_json, actual_json, detail_json, recorded_at, raw_seq "
@@ -207,6 +210,20 @@ def _migrate_legacy_event_db(runtime_dir: Path) -> bool:
             "SELECT parent_run_id, child_id, child_run_id, source_path, "
             "source_size, created_at FROM child_runs"
         ).fetchall()
+        live_run_ids.update(
+            str(row[2]) for row in child_rows if str(row[0]) in live_run_ids
+        )
+        parity_rows = [row for row in parity_rows if str(row[1]) in live_run_ids]
+        child_rows = [
+            row
+            for row in child_rows
+            if str(row[0]) in live_run_ids or str(row[2]) in live_run_ids
+        ]
+        generation_by_run_id = {
+            run_id: generation
+            for run_id, generation in generation_by_run_id.items()
+            if run_id in live_run_ids
+        }
 
         with metadata.connection() as connection:
             connection.executemany(
@@ -230,6 +247,8 @@ def _migrate_legacy_event_db(runtime_dir: Path) -> bool:
 
         for run_row in run_rows:
             run_id = str(run_row[0])
+            if run_id not in live_run_ids:
+                continue
             target = runtime_event_db_path(runtime_path, run_id)
             if target.is_file():
                 try:

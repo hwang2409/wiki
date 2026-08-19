@@ -614,6 +614,40 @@ def test_runtime_event_store_migrates_shared_database_and_resumes_partial_shard(
         assert reopened.cursor("run-a").run_id == "run-a"
 
 
+def test_legacy_migration_skips_archived_runs() -> None:
+    with TemporaryDirectory() as tmp:
+        runtime_path = Path(tmp)
+        legacy = SQLiteEventStore(runtime_event_db_path(runtime_path))
+        legacy.create_run(
+            "live",
+            agent_id="live",
+            provider="codex",
+            created_at="now",
+        )
+        legacy.create_run(
+            "archived",
+            agent_id="archived",
+            provider="codex",
+            created_at="now",
+            archive_state="archived",
+        )
+        with legacy.connection() as connection:
+            connection.execute(
+                "INSERT INTO parity_records(run_id, normalizer_version, "
+                "record_type, path, detail_json, recorded_at) "
+                "VALUES ('archived', 'test', 'archived', 'migration', '{}', 'now')"
+            )
+
+        runtime = RuntimeEventStore(runtime_path)
+
+        assert runtime_event_db_path(runtime_path, "live").is_file()
+        assert not runtime_event_db_path(runtime_path, "archived").exists()
+        with runtime.metadata_store.connection(read_only=True) as connection:
+            assert connection.execute(
+                "SELECT run_id FROM parity_records WHERE run_id = 'archived'"
+            ).fetchall() == []
+
+
 def test_runtime_event_store_failure_is_limited_to_one_run() -> None:
     with TemporaryDirectory() as tmp:
         runtime_path = Path(tmp)
@@ -1169,6 +1203,37 @@ def test_artifact_index_merges_archived_events_with_live_events() -> None:
         }
 
 
+def test_artifact_index_streams_artifacts_past_the_old_limit() -> None:
+    with TemporaryDirectory() as tmp:
+        runtime_path = Path(tmp) / "runtime"
+        archive_path = Path(tmp) / "archive"
+        session = archive_path / "ticket" / "20260818-000000"
+        session.mkdir(parents=True)
+        (session / "archive-complete.json").write_text("{}")
+        (session / "run.json").write_text(json.dumps({"run_id": "archived"}))
+        artifacts = [
+            {
+                "kind": "artifact",
+                "id": f"artifact-{index}",
+                "artifact": {"kind": "table", "filename": f"{index}.html"},
+            }
+            for index in range(801)
+        ]
+        (session / "events.jsonl").write_text(
+            "".join(json.dumps(artifact) + "\n" for artifact in artifacts)
+        )
+
+        events = list(
+            RuntimeEventStore(
+                runtime_path,
+                archive_dir=archive_path,
+            ).read_artifact_events()
+        )
+
+        assert len(events) == 801
+        assert any(event["id"] == "artifact-800" for _run_id, event in events)
+
+
 def test_artifact_index_skips_malformed_shard_rows() -> None:
     with TemporaryDirectory() as tmp:
         runtime_path = Path(tmp) / "runtime"
@@ -1253,7 +1318,7 @@ def test_artifact_index_stops_when_the_reader_is_cancelled() -> None:
             archive_dir=archive_path,
         ).read_artifact_events(should_cancel=lambda: True)
 
-        assert events == []
+        assert list(events) == []
 
 
 def _json_bytes_for_test(value: dict[str, object]) -> str:

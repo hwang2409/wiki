@@ -93,105 +93,99 @@ class EventStoreRouter:
         self,
         *,
         should_cancel: Callable[[], bool] | None = None,
-    ) -> list[tuple[str, dict[str, Any]]]:
-        """Return a bounded, recent artifact index.
-
-        Archived event logs can contain years of history. Read only the
-        recent sessions and stop promptly when the caller disconnects.
-        """
-
-        max_events = 800
-        max_archive_sessions = 40
-        max_archive_events_per_session = 20
-        events: list[tuple[str, dict[str, Any], str]] = []
+    ) -> Iterator[tuple[str, dict[str, Any]]]:
+        """Stream every indexed artifact event without retaining the stream."""
 
         def cancelled() -> bool:
             return should_cancel is not None and should_cancel()
 
         for path in self.runtime_dir.joinpath("runs").glob("*/events.sqlite3"):
-            if cancelled() or len(events) >= max_events:
+            if cancelled():
                 break
             try:
                 with connect_event_db(path, read_only=True) as connection:
-                    rows = connection.execute(
+                    cursor = connection.execute(
                         "SELECT run_id, event_json, updated_at FROM events "
-                        "WHERE kind = 'artifact' ORDER BY updated_at DESC LIMIT ?",
-                        (max_events - len(events),),
-                    ).fetchall()
+                        "WHERE kind = 'artifact' ORDER BY updated_at DESC"
+                    )
+                    while True:
+                        rows = cursor.fetchmany(256)
+                        if not rows:
+                            break
+                        for row in rows:
+                            if cancelled():
+                                return
+                            try:
+                                event = json.loads(row[1])
+                            except (
+                                TypeError,
+                                ValueError,
+                                KeyError,
+                                json.JSONDecodeError,
+                            ):
+                                continue
+                            if isinstance(event, dict):
+                                yield str(row[0]), event
             except (OSError, sqlite3.DatabaseError):
                 continue
-            for row in rows:
-                if cancelled() or len(events) >= max_events:
-                    break
-                try:
-                    event = json.loads(row[1])
-                except (TypeError, ValueError, KeyError, json.JSONDecodeError):
-                    continue
-                if isinstance(event, dict):
-                    events.append((str(row[0]), event, str(row[2])))
         if self.archive_dir is not None and self.archive_dir.is_dir():
-            sessions: list[Path] = []
-            for ticket_dir in self.archive_dir.iterdir():
-                if cancelled() or not ticket_dir.is_dir() or ticket_dir.is_symlink():
-                    continue
-                try:
-                    candidates = ticket_dir.iterdir()
-                    sessions.extend(
-                        session_dir
-                        for session_dir in candidates
-                        if session_dir.is_dir()
-                        and not session_dir.is_symlink()
-                        and (session_dir / "archive-complete.json").is_file()
-                        and (session_dir / "events.jsonl").is_file()
-                        and not (session_dir / "events.jsonl").is_symlink()
-                    )
-                except OSError:
-                    continue
-            sessions.sort(
-                key=lambda path: path.stat().st_mtime_ns
-                if path.exists()
-                else 0,
-                reverse=True,
-            )
-            for session_dir in sessions[:max_archive_sessions]:
-                if cancelled() or len(events) >= max_events:
-                    break
-                events_path = session_dir / "events.jsonl"
-                try:
-                    run_value = json.loads(
-                        (session_dir / "run.json").read_text(encoding="utf-8")
-                    )
-                    run_id = str(run_value["run_id"])
-                    session_events = 0
-                    with events_path.open(encoding="utf-8") as handle:
-                        for line in handle:
-                            if cancelled() or len(events) >= max_events:
-                                break
-                            if not line.strip():
-                                continue
-                            value = json.loads(line)
+            try:
+                ticket_dirs = self.archive_dir.iterdir()
+                for ticket_dir in ticket_dirs:
+                    if (
+                        cancelled()
+                        or not ticket_dir.is_dir()
+                        or ticket_dir.is_symlink()
+                    ):
+                        continue
+                    try:
+                        session_dirs = ticket_dir.iterdir()
+                        for session_dir in session_dirs:
+                            if cancelled():
+                                return
+                            marker = session_dir / "archive-complete.json"
+                            events_path = session_dir / "events.jsonl"
                             if (
-                                isinstance(value, dict)
-                                and value.get("kind") == "artifact"
+                                not session_dir.is_dir()
+                                or session_dir.is_symlink()
+                                or not marker.is_file()
+                                or not events_path.is_file()
+                                or events_path.is_symlink()
                             ):
-                                events.append(
-                                    (
-                                        run_id,
-                                        value,
-                                        str(
-                                            value.get("normalized_at")
-                                            or value.get("updated_at")
-                                            or ""
-                                        ),
+                                continue
+                            try:
+                                run_value = json.loads(
+                                    (session_dir / "run.json").read_text(
+                                        encoding="utf-8"
                                     )
                                 )
-                                session_events += 1
-                                if session_events >= max_archive_events_per_session:
-                                    break
-                except (OSError, TypeError, ValueError, KeyError):
-                    continue
-        events.sort(key=lambda item: item[2], reverse=True)
-        return [(run_id, event) for run_id, event, _updated_at in events]
+                                run_id = str(run_value["run_id"])
+                                with events_path.open(encoding="utf-8") as handle:
+                                    for line in handle:
+                                        if cancelled():
+                                            return
+                                        if not line.strip():
+                                            continue
+                                        try:
+                                            value = json.loads(line)
+                                        except (
+                                            TypeError,
+                                            ValueError,
+                                            KeyError,
+                                            json.JSONDecodeError,
+                                        ):
+                                            continue
+                                        if (
+                                            isinstance(value, dict)
+                                            and value.get("kind") == "artifact"
+                                        ):
+                                            yield run_id, value
+                            except (OSError, TypeError, ValueError, KeyError):
+                                continue
+                    except OSError:
+                        continue
+            except OSError:
+                return
 
     def create_run(self, run_id: str, **kwargs: Any) -> None:
         self.for_run(run_id).create_run(run_id, **kwargs)

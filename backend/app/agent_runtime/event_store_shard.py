@@ -24,7 +24,6 @@ from .types import (
     EventDisposition,
     LifecycleState,
     ProviderKind,
-    utc_now,
     validate_transition,
 )
 
@@ -39,7 +38,52 @@ _RUN_LOCKS_GUARD = threading.Lock()
 class MetadataStoreProtocol(Protocol):
     """The metadata operations shared by every event-store shard."""
 
-    def __getattr__(self, name: str) -> Any: ...
+    def ensure_schema(self) -> None: ...
+
+    def backfill_completed_run_ids(self, normalizer_version: str) -> set[str]: ...
+
+    def backfill_cursor(self, normalizer_version: str) -> str: ...
+
+    def advance_backfill_cursor(self, normalizer_version: str, run_id: str) -> None: ...
+
+    def ensure_child_mapping(
+        self,
+        *,
+        parent_run_id: str,
+        child_id: str,
+        child_run_id: str,
+        source_path: str,
+        created_at: str,
+    ) -> ChildRunMapping: ...
+
+    def child_run_for(
+        self, parent_run_id: str, child_id: str
+    ) -> ChildRunMapping | None: ...
+
+    def refresh_child_source_fingerprint(
+        self, parent_run_id: str, child_id: str, source_size: int
+    ) -> None: ...
+
+    def invalidate_child_source_fingerprint(
+        self, parent_run_id: str, child_id: str
+    ) -> None: ...
+
+    def record_parity_record(
+        self,
+        run_id: str,
+        *,
+        normalizer_version: str,
+        record_type: str,
+        path: str,
+        detail: dict[str, Any],
+        expected: Any = None,
+        actual: Any = None,
+        raw_seq: int | None = None,
+    ) -> None: ...
+
+    def parity_records(
+        self, run_id: str | None = None
+    ) -> list[dict[str, Any]]: ...
 
 
 @dataclass(frozen=True)
@@ -800,30 +844,12 @@ class SQLiteEventStore:
     def backfill_completed_run_ids(self, normalizer_version: str) -> set[str]:
         """Return runs whose completed marker makes them backfill-ineligible."""
 
-        if self.metadata_store is not None:
-            return self.metadata_store.backfill_completed_run_ids(normalizer_version)
-        self.ensure_schema()
-        with self.connection(read_only=True) as connection:
-            rows = connection.execute(
-                "SELECT DISTINCT run_id FROM parity_records "
-                "WHERE normalizer_version = ? AND record_type = 'backfill_completed'",
-                (normalizer_version,),
-            ).fetchall()
-        return {str(row[0]) for row in rows}
+        return self.metadata_store.backfill_completed_run_ids(normalizer_version)
 
     def backfill_cursor(self, normalizer_version: str) -> str:
         """Return the durable next-batch position for one normalizer."""
 
-        if self.metadata_store is not None:
-            return self.metadata_store.backfill_cursor(normalizer_version)
-        self.ensure_schema()
-        with self.connection(read_only=True) as connection:
-            row = connection.execute(
-                "SELECT cursor_run_id FROM backfill_progress "
-                "WHERE normalizer_version = ?",
-                (normalizer_version,),
-            ).fetchone()
-        return str(row[0]) if row is not None else ""
+        return self.metadata_store.backfill_cursor(normalizer_version)
 
     def advance_backfill_cursor(
         self,
@@ -832,17 +858,7 @@ class SQLiteEventStore:
     ) -> None:
         """Durably advance the backfill scan after one examined run."""
 
-        if self.metadata_store is not None:
-            self.metadata_store.advance_backfill_cursor(normalizer_version, run_id)
-            return
-        self.ensure_schema()
-        with self.connection() as connection:
-            connection.execute(
-                "INSERT INTO backfill_progress(normalizer_version, cursor_run_id) "
-                "VALUES (?, ?) ON CONFLICT(normalizer_version) DO UPDATE SET "
-                "cursor_run_id = excluded.cursor_run_id",
-                (normalizer_version, run_id),
-            )
+        self.metadata_store.advance_backfill_cursor(normalizer_version, run_id)
 
     def create_run(
         self,
@@ -901,149 +917,47 @@ class SQLiteEventStore:
     ) -> ChildRunMapping:
         """Create one child materialized run and its durable parent mapping."""
 
-        if self.metadata_store is not None:
-            runtime_dir = self.path.parents[2]
-            child_store = SQLiteEventStore(
-                runtime_event_db_path(runtime_dir, child_run_id),
-                self.metadata_store,
-            )
-            child_store.create_run(
-                child_run_id,
-                agent_id=f"{parent_run_id}/{child_id}",
-                provider=provider,
-                created_at=created_at,
-            )
-            return self.metadata_store.ensure_child_mapping(
-                parent_run_id=parent_run_id,
-                child_id=child_id,
-                child_run_id=child_run_id,
-                source_path=source_path,
-                created_at=created_at,
-            )
-
-        self.ensure_schema()
-        provider_kind = _provider_kind(provider)
-        with self.connection() as connection:
-            connection.execute("BEGIN")
-            connection.execute(
-                "INSERT OR IGNORE INTO runs "
-                "(run_id, agent_id, provider, format, normalizer_version, "
-                "created_at, state, archive_state) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
-                (
-                    child_run_id,
-                    f"{parent_run_id}/{child_id}",
-                    provider_kind.value,
-                    provider_kind.value,
-                    NORMALIZER_VERSION,
-                    created_at,
-                    LifecycleState.STARTING.value,
-                    "live",
-                ),
-            )
-            connection.execute(
-                "INSERT OR IGNORE INTO run_cursors(run_id, normalizer_version, rebuild_state) "
-                "VALUES (?, ?, 'ready')",
-                (child_run_id, NORMALIZER_VERSION),
-            )
-            connection.execute(
-                "INSERT OR IGNORE INTO run_projections "
-                "(run_id, current_turn_json, tasks_json, session_meta_json, "
-                "pending_requests_json, composer_messages_json, "
-                "disposition_counts_json, unread_event_seq, projection_revision) "
-                "VALUES (?, '{}', '[]', '{}', '{}', '[]', '{}', 0, 0)",
-                (child_run_id,),
-            )
-            connection.execute(
-                "INSERT INTO child_runs "
-                "(parent_run_id, child_id, child_run_id, source_path, "
-                "source_size, created_at) "
-                "VALUES (?, ?, ?, ?, ?, ?) "
-                "ON CONFLICT(parent_run_id, child_id) DO UPDATE SET "
-                "source_path = excluded.source_path",
-                (
-                    parent_run_id,
-                    child_id,
-                    child_run_id,
-                    source_path,
-                    -1,
-                    created_at,
-                ),
-            )
-            row = connection.execute(
-                "SELECT parent_run_id, child_id, child_run_id, source_path, "
-                "source_size, created_at "
-                "FROM child_runs WHERE parent_run_id = ? AND child_id = ?",
-                (parent_run_id, child_id),
-            ).fetchone()
-        if row is None:
-            raise KeyError((parent_run_id, child_id))
-        return ChildRunMapping(
-            parent_run_id=str(row[0]),
-            child_id=str(row[1]),
-            child_run_id=str(row[2]),
-            source_path=str(row[3]),
-            source_size=int(row[4]),
-            created_at=str(row[5]),
+        runtime_dir = self.path.parents[2]
+        child_store = SQLiteEventStore(
+            runtime_event_db_path(runtime_dir, child_run_id),
+            self.metadata_store,
+        )
+        child_store.create_run(
+            child_run_id,
+            agent_id=f"{parent_run_id}/{child_id}",
+            provider=provider,
+            created_at=created_at,
+        )
+        return self.metadata_store.ensure_child_mapping(
+            parent_run_id=parent_run_id,
+            child_id=child_id,
+            child_run_id=child_run_id,
+            source_path=source_path,
+            created_at=created_at,
         )
 
     def child_run_for(self, parent_run_id: str, child_id: str) -> ChildRunMapping | None:
         """Return the durable child mapping without changing SQLite state."""
 
-        if self.metadata_store is not None:
-            return self.metadata_store.child_run_for(parent_run_id, child_id)
-        with self.connection(read_only=True) as connection:
-            row = connection.execute(
-                "SELECT parent_run_id, child_id, child_run_id, source_path, "
-                "source_size, created_at "
-                "FROM child_runs WHERE parent_run_id = ? AND child_id = ?",
-                (parent_run_id, child_id),
-            ).fetchone()
-        return (
-            ChildRunMapping(
-                parent_run_id=str(row[0]),
-                child_id=str(row[1]),
-                child_run_id=str(row[2]),
-                source_path=str(row[3]),
-                source_size=int(row[4]),
-                created_at=str(row[5]),
-            )
-            if row is not None
-            else None
-        )
+        return self.metadata_store.child_run_for(parent_run_id, child_id)
 
     def refresh_child_source_fingerprint(
         self, parent_run_id: str, child_id: str, source_size: int
     ) -> None:
         """Publish the consumed child file size after successful materialization."""
 
-        if self.metadata_store is not None:
-            self.metadata_store.refresh_child_source_fingerprint(
-                parent_run_id, child_id, source_size
-            )
-            return
-        with self.connection() as connection:
-            connection.execute(
-                "UPDATE child_runs SET source_size = ? "
-                "WHERE parent_run_id = ? AND child_id = ?",
-                (source_size, parent_run_id, child_id),
-            )
+        self.metadata_store.refresh_child_source_fingerprint(
+            parent_run_id, child_id, source_size
+        )
 
     def invalidate_child_source_fingerprint(
         self, parent_run_id: str, child_id: str
     ) -> None:
         """Hide a child view while its source is being materialized."""
 
-        if self.metadata_store is not None:
-            self.metadata_store.invalidate_child_source_fingerprint(
-                parent_run_id, child_id
-            )
-            return
-        with self.connection() as connection:
-            connection.execute(
-                "UPDATE child_runs SET source_size = -1 "
-                "WHERE parent_run_id = ? AND child_id = ?",
-                (parent_run_id, child_id),
-            )
+        self.metadata_store.invalidate_child_source_fingerprint(
+            parent_run_id, child_id
+        )
 
     def materialize_raw_rows(
         self,
@@ -1598,13 +1512,6 @@ class SQLiteEventStore:
             generation_row = None
         if generation_row is not None:
             generation = int(generation_row[0])
-        elif self.metadata_store is None:
-            parity_row = connection.execute(
-                "SELECT COUNT(*) FROM parity_records "
-                "WHERE run_id = ? AND record_type = 'rebuild_generation'",
-                (run_id,),
-            ).fetchone()
-            generation = int(parity_row[0]) if parity_row is not None else 0
         else:
             generation = 0
         return RunCursor(
@@ -1679,15 +1586,7 @@ class SQLiteEventStore:
             return 0
         if row is not None:
             return int(row[0])
-        if self.metadata_store is not None:
-            return 0
-        with self.connection(read_only=True) as connection:
-            row = connection.execute(
-                "SELECT COUNT(*) FROM parity_records WHERE run_id = ? "
-                "AND record_type = 'rebuild_generation'",
-                (run_id,),
-            ).fetchone()
-        return int(row[0]) if row is not None else 0
+        return 0
 
     def read_older_snapshot(
         self,
@@ -1862,72 +1761,22 @@ class SQLiteEventStore:
     ) -> None:
         """Persist one parity or backfill decision for later inspection."""
 
-        if self.metadata_store is not None:
-            self.metadata_store.record_parity_record(
-                run_id,
-                normalizer_version=normalizer_version,
-                record_type=record_type,
-                path=path,
-                detail=detail,
-                expected=expected,
-                actual=actual,
-                raw_seq=raw_seq,
-            )
-            return
-        self.ensure_schema()
-        with self.connection() as connection:
-            connection.execute(
-                "INSERT INTO parity_records "
-                "(run_id, normalizer_version, record_type, path, expected_json, "
-                "actual_json, detail_json, recorded_at, raw_seq) "
-                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
-                (
-                    run_id,
-                    normalizer_version,
-                    record_type,
-                    path,
-                    _json_bytes(expected) if expected is not None else None,
-                    _json_bytes(actual) if actual is not None else None,
-                    _json_bytes(detail),
-                    utc_now(),
-                    raw_seq,
-                ),
-            )
+        self.metadata_store.record_parity_record(
+            run_id,
+            normalizer_version=normalizer_version,
+            record_type=record_type,
+            path=path,
+            detail=detail,
+            expected=expected,
+            actual=actual,
+            raw_seq=raw_seq,
+        )
 
     def parity_records(
         self,
         run_id: str | None = None,
     ) -> list[dict[str, Any]]:
-        if self.metadata_store is not None:
-            return self.metadata_store.parity_records(run_id)
-        self.ensure_schema()
-        query = (
-            "SELECT record_id, run_id, normalizer_version, record_type, path, "
-            "expected_json, actual_json, detail_json, recorded_at, raw_seq "
-            "FROM parity_records"
-        )
-        parameters: tuple[Any, ...] = ()
-        if run_id is not None:
-            query += " WHERE run_id = ?"
-            parameters = (run_id,)
-        query += " ORDER BY record_id"
-        with self.connection(read_only=True) as connection:
-            rows = connection.execute(query, parameters).fetchall()
-        return [
-            {
-                "record_id": int(row[0]),
-                "run_id": str(row[1]),
-                "normalizer_version": str(row[2]),
-                "record_type": str(row[3]),
-                "path": str(row[4]),
-                "expected": json.loads(row[5]) if row[5] is not None else None,
-                "actual": json.loads(row[6]) if row[6] is not None else None,
-                "detail": json.loads(row[7]),
-                "recorded_at": str(row[8]),
-                "raw_seq": int(row[9]) if row[9] is not None else None,
-            }
-            for row in rows
-        ]
+        return self.metadata_store.parity_records(run_id)
 
     def export_events_jsonl(
         self,
@@ -2015,165 +1864,65 @@ class SQLiteEventStore:
     ) -> None:
         """Atomically replace one run from a validated temporary database."""
 
-        if self.metadata_store is not None:
-            with self.run_lock(run_id):
-                source_path = Path(source).absolute()
-                if not source_path.is_file():
-                    raise FileNotFoundError(source_path)
-                generation = self.rebuild_generation(run_id) + 1
-                with connect_event_db(source_path) as connection:
-                    connection.execute(
-                        "CREATE TABLE IF NOT EXISTS rebuild_generations ("
-                        "run_id TEXT PRIMARY KEY, generation INTEGER NOT NULL"
-                        ")"
-                    )
-                    connection.execute(
-                        "INSERT INTO rebuild_generations(run_id, generation) "
-                        "VALUES (?, ?) ON CONFLICT(run_id) DO UPDATE SET "
-                        "generation = excluded.generation",
-                        (run_id, generation),
-                    )
-                    connection.commit()
-                    connection.execute("PRAGMA wal_checkpoint(TRUNCATE)")
-                runtime_store._fsync_file(source_path)
-                runtime_store._fsync_directory(source_path.parent)
-                self.path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
-                stale_sidecars: list[tuple[Path, Path]] = []
-                for suffix in ("-wal", "-shm"):
-                    original = self.path.with_name(self.path.name + suffix)
-                    if not original.exists():
-                        continue
-                    stale = self.path.with_name(
-                        f".{self.path.name}.stale{suffix}"
-                    )
-                    stale.unlink(missing_ok=True)
-                    os.rename(original, stale)
-                    stale_sidecars.append((original, stale))
-                runtime_store._fsync_directory(self.path.parent)
-                try:
-                    os.replace(source_path, self.path)
-                except BaseException:
-                    for original, stale in reversed(stale_sidecars):
-                        if stale.exists():
-                            os.rename(stale, original)
-                    raise
-                for _original, stale in stale_sidecars:
-                    stale.unlink(missing_ok=True)
-                for suffix in ("-wal", "-shm"):
-                    source_path.with_name(source_path.name + suffix).unlink(
-                        missing_ok=True
-                    )
-                runtime_store._fsync_directory(self.path.parent)
-            return
-
         with self.run_lock(run_id):
-            self.ensure_schema()
             source_path = Path(source).absolute()
             if not source_path.is_file():
                 raise FileNotFoundError(source_path)
-            with self.connection() as connection:
-                connection.execute("ATTACH DATABASE ? AS rebuilt", (str(source_path),))
-                attached = True
-                try:
-                    connection.execute("BEGIN IMMEDIATE")
-                    connection.execute(
-                        "INSERT INTO main.runs "
-                        "(run_id, agent_id, provider, format, normalizer_version, "
-                        "created_at, state, archive_state) "
-                        "SELECT run_id, agent_id, provider, format, normalizer_version, "
-                        "created_at, state, archive_state FROM rebuilt.runs "
-                        "WHERE run_id = ? AND NOT EXISTS "
-                        "(SELECT 1 FROM main.runs WHERE run_id = ?)",
-                        (run_id, run_id),
-                    )
-                    for table, columns in (
-                    (
-                        "run_cursors",
-                        (
-                            "run_id, raw_seq, materialized_raw_seq, next_event_id, "
-                            "event_base, event_count, change_cursor, patch_base_cursor, "
-                            "last_causal_raw_seq, last_lifecycle_change, "
-                            "normalizer_version, rebuild_state"
-                        ),
-                    ),
-                    (
-                        "run_projections",
-                        (
-                            "run_id, current_turn_json, tasks_json, pr_json, "
-                            "session_meta_json, pending_requests_json, "
-                            "composer_messages_json, disposition_counts_json, "
-                            "tokens_json, projection_revision, unread_event_seq"
-                        ),
-                    ),
-                    (
-                        "dispositions",
-                        (
-                            "run_id, raw_seq, disposition, normalized_kind, "
-                            "normalized_json, normalizer_version, created_at"
-                        ),
-                    ),
-                    (
-                        "events",
-                        (
-                            "run_id, event_id, raw_seq, kind, event_json, created_at, "
-                            "updated_at, revision, deleted"
-                        ),
-                    ),
-                    (
-                        "patches",
-                        (
-                            "run_id, change_cursor, event_id, raw_seq, patch_json, "
-                            "event_revision, created_at"
-                        ),
-                    ),
-                    ):
-                        connection.execute(
-                            f"DELETE FROM main.{table} WHERE run_id = ?", (run_id,)
-                        )
-                        connection.execute(
-                            f"INSERT INTO main.{table} ({columns}) "
-                            f"SELECT {columns} FROM rebuilt.{table} WHERE run_id = ?",
-                            (run_id,),
-                        )
-                    connection.execute(
-                        "UPDATE main.runs SET agent_id = rebuilt.agent_id, "
-                        "provider = rebuilt.provider, format = rebuilt.format, "
-                        "normalizer_version = rebuilt.normalizer_version, "
-                        "created_at = rebuilt.created_at, state = rebuilt.state, "
-                        "archive_state = rebuilt.archive_state "
-                        "FROM rebuilt.runs AS rebuilt WHERE main.runs.run_id = ? "
-                        "AND rebuilt.run_id = ?",
-                        (run_id, run_id),
-                    )
-                    if self.metadata_store is None:
-                        connection.execute(
-                            "INSERT INTO parity_records "
-                            "(run_id, normalizer_version, record_type, path, detail_json, recorded_at) "
-                            "VALUES (?, ?, 'rebuild_generation', 'replace_run_from', ?, ?)",
-                            (
-                                run_id,
-                                NORMALIZER_VERSION,
-                                _json_bytes({"source": str(source_path)}),
-                                utc_now(),
-                            ),
-                        )
-                    connection.commit()
-                    connection.execute("DETACH DATABASE rebuilt")
-                    attached = False
-                except BaseException:
-                    connection.rollback()
-                    raise
-                finally:
-                    if attached:
-                        connection.execute("DETACH DATABASE rebuilt")
-            if self.metadata_store is not None:
-                self.record_parity_record(
-                    run_id,
-                    normalizer_version=NORMALIZER_VERSION,
-                    record_type="rebuild_generation",
-                    path="replace_run_from",
-                    detail={"source": str(source_path)},
+            generation = self.rebuild_generation(run_id) + 1
+            with connect_event_db(source_path) as connection:
+                connection.execute(
+                    "CREATE TABLE IF NOT EXISTS rebuild_generations ("
+                    "run_id TEXT PRIMARY KEY, generation INTEGER NOT NULL"
+                    ")"
                 )
+                connection.execute(
+                    "INSERT INTO rebuild_generations(run_id, generation) "
+                    "VALUES (?, ?) ON CONFLICT(run_id) DO UPDATE SET "
+                    "generation = excluded.generation",
+                    (run_id, generation),
+                )
+                connection.commit()
+                connection.execute("PRAGMA wal_checkpoint(TRUNCATE)")
+            runtime_store._fsync_file(source_path)
+            runtime_store._fsync_directory(source_path.parent)
+            self.path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+            stale_sidecars: list[tuple[Path, Path]] = []
+            for suffix in ("-wal", "-shm"):
+                original = self.path.with_name(self.path.name + suffix)
+                if not original.exists():
+                    continue
+                stale = self.path.with_name(f".{self.path.name}.stale{suffix}")
+                stale.unlink(missing_ok=True)
+                os.rename(original, stale)
+                stale_sidecars.append((original, stale))
+            runtime_store._fsync_directory(self.path.parent)
+            try:
+                os.replace(source_path, self.path)
+            except BaseException:
+                for original, stale in reversed(stale_sidecars):
+                    if stale.exists():
+                        os.rename(stale, original)
+                raise
+            for _original, stale in stale_sidecars:
+                stale.unlink(missing_ok=True)
+            for suffix in ("-wal", "-shm"):
+                source_path.with_name(source_path.name + suffix).unlink(missing_ok=True)
+            runtime_store._fsync_directory(self.path.parent)
+            self._invalidate_connections()
+            self.record_parity_record(
+                run_id,
+                normalizer_version=NORMALIZER_VERSION,
+                record_type="rebuild_generation",
+                path="replace_run_from",
+                detail={"source": str(source_path)},
+            )
+
+    def _invalidate_connections(self) -> None:
+        """Force future operations to reopen after an atomic database swap."""
+
+        # Connections are per-operation today. Persistent connection work must
+        # close and reopen its handle here after replace_run_from swaps the file.
+        self._schema_ready = False
 
 
 def replay_raw_jsonl(
