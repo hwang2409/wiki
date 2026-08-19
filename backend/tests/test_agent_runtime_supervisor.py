@@ -10830,6 +10830,37 @@ class UnixClientTests(unittest.IsolatedAsyncioTestCase):
         self.server = replacement
 
 
+class RecoveryLoopTests(unittest.IsolatedAsyncioTestCase):
+    async def test_missing_run_is_logged_without_traceback(self) -> None:
+        stop = asyncio.Event()
+        calls = 0
+
+        class MissingThenStopped:
+            async def recover_on_start(self) -> None:
+                nonlocal calls
+                calls += 1
+                if calls == 1:
+                    raise RunNotFound("run disappeared during recovery")
+                stop.set()
+
+        async def timeout_wait(awaitable: Any, timeout: float) -> None:
+            del timeout
+            awaitable.close()
+            raise TimeoutError
+
+        with (
+            mock.patch.object(agent_daemon.asyncio, "wait_for", timeout_wait),
+            self.assertLogs(agent_daemon.logger, level="INFO") as logs,
+        ):
+            await agent_daemon._recovery_loop(MissingThenStopped(), stop)
+
+        self.assertEqual(calls, 2)
+        self.assertEqual(
+            logs.output,
+            ["INFO:backend.app.agent_runtime.daemon:recovery skipped missing run: run disappeared during recovery"],
+        )
+
+
 class DaemonShutdownTests(unittest.IsolatedAsyncioTestCase):
     async def test_lock_and_pid_release_before_provider_drain(self) -> None:
         """WIKI-217: a replacement must be able to start while the old daemon drains."""

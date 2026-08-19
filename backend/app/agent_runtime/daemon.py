@@ -21,8 +21,11 @@ from .fleet_monitor_ids import (
 from .autopilot import AutopilotController
 from ..nofile_limit import raise_nofile_limit
 from .protocol import UnixSupervisorServer
-from .store import RunStore, RuntimePaths
+from .store import RunNotFound, RunStore, RuntimePaths
 from .supervisor import Supervisor
+
+
+logger = logging.getLogger(__name__)
 
 
 def build_fleet_monitor_dispatch(supervisor: Supervisor):
@@ -112,6 +115,8 @@ async def _recovery_loop(supervisor: Supervisor, stop: asyncio.Event) -> None:
         except TimeoutError:
             try:
                 await supervisor.recover_on_start()
+            except RunNotFound as exc:
+                logger.info("recovery skipped missing run: %s", exc)
             except Exception:
                 # stderr is the daemon's private supervisor.log; polling must
                 # survive a corrupt sibling run or transient filesystem error.
