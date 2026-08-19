@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 from collections.abc import Iterable, Mapping
+from pathlib import Path
 from typing import Any
 
 import pytest
@@ -413,8 +414,6 @@ def test_known_methods_and_item_starts_never_use_unknown_fallback() -> None:
         | _CODEX_APPROVAL_METHODS
     )
     for method in known_methods:
-        if method == "item/started":
-            continue
         assert "[event] " not in _capture(
             render_item(_item({"method": method, "params": {}}))
         )
@@ -432,18 +431,21 @@ def test_known_methods_and_item_starts_never_use_unknown_fallback() -> None:
         )
 
 
+@pytest.mark.parametrize("method", ["item/started", "item/completed"])
 @pytest.mark.parametrize("item_type", [{}, [], None])
-def test_normalizer_handles_malformed_codex_item_types(item_type: object) -> None:
+def test_normalizer_handles_malformed_codex_item_types(
+    method: str, item_type: object
+) -> None:
     normalized = normalize_provider_event(
         ProviderKind.CODEX,
         {
-            "method": "item/started",
+            "method": method,
             "params": {"item": {"type": item_type}},
         },
     )
 
     assert normalized.disposition is EventDisposition.UNKNOWN
-    assert normalized.kind == "item/started"
+    assert normalized.kind == method
 
 
 @pytest.mark.parametrize("item_type", sorted(CODEX_ITEM_TYPES))
@@ -481,8 +483,27 @@ def test_normalizer_item_type_set_controls_dispatch(
     assert normalized.disposition is EventDisposition.UNKNOWN
 
 
+def test_normalizer_item_type_gate_precedes_artifact_extraction(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    fixture = (
+        Path(__file__).parent
+        / "fixtures/agent_runtime/codex_render_artifact_completed.jsonl"
+    )
+    raw = json.loads(fixture.read_text())["message"]
+    item_type = raw["params"]["item"]["type"]
+    item_types = CODEX_ITEM_TYPES.copy()
+    item_types.remove(item_type)
+    monkeypatch.setattr(normalizer, "CODEX_ITEM_TYPES", item_types)
+
+    normalized = normalize_provider_event(ProviderKind.CODEX, raw)
+
+    assert normalized.disposition is EventDisposition.UNKNOWN
+    assert normalized.kind == "item/completed"
+
+
 @pytest.mark.parametrize("method", ["item/started", "item/completed"])
-@pytest.mark.parametrize("item_type", [{}, []])
+@pytest.mark.parametrize("item_type", [{}, [], None])
 def test_renderer_handles_unhashable_codex_item_types(
     method: str, item_type: object
 ) -> None:
@@ -495,7 +516,12 @@ def test_renderer_handles_unhashable_codex_item_types(
         )
     )
 
-    assert rendered
+    if method == "item/started":
+        expected = "[event] item/started"
+    else:
+        body = item_type or {"type": item_type}
+        expected = f"[item] {json.dumps(body, sort_keys=True)}"
+    assert _capture(rendered).strip() == expected
 
 
 def test_codex_moderation_warning_is_visible() -> None:

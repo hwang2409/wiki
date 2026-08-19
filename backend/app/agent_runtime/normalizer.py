@@ -166,13 +166,6 @@ def _normalize_codex(payload: dict[str, Any]) -> NormalizedProviderEvent:
     lifecycle = _codex_state(payload)
     params = payload.get("params")
     item = params.get("item") if isinstance(params, dict) else None
-    artifact = (
-        artifact_from_codex_mcp_tool_result(item)
-        if method == "item/completed"
-        else None
-    )
-    if artifact is not None:
-        return NormalizedProviderEvent(EventDisposition.RENDERED, "artifact", artifact)
     if method in _CODEX_APPROVAL_METHODS:
         disposition = EventDisposition.RENDERED
         kind = "approval"
@@ -186,6 +179,13 @@ def _normalize_codex(payload: dict[str, Any]) -> NormalizedProviderEvent:
         method in _CODEX_ITEM_METHODS
         and _codex_item_type(item) in CODEX_ITEM_TYPES
     ):
+        artifact = (
+            artifact_from_codex_mcp_tool_result(item)
+            if method == "item/completed"
+            else None
+        )
+        if artifact is not None:
+            return NormalizedProviderEvent(EventDisposition.RENDERED, "artifact", artifact)
         disposition = EventDisposition.RENDERED
         kind = str(method).replace("/", "_")
     elif method in _CODEX_ITEM_METHODS:
