@@ -4135,6 +4135,29 @@ class ClientEchoRowTests(unittest.TestCase):
             {"rendered": 1, "summarized": 0, "ignored": 1, "unknown": 0},
         )
 
+    def test_approval_response_does_not_render_as_user_event(self) -> None:
+        parsed = self._parse_rows(
+            "claude-normalized",
+            [
+                {
+                    "seq": 1,
+                    "raw_seq": 1,
+                    "normalized_at": "2026-08-18T10:00:00+00:00",
+                    "disposition": "ignored",
+                    "kind": "approval_response",
+                    "payload": {
+                        "type": "control_response",
+                        "response": {"request_id": "approval-1"},
+                    },
+                }
+            ],
+        )
+        self.assertEqual(parsed["events"], [])
+        self.assertEqual(
+            parsed["dispositions"],
+            {"rendered": 0, "summarized": 0, "ignored": 1, "unknown": 0},
+        )
+
 
 class RegistryIdBeatsDiscoveryTests(unittest.TestCase):
     def test_registry_id_confines_result_to_anchor_cwd(self) -> None:
