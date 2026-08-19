@@ -118,6 +118,7 @@ def parse_cli(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--effort", choices=EFFORT_LEVELS, help="reasoning effort (codex lane only)")
     parser.add_argument("--workdir", type=Path, default=Path.cwd(), help="lane worktree (default: current directory)")
     parser.add_argument("-p", "--prompt", help="one-shot mode: run a single turn and exit")
+    parser.add_argument("--p", dest="prompt", help=argparse.SUPPRESS)
     parser.add_argument("--plain", action="store_true", help="use the plain REPL instead of the TUI")
     args = parser.parse_args(argv)
     if args.lane == "claude" and args.effort is not None:
