@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import json
 from collections.abc import Iterable, Mapping
-from pathlib import Path
 from typing import Any
 
 import pytest
@@ -13,7 +12,14 @@ from rich.console import Console
 from rich.markdown import Markdown
 from rich.text import Text
 
-from backend.app.agent_runtime import normalizer
+from backend.app.agent_runtime.normalizer import (
+    CODEX_ITEM_TYPES,
+    _CLAUDE_IGNORED_TYPES,
+    _CODEX_APPROVAL_METHODS,
+    _CODEX_IGNORED_METHODS,
+    _CODEX_RENDERED_METHODS,
+    _CODEX_SUMMARIZED_METHODS,
+)
 from backend.app.agent_runtime.wk_tui import render as render_module
 from backend.app.agent_runtime.wk_tui.render import render_event, render_item
 
@@ -27,33 +33,6 @@ def _capture(renderables: Iterable[object]) -> str:
     for renderable in renderables:
         console.print(renderable)
     return console.export_text()
-
-
-def _known_codex_item_types() -> set[str]:
-    item_types = set(getattr(normalizer, "_CODEX_ITEM_TYPES", ()))
-    for fixture in (Path(__file__).parent / "fixtures").rglob("*.jsonl"):
-        for line in fixture.read_text().splitlines():
-            try:
-                value = json.loads(line)
-            except json.JSONDecodeError:
-                continue
-            _collect_item_types(value, item_types)
-    return item_types
-
-
-def _collect_item_types(value: object, item_types: set[str]) -> None:
-    if isinstance(value, Mapping):
-        if value.get("method") in {"item/started", "item/completed"}:
-            params = value.get("params")
-            item = params.get("item") if isinstance(params, Mapping) else None
-            item_type = item.get("type") if isinstance(item, Mapping) else None
-            if isinstance(item_type, str):
-                item_types.add(item_type)
-        for child in value.values():
-            _collect_item_types(child, item_types)
-    elif isinstance(value, list):
-        for child in value:
-            _collect_item_types(child, item_types)
 
 
 def test_claude_events_render_markdown_and_lifecycle() -> None:
@@ -401,15 +380,14 @@ def test_known_codex_noise_is_ignored_but_unknown_methods_are_visible() -> None:
 
 
 def test_renderer_classification_sets_match_normalizer() -> None:
-    assert render_module._CODEX_RENDERED_METHODS == normalizer._CODEX_RENDERED_METHODS
-    assert render_module._CODEX_SUMMARIZED_METHODS == normalizer._CODEX_SUMMARIZED_METHODS
-    assert render_module._CODEX_IGNORED_METHODS == normalizer._CODEX_IGNORED_METHODS
-    assert render_module._CODEX_APPROVAL_METHODS == normalizer._CODEX_APPROVAL_METHODS
-    assert render_module._CLAUDE_IGNORED_TYPES == normalizer._CLAUDE_IGNORED_TYPES
+    assert render_module._CODEX_RENDERED_METHODS == _CODEX_RENDERED_METHODS
+    assert render_module._CODEX_SUMMARIZED_METHODS == _CODEX_SUMMARIZED_METHODS
+    assert render_module._CODEX_IGNORED_METHODS == _CODEX_IGNORED_METHODS
+    assert render_module._CODEX_APPROVAL_METHODS == _CODEX_APPROVAL_METHODS
+    assert render_module._CLAUDE_IGNORED_TYPES == _CLAUDE_IGNORED_TYPES
     authoritative_delta_methods = {
         method
-        for method in normalizer._CODEX_RENDERED_METHODS
-        | normalizer._CODEX_SUMMARIZED_METHODS
+        for method in _CODEX_RENDERED_METHODS | _CODEX_SUMMARIZED_METHODS
         if method.startswith("item/")
         and (
             method.endswith("Delta")
@@ -420,16 +398,16 @@ def test_renderer_classification_sets_match_normalizer() -> None:
     }
     assert render_module._CODEX_DELTA_METHODS == authoritative_delta_methods
 
-    for event_type in normalizer._CLAUDE_IGNORED_TYPES:
+    for event_type in _CLAUDE_IGNORED_TYPES:
         assert render_item(_item({"type": event_type})) == []
 
 
 def test_known_methods_and_item_starts_never_use_unknown_fallback() -> None:
     known_methods = (
-        normalizer._CODEX_RENDERED_METHODS
-        | normalizer._CODEX_SUMMARIZED_METHODS
-        | normalizer._CODEX_IGNORED_METHODS
-        | normalizer._CODEX_APPROVAL_METHODS
+        _CODEX_RENDERED_METHODS
+        | _CODEX_SUMMARIZED_METHODS
+        | _CODEX_IGNORED_METHODS
+        | _CODEX_APPROVAL_METHODS
     )
     for method in known_methods:
         if method == "item/started":
@@ -438,7 +416,7 @@ def test_known_methods_and_item_starts_never_use_unknown_fallback() -> None:
             render_item(_item({"method": method, "params": {}}))
         )
 
-    for item_type in _known_codex_item_types():
+    for item_type in CODEX_ITEM_TYPES:
         assert "[event] " not in _capture(
             render_item(
                 _item(

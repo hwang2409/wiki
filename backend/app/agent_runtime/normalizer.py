@@ -66,6 +66,20 @@ _CODEX_APPROVAL_METHODS = {
     "execCommandApproval",
     "applyPatchApproval",
 }
+CODEX_ITEM_TYPES = {
+    "agentMessage",
+    "collabAgentToolCall",
+    "collabToolCall",
+    "commandExecution",
+    "dynamicToolCall",
+    "fileChange",
+    "imageView",
+    "mcpToolCall",
+    "reasoning",
+    "userMessage",
+    "webSearch",
+}
+_CODEX_ITEM_METHODS = {"item/started", "item/completed"}
 
 
 def _codex_state(payload: dict[str, Any]) -> LifecycleState | None:
@@ -142,6 +156,14 @@ def _codex_moderation_is_warning(params: object) -> bool:
     return bool(_codex_moderation_flags(params))
 
 
+def _codex_item_method_kind(method: object, item: object) -> str:
+    if method in _CODEX_ITEM_METHODS and isinstance(item, dict):
+        item_type = item.get("type")
+        if item_type in CODEX_ITEM_TYPES:
+            return str(method).replace("/", "_")
+    return str(method).replace("/", "_")
+
+
 def _normalize_codex(payload: dict[str, Any]) -> NormalizedProviderEvent:
     method = payload.get("method")
     lifecycle = _codex_state(payload)
@@ -165,7 +187,7 @@ def _normalize_codex(payload: dict[str, Any]) -> NormalizedProviderEvent:
         kind = "turn_moderationMetadata_warning"
     elif method in _CODEX_RENDERED_METHODS:
         disposition = EventDisposition.RENDERED
-        kind = str(method).replace("/", "_")
+        kind = _codex_item_method_kind(method, item)
     elif method in _CODEX_SUMMARIZED_METHODS:
         disposition = EventDisposition.SUMMARIZED
         kind = str(method).replace("/", "_")
