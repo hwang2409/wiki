@@ -166,6 +166,34 @@ test("retry button on stale banner triggers immediate fetch and clears banner on
   expect(call).toBe(3);
 });
 
+test("ticket and cost failures render one stale label", async () => {
+  vi.useFakeTimers();
+  let ticketCalls = 0;
+  let costCalls = 0;
+  const fetchTickets = vi.fn(async (): Promise<DashboardTicketsPayload> => {
+    ticketCalls++;
+    if (ticketCalls > 1) throw new Error("ticket refresh failed");
+    return { tickets: [ticketRow({ ticket: "WIKI-42" })], repo_allowlist: [] };
+  });
+  const fetchCosts = vi.fn(async () => {
+    costCalls++;
+    if (costCalls > 1) throw new Error("cost refresh failed");
+    return EMPTY_COSTS;
+  });
+
+  render(<DashboardView fetchTickets={fetchTickets} fetchCosts={fetchCosts} pollMs={5_000} />);
+  await act(async () => {
+    await Promise.resolve();
+    await Promise.resolve();
+    await vi.advanceTimersByTimeAsync(5_100);
+    await Promise.resolve();
+    await Promise.resolve();
+  });
+
+  expect(screen.getAllByText("stale")).toHaveLength(1);
+  expect(screen.getByText(/Cost data: cost refresh failed/)).toBeTruthy();
+});
+
 test("zero-tickets state (loaded, empty) reads differently than a failed load", async () => {
   const fetchFn = vi.fn(async (): Promise<DashboardTicketsPayload> => ({
     tickets: [],
