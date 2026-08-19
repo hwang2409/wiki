@@ -28,7 +28,23 @@ const SERIF_TAIL =
   'Georgia, Charter, "Iowan Old Style", "Times New Roman", serif';
 
 export const MONO_FONTS: FontChoice[] = [
-  { label: "JetBrains Mono", family: "JetBrains Mono", stack: `"JetBrains Mono", ${MONO_TAIL}` },
+  {
+    label: "JetBrains Mono NL",
+    family: "JetBrains Mono NL",
+    stack:
+      '"JetBrains Mono NL", "JetBrainsMonoNL Nerd Font Mono", "JetBrainsMonoNL Nerd Font Propo", ' +
+      MONO_TAIL,
+  },
+  {
+    label: "JetBrainsMonoNL Nerd Font Mono",
+    family: "JetBrainsMonoNL Nerd Font Mono",
+    stack: `"JetBrainsMonoNL Nerd Font Mono", ${MONO_TAIL}`,
+  },
+  {
+    label: "JetBrainsMonoNL Nerd Font Propo",
+    family: "JetBrainsMonoNL Nerd Font Propo",
+    stack: `"JetBrainsMonoNL Nerd Font Propo", ${MONO_TAIL}`,
+  },
   { label: "Geist Mono", family: "Geist Mono", stack: `"Geist Mono", ${MONO_TAIL}` },
   { label: "Fira Code", family: "Fira Code", stack: `"Fira Code", ${MONO_TAIL}` },
   { label: "IBM Plex Mono", family: "IBM Plex Mono", stack: `"IBM Plex Mono", ${MONO_TAIL}` },
