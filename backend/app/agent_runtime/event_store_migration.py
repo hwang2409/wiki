@@ -47,6 +47,7 @@ def _rebuild_run_shards_from_raw(runtime_dir: Path) -> None:
     runs_dir = runtime_dir / "runs"
     if not runs_dir.is_dir():
         return
+    metadata = SQLiteMetadataStore(runtime_metadata_db_path(runtime_dir))
     for run_dir in sorted(runs_dir.iterdir()):
         if not run_dir.is_dir() or run_dir.is_symlink():
             continue
@@ -66,6 +67,7 @@ def _rebuild_run_shards_from_raw(runtime_dir: Path) -> None:
                 replay_raw_jsonl(
                     raw_path,
                     temporary,
+                    metadata,
                     run_id=run_id,
                     agent_id=agent_id,
                     provider=provider,
@@ -73,7 +75,7 @@ def _rebuild_run_shards_from_raw(runtime_dir: Path) -> None:
                     normalizer_version=NORMALIZER_VERSION,
                 )
             else:
-                rebuilt = SQLiteEventStore(temporary)
+                rebuilt = SQLiteEventStore(temporary, metadata)
                 rebuilt.create_run(
                     run_id,
                     agent_id=agent_id,
@@ -231,7 +233,9 @@ def _migrate_legacy_event_db(runtime_dir: Path) -> bool:
             target = runtime_event_db_path(runtime_path, run_id)
             if target.is_file():
                 try:
-                    existing = SQLiteEventStore(target, migrate=False)
+                    existing = SQLiteEventStore(
+                        target, metadata, migrate=False
+                    )
                     if (
                         existing.run_is_healthy(run_id)
                         and existing.rebuild_generation(run_id)
@@ -244,7 +248,7 @@ def _migrate_legacy_event_db(runtime_dir: Path) -> bool:
             temporary = target.with_name(f".{target.name}.migration")
             for suffix in ("", "-wal", "-shm"):
                 temporary.with_name(temporary.name + suffix).unlink(missing_ok=True)
-            SQLiteEventStore(temporary).ensure_schema()
+            SQLiteEventStore(temporary, metadata).ensure_schema()
             with connect_event_db(temporary) as destination:
                 destination.execute("ATTACH DATABASE ? AS legacy", (str(legacy_path),))
                 destination.executemany(

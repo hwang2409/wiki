@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import ast
 import errno
 import json
 import os
@@ -50,6 +51,54 @@ def test_event_store_modules_import_independently(module: str) -> None:
         check=False,
     )
     assert result.returncode == 0, result.stderr
+
+
+def test_event_store_module_dependency_graph_is_acyclic() -> None:
+    modules = {
+        "event_store_shard",
+        "event_store_metadata",
+        "event_store_migration",
+        "event_store_router",
+        "event_store",
+    }
+    dependencies: dict[str, set[str]] = {}
+    source_root = Path(__file__).resolve().parents[1] / "app" / "agent_runtime"
+    for module in modules:
+        tree = ast.parse(
+            (source_root / f"{module}.py").read_text(encoding="utf-8"),
+            filename=module,
+        )
+        found: set[str] = set()
+        for node in ast.walk(tree):
+            if isinstance(node, ast.ImportFrom) and node.level == 1:
+                imported_module = node.module
+                if imported_module in modules:
+                    found.add(imported_module)
+            elif isinstance(node, ast.Import):
+                found.update(
+                    alias.name.rsplit(".", 1)[-1]
+                    for alias in node.names
+                    if alias.name.rsplit(".", 1)[-1] in modules
+                )
+        dependencies[module] = found
+
+    assert not dependencies["event_store_shard"] & (modules - {"event_store_shard"})
+    visiting: set[str] = set()
+    visited: set[str] = set()
+
+    def visit(module: str) -> None:
+        if module in visiting:
+            raise AssertionError(f"event-store import cycle includes {module}")
+        if module in visited:
+            return
+        visiting.add(module)
+        for dependency in dependencies[module]:
+            visit(dependency)
+        visiting.remove(module)
+        visited.add(module)
+
+    for module in modules:
+        visit(module)
 
 
 def _raw(seq: int, method: str, params: dict, *, received_at: str) -> dict:

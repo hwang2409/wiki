@@ -15,7 +15,7 @@ from collections.abc import Iterator, Mapping
 from contextlib import contextmanager
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any
+from typing import Any, Protocol
 
 from .. import transcripts
 from . import store as runtime_store
@@ -34,6 +34,12 @@ NORMALIZER_VERSION = "wiki-282-1"
 
 _RUN_LOCKS: dict[tuple[str, str], threading.RLock] = {}
 _RUN_LOCKS_GUARD = threading.Lock()
+
+
+class MetadataStoreProtocol(Protocol):
+    """The metadata operations shared by every event-store shard."""
+
+    def __getattr__(self, name: str) -> Any: ...
 
 
 @dataclass(frozen=True)
@@ -751,19 +757,12 @@ class SQLiteEventStore:
     def __init__(
         self,
         path: Path | str,
+        metadata_store: MetadataStoreProtocol,
         *,
         migrate: bool = True,
-        metadata_path: Path | str | None = None,
     ) -> None:
-        from .event_store_metadata import SQLiteMetadataStore
-
         self.path = Path(path)
-        self.metadata_path = Path(metadata_path) if metadata_path is not None else None
-        self.metadata_store = (
-            SQLiteMetadataStore(self.metadata_path, migrate=migrate)
-            if self.metadata_path is not None
-            else None
-        )
+        self.metadata_store = metadata_store
         self._schema_ready = False
         self._schema_lock = threading.Lock()
         if migrate:
@@ -906,7 +905,7 @@ class SQLiteEventStore:
             runtime_dir = self.path.parents[2]
             child_store = SQLiteEventStore(
                 runtime_event_db_path(runtime_dir, child_run_id),
-                metadata_path=self.metadata_path,
+                self.metadata_store,
             )
             child_store.create_run(
                 child_run_id,
@@ -1215,7 +1214,9 @@ class SQLiteEventStore:
         dispositions: list[tuple[Any, ...]],
     ) -> dict[str, list[tuple[Any, ...]]]:
         with tempfile.TemporaryDirectory(prefix="wiki-282-health-") as directory:
-            expected = SQLiteEventStore(Path(directory) / "events.sqlite3")
+            expected = SQLiteEventStore(
+                Path(directory) / "events.sqlite3", self.metadata_store
+            )
             expected.create_run(
                 run_id,
                 agent_id=agent_id,
@@ -2178,6 +2179,7 @@ class SQLiteEventStore:
 def replay_raw_jsonl(
     raw_path: Path | str,
     database_path: Path | str,
+    metadata_store: MetadataStoreProtocol,
     *,
     run_id: str = "replay",
     agent_id: str = "replay",
@@ -2200,7 +2202,7 @@ def replay_raw_jsonl(
         if not rows:
             raise ValueError("cannot infer provider from an empty raw JSONL file")
         provider = rows[0].get("provider")
-    store = SQLiteEventStore(database_path)
+    store = SQLiteEventStore(database_path, metadata_store)
     store.create_run(
         run_id,
         agent_id=agent_id,

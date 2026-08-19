@@ -73,7 +73,7 @@ class EventStoreRouter:
         if len(run_paths) != 1:
             raise RuntimeError("select a run with RuntimeEventStore.for_run")
         store = SQLiteEventStore(
-            run_paths[0], migrate=False, metadata_path=self.metadata_path
+            run_paths[0], self.metadata_store, migrate=False
         )
         with store.connection(read_only=read_only) as connection:
             yield connection
@@ -83,8 +83,8 @@ class EventStoreRouter:
         if store is None:
             store = SQLiteEventStore(
                 runtime_event_db_path(self.runtime_dir, run_id),
+                self.metadata_store,
                 migrate=False,
-                metadata_path=self.metadata_path,
             )
             self._stores[run_id] = store
         return store
