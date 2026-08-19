@@ -38,6 +38,7 @@ import remarkGfm from "remark-gfm";
 import remarkMath from "remark-math";
 import { MarkdownPre, MarkdownTable, prepareTranscriptMarkdown, rehypeEscapeRawHtml } from "./markdown";
 import {
+  ApiError,
   cancelAgentModelChange,
   cancelQueuedMessage,
   getAgentModels,
@@ -146,6 +147,7 @@ import {
   clearInlineArtifactStates,
   loadOlderEvents,
   removePendingUserMessage,
+  pendingUserMessageIsAcknowledged,
   refreshTranscript,
   replaceTranscriptDesiredModel,
   replaceTranscriptQueue,
@@ -2543,6 +2545,7 @@ const MessageBlock = memo(function MessageBlock({
         <PendingUserMessageRow
           message={{
             id: event.pending_id,
+            requestId: event.pending_id,
             text: event.text,
             status: event.pending_status,
             mode: event.pending_mode,
@@ -2664,6 +2667,13 @@ function PendingUserMessageRow({
           <>
             <CircleCheck size={11} />
             <span>sent · waiting for transcript</span>
+          </>
+        ) : message.status === "uncertain" ? (
+          <>
+            <AlertTriangle size={11} />
+            <span title={message.error}>delivery uncertain</span>
+            <button type="button" onClick={() => onRetry?.(message)}>Verify delivery</button>
+            <button type="button" onClick={() => onEdit?.(message)}>Edit message</button>
           </>
         ) : (
           <>
@@ -2936,22 +2946,55 @@ type ScrollState = {
 
 async function deliverPendingMessage(
   ticket: string,
-  message: Pick<PendingUserMessage, "id" | "text" | "mode">,
+  message: Pick<PendingUserMessage, "id" | "text" | "mode" | "requestId">,
 ) {
-  const result = await sendAgentMessage(ticket, message.text, message.mode, message.id);
-  if (result.messages) {
-    replaceTranscriptQueue(ticket, result.messages, {
-      pendingId: message.id,
-      source: message.mode === "now" ? "auto" : "explicit",
-      text: message.text,
-      position: result.position,
+  if (activePendingDeliveries.has(message.id)) return;
+  activePendingDeliveries.add(message.id);
+  const controller = new AbortController();
+  const timeout = window.setTimeout(() => controller.abort(), 15_000);
+  try {
+    const result = await sendAgentMessage(
+      ticket,
+      message.text,
+      message.mode,
+      message.id,
+      undefined,
+      message.requestId,
+      controller.signal,
+    );
+    if (result.messages) {
+      replaceTranscriptQueue(ticket, result.messages, {
+        pendingId: message.id,
+        source: message.mode === "now" ? "auto" : "explicit",
+        text: message.text,
+        position: result.position,
+      });
+    }
+    if (result.status === "uncertain") {
+      updatePendingUserMessage(ticket, message.id, {
+        status: "uncertain",
+        error: "Delivery is uncertain. Verify it before sending again.",
+      });
+    } else if (result.status !== "queued") {
+      updatePendingUserMessage(ticket, message.id, { status: "sent", error: undefined });
+      refreshTranscript(ticket);
+    }
+  } catch (error) {
+    const uncertain = !(error instanceof ApiError) || error.status >= 500;
+    updatePendingUserMessage(ticket, message.id, {
+      status: uncertain ? "uncertain" : "failed",
+      error: uncertain
+        ? "Delivery is uncertain. Verify it before sending again."
+        : error.message,
     });
-  }
-  if (result.status !== "queued") {
-    updatePendingUserMessage(ticket, message.id, { status: "sent", error: undefined });
-    refreshTranscript(ticket);
+    throw error;
+  } finally {
+    window.clearTimeout(timeout);
+    activePendingDeliveries.delete(message.id);
   }
 }
+
+const activePendingDeliveries = new Set<string>();
 
 const composerStateCache = new Map<string, ComposerState>();
 const sessionUiStateCache = new Map<string, SessionUiState>();
@@ -3082,16 +3125,17 @@ export function SessionTab({
   const [retrying, setRetrying] = useState(false);
   const [pendingEditRequest, setPendingEditRequest] = useState<PendingUserMessage | null>(null);
   const retryPending = useCallback(async (message: PendingUserMessage) => {
-    retryPendingUserMessage(ticket, message.id);
     try {
+      if (message.status === "uncertain") {
+        await retryTranscript(target);
+        if (pendingUserMessageIsAcknowledged(ticket, message.id)) return;
+      }
+      retryPendingUserMessage(ticket, message.id);
       await deliverPendingMessage(ticket, message);
-    } catch (sendError) {
-      updatePendingUserMessage(ticket, message.id, {
-        status: "failed",
-        error: sendError instanceof Error ? sendError.message : "Send failed",
-      });
+    } catch {
+      // deliverPendingMessage preserves the delivery state and error detail.
     }
-  }, [ticket]);
+  }, [target, ticket]);
   const editPending = useCallback((message: PendingUserMessage) => {
     setPendingEditRequest(message);
   }, []);
@@ -3325,7 +3369,6 @@ export function SessionTab({
   const displayEvents = useMemo(
     () => {
       if (!session) return [];
-      const transcriptEvents = session.events.filter((event) => event.kind !== "claude_init");
       const pendingEvents: SessionEvent[] = pendingUserMessages.map((message, index) => ({
         id: 3_000_000 + index,
         kind: "user",
@@ -3339,7 +3382,7 @@ export function SessionTab({
       }));
       return [
         ...mergeComposerEvents(
-          applyComposerSources(transcriptEvents, session.composerMessages),
+          applyComposerSources(session.events, session.composerMessages),
           composerMessageEvents(session),
         ),
         ...pendingEvents,
@@ -4622,7 +4665,7 @@ function MessageComposer({
   }
 
   async function deliverPending(
-    message: Pick<PendingUserMessage, "id" | "text" | "mode">,
+    message: Pick<PendingUserMessage, "id" | "requestId" | "text" | "mode">,
   ) {
     setBusy(true);
     setError(null);
@@ -4630,10 +4673,7 @@ function MessageComposer({
       await deliverPendingMessage(ticket, message);
       historyPosRef.current = null;
     } catch (err) {
-      updatePendingUserMessage(ticket, message.id, {
-        status: "failed",
-        error: err instanceof Error ? err.message : "Send failed",
-      });
+      setError(err instanceof Error ? err.message : "Send failed");
     } finally {
       setBusy(false);
     }
@@ -4651,6 +4691,7 @@ function MessageComposer({
     rememberSelection(0);
     const message = {
       id: crypto.randomUUID(),
+      requestId: crypto.randomUUID(),
       text: value,
       mode,
     };

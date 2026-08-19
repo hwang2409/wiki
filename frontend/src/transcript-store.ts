@@ -17,6 +17,8 @@ import {
 import { mergeQueueSources, mergeSession, prependOlderEvents } from "./transcript-merge";
 
 const POLL_MS = 2500;
+const PENDING_RECOVERY_MS = 30_000;
+const ENTRY_RETENTION_MS = 60_000;
 
 export type TranscriptTarget =
   | { mode: "live"; ticket: string; subagent?: string; archivedAt?: never }
@@ -88,8 +90,9 @@ export type PanelState = {
 
 export type PendingUserMessage = {
   id: string;
+  requestId: string;
   text: string;
-  status: "sending" | "sent" | "failed";
+  status: "sending" | "sent" | "uncertain" | "failed";
   mode: "now" | "on-idle";
   firstSeenTs: number;
   eventIdFloor: number;
@@ -114,6 +117,7 @@ type Entry = {
   inFlight: Promise<void> | null;
   dirty: boolean;
   lastLoadedAt: number;
+  cleanupHandle: number | null;
 };
 
 const entries = new Map<string, Entry>();
@@ -200,6 +204,7 @@ function createEntry(target: TranscriptTarget): Entry {
     inFlight: null,
     dirty: false,
     lastLoadedAt: 0,
+    cleanupHandle: null,
   };
 }
 
@@ -250,7 +255,21 @@ function reconcilePendingUserMessages(
   }
   // Text matching is only a fallback for providers without durable ids. One
   // event consumes one optimistic row, so identical sends remain FIFO-safe.
-  return remaining.length === pending.length ? pending : remaining;
+  if (remaining.length === 0) return remaining;
+  const now = Date.now();
+  return remaining.map((message) => {
+    if (
+      message.status === "sent" &&
+      now - message.firstSeenTs >= PENDING_RECOVERY_MS
+    ) {
+      return {
+        ...message,
+        status: "uncertain" as const,
+        error: "Delivery is uncertain. Verify it before sending again.",
+      };
+    }
+    return message;
+  });
 }
 
 function getEntry(target: TranscriptTarget): Entry {
@@ -260,6 +279,19 @@ function getEntry(target: TranscriptTarget): Entry {
   const created = createEntry(target);
   entries.set(key, created);
   return created;
+}
+
+function scheduleEntryCleanup(entry: Entry) {
+  if (entry.cleanupHandle !== null) return;
+  entry.cleanupHandle = window.setTimeout(() => {
+    entry.cleanupHandle = null;
+    if (entry.listeners.size > 0 || entry.pollers.size > 0) return;
+    if (entry.inFlight) {
+      scheduleEntryCleanup(entry);
+      return;
+    }
+    entries.delete(entry.key);
+  }, ENTRY_RETENTION_MS);
 }
 
 function emit(entry: Entry) {
@@ -382,12 +414,17 @@ function shouldRefreshImmediately(entry: Entry): boolean {
 
 function subscribeEntry(target: TranscriptTarget, listener: Listener) {
   const entry = getEntry(target);
+  if (entry.cleanupHandle !== null) {
+    window.clearTimeout(entry.cleanupHandle);
+    entry.cleanupHandle = null;
+  }
   entry.listeners.add(listener);
   if (!entry.snapshot.session && !entry.inFlight) {
     void fetchEntry(entry);
   }
   return () => {
     entry.listeners.delete(listener);
+    if (entry.listeners.size === 0 && entry.pollers.size === 0) scheduleEntryCleanup(entry);
   };
 }
 
@@ -399,6 +436,9 @@ function setPolling(target: TranscriptTarget, subscriberId: string, polling: boo
   const entry = getEntry(target);
   if (polling) entry.pollers.add(subscriberId);
   else entry.pollers.delete(subscriberId);
+  if (!polling && entry.listeners.size === 0 && entry.pollers.size === 0) {
+    scheduleEntryCleanup(entry);
+  }
   setPollerState();
   if (polling && shouldRefreshImmediately(entry)) {
     void fetchEntry(entry);
@@ -447,6 +487,14 @@ export function retryTranscript(target: TranscriptTarget): Promise<void> {
   const entry = getEntry(target);
   entry.dirty = true;
   return fetchEntry(entry);
+}
+
+export function pendingUserMessageIsAcknowledged(ticket: string, pendingId: string): boolean {
+  const entry = getEntry({ mode: "live", ticket });
+  return Boolean(
+    entry.snapshot.session?.events.some((event) => event.pending_id === pendingId) ||
+    entry.snapshot.session?.composerMessages.some((message) => message.pending_id === pendingId),
+  );
 }
 
 export function refreshTranscript(ticket: string) {
@@ -511,7 +559,7 @@ export function replaceTranscriptQueue(
 
 export function addPendingUserMessage(
   ticket: string,
-  message: Pick<PendingUserMessage, "id" | "text" | "mode">,
+  message: Pick<PendingUserMessage, "id" | "requestId" | "text" | "mode">,
 ) {
   const entry = getEntry({ mode: "live", ticket });
   const events = entry.snapshot.session?.events ?? [];
@@ -558,7 +606,6 @@ export function retryPendingUserMessage(ticket: string, id: string) {
       ...message,
       status: "sending" as const,
       error: undefined,
-      firstSeenTs: Date.now(),
       eventIdFloor,
     };
   });

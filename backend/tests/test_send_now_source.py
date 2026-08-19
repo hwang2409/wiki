@@ -273,6 +273,19 @@ class SendNowSourceTests(unittest.IsolatedAsyncioTestCase):
             after_lifecycle.unread_event_seq, pre_lifecycle.unread_event_seq
         )
 
+        # 3b. Provider startup metadata is retained but does not create an
+        # unread marker without a visible transcript row.
+        pre_init = self.store.get(run_id)
+        self.store.append_normalized(
+            run_id,
+            raw_seq=pre_init.raw_event_count,
+            disposition=EventDisposition.RENDERED,
+            kind="claude_init",
+            payload={"type": "system", "subtype": "init"},
+        )
+        after_init = self.store.get(run_id)
+        self.assertEqual(after_init.unread_event_seq, pre_init.unread_event_seq)
+
         # 4. Henry-typed user echo (unsourced) also does not advance unread —
         # Henry just sent it, so it can't be "unread" for him.
         pre_henry = self.store.get(run_id)

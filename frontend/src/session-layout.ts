@@ -76,6 +76,7 @@ function firstChangedRef<T>(previous: T[], next: T[]): number {
 // Mirrors the render layer: traceRows drops text-less thinking events and
 // payload-less tool events; an empty assistant body renders an empty div.
 export function eventRendersRow(event: SessionEvent): boolean {
+  if (event.kind === "claude_init") return false;
   if (event.kind === "thinking") return Boolean(event.text);
   if (event.kind === "tool") return Boolean(event.tool);
   if (event.kind === "assistant") return event.text.trim().length > 0;
