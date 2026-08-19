@@ -12,6 +12,7 @@ from rich.console import Console
 from rich.markdown import Markdown
 from rich.text import Text
 
+from backend.app.agent_runtime import normalizer
 from backend.app.agent_runtime.normalizer import (
     CODEX_ITEM_TYPES,
     _CLAUDE_IGNORED_TYPES,
@@ -441,8 +442,71 @@ def test_normalizer_handles_malformed_codex_item_types(item_type: object) -> Non
         },
     )
 
+    assert normalized.disposition is EventDisposition.UNKNOWN
+    assert normalized.kind == "item/started"
+
+
+@pytest.mark.parametrize("item_type", sorted(CODEX_ITEM_TYPES))
+def test_normalizer_known_codex_item_types_are_rendered(item_type: str) -> None:
+    normalized = normalize_provider_event(
+        ProviderKind.CODEX,
+        {
+            "method": "item/started",
+            "params": {"item": {"type": item_type}},
+        },
+    )
+
     assert normalized.disposition is EventDisposition.RENDERED
     assert normalized.kind == "item_started"
+
+
+def test_normalizer_item_type_set_controls_dispatch(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    item_types = CODEX_ITEM_TYPES.copy()
+    item_type = next(iter(item_types))
+    item_types.remove(item_type)
+    monkeypatch.setattr(normalizer, "CODEX_ITEM_TYPES", item_types)
+
+    normalized = normalize_provider_event(
+        ProviderKind.CODEX,
+        {
+            "method": "item/started",
+            "params": {"item": {"type": item_type}},
+        },
+    )
+
+    assert normalized.disposition is EventDisposition.UNKNOWN
+
+
+@pytest.mark.parametrize("method", ["item/started", "item/completed"])
+@pytest.mark.parametrize("item_type", [{}, []])
+def test_renderer_handles_unhashable_codex_item_types(
+    method: str, item_type: object
+) -> None:
+    rendered = render_item(
+        _item(
+            {
+                "method": method,
+                "params": {"item": {"type": item_type}},
+            }
+        )
+    )
+
+    assert rendered
+
+
+def test_codex_moderation_warning_is_visible() -> None:
+    rendered = render_item(
+        _item(
+            {
+                "method": "turn/moderationMetadata",
+                "params": {"flags": {"violence": True}},
+            }
+        )
+    )
+
+    assert "[warning]" in _capture(rendered)
 
 
 def test_native_tool_lines_include_inputs_and_results() -> None:

@@ -338,7 +338,11 @@ def render_codex(raw: Mapping[str, Any], verbose: bool = False) -> list[Renderab
     elif method == "item/started":
         item = params.get("item")
         item_type = item.get("type") if isinstance(item, Mapping) else None
-        item_renderer = _CODEX_ITEM_STARTED_RENDERERS.get(item_type)
+        item_renderer = (
+            _CODEX_ITEM_STARTED_RENDERERS.get(item_type)
+            if isinstance(item_type, str)
+            else None
+        )
         if item_renderer is _IGNORED_CODEX_ITEM_START:
             pass
         elif item_renderer is not None and isinstance(item, Mapping):
@@ -350,7 +354,7 @@ def render_codex(raw: Mapping[str, Any], verbose: bool = False) -> list[Renderab
     elif method == "item/completed":
         item = params.get("item") if isinstance(params.get("item"), Mapping) else {}
         item_type = item.get("type")
-        if item_type in _NATIVE_TOOL_TYPES:
+        if isinstance(item_type, str) and item_type in _NATIVE_TOOL_TYPES:
             rendered.append(_native_tool_result_line(item))
         elif item_type == "agentMessage":
             text = str(item.get("text") or "")
@@ -379,6 +383,10 @@ def render_codex(raw: Mapping[str, Any], verbose: bool = False) -> list[Renderab
             params.get("status") if isinstance(params.get("status"), Mapping) else {}
         )
         rendered.append(_line("[status] ", status.get("type") or "?", "dim"))
+    elif method == "turn/moderationMetadata" and normalizer._codex_moderation_is_warning(
+        params
+    ):
+        rendered.append(_line("[warning] ", params, "yellow"))
     elif method in _CODEX_SILENT_METHODS or method in _CODEX_SUMMARIZED_METHODS:
         pass
     elif method in _CODEX_IGNORED_METHODS:

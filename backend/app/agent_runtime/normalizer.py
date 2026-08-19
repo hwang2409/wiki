@@ -19,8 +19,6 @@ _CODEX_RENDERED_METHODS = {
     "thread/started",
     "turn/started",
     "turn/completed",
-    "item/started",
-    "item/completed",
     "item/fileChange/outputDelta",
     "item/commandExecution/outputDelta",
     "item/mcpToolCall/outputDelta",
@@ -190,6 +188,9 @@ def _normalize_codex(payload: dict[str, Any]) -> NormalizedProviderEvent:
     ):
         disposition = EventDisposition.RENDERED
         kind = str(method).replace("/", "_")
+    elif method in _CODEX_ITEM_METHODS:
+        disposition = EventDisposition.UNKNOWN
+        kind = str(method or "unknown")
     elif method in _CODEX_RENDERED_METHODS:
         disposition = EventDisposition.RENDERED
         kind = str(method).replace("/", "_")
