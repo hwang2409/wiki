@@ -18,28 +18,81 @@ _CODEX_ERROR_METHODS = {
     "provider/processExited",
     "wk.codex.tool_policy_unavailable",
 }
-_IGNORED_CODEX_METHODS = {
-    "item/agentMessage/delta",
+# These sets mirror backend/app/agent_runtime/normalizer.py. The renderer tests
+# compare them directly so provider classifications cannot drift silently.
+_CODEX_RENDERED_METHODS = {
+    "thread/started",
+    "turn/started",
+    "turn/completed",
+    "item/started",
+    "item/completed",
+    "item/fileChange/outputDelta",
     "item/commandExecution/outputDelta",
+    "item/mcpToolCall/outputDelta",
+    "item/dynamicToolCall/outputDelta",
     "item/commandExecution/terminalInteraction",
     "item/delta",
-    "item/dynamicToolCall/outputDelta",
-    "item/fileChange/outputDelta",
-    "item/mcpToolCall/outputDelta",
-    "item/reasoning/summaryPartAdded",
-    "item/reasoning/summaryTextDelta",
-    "item/userMessage",
-    "hook/completed",
-    "hook/started",
-    "mcpServer/startupStatus/updated",
-    "rawResponse/completed",
-    "rawResponseItem/completed",
-    "remoteControl/status/changed",
+    "turn/diff/updated",
+    "warning",
+    "skills/changed",
+    "turn/plan/updated",
+    "error",
+    "account/rateLimits/updated",
+    "context/compacted",
+    "account/chatgptAuthTokens/refresh",
+    "serverRequest/resolved",
+    "thread/archived",
     "thread/closed",
-    "thread/goal/cleared",
-    "thread/settings/updated",
+}
+_CODEX_SUMMARIZED_METHODS = {
+    "item/agentMessage/delta",
+    "item/reasoning/summaryTextDelta",
+    "item/reasoning/summaryPartAdded",
+    "hook/started",
+    "hook/completed",
     "thread/tokenUsage/updated",
+    "thread/status/changed",
+}
+_CODEX_IGNORED_METHODS = {
+    "rawResponseItem/completed",
+    "rawResponse/completed",
+    "mcpServer/startupStatus/updated",
+    "remoteControl/status/changed",
+    "thread/settings/updated",
+    "thread/goal/cleared",
     "turn/moderationMetadata",
+}
+_CODEX_APPROVAL_METHODS = {
+    "item/commandExecution/requestApproval",
+    "item/fileChange/requestApproval",
+    "item/permissions/requestApproval",
+    "item/tool/requestUserInput",
+    "mcpServer/elicitation/request",
+    "execCommandApproval",
+    "applyPatchApproval",
+}
+_CLAUDE_IGNORED_TYPES = {
+    "ai-title",
+    "file-history-snapshot",
+    "last-prompt",
+    "mode",
+    "queue-operation",
+    "started",
+}
+_CODEX_DELTA_METHODS = {
+    "item/agentMessage/delta",
+    "item/reasoning/summaryTextDelta",
+    "item/reasoning/summaryPartAdded",
+    "item/fileChange/outputDelta",
+    "item/commandExecution/outputDelta",
+    "item/mcpToolCall/outputDelta",
+    "item/dynamicToolCall/outputDelta",
+    "item/commandExecution/terminalInteraction",
+    "item/delta",
+}
+_CODEX_SILENT_METHODS = _CODEX_DELTA_METHODS | {
+    "item/userMessage",
+    "thread/closed",
 }
 _IGNORED_CODEX_ITEM_STARTED_TYPES = {
     "agentMessage",
@@ -235,7 +288,9 @@ def render_claude(
 
     kind = str(raw.get("type") or "")
     rendered: list[RenderableType] = []
-    if kind == "system":
+    if kind in _CLAUDE_IGNORED_TYPES:
+        pass
+    elif kind == "system":
         subtype = str(raw.get("subtype") or "")
         if subtype == "init":
             rendered.append(
@@ -315,6 +370,8 @@ def render_codex(raw: Mapping[str, Any], verbose: bool = False) -> list[Renderab
                 params.get("arguments"),
             )
         )
+    elif method in _CODEX_APPROVAL_METHODS or method == "serverRequest/resolved":
+        rendered.append(_line("[approval] ", params, "yellow"))
     elif method == "item/started":
         item = params.get("item")
         if isinstance(item, Mapping) and item.get("type") in _NATIVE_TOOL_TYPES:
@@ -358,7 +415,13 @@ def render_codex(raw: Mapping[str, Any], verbose: bool = False) -> list[Renderab
             params.get("status") if isinstance(params.get("status"), Mapping) else {}
         )
         rendered.append(_line("[status] ", status.get("type") or "?", "dim"))
-    elif method not in _IGNORED_CODEX_METHODS:
+    elif method in _CODEX_SILENT_METHODS or method in _CODEX_SUMMARIZED_METHODS:
+        pass
+    elif method in _CODEX_IGNORED_METHODS:
+        pass
+    elif method in _CODEX_RENDERED_METHODS:
+        rendered.append(_line("[event] ", method, "dim"))
+    else:
         rendered.append(_line("[event] ", method or dict(raw), "dim"))
     return _append_verbose(rendered, raw, verbose)
 

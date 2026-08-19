@@ -12,6 +12,8 @@ from rich.console import Console
 from rich.markdown import Markdown
 from rich.text import Text
 
+from backend.app.agent_runtime import normalizer
+from backend.app.agent_runtime.wk_tui import render as render_module
 from backend.app.agent_runtime.wk_tui.render import render_event, render_item
 
 
@@ -355,6 +357,20 @@ def test_known_codex_noise_is_ignored_but_unknown_methods_are_visible() -> None:
     assert "[event] item/started" in _capture(
         render_item(_item({"method": "item/started", "params": {"item": {"type": "new"}}}))
     )
+
+
+def test_renderer_classification_sets_match_normalizer() -> None:
+    assert render_module._CODEX_RENDERED_METHODS == normalizer._CODEX_RENDERED_METHODS
+    assert render_module._CODEX_SUMMARIZED_METHODS == normalizer._CODEX_SUMMARIZED_METHODS
+    assert render_module._CODEX_IGNORED_METHODS == normalizer._CODEX_IGNORED_METHODS
+    assert render_module._CODEX_APPROVAL_METHODS == normalizer._CODEX_APPROVAL_METHODS
+    assert render_module._CLAUDE_IGNORED_TYPES == normalizer._CLAUDE_IGNORED_TYPES
+    assert render_module._CODEX_DELTA_METHODS <= (
+        normalizer._CODEX_RENDERED_METHODS | normalizer._CODEX_SUMMARIZED_METHODS
+    )
+
+    for event_type in normalizer._CLAUDE_IGNORED_TYPES:
+        assert render_item(_item({"type": event_type})) == []
 
 
 def test_native_tool_lines_include_inputs_and_results() -> None:
