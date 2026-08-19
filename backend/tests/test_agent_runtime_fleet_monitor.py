@@ -700,6 +700,65 @@ class FleetMonitorTests(unittest.IsolatedAsyncioTestCase):
         )
         self.assertNotEqual(first_stalls[0].dedupe_key, second_stalls[0].dedupe_key)
 
+    async def test_graph_health_stall_resets_after_worker_replacement(self) -> None:
+        await self._spawn("WIKI-ORCH", role="orchestrator", orch=None)
+        worker = await self._spawn("WIKI-929", role="implement", orch="WIKI-ORCH")
+        stale_activity = self.clock.now - 2000
+        _set_created_at(self.store, worker, stale_activity - 1)
+        _write_status(
+            self.store,
+            worker.agent_id,
+            {"state": "working", "pr": None, "step": "coding", "blocker": None},
+            mtime=stale_activity,
+        )
+        graph = self._graph(
+            "WIKI-929",
+            edges=[self._graph_edge("spawn", self.clock.now - 1801, to="WIKI-929")],
+        )
+        escalations: list[dict] = []
+
+        def record_escalation(**payload):
+            escalations.append(payload)
+            ack = Future()
+            ack.set_result(None)
+            return ack
+
+        with self._patch_graph(graph), mock.patch(
+            "backend.app.workgraph_service.record_escalation",
+            side_effect=record_escalation,
+        ):
+            first = await self.monitor.tick()
+            replacement = await self.supervisor.replace(worker.run_id, "replacement")
+            _write_status(
+                self.store,
+                replacement.agent_id,
+                {"state": "working", "pr": None, "step": "coding", "blocker": None},
+                mtime=self.clock.now,
+            )
+            fresh = await self.monitor.tick()
+            graph["edges"].append(
+                self._graph_edge("spawn", self.clock.now - 1801, to=replacement.agent_id)
+            )
+            _write_status(
+                self.store,
+                replacement.agent_id,
+                {"state": "working", "pr": None, "step": "coding", "blocker": None},
+                mtime=self.clock.now - 2000,
+            )
+            second = await self.monitor.tick()
+
+        first_stalls = [note for note in first if note.event_type == "graph-health-stall"]
+        self.assertNotEqual(worker.run_id, replacement.run_id)
+        self.assertEqual(len(first_stalls), 1)
+        self.assertNotIn("graph-health-stall", {note.event_type for note in fresh})
+        second_stalls = [note for note in second if note.event_type == "graph-health-stall"]
+        self.assertEqual(len(second_stalls), 1)
+        self.assertEqual(len(escalations), 2)
+        self.assertNotEqual(
+            escalations[0]["request_id"], escalations[1]["request_id"]
+        )
+        self.assertNotEqual(first_stalls[0].dedupe_key, second_stalls[0].dedupe_key)
+
     async def test_graph_health_stall_ignores_api_failures_but_accepts_progress(self) -> None:
         await self._spawn("WIKI-ORCH", role="orchestrator", orch=None)
         worker = await self._spawn("WIKI-928", role="implement", orch="WIKI-ORCH")

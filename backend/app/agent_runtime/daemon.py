@@ -11,6 +11,8 @@ import traceback
 from pathlib import Path
 from typing import BinaryIO
 
+from ..nofile_limit import raise_nofile_limit
+from .autopilot import AutopilotController
 from .factory import RealAdapterFactory
 from .fake import FixtureAdapterFactory
 from .fleet_monitor import FleetMonitor
@@ -18,12 +20,9 @@ from .fleet_monitor_ids import (
     fleet_monitor_message_dedupe_key,
     fleet_monitor_request_id,
 )
-from .autopilot import AutopilotController
-from ..nofile_limit import raise_nofile_limit
 from .protocol import UnixSupervisorServer
 from .store import RunStore, RuntimePaths
 from .supervisor import Supervisor
-
 
 def build_fleet_monitor_dispatch(supervisor: Supervisor):
     """Return the durable dispatch callable that ``FleetMonitor`` uses.

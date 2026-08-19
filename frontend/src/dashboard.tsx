@@ -343,7 +343,7 @@ export function DashboardView({
       ) : null}
       {costError && costs ? (
         <div className="dashboard-stale" role="status">
-          <span className="dashboard-stale-label">stale</span>
+          {!error || !tickets ? <span className="dashboard-stale-label">stale</span> : null}
           <span className="dashboard-stale-body">Cost data: {costError}</span>
           <Button
             type="button"

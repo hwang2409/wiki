@@ -4123,13 +4123,21 @@ Preserve the same identity, role, worktree, orchestrator grouping, PR gates, and
         for snapshot in snapshots:
             if snapshot.run_id in self.materializer_failed_runs:
                 continue
-            if snapshot.provider is ProviderKind.CODEX:
-                async with self.codex_fleet_lock:
-                    async with self._agent_lock(snapshot.agent_id):
-                        results.append(await self._recover_run(snapshot.run_id))
+            try:
+                if snapshot.provider is ProviderKind.CODEX:
+                    async with self.codex_fleet_lock:
+                        async with self._agent_lock(snapshot.agent_id):
+                            results.append(await self._recover_run(snapshot.run_id))
+                    continue
+                async with self._agent_lock(snapshot.agent_id):
+                    results.append(await self._recover_run(snapshot.run_id))
+            except RunNotFound:
+                logger.info(
+                    "recovery skipped missing run agent_id=%s run_id=%s",
+                    snapshot.agent_id,
+                    snapshot.run_id,
+                )
                 continue
-            async with self._agent_lock(snapshot.agent_id):
-                results.append(await self._recover_run(snapshot.run_id))
         return results
 
     async def _handover_preflight(self) -> list[str]:
