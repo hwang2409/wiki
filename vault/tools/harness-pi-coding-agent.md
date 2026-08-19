@@ -2,10 +2,17 @@
 type: reference
 tags: [tools, agents, harness]
 created: 2026-07-21
-updated: 2026-07-21
+updated: 2026-08-19
 ---
 
 # Harness: Pi (coding-agent) internals
+
+## Current source check (2026-08-19)
+
+- Pi at `496185f` owns its provider transport. `ModelRuntime` composes built-ins, `models.json`, and extensions; it resolves auth per request and passes model, base URL, headers, and credentials to a Pi API adapter.
+- OpenAI Codex uses Pi's direct `openai-codex-responses` client against `https://chatgpt.com/backend-api`; it streams over WebSocket with SSE fallback. Claude uses Pi's direct `anthropic-messages` client, including OAuth identity headers. Pi does not drive Codex App Server or the Claude Agent SDK.
+- Auth priority is request override, stored `~/.pi/agent/auth.json`, then ambient credentials. OAuth refreshes under a credential-store lock. Source: https://github.com/earendil-works/pi/tree/496185f/packages/ai and https://pi.dev/docs/latest/providers.
+- The default interactive tool set is `read`, `bash`, `edit`, and `write`. `grep`, `find`, and `ls` remain available factory tools, not defaults. This corrects the older seven-tool summary below.
 
 Source: `misc/open-docs/docs/coding-agent/` (single-pass mining 2026-07-21, workflow `open-docs-harness-mining`). Not adversarially verified — treat as "docs claim X", not first-hand code audit.
 
