@@ -2779,7 +2779,7 @@ const VirtualSessionRow = memo(function VirtualSessionRow({
   uiState: SessionUiState;
 }) {
   const rowRef = useMeasuredRow(row, onHeightChange);
-  const style: CSSProperties = { transform: `translateY(${top}px)` };
+  const style: CSSProperties = { top: `${top}px` };
   const ts = showTimestamp ? rowTimestamp(row) : null;
   const isActivity = row.event.kind === "tool" || row.event.kind === "thinking";
   return (

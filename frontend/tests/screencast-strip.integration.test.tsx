@@ -179,7 +179,7 @@ describe("ScreencastStrip spec", () => {
     expect(rule).toMatch(/\bmin-height:\s*calc\(var\(--fleet-screencast-lines\)/);
     expect(rule).toMatch(/\bmax-height:\s*calc\(var\(--fleet-screencast-lines\)/);
     expect(rule).toMatch(/\boverflow:\s*hidden/);
-    expect(rule).toMatch(/\bcontain:\s*layout paint size/);
+    expect(rule).toMatch(/\bcontain:\s*layout size/);
   });
 
   test("rendered strip has a bounded tape element with no inline size override", async () => {
