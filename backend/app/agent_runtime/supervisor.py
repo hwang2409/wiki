@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import asyncio
 from contextlib import asynccontextmanager
+from concurrent.futures import ThreadPoolExecutor
+from functools import partial
 import json
 import logging
 import math
@@ -474,6 +476,13 @@ class Supervisor:
         ] = {}
         self._deferred_provider_event_barriers: dict[str, asyncio.Future[None]] = {}
         self.agent_locks: dict[str, asyncio.Lock] = {}
+        self.archive_executor = ThreadPoolExecutor(
+            max_workers=1,
+            thread_name_prefix="wiki-archive",
+        )
+        self.archive_inflight: set[str] = set()
+        self.archive_inflight_agents: dict[str, str] = {}
+        self.archive_tasks: set[asyncio.Task[Any]] = set()
         self.handover_condition = asyncio.Condition()
         self.active_run_mutations = 0
         self.handover_pending = False
@@ -717,6 +726,7 @@ class Supervisor:
         )
     def _runtime_status(self, record: RunRecord) -> dict[str, Any]:
         value = _public_run(record)
+        value["archive_in_progress"] = record.run_id in self.archive_inflight
         value["composer_messages"] = self.store.composer_messages_for_run(
             record.run_id
         )
@@ -807,7 +817,17 @@ class Supervisor:
         return self.agent_locks.setdefault(agent_id, asyncio.Lock())
 
     def _run_lock(self, run_id: str) -> asyncio.Lock:
+        if run_id in self.archive_inflight:
+            raise StoreConflict("archive is already in progress")
         return self._agent_lock(self.store.get(run_id).agent_id)
+
+    def _reject_archive_inflight(self, params: Mapping[str, Any]) -> None:
+        run_id = params.get("run_id")
+        agent_id = params.get("agent_id")
+        if isinstance(run_id, str) and run_id in self.archive_inflight:
+            raise StoreConflict("archive is already in progress")
+        if isinstance(agent_id, str) and agent_id in self.archive_inflight_agents:
+            raise StoreConflict("archive is already in progress")
 
     @asynccontextmanager
     async def _run_mutation_admission(self, *, wait_for_handover: bool = False):
@@ -5162,6 +5182,102 @@ Preserve the same identity, role, worktree, orchestrator grouping, PR gates, and
         command_hash: str | None = None,
         command_hash_payload: Mapping[str, Any] | None = None,
     ) -> RunRecord:
+        if run_id in self.archive_inflight:
+            raise StoreConflict("archive is already in progress")
+        record = self.store.get(run_id)
+        task = asyncio.current_task()
+        if task is not None:
+            self.archive_tasks.add(task)
+        self.archive_inflight.add(run_id)
+        self.archive_inflight_agents[record.agent_id] = run_id
+        try:
+            return await self._archive_locked(
+                run_id,
+                outcome=outcome,
+                effect_id=effect_id,
+                command_hash=command_hash,
+                command_hash_payload=command_hash_payload,
+            )
+        finally:
+            self.archive_inflight.discard(run_id)
+            if self.archive_inflight_agents.get(record.agent_id) == run_id:
+                self.archive_inflight_agents.pop(record.agent_id, None)
+            if task is not None:
+                self.archive_tasks.discard(task)
+
+    async def _archive_finalize(
+        self,
+        run_id: str,
+        *,
+        outcome: str | None = None,
+        effect_id: str | None = None,
+        command_hash: str | None = None,
+        command_hash_payload: Mapping[str, Any] | None = None,
+    ) -> tuple[RunRecord, Path]:
+        loop = asyncio.get_running_loop()
+        future = loop.run_in_executor(
+            self.archive_executor,
+            partial(
+                self._archive_finalize_sync,
+                run_id,
+                outcome=outcome,
+                effect_id=effect_id,
+                command_hash=command_hash,
+                command_hash_payload=command_hash_payload,
+            ),
+        )
+
+        async def wait_for_archive() -> tuple[RunRecord, Path]:
+            return await asyncio.shield(future)
+
+        return await self._await_cleanup(wait_for_archive())
+
+    def _archive_finalize_sync(
+        self,
+        run_id: str,
+        *,
+        outcome: str | None = None,
+        effect_id: str | None = None,
+        command_hash: str | None = None,
+        command_hash_payload: Mapping[str, Any] | None = None,
+    ) -> tuple[RunRecord, Path]:
+        archived, session_dir = self.store.archive_current(run_id, outcome=outcome)
+        self.event_store.close_run(run_id)
+        self._record_archive_edge(archived, outcome)
+        if effect_id is not None:
+            effect_payload: dict[str, Any] = {
+                "agent_id": archived.agent_id,
+                "run_id": run_id,
+                "outcome": outcome,
+                "request_id": effect_id,
+                "method": "run/archive",
+            }
+            if command_hash_payload is not None:
+                effect_payload["command_hash_payload"] = dict(command_hash_payload)
+            self.store.command_log.complete_effect(
+                AgentCommand(
+                    "run/archive",
+                    archived.agent_id,
+                    effect_id,
+                    effect_payload,
+                ),
+                {
+                    **_public_run(archived),
+                    "_workgraph_archive_recorded": True,
+                },
+                command_hash=command_hash,
+            )
+        return archived, session_dir
+
+    async def _archive_locked(
+        self,
+        run_id: str,
+        *,
+        outcome: str | None = None,
+        effect_id: str | None = None,
+        command_hash: str | None = None,
+        command_hash_payload: Mapping[str, Any] | None = None,
+    ) -> RunRecord:
         adapter = self.adapters.get(run_id)
         if adapter is None:
             record = self.store.get(run_id)
@@ -5209,34 +5325,13 @@ Preserve the same identity, role, worktree, orchestrator grouping, PR gates, and
                     LifecycleState.COMPLETED,
                     reason="archived",
                 )
-            archived, _ = self.store.archive_current(run_id, outcome=outcome)
-            self.event_store.close_run(run_id)
-            self._record_archive_edge(archived, outcome)
-            if effect_id is not None:
-                effect_payload = {
-                    "agent_id": archived.agent_id,
-                    "run_id": run_id,
-                    "outcome": outcome,
-                    "request_id": effect_id,
-                    "method": "run/archive",
-                }
-                if command_hash_payload is not None:
-                    effect_payload["command_hash_payload"] = dict(
-                        command_hash_payload
-                    )
-                self.store.command_log.complete_effect(
-                    AgentCommand(
-                        "run/archive",
-                        archived.agent_id,
-                        effect_id,
-                        effect_payload,
-                    ),
-                    {
-                        **_public_run(archived),
-                        "_workgraph_archive_recorded": True,
-                    },
-                    command_hash=command_hash,
-                )
+            archived, _ = await self._archive_finalize(
+                run_id,
+                outcome=outcome,
+                effect_id=effect_id,
+                command_hash=command_hash,
+                command_hash_payload=command_hash_payload,
+            )
             self._forget_implicit_idempotency_for_run(run_id)
             self._clear_adapter_loss(run_id)
             self._clear_auth_dead_recovery_state(run_id)
@@ -5259,32 +5354,13 @@ Preserve the same identity, role, worktree, orchestrator grouping, PR gates, and
         if status is None:
             raise StoreConflict("provider archive returned no status")
         record = self.store.update_adapter_status(run_id, status)
-        archived, _ = self.store.archive_current(run_id, outcome=outcome)
-        self.event_store.close_run(run_id)
-        self._record_archive_edge(archived, outcome)
-        if effect_id is not None:
-            effect_payload = {
-                "agent_id": archived.agent_id,
-                "run_id": run_id,
-                "outcome": outcome,
-                "request_id": effect_id,
-                "method": "run/archive",
-            }
-            if command_hash_payload is not None:
-                effect_payload["command_hash_payload"] = dict(command_hash_payload)
-            self.store.command_log.complete_effect(
-                AgentCommand(
-                    "run/archive",
-                    archived.agent_id,
-                    effect_id,
-                    effect_payload,
-                ),
-                {
-                    **_public_run(archived),
-                    "_workgraph_archive_recorded": True,
-                },
-                command_hash=command_hash,
-            )
+        archived, _ = await self._archive_finalize(
+            run_id,
+            outcome=outcome,
+            effect_id=effect_id,
+            command_hash=command_hash,
+            command_hash_payload=command_hash_payload,
+        )
         self._forget_implicit_idempotency_for_run(run_id)
         self._clear_adapter_loss(run_id)
         self._clear_auth_dead_recovery_state(run_id)
@@ -5744,6 +5820,7 @@ Preserve the same identity, role, worktree, orchestrator grouping, PR gates, and
 
     async def dispatch(self, method: str, params: dict[str, Any]) -> Any:
         if method in _COMMAND_METHODS:
+            self._reject_archive_inflight(params)
             await self.command_queue.recover_pending()
             command_params = dict(params)
             request_id = _validated_idempotency_request_id(
@@ -6446,6 +6523,16 @@ Preserve the same identity, role, worktree, orchestrator grouping, PR gates, and
             except BaseException as exc:
                 worker_error = exc
         self.archive_backfill_worker = None
+        current_task = asyncio.current_task()
+        archive_tasks = tuple(
+            task for task in self.archive_tasks if task is not current_task
+        )
+        if archive_tasks:
+            await asyncio.gather(
+                *(asyncio.shield(task) for task in archive_tasks),
+                return_exceptions=True,
+            )
+        self.archive_executor.shutdown(wait=True)
         self.event_routes.clear()
         self.event_processing_locks.clear()
         self.event_inflight_counts.clear()
@@ -6465,6 +6552,9 @@ Preserve the same identity, role, worktree, orchestrator grouping, PR gates, and
         self.implicit_idempotency_keys.clear()
         self.implicit_idempotency_runs.clear()
         self.detached_at_monotonic.clear()
+        self.archive_inflight.clear()
+        self.archive_inflight_agents.clear()
+        self.archive_tasks.clear()
         self.adapters.clear()
         try:
             await self.command_queue.close()
