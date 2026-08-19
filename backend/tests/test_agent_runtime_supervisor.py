@@ -9734,6 +9734,60 @@ class SupervisorTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(result["action"], "block")
         self.assertNotIn(record.run_id, self.supervisor.adapters)
 
+    async def test_one_run_event_store_failure_does_not_stop_another_pump(self) -> None:
+        damaged = await self.supervisor.start_run(
+            agent_id="WIKI-DAMAGED-STORE",
+            provider=ProviderKind.CODEX,
+            role="implement",
+            model="fixture-codex",
+            effort="high",
+            worktree=str(self.worktree),
+            prompt="Work on ticket WIKI-DAMAGED-STORE",
+        )
+        healthy = await self.supervisor.start_run(
+            agent_id="WIKI-HEALTHY-STORE",
+            provider=ProviderKind.CODEX,
+            role="implement",
+            model="fixture-codex",
+            effort="high",
+            worktree=str(self.worktree),
+            prompt="Work on ticket WIKI-HEALTHY-STORE",
+        )
+        await _wait_for_events(self.store, damaged.run_id, 10)
+        await _wait_for_events(self.store, healthy.run_id, 10)
+        damaged_adapter = self.supervisor.adapters[damaged.run_id]
+        healthy_adapter = self.supervisor.adapters[healthy.run_id]
+        healthy_before = self.store.get(healthy.run_id).raw_event_count
+        original_materialize = self.supervisor.event_store.materialize
+
+        def fail_one_run(run_id: str, *args: Any, **kwargs: Any):
+            if run_id == damaged.run_id:
+                raise OSError("damaged event database")
+            return original_materialize(run_id, *args, **kwargs)
+
+        with mock.patch.object(
+            self.supervisor.event_store,
+            "materialize",
+            side_effect=fail_one_run,
+        ):
+            await damaged_adapter.respond("damaged-request", {"answer": "x"})
+            await healthy_adapter.respond("healthy-request", {"answer": "x"})
+            for _ in range(200):
+                if (
+                    damaged.run_id in self.supervisor.pipeline_failures
+                    and self.store.get(healthy.run_id).raw_event_count > healthy_before
+                ):
+                    break
+                await asyncio.sleep(0.01)
+
+        self.assertIn(damaged.run_id, self.supervisor.pipeline_failures)
+        self.assertGreater(
+            self.store.get(healthy.run_id).raw_event_count,
+            healthy_before,
+        )
+        self.assertIs(self.supervisor.adapters.get(healthy.run_id), healthy_adapter)
+        self.assertFalse(healthy_adapter.closed)
+
     async def test_replace_serializes_send_and_interrupt_against_old_run(self) -> None:
         old = await self.supervisor.start_run(
             agent_id="WIKI-RACE",

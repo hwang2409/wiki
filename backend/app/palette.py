@@ -25,11 +25,12 @@ import math
 import os
 import re
 import threading
-from urllib.parse import quote
+from collections.abc import Callable, Iterable
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Callable, Iterable
+from typing import Any
+from urllib.parse import quote
 
 from .agent_runtime.archive_protocol import archive_is_committed
 
@@ -538,7 +539,10 @@ def _artifact_payload_from_event(event: dict[str, Any]) -> tuple[str, dict[str, 
             artifact = payload.get("artifact")
             artifact_id = payload.get("id") or event.get("artifact_id")
             if isinstance(artifact, dict) and isinstance(artifact_id, str):
-                return artifact_id, {**payload, "artifact": artifact}
+                unwrapped = {**payload, "artifact": artifact}
+                if event.get("normalized_at") is not None:
+                    unwrapped["normalized_at"] = event["normalized_at"]
+                return artifact_id, unwrapped
         payload = event
         artifact = payload.get("artifact")
         artifact_id = payload.get("id") or event.get("artifact_id")
@@ -752,6 +756,9 @@ def collect_artifact_items_from_index(
     *,
     ticket_by_run: dict[str, str] | None = None,
     archive_by_run: dict[str, tuple[str, str]] | None = None,
+    query: str = "",
+    limit: int = DEFAULT_LIMIT,
+    should_cancel: Callable[[], bool] | None = None,
 ) -> list[PaletteItem] | None:
     """Build palette artifacts from SQLite without walking event JSONL files.
 
@@ -759,33 +766,50 @@ def collect_artifact_items_from_index(
     legacy scan for installations that have not materialized any runs.
     """
 
+    candidate_limit = max(1, min(limit, MAX_LIMIT))
+    normalized_query = (query or "").strip()
+    now = datetime.now(tz=timezone.utc)
+    ranked: list[tuple[PaletteItem, tuple[float, float]]] = []
     try:
-        indexed_events = event_store.read_artifact_events()
+        indexed_events = event_store.read_artifact_events(
+            should_cancel=should_cancel,
+        )
+        for run_id, event in indexed_events:
+            extracted = _artifact_payload_from_event(event)
+            if extracted is None:
+                continue
+            artifact_id, payload = extracted
+            if any(item.artifact_id == artifact_id for item, _key in ranked):
+                continue
+            archive_metadata = (archive_by_run or {}).get(run_id)
+            item = _make_artifact_item(
+                artifact_id,
+                payload,
+                (ticket_by_run or {}).get(run_id)
+                or (archive_metadata[0] if archive_metadata else None),
+                _artifact_ts(payload, None),
+                run_id=run_id,
+                archived_at=archive_metadata[1] if archive_metadata else None,
+            )
+            if item is None:
+                continue
+            if normalized_query:
+                score = score_item(item, normalized_query, now)
+                if score is None:
+                    continue
+                ranking_key = _sort_key((item, score))
+            else:
+                updated = item.updated_at or datetime.fromtimestamp(
+                    0, tz=timezone.utc
+                )
+                ranking_key = (-updated.timestamp(), 0.0)
+            ranked.append((item, ranking_key))
+            if len(ranked) > candidate_limit:
+                ranked.pop(max(range(len(ranked)), key=lambda index: ranked[index][1]))
     except Exception:
         return None
-    items: list[PaletteItem] = []
-    seen: set[str] = set()
-    for run_id, event in indexed_events:
-        extracted = _artifact_payload_from_event(event)
-        if extracted is None:
-            continue
-        artifact_id, payload = extracted
-        if artifact_id in seen:
-            continue
-        seen.add(artifact_id)
-        archive_metadata = (archive_by_run or {}).get(run_id)
-        item = _make_artifact_item(
-            artifact_id,
-            payload,
-            (ticket_by_run or {}).get(run_id)
-            or (archive_metadata[0] if archive_metadata else None),
-            _artifact_ts(payload, None),
-            run_id=run_id,
-            archived_at=archive_metadata[1] if archive_metadata else None,
-        )
-        if item is not None:
-            items.append(item)
-    return items
+    ranked.sort(key=lambda pair: pair[1])
+    return [item for item, _key in ranked]
 
 
 def _title_from_note(note_path: Path, content: str) -> tuple[str, str]:

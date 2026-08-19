@@ -13,7 +13,12 @@ from backend.app.agent_runtime.fake import FixtureAdapterFactory
 from backend.app.agent_runtime.provider import ProviderEvent
 from backend.app.agent_runtime.store import RunStore, RuntimePaths
 from backend.app.agent_runtime.supervisor import Supervisor
-from backend.app.agent_runtime.types import EventDisposition, ProviderKind, RunRecord
+from backend.app.agent_runtime.types import (
+    EventDisposition,
+    LifecycleState,
+    ProviderKind,
+    RunRecord,
+)
 
 
 FIXTURES = Path(__file__).parent / "fixtures" / "agent_runtime"
@@ -96,7 +101,9 @@ class SupervisorDualWriteTests(unittest.IsolatedAsyncioTestCase):
         raw_rows = list(self.store.iter_raw_events(self.record.run_id))
         normalized_rows = list(self.store.iter_normalized_events(self.record.run_id))
         sqlite_rows = self.supervisor.event_store.view_rows(self.record.run_id)
-        with self.supervisor.event_store.connection(read_only=True) as connection:
+        with self.supervisor.event_store.for_run(self.record.run_id).connection(
+            read_only=True
+        ) as connection:
             dispositions = connection.execute(
                 "SELECT raw_seq, normalized_json, normalizer_version, created_at "
                 "FROM dispositions WHERE run_id = ? ORDER BY raw_seq",
@@ -182,7 +189,7 @@ class SupervisorDualWriteTests(unittest.IsolatedAsyncioTestCase):
         await self._apply(
             self._event("turn/diff/updated", {"diff": "updated"})
         )
-        event_store = self.supervisor.event_store
+        event_store = self.supervisor.event_store.for_run(self.record.run_id)
         with event_store.connection() as connection:
             connection.execute(
                 "DELETE FROM dispositions WHERE run_id = ? AND raw_seq = 1",
@@ -259,7 +266,9 @@ class SupervisorDualWriteTests(unittest.IsolatedAsyncioTestCase):
         )
         self.assertEqual(raw_one["seq"], 1)
         sqlite_rows = self.supervisor.event_store.view_rows(self.record.run_id)
-        with self.supervisor.event_store.connection(read_only=True) as connection:
+        with self.supervisor.event_store.for_run(self.record.run_id).connection(
+            read_only=True
+        ) as connection:
             created_at_by_raw_seq = {
                 int(row[0]): str(row[1])
                 for row in connection.execute(
@@ -327,20 +336,20 @@ class SupervisorDualWriteTests(unittest.IsolatedAsyncioTestCase):
         await self._apply(
             self._event("turn/started", {"turn": {"id": "turn-1"}})
         )
-        with self.supervisor.event_store.connection() as connection:
+        with self.supervisor.event_store.for_run(self.record.run_id).connection() as connection:
             connection.execute(
                 "DELETE FROM schema_migrations WHERE version = 2"
             )
         self.assertFalse(
             self.supervisor.event_store.run_is_healthy(self.record.run_id)
         )
-        await self.supervisor._rebuild_materializer_database()  # noqa: SLF001
+        await self.supervisor._rebuild_materializer_database(self.record.run_id)  # noqa: SLF001
         self.assertTrue(
             self.supervisor.event_store.run_is_healthy(self.record.run_id)
         )
 
     async def test_unhealthy_zero_event_database_rebuilds(self) -> None:
-        self.supervisor.event_store.ensure_schema()
+        self.supervisor.event_store.for_run(self.record.run_id).ensure_schema()
         self.supervisor.event_store.create_run(
             self.record.run_id,
             agent_id=self.record.agent_id,
@@ -348,7 +357,7 @@ class SupervisorDualWriteTests(unittest.IsolatedAsyncioTestCase):
             created_at=self.record.created_at,
             state=self.record.state,
         )
-        with self.supervisor.event_store.connection() as connection:
+        with self.supervisor.event_store.for_run(self.record.run_id).connection() as connection:
             connection.execute(
                 "DELETE FROM schema_migrations WHERE version = 2"
             )
@@ -360,23 +369,150 @@ class SupervisorDualWriteTests(unittest.IsolatedAsyncioTestCase):
             self.supervisor.event_store.run_is_healthy(self.record.run_id)
         )
 
+    async def test_startup_repair_failure_is_scoped_to_one_run(self) -> None:
+        other = self.store.create(
+            RunRecord.new(
+                agent_id="WIKI-OTHER-REPAIR",
+                provider=ProviderKind.CODEX,
+                role="implement",
+                model="fixture",
+                worktree=str(self.root),
+                prompt="repair test",
+            )
+        )
+        for record in (self.record, other):
+            self.supervisor.event_store.create_run(
+                record.run_id,
+                agent_id=record.agent_id,
+                provider=record.provider,
+                created_at=record.created_at,
+                state=LifecycleState.WORKING,
+            )
+            self.store.transition(record.run_id, LifecycleState.WORKING)
+        damaged_path = self.supervisor.event_store.for_run(self.record.run_id).path
+        damaged_path.write_bytes(b"damaged")
+        for suffix in ("-wal", "-shm"):
+            damaged_path.with_name(damaged_path.name + suffix).unlink(missing_ok=True)
+        damaged_store = self.supervisor.event_store.for_run(self.record.run_id)
+        with mock.patch.object(
+            damaged_store,
+            "replace_run_from",
+            side_effect=OSError("damaged run cannot be replaced"),
+        ):
+            await self.supervisor._normalize_orphan_raw_events()
+
+        self.assertEqual(
+            self.store.get(self.record.run_id).state,
+            LifecycleState.BLOCKED,
+        )
+        self.assertTrue(self.supervisor.event_store.run_is_healthy(other.run_id))
+
+    async def test_failed_rebuild_does_not_reattach_run_and_other_run_recovers(
+        self,
+    ) -> None:
+        other = self.store.create(
+            RunRecord.new(
+                agent_id="WIKI-OTHER-REATTACH",
+                provider=ProviderKind.CODEX,
+                role="implement",
+                model="fixture",
+                worktree=str(self.root),
+                prompt="reattach test",
+            )
+        )
+        for record in (self.record, other):
+            record.state = LifecycleState.WORKING
+            record.provider_session_id = f"session-{record.run_id}"
+            self.store._write_record(record)  # noqa: SLF001
+            self.supervisor.event_store.create_run(
+                record.run_id,
+                agent_id=record.agent_id,
+                provider=record.provider,
+                created_at=record.created_at,
+                state=LifecycleState.WORKING,
+            )
+
+        damaged_path = self.supervisor.event_store.for_run(self.record.run_id).path
+        damaged_path.write_bytes(b"damaged")
+        for suffix in ("-wal", "-shm"):
+            damaged_path.with_name(damaged_path.name + suffix).unlink(missing_ok=True)
+        damaged_store = self.supervisor.event_store.for_run(self.record.run_id)
+        with mock.patch.object(
+            damaged_store,
+            "replace_run_from",
+            side_effect=OSError("damaged run cannot be replaced"),
+        ):
+            results = await self.supervisor.recover_on_start()
+
+        failed_result = next(
+            result for result in results if result["run_id"] == self.record.run_id
+        )
+        self.assertEqual(failed_result["action"], "block")
+        self.assertNotIn(self.record.run_id, self.supervisor.adapters)
+        self.assertIn(other.run_id, self.supervisor.adapters)
+        self.assertTrue(self.store.get(self.record.run_id).automatic_resume_suppressed)
+
+    async def test_corrupt_raw_boot_blocks_one_run_and_attaches_other(self) -> None:
+        other = self.store.create(
+            RunRecord.new(
+                agent_id="WIKI-OTHER-CORRUPT-RAW",
+                provider=ProviderKind.CODEX,
+                role="implement",
+                model="fixture",
+                worktree=str(self.root),
+                prompt="corrupt raw test",
+            )
+        )
+        for record in (self.record, other):
+            record.state = LifecycleState.WORKING
+            record.provider_session_id = f"session-{record.run_id}"
+            self.store._write_record(record)  # noqa: SLF001
+            self.supervisor.event_store.create_run(
+                record.run_id,
+                agent_id=record.agent_id,
+                provider=record.provider,
+                created_at=record.created_at,
+                state=LifecycleState.WORKING,
+            )
+        await self.supervisor.close()
+        self.store.raw_events_path(self.record.run_id).write_text(
+            "not-json\n",
+            encoding="utf-8",
+        )
+        self.supervisor = Supervisor(self.store, self.factory)
+
+        results = await self.supervisor.recover_on_start()
+
+        failed_result = next(
+            result for result in results if result["run_id"] == self.record.run_id
+        )
+        self.assertEqual(failed_result["action"], "block")
+        self.assertEqual(
+            self.store.get(self.record.run_id).state,
+            LifecycleState.BLOCKED,
+        )
+        self.assertNotIn(self.record.run_id, self.supervisor.adapters)
+        self.assertIn(other.run_id, self.supervisor.adapters)
+
     async def test_rebuild_failure_keeps_original_database_unswapped(self) -> None:
         await self._apply(
             self._event("turn/started", {"turn": {"id": "turn-1"}})
         )
-        database_path = self.supervisor.event_store.path
-        with self.supervisor.event_store.connection() as connection:
+        database_path = self.supervisor.event_store.for_run(self.record.run_id).path
+        with self.supervisor.event_store.for_run(self.record.run_id).connection() as connection:
             connection.execute(
                 "DELETE FROM events WHERE run_id = ?",
                 (self.record.run_id,),
             )
         with mock.patch(
-            "backend.app.agent_runtime.supervisor.os.replace",
+            "backend.app.agent_runtime.event_store.os.replace",
             side_effect=OSError("injected swap failure"),
         ):
             with self.assertRaisesRegex(OSError, "injected swap failure"):
-                await self.supervisor._rebuild_materializer_database()
-        with self.supervisor.event_store.connection(read_only=True) as connection:
+                await self.supervisor._rebuild_materializer_database(self.record.run_id)
+        with self.supervisor.event_store.for_run(self.record.run_id).connection(
+            read_only=True
+        ) as connection:
             self.assertEqual(
                 connection.execute(
                     "SELECT COUNT(*) FROM events WHERE run_id = ?",

@@ -24,7 +24,11 @@ from uuid import NAMESPACE_URL, UUID, uuid4, uuid5
 from .. import accounts, provider_health
 from .. import transcripts
 from .command_log import AgentCommand, CommandConflict, CommandQueue, CommandRetryable
-from .event_store import EventReducerAdapter, SQLiteEventStore, runtime_event_db_path
+from .event_store import (
+    EventReducerAdapter,
+    RuntimeEventStore,
+    SQLiteEventStore,
+)
 from .normalizer import NormalizedProviderEvent, normalize_provider_event
 from .process import (
     ProviderProcessStatus,
@@ -364,10 +368,24 @@ class Supervisor:
             raise ValueError("idempotency_cache_size must be positive")
         self.store = store
         self.adapter_factory = adapter_factory
-        self.event_store = SQLiteEventStore(
-            runtime_event_db_path(store.paths.runtime_dir),
-            migrate=False,
+        self.materializer_failed_runs: dict[str, str] = {}
+        self.event_store = RuntimeEventStore(
+            store.paths.runtime_dir,
+            archive_dir=store.paths.archive_dir,
         )
+        for run_id in self.event_store.corrupt_raw_run_ids:
+            reason = "raw event log is corrupt"
+            self.materializer_failed_runs[run_id] = reason
+            try:
+                record = self.store.get(run_id)
+                recovery_state = record.recovery_from_state or record.state
+                self.store.mark_automatic_resume_failed(
+                    run_id,
+                    reason=reason,
+                    recovery_state=recovery_state,
+                )
+            except Exception:
+                logger.exception("could not block corrupt raw run %s", run_id)
         self.store.set_archive_events_exporter(
             lambda run_id, destination, legacy_source: self.event_store.export_events_jsonl(
                 run_id,
@@ -3009,6 +3027,8 @@ Preserve the same identity, role, worktree, orchestrator grouping, PR gates, and
             return
         for record in self.store.list_runs():
             run_id = record.run_id
+            if run_id in self.materializer_failed_runs:
+                continue
             # WIKI-243: stream both logs to detect orphans instead of
             # materializing full raw + normalized dict lists per run.
             # Startup used to hold every event of every run in RAM just
@@ -3038,7 +3058,8 @@ Preserve the same identity, role, worktree, orchestrator grouping, PR gates, and
                 continue
             # A new run has no SQLite file until its first dual write. There
             # is no unhealthy database to recover in that state.
-            if not raw_rows and not self.event_store.path.exists():
+            run_event_store = self.event_store.for_run(run_id)
+            if not raw_rows and not run_event_store.path.exists():
                 continue
             try:
                 materialized_seqs = self.event_store.materialized_raw_seqs(run_id)
@@ -3110,7 +3131,31 @@ Preserve the same identity, role, worktree, orchestrator grouping, PR gates, and
                     int(event.get("seq", 0)) for event in raw_rows
                     }
                 ):
-                    await self._rebuild_materializer_database()
+                    try:
+                        await self._rebuild_materializer_database(run_id)
+                    except Exception as exc:
+                        reason = f"event materializer rebuild failed: {exc}"
+                        self.materializer_failed_runs[run_id] = reason
+                        try:
+                            record = self.store.get(run_id)
+                            recovery_state = (
+                                record.recovery_from_state or record.state
+                            )
+                            self.store.mark_automatic_resume_failed(
+                                run_id,
+                                reason=reason,
+                                recovery_state=recovery_state,
+                            )
+                        except Exception:
+                            logger.exception(
+                                "could not block failed materializer run %s",
+                                run_id,
+                            )
+                        logger.exception(
+                            "event materializer rebuild failed for %s",
+                            run_id,
+                        )
+                        continue
                     # Recovered orphans get appended after later normalized
                     # rows, so any projection built by walking normalized
                     # events in file order (lifecycle state,
@@ -3277,78 +3322,75 @@ Preserve the same identity, role, worktree, orchestrator grouping, PR gates, and
             )
         return True
 
-    async def _rebuild_materializer_database(self) -> None:
-        database_path = self.event_store.path
+    async def _rebuild_materializer_database(self, run_id: str) -> None:
+        record = self.store.get(run_id)
+        target = self.event_store.for_run(run_id)
         temp_directory = Path(
-            tempfile.mkdtemp(prefix="events-rebuild-", dir=database_path.parent)
+            tempfile.mkdtemp(prefix="events-rebuild-", dir=target.path.parent)
         )
-        temporary_path = temp_directory / database_path.name
+        temporary_path = temp_directory / target.path.name
         try:
             rebuilt = SQLiteEventStore(temporary_path)
-            for record in self.store.list_runs():
-                raw_rows = sorted(
-                    self.store.iter_raw_events(record.run_id),
-                    key=lambda item: int(item["seq"]),
-                )
-                normalized_rows = {
-                    int(row["raw_seq"]): row
-                    for row in self.store.iter_normalized_events(record.run_id)
-                }
-                rebuilt.create_run(
-                    record.run_id,
-                    agent_id=record.agent_id,
-                    provider=record.provider,
-                    created_at=record.created_at,
-                    state=record.state,
-                )
-                reducer = EventReducerAdapter(record.provider)
-                for raw in raw_rows:
-                    row = normalized_rows.get(int(raw["seq"]))
-                    normalized = None
-                    materialize_raw = dict(raw)
-                    if row is not None:
-                        materialize_raw["normalized_seq"] = int(row["seq"])
-                        disposition = row.get("disposition")
-                        event_disposition = (
-                            EventDisposition.IGNORED
-                            if disposition in {
-                                "ignored",
-                                "intentionally_ignored",
-                                EventDisposition.IGNORED.value,
-                            }
-                            else EventDisposition(str(disposition))
-                        )
-                        lifecycle_value = row.get("lifecycle_state")
-                        normalized = NormalizedProviderEvent(
-                            event_disposition,
-                            str(row["kind"]),
-                            row.get("payload")
-                            if isinstance(row.get("payload"), dict)
-                            else {},
-                            LifecycleState(str(lifecycle_value))
-                            if lifecycle_value is not None
-                            else None,
-                        )
-                    rebuilt.materialize(
-                        record.run_id,
-                        materialize_raw,
-                        reducer,
-                        normalized=normalized,
+            raw_rows = sorted(
+                self.store.iter_raw_events(run_id),
+                key=lambda item: int(item["seq"]),
+            )
+            normalized_rows = {
+                int(row["raw_seq"]): row
+                for row in self.store.iter_normalized_events(run_id)
+            }
+            rebuilt.create_run(
+                run_id,
+                agent_id=record.agent_id,
+                provider=record.provider,
+                created_at=record.created_at,
+                state=record.state,
+            )
+            reducer = EventReducerAdapter(record.provider)
+            for raw in raw_rows:
+                row = normalized_rows.get(int(raw["seq"]))
+                normalized = None
+                materialize_raw = dict(raw)
+                if row is not None:
+                    materialize_raw["normalized_seq"] = int(row["seq"])
+                    disposition = row.get("disposition")
+                    event_disposition = (
+                        EventDisposition.IGNORED
+                        if disposition in {
+                            "ignored",
+                            "intentionally_ignored",
+                            EventDisposition.IGNORED.value,
+                        }
+                        else EventDisposition(str(disposition))
                     )
-                if not rebuilt.run_is_healthy(record.run_id):
-                    raise RuntimeError(f"rebuilt event store failed validation for {record.run_id}")
+                    lifecycle_value = row.get("lifecycle_state")
+                    normalized = NormalizedProviderEvent(
+                        event_disposition,
+                        str(row["kind"]),
+                        row.get("payload")
+                        if isinstance(row.get("payload"), dict)
+                        else {},
+                        LifecycleState(str(lifecycle_value))
+                        if lifecycle_value is not None
+                        else None,
+                    )
+                rebuilt.materialize(
+                    run_id,
+                    materialize_raw,
+                    reducer,
+                    normalized=normalized,
+                )
+            if not rebuilt.run_is_healthy(run_id):
+                raise RuntimeError(
+                    f"rebuilt event store failed validation for {run_id}"
+                )
             with rebuilt.connection() as connection:
                 connection.execute("PRAGMA wal_checkpoint(TRUNCATE)")
-            os.replace(temporary_path, database_path)
-            for suffix in ("-wal", "-shm"):
-                database_path.with_name(database_path.name + suffix).unlink(
-                    missing_ok=True
-                )
-            self.event_store = SQLiteEventStore(database_path, migrate=False)
-            self.event_store.ensure_schema()
-            self.materializer_reducers.clear()
+            target.replace_run_from(temporary_path, run_id)
+            self.materializer_failed_runs.pop(run_id, None)
         finally:
             shutil.rmtree(temp_directory, ignore_errors=True)
+        self.materializer_reducers.clear()
 
     async def _reconcile_sending_steer_effects(self) -> None:
         """Resolve every steer effect left at status='sending' by a prior boot.
@@ -4062,7 +4104,20 @@ Preserve the same identity, role, worktree, orchestrator grouping, PR gates, and
         async with self.codex_fleet_lock:
             await self._recover_codex_rotation_locked()
         results: list[dict[str, str]] = []
-        for snapshot in self.store.list_runs():
+        snapshots = self.store.list_runs()
+        for snapshot in snapshots:
+            reason = self.materializer_failed_runs.get(snapshot.run_id)
+            if reason is not None:
+                results.append(
+                    {
+                        "run_id": snapshot.run_id,
+                        "action": RecoveryAction.BLOCK.value,
+                        "reason": reason,
+                    }
+                )
+        for snapshot in snapshots:
+            if snapshot.run_id in self.materializer_failed_runs:
+                continue
             if snapshot.provider is ProviderKind.CODEX:
                 async with self.codex_fleet_lock:
                     async with self._agent_lock(snapshot.agent_id):
