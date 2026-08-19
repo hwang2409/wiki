@@ -2735,10 +2735,14 @@ export function TurnMetaRow({ meta }: { meta: TurnMeta }) {
 function CurrentTurnState({ runState }: { runState: Exclude<ActivityRunState, "idle"> }) {
   const state = activityStateLabel([], runState);
   const stateClass = state.replace(/\s+/g, "-");
+  // "current turn" only makes sense while the turn is still live. A `failed`
+  // run has already terminated (provider crash, event-persistence error,
+  // etc.), so pairing "failed" with "current turn" reads as a contradiction.
+  const isLive = runState !== "failed";
   return (
     <div className="session-turn-live-state" data-testid="session-turn-live-state">
       <span className={`session-activity-state is-${stateClass}`}>{state}</span>
-      <span className="session-activity-meta">current turn</span>
+      {isLive ? <span className="session-activity-meta">current turn</span> : null}
     </div>
   );
 }
