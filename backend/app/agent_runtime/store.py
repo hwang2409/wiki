@@ -9,7 +9,7 @@ import shutil
 import stat
 import tempfile
 import threading
-from collections.abc import Callable, Iterator, Mapping
+from collections.abc import Callable, Collection, Iterator, Mapping
 from copy import deepcopy
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
@@ -797,14 +797,16 @@ class RunStore:
         destination: Path,
     ) -> bool:
         exporter = self._archive_events_exporter
+        event_store: Any | None = None
         if exporter is None:
             try:
                 from .event_store import RuntimeEventStore
 
-                exporter = RuntimeEventStore(
+                event_store = RuntimeEventStore(
                     self.paths.runtime_dir,
                     migrate=False,
-                ).export_events_jsonl
+                )
+                exporter = event_store.export_events_jsonl
             except Exception:
                 return False
         try:
@@ -819,10 +821,18 @@ class RunStore:
             logger.exception("SQLite archive export failed for %s", run_id)
             destination.unlink(missing_ok=True)
             return False
+        finally:
+            if event_store is not None:
+                event_store.close()
 
-    def prune_terminal_runs(self) -> dict[str, int]:
-        with self._lock:
-            return self._prune_terminal_runs()
+    def prune_terminal_runs(
+        self, eligible_run_ids: Collection[str] | None = None
+    ) -> dict[str, int]:
+        """Archive eligible terminal runs without holding the store lock for I/O."""
+
+        return self._prune_terminal_runs(
+            frozenset(eligible_run_ids) if eligible_run_ids is not None else None
+        )
 
     def current_turn_diff_path(self, run_id: str) -> Path:
         return self.run_dir(run_id) / "current-turn-diff.json"
@@ -1349,13 +1359,16 @@ class RunStore:
     def _archive_terminal_run(self, record: RunRecord) -> None:
         """Move one non-current terminal run out of the boot hot path."""
 
-        registry = self._read_registry()
-        entry = registry.get(record.agent_id)
-        current = entry.get("current") if isinstance(entry, dict) else None
+        with self._lock:
+            registry = self._read_registry()
+            entry = registry.get(record.agent_id)
+            current = entry.get("current") if isinstance(entry, dict) else None
+            archive_worker = self._registry_current(record)
         if isinstance(current, dict) and current.get("run_id") == record.run_id:
             self.archive_current(record.run_id, outcome=record.outcome)
             return
-        archived_entry = self._find_archived_run_entry(record.run_id)
+        with self._lock:
+            archived_entry = self._find_archived_run_entry(record.run_id)
         if (
             archived_entry is not None
             and archived_entry[0].created_at == record.created_at
@@ -1372,7 +1385,6 @@ class RunStore:
             for item in (entry.get("history") if isinstance(entry, dict) else []) or []
             if isinstance(item, dict) and item.get("run_id") != record.run_id
         ]
-        archive_worker = self._registry_current(record)
         archive_worker["ended_at"] = ended_at
         if record.outcome is not None:
             archive_worker["outcome"] = record.outcome
@@ -1435,36 +1447,49 @@ class RunStore:
         if not archive_is_committed(session_dir):
             raise StoreError("archive commit failed verification")
         knowledge.enqueue_refresh(runtime_dir=self.paths.runtime_dir)
-        if isinstance(entry, dict):
-            row = dict(archive_worker)
-            row.update(
-                {
-                    "outcome": record.outcome,
-                    "ended_at": ended_at,
-                    "replaced_by_run_id": record.replaced_by_run_id,
+        with self._lock:
+            registry = self._read_registry()
+            entry = registry.get(record.agent_id)
+            current = entry.get("current") if isinstance(entry, dict) else None
+            if isinstance(entry, dict):
+                history = [
+                    dict(item)
+                    for item in (entry.get("history") or [])
+                    if isinstance(item, dict) and item.get("run_id") != record.run_id
+                ]
+                row = dict(archive_worker)
+                row.update(
+                    {
+                        "outcome": record.outcome,
+                        "ended_at": ended_at,
+                        "replaced_by_run_id": record.replaced_by_run_id,
+                    }
+                )
+                history.append(row)
+                registry[record.agent_id] = {
+                    "history": history,
+                    "current": current,
                 }
-            )
-            history.append(row)
-            registry[record.agent_id] = {
-                "history": history,
-                "current": current,
-            }
-            self._write_registry(registry)
-            self.command_log.replace_projection(
-                record.agent_id,
-                {record.agent_id: registry[record.agent_id]},
-            )
+                self._write_registry(registry)
+                self.command_log.replace_projection(
+                    record.agent_id,
+                    {record.agent_id: registry[record.agent_id]},
+                )
         shutil.rmtree(self.run_dir(record.run_id))
         if self.run_dir(record.run_id).exists():
             raise StoreConflict("pruned terminal run remains in the hot store")
 
-    def _prune_terminal_runs(self) -> dict[str, int]:
+    def _prune_terminal_runs(
+        self, eligible_run_ids: frozenset[str] | None = None
+    ) -> dict[str, int]:
         """Archive terminal runs older than the configured hot-store window."""
 
         cutoff = _run_retention_cutoff()
         pruned = 0
         failed_prunes = 0
         for snapshot in self.list_runs():
+            if eligible_run_ids is not None and snapshot.run_id not in eligible_run_ids:
+                continue
             if snapshot.state not in TERMINAL_STATES or not _run_is_older_than(
                 snapshot.updated_at, cutoff
             ):
@@ -1474,13 +1499,9 @@ class RunStore:
                 if record.state not in TERMINAL_STATES:
                     continue
                 if (
-                    self._terminal_run_prune_guard is not None
+                    eligible_run_ids is None
+                    and self._terminal_run_prune_guard is not None
                     and not self._terminal_run_prune_guard(record)
-                ):
-                    continue
-                if any(
-                    effect.get("run_id") == record.run_id
-                    for effect in self.command_log.sending_steer_effects()
                 ):
                     continue
                 self._archive_terminal_run(record)

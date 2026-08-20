@@ -390,13 +390,6 @@ class Supervisor:
                 )
             except Exception:
                 logger.exception("could not block corrupt raw run %s", run_id)
-        self.store.set_archive_events_exporter(
-            lambda run_id, destination, legacy_source: self.event_store.export_events_jsonl(
-                run_id,
-                destination,
-                legacy_source=legacy_source,
-            )
-        )
         self.materializer_reducers: dict[str, EventReducerAdapter] = {}
         self.materializer_latency_seconds: deque[float] = deque(maxlen=256)
         self.materializer_queue_depth: dict[str, int] = {}
@@ -2993,6 +2986,15 @@ Preserve the same identity, role, worktree, orchestrator grouping, PR gates, and
             for effect in self.store.command_log.sending_steer_effects()
         )
 
+    def _terminal_run_prune_ids(self) -> frozenset[str]:
+        """Snapshot loop-owned prune eligibility before entering the worker."""
+
+        return frozenset(
+            record.run_id
+            for record in self.store.list_runs()
+            if self._terminal_run_can_prune(record)
+        )
+
     async def recover_on_start(self) -> list[dict[str, str]]:
         async with self._run_mutation_admission():
             async with self.recovery_scan_lock:
@@ -3007,7 +3009,11 @@ Preserve the same identity, role, worktree, orchestrator grouping, PR gates, and
                         self.store.rebuild_wk_status_projection(record.run_id)
                 results = await self._recover_once()
                 await self._reconcile_sending_steer_effects()
-                await self._run_archive_worker(self.store.prune_terminal_runs)
+                prune_ids = self._terminal_run_prune_ids()
+                await self._run_archive_worker(
+                    self.store.prune_terminal_runs,
+                    prune_ids,
+                )
                 await self.command_queue.recover_pending()
                 if self._reaper_due():
                     by_run_id = {
@@ -5211,12 +5217,8 @@ Preserve the same identity, role, worktree, orchestrator grouping, PR gates, and
         command_hash: str | None = None,
         command_hash_payload: Mapping[str, Any] | None = None,
     ) -> RunRecord:
-        if run_id in self.archive_inflight:
-            raise StoreConflict("archive is already in progress")
         record = self.store.get(run_id)
-        self.archive_inflight.add(run_id)
-        self.archive_inflight_agents[record.agent_id] = run_id
-        try:
+        async with self._archive_admission(record):
             return await self._archive_locked(
                 run_id,
                 outcome=outcome,
@@ -5224,9 +5226,22 @@ Preserve the same identity, role, worktree, orchestrator grouping, PR gates, and
                 command_hash=command_hash,
                 command_hash_payload=command_hash_payload,
             )
+
+    @asynccontextmanager
+    async def _archive_admission(self, record: RunRecord):
+        """Block commands while either archive path finalizes one run."""
+
+        if record.run_id in self.archive_inflight:
+            raise StoreConflict("archive is already in progress")
+        if record.agent_id in self.archive_inflight_agents:
+            raise StoreConflict("archive is already in progress")
+        self.archive_inflight.add(record.run_id)
+        self.archive_inflight_agents[record.agent_id] = record.run_id
+        try:
+            yield
         finally:
-            self.archive_inflight.discard(run_id)
-            if self.archive_inflight_agents.get(record.agent_id) == run_id:
+            self.archive_inflight.discard(record.run_id)
+            if self.archive_inflight_agents.get(record.agent_id) == record.run_id:
                 self.archive_inflight_agents.pop(record.agent_id, None)
 
     async def _archive_finalize(
@@ -5238,7 +5253,7 @@ Preserve the same identity, role, worktree, orchestrator grouping, PR gates, and
         command_hash: str | None = None,
         command_hash_payload: Mapping[str, Any] | None = None,
     ) -> tuple[RunRecord, Path]:
-        return await self._run_archive_worker(
+        archived, session_dir = await self._run_archive_worker(
             self._archive_finalize_sync,
             run_id,
             outcome=outcome,
@@ -5246,14 +5261,22 @@ Preserve the same identity, role, worktree, orchestrator grouping, PR gates, and
             command_hash=command_hash,
             command_hash_payload=command_hash_payload,
         )
+        self.event_store.close_run(run_id)
+        self._record_archive_edge(archived, outcome)
+        return archived, session_dir
 
     async def _replay_archive_cleanup(self, run_id: str) -> RunRecord | None:
         async with self._run_mutation_admission():
             async with self._run_lock(run_id):
-                return await self._run_archive_worker(
-                    self.store.finalize_archived_run,
-                    run_id,
-                )
+                record = self.store.get(run_id)
+                async with self._archive_admission(record):
+                    archived = await self._run_archive_worker(
+                        self.store.finalize_archived_run,
+                        run_id,
+                    )
+                if archived is not None:
+                    self.event_store.close_run(run_id)
+                return archived
 
     def _archive_finalize_sync(
         self,
@@ -5265,8 +5288,6 @@ Preserve the same identity, role, worktree, orchestrator grouping, PR gates, and
         command_hash_payload: Mapping[str, Any] | None = None,
     ) -> tuple[RunRecord, Path]:
         archived, session_dir = self.store.archive_current(run_id, outcome=outcome)
-        self.event_store.close_run(run_id)
-        self._record_archive_edge(archived, outcome)
         if effect_id is not None:
             effect_payload: dict[str, Any] = {
                 "agent_id": archived.agent_id,

@@ -10226,6 +10226,16 @@ class SupervisorTests(unittest.IsolatedAsyncioTestCase):
             ):
                 recovery_task = asyncio.create_task(self.supervisor.recover_on_start())
                 self.assertTrue(await asyncio.to_thread(started.wait, 5))
+                run_task = asyncio.create_task(
+                    asyncio.to_thread(self.store.get, record.run_id)
+                )
+                list_task = asyncio.create_task(
+                    asyncio.to_thread(self.store.list_runs)
+                )
+                await asyncio.wait_for(
+                    asyncio.gather(run_task, list_task),
+                    timeout=2,
+                )
                 latencies: list[float] = []
                 for _ in range(20):
                     probe_started = time.perf_counter()
@@ -10244,8 +10254,33 @@ class SupervisorTests(unittest.IsolatedAsyncioTestCase):
     async def test_close_drains_dispatched_archive_worker(self) -> None:
         record = self._create_terminal_archive_run("WIKI-ARCHIVE-CLOSE")
 
-        await self.supervisor.dispatch("run/archive", {"run_id": record.run_id})
-        await asyncio.wait_for(self.supervisor.close(), timeout=2)
+        started = threading.Event()
+        release = threading.Event()
+        real_copy = self.store._copy_archive_file
+
+        def paused_copy(source: Path, destination: Path) -> None:
+            started.set()
+            if not release.wait(timeout=5):
+                raise AssertionError("archive close worker was not released")
+            real_copy(source, destination)
+
+        with mock.patch.object(
+            self.store,
+            "_copy_archive_file",
+            side_effect=paused_copy,
+        ):
+            archive_task = asyncio.create_task(
+                self.supervisor.dispatch("run/archive", {"run_id": record.run_id})
+            )
+            self.assertTrue(await asyncio.to_thread(started.wait, 2))
+            close_task = asyncio.create_task(self.supervisor.close())
+            await asyncio.sleep(0.05)
+            self.assertFalse(close_task.done())
+            release.set()
+            await asyncio.wait_for(
+                asyncio.gather(archive_task, close_task),
+                timeout=2,
+            )
 
         self.store = RunStore(self.paths)
         self.supervisor = Supervisor(
@@ -10293,7 +10328,7 @@ class SupervisorTests(unittest.IsolatedAsyncioTestCase):
         await replay_task
         try:
             marked = await mutation_task
-        except RunNotFound:
+        except (RunNotFound, StoreConflict):
             return
         archived = self.store.find_archived_run(record.run_id)
         self.assertIsNotNone(archived)
