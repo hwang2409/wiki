@@ -1,30 +1,29 @@
 from __future__ import annotations
 
 import asyncio
-from contextlib import asynccontextmanager
-from concurrent.futures import ThreadPoolExecutor
-from functools import partial
 import json
 import logging
 import math
 import os
 import re
-import sqlite3
 import shutil
+import sqlite3
 import tempfile
 import time
 import warnings
 from collections import OrderedDict, deque
 from collections.abc import Callable, Iterator, Mapping
+from concurrent.futures import ThreadPoolExecutor
+from contextlib import asynccontextmanager
 from copy import deepcopy
 from datetime import datetime, timezone
 from enum import Enum
+from functools import partial
 from pathlib import Path
 from typing import Any
 from uuid import NAMESPACE_URL, UUID, uuid4, uuid5
 
-from .. import accounts, provider_health
-from .. import transcripts
+from .. import accounts, provider_health, transcripts
 from .command_log import AgentCommand, CommandConflict, CommandQueue, CommandRetryable
 from .event_store import (
     EventReducerAdapter,
@@ -37,7 +36,6 @@ from .process import (
     orphaned_provider_process,
     terminate_detached_provider_pid,
 )
-from .runtime_card import inject_runtime_card
 from .provider import (
     AdapterStatus,
     ProviderAdapter,
@@ -46,20 +44,20 @@ from .provider import (
     ProviderProcessError,
     StartRequest,
 )
+from .runtime_card import inject_runtime_card
 from .store import RunNotFound, RunStore, StoreConflict
 from .types import (
-    LifecycleState,
-    EventDisposition,
     MAX_PENDING_USER_MESSAGES,
+    TERMINAL_STATES,
+    EventDisposition,
+    LifecycleState,
     ProviderKind,
     RecoveryAction,
     RunRecord,
-    TERMINAL_STATES,
     restart_recovery_decision,
 )
 from .version import RUNTIME_FINGERPRINT
 from .wk_feature import is_wk_kind, wk_enabled
-
 
 AdapterFactory = Callable[[RunRecord], ProviderAdapter]
 DEFAULT_REAPER_INTERVAL_SECONDS = 30.0
@@ -488,7 +486,7 @@ class Supervisor:
         self.archive_pending = 0
         self.archive_inflight: set[str] = set()
         self.archive_inflight_agents: dict[str, str] = {}
-        self.archive_tasks: set[asyncio.Task[Any]] = set()
+        self.archive_jobs: set[asyncio.Future[Any]] = set()
         self.handover_condition = asyncio.Condition()
         self.active_run_mutations = 0
         self.handover_pending = False
@@ -764,6 +762,8 @@ class Supervisor:
                 self.archive_executor,
                 partial(operation, *args, **kwargs),
             )
+            self.archive_jobs.add(future)
+            future.add_done_callback(self.archive_jobs.discard)
 
             async def wait_for_archive() -> Any:
                 return await asyncio.shield(future)
@@ -3007,7 +3007,7 @@ Preserve the same identity, role, worktree, orchestrator grouping, PR gates, and
                         self.store.rebuild_wk_status_projection(record.run_id)
                 results = await self._recover_once()
                 await self._reconcile_sending_steer_effects()
-                self.store.prune_terminal_runs()
+                await self._run_archive_worker(self.store.prune_terminal_runs)
                 await self.command_queue.recover_pending()
                 if self._reaper_due():
                     by_run_id = {
@@ -5214,9 +5214,6 @@ Preserve the same identity, role, worktree, orchestrator grouping, PR gates, and
         if run_id in self.archive_inflight:
             raise StoreConflict("archive is already in progress")
         record = self.store.get(run_id)
-        task = asyncio.current_task()
-        if task is not None:
-            self.archive_tasks.add(task)
         self.archive_inflight.add(run_id)
         self.archive_inflight_agents[record.agent_id] = run_id
         try:
@@ -5231,8 +5228,6 @@ Preserve the same identity, role, worktree, orchestrator grouping, PR gates, and
             self.archive_inflight.discard(run_id)
             if self.archive_inflight_agents.get(record.agent_id) == run_id:
                 self.archive_inflight_agents.pop(record.agent_id, None)
-            if task is not None:
-                self.archive_tasks.discard(task)
 
     async def _archive_finalize(
         self,
@@ -5253,10 +5248,12 @@ Preserve the same identity, role, worktree, orchestrator grouping, PR gates, and
         )
 
     async def _replay_archive_cleanup(self, run_id: str) -> RunRecord | None:
-        return await self._run_archive_worker(
-            self.store.finalize_archived_run,
-            run_id,
-        )
+        async with self._run_mutation_admission():
+            async with self._run_lock(run_id):
+                return await self._run_archive_worker(
+                    self.store.finalize_archived_run,
+                    run_id,
+                )
 
     def _archive_finalize_sync(
         self,
@@ -6553,16 +6550,6 @@ Preserve the same identity, role, worktree, orchestrator grouping, PR gates, and
             except BaseException as exc:
                 worker_error = exc
         self.archive_backfill_worker = None
-        current_task = asyncio.current_task()
-        archive_tasks = tuple(
-            task for task in self.archive_tasks if task is not current_task
-        )
-        if archive_tasks:
-            await asyncio.gather(
-                *(asyncio.shield(task) for task in archive_tasks),
-                return_exceptions=True,
-            )
-        self.archive_executor.shutdown(wait=True)
         self.event_routes.clear()
         self.event_processing_locks.clear()
         self.event_inflight_counts.clear()
@@ -6584,11 +6571,18 @@ Preserve the same identity, role, worktree, orchestrator grouping, PR gates, and
         self.detached_at_monotonic.clear()
         self.archive_inflight.clear()
         self.archive_inflight_agents.clear()
-        self.archive_tasks.clear()
         self.adapters.clear()
         try:
             await self.command_queue.close()
         finally:
+            archive_jobs = tuple(self.archive_jobs)
+            if archive_jobs:
+                await asyncio.gather(
+                    *(asyncio.shield(job) for job in archive_jobs),
+                    return_exceptions=True,
+                )
+            self.archive_executor.shutdown(wait=True)
+            self.archive_jobs.clear()
             self.event_store.close()
         if worker_error is not None:
             raise worker_error

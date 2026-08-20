@@ -22,20 +22,19 @@ from typing import Any, cast
 from unittest import mock
 from uuid import uuid4
 
-from backend.app import accounts
+from backend.app import accounts, provider_health
 from backend.app.account_notices import AccountNoticeStore
-from backend.app import provider_health
+from backend.app.agent_runtime import daemon as agent_daemon
+from backend.app.agent_runtime import store as store_module
+from backend.app.agent_runtime import supervisor as supervisor_module
+from backend.app.agent_runtime.claude import ClaudeStreamAdapter
 from backend.app.agent_runtime.client import (
     SupervisorClient,
     SupervisorRemoteError,
     SupervisorUnavailable,
 )
-from backend.app.agent_runtime.command_log import AgentCommand, CommandRetryable
-from backend.app.agent_runtime import daemon as agent_daemon
-from backend.app.agent_runtime import store as store_module
-from backend.app.agent_runtime import supervisor as supervisor_module
-from backend.app.agent_runtime.claude import ClaudeStreamAdapter
 from backend.app.agent_runtime.codex import CodexAppServerAdapter
+from backend.app.agent_runtime.command_log import AgentCommand, CommandRetryable
 from backend.app.agent_runtime.fake import (
     ClaudeFixtureAdapter,
     CodexFixtureAdapter,
@@ -57,12 +56,17 @@ from backend.app.agent_runtime.provider import (
     ProviderProcessError,
     StartRequest,
 )
-from backend.app.agent_runtime.store import RunNotFound, RunStore, RuntimePaths, StoreConflict
+from backend.app.agent_runtime.store import (
+    RunNotFound,
+    RunStore,
+    RuntimePaths,
+    StoreConflict,
+)
 from backend.app.agent_runtime.supervisor import Supervisor, resolve_safe_worktree
 from backend.app.agent_runtime.types import (
-    EventDisposition,
     MAX_MESSAGE_DEDUPE_KEYS,
     MAX_PENDING_USER_MESSAGES,
+    EventDisposition,
     LifecycleState,
     ProviderKind,
     RecoveryAction,
@@ -70,7 +74,6 @@ from backend.app.agent_runtime.types import (
     restart_recovery_decision,
 )
 from backend.app.agent_runtime.version import RUNTIME_FINGERPRINT
-
 
 FIXTURES = Path(__file__).parent / "fixtures" / "agent_runtime"
 
@@ -10188,6 +10191,114 @@ class SupervisorTests(unittest.IsolatedAsyncioTestCase):
         ):
             self.store.archive_current(record.run_id)
         return record
+
+    async def test_recovery_prune_worker_keeps_ping_loop_under_three_seconds(
+        self,
+    ) -> None:
+        record = self._create_terminal_archive_run("WIKI-ARCHIVE-RECOVERY-PING")
+        record.updated_at = "2020-01-01T00:00:00+00:00"
+        store_module._atomic_write_json(  # noqa: SLF001 - retention fixture
+            self.store.run_path(record.run_id), record.to_dict()
+        )
+        started = threading.Event()
+        release = threading.Event()
+        real_copy = self.store._copy_archive_file
+
+        def paused_copy(source: Path, destination: Path) -> None:
+            started.set()
+            if not release.wait(timeout=5):
+                raise AssertionError("recovery archive was not released")
+            real_copy(source, destination)
+
+        recovery_task: asyncio.Task[list[dict[str, str]]] | None = None
+        try:
+            with mock.patch.object(
+                self.store,
+                "_copy_archive_file",
+                side_effect=paused_copy,
+            ), mock.patch.object(
+                self.supervisor,
+                "_normalize_orphan_raw_events",
+                new=mock.AsyncMock(),
+            ), mock.patch.dict(
+                os.environ,
+                {"WIKI_AGENT_RUN_RETENTION_DAYS": "1"},
+            ):
+                recovery_task = asyncio.create_task(self.supervisor.recover_on_start())
+                self.assertTrue(await asyncio.to_thread(started.wait, 5))
+                latencies: list[float] = []
+                for _ in range(20):
+                    probe_started = time.perf_counter()
+                    self.assertEqual(
+                        (await self.supervisor.dispatch("ping", {}))["status"],
+                        "ok",
+                    )
+                    latencies.append(time.perf_counter() - probe_started)
+                self.assertLess(max(latencies), 3)
+        finally:
+            release.set()
+        assert recovery_task is not None
+        await recovery_task
+        self.assertFalse(self.store.run_dir(record.run_id).exists())
+
+    async def test_close_drains_dispatched_archive_worker(self) -> None:
+        record = self._create_terminal_archive_run("WIKI-ARCHIVE-CLOSE")
+
+        await self.supervisor.dispatch("run/archive", {"run_id": record.run_id})
+        await asyncio.wait_for(self.supervisor.close(), timeout=2)
+
+        self.store = RunStore(self.paths)
+        self.supervisor = Supervisor(
+            self.store,
+            FixtureAdapterFactory(FIXTURES, pid=os.getpid()),
+        )
+
+    async def test_replay_cleanup_rejects_concurrent_mutation_without_data_loss(
+        self,
+    ) -> None:
+        record = self._create_committed_archive_retry_run("WIKI-ARCHIVE-REPLAY-MUTATION")
+        started = threading.Event()
+        release = threading.Event()
+        real_finish = self.store._finish_archive_cleanup
+
+        def paused_finish(*args: object, **kwargs: object) -> None:
+            started.set()
+            if not release.wait(timeout=5):
+                raise AssertionError("archive replay was not released")
+            real_finish(*args, **kwargs)
+
+        replay_task: asyncio.Task[dict[str, Any]] | None = None
+        mutation_task: asyncio.Task[RunRecord] | None = None
+        try:
+            with mock.patch.object(
+                self.store,
+                "_finish_archive_cleanup",
+                side_effect=paused_finish,
+            ):
+                replay_task = asyncio.create_task(
+                    self.supervisor.dispatch(
+                        "run/archive",
+                        {"run_id": record.run_id},
+                    )
+                )
+                self.assertTrue(await asyncio.to_thread(started.wait, 2))
+                mutation_task = asyncio.create_task(
+                    self.supervisor.mark_viewed(record.run_id)
+                )
+                release.set()
+        finally:
+            release.set()
+        assert replay_task is not None
+        assert mutation_task is not None
+        await replay_task
+        try:
+            marked = await mutation_task
+        except RunNotFound:
+            return
+        archived = self.store.find_archived_run(record.run_id)
+        self.assertIsNotNone(archived)
+        assert archived is not None
+        self.assertEqual(archived.last_viewed_seq, marked.last_viewed_seq)
 
     async def test_archive_worker_keeps_ping_loop_under_three_seconds(self) -> None:
         record = self._create_terminal_archive_run("WIKI-ARCHIVE-PING")
