@@ -11056,6 +11056,93 @@ class UnixClientTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(current["provider_alive"])
         await stream.aclose()
 
+    async def test_cold_boot_serves_commands_while_projections_rebuild(self) -> None:
+        records = []
+        for index in range(4):
+            record = self.store.create(
+                RunRecord.new(
+                    agent_id=f"WIKI-COLD-BOOT-{index}",
+                    provider=ProviderKind.CODEX,
+                    role="implement",
+                    model="fixture-codex",
+                    worktree=str(self.worktree),
+                    prompt="cold boot projection test",
+                )
+            )
+            for event_index in range(20):
+                self.store.append_raw(
+                    record.run_id,
+                    provider=ProviderKind.CODEX.value,
+                    direction="provider",
+                    payload={
+                        "method": "turn/diff/updated",
+                        "params": {"diff": f"{index}-{event_index}"},
+                    },
+                )
+            records.append(record)
+
+        await self.server.close()
+        await self.supervisor.close()
+        restarted = Supervisor(self.store, FixtureAdapterFactory(FIXTURES))
+        server = UnixSupervisorServer(restarted, self.paths.socket_path)
+        await server.start()
+        client = SupervisorClient(self.paths, timeout=2)
+        rebuild_started = threading.Event()
+        release_rebuild = threading.Event()
+        original_rebuild = restarted._rebuild_materializer_database_sync
+
+        def paused_rebuild(run_id: str) -> None:
+            rebuild_started.set()
+            if not release_rebuild.wait(timeout=5):
+                raise AssertionError("startup rebuild was not released")
+            original_rebuild(run_id)
+
+        recovery = asyncio.create_task(restarted.recover_on_start())
+        try:
+            with mock.patch.object(
+                restarted,
+                "_rebuild_materializer_database_sync",
+                side_effect=paused_rebuild,
+            ):
+                self.assertTrue(await asyncio.to_thread(rebuild_started.wait, 5))
+                self.assertEqual(
+                    (await asyncio.to_thread(client.ping))["status"],
+                    "ok",
+                )
+                started = await asyncio.to_thread(
+                    client.request,
+                    "run/start",
+                    {
+                        "agent_id": "WIKI-COLD-BOOT-NEW",
+                        "provider": "codex",
+                        "role": "implement",
+                        "model": "fixture-codex",
+                        "effort": "high",
+                        "worktree": str(self.worktree),
+                        "prompt": "start while projections rebuild",
+                    },
+                )
+                self.assertEqual(started["agent_id"], "WIKI-COLD-BOOT-NEW")
+                listed = await asyncio.to_thread(client.request, "run/list")
+                self.assertEqual(len(listed["runs"]), len(records) + 1)
+                release_rebuild.set()
+                await asyncio.wait_for(recovery, timeout=10)
+                for record in records:
+                    raw_seqs = {
+                        int(event["seq"])
+                        for event in self.store.iter_raw_events(record.run_id)
+                    }
+                    self.assertEqual(
+                        restarted.event_store.materialized_raw_seqs(record.run_id),
+                        raw_seqs,
+                    )
+        finally:
+            release_rebuild.set()
+            if not recovery.done():
+                await recovery
+            await server.close()
+            await restarted.close()
+
     def test_default_client_timeout_is_lane_aware_and_retry_safe(self) -> None:
         client = SupervisorClient(self.paths)
         for method in {

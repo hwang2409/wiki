@@ -12,7 +12,7 @@ import tempfile
 import time
 import warnings
 from collections import OrderedDict, deque
-from collections.abc import Callable, Iterator, Mapping
+from collections.abc import Callable, Collection, Iterator, Mapping
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import asynccontextmanager
 from copy import deepcopy
@@ -67,6 +67,7 @@ DEFAULT_ADAPTER_DETACH_GRACE_SECONDS = 1.0
 DEFAULT_IDEMPOTENCY_CACHE_SIZE = 256
 DEFAULT_WORKER_SOFT_CAP = 5
 DEFAULT_ARCHIVE_QUEUE_LIMIT = 4
+MAX_TERMINAL_ORPHAN_NORMALIZE_ROWS = 256
 _IDEMPOTENT_METHODS = frozenset({"run/start", "run/send_now", "run/send_on_idle"})
 _COMMAND_METHODS = frozenset(
     {"run/start", "run/send_now", "run/send_on_idle", "run/archive", "run/replace"}
@@ -475,6 +476,13 @@ class Supervisor:
             max_workers=1,
             thread_name_prefix="wiki-archive",
         )
+        self.materializer_executor = ThreadPoolExecutor(
+            max_workers=1,
+            thread_name_prefix="wiki-materializer",
+        )
+        self.projection_rebuild_tasks: dict[str, asyncio.Task[None]] = {}
+        self.projection_rebuild_errors: dict[str, BaseException] = {}
+        self.projection_rebuilds_started = False
         self.archive_queue_limit = archive_queue_limit
         self.archive_pending = 0
         self.archive_inflight: set[str] = set()
@@ -1538,7 +1546,7 @@ Preserve the same identity, role, worktree, orchestrator grouping, PR gates, and
                     normalized=normalized,
                     prior_state=prior_state,
                 )
-        except BaseException as exc:
+        except Exception as exc:
             if barrier is not None and not barrier.done():
                 barrier.set_exception(exc)
                 # The flush caller already receives this exception. Mark the
@@ -2996,14 +3004,13 @@ Preserve the same identity, role, worktree, orchestrator grouping, PR gates, and
         )
 
     async def recover_on_start(self) -> list[dict[str, str]]:
+        await self._rebuild_startup_projections()
         async with self._run_mutation_admission():
             async with self.recovery_scan_lock:
                 self.store.abort_uncommitted_starts()
-                # Normalize orphan raw rows before ``_recover_once`` attaches
-                # any live provider event pumps. Running after recovery let an
-                # in-flight normalize race the sweep and the middle-gap case
-                # go undetected (WIKI-232 REVIEW9 F2).
-                await self._normalize_orphan_raw_events()
+                # Projection rebuilds also recover orphan raw rows before
+                # ``_recover_once`` attaches any live provider event pumps.
+                self._orphan_raw_events_normalized = True
                 for record in self.store.list_runs():
                     if is_wk_kind(record.execution_kind):
                         self.store.rebuild_wk_status_projection(record.run_id)
@@ -3028,6 +3035,113 @@ Preserve the same identity, role, worktree, orchestrator grouping, PR gates, and
                 results.extend(await self._auto_archive_sweep())
                 self._schedule_archive_backfill()
                 return results
+
+    async def _rebuild_startup_projections(self) -> None:
+        """Rebuild retained run projections without blocking the event loop."""
+
+        attached_run_ids = frozenset(self.adapters)
+        if attached_run_ids:
+            # Attached event pumps already own their live shards. Preserve
+            # the existing lock-coordinated orphan repair for those runs.
+            await self._normalize_orphan_raw_events(attached_run_ids)
+        if not self.projection_rebuilds_started:
+            self.projection_rebuilds_started = True
+            for record in self.store.list_runs():
+                # Terminal runs are handed to the archive worker during this
+                # recovery pass. Their durable event export is the retained
+                # projection, so do not delay that handoff for a live shard
+                # rebuild that would be deleted immediately afterwards.
+                if (
+                    record.run_id in self.materializer_failed_runs
+                    or record.run_id in self.adapters
+                    or (
+                        record.state in TERMINAL_STATES
+                        and record.raw_event_count == record.normalized_event_count
+                    )
+                ):
+                    continue
+                self.projection_rebuild_tasks[record.run_id] = asyncio.create_task(
+                    self._rebuild_startup_projection(record.run_id),
+                    name=f"agent-materializer-rebuild-{record.run_id}",
+                )
+        if self.projection_rebuild_tasks:
+            await asyncio.gather(
+                *self.projection_rebuild_tasks.values(),
+                return_exceptions=True,
+            )
+
+    async def _rebuild_startup_projection(self, run_id: str) -> None:
+        loop = asyncio.get_running_loop()
+        try:
+            await loop.run_in_executor(
+                self.materializer_executor,
+                partial(self._rebuild_startup_projection_sync, run_id),
+            )
+        except Exception as exc:
+            self.projection_rebuild_errors[run_id] = exc
+            reason = f"event materializer rebuild failed: {exc}"
+            self.materializer_failed_runs[run_id] = reason
+            try:
+                record = self.store.get(run_id)
+                recovery_state = record.recovery_from_state or record.state
+                self.store.mark_automatic_resume_failed(
+                    run_id,
+                    reason=reason,
+                    recovery_state=recovery_state,
+                )
+            except Exception:
+                logger.exception("could not block failed materializer run %s", run_id)
+            logger.exception("event materializer rebuild failed for %s", run_id)
+
+    def _rebuild_startup_projection_sync(self, run_id: str) -> None:
+        """Normalize orphan rows and rebuild one run in a worker thread."""
+
+        try:
+            record = self.store.get(run_id)
+            normalized_rows = list(self.store.iter_normalized_events(run_id))
+            normalized_by_raw_seq = {
+                int(event.get("raw_seq", 0)): event for event in normalized_rows
+            }
+            raw_rows = list(self.store.iter_raw_events(run_id))
+        except RunNotFound:
+            return
+        if (
+            record.state in TERMINAL_STATES
+            and len(raw_rows) > MAX_TERMINAL_ORPHAN_NORMALIZE_ROWS
+        ):
+            # The archive worker exports raw history directly. Keep a large
+            # terminal run from delaying command admission on legacy cleanup.
+            return
+        for envelope in raw_rows:
+            raw_seq = int(envelope.get("seq", 0))
+            if raw_seq in normalized_by_raw_seq:
+                continue
+            # Keep the legacy projection complete before rebuilding SQLite.
+            asyncio.run(
+                self._recover_orphan_raw_event(
+                    run_id,
+                    envelope,
+                    materialize=False,
+                )
+            )
+        if len(normalized_by_raw_seq) != len(raw_rows):
+            self.store.rebuild_projections_from_normalized(run_id)
+        if record.state in TERMINAL_STATES:
+            # Archive export preserves terminal history. There is no live
+            # SQLite shard left to serve after this recovery pass.
+            return
+        self._rebuild_materializer_database_sync(run_id)
+
+    async def _ensure_projection_ready(self, run_id: str) -> None:
+        task = self.projection_rebuild_tasks.get(run_id)
+        if task is None:
+            return
+        await asyncio.shield(task)
+        error = self.projection_rebuild_errors.get(run_id)
+        if error is not None:
+            raise CommandRetryable(
+                f"event projection is unavailable for run {run_id}: {error}"
+            ) from error
 
     def _schedule_archive_backfill(self) -> None:
         """Run a bounded archive parity backfill off the recovery path."""
@@ -3057,7 +3171,9 @@ Preserve the same identity, role, worktree, orchestrator grouping, PR gates, and
             name="archive-parity-backfill",
         )
 
-    async def _normalize_orphan_raw_events(self) -> None:
+    async def _normalize_orphan_raw_events(
+        self, run_ids: Collection[str] | None = None
+    ) -> None:
         """Normalize raw provider rows whose normalization did not commit.
 
         ``_handle_provider_event_without_admission`` appends the raw row
@@ -3082,6 +3198,8 @@ Preserve the same identity, role, worktree, orchestrator grouping, PR gates, and
             return
         for record in self.store.list_runs():
             run_id = record.run_id
+            if run_ids is not None and run_id not in run_ids:
+                continue
             if run_id in self.materializer_failed_runs:
                 continue
             # WIKI-243: stream both logs to detect orphans instead of
@@ -3378,6 +3496,9 @@ Preserve the same identity, role, worktree, orchestrator grouping, PR gates, and
         return True
 
     async def _rebuild_materializer_database(self, run_id: str) -> None:
+        self._rebuild_materializer_database_sync(run_id)
+
+    def _rebuild_materializer_database_sync(self, run_id: str) -> None:
         record = self.store.get(run_id)
         target = self.event_store.for_run(run_id)
         temp_directory = Path(
@@ -5854,6 +5975,14 @@ Preserve the same identity, role, worktree, orchestrator grouping, PR gates, and
         command_params["_recovery_replay"] = True
 
         async def execute() -> Any:
+            if command.method != "run/start":
+                try:
+                    await self._ensure_projection_ready(
+                        self._resolve_run_id(command_params)
+                    )
+                except RunNotFound:
+                    if command.method != "run/archive":
+                        raise
             return await self._dispatch(
                 command.method,
                 command_params,
@@ -5863,6 +5992,21 @@ Preserve the same identity, role, worktree, orchestrator grouping, PR gates, and
         return execute
 
     async def dispatch(self, method: str, params: dict[str, Any]) -> Any:
+        if method not in {
+            "ping",
+            "idempotency/status",
+            "run/list",
+            "run/start",
+            "supervisor/recover",
+            "supervisor/handover",
+        }:
+            try:
+                await self._ensure_projection_ready(self._resolve_run_id(params))
+            except RunNotFound:
+                # Archive can still resolve a run from its durable archive
+                # record when no current run remains.
+                if method != "run/archive":
+                    raise
         if method in _COMMAND_METHODS:
             self._reject_archive_inflight(params)
             await self.command_queue.recover_pending()
@@ -6603,6 +6747,7 @@ Preserve the same identity, role, worktree, orchestrator grouping, PR gates, and
                     return_exceptions=True,
                 )
             self.archive_executor.shutdown(wait=True)
+            self.materializer_executor.shutdown(wait=True)
             self.archive_jobs.clear()
             self.event_store.close()
         if worker_error is not None:

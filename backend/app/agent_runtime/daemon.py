@@ -163,11 +163,18 @@ async def run_daemon(args: argparse.Namespace) -> None:
             loop.add_signal_handler(sig, stop.set)
         except NotImplementedError:
             pass
+    startup_recovery_task: asyncio.Task[None] | None = None
     recovery_task: asyncio.Task[None] | None = None
     fleet_task: asyncio.Task[None] | None = None
     try:
-        await supervisor.recover_on_start()
         await server.start()
+        # Bind before replaying retained event history. Recovery rebuilds one
+        # run at a time in the supervisor's worker, so ping and new commands
+        # remain available while cold-start projections catch up.
+        startup_recovery_task = asyncio.create_task(
+            supervisor.recover_on_start(),
+            name="agent-supervisor-startup-recovery",
+        )
         recovery_task = asyncio.create_task(
             _recovery_loop(supervisor, stop),
             name="agent-supervisor-recovery",
@@ -195,7 +202,13 @@ async def run_daemon(args: argparse.Namespace) -> None:
         )
         await stop.wait()
     finally:
-        await _shutdown(server, supervisor, [recovery_task, fleet_task], lock, paths)
+        await _shutdown(
+            server,
+            supervisor,
+            [startup_recovery_task, recovery_task, fleet_task],
+            lock,
+            paths,
+        )
 
 
 def main() -> None:
