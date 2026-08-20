@@ -498,6 +498,73 @@ class SupervisorTests(unittest.IsolatedAsyncioTestCase):
             {int(raw["seq"]) for raw in raw_rows},
         )
 
+    async def test_terminal_recovery_uses_raw_coverage_at_256_row_boundary(self) -> None:
+        cases = (
+            ("boundary-orphan", 255),
+            ("all-orphan", 0),
+            ("empty-shard", 256),
+        )
+        expected_seqs = set(range(1, 257))
+        records: dict[str, RunRecord] = {}
+        for suffix, normalized_count in cases:
+            with self.subTest(suffix=suffix):
+                record = self.store.create(
+                    RunRecord.new(
+                        agent_id=f"WIKI-TERMINAL-{suffix}",
+                        provider=ProviderKind.CODEX,
+                        role="implement",
+                        model="fixture-codex",
+                        worktree=str(self.worktree),
+                        prompt="terminal coverage recovery",
+                    )
+                )
+                records[suffix] = record
+                raw_rows = [
+                    self.store.append_raw(
+                        record.run_id,
+                        provider=ProviderKind.CODEX.value,
+                        direction="provider",
+                        payload={
+                            "method": "turn/diff/updated",
+                            "params": {"diff": str(index)},
+                        },
+                    )
+                    for index in range(256)
+                ]
+                for raw in raw_rows[:normalized_count]:
+                    await self.supervisor._recover_orphan_raw_event(  # noqa: SLF001
+                        record.run_id,
+                        raw,
+                        materialize=False,
+                    )
+                self.store.transition(record.run_id, LifecycleState.COMPLETED)
+
+        await self.supervisor._rebuild_startup_projections()  # noqa: SLF001
+        for suffix, _normalized_count in cases:
+            record = records[suffix]
+            self.assertEqual(
+                self.supervisor.event_store.materialized_raw_seqs(record.run_id),
+                expected_seqs,
+            )
+            self.assertEqual(
+                {
+                    int(event["raw_seq"])
+                    for event in self.store.iter_normalized_events(record.run_id)
+                },
+                expected_seqs,
+            )
+            await self.supervisor.archive(record.run_id, outcome="closed")
+            session_dir = sorted(
+                (self.paths.archive_dir / record.agent_id).iterdir()
+            )[-1]
+            self.assertEqual(
+                {
+                    int(json.loads(line)["raw_seq"])
+                    for line in (session_dir / "events.jsonl").read_text().splitlines()
+                },
+                expected_seqs,
+            )
+
     async def _spawn_orphan_process(self, *, ignore_sigterm: bool = False) -> int:
         child_code = (
             "import os, signal, sys, time\n"
@@ -11190,6 +11257,11 @@ class UnixClientTests(unittest.IsolatedAsyncioTestCase):
                     (await asyncio.to_thread(client.ping))["status"],
                     "ok",
                 )
+                listed_during_rebuild = asyncio.create_task(
+                    restarted.dispatch("run/list", {})
+                )
+                await asyncio.sleep(0)
+                self.assertFalse(listed_during_rebuild.done())
                 with mock.patch.object(
                     restarted,
                     "request_codex_rotation",
@@ -11207,6 +11279,8 @@ class UnixClientTests(unittest.IsolatedAsyncioTestCase):
                         force_target=None,
                     )
                 release_rebuild.set()
+                listed = await asyncio.wait_for(listed_during_rebuild, timeout=10)
+                self.assertEqual(len(listed["runs"]), len(records))
                 await asyncio.wait_for(pending_recovery_started.wait(), timeout=10)
                 started = await asyncio.to_thread(
                     client.request,
@@ -11785,7 +11859,7 @@ class DaemonShutdownTests(unittest.IsolatedAsyncioTestCase):
             observed: dict[str, bool] = {}
 
             class DrainingSupervisor:
-                async def close_materializer_executor(self) -> None:
+                async def drain_writers_before_lock_release(self) -> None:
                     pass
 
                 async def close(self) -> None:
@@ -11813,6 +11887,156 @@ class DaemonShutdownTests(unittest.IsolatedAsyncioTestCase):
             )
             self.assertTrue(observed["lock_free"])
             self.assertTrue(observed["pid_gone"])
+
+    async def test_shutdown_drains_inflight_queue_write_before_lock_release(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            paths = _paths(root)
+            store = RunStore(paths)
+            supervisor = Supervisor(store, FixtureAdapterFactory(FIXTURES))
+            record = store.create(
+                RunRecord.new(
+                    agent_id="WIKI-SHUTDOWN-QUEUE",
+                    provider=ProviderKind.CODEX,
+                    role="implement",
+                    model="fixture-codex",
+                    worktree=str(root),
+                    prompt="shutdown queue",
+                )
+            )
+            started = asyncio.Event()
+            release = asyncio.Event()
+            write_at: float | None = None
+
+            async def execute() -> dict[str, str]:
+                nonlocal write_at
+                started.set()
+                await release.wait()
+                store.append_raw(
+                    record.run_id,
+                    provider="codex",
+                    direction="provider",
+                    payload={"method": "shutdown/queue"},
+                )
+                write_at = time.monotonic()
+                return {"status": "ok"}
+
+            command = AgentCommand.steer(
+                agent_id=record.agent_id,
+                request_id="shutdown-queue",
+                payload={"method": "run/send_now", "run_id": record.run_id},
+            )
+            submit = asyncio.create_task(supervisor.command_queue.submit(command, execute))
+            await started.wait()
+            lock = agent_daemon._acquire_single_instance(paths)
+            release_at: float | None = None
+            original_flock = agent_daemon.fcntl.flock
+
+            def tracked_flock(handle: Any, operation: int) -> None:
+                nonlocal release_at
+                if operation == fcntl.LOCK_UN:
+                    release_at = time.monotonic()
+                original_flock(handle, operation)
+
+            class ClosedServer:
+                async def close(self) -> None:
+                    pass
+
+            shutdown: asyncio.Task[None]
+            with mock.patch.object(agent_daemon.fcntl, "flock", tracked_flock):
+                shutdown = asyncio.create_task(
+                    agent_daemon._shutdown(
+                        ClosedServer(),
+                        supervisor,
+                        [],
+                        lock,
+                        paths,
+                    )
+                )
+                await asyncio.sleep(0)
+                self.assertFalse(shutdown.done())
+                release.set()
+                await asyncio.wait_for(submit, timeout=5)
+                await asyncio.wait_for(shutdown, timeout=5)
+            self.assertIsNotNone(write_at)
+            self.assertIsNotNone(release_at)
+            assert write_at is not None and release_at is not None
+            self.assertLess(write_at, release_at)
+
+    async def test_shutdown_drains_shielded_recovery_write_before_lock_release(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            paths = _paths(root)
+            store = RunStore(paths)
+            supervisor = Supervisor(store, FixtureAdapterFactory(FIXTURES))
+            record = store.create(
+                RunRecord.new(
+                    agent_id="WIKI-SHUTDOWN-RECOVERY",
+                    provider=ProviderKind.CODEX,
+                    role="implement",
+                    model="fixture-codex",
+                    worktree=str(root),
+                    prompt="shutdown recovery",
+                )
+            )
+            pending = AgentCommand.spawn(
+                agent_id=record.agent_id,
+                request_id="shutdown-recovery",
+                payload={"run_id": "shutdown-recovery-run"},
+            )
+            store.command_log.append_intent(pending, {})
+            started = asyncio.Event()
+            release = asyncio.Event()
+            write_at: float | None = None
+
+            async def recover() -> dict[str, str]:
+                nonlocal write_at
+                started.set()
+                await release.wait()
+                store.append_raw(
+                    record.run_id,
+                    provider="codex",
+                    direction="provider",
+                    payload={"method": "shutdown/recovery"},
+                )
+                write_at = time.monotonic()
+                return {"status": "recovered"}
+
+            supervisor.command_queue.recovery_factory = lambda _command: recover
+            recovery = asyncio.create_task(supervisor.command_queue.recover_pending())
+            await started.wait()
+            lock = agent_daemon._acquire_single_instance(paths)
+            release_at: float | None = None
+            original_flock = agent_daemon.fcntl.flock
+
+            def tracked_flock(handle: Any, operation: int) -> None:
+                nonlocal release_at
+                if operation == fcntl.LOCK_UN:
+                    release_at = time.monotonic()
+                original_flock(handle, operation)
+
+            class ClosedServer:
+                async def close(self) -> None:
+                    pass
+
+            with mock.patch.object(agent_daemon.fcntl, "flock", tracked_flock):
+                shutdown = asyncio.create_task(
+                    agent_daemon._shutdown(
+                        ClosedServer(),
+                        supervisor,
+                        [recovery],
+                        lock,
+                        paths,
+                    )
+                )
+                await asyncio.sleep(0)
+                self.assertFalse(shutdown.done())
+                release.set()
+                await asyncio.wait_for(shutdown, timeout=5)
+            self.assertIsNotNone(write_at)
+            self.assertIsNotNone(release_at)
+            assert write_at is not None and release_at is not None
+            self.assertLess(write_at, release_at)
 
 
 class DaemonProcessTests(unittest.TestCase):

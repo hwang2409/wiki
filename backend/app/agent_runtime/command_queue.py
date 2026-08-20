@@ -201,14 +201,15 @@ class CommandQueue:
             self._deferred[(command.method, command.request_id)] = command
             self.recovery_retries.append((command, retry))
             return
+        self._open_recovery_barrier_if_ready(command.agent_id)
+
+    def _open_recovery_barrier_if_ready(self, agent_id: str) -> None:
         if not any(
-            pending.agent_id == command.agent_id
-            for pending in self._recovery_commands.values()
+            pending.agent_id == agent_id for pending in self._recovery_commands.values()
         ) and not any(
-            pending.agent_id == command.agent_id
-            for pending in self._deferred.values()
+            pending.agent_id == agent_id for pending in self._deferred.values()
         ):
-            self._recovery_agent_events[command.agent_id].set()
+            self._recovery_agent_events[agent_id].set()
 
     async def submit(self, command: AgentCommand, execute: CommandExecutor) -> Any:
         if self._closed:
@@ -222,18 +223,9 @@ class CommandQueue:
                     f"request_id {command.request_id} has a conflicting command"
                 )
             return await asyncio.shield(existing[1])
-        if key in self._deferred:
-            self._deferred.pop(key, None)
-            if not any(
-                pending.agent_id == command.agent_id
-                for pending in self._deferred.values()
-            ) and not any(
-                pending.agent_id == command.agent_id
-                for pending in self._recovery_commands.values()
-            ):
-                self._recovery_agent_events[command.agent_id].set()
+        deferred = self._deferred.get(key)
         recovery_event = self._recovery_agent_events.get(command.agent_id)
-        if recovery_event is not None and not recovery_event.is_set():
+        if deferred is None and recovery_event is not None and not recovery_event.is_set():
             await recovery_event.wait()
         loop = asyncio.get_running_loop()
         future: asyncio.Future[Any] = loop.create_future()
@@ -246,6 +238,9 @@ class CommandQueue:
                     else self.state_provider()
                 )
                 intent = await asyncio.to_thread(self.log.append_intent, command, state)
+            if deferred is not None:
+                self._deferred.pop(key, None)
+                self._open_recovery_barrier_if_ready(command.agent_id)
             if intent.replay:
                 # A receipt is terminal. It also closes any deferred retry
                 # left by an earlier provider-control outage.

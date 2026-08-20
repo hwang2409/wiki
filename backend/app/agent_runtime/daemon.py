@@ -131,10 +131,13 @@ async def _shutdown(
     if pending:
         await asyncio.gather(*pending, return_exceptions=True)
     await server.close()
-    await supervisor.close_materializer_executor()
-    # Release the single-instance lock before the provider drain: the drain
-    # waits on long-lived provider turns, and holding the lock through it
-    # blocks every replacement daemon from binding (WIKI-217).
+    # Drain every writer before handover: command-queue work, shielded
+    # recovery and monitor tasks, the materializer executor, and the archive
+    # store executor. Supervisor.close() runs after the lock release and may
+    # only close provider transports.
+    await supervisor.drain_writers_before_lock_release()
+    # Release the single-instance lock before the provider transport drain.
+    # Long-lived provider turns must not block a replacement daemon (WIKI-217).
     paths.pid_path.unlink(missing_ok=True)
     try:
         fcntl.flock(lock.fileno(), fcntl.LOCK_UN)
@@ -172,6 +175,7 @@ async def run_daemon(args: argparse.Namespace) -> None:
         # Bind before replaying retained event history. Recovery rebuilds one
         # run at a time in the supervisor's worker, so ping and new commands
         # remain available while cold-start projections catch up.
+        supervisor.projection_rebuild_ready.clear()
         startup_recovery_task = asyncio.create_task(
             supervisor.recover_on_start(),
             name="agent-supervisor-startup-recovery",
@@ -197,8 +201,19 @@ async def run_daemon(args: argparse.Namespace) -> None:
                 notify=AutopilotController.live_notify,
             ).on_transition,
         )
+        async def run_fleet_after_startup() -> None:
+            try:
+                await asyncio.shield(startup_recovery_task)
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                traceback.print_exc()
+                return
+            if not stop.is_set():
+                await fleet_monitor.run(stop)
+
         fleet_task = asyncio.create_task(
-            fleet_monitor.run(stop),
+            run_fleet_after_startup(),
             name="agent-supervisor-fleet-monitor",
         )
         await stop.wait()

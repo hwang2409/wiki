@@ -5,6 +5,7 @@ import json
 import tempfile
 import unittest
 from pathlib import Path
+from unittest import mock
 
 from backend.app.agent_runtime.command_log import (
     AgentCommand,
@@ -425,6 +426,76 @@ class CommandLogTests(unittest.TestCase):
                 self.assertFalse(recovery.done())
                 release_second.set()
                 await recovery
+                await queue.close()
+
+        asyncio.run(run())
+
+    def test_deferred_admission_failure_restores_intent_and_barrier(self) -> None:
+        async def run() -> None:
+            with tempfile.TemporaryDirectory() as tmp:
+                log = CommandLog(Path(tmp) / "command-log.sqlite3")
+                deferred = AgentCommand.spawn(
+                    agent_id="WIKI-A",
+                    request_id="spawn-deferred",
+                    payload={"run_id": "run-deferred"},
+                )
+                log.append_intent(deferred, {})
+                attempts = 0
+
+                def factory(command: AgentCommand):
+                    async def effect() -> dict[str, str]:
+                        nonlocal attempts
+                        attempts += 1
+                        if attempts == 1:
+                            raise CommandRetryable("provider control is unavailable")
+                        return {"run_id": str(command.payload["run_id"])}
+
+                    return effect
+
+                queue = CommandQueue(log, lambda: {}, recovery_factory=factory)
+                await queue.recover_pending()
+                self.assertIn(
+                    (deferred.method, deferred.request_id), queue._deferred  # noqa: SLF001
+                )
+
+                admission_failure = RuntimeError("command log is unavailable")
+                replacement = AgentCommand.spawn(
+                    agent_id="WIKI-A",
+                    request_id=deferred.request_id,
+                    payload={"run_id": "run-deferred"},
+                )
+                with mock.patch.object(
+                    log,
+                    "append_intent",
+                    side_effect=admission_failure,
+                ):
+                    with self.assertRaisesRegex(RuntimeError, "command log is unavailable"):
+                        await queue.submit(
+                            replacement,
+                            lambda: _return_result({"status": "started"}),
+                        )
+                self.assertEqual(
+                    [item.request_id for item in log.pending()],
+                    [deferred.request_id],
+                )
+                self.assertFalse(queue._recovery_agent_events["WIKI-A"].is_set())  # noqa: SLF001
+
+                next_start = AgentCommand.spawn(
+                    agent_id="WIKI-A",
+                    request_id="spawn-after-deferred",
+                    payload={"run_id": "run-next"},
+                )
+                blocked = asyncio.create_task(
+                    queue.submit(next_start, lambda: _return_result({"status": "started"}))
+                )
+                await asyncio.sleep(0)
+                self.assertFalse(blocked.done())
+
+                await queue.recover_pending()
+                self.assertEqual(
+                    await blocked,
+                    {"status": "started"},
+                )
                 await queue.close()
 
         asyncio.run(run())

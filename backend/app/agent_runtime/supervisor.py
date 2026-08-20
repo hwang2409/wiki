@@ -67,7 +67,6 @@ DEFAULT_ADAPTER_DETACH_GRACE_SECONDS = 1.0
 DEFAULT_IDEMPOTENCY_CACHE_SIZE = 256
 DEFAULT_WORKER_SOFT_CAP = 5
 DEFAULT_ARCHIVE_QUEUE_LIMIT = 4
-MAX_TERMINAL_ORPHAN_NORMALIZE_ROWS = 256
 _IDEMPOTENT_METHODS = frozenset({"run/start", "run/send_now", "run/send_on_idle"})
 _COMMAND_METHODS = frozenset(
     {"run/start", "run/send_now", "run/send_on_idle", "run/archive", "run/replace"}
@@ -92,6 +91,7 @@ _RUN_SCOPED_METHODS = frozenset(
         "events/read",
     }
 )
+_AGGREGATE_READ_METHODS = frozenset({"run/list"})
 DEFAULT_APPROVAL_RECOVERY_TIMEOUT_SECONDS = 30.0
 AMBIGUOUS_SEND_ECHO_GRACE_SECONDS = 0.05
 _AUTO_ARCHIVE_FORBIDDEN_ROLES = frozenset({"implement", "plan"})
@@ -506,6 +506,8 @@ class Supervisor:
         self.projection_rebuild_tasks: dict[str, asyncio.Task[None]] = {}
         self.projection_rebuild_errors: dict[str, BaseException] = {}
         self.projection_rebuilds_started = False
+        self.projection_rebuild_ready = asyncio.Event()
+        self.projection_rebuild_ready.set()
         self.archive_queue_limit = archive_queue_limit
         self.archive_pending = 0
         self.archive_inflight: set[str] = set()
@@ -525,6 +527,8 @@ class Supervisor:
         self.recovery_scan_lock = asyncio.Lock()
         self.archive_backfill_task: asyncio.Task[Any] | None = None
         self.archive_backfill_worker: asyncio.Task[Any] | None = None
+        self._writers_drained_before_lock_release = False
+        self._writers_fenced = False
         # A supervisor boot invalidates any provider stdin write that had not
         # completed before shutdown: even if the row is at "sending", the
         # previous transport is gone. Sweep once per boot so the on-idle
@@ -1305,6 +1309,8 @@ Preserve the same identity, role, worktree, orchestrator grouping, PR gates, and
         adapter: ProviderAdapter,
         event: ProviderEvent,
     ) -> None:
+        if self._writers_fenced:
+            return
         async with self._event_mutation_admission(run_id, adapter, event) as admitted:
             if not admitted:
                 return
@@ -3027,7 +3033,11 @@ Preserve the same identity, role, worktree, orchestrator grouping, PR gates, and
         )
 
     async def recover_on_start(self) -> list[dict[str, str]]:
-        await self._rebuild_startup_projections()
+        self.projection_rebuild_ready.clear()
+        try:
+            await self._rebuild_startup_projections()
+        finally:
+            self.projection_rebuild_ready.set()
         async with self._run_mutation_admission():
             async with self.recovery_scan_lock:
                 self.store.abort_uncommitted_starts()
@@ -3070,17 +3080,9 @@ Preserve the same identity, role, worktree, orchestrator grouping, PR gates, and
         if not self.projection_rebuilds_started:
             self.projection_rebuilds_started = True
             for record in self.store.list_runs():
-                # Terminal runs are handed to the archive worker during this
-                # recovery pass. Their durable event export is the retained
-                # projection, so do not delay that handoff for a live shard
-                # rebuild that would be deleted immediately afterwards.
                 if (
                     record.run_id in self.materializer_failed_runs
                     or record.run_id in self.adapters
-                    or (
-                        record.state in TERMINAL_STATES
-                        and record.raw_event_count == record.normalized_event_count
-                    )
                 ):
                     continue
                 self.projection_rebuild_tasks[record.run_id] = asyncio.create_task(
@@ -3117,7 +3119,7 @@ Preserve the same identity, role, worktree, orchestrator grouping, PR gates, and
             logger.exception("event materializer rebuild failed for %s", run_id)
 
     def _rebuild_startup_projection_sync(self, run_id: str) -> None:
-        """Normalize orphan rows and rebuild one run in a worker thread."""
+        """Repair one run when raw sequence coverage has a gap."""
 
         try:
             record = self.store.get(run_id)
@@ -3128,12 +3130,15 @@ Preserve the same identity, role, worktree, orchestrator grouping, PR gates, and
             raw_rows = list(self.store.iter_raw_events(run_id))
         except RunNotFound:
             return
-        if (
-            record.state in TERMINAL_STATES
-            and len(raw_rows) > MAX_TERMINAL_ORPHAN_NORMALIZE_ROWS
-        ):
-            # Terminal large runs are repaired by the archive worker, immediately
-            # before export and deletion.
+        raw_seqs = {int(envelope.get("seq", 0)) for envelope in raw_rows}
+        normalized_seqs = set(normalized_by_raw_seq)
+        try:
+            materialized_seqs = self.event_store.materialized_raw_seqs(run_id)
+        except (sqlite3.DatabaseError, ValueError):
+            materialized_seqs = set()
+        missing_normalized = raw_seqs - normalized_seqs
+        missing_materialized = raw_seqs - materialized_seqs
+        if not missing_normalized and not missing_materialized:
             return
         for envelope in raw_rows:
             raw_seq = int(envelope.get("seq", 0))
@@ -3147,13 +3152,11 @@ Preserve the same identity, role, worktree, orchestrator grouping, PR gates, and
                     materialize=False,
                 )
             )
-        if len(normalized_by_raw_seq) != len(raw_rows):
+        if missing_normalized:
             self.store.rebuild_projections_from_normalized(run_id)
-        if record.state in TERMINAL_STATES:
-            # Archive export preserves terminal history. There is no live
-            # SQLite shard left to serve after this recovery pass.
-            return
         self._rebuild_materializer_database_sync(run_id)
+        if record.state in TERMINAL_STATES:
+            return
 
     async def _ensure_projection_ready(self, run_id: str) -> None:
         task = self.projection_rebuild_tasks.get(run_id)
@@ -3162,6 +3165,14 @@ Preserve the same identity, role, worktree, orchestrator grouping, PR gates, and
         await asyncio.shield(task)
         error = self.projection_rebuild_errors.get(run_id)
         if error is not None:
+            raise CommandRetryable(
+                f"event projection is unavailable for run {run_id}: {error}"
+            ) from error
+
+    async def _ensure_aggregate_projection_ready(self) -> None:
+        await self.projection_rebuild_ready.wait()
+        if self.projection_rebuild_errors:
+            run_id, error = next(iter(self.projection_rebuild_errors.items()))
             raise CommandRetryable(
                 f"event projection is unavailable for run {run_id}: {error}"
             ) from error
@@ -5472,18 +5483,23 @@ Preserve the same identity, role, worktree, orchestrator grouping, PR gates, and
         record = self.store.get(run_id)
         if record.state not in TERMINAL_STATES:
             return
-        if record.raw_event_count == record.normalized_event_count:
-            return
         raw_rows = list(self.store.iter_raw_events(run_id))
         normalized_rows = list(self.store.iter_normalized_events(run_id))
+        raw_seqs = {int(row.get("seq", 0)) for row in raw_rows}
         normalized_seqs = {
             int(row.get("raw_seq", 0)) for row in normalized_rows
         }
+        try:
+            materialized_seqs = self.event_store.materialized_raw_seqs(run_id)
+        except (sqlite3.DatabaseError, ValueError):
+            materialized_seqs = set()
+        missing_normalized = raw_seqs - normalized_seqs
+        missing_materialized = raw_seqs - materialized_seqs
+        if not missing_normalized and not missing_materialized:
+            return
         orphans = [
             row for row in raw_rows if int(row.get("seq", 0)) not in normalized_seqs
         ]
-        if not orphans:
-            return
         for envelope in orphans:
             asyncio.run(
                 self._recover_orphan_raw_event(
@@ -5492,7 +5508,8 @@ Preserve the same identity, role, worktree, orchestrator grouping, PR gates, and
                     materialize=False,
                 )
             )
-        self.store.rebuild_projections_from_normalized(run_id)
+        if missing_normalized:
+            self.store.rebuild_projections_from_normalized(run_id)
         self._rebuild_materializer_database_sync(run_id)
 
     def _validate_terminal_archive(self, run_id: str, session_dir: Path) -> None:
@@ -6085,6 +6102,8 @@ Preserve the same identity, role, worktree, orchestrator grouping, PR gates, and
                 # record when no current run remains.
                 if method != "run/archive":
                     raise
+        elif method in _AGGREGATE_READ_METHODS:
+            await self._ensure_aggregate_projection_ready()
         if method in _COMMAND_METHODS:
             self._reject_archive_inflight(params)
             if method != "run/start":
@@ -6741,7 +6760,77 @@ Preserve the same identity, role, worktree, orchestrator grouping, PR gates, and
             return await self.prepare_handover(run_ids)
         raise ValueError(f"unknown supervisor method: {method}")
 
+    async def drain_writers_before_lock_release(self) -> None:
+        """Finish every supervisor-owned write before daemon handover."""
+
+        if self._writers_drained_before_lock_release:
+            return
+        self._writers_fenced = True
+        for task in tuple(self.event_tasks.values()):
+            task.cancel()
+        if self.event_tasks:
+            await asyncio.gather(*self.event_tasks.values(), return_exceptions=True)
+
+        while self.monitor_tasks:
+            await asyncio.gather(
+                *(asyncio.shield(task) for task in tuple(self.monitor_tasks)),
+                return_exceptions=True,
+            )
+        rotation = self.codex_rotation_task
+        if rotation is not None and not rotation.done():
+            await asyncio.gather(asyncio.shield(rotation), return_exceptions=True)
+
+        await self.command_queue.close()
+        for task in tuple(self.idempotency_tasks.values()):
+            if not task.done():
+                task.cancel()
+        if self.idempotency_tasks:
+            await asyncio.gather(
+                *(asyncio.shield(task) for task in self.idempotency_tasks.values()),
+                return_exceptions=True,
+            )
+        worker = self.archive_backfill_worker
+        if worker is not None and not worker.done():
+            await asyncio.gather(asyncio.shield(worker), return_exceptions=True)
+        if self.archive_jobs:
+            await asyncio.gather(
+                *(asyncio.shield(job) for job in tuple(self.archive_jobs)),
+                return_exceptions=True,
+            )
+        await asyncio.to_thread(self.archive_executor.shutdown, wait=True)
+        await self.close_materializer_executor()
+        if self.projection_rebuild_tasks:
+            await asyncio.gather(
+                *(
+                    asyncio.shield(task)
+                    for task in self.projection_rebuild_tasks.values()
+                ),
+                return_exceptions=True,
+            )
+        self._writers_drained_before_lock_release = True
+
     async def close(self) -> None:
+        if self._writers_drained_before_lock_release:
+            adapters: list[ProviderAdapter] = []
+            seen: set[int] = set()
+            for adapter in self.adapters.values():
+                if id(adapter) in seen:
+                    continue
+                seen.add(id(adapter))
+                adapters.append(adapter)
+            for adapter in adapters:
+                try:
+                    await self._await_cleanup(adapter.close())
+                except BaseException:
+                    continue
+            self.event_tasks.clear()
+            self.adapters.clear()
+            self.event_routes.clear()
+            self.archive_jobs.clear()
+            self.archive_backfill_worker = None
+            self.archive_backfill_task = None
+            self.event_store.close()
+            return
         rotation = self.codex_rotation_task
         if rotation is not None and not rotation.done():
             try:
