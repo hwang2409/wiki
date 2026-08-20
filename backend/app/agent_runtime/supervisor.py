@@ -1,28 +1,29 @@
 from __future__ import annotations
 
 import asyncio
-from contextlib import asynccontextmanager
 import json
 import logging
 import math
 import os
 import re
-import sqlite3
 import shutil
+import sqlite3
 import tempfile
 import time
 import warnings
 from collections import OrderedDict, deque
 from collections.abc import Callable, Iterator, Mapping
+from concurrent.futures import ThreadPoolExecutor
+from contextlib import asynccontextmanager
 from copy import deepcopy
 from datetime import datetime, timezone
 from enum import Enum
+from functools import partial
 from pathlib import Path
 from typing import Any
 from uuid import NAMESPACE_URL, UUID, uuid4, uuid5
 
-from .. import accounts, provider_health
-from .. import transcripts
+from .. import accounts, provider_health, transcripts
 from .command_log import AgentCommand, CommandConflict, CommandQueue, CommandRetryable
 from .event_store import (
     EventReducerAdapter,
@@ -35,7 +36,6 @@ from .process import (
     orphaned_provider_process,
     terminate_detached_provider_pid,
 )
-from .runtime_card import inject_runtime_card
 from .provider import (
     AdapterStatus,
     ProviderAdapter,
@@ -44,20 +44,20 @@ from .provider import (
     ProviderProcessError,
     StartRequest,
 )
+from .runtime_card import inject_runtime_card
 from .store import RunNotFound, RunStore, StoreConflict
 from .types import (
-    LifecycleState,
-    EventDisposition,
     MAX_PENDING_USER_MESSAGES,
+    TERMINAL_STATES,
+    EventDisposition,
+    LifecycleState,
     ProviderKind,
     RecoveryAction,
     RunRecord,
-    TERMINAL_STATES,
     restart_recovery_decision,
 )
 from .version import RUNTIME_FINGERPRINT
 from .wk_feature import is_wk_kind, wk_enabled
-
 
 AdapterFactory = Callable[[RunRecord], ProviderAdapter]
 DEFAULT_REAPER_INTERVAL_SECONDS = 30.0
@@ -66,6 +66,7 @@ DEFAULT_AUTO_ARCHIVE_GRACE_SECONDS = 10 * 60.0
 DEFAULT_ADAPTER_DETACH_GRACE_SECONDS = 1.0
 DEFAULT_IDEMPOTENCY_CACHE_SIZE = 256
 DEFAULT_WORKER_SOFT_CAP = 5
+DEFAULT_ARCHIVE_QUEUE_LIMIT = 4
 _IDEMPOTENT_METHODS = frozenset({"run/start", "run/send_now", "run/send_on_idle"})
 _COMMAND_METHODS = frozenset(
     {"run/start", "run/send_now", "run/send_on_idle", "run/archive", "run/replace"}
@@ -363,9 +364,12 @@ class Supervisor:
         orphan_archive_grace_seconds: float = 0.5,
         idempotency_cache_size: int = DEFAULT_IDEMPOTENCY_CACHE_SIZE,
         worker_soft_cap: int | None = None,
+        archive_queue_limit: int = DEFAULT_ARCHIVE_QUEUE_LIMIT,
     ):
         if idempotency_cache_size < 1:
             raise ValueError("idempotency_cache_size must be positive")
+        if archive_queue_limit < 1:
+            raise ValueError("archive_queue_limit must be positive")
         self.store = store
         self.adapter_factory = adapter_factory
         self.materializer_failed_runs: dict[str, str] = {}
@@ -386,13 +390,6 @@ class Supervisor:
                 )
             except Exception:
                 logger.exception("could not block corrupt raw run %s", run_id)
-        self.store.set_archive_events_exporter(
-            lambda run_id, destination, legacy_source: self.event_store.export_events_jsonl(
-                run_id,
-                destination,
-                legacy_source=legacy_source,
-            )
-        )
         self.materializer_reducers: dict[str, EventReducerAdapter] = {}
         self.materializer_latency_seconds: deque[float] = deque(maxlen=256)
         self.materializer_queue_depth: dict[str, int] = {}
@@ -474,6 +471,15 @@ class Supervisor:
         ] = {}
         self._deferred_provider_event_barriers: dict[str, asyncio.Future[None]] = {}
         self.agent_locks: dict[str, asyncio.Lock] = {}
+        self.archive_executor = ThreadPoolExecutor(
+            max_workers=1,
+            thread_name_prefix="wiki-archive",
+        )
+        self.archive_queue_limit = archive_queue_limit
+        self.archive_pending = 0
+        self.archive_inflight: set[str] = set()
+        self.archive_inflight_agents: dict[str, str] = {}
+        self.archive_jobs: set[asyncio.Future[Any]] = set()
         self.handover_condition = asyncio.Condition()
         self.active_run_mutations = 0
         self.handover_pending = False
@@ -717,6 +723,7 @@ class Supervisor:
         )
     def _runtime_status(self, record: RunRecord) -> dict[str, Any]:
         value = _public_run(record)
+        value["archive_in_progress"] = record.run_id in self.archive_inflight
         value["composer_messages"] = self.store.composer_messages_for_run(
             record.run_id
         )
@@ -732,6 +739,31 @@ class Supervisor:
             value["provider_pid"] = snapshot.pid
             value["active_turn_id"] = snapshot.active_turn_id
         return value
+
+    async def _run_archive_worker(
+        self,
+        operation: Callable[..., Any],
+        *args: Any,
+        **kwargs: Any,
+    ) -> Any:
+        if self.archive_pending >= self.archive_queue_limit:
+            raise CommandRetryable("archive worker queue is full; retry later")
+        self.archive_pending += 1
+        loop = asyncio.get_running_loop()
+        try:
+            future = loop.run_in_executor(
+                self.archive_executor,
+                partial(operation, *args, **kwargs),
+            )
+            self.archive_jobs.add(future)
+            future.add_done_callback(self.archive_jobs.discard)
+
+            async def wait_for_archive() -> Any:
+                return await asyncio.shield(future)
+
+            return await self._await_cleanup(wait_for_archive())
+        finally:
+            self.archive_pending -= 1
 
     def subscribe(self) -> asyncio.Queue[dict[str, Any]]:
         queue: asyncio.Queue[dict[str, Any]] = asyncio.Queue(maxsize=256)
@@ -807,7 +839,17 @@ class Supervisor:
         return self.agent_locks.setdefault(agent_id, asyncio.Lock())
 
     def _run_lock(self, run_id: str) -> asyncio.Lock:
+        if run_id in self.archive_inflight:
+            raise StoreConflict("archive is already in progress")
         return self._agent_lock(self.store.get(run_id).agent_id)
+
+    def _reject_archive_inflight(self, params: Mapping[str, Any]) -> None:
+        run_id = params.get("run_id")
+        agent_id = params.get("agent_id")
+        if isinstance(run_id, str) and run_id in self.archive_inflight:
+            raise StoreConflict("archive is already in progress")
+        if isinstance(agent_id, str) and agent_id in self.archive_inflight_agents:
+            raise StoreConflict("archive is already in progress")
 
     @asynccontextmanager
     async def _run_mutation_admission(self, *, wait_for_handover: bool = False):
@@ -2944,6 +2986,15 @@ Preserve the same identity, role, worktree, orchestrator grouping, PR gates, and
             for effect in self.store.command_log.sending_steer_effects()
         )
 
+    def _terminal_run_prune_ids(self) -> frozenset[str]:
+        """Snapshot loop-owned prune eligibility before entering the worker."""
+
+        return frozenset(
+            record.run_id
+            for record in self.store.list_runs()
+            if self._terminal_run_can_prune(record)
+        )
+
     async def recover_on_start(self) -> list[dict[str, str]]:
         async with self._run_mutation_admission():
             async with self.recovery_scan_lock:
@@ -2958,7 +3009,11 @@ Preserve the same identity, role, worktree, orchestrator grouping, PR gates, and
                         self.store.rebuild_wk_status_projection(record.run_id)
                 results = await self._recover_once()
                 await self._reconcile_sending_steer_effects()
-                self.store.prune_terminal_runs()
+                prune_ids = self._terminal_run_prune_ids()
+                await self._run_archive_worker(
+                    self.store.prune_terminal_runs,
+                    prune_ids,
+                )
                 await self.command_queue.recover_pending()
                 if self._reaper_due():
                     by_run_id = {
@@ -5162,6 +5217,111 @@ Preserve the same identity, role, worktree, orchestrator grouping, PR gates, and
         command_hash: str | None = None,
         command_hash_payload: Mapping[str, Any] | None = None,
     ) -> RunRecord:
+        record = self.store.get(run_id)
+        async with self._archive_admission(record):
+            return await self._archive_locked(
+                run_id,
+                outcome=outcome,
+                effect_id=effect_id,
+                command_hash=command_hash,
+                command_hash_payload=command_hash_payload,
+            )
+
+    @asynccontextmanager
+    async def _archive_admission(self, record: RunRecord):
+        """Block commands while either archive path finalizes one run."""
+
+        if record.run_id in self.archive_inflight:
+            raise StoreConflict("archive is already in progress")
+        if record.agent_id in self.archive_inflight_agents:
+            raise StoreConflict("archive is already in progress")
+        self.archive_inflight.add(record.run_id)
+        self.archive_inflight_agents[record.agent_id] = record.run_id
+        try:
+            yield
+        finally:
+            self.archive_inflight.discard(record.run_id)
+            if self.archive_inflight_agents.get(record.agent_id) == record.run_id:
+                self.archive_inflight_agents.pop(record.agent_id, None)
+
+    async def _archive_finalize(
+        self,
+        run_id: str,
+        *,
+        outcome: str | None = None,
+        effect_id: str | None = None,
+        command_hash: str | None = None,
+        command_hash_payload: Mapping[str, Any] | None = None,
+    ) -> tuple[RunRecord, Path]:
+        archived, session_dir = await self._run_archive_worker(
+            self._archive_finalize_sync,
+            run_id,
+            outcome=outcome,
+            effect_id=effect_id,
+            command_hash=command_hash,
+            command_hash_payload=command_hash_payload,
+        )
+        self.event_store.close_run(run_id)
+        self._record_archive_edge(archived, outcome)
+        return archived, session_dir
+
+    async def _replay_archive_cleanup(self, run_id: str) -> RunRecord | None:
+        async with self._run_mutation_admission():
+            async with self._run_lock(run_id):
+                record = self.store.get(run_id)
+                async with self._archive_admission(record):
+                    archived = await self._run_archive_worker(
+                        self.store.finalize_archived_run,
+                        run_id,
+                    )
+                if archived is not None:
+                    self.event_store.close_run(run_id)
+                return archived
+
+    def _archive_finalize_sync(
+        self,
+        run_id: str,
+        *,
+        outcome: str | None = None,
+        effect_id: str | None = None,
+        command_hash: str | None = None,
+        command_hash_payload: Mapping[str, Any] | None = None,
+    ) -> tuple[RunRecord, Path]:
+        archived, session_dir = self.store.archive_current(run_id, outcome=outcome)
+        if effect_id is not None:
+            effect_payload: dict[str, Any] = {
+                "agent_id": archived.agent_id,
+                "run_id": run_id,
+                "outcome": outcome,
+                "request_id": effect_id,
+                "method": "run/archive",
+            }
+            if command_hash_payload is not None:
+                effect_payload["command_hash_payload"] = dict(command_hash_payload)
+            self.store.command_log.complete_effect(
+                AgentCommand(
+                    "run/archive",
+                    archived.agent_id,
+                    effect_id,
+                    effect_payload,
+                ),
+                {
+                    **_public_run(archived),
+                    "_workgraph_archive_recorded": True,
+                },
+                command_hash=command_hash,
+            )
+        return archived, session_dir
+
+    async def _archive_locked(
+        self,
+        run_id: str,
+        *,
+        outcome: str | None = None,
+        effect_id: str | None = None,
+        command_hash: str | None = None,
+        command_hash_payload: Mapping[str, Any] | None = None,
+    ) -> RunRecord:
         adapter = self.adapters.get(run_id)
         if adapter is None:
             record = self.store.get(run_id)
@@ -5209,34 +5369,13 @@ Preserve the same identity, role, worktree, orchestrator grouping, PR gates, and
                     LifecycleState.COMPLETED,
                     reason="archived",
                 )
-            archived, _ = self.store.archive_current(run_id, outcome=outcome)
-            self.event_store.close_run(run_id)
-            self._record_archive_edge(archived, outcome)
-            if effect_id is not None:
-                effect_payload = {
-                    "agent_id": archived.agent_id,
-                    "run_id": run_id,
-                    "outcome": outcome,
-                    "request_id": effect_id,
-                    "method": "run/archive",
-                }
-                if command_hash_payload is not None:
-                    effect_payload["command_hash_payload"] = dict(
-                        command_hash_payload
-                    )
-                self.store.command_log.complete_effect(
-                    AgentCommand(
-                        "run/archive",
-                        archived.agent_id,
-                        effect_id,
-                        effect_payload,
-                    ),
-                    {
-                        **_public_run(archived),
-                        "_workgraph_archive_recorded": True,
-                    },
-                    command_hash=command_hash,
-                )
+            archived, _ = await self._archive_finalize(
+                run_id,
+                outcome=outcome,
+                effect_id=effect_id,
+                command_hash=command_hash,
+                command_hash_payload=command_hash_payload,
+            )
             self._forget_implicit_idempotency_for_run(run_id)
             self._clear_adapter_loss(run_id)
             self._clear_auth_dead_recovery_state(run_id)
@@ -5259,32 +5398,13 @@ Preserve the same identity, role, worktree, orchestrator grouping, PR gates, and
         if status is None:
             raise StoreConflict("provider archive returned no status")
         record = self.store.update_adapter_status(run_id, status)
-        archived, _ = self.store.archive_current(run_id, outcome=outcome)
-        self.event_store.close_run(run_id)
-        self._record_archive_edge(archived, outcome)
-        if effect_id is not None:
-            effect_payload = {
-                "agent_id": archived.agent_id,
-                "run_id": run_id,
-                "outcome": outcome,
-                "request_id": effect_id,
-                "method": "run/archive",
-            }
-            if command_hash_payload is not None:
-                effect_payload["command_hash_payload"] = dict(command_hash_payload)
-            self.store.command_log.complete_effect(
-                AgentCommand(
-                    "run/archive",
-                    archived.agent_id,
-                    effect_id,
-                    effect_payload,
-                ),
-                {
-                    **_public_run(archived),
-                    "_workgraph_archive_recorded": True,
-                },
-                command_hash=command_hash,
-            )
+        archived, _ = await self._archive_finalize(
+            run_id,
+            outcome=outcome,
+            effect_id=effect_id,
+            command_hash=command_hash,
+            command_hash_payload=command_hash_payload,
+        )
         self._forget_implicit_idempotency_for_run(run_id)
         self._clear_adapter_loss(run_id)
         self._clear_auth_dead_recovery_state(run_id)
@@ -5744,6 +5864,7 @@ Preserve the same identity, role, worktree, orchestrator grouping, PR gates, and
 
     async def dispatch(self, method: str, params: dict[str, Any]) -> Any:
         if method in _COMMAND_METHODS:
+            self._reject_archive_inflight(params)
             await self.command_queue.recover_pending()
             command_params = dict(params)
             request_id = _validated_idempotency_request_id(
@@ -6025,12 +6146,16 @@ Preserve the same identity, role, worktree, orchestrator grouping, PR gates, and
                 )
             return result
         if method == "run/list":
+            runs: list[dict[str, Any]] = []
+            for record in self.store.list_runs():
+                try:
+                    runs.append(self._runtime_status(record))
+                except RunNotFound:
+                    continue
             return {
                 "status": "ok",
                 "pid": os.getpid(),
-                "runs": [
-                    self._runtime_status(record) for record in self.store.list_runs()
-                ],
+                "runs": runs,
             }
         if method == "fleet/rotate_codex":
             account = params.get("account")
@@ -6142,7 +6267,7 @@ Preserve the same identity, role, worktree, orchestrator grouping, PR gates, and
                     **_public_run(archived),
                     "_workgraph_archive_recorded": True,
                 }
-            archived = self.store.finalize_archived_run(run_id)
+            archived = await self._replay_archive_cleanup(run_id)
             if archived is not None:
                 return {
                     **_public_run(archived),
@@ -6465,10 +6590,20 @@ Preserve the same identity, role, worktree, orchestrator grouping, PR gates, and
         self.implicit_idempotency_keys.clear()
         self.implicit_idempotency_runs.clear()
         self.detached_at_monotonic.clear()
+        self.archive_inflight.clear()
+        self.archive_inflight_agents.clear()
         self.adapters.clear()
         try:
             await self.command_queue.close()
         finally:
+            archive_jobs = tuple(self.archive_jobs)
+            if archive_jobs:
+                await asyncio.gather(
+                    *(asyncio.shield(job) for job in archive_jobs),
+                    return_exceptions=True,
+                )
+            self.archive_executor.shutdown(wait=True)
+            self.archive_jobs.clear()
             self.event_store.close()
         if worker_error is not None:
             raise worker_error
