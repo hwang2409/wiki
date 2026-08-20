@@ -1311,6 +1311,10 @@ Preserve the same identity, role, worktree, orchestrator grouping, PR gates, and
         event: ProviderEvent,
     ) -> None:
         if self._writers_fenced:
+            async with self.handover_condition:
+                self.handover_event_queue.setdefault(run_id, []).append(
+                    (adapter, event)
+                )
             return
         async with self._event_mutation_admission(run_id, adapter, event) as admitted:
             if not admitted:
@@ -6770,6 +6774,24 @@ Preserve the same identity, role, worktree, orchestrator grouping, PR gates, and
         if self._writers_drained_before_lock_release:
             return
         self._writers_fenced = True
+
+        # Stop provider input before cancelling pumps. The adapter queues can
+        # still contain events accepted before the fence; drain and persist
+        # them while the old daemon still owns the handover lock.
+        for run_id, adapter in tuple(self.adapters.items()):
+            stream_key = id(adapter)
+            self.expected_stream_ends.add(stream_key)
+            try:
+                try:
+                    await adapter.stop()
+                except BaseException:
+                    pass
+                await self._drain_stopped_adapter(run_id, adapter)
+            finally:
+                self.expected_stream_ends.discard(stream_key)
+        await self._capture_live_handover_events()
+        await self._flush_all_handover_events()
+
         for task in tuple(self.event_tasks.values()):
             task.cancel()
         if self.event_tasks:

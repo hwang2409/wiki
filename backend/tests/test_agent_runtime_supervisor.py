@@ -12249,6 +12249,53 @@ class DaemonShutdownTests(unittest.IsolatedAsyncioTestCase):
             self.assertTrue(observed["lock_free"])
             self.assertTrue(observed["pid_gone"])
 
+    async def test_shutdown_persists_buffered_adapter_events_for_restart_replay(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            paths = _paths(root)
+            store = RunStore(paths)
+            supervisor = Supervisor(store, FixtureAdapterFactory(FIXTURES))
+            record = store.create(
+                RunRecord.new(
+                    agent_id="WIKI-SHUTDOWN-BUFFER",
+                    provider=ProviderKind.CODEX,
+                    role="implement",
+                    model="fixture-codex",
+                    worktree=str(root),
+                    prompt="shutdown buffered events",
+                )
+            )
+            adapter = supervisor.adapter_factory(record)
+            for index in range(3):
+                await adapter._events.put(  # noqa: SLF001 - shutdown buffer fixture
+                    ProviderEvent(
+                        ProviderKind.CODEX,
+                        {
+                            "method": "item/completed",
+                            "params": {
+                                "item": {
+                                    "type": "agentMessage",
+                                    "text": f"buffered-{index}",
+                                }
+                            },
+                        },
+                    )
+                )
+            supervisor._attach_adapter(record.run_id, adapter)  # noqa: SLF001
+
+            await supervisor.drain_writers_before_lock_release()
+            self.assertEqual(len(store.read_raw_events(record.run_id)), 3)
+            await supervisor.close()
+
+            restarted_store = RunStore(paths)
+            restarted = Supervisor(
+                restarted_store,
+                FixtureAdapterFactory(FIXTURES),
+            )
+            await restarted.recover_on_start()
+            self.assertEqual(len(restarted_store.read_raw_events(record.run_id)), 3)
+            await restarted.close()
+
     async def test_shutdown_drains_inflight_queue_write_before_lock_release(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
