@@ -657,6 +657,7 @@ export function retryPendingUserMessage(ticket: string, id: string, requestId?: 
       requestId: requestId ?? message.requestId,
       status: "sending" as const,
       error: undefined,
+      firstSeenTs: Date.now(),
       eventIdFloor,
     };
   });

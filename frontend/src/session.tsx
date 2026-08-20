@@ -3814,7 +3814,7 @@ export function SessionTab({
               {olderError ? <span role="alert">{olderError}</span> : null}
             </div>
           ) : null}
-          {displayEvents.length === 0 && pendingUserMessages.length === 0 ? (
+          {rows.length === 0 && pendingUserMessages.length === 0 ? (
             <div
               className="session-zero-events"
               role="status"
