@@ -565,6 +565,47 @@ class SupervisorTests(unittest.IsolatedAsyncioTestCase):
                 expected_seqs,
             )
 
+    async def test_startup_rebuilds_matching_raw_sequences_with_unhealthy_sqlite(self) -> None:
+        record = self.store.create(
+            RunRecord.new(
+                agent_id="WIKI-UNHEALTHY-SQLITE",
+                provider=ProviderKind.CODEX,
+                role="implement",
+                model="fixture-codex",
+                worktree=str(self.worktree),
+                prompt="unhealthy sqlite fixture",
+            )
+        )
+        raw = self.store.append_raw(
+            record.run_id,
+            provider="codex",
+            direction="provider",
+            payload={"method": "turn/diff/updated", "params": {"diff": "one"}},
+        )
+        await self.supervisor._recover_orphan_raw_event(  # noqa: SLF001
+            record.run_id,
+            raw,
+            materialize=False,
+        )
+        self.supervisor._rebuild_materializer_database_sync(record.run_id)  # noqa: SLF001
+        with self.supervisor.event_store.connection() as connection:
+            connection.execute("DROP TABLE run_projections")
+        self.assertEqual(
+            self.supervisor.event_store.materialized_raw_seqs(record.run_id),
+            {1},
+        )
+        self.assertFalse(self.supervisor.event_store.run_is_healthy(record.run_id))
+
+        with mock.patch.object(
+            self.supervisor,
+            "_rebuild_materializer_database_sync",
+            wraps=self.supervisor._rebuild_materializer_database_sync,  # noqa: SLF001
+        ) as rebuild:
+            self.supervisor._rebuild_startup_projection_sync(record.run_id)  # noqa: SLF001
+
+        rebuild.assert_called_once_with(record.run_id)
+        self.assertTrue(self.supervisor.event_store.run_is_healthy(record.run_id))
+
     async def _spawn_orphan_process(self, *, ignore_sigterm: bool = False) -> int:
         child_code = (
             "import os, signal, sys, time\n"
@@ -12366,28 +12407,23 @@ class DaemonShutdownTests(unittest.IsolatedAsyncioTestCase):
             paths = _paths(root)
             store = RunStore(paths)
             supervisor = Supervisor(store, FixtureAdapterFactory(FIXTURES))
-            start_entered = asyncio.Event()
-            release_start = asyncio.Event()
+            late_attach = asyncio.Event()
             stream_loss_writes: list[float] = []
-            original_factory = supervisor.adapter_factory
-
-            class BlockingStartAdapter(CodexFixtureAdapter):
-                async def start(self, request: StartRequest) -> AdapterStatus:
-                    start_entered.set()
-                    await release_start.wait()
-                    return await super().start(request)
-
-            def factory(record: RunRecord) -> ProviderAdapter:
-                if record.provider is ProviderKind.CODEX:
-                    return BlockingStartAdapter(
-                        FIXTURES / "codex_app_server_success.jsonl",
-                        FIXTURES / "codex_app_server_control.jsonl",
-                        generation=record.provider_generation,
-                    )
-                return original_factory(record)
-
-            supervisor.adapter_factory = factory
             original_stream_loss = supervisor._record_stream_loss
+            original_attach = supervisor._attach_adapter
+            original_close = supervisor.command_queue.close
+            late_start: asyncio.Task[Any] | None = None
+
+            def admit_late_adapter(run_id: str, adapter: ProviderAdapter) -> None:
+                # This models a run/start that won admission before the door
+                # closed but registers its pump after the first task snapshot.
+                writers_fenced = supervisor._writers_fenced  # noqa: SLF001
+                supervisor._writers_fenced = False  # noqa: SLF001
+                try:
+                    original_attach(run_id, adapter)
+                finally:
+                    supervisor._writers_fenced = writers_fenced  # noqa: SLF001
+                late_attach.set()
 
             async def record_stream_loss(
                 run_id: str,
@@ -12397,22 +12433,25 @@ class DaemonShutdownTests(unittest.IsolatedAsyncioTestCase):
                 stream_loss_writes.append(time.monotonic())
                 await original_stream_loss(run_id, adapter, reason)
 
-            start = asyncio.create_task(
-                supervisor.dispatch(
-                    "run/start",
-                    {
-                        "agent_id": "WIKI-SHUTDOWN-RACE",
-                        "provider": "codex",
-                        "role": "implement",
-                        "model": "fixture-codex",
-                        "effort": "high",
-                        "worktree": str(root),
-                        "prompt": "shutdown race",
-                    },
+            async def close_queue_with_late_start() -> None:
+                nonlocal late_start
+                late_start = asyncio.create_task(
+                    supervisor.dispatch(
+                        "run/start",
+                        {
+                            "agent_id": "WIKI-SHUTDOWN-RACE",
+                            "provider": "codex",
+                            "role": "implement",
+                            "model": "fixture-codex",
+                            "effort": "high",
+                            "worktree": str(root),
+                            "prompt": "shutdown race",
+                        },
+                    )
                 )
-            )
-            await start_entered.wait()
-            self.assertEqual(len(supervisor.event_tasks), 1)
+                await asyncio.wait_for(late_attach.wait(), timeout=5)
+                await original_close()
+
             lock = agent_daemon._acquire_single_instance(paths)
             release_at: float | None = None
             original_flock = agent_daemon.fcntl.flock
@@ -12431,6 +12470,14 @@ class DaemonShutdownTests(unittest.IsolatedAsyncioTestCase):
                 supervisor,
                 "_record_stream_loss",
                 side_effect=record_stream_loss,
+            ), mock.patch.object(
+                supervisor,
+                "_attach_adapter",
+                side_effect=admit_late_adapter,
+            ), mock.patch.object(
+                supervisor.command_queue,
+                "close",
+                side_effect=close_queue_with_late_start,
             ), mock.patch.object(agent_daemon.fcntl, "flock", tracked_flock):
                 shutdown = asyncio.create_task(
                     agent_daemon._shutdown(
@@ -12441,11 +12488,10 @@ class DaemonShutdownTests(unittest.IsolatedAsyncioTestCase):
                         paths,
                     )
                 )
-                await asyncio.sleep(0)
-                self.assertFalse(shutdown.done())
-                release_start.set()
-                await asyncio.wait_for(start, timeout=5)
                 await asyncio.wait_for(shutdown, timeout=5)
+                self.assertIsNotNone(late_start)
+                assert late_start is not None
+                await asyncio.wait_for(late_start, timeout=5)
 
             self.assertIsNotNone(release_at)
             assert release_at is not None

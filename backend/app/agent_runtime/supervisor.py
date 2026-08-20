@@ -3155,7 +3155,11 @@ Preserve the same identity, role, worktree, orchestrator grouping, PR gates, and
             materialized_seqs = set()
         missing_normalized = raw_seqs - normalized_seqs
         missing_materialized = raw_seqs - materialized_seqs
-        if not missing_normalized and not missing_materialized:
+        if (
+            not missing_normalized
+            and not missing_materialized
+            and self.event_store.run_is_healthy(run_id)
+        ):
             return raw_seqs
         for envelope in raw_rows:
             raw_seq = int(envelope.get("seq", 0))

@@ -455,8 +455,8 @@ class CommandLogTests(unittest.TestCase):
                 queue = CommandQueue(log, lambda: {}, recovery_factory=factory)
                 await queue.recover_pending()
                 self.assertIn(
-                    deferred,
-                    queue._deferred[deferred.agent_id],  # noqa: SLF001
+                    deferred.request_id,
+                    queue.recovery_queue(deferred.agent_id),
                 )
 
                 admission_failure = RuntimeError("command log is unavailable")
@@ -479,7 +479,7 @@ class CommandLogTests(unittest.TestCase):
                     [item.request_id for item in log.pending()],
                     [deferred.request_id],
                 )
-                self.assertFalse(queue._recovery_agent_events["WIKI-A"].is_set())  # noqa: SLF001
+                self.assertFalse(queue.recovery_barrier_open("WIKI-A"))
 
                 next_start = AgentCommand.spawn(
                     agent_id="WIKI-A",
@@ -536,8 +536,8 @@ class CommandLogTests(unittest.TestCase):
                     return effect
 
                 queue = CommandQueue(log, lambda: {}, recovery_factory=factory)
-                queue._defer(first)  # noqa: SLF001 - ordered retry fixture
-                queue._defer(second)  # noqa: SLF001 - ordered retry fixture
+                queue.defer_for_recovery(first)
+                queue.defer_for_recovery(second)
                 recovery = asyncio.create_task(queue.recover_pending())
                 await asyncio.wait_for(first_started.wait(), timeout=2)
                 self.assertFalse(second_started.is_set())
@@ -599,22 +599,18 @@ class CommandLogTests(unittest.TestCase):
                 await queue.recover_pending()
                 self.assertEqual(effects, [])
                 self.assertEqual(
-                    [command.request_id for command in queue._deferred["WIKI-A"]],
-                    [first.request_id, second.request_id],
+                    queue.recovery_queue("WIKI-A"),
+                    (first.request_id, second.request_id),
                 )
-                self.assertNotIn(
-                    (second.method, second.request_id), queue._inflight
-                )
+                self.assertIsNone(queue.recovery_admitted("WIKI-A"))
 
                 await queue.recover_pending()
                 self.assertEqual(effects, [first.request_id])
                 await second_started.wait()
-                self.assertIn(
-                    (second.method, second.request_id), queue._inflight
-                )
+                self.assertEqual(queue.recovery_admitted("WIKI-A"), second.request_id)
                 self.assertEqual(
-                    [command.request_id for command in queue._deferred["WIKI-A"]],
-                    [second.request_id],
+                    queue.recovery_queue("WIKI-A"),
+                    (second.request_id,),
                 )
 
                 release_second.set()
@@ -622,6 +618,107 @@ class CommandLogTests(unittest.TestCase):
                 self.assertEqual(effects, [first.request_id, second.request_id])
                 self.assertEqual(log.pending(), [])
                 await queue.close()
+
+        asyncio.run(run())
+
+    def test_deferred_start_blocks_same_agent_until_recovery_finishes(self) -> None:
+        async def run() -> None:
+            with tempfile.TemporaryDirectory() as tmp:
+                log = CommandLog(Path(tmp) / "command-log.sqlite3")
+                old = AgentCommand.steer(
+                    agent_id="WIKI-A",
+                    request_id="send-a-old",
+                    payload={
+                        "method": "run/send_now",
+                        "run_id": "run-a",
+                        "text": "old",
+                    },
+                )
+                state = {"WIKI-A": {"current": {"run_id": "run-a"}}}
+                log.append_intent(old, state)
+                old_started = asyncio.Event()
+                release_old = asyncio.Event()
+
+                async def recover_old() -> dict[str, str]:
+                    old_started.set()
+                    await release_old.wait()
+                    return {"status": "sent"}
+
+                queue = CommandQueue(log, lambda: state, recovery_factory=lambda _command: recover_old)
+                recovery = asyncio.create_task(queue.recover_pending())
+                await old_started.wait()
+                new = AgentCommand.steer(
+                    agent_id="WIKI-A",
+                    request_id="send-a-new",
+                    payload={
+                        "method": "run/send_now",
+                        "run_id": "run-a",
+                        "text": "new",
+                    },
+                )
+                blocked = asyncio.create_task(
+                    queue.submit(new, lambda: _return_result({"status": "sent"}))
+                )
+                await asyncio.sleep(0)
+                self.assertFalse(blocked.done())
+                release_old.set()
+                await recovery
+                self.assertEqual(
+                    await asyncio.wait_for(blocked, timeout=5),
+                    {"status": "sent"},
+                )
+                await queue.close()
+
+        asyncio.run(run())
+
+    def test_terminal_recovery_paths_open_empty_agent_barrier(self) -> None:
+        async def run() -> None:
+            for outcome in ("failure", "success", "timeout"):
+                with self.subTest(outcome=outcome), tempfile.TemporaryDirectory() as tmp:
+                    log = CommandLog(Path(tmp) / "command-log.sqlite3")
+                    old = AgentCommand.steer(
+                        agent_id="WIKI-A",
+                        request_id=f"send-{outcome}",
+                        payload={
+                            "method": "run/send_now",
+                            "run_id": "run-a",
+                            "text": outcome,
+                        },
+                    )
+                    state = {"WIKI-A": {"current": {"run_id": "run-a"}}}
+                    log.append_intent(old, state)
+
+                    async def recover_old() -> dict[str, str]:
+                        if outcome == "failure":
+                            raise RuntimeError("recovery failed")
+                        if outcome == "timeout":
+                            raise asyncio.TimeoutError("recovery timed out")
+                        return {"status": "sent"}
+
+                    queue = CommandQueue(
+                        log,
+                        lambda: state,
+                        recovery_factory=lambda _command: recover_old,
+                    )
+                    await queue.recover_pending()
+                    self.assertTrue(queue.recovery_barrier_open("WIKI-A"))
+                    new = AgentCommand.steer(
+                        agent_id="WIKI-A",
+                        request_id=f"next-{outcome}",
+                        payload={
+                            "method": "run/send_now",
+                            "run_id": "run-a",
+                            "text": "next",
+                        },
+                    )
+                    self.assertEqual(
+                        await queue.submit(
+                            new,
+                            lambda: _return_result({"status": "sent"}),
+                        ),
+                        {"status": "sent"},
+                    )
+                    await queue.close()
 
         asyncio.run(run())
 
