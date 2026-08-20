@@ -935,15 +935,7 @@ class RunStore:
                 provider_process_group_members_sync(identity.process_group_id)
             )
             self._write_record(record)
-            registry = self._read_registry()
-            current = (registry.get(record.agent_id) or {}).get("current") or {}
-            if current.get("run_id") == record.run_id:
-                registry[record.agent_id]["current"] = self._registry_current(record)
-                self._write_registry(registry)
-                self.command_log.replace_projection(
-                    record.agent_id,
-                    {record.agent_id: registry[record.agent_id]},
-                )
+            self._write_current_projection(record)
             return record
 
     def find_archived_start_request(self, request_id: str) -> RunRecord | None:
@@ -1002,6 +994,22 @@ class RunStore:
             raise StoreError("agent registry must contain an object")
         return value
 
+    @staticmethod
+    def _registry_projection_is_empty(registry: dict[str, Any]) -> bool:
+        return not any(
+            key != "_orchestrators" and value
+            for key, value in registry.items()
+        ) and not registry.get("_orchestrators")
+
+    def _read_registry_for_mutation(self) -> dict[str, Any]:
+        registry = self._read_registry()
+        if not self._registry_projection_is_empty(registry):
+            return registry
+        return self._reconcile_registry_from_runs(
+            include_terminal=False,
+            registry=registry,
+        )
+
     def _write_registry(self, registry: dict[str, Any]) -> None:
         _atomic_write_json(self.paths.registry_path, registry)
 
@@ -1018,7 +1026,12 @@ class RunStore:
             projected = self.command_log.projection_for(agent_id)
             if projected:
                 return deepcopy(projected)
-            entry = self._read_registry().get(agent_id)
+            registry = self._read_registry_for_mutation()
+            entry = registry.get(agent_id)
+            if entry is None:
+                legacy = (registry.get("_orchestrators") or {}).get(agent_id)
+                if isinstance(legacy, dict):
+                    entry = {"history": [], "current": legacy}
             if entry is None:
                 return {agent_id: None}
             seeded = {agent_id: deepcopy(entry)}
@@ -1029,7 +1042,12 @@ class RunStore:
         """Read one agent from the registry without using the command projection."""
 
         with self._lock:
-            entry = self._read_registry().get(agent_id)
+            registry = self._read_registry_for_mutation()
+            entry = registry.get(agent_id)
+            if entry is None:
+                legacy = (registry.get("_orchestrators") or {}).get(agent_id)
+                if isinstance(legacy, dict):
+                    entry = {"history": [], "current": legacy}
             return {agent_id: deepcopy(entry)} if entry is not None else {agent_id: None}
 
     def find_start_request(self, request_id: str) -> RunRecord | None:
@@ -1060,7 +1078,7 @@ class RunStore:
     ) -> None:
         """Restore the pre-start registry and status file from durable data."""
 
-        registry = self._read_registry()
+        registry = self._read_registry_for_mutation()
         current = registry.get(record.agent_id)
         current_run_id = (
             current.get("current", {}).get("run_id")
@@ -1068,6 +1086,11 @@ class RunStore:
             and isinstance(current.get("current"), dict)
             else None
         )
+        legacy = registry.get("_orchestrators")
+        if current_run_id is None and isinstance(legacy, dict):
+            legacy_current = legacy.get(record.agent_id)
+            if isinstance(legacy_current, dict):
+                current_run_id = legacy_current.get("run_id")
         if snapshot is None:
             if current_run_id == record.run_id:
                 registry.pop(record.agent_id, None)
@@ -1082,7 +1105,6 @@ class RunStore:
         elif current_run_id == record.run_id:
             registry.pop(record.agent_id, None)
 
-        legacy = registry.get("_orchestrators")
         if bool(snapshot.get("legacy_present")):
             previous_legacy = snapshot.get("legacy_entry")
             if not isinstance(legacy, dict):
@@ -1321,6 +1343,52 @@ class RunStore:
             value["lane"] = record.wk_lane
         return value
 
+    def _project_current_registry(
+        self,
+        registry: dict[str, Any],
+        record: RunRecord,
+    ) -> dict[str, Any] | None:
+        """Project a live run, recreating a missing registry entry if needed."""
+
+        projected = self._registry_current(record)
+        entry = registry.get(record.agent_id)
+        if isinstance(entry, dict):
+            current = entry.get("current")
+            current_run_id = (
+                current.get("run_id") if isinstance(current, dict) else None
+            )
+            if current_run_id not in {None, record.run_id}:
+                return None
+            entry["current"] = projected
+            return {record.agent_id: entry}
+
+        legacy_orchestrators = registry.get("_orchestrators")
+        if record.role == "orchestrator" and isinstance(
+            legacy_orchestrators, dict
+        ):
+            legacy = legacy_orchestrators.get(record.agent_id)
+            legacy_run_id = legacy.get("run_id") if isinstance(legacy, dict) else None
+            if legacy_run_id not in {None, record.run_id}:
+                return None
+            legacy_orchestrators[record.agent_id] = projected
+            return {
+                record.agent_id: {
+                    "history": [],
+                    "current": projected,
+                }
+            }
+
+        registry[record.agent_id] = {"history": [], "current": projected}
+        return {record.agent_id: registry[record.agent_id]}
+
+    def _write_current_projection(self, record: RunRecord) -> None:
+        registry = self._read_registry_for_mutation()
+        projection = self._project_current_registry(registry, record)
+        if projection is None:
+            return
+        self._write_registry(registry)
+        self.command_log.replace_projection(record.agent_id, projection)
+
     def _write_record(self, record: RunRecord) -> None:
         record.updated_at = utc_now()
         _atomic_write_json(self.run_path(record.run_id), record.to_dict())
@@ -1363,7 +1431,7 @@ class RunStore:
         """Move one non-current terminal run out of the boot hot path."""
 
         with self._lock:
-            registry = self._read_registry()
+            registry = self._read_registry_for_mutation()
             entry = registry.get(record.agent_id)
             current = entry.get("current") if isinstance(entry, dict) else None
             archive_worker = self._registry_current(record)
@@ -1616,7 +1684,12 @@ class RunStore:
                 # must not prevent the daemon from recovering healthy siblings.
                 continue
 
-    def _reconcile_registry_from_runs(self) -> None:
+    def _reconcile_registry_from_runs(
+        self,
+        *,
+        include_terminal: bool = True,
+        registry: dict[str, Any] | None = None,
+    ) -> dict[str, Any]:
         """Rebuild runtime-owned registry entries after cross-file crashes.
 
         Per-run metadata is the supervisor authority. The compatibility
@@ -1625,7 +1698,8 @@ class RunStore:
         and history rows not owned by this runtime are preserved verbatim.
         """
 
-        registry = self._read_registry()
+        if registry is None:
+            registry = self._read_registry()
         changed = False
         for agent_id, entry in list(registry.items()):
             if agent_id.startswith("_") or not isinstance(entry, dict):
@@ -1664,17 +1738,27 @@ class RunStore:
         if not records_by_agent:
             if changed:
                 self._write_registry(registry)
-            return
+            return registry
         for agent_id, records in records_by_agent.items():
             live_records = [
                 record
                 for record in records
                 if record.run_id not in archived_run_ids
                 and record.replaced_by_run_id not in archived_run_ids
+                and (include_terminal or record.state not in TERMINAL_STATES)
             ]
             if not live_records:
                 if agent_id in registry:
                     registry.pop(agent_id, None)
+                    changed = True
+                legacy_orchestrators = registry.get("_orchestrators")
+                if (
+                    isinstance(legacy_orchestrators, dict)
+                    and agent_id in legacy_orchestrators
+                ):
+                    legacy_orchestrators.pop(agent_id)
+                    if not legacy_orchestrators:
+                        registry.pop("_orchestrators", None)
                     changed = True
                 continue
             records = live_records
@@ -1693,6 +1777,15 @@ class RunStore:
             raw_current = entry.get("current")
             existing_current = raw_current if isinstance(raw_current, dict) else {}
             existing_current_id = existing_current.get("run_id")
+            if not existing_current_id:
+                legacy_orchestrators = registry.get("_orchestrators")
+                legacy_entry = (
+                    legacy_orchestrators.get(agent_id)
+                    if isinstance(legacy_orchestrators, dict)
+                    else None
+                )
+                if isinstance(legacy_entry, dict):
+                    existing_current_id = legacy_entry.get("run_id")
             current = next(
                 (record for record in heads if record.run_id == existing_current_id),
                 None,
@@ -1714,6 +1807,20 @@ class RunStore:
                 if old.state not in TERMINAL_STATES:
                     old.state = LifecycleState.COMPLETED
                 self._write_record(old)
+
+            if current.role == "orchestrator":
+                legacy_orchestrators = registry.get("_orchestrators")
+                if not isinstance(legacy_orchestrators, dict):
+                    legacy_orchestrators = {}
+                    registry["_orchestrators"] = legacy_orchestrators
+                projected = self._registry_current(current)
+                if legacy_orchestrators.get(agent_id) != projected:
+                    legacy_orchestrators[agent_id] = projected
+                    changed = True
+                if agent_id in registry:
+                    registry.pop(agent_id, None)
+                    changed = True
+                continue
 
             runtime_ids = set(by_id)
             raw_history = entry.get("history")
@@ -1786,6 +1893,7 @@ class RunStore:
                 changed = True
         if changed:
             self._write_registry(registry)
+        return registry
 
     def _next_archive_session_dir(self, agent_id: str) -> Path:
         archive_dir = self.paths.archive_dir
@@ -2057,7 +2165,7 @@ class RunStore:
             raise StoreConflict("archived run directory remains after cleanup")
         self.command_log.forget_implicit_for_run(record.run_id)
         with self._lock:
-            registry = self._read_registry()
+            registry = self._read_registry_for_mutation()
             entry = registry.get(record.agent_id)
             current = entry.get("current") if isinstance(entry, dict) else None
             if isinstance(current, dict) and current.get("run_id") not in {None, record.run_id}:
@@ -2084,7 +2192,7 @@ class RunStore:
         transactional_start: bool = False,
     ) -> RunRecord:
         with self._lock:
-            registry = self._read_registry()
+            registry = self._read_registry_for_mutation()
             entry = registry.get(record.agent_id)
             current = entry.get("current") if isinstance(entry, dict) else None
             legacy_orchestrators = registry.get("_orchestrators")
@@ -2312,7 +2420,14 @@ class RunStore:
 
     def current_run_id(self, agent_id: str) -> str | None:
         with self._lock:
-            current = (self._read_registry().get(agent_id) or {}).get("current") or {}
+            registry = self._read_registry_for_mutation()
+            entry = registry.get(agent_id)
+            if not isinstance(entry, dict):
+                entry = (registry.get("_orchestrators") or {}).get(agent_id)
+            if isinstance(entry, dict) and isinstance(entry.get("current"), dict):
+                current = entry["current"]
+            else:
+                current = entry if isinstance(entry, dict) else {}
             run_id = current.get("run_id")
             return run_id if isinstance(run_id, str) else None
 
@@ -2328,11 +2443,7 @@ class RunStore:
                 self._control_attached_run_ids.add(run_id)
             else:
                 self._control_attached_run_ids.discard(run_id)
-            registry = self._read_registry()
-            current = (registry.get(record.agent_id) or {}).get("current") or {}
-            if current.get("run_id") == run_id:
-                registry[record.agent_id]["current"] = self._registry_current(record)
-                self._write_registry(registry)
+            self._write_current_projection(record)
             return record
 
     def transition(
@@ -2399,15 +2510,7 @@ class RunStore:
                 record.automatic_resume_suppressed = True
                 record.automatic_resume_guarded_at = utc_now()
             self._write_record(record)
-            registry = self._read_registry()
-            current = (registry.get(record.agent_id) or {}).get("current") or {}
-            if current.get("run_id") == record.run_id:
-                registry[record.agent_id]["current"] = self._registry_current(record)
-                self._write_registry(registry)
-                self.command_log.replace_projection(
-                    record.agent_id,
-                    {record.agent_id: registry[record.agent_id]},
-                )
+            self._write_current_projection(record)
             return record
 
     def mark_recovery_blocked(self, run_id: str, *, reason: str) -> RunRecord:
@@ -2437,15 +2540,7 @@ class RunStore:
             record.automatic_resume_suppressed = False
             record.automatic_resume_guarded_at = None
             self._write_record(record)
-            registry = self._read_registry()
-            current = (registry.get(record.agent_id) or {}).get("current") or {}
-            if current.get("run_id") == record.run_id:
-                registry[record.agent_id]["current"] = self._registry_current(record)
-                self._write_registry(registry)
-                self.command_log.replace_projection(
-                    record.agent_id,
-                    {record.agent_id: registry[record.agent_id]},
-                )
+            self._write_current_projection(record)
             return record
 
     def mark_automatic_resume_failed(
@@ -2474,11 +2569,7 @@ class RunStore:
             record.automatic_resume_suppressed = True
             record.automatic_resume_guarded_at = None
             self._write_record(record)
-            registry = self._read_registry()
-            current = (registry.get(record.agent_id) or {}).get("current") or {}
-            if current.get("run_id") == record.run_id:
-                registry[record.agent_id]["current"] = self._registry_current(record)
-                self._write_registry(registry)
+            self._write_current_projection(record)
             return record
 
     def clear_automatic_resume_suppression(self, run_id: str) -> RunRecord:
@@ -2493,11 +2584,7 @@ class RunStore:
             record.automatic_resume_suppressed = False
             record.automatic_resume_guarded_at = None
             self._write_record(record)
-            registry = self._read_registry()
-            current = (registry.get(record.agent_id) or {}).get("current") or {}
-            if current.get("run_id") == record.run_id:
-                registry[record.agent_id]["current"] = self._registry_current(record)
-                self._write_registry(registry)
+            self._write_current_projection(record)
             return record
 
     def update_adapter_status(
@@ -2536,11 +2623,7 @@ class RunStore:
             record.last_viewed_seq = accepted_seq
             record.last_viewed_at = utc_now()
             self._write_record(record)
-            registry = self._read_registry()
-            current = (registry.get(record.agent_id) or {}).get("current") or {}
-            if current.get("run_id") == record.run_id:
-                registry[record.agent_id]["current"] = self._registry_current(record)
-                self._write_registry(registry)
+            self._write_current_projection(record)
             return record
 
     def set_auto_archive_candidate(self, run_id: str, verdict_seq: int) -> RunRecord:
@@ -2553,11 +2636,7 @@ class RunStore:
             record.auto_archive_terminal_at = utc_now()
             record.auto_archive_verdict_seq = max(0, verdict_seq)
             self._write_record(record)
-            registry = self._read_registry()
-            current = (registry.get(record.agent_id) or {}).get("current") or {}
-            if current.get("run_id") == record.run_id:
-                registry[record.agent_id]["current"] = self._registry_current(record)
-                self._write_registry(registry)
+            self._write_current_projection(record)
             return record
 
     def record_provider_process_created(self, run_id: str, pid: int) -> RunRecord:
@@ -2582,15 +2661,7 @@ class RunStore:
                     provider_process_group_members_sync(identity.process_group_id)
                 )
             self._write_record(record)
-            registry = self._read_registry()
-            current = (registry.get(record.agent_id) or {}).get("current") or {}
-            if current.get("run_id") == record.run_id:
-                registry[record.agent_id]["current"] = self._registry_current(record)
-                self._write_registry(registry)
-                self.command_log.replace_projection(
-                    record.agent_id,
-                    {record.agent_id: registry[record.agent_id]},
-                )
+            self._write_current_projection(record)
             return record
 
     def finalize_handover_detach(
@@ -2629,11 +2700,7 @@ class RunStore:
                 key: dict(request) for key, request in pending_requests.items()
             }
             self._write_record(record)
-            registry = self._read_registry()
-            current = (registry.get(record.agent_id) or {}).get("current") or {}
-            if current.get("run_id") == record.run_id:
-                registry[record.agent_id]["current"] = self._registry_current(record)
-                self._write_registry(registry)
+            self._write_current_projection(record)
             return record
 
     def set_desired_model(self, run_id: str, model: str | None) -> RunRecord:
@@ -2641,11 +2708,7 @@ class RunStore:
             record = self.get(run_id)
             record.desired_model = model
             self._write_record(record)
-            registry = self._read_registry()
-            current = (registry.get(record.agent_id) or {}).get("current") or {}
-            if current.get("run_id") == record.run_id:
-                registry[record.agent_id]["current"] = self._registry_current(record)
-                self._write_registry(registry)
+            self._write_current_projection(record)
             return record
 
     def append_raw(
@@ -2895,11 +2958,7 @@ class RunStore:
             record.quiesce_operation_id = operation_id
             record.quiesce_resume_state = captured_state
             self._write_record(record)
-            registry = self._read_registry()
-            current = (registry.get(record.agent_id) or {}).get("current") or {}
-            if current.get("run_id") == record.run_id:
-                registry[record.agent_id]["current"] = self._registry_current(record)
-                self._write_registry(registry)
+            self._write_current_projection(record)
             return record
 
     def finish_provider_detached(
@@ -2928,11 +2987,7 @@ class RunStore:
             record.state = LifecycleState.BLOCKED
             record.state_reason = reason
             self._write_record(record)
-            registry = self._read_registry()
-            current = (registry.get(record.agent_id) or {}).get("current") or {}
-            if current.get("run_id") == record.run_id:
-                registry[record.agent_id]["current"] = self._registry_current(record)
-                self._write_registry(registry)
+            self._write_current_projection(record)
             return record
 
     def clear_quiesce_marker(
@@ -2958,11 +3013,7 @@ class RunStore:
             record.automatic_resume_suppressed = False
             record.automatic_resume_guarded_at = None
             self._write_record(record)
-            registry = self._read_registry()
-            current = (registry.get(record.agent_id) or {}).get("current") or {}
-            if current.get("run_id") == record.run_id:
-                registry[record.agent_id]["current"] = self._registry_current(record)
-                self._write_registry(registry)
+            self._write_current_projection(record)
             return record
 
     def abandon_quiesce_marker(
@@ -2989,11 +3040,7 @@ class RunStore:
             record.automatic_resume_suppressed = False
             record.automatic_resume_guarded_at = None
             self._write_record(record)
-            registry = self._read_registry()
-            current = (registry.get(record.agent_id) or {}).get("current") or {}
-            if current.get("run_id") == record.run_id:
-                registry[record.agent_id]["current"] = self._registry_current(record)
-                self._write_registry(registry)
+            self._write_current_projection(record)
             return record
 
     def track_pending_user_message(
@@ -3281,7 +3328,7 @@ class RunStore:
                 raise StoreConflict("replacement agent id must match")
             if new_record.run_id == old.run_id:
                 raise StoreConflict("replacement must use a new run id")
-            registry = self._read_registry()
+            registry = self._read_registry_for_mutation()
             entry = registry.get(old.agent_id) or {}
             current = entry.get("current") or {}
             if current.get("run_id") != old.run_id:
@@ -3346,7 +3393,7 @@ class RunStore:
             replacement = self.get(replacement_run_id)
             if replacement.agent_id != old.agent_id:
                 raise StoreConflict("replacement agent id must match")
-            registry = self._read_registry()
+            registry = self._read_registry_for_mutation()
             entry = registry.get(old.agent_id) or {}
             current = entry.get("current") or {}
             if current.get("run_id") != replacement_run_id:
@@ -3671,11 +3718,7 @@ class RunStore:
                     source_seq=source_seq,
                 )
             self._write_record(record)
-            registry = self._read_registry()
-            current = (registry.get(record.agent_id) or {}).get("current") or {}
-            if current.get("run_id") == record.run_id:
-                registry[record.agent_id]["current"] = self._registry_current(record)
-                self._write_registry(registry)
+            self._write_current_projection(record)
             return record
 
     def _read_json_lines_tail(

@@ -593,6 +593,102 @@ class LifecycleTests(unittest.TestCase):
 
 
 class RunStoreTests(unittest.TestCase):
+    def test_registry_wipe_cascade_preserves_prior_live_agents(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            paths = _paths(root)
+            store = RunStore(paths)
+            first = store.create(_record(root, "WIKI-353-A"))
+
+            paths.registry_path.unlink()
+            second = store.create(
+                _record(root, "WIKI-353-B"),
+                transactional_start=True,
+            )
+            store.abort_start(second.run_id, reason="provider start failed")
+            third = store.create(_record(root, "WIKI-353-C"))
+
+            registry = json.loads(paths.registry_path.read_text(encoding="utf-8"))
+            self.assertEqual(
+                set(registry),
+                {"WIKI-353-A", "WIKI-353-C"},
+            )
+            self.assertEqual(
+                registry["WIKI-353-A"]["current"]["run_id"], first.run_id
+            )
+            self.assertEqual(
+                registry["WIKI-353-C"]["current"]["run_id"], third.run_id
+            )
+
+    def test_empty_registry_rebuilds_live_workers_and_orchestrators(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            paths = _paths(root)
+            store = RunStore(paths)
+            terminal = store.create(_record(root, "WIKI-353-TERMINAL"))
+            store.transition(terminal.run_id, LifecycleState.COMPLETED)
+            live = store.create(_record(root, "WIKI-353-LIVE"))
+            orchestrator = _record(root, "wiki-353-orch")
+            orchestrator.role = "orchestrator"
+            orchestrator.orchestrator_id = None
+            orchestrator = store.create(orchestrator)
+
+            paths.registry_path.write_text(
+                json.dumps({"_orchestrators": {}}),
+                encoding="utf-8",
+            )
+            fresh = store.create(_record(root, "WIKI-353-FRESH"))
+
+            registry = json.loads(paths.registry_path.read_text(encoding="utf-8"))
+            self.assertEqual(
+                {key for key in registry if not key.startswith("_")},
+                {"WIKI-353-LIVE", "WIKI-353-FRESH"},
+            )
+            self.assertEqual(
+                set(registry["_orchestrators"]),
+                {"wiki-353-orch"},
+            )
+            self.assertNotIn("WIKI-353-TERMINAL", registry)
+            self.assertNotIn("wiki-353-orch", registry)
+            self.assertEqual(
+                registry["WIKI-353-LIVE"]["current"]["run_id"], live.run_id
+            )
+            self.assertEqual(
+                registry["WIKI-353-FRESH"]["current"]["run_id"], fresh.run_id
+            )
+            self.assertEqual(
+                registry["_orchestrators"]["wiki-353-orch"]["run_id"],
+                orchestrator.run_id,
+            )
+
+    def test_transition_reprojects_a_missing_registry_entry(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            paths = _paths(root)
+            store = RunStore(paths)
+            missing = store.create(_record(root, "WIKI-353-MISSING"))
+            other = store.create(_record(root, "WIKI-353-OTHER"))
+            registry = json.loads(paths.registry_path.read_text(encoding="utf-8"))
+            registry.pop("WIKI-353-MISSING")
+            paths.registry_path.write_text(json.dumps(registry), encoding="utf-8")
+
+            store.transition(missing.run_id, LifecycleState.WORKING, reason="repaired")
+
+            registry = json.loads(paths.registry_path.read_text(encoding="utf-8"))
+            self.assertEqual(
+                set(registry),
+                {"WIKI-353-MISSING", "WIKI-353-OTHER"},
+            )
+            self.assertEqual(
+                registry["WIKI-353-MISSING"]["current"]["run_id"], missing.run_id
+            )
+            self.assertEqual(
+                registry["WIKI-353-MISSING"]["current"]["state"], "working"
+            )
+            self.assertEqual(
+                registry["WIKI-353-OTHER"]["current"]["run_id"], other.run_id
+            )
+
     def test_run_id_cannot_escape_runtime_directory(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             store = RunStore(_paths(Path(tmp)))
