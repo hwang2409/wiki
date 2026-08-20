@@ -5410,6 +5410,20 @@ def _registry_agent(
         current = entry.get("current")
         if isinstance(current, dict):
             return str(candidate), entry, current
+    # Orchestrator entries live under `_orchestrators` with a flat schema
+    # (no `current` wrapper). Treat the entry itself as `current` when it
+    # carries a supervisor `run_id` — that IS a headless run.
+    orchestrators = registry.get("_orchestrators")
+    if isinstance(orchestrators, dict):
+        for candidate in (agent_id, agent_id.upper()):
+            entry = orchestrators.get(candidate)
+            if isinstance(entry, dict) and _is_headless(entry):
+                return candidate, entry, entry
+        for candidate, entry in orchestrators.items():
+            if str(candidate).upper() != wanted or not isinstance(entry, dict):
+                continue
+            if _is_headless(entry):
+                return str(candidate), entry, entry
     return None
 
 
@@ -5426,10 +5440,12 @@ def _has_legacy_control_target(registry: dict, agent_id: str) -> bool:
         if isinstance(current, dict) and not _is_headless(current):
             return True
     orchestrators = registry.get("_orchestrators")
-    return bool(
-        isinstance(orchestrators, dict)
-        and isinstance(orchestrators.get(agent_id), dict)
-    )
+    if isinstance(orchestrators, dict):
+        for candidate in (agent_id, agent_id.upper()):
+            entry = orchestrators.get(candidate)
+            if isinstance(entry, dict) and not _is_headless(entry):
+                return True
+    return False
 
 
 def _supervisor_request(method: str, params: dict | None = None) -> Any:

@@ -734,6 +734,58 @@ class HeadlessMainRouteTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(len(background.tasks), 0)
         self.assertEqual([call for call in self.client.calls if call not in calls_before], [])
 
+    async def test_composer_message_routes_flat_orchestrator_entry(self) -> None:
+        self._seed_headless()
+        registry = json.loads(self.registry.read_text(encoding="utf-8"))
+        registry["_orchestrators"] = {
+            "wiki": {
+                "run_id": "orch-run-0000",
+                "role": "orchestrator",
+                "kind": "cc",
+                "model": "opus-4.7",
+                "cwd": str(self.worktree),
+                "provider_pid": 12345,
+            }
+        }
+        self.registry.write_text(json.dumps(registry), encoding="utf-8")
+        calls_before = list(self.client.calls)
+        background = BackgroundTasks()
+
+        result = main.agent_message(
+            "wiki",
+            main.MessageIn(text="steer orch", mode="now"),
+            background,
+        )
+
+        self.assertIsInstance(result, dict)
+        new_calls = [call for call in self.client.calls if call not in calls_before]
+        self.assertEqual([method for method, _ in new_calls], ["run/send_now"])
+        self.assertEqual(new_calls[0][1]["agent_id"], "wiki")
+        self.assertEqual(new_calls[0][1]["text"], "steer orch")
+
+    async def test_composer_message_rejects_flat_orchestrator_without_run_id(self) -> None:
+        self._seed_headless()
+        registry = json.loads(self.registry.read_text(encoding="utf-8"))
+        registry["_orchestrators"] = {
+            "wiki": {
+                "role": "orchestrator",
+                "kind": "cc",
+                "cwd": str(self.worktree),
+            }
+        }
+        self.registry.write_text(json.dumps(registry), encoding="utf-8")
+        background = BackgroundTasks()
+
+        with self.assertRaises(HTTPException) as blocked:
+            main.agent_message(
+                "wiki",
+                main.MessageIn(text="steer orch", mode="now"),
+                background,
+            )
+
+        self.assertEqual(blocked.exception.status_code, 409)
+        self.assertIn("must be migrated", str(blocked.exception.detail))
+
     async def test_agents_and_log_use_registry_snapshot_without_tmux(self) -> None:
         self._seed_headless()
         with mock.patch.object(
