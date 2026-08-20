@@ -47,6 +47,7 @@ Topic → note index. **Agents: read this file first, before grepping.** Every n
 - [[graph-engineering]] — graph engineering as next layer after loop engineering; org-graph + work-graph, nodes/edges/shared-state, maps onto orchestrator/worker stack
 - [[t3code]] — prior art for the wiki agent-control surface: theo/ping's open-source multi-provider harness controller
 - [[kickoff-defect-classes]] — recurring worker defect classes to name in kickoff contracts (stale caches, seam leaks)
+- [[newt-audit-2026-08-20]] — newt audit: penalty reactions and sensor-force timing risks
 
 ## Design
 
