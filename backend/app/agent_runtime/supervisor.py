@@ -749,6 +749,29 @@ class Supervisor:
             value["active_turn_id"] = snapshot.active_turn_id
         return value
 
+    async def _run_archive_worker(
+        self,
+        operation: Callable[..., Any],
+        *args: Any,
+        **kwargs: Any,
+    ) -> Any:
+        if self.archive_pending >= self.archive_queue_limit:
+            raise CommandRetryable("archive worker queue is full; retry later")
+        self.archive_pending += 1
+        loop = asyncio.get_running_loop()
+        try:
+            future = loop.run_in_executor(
+                self.archive_executor,
+                partial(operation, *args, **kwargs),
+            )
+
+            async def wait_for_archive() -> Any:
+                return await asyncio.shield(future)
+
+            return await self._await_cleanup(wait_for_archive())
+        finally:
+            self.archive_pending -= 1
+
     def subscribe(self) -> asyncio.Queue[dict[str, Any]]:
         queue: asyncio.Queue[dict[str, Any]] = asyncio.Queue(maxsize=256)
         self.subscribers.add(queue)
@@ -5220,29 +5243,20 @@ Preserve the same identity, role, worktree, orchestrator grouping, PR gates, and
         command_hash: str | None = None,
         command_hash_payload: Mapping[str, Any] | None = None,
     ) -> tuple[RunRecord, Path]:
-        if self.archive_pending >= self.archive_queue_limit:
-            raise CommandRetryable("archive worker queue is full; retry later")
-        self.archive_pending += 1
-        loop = asyncio.get_running_loop()
-        try:
-            future = loop.run_in_executor(
-                self.archive_executor,
-                partial(
-                    self._archive_finalize_sync,
-                    run_id,
-                    outcome=outcome,
-                    effect_id=effect_id,
-                    command_hash=command_hash,
-                    command_hash_payload=command_hash_payload,
-                ),
-            )
+        return await self._run_archive_worker(
+            self._archive_finalize_sync,
+            run_id,
+            outcome=outcome,
+            effect_id=effect_id,
+            command_hash=command_hash,
+            command_hash_payload=command_hash_payload,
+        )
 
-            async def wait_for_archive() -> tuple[RunRecord, Path]:
-                return await asyncio.shield(future)
-
-            return await self._await_cleanup(wait_for_archive())
-        finally:
-            self.archive_pending -= 1
+    async def _replay_archive_cleanup(self, run_id: str) -> RunRecord | None:
+        return await self._run_archive_worker(
+            self.store.finalize_archived_run,
+            run_id,
+        )
 
     def _archive_finalize_sync(
         self,
@@ -6114,12 +6128,16 @@ Preserve the same identity, role, worktree, orchestrator grouping, PR gates, and
                 )
             return result
         if method == "run/list":
+            runs: list[dict[str, Any]] = []
+            for record in self.store.list_runs():
+                try:
+                    runs.append(self._runtime_status(record))
+                except RunNotFound:
+                    continue
             return {
                 "status": "ok",
                 "pid": os.getpid(),
-                "runs": [
-                    self._runtime_status(record) for record in self.store.list_runs()
-                ],
+                "runs": runs,
             }
         if method == "fleet/rotate_codex":
             account = params.get("account")
@@ -6231,7 +6249,7 @@ Preserve the same identity, role, worktree, orchestrator grouping, PR gates, and
                     **_public_run(archived),
                     "_workgraph_archive_recorded": True,
                 }
-            archived = self.store.finalize_archived_run(run_id)
+            archived = await self._replay_archive_cleanup(run_id)
             if archived is not None:
                 return {
                     **_public_run(archived),

@@ -10171,6 +10171,24 @@ class SupervisorTests(unittest.IsolatedAsyncioTestCase):
             )
         return self.store.transition(record.run_id, LifecycleState.COMPLETED)
 
+    def _create_committed_archive_retry_run(self, agent_id: str) -> RunRecord:
+        record = self._create_terminal_archive_run(agent_id)
+        real_rmtree = store_module.shutil.rmtree
+
+        def fail_cleanup(
+            path: str | os.PathLike[str], *args: object, **kwargs: object
+        ) -> None:
+            if Path(path) == self.store.run_dir(record.run_id):
+                raise OSError("fixture cleanup interruption")
+            real_rmtree(path, *args, **kwargs)
+
+        with (
+            mock.patch.object(store_module.shutil, "rmtree", side_effect=fail_cleanup),
+            self.assertRaisesRegex(OSError, "fixture cleanup interruption"),
+        ):
+            self.store.archive_current(record.run_id)
+        return record
+
     async def test_archive_worker_keeps_ping_loop_under_three_seconds(self) -> None:
         record = self._create_terminal_archive_run("WIKI-ARCHIVE-PING")
         started = threading.Event()
@@ -10278,6 +10296,139 @@ class SupervisorTests(unittest.IsolatedAsyncioTestCase):
         ]
         self.assertEqual(len(rejected), 1)
         self.assertIn("archive worker queue is full", str(rejected[0]))
+
+    async def test_archive_replay_worker_keeps_ping_loop_under_three_seconds(self) -> None:
+        record = self._create_committed_archive_retry_run("WIKI-ARCHIVE-REPLAY-PING")
+        started = threading.Event()
+        release = threading.Event()
+        store_request_done = threading.Event()
+        real_rmtree = store_module.shutil.rmtree
+
+        def paused_cleanup(
+            path: str | os.PathLike[str], *args: object, **kwargs: object
+        ) -> None:
+            if Path(path) == self.store.run_dir(record.run_id):
+                started.set()
+                if not release.wait(timeout=5):
+                    raise AssertionError("archive replay was not released")
+            real_rmtree(path, *args, **kwargs)
+
+        def store_request() -> None:
+            try:
+                self.store.list_runs()
+            finally:
+                store_request_done.set()
+
+        replay_task: asyncio.Task[dict[str, Any]] | None = None
+        store_task: asyncio.Task[None] | None = None
+        try:
+            with mock.patch.object(
+                store_module.shutil,
+                "rmtree",
+                side_effect=paused_cleanup,
+            ):
+                replay_task = asyncio.create_task(
+                    self.supervisor.dispatch(
+                        "run/archive",
+                        {"run_id": record.run_id},
+                    )
+                )
+                self.assertTrue(await asyncio.to_thread(started.wait, 2))
+                store_task = asyncio.create_task(asyncio.to_thread(store_request))
+                latencies: list[float] = []
+                for _ in range(20):
+                    probe_started = time.perf_counter()
+                    self.assertEqual(
+                        (await self.supervisor.dispatch("ping", {}))["status"],
+                        "ok",
+                    )
+                    latencies.append(time.perf_counter() - probe_started)
+                self.assertTrue(await asyncio.to_thread(store_request_done.wait, 2))
+                self.assertLess(max(latencies), 3)
+        finally:
+            release.set()
+        assert replay_task is not None
+        assert store_task is not None
+        replayed = await replay_task
+        self.assertEqual(replayed["run_id"], record.run_id)
+        await store_task
+
+    async def test_run_list_skips_run_removed_after_snapshot(self) -> None:
+        record = self._create_committed_archive_retry_run("WIKI-ARCHIVE-LIST-RACE")
+        cleanup_started = threading.Event()
+        cleanup_release = threading.Event()
+        cleanup_deleted = threading.Event()
+        listed = threading.Event()
+        list_release = threading.Event()
+        real_rmtree = store_module.shutil.rmtree
+        real_list_runs = self.store.list_runs
+
+        def paused_cleanup(
+            path: str | os.PathLike[str], *args: object, **kwargs: object
+        ) -> None:
+            if Path(path) == self.store.run_dir(record.run_id):
+                cleanup_started.set()
+                if not cleanup_release.wait(timeout=5):
+                    raise AssertionError("archive cleanup was not released")
+                real_rmtree(path, *args, **kwargs)
+                cleanup_deleted.set()
+                return
+            real_rmtree(path, *args, **kwargs)
+
+        def delayed_list_runs() -> list[RunRecord]:
+            records = real_list_runs()
+            listed.set()
+            if not list_release.wait(timeout=5):
+                raise AssertionError("run list was not released")
+            return records
+
+        def release_after_delete() -> None:
+            if not listed.wait(timeout=5):
+                return
+            cleanup_release.set()
+            if cleanup_deleted.wait(timeout=5):
+                list_release.set()
+
+        replay_task: asyncio.Task[dict[str, Any]] | None = None
+        list_task: asyncio.Task[dict[str, Any]] | None = None
+        controller: threading.Thread | None = None
+        try:
+            with (
+                mock.patch.object(
+                    store_module.shutil,
+                    "rmtree",
+                    side_effect=paused_cleanup,
+                ),
+                mock.patch.object(
+                    self.store,
+                    "list_runs",
+                    side_effect=delayed_list_runs,
+                ),
+            ):
+                replay_task = asyncio.create_task(
+                    self.supervisor.dispatch(
+                        "run/archive",
+                        {"run_id": record.run_id},
+                    )
+                )
+                self.assertTrue(await asyncio.to_thread(cleanup_started.wait, 2))
+                controller = threading.Thread(target=release_after_delete)
+                controller.start()
+                list_task = asyncio.create_task(
+                    self.supervisor.dispatch("run/list", {})
+                )
+                listed_result = await list_task
+        finally:
+            cleanup_release.set()
+            list_release.set()
+        assert replay_task is not None
+        assert controller is not None
+        controller.join(timeout=2)
+        await replay_task
+        self.assertNotIn(
+            record.run_id,
+            {item["run_id"] for item in listed_result["runs"]},
+        )
 
     async def test_archive_worker_failure_leaves_run_retryable(self) -> None:
         record = self._create_terminal_archive_run("WIKI-ARCHIVE-RETRY")
