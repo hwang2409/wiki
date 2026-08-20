@@ -853,6 +853,72 @@ function mergeComposerEvents(events: SessionEvent[], composerEvents: SessionEven
   return merged;
 }
 
+function pendingTimelineEvent(message: PendingUserMessage, id: number): SessionEvent {
+  return {
+    id,
+    kind: "user",
+    ts: new Date(message.firstSeenTs).toISOString(),
+    text: message.text,
+    disposition: "rendered",
+    pending_id: message.id,
+    pending_request_id: message.requestId,
+    pending_status: message.status,
+    pending_mode: message.mode,
+    pending_error: message.error,
+  };
+}
+
+function mergePendingEvents(
+  events: SessionEvent[],
+  pendingMessages: readonly PendingUserMessage[],
+  pendingHistory: ReadonlyMap<string, PendingUserMessage>,
+): SessionEvent[] {
+  if (pendingMessages.length === 0 && pendingHistory.size === 0) return events;
+
+  const echoes = new Map<string, SessionEvent>();
+  for (const event of events) {
+    if (!event.pending_id || !pendingHistory.has(event.pending_id)) continue;
+    if (!echoes.has(event.pending_id)) echoes.set(event.pending_id, event);
+  }
+
+  const activeIds = new Set(pendingMessages.map((message) => message.id));
+  const timelineMessages = [...pendingHistory.values()].filter(
+    (message) => activeIds.has(message.id) || echoes.has(message.id),
+  );
+  const knownIds = new Set(timelineMessages.map((message) => message.id));
+  for (const message of pendingMessages) {
+    if (!knownIds.has(message.id)) timelineMessages.push(message);
+  }
+
+  const eventsByFloor = new Map<number, SessionEvent[]>();
+  let pendingEventId = 3_000_000;
+  for (const message of timelineMessages) {
+    const event = echoes.get(message.id) ?? pendingTimelineEvent(message, pendingEventId++);
+    const floorEvents = eventsByFloor.get(message.eventIdFloor) ?? [];
+    floorEvents.push(event);
+    eventsByFloor.set(message.eventIdFloor, floorEvents);
+  }
+  if (eventsByFloor.size === 0) return events;
+
+  const echoIds = new Set(echoes.values());
+  const serverEvents = events.filter((event) => !echoIds.has(event));
+  const floors = [...eventsByFloor.keys()].sort((left, right) => left - right);
+  const merged: SessionEvent[] = [];
+  let floorIndex = 0;
+  for (const event of serverEvents) {
+    while (floorIndex < floors.length && floors[floorIndex] < event.id) {
+      merged.push(...(eventsByFloor.get(floors[floorIndex]) ?? []));
+      floorIndex += 1;
+    }
+    merged.push(event);
+  }
+  while (floorIndex < floors.length) {
+    merged.push(...(eventsByFloor.get(floors[floorIndex]) ?? []));
+    floorIndex += 1;
+  }
+  return merged;
+}
+
 export function SessionModelFooter({
   session,
   ticket,
@@ -3091,6 +3157,8 @@ export function SessionTab({
   const layoutDirtyFromRef = useRef(Number.POSITIVE_INFINITY);
   const layoutRef = useRef<VirtualLayout | null>(null);
   const layoutResetKeyRef = useRef(resetKey);
+  const pendingTimelineKeyRef = useRef(resetKey);
+  const pendingTimelineRef = useRef(new Map<string, PendingUserMessage>());
   const [containerNode, setContainerNode] = useState<HTMLDivElement | null>(null);
   const restoreAttemptsRef = useRef(3);
   const scrollRestoreStateRef = useRef<ScrollState | null>(sessionScrollCache.get(sessionStateKey) ?? null);
@@ -3111,6 +3179,10 @@ export function SessionTab({
     layoutCacheRef.current = null;
     layoutDirtyFromRef.current = 0;
   }
+  if (pendingTimelineKeyRef.current !== resetKey) {
+    pendingTimelineKeyRef.current = resetKey;
+    pendingTimelineRef.current = new Map();
+  }
 
   const target = useMemo(
     () =>
@@ -3123,6 +3195,16 @@ export function SessionTab({
   ) satisfies TranscriptTarget;
   const visible = useElementVisible(containerNode);
   const { session, pendingUserMessages, error, refreshError, loading } = useTranscriptSession(target, visible);
+  const pendingTimeline = useMemo(() => {
+    const next = new Map(pendingTimelineRef.current);
+    for (const message of pendingUserMessages) next.set(message.id, message);
+    pendingTimelineRef.current = next;
+    return next;
+  }, [pendingUserMessages]);
+  const activePendingIds = useMemo(
+    () => new Set(pendingUserMessages.map((message) => message.id)),
+    [pendingUserMessages],
+  );
   const [retrying, setRetrying] = useState(false);
   const [pendingEditRequest, setPendingEditRequest] = useState<PendingUserMessage | null>(null);
   const retryPending = useCallback(async (message: PendingUserMessage) => {
@@ -3375,28 +3457,16 @@ export function SessionTab({
   const displayEvents = useMemo(
     () => {
       if (!session) return [];
-      const pendingEvents: SessionEvent[] = pendingUserMessages.map((message, index) => ({
-        id: 3_000_000 + index,
-        kind: "user",
-        ts: new Date(message.firstSeenTs).toISOString(),
-        text: message.text,
-        disposition: "rendered",
-        pending_id: message.id,
-        pending_request_id: message.requestId,
-        pending_status: message.status,
-        pending_mode: message.mode,
-        pending_error: message.error,
-      }));
-      return [
-        ...mergeComposerEvents(
+      const transcriptEvents = mergeComposerEvents(
           applyComposerSources(session.events, session.composerMessages),
           composerMessageEvents(session),
-        ),
-        ...pendingEvents,
+        );
+      return [
+        ...mergePendingEvents(transcriptEvents, pendingUserMessages, pendingTimeline),
         ...modelChangedMarkers(session),
       ];
     },
-    [pendingUserMessages, session?.events, session?.providerInspector, session?.composerMessages],
+    [pendingTimeline, pendingUserMessages, session?.events, session?.providerInspector, session?.composerMessages],
   );
 
   const rowResult = useMemo(() => {
@@ -3844,7 +3914,9 @@ export function SessionTab({
                 }
                 row={row}
                 imageNums={row.event.kind === "user" ? imageNumbers.get(row.event) : undefined}
-                key={row.key}
+                key={row.event.pending_id && activePendingIds.has(row.event.pending_id)
+                  ? `pending:${row.event.pending_id}`
+                  : row.key}
                 onHeightChange={reportRowHeight}
                 onInspect={onInspect}
                 onInspectArtifact={onInspectArtifact}
@@ -4036,10 +4108,9 @@ function MessageComposer({
   }, [stateKey]);
 
   useEffect(() => {
-    if (!editRequest || handledEditRef.current === editRequest.id) return;
-    handledEditRef.current = editRequest.id;
-    edit(editRequest);
-  }, [editRequest]);
+    if (!editRequest || handledEditRef.current === editRequest.id || busy) return;
+    if (edit(editRequest)) handledEditRef.current = editRequest.id;
+  }, [busy, editRequest]);
 
   useEffect(() => {
     const start = Math.max(0, Math.min(selectionRef.current.start, text.length));
@@ -4708,12 +4779,13 @@ function MessageComposer({
   }
 
   function edit(message: PendingUserMessage) {
-    if (busy) return;
+    if (busy) return false;
     removePendingUserMessage(ticket, message.id);
     setText(message.text);
     setVimMode("insert");
     setInsertCaret(message.text.length);
     inputRef.current?.focus();
+    return true;
   }
 
   async function cancel(index: number) {
@@ -4728,6 +4800,7 @@ function MessageComposer({
   return (
     <div
       className="session-composer"
+      data-busy={busy ? "true" : "false"}
       data-compact={narrowComposer ? "true" : undefined}
       data-history-count={history.length}
       ref={composerRef}

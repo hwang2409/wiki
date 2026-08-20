@@ -66,6 +66,22 @@ async function main() {
         }),
       });
     });
+    await page.route(`**/api/agents/${TICKET}/message`, async (route) => {
+      const body = route.request().postDataJSON();
+      sessionEvents.push({
+        id: sessionEvents.length,
+        kind: "user",
+        ts: new Date().toISOString(),
+        text: body.text,
+        pending_id: body.pending_id,
+        disposition: "rendered",
+      });
+      await route.fulfill({
+        status: 200,
+        contentType: "application/json",
+        body: JSON.stringify({ status: "sent", pending_id: body.pending_id }),
+      });
+    });
     await page.addInitScript(({ ticket }) => {
       localStorage.setItem("wiki-sidebar-visible", "false");
       localStorage.setItem(
@@ -88,6 +104,20 @@ async function main() {
     }
     if (await page.getByText(/^session started:/).count() !== 0) {
       throw new Error("session started was rendered in the transcript");
+    }
+
+    const composer = page.locator(".session-composer textarea");
+    await composer.fill("first zero-state message");
+    await composer.press("Enter");
+    await page.locator(".session-pending-user", { hasText: "first zero-state message" }).waitFor();
+    await page.locator(".session-user:not(.session-pending-user)", {
+      hasText: "first zero-state message",
+    }).waitFor();
+    if (await page.locator(".session-pending-user", { hasText: "first zero-state message" }).count() !== 0) {
+      throw new Error("first zero-state message stayed pending after reconciliation");
+    }
+    if (await page.getByTestId("session-zero-events").count() !== 0) {
+      throw new Error("zero-state placeholder stayed visible after the first message");
     }
   } finally {
     await page.close();

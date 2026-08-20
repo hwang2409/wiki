@@ -17,8 +17,7 @@ function delay(ms) {
 
 async function waitForComposerEnabled(page) {
   await page.waitForFunction(() => {
-    const composer = document.querySelector(".session-composer textarea");
-    return composer !== null && !composer.matches(":disabled");
+    return document.querySelector(".session-composer")?.getAttribute("data-busy") === "false";
   });
 }
 
@@ -67,6 +66,10 @@ async function main() {
   let editedRequestId;
   let ambiguousRequestId;
   let uncertainEditRequestId;
+  let reversedFirstPendingId;
+  let reversedSecondPendingId;
+  let releaseBusySend;
+  const busySendReleased = new Promise((resolve) => { releaseBusySend = resolve; });
   const backend = await startBackend(fixtures);
   const browser = await chromium.launch({ headless: true });
   const page = await browser.newPage({ viewport: { width: 1280, height: 900 } });
@@ -241,6 +244,41 @@ async function main() {
         });
         return;
       }
+      if (sendCount === 10 || sendCount === 11) {
+        if (sendCount === 10) reversedFirstPendingId = body.pending_id;
+        if (sendCount === 11) reversedSecondPendingId = body.pending_id;
+        await route.fulfill({
+          status: 200,
+          contentType: "application/json",
+          body: JSON.stringify({ status: "sent", pending_id: body.pending_id }),
+        });
+        return;
+      }
+      if (sendCount === 12) {
+        await route.fulfill({
+          status: 400,
+          contentType: "application/json",
+          body: JSON.stringify({ detail: "fixture send failure" }),
+        });
+        return;
+      }
+      if (sendCount === 13) {
+        await busySendReleased;
+        sessionEvents.push({
+          id: sessionEvents.length,
+          kind: "user",
+          ts: new Date().toISOString(),
+          text: body.text,
+          pending_id: body.pending_id,
+          disposition: "rendered",
+        });
+        await route.fulfill({
+          status: 200,
+          contentType: "application/json",
+          body: JSON.stringify({ status: "sent", pending_id: body.pending_id }),
+        });
+        return;
+      }
       await route.fulfill({
         status: 503,
         contentType: "application/json",
@@ -280,6 +318,25 @@ async function main() {
     }
     const pendingRow = pending.locator("..");
     const pendingKey = await pendingRow.getAttribute("data-row-key");
+    await pendingRow.evaluate((row) => row.setAttribute("data-pending-sentinel", "stable"));
+    sessionEvents.push({
+      id: sessionEvents.length,
+      kind: "assistant",
+      ts: new Date().toISOString(),
+      text: "delayed real event",
+      disposition: "rendered",
+    });
+    await page.getByText("delayed real event", { exact: true }).waitFor({ state: "visible", timeout: 8_000 });
+    if (await pendingRow.getAttribute("data-pending-sentinel") !== "stable") {
+      throw new Error("delayed real event remounted the pending row");
+    }
+    const delayedOrder = await page.locator(".session-scroll .session-virtual-row").evaluateAll((rows) =>
+      rows.map((row) => row.textContent ?? ""));
+    const delayedPendingIndex = delayedOrder.findIndex((text) => text.includes("instant hello"));
+    const delayedEventIndex = delayedOrder.findIndex((text) => text.includes("delayed real event"));
+    if (delayedPendingIndex < 0 || delayedEventIndex < 0 || delayedPendingIndex >= delayedEventIndex) {
+      throw new Error("pending message moved below a delayed real event");
+    }
     releaseFirstSend();
 
     const authoritative = page.locator(".session-scroll .session-user:not(.session-pending-user)", { hasText: "instant hello" });
@@ -310,6 +367,7 @@ async function main() {
     const editable = page.locator(".session-scroll .session-pending-user", { hasText: "edit me" });
     await editable.getByText("send failed: fixture send failure").waitFor({ state: "visible", timeout: 5_000 });
     await editable.getByRole("button", { name: "Edit message" }).click();
+    await editable.waitFor({ state: "detached", timeout: 5_000 });
     await composer.fill("edited hello");
     await composer.press("Enter");
     await page.locator(".session-scroll .session-user:not(.session-pending-user)", { hasText: "edited hello" })
@@ -353,6 +411,59 @@ async function main() {
     }
     if (await page.locator(".session-scroll .session-user", { hasText: "uncertain edit me" }).count() !== 0) {
       throw new Error("uncertain edit left the old logical row visible");
+    }
+    await waitForComposerEnabled(page);
+
+    await composer.fill("reversed first");
+    await composer.press("Enter");
+    await page.locator(".session-pending-user", { hasText: "reversed first" }).waitFor();
+    await waitForComposerEnabled(page);
+    await composer.fill("reversed second");
+    await composer.press("Enter");
+    await waitForComposerEnabled(page);
+    if (!reversedFirstPendingId || !reversedSecondPendingId) {
+      throw new Error("fixture did not capture both reversed-send pending ids");
+    }
+    sessionEvents.push({
+      id: sessionEvents.length,
+      kind: "user",
+      ts: new Date().toISOString(),
+      text: "reversed second",
+      pending_id: reversedSecondPendingId,
+      disposition: "rendered",
+    });
+    sessionEvents.push({
+      id: sessionEvents.length,
+      kind: "user",
+      ts: new Date().toISOString(),
+      text: "reversed first",
+      pending_id: reversedFirstPendingId,
+      disposition: "rendered",
+    });
+    await page.locator(".session-user:not(.session-pending-user)", { hasText: "reversed second" })
+      .waitFor({ state: "visible", timeout: 8_000 });
+    await page.locator(".session-user:not(.session-pending-user)", { hasText: "reversed first" })
+      .waitFor({ state: "visible", timeout: 8_000 });
+    const reversedOrder = await page.locator(".session-scroll .session-virtual-row").evaluateAll((rows) =>
+      rows.map((row) => row.textContent ?? ""));
+    const reversedFirstIndex = reversedOrder.findIndex((text) => text.includes("reversed first"));
+    const reversedSecondIndex = reversedOrder.findIndex((text) => text.includes("reversed second"));
+    if (reversedFirstIndex < 0 || reversedSecondIndex < 0 || reversedFirstIndex >= reversedSecondIndex) {
+      throw new Error("reversed echoes changed the original visual order");
+    }
+
+    await composer.fill("edit during send");
+    await composer.press("Enter");
+    const editDuringSend = page.locator(".session-pending-user", { hasText: "edit during send" });
+    await editDuringSend.getByText("send failed: fixture send failure").waitFor();
+    await composer.fill("busy send");
+    await composer.press("Enter");
+    await page.locator(".session-pending-user", { hasText: "busy send" }).waitFor();
+    await editDuringSend.getByRole("button", { name: "Edit message" }).click();
+    releaseBusySend();
+    await waitForComposerEnabled(page);
+    if (await composer.inputValue() !== "edit during send") {
+      throw new Error("edit request was lost while another send was busy");
     }
   } finally {
     await page.close();

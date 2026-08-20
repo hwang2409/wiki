@@ -53,6 +53,7 @@ const PLAYWRIGHT_SUITES = [
   "wiki-92-artifact-panel",
   "wiki-89-artifact-callability",
   "wiki-93-optimistic-send",
+  "wiki-373-instant-send",
   "wiki-373-delayed-retry",
   "wiki-373-zero-state",
   "wiki-96-composer-reconcile",
