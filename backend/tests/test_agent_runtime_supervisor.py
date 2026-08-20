@@ -453,6 +453,51 @@ class SupervisorTests(unittest.IsolatedAsyncioTestCase):
         ]
         self.assertEqual([item["raw_seq"] for item in normalized], [1])
 
+    async def test_large_terminal_orphan_archive_preserves_every_raw_event(self) -> None:
+        record = self.store.create(
+            RunRecord.new(
+                agent_id="WIKI-LARGE-TERMINAL-ORPHAN",
+                provider=ProviderKind.CODEX,
+                role="implement",
+                model="fixture-codex",
+                worktree=str(self.worktree),
+                prompt="large terminal orphan fixture",
+            )
+        )
+        raw_rows: list[dict[str, Any]] = []
+        for event_index in range(300):
+            raw = self.store.append_raw(
+                record.run_id,
+                provider=ProviderKind.CODEX.value,
+                direction="provider",
+                payload={
+                    "method": "turn/diff/updated",
+                    "params": {"diff": str(event_index)},
+                },
+            )
+            raw_rows.append(raw)
+            if event_index < 260:
+                await self.supervisor._recover_orphan_raw_event(  # noqa: SLF001
+                    record.run_id,
+                    raw,
+                    materialize=False,
+                )
+        record = self.store.transition(record.run_id, LifecycleState.COMPLETED)
+
+        await self.supervisor.archive(record.run_id, outcome="closed")
+
+        sessions = sorted(
+            (self.paths.archive_dir / record.agent_id).iterdir()
+        )
+        archived_events = [
+            json.loads(line)
+            for line in (sessions[-1] / "events.jsonl").read_text().splitlines()
+        ]
+        self.assertEqual(
+            {int(event["raw_seq"]) for event in archived_events},
+            {int(raw["seq"]) for raw in raw_rows},
+        )
+
     async def _spawn_orphan_process(self, *, ignore_sigterm: bool = False) -> int:
         child_code = (
             "import os, signal, sys, time\n"
@@ -10167,11 +10212,24 @@ class SupervisorTests(unittest.IsolatedAsyncioTestCase):
             )
         )
         for index in range(1000):
-            self.store.append_raw(
+            payload = {"method": "item/completed", "params": {"index": index}}
+            raw = self.store.append_raw(
                 record.run_id,
                 provider="codex",
                 direction="stdout",
-                payload={"method": "item/completed", "params": {"index": index}},
+                payload=payload,
+            )
+            normalized = supervisor_module.normalize_provider_event(
+                ProviderKind.CODEX,
+                payload,
+            )
+            self.store.append_normalized(
+                record.run_id,
+                raw_seq=int(raw["seq"]),
+                disposition=normalized.disposition,
+                kind=normalized.kind,
+                payload=normalized.payload,
+                lifecycle_state=normalized.lifecycle_state,
             )
         return self.store.transition(record.run_id, LifecycleState.COMPLETED)
 
@@ -11081,6 +11139,20 @@ class UnixClientTests(unittest.IsolatedAsyncioTestCase):
                 )
             records.append(record)
 
+        pending = AgentCommand.steer(
+            agent_id=records[0].agent_id,
+            request_id="cold-boot-pending-send",
+            payload={
+                "method": "run/send_now",
+                "run_id": records[0].run_id,
+                "text": "pending while projection rebuilds",
+            },
+        )
+        self.store.command_log.append_intent(
+            pending,
+            self.store.command_state_for(records[0].agent_id),
+        )
+
         await self.server.close()
         await self.supervisor.close()
         restarted = Supervisor(self.store, FixtureAdapterFactory(FIXTURES))
@@ -11089,6 +11161,8 @@ class UnixClientTests(unittest.IsolatedAsyncioTestCase):
         client = SupervisorClient(self.paths, timeout=2)
         rebuild_started = threading.Event()
         release_rebuild = threading.Event()
+        pending_recovery_started = asyncio.Event()
+        release_pending_recovery = asyncio.Event()
         original_rebuild = restarted._rebuild_materializer_database_sync
 
         def paused_rebuild(run_id: str) -> None:
@@ -11096,6 +11170,13 @@ class UnixClientTests(unittest.IsolatedAsyncioTestCase):
             if not release_rebuild.wait(timeout=5):
                 raise AssertionError("startup rebuild was not released")
             original_rebuild(run_id)
+
+        async def blocked_pending_recovery() -> dict[str, str]:
+            pending_recovery_started.set()
+            await release_pending_recovery.wait()
+            return {"status": "recovered"}
+
+        restarted.command_queue.recovery_factory = lambda _command: blocked_pending_recovery
 
         recovery = asyncio.create_task(restarted.recover_on_start())
         try:
@@ -11109,6 +11190,8 @@ class UnixClientTests(unittest.IsolatedAsyncioTestCase):
                     (await asyncio.to_thread(client.ping))["status"],
                     "ok",
                 )
+                release_rebuild.set()
+                await asyncio.wait_for(pending_recovery_started.wait(), timeout=10)
                 started = await asyncio.to_thread(
                     client.request,
                     "run/start",
@@ -11125,7 +11208,8 @@ class UnixClientTests(unittest.IsolatedAsyncioTestCase):
                 self.assertEqual(started["agent_id"], "WIKI-COLD-BOOT-NEW")
                 listed = await asyncio.to_thread(client.request, "run/list")
                 self.assertEqual(len(listed["runs"]), len(records) + 1)
-                release_rebuild.set()
+                self.assertFalse(recovery.done())
+                release_pending_recovery.set()
                 await asyncio.wait_for(recovery, timeout=10)
                 for record in records:
                     raw_seqs = {
@@ -11627,6 +11711,55 @@ class RecoveryLoopTests(unittest.IsolatedAsyncioTestCase):
 
 
 class DaemonShutdownTests(unittest.IsolatedAsyncioTestCase):
+    async def test_lock_stays_held_until_materializer_writes_finish(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            paths = _paths(root)
+            store = RunStore(paths)
+            supervisor = Supervisor(store, FixtureAdapterFactory(FIXTURES))
+            lock = agent_daemon._acquire_single_instance(paths)
+            callback_started = threading.Event()
+            release_callback = threading.Event()
+            callback_finished = threading.Event()
+
+            def paused_callback() -> None:
+                callback_started.set()
+                if not release_callback.wait(timeout=5):
+                    raise AssertionError("materializer callback was not released")
+                callback_finished.set()
+
+            supervisor.materializer_executor.submit(paused_callback)
+
+            class ClosedServer:
+                async def close(self) -> None:
+                    pass
+
+            shutdown = asyncio.create_task(
+                agent_daemon._shutdown(
+                    ClosedServer(),
+                    supervisor,
+                    [],
+                    lock,
+                    paths,
+                )
+            )
+            try:
+                self.assertTrue(await asyncio.to_thread(callback_started.wait, 5))
+                self.assertFalse(shutdown.done())
+                probe = paths.lock_path.open("a+b")
+                try:
+                    with self.assertRaises(BlockingIOError):
+                        fcntl.flock(probe.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+                finally:
+                    probe.close()
+                release_callback.set()
+                await asyncio.wait_for(shutdown, timeout=10)
+                self.assertTrue(callback_finished.is_set())
+            finally:
+                release_callback.set()
+                if not shutdown.done():
+                    await shutdown
+
     async def test_lock_and_pid_release_before_provider_drain(self) -> None:
         """WIKI-217: a replacement must be able to start while the old daemon drains."""
 
@@ -11636,6 +11769,9 @@ class DaemonShutdownTests(unittest.IsolatedAsyncioTestCase):
             observed: dict[str, bool] = {}
 
             class DrainingSupervisor:
+                async def close_materializer_executor(self) -> None:
+                    pass
+
                 async def close(self) -> None:
                     probe = paths.lock_path.open("a+b")
                     try:

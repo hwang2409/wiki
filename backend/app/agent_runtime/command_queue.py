@@ -62,7 +62,9 @@ class CommandQueue:
         self.recovery_factory = recovery_factory
         self.failure_state_provider = failure_state_provider
         self._queue: asyncio.Queue[_QueuedCommand] = asyncio.Queue()
+        self._recovery_queue: asyncio.Queue[_QueuedCommand] = asyncio.Queue()
         self._worker: asyncio.Task[None] | None = None
+        self._recovery_worker: asyncio.Task[None] | None = None
         self._append_lock = asyncio.Lock()
         self._commit_lock = asyncio.Lock()
         self._recovery_lock = asyncio.Lock()
@@ -71,6 +73,8 @@ class CommandQueue:
             tuple[str, str], tuple[AgentCommand, asyncio.Future[Any]]
         ] = {}
         self._recovery_commands: dict[asyncio.Future[Any], AgentCommand] = {}
+        self._recovery_agent_events: dict[str, asyncio.Event] = {}
+        self._recovery_handled: set[asyncio.Future[Any]] = set()
         self._deferred: dict[tuple[str, str], AgentCommand] = {}
         self.recovery_failures: list[tuple[AgentCommand, Exception]] = []
         self.recovery_retries: list[tuple[AgentCommand, CommandRetryable]] = []
@@ -80,6 +84,12 @@ class CommandQueue:
         if self._worker is None or self._worker.done():
             self._worker = asyncio.create_task(
                 self._run(), name="global-command-reactor"
+            )
+
+    def _start_recovery_worker(self) -> None:
+        if self._recovery_worker is None or self._recovery_worker.done():
+            self._recovery_worker = asyncio.create_task(
+                self._run(recovery=True), name="recovered-command-reactor"
             )
 
     @staticmethod
@@ -110,9 +120,12 @@ class CommandQueue:
                 future: asyncio.Future[Any] = loop.create_future()
                 self._inflight[key] = (command, future)
                 self._recovery_commands[future] = command
+                self._recovery_agent_events.setdefault(
+                    command.agent_id, asyncio.Event()
+                ).clear()
                 futures.append(future)
                 assert self.recovery_factory is not None
-                await self._queue.put(
+                await self._recovery_queue.put(
                     _QueuedCommand(
                         command,
                         self.recovery_factory(command),
@@ -122,7 +135,7 @@ class CommandQueue:
                 )
             self._recovered = True
             if pending:
-                self._start_worker()
+                self._start_recovery_worker()
             return futures
 
     async def recover_pending(self) -> None:
@@ -139,32 +152,25 @@ class CommandQueue:
                 future: asyncio.Future[Any] = loop.create_future()
                 self._inflight[key] = (command, future)
                 self._recovery_commands[future] = command
+                self._recovery_agent_events.setdefault(
+                    command.agent_id, asyncio.Event()
+                ).clear()
                 futures.append(future)
-                await self._queue.put(
+                await self._recovery_queue.put(
                     _QueuedCommand(command, self.recovery_factory(command), future, True)
                 )
             if futures:
-                self._start_worker()
+                self._start_recovery_worker()
         if futures:
             results = await asyncio.gather(
                 *(asyncio.shield(future) for future in futures),
                 return_exceptions=True,
             )
             for future, result in zip(futures, results, strict=True):
+                self._finish_recovery(future)
                 if not isinstance(result, BaseException):
                     continue
-                if isinstance(result, _RecoveredCommandFailure):
-                    command = self._recovery_commands.get(future)
-                    if command is None:
-                        raise CommandError("recovered command binding was lost")
-                    self.recovery_failures.append((command, result.error))
-                    continue
-                if isinstance(result, _RecoveredCommandRetry):
-                    command = self._recovery_commands.get(future)
-                    if command is None:
-                        raise CommandError("recovered command binding was lost")
-                    self._deferred[(command.method, command.request_id)] = command
-                    self.recovery_retries.append((command, result.error))
+                if isinstance(result, (_RecoveredCommandFailure, _RecoveredCommandRetry)):
                     continue
                 if isinstance(
                     result,
@@ -175,10 +181,44 @@ class CommandQueue:
                     raise result
                 raise result
 
+    def _finish_recovery(self, future: asyncio.Future[Any]) -> None:
+        if future in self._recovery_handled:
+            return
+        self._recovery_handled.add(future)
+        command = self._recovery_commands.pop(future, None)
+        if command is None:
+            return
+        try:
+            future.result()
+        except _RecoveredCommandFailure as failure:
+            self.recovery_failures.append((command, failure.error))
+        except _RecoveredCommandRetry as retry:
+            self._deferred[(command.method, command.request_id)] = command
+            self.recovery_retries.append((command, retry.error))
+            return
+        except BaseException:
+            # The recovery worker already observed and durably handled all
+            # ordinary command failures. Keep unexpected failures observed so
+            # a non-blocking start cannot emit an unhandled-future warning.
+            pass
+        if not any(
+            pending.agent_id == command.agent_id
+            for pending in self._recovery_commands.values()
+        ) and not any(
+            pending.agent_id == command.agent_id
+            for pending in self._deferred.values()
+        ):
+            self._recovery_agent_events[command.agent_id].set()
+
+    def _observe_nonblocking_recovery(self, future: asyncio.Future[Any]) -> None:
+        self._finish_recovery(future)
+
     async def submit(self, command: AgentCommand, execute: CommandExecutor) -> Any:
         if self._closed:
             raise CommandError("command queue is closed")
-        await self._ensure_recovered()
+        recovered = await self._ensure_recovered()
+        for future in recovered:
+            future.add_done_callback(self._observe_nonblocking_recovery)
         key = (command.method, command.request_id)
         existing = self._inflight.get(key)
         if existing is not None:
@@ -187,6 +227,19 @@ class CommandQueue:
                     f"request_id {command.request_id} has a conflicting command"
                 )
             return await asyncio.shield(existing[1])
+        if key in self._deferred:
+            self._deferred.pop(key, None)
+            if not any(
+                pending.agent_id == command.agent_id
+                for pending in self._deferred.values()
+            ) and not any(
+                pending.agent_id == command.agent_id
+                for pending in self._recovery_commands.values()
+            ):
+                self._recovery_agent_events[command.agent_id].set()
+        recovery_event = self._recovery_agent_events.get(command.agent_id)
+        if recovery_event is not None and not recovery_event.is_set():
+            await recovery_event.wait()
         loop = asyncio.get_running_loop()
         future: asyncio.Future[Any] = loop.create_future()
         self._inflight[key] = (command, future)
@@ -214,9 +267,10 @@ class CommandQueue:
                 future.set_exception(exc)
         return await future
 
-    async def _run(self) -> None:
+    async def _run(self, *, recovery: bool = False) -> None:
+        queue = self._recovery_queue if recovery else self._queue
         while True:
-            item = await self._queue.get()
+            item = await queue.get()
             command, execute, future = item.command, item.execute, item.future
             retryable = False
             try:
@@ -276,12 +330,17 @@ class CommandQueue:
                     self._deferred[key] = command
                 else:
                     self._deferred.pop(key, None)
-                self._queue.task_done()
+                queue.task_done()
 
     async def close(self) -> None:
         self._closed = True
         await self._queue.join()
+        await self._recovery_queue.join()
         if self._worker is not None:
             self._worker.cancel()
             await asyncio.gather(self._worker, return_exceptions=True)
         self._worker = None
+        if self._recovery_worker is not None:
+            self._recovery_worker.cancel()
+            await asyncio.gather(self._recovery_worker, return_exceptions=True)
+        self._recovery_worker = None

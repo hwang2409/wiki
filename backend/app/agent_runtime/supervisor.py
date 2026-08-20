@@ -45,7 +45,7 @@ from .provider import (
     StartRequest,
 )
 from .runtime_card import inject_runtime_card
-from .store import RunNotFound, RunStore, StoreConflict
+from .store import RunNotFound, RunStore, StoreConflict, StoreError
 from .types import (
     MAX_PENDING_USER_MESSAGES,
     TERMINAL_STATES,
@@ -378,6 +378,8 @@ class Supervisor:
             store.paths.runtime_dir,
             archive_dir=store.paths.archive_dir,
         )
+        self.store.set_archive_events_preparer(self._prepare_terminal_archive)
+        self.store.set_archive_events_validator(self._validate_terminal_archive)
         for run_id in self.event_store.corrupt_raw_run_ids:
             reason = "raw event log is corrupt"
             self.materializer_failed_runs[run_id] = reason
@@ -480,6 +482,7 @@ class Supervisor:
             max_workers=1,
             thread_name_prefix="wiki-materializer",
         )
+        self._materializer_executor_closed = False
         self.projection_rebuild_tasks: dict[str, asyncio.Task[None]] = {}
         self.projection_rebuild_errors: dict[str, BaseException] = {}
         self.projection_rebuilds_started = False
@@ -3021,7 +3024,6 @@ Preserve the same identity, role, worktree, orchestrator grouping, PR gates, and
                     self.store.prune_terminal_runs,
                     prune_ids,
                 )
-                await self.command_queue.recover_pending()
                 if self._reaper_due():
                     by_run_id = {
                         item["run_id"]: index for index, item in enumerate(results)
@@ -3034,7 +3036,8 @@ Preserve the same identity, role, worktree, orchestrator grouping, PR gates, and
                             results[index] = reaped
                 results.extend(await self._auto_archive_sweep())
                 self._schedule_archive_backfill()
-                return results
+        await self.command_queue.recover_pending()
+        return results
 
     async def _rebuild_startup_projections(self) -> None:
         """Rebuild retained run projections without blocking the event loop."""
@@ -3109,8 +3112,8 @@ Preserve the same identity, role, worktree, orchestrator grouping, PR gates, and
             record.state in TERMINAL_STATES
             and len(raw_rows) > MAX_TERMINAL_ORPHAN_NORMALIZE_ROWS
         ):
-            # The archive worker exports raw history directly. Keep a large
-            # terminal run from delaying command admission on legacy cleanup.
+            # Terminal large runs are repaired by the archive worker, immediately
+            # before export and deletion.
             return
         for envelope in raw_rows:
             raw_seq = int(envelope.get("seq", 0))
@@ -3142,6 +3145,14 @@ Preserve the same identity, role, worktree, orchestrator grouping, PR gates, and
             raise CommandRetryable(
                 f"event projection is unavailable for run {run_id}: {error}"
             ) from error
+
+    async def _ensure_recovery_projection_ready(self, run_id: str) -> None:
+        task = self.projection_rebuild_tasks.get(run_id)
+        if task is not None and not task.done():
+            raise CommandRetryable(
+                f"event projection is still rebuilding for run {run_id}"
+            )
+        await self._ensure_projection_ready(run_id)
 
     def _schedule_archive_backfill(self) -> None:
         """Run a bounded archive parity backfill off the recovery path."""
@@ -5408,6 +5419,7 @@ Preserve the same identity, role, worktree, orchestrator grouping, PR gates, and
         command_hash: str | None = None,
         command_hash_payload: Mapping[str, Any] | None = None,
     ) -> tuple[RunRecord, Path]:
+        self._prepare_terminal_archive(run_id)
         archived, session_dir = self.store.archive_current(run_id, outcome=outcome)
         if effect_id is not None:
             effect_payload: dict[str, Any] = {
@@ -5433,6 +5445,59 @@ Preserve the same identity, role, worktree, orchestrator grouping, PR gates, and
                 command_hash=command_hash,
             )
         return archived, session_dir
+
+    def _prepare_terminal_archive(self, run_id: str) -> None:
+        """Repair skipped terminal normalization before archive export."""
+
+        record = self.store.get(run_id)
+        if record.state not in TERMINAL_STATES:
+            return
+        if record.raw_event_count == record.normalized_event_count:
+            return
+        raw_rows = list(self.store.iter_raw_events(run_id))
+        normalized_rows = list(self.store.iter_normalized_events(run_id))
+        normalized_seqs = {
+            int(row.get("raw_seq", 0)) for row in normalized_rows
+        }
+        orphans = [
+            row for row in raw_rows if int(row.get("seq", 0)) not in normalized_seqs
+        ]
+        if not orphans:
+            return
+        for envelope in orphans:
+            asyncio.run(
+                self._recover_orphan_raw_event(
+                    run_id,
+                    envelope,
+                    materialize=False,
+                )
+            )
+        self.store.rebuild_projections_from_normalized(run_id)
+        self._rebuild_materializer_database_sync(run_id)
+
+    def _validate_terminal_archive(self, run_id: str, session_dir: Path) -> None:
+        """Reject terminal archives whose normalized rows do not cover raw rows."""
+
+        record = self.store.get(run_id)
+        if record.state not in TERMINAL_STATES:
+            return
+        raw_seqs = [
+            int(row["seq"])
+            for row in self.store._iter_json_lines(session_dir / "raw.jsonl")  # noqa: SLF001
+        ]
+        normalized_seqs = [
+            int(row["raw_seq"])
+            for row in self.store._iter_json_lines(  # noqa: SLF001
+                session_dir / "events.jsonl"
+            )
+        ]
+        if len(raw_seqs) != len(normalized_seqs) or set(raw_seqs) != set(
+            normalized_seqs
+        ):
+            raise StoreError(
+                f"archive event parity failed for {run_id}: "
+                f"raw={len(raw_seqs)} normalized={len(normalized_seqs)}"
+            )
 
     async def _archive_locked(
         self,
@@ -5977,7 +6042,7 @@ Preserve the same identity, role, worktree, orchestrator grouping, PR gates, and
         async def execute() -> Any:
             if command.method != "run/start":
                 try:
-                    await self._ensure_projection_ready(
+                    await self._ensure_recovery_projection_ready(
                         self._resolve_run_id(command_params)
                     )
                 except RunNotFound:
@@ -6009,7 +6074,8 @@ Preserve the same identity, role, worktree, orchestrator grouping, PR gates, and
                     raise
         if method in _COMMAND_METHODS:
             self._reject_archive_inflight(params)
-            await self.command_queue.recover_pending()
+            if method != "run/start":
+                await self.command_queue.recover_pending()
             command_params = dict(params)
             request_id = _validated_idempotency_request_id(
                 command_params.get("request_id")
@@ -6747,8 +6813,14 @@ Preserve the same identity, role, worktree, orchestrator grouping, PR gates, and
                     return_exceptions=True,
                 )
             self.archive_executor.shutdown(wait=True)
-            self.materializer_executor.shutdown(wait=True)
+            await self.close_materializer_executor()
             self.archive_jobs.clear()
             self.event_store.close()
         if worker_error is not None:
             raise worker_error
+
+    async def close_materializer_executor(self) -> None:
+        if getattr(self, "_materializer_executor_closed", False):
+            return
+        await asyncio.to_thread(self.materializer_executor.shutdown, wait=True)
+        self._materializer_executor_closed = True

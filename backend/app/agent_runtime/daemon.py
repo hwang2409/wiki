@@ -131,6 +131,7 @@ async def _shutdown(
     if pending:
         await asyncio.gather(*pending, return_exceptions=True)
     await server.close()
+    await supervisor.close_materializer_executor()
     # Release the single-instance lock before the provider drain: the drain
     # waits on long-lived provider turns, and holding the lock through it
     # blocks every replacement daemon from binding (WIKI-217).
