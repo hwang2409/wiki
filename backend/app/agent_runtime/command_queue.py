@@ -54,7 +54,7 @@ class PerAgentQueueOwner:
         self._inflight: dict[
             tuple[str, str], tuple[AgentCommand, asyncio.Future[Any]]
         ] = {}
-        self._recovered = False
+        self._promoted_futures: list[asyncio.Future[Any]] = []
         self._barrier = asyncio.Event()
         self._barrier.set()
 
@@ -77,9 +77,6 @@ class PerAgentQueueOwner:
         if not self._commands:
             self._barrier.clear()
         self._commands.append(command)
-
-    def mark_recovered(self) -> None:
-        self._recovered = True
 
     def admit_head(self) -> tuple[AgentCommand, asyncio.Future[Any]] | None:
         if not self._commands or self._admitted is not None:
@@ -106,6 +103,7 @@ class PerAgentQueueOwner:
         except BaseException as error:
             self.rollback_promotion(error)
             raise
+        self._promoted_futures.append(future)
         return admission
 
     def rollback_promotion(self, reason: BaseException) -> None:
@@ -157,8 +155,8 @@ class PerAgentQueueOwner:
         if self._inflight.get(key, (None, None))[1] is future:
             self._inflight.pop(key, None)
 
-    async def wait_for_turn(self, request_id: str) -> None:
-        if self._commands and self._commands[0].request_id != request_id:
+    async def wait_for_turn(self, key: tuple[str, str]) -> None:
+        if self._commands and self._key(self._commands[0]) != key:
             await self._barrier.wait()
 
     def barrier_open(self) -> bool:
@@ -175,6 +173,11 @@ class PerAgentQueueOwner:
 
     def admitted_future(self) -> asyncio.Future[Any] | None:
         return self._admitted[1] if self._admitted is not None else None
+
+    def take_promoted_futures(self) -> list[asyncio.Future[Any]]:
+        futures = self._promoted_futures
+        self._promoted_futures = []
+        return futures
 
 
 class CommandQueue:
@@ -302,8 +305,6 @@ class CommandQueue:
                         )
                     continue
                 self.defer_for_recovery(command)
-            for state in self._agent_recovery.values():
-                state.mark_recovered()
             self._pending_loaded = True
             return futures
 
@@ -311,13 +312,21 @@ class CommandQueue:
         """Replay all pending intents before startup accepts new mutations."""
 
         futures = await self._ensure_recovered()
-        futures.extend(await self._queue_deferred_heads())
-        if futures:
+        known = set(futures)
+        for future in await self._queue_deferred_heads():
+            if future not in known:
+                futures.append(future)
+                known.add(future)
+        for state in self._agent_recovery.values():
+            state.take_promoted_futures()
+        while futures:
+            current = futures
+            futures = []
             results = await asyncio.gather(
-                *(asyncio.shield(future) for future in futures),
+                *(asyncio.shield(future) for future in current),
                 return_exceptions=True,
             )
-            for future, result in zip(futures, results, strict=True):
+            for future, result in zip(current, results, strict=True):
                 if not isinstance(result, BaseException):
                     continue
                 if isinstance(result, (_RecoveredCommandFailure, _RecoveredCommandRetry)):
@@ -330,6 +339,8 @@ class CommandQueue:
                 if isinstance(result, sqlite3.DatabaseError):
                     raise result
                 raise result
+            for state in self._agent_recovery.values():
+                futures.extend(state.take_promoted_futures())
 
     def _finish_recovery(
         self, command: AgentCommand, future: asyncio.Future[Any]
@@ -390,8 +401,8 @@ class CommandQueue:
                 )
             return await asyncio.shield(existing[1])
         queued_request_ids = owner.queued_request_ids()
-        if queued_request_ids and queued_request_ids[0] != command.request_id:
-            await owner.wait_for_turn(command.request_id)
+        if queued_request_ids:
+            await owner.wait_for_turn(key)
         loop = asyncio.get_running_loop()
         future: asyncio.Future[Any] = loop.create_future()
         owner.register_live(command, future)

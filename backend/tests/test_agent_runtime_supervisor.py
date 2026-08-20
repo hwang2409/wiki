@@ -12266,6 +12266,14 @@ class DaemonShutdownTests(unittest.IsolatedAsyncioTestCase):
                 )
             )
             adapter = supervisor.adapter_factory(record)
+            original_stop = adapter.stop
+            raw_count_at_stop: list[int] = []
+
+            async def tracked_stop() -> AdapterStatus:
+                raw_count_at_stop.append(len(store.read_raw_events(record.run_id)))
+                return await original_stop()
+
+            adapter.stop = tracked_stop  # type: ignore[method-assign]
             for index in range(3):
                 await adapter._events.put(  # noqa: SLF001 - shutdown buffer fixture
                     ProviderEvent(
@@ -12284,6 +12292,7 @@ class DaemonShutdownTests(unittest.IsolatedAsyncioTestCase):
             supervisor._attach_adapter(record.run_id, adapter)  # noqa: SLF001
 
             await supervisor.drain_writers_before_lock_release()
+            self.assertEqual(raw_count_at_stop, [3])
             self.assertEqual(len(store.read_raw_events(record.run_id)), 3)
             await supervisor.close()
 
@@ -12370,6 +12379,85 @@ class DaemonShutdownTests(unittest.IsolatedAsyncioTestCase):
             self.assertIsNotNone(release_at)
             assert write_at is not None and release_at is not None
             self.assertLess(write_at, release_at)
+
+    async def test_shutdown_drains_accepted_command_before_stopping_adapter(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            paths = _paths(root)
+            store = RunStore(paths)
+            supervisor = Supervisor(store, FixtureAdapterFactory(FIXTURES))
+            record = store.create(
+                RunRecord.new(
+                    agent_id="WIKI-SHUTDOWN-COMMAND",
+                    provider=ProviderKind.CODEX,
+                    role="implement",
+                    model="fixture-codex",
+                    worktree=str(root),
+                    prompt="shutdown accepted command",
+                )
+            )
+            adapter = supervisor.adapter_factory(record)
+            supervisor._attach_adapter(record.run_id, adapter)  # noqa: SLF001
+            original_stop = adapter.stop
+            command = AgentCommand.steer(
+                agent_id=record.agent_id,
+                request_id="shutdown-command",
+                payload={
+                    "method": "run/send_now",
+                    "run_id": record.run_id,
+                    "text": "replay me",
+                },
+            )
+            command_started = asyncio.Event()
+            release_command = asyncio.Event()
+
+            async def execute() -> dict[str, str]:
+                command_started.set()
+                await release_command.wait()
+                await adapter.send_now("replay me")
+                return {"status": "sent"}
+
+            async def tracked_stop() -> AdapterStatus:
+                self.assertIsNotNone(
+                    store.command_log.receipt(command.method, command.request_id)
+                )
+                return await original_stop()
+
+            adapter.stop = tracked_stop  # type: ignore[method-assign]
+            submit = asyncio.create_task(supervisor.command_queue.submit(command, execute))
+            await command_started.wait()
+            lock = agent_daemon._acquire_single_instance(paths)
+
+            class ClosedServer:
+                async def close(self) -> None:
+                    pass
+
+            shutdown = asyncio.create_task(
+                agent_daemon._shutdown(
+                    ClosedServer(),
+                    supervisor,
+                    [],
+                    lock,
+                    paths,
+                )
+            )
+            await asyncio.sleep(0)
+            self.assertFalse(submit.done())
+            release_command.set()
+            self.assertEqual(await asyncio.wait_for(submit, timeout=5), {"status": "sent"})
+            await asyncio.wait_for(shutdown, timeout=5)
+
+            restarted = Supervisor(RunStore(paths), FixtureAdapterFactory(FIXTURES))
+
+            async def must_not_execute() -> dict[str, str]:
+                return {"status": "must not execute"}
+
+            replay = await restarted.command_queue.submit(
+                command,
+                must_not_execute,
+            )
+            self.assertEqual(replay, {"status": "sent"})
+            await restarted.close()
 
     async def test_shutdown_drains_shielded_recovery_write_before_lock_release(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

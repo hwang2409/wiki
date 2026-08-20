@@ -603,9 +603,10 @@ class CommandLogTests(unittest.TestCase):
                 )
                 self.assertIsNone(queue.recovery_admitted("WIKI-A"))
 
-                await queue.recover_pending()
-                self.assertEqual(effects, [first.request_id])
+                recovery = asyncio.create_task(queue.recover_pending())
                 await second_started.wait()
+                self.assertEqual(effects, [first.request_id])
+                self.assertFalse(recovery.done())
                 self.assertEqual(queue.recovery_admitted("WIKI-A"), second.request_id)
                 self.assertEqual(
                     queue.recovery_queue("WIKI-A"),
@@ -613,7 +614,7 @@ class CommandLogTests(unittest.TestCase):
                 )
 
                 release_second.set()
-                await queue.recover_pending()
+                await recovery
                 self.assertEqual(effects, [first.request_id, second.request_id])
                 self.assertEqual(log.pending(), [])
                 await queue.close()
@@ -665,6 +666,59 @@ class CommandLogTests(unittest.TestCase):
                     await asyncio.wait_for(blocked, timeout=5),
                     {"run_id": "run-a-new"},
                 )
+                await queue.close()
+
+        asyncio.run(run())
+
+    def test_barrier_uses_method_and_request_id_composite_key(self) -> None:
+        async def run() -> None:
+            with tempfile.TemporaryDirectory() as tmp:
+                log = CommandLog(Path(tmp) / "command-log.sqlite3")
+                first = AgentCommand.steer(
+                    agent_id="WIKI-A",
+                    request_id="shared-request",
+                    payload={
+                        "method": "run/send_now",
+                        "run_id": "run-a",
+                        "text": "first",
+                    },
+                )
+                second = AgentCommand.archive(
+                    agent_id="WIKI-A",
+                    request_id="shared-request",
+                    payload={"run_id": "run-a"},
+                )
+                first_started = asyncio.Event()
+                release_first = asyncio.Event()
+
+                async def recover_first() -> dict[str, str]:
+                    first_started.set()
+                    await release_first.wait()
+                    return {"status": "sent"}
+
+                async def recover_second() -> dict[str, str]:
+                    return {"status": "archived"}
+
+                def factory(command: AgentCommand):
+                    return recover_first if command is first else recover_second
+
+                queue = CommandQueue(log, lambda: {}, recovery_factory=factory)
+                queue.defer_for_recovery(first)
+                queue.defer_for_recovery(second)
+                recovery = asyncio.create_task(queue.recover_pending())
+                await first_started.wait()
+
+                blocked = asyncio.create_task(
+                    queue.submit(
+                        second,
+                        lambda: _return_result({"status": "wrong-path"}),
+                    )
+                )
+                await asyncio.sleep(0)
+                self.assertFalse(blocked.done())
+                release_first.set()
+                await recovery
+                self.assertEqual(await blocked, {"status": "archived"})
                 await queue.close()
 
         asyncio.run(run())

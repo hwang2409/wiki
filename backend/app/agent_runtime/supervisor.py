@@ -6775,9 +6775,44 @@ Preserve the same identity, role, worktree, orchestrator grouping, PR gates, and
             return
         self._writers_fenced = True
 
-        # Stop provider input before cancelling pumps. The adapter queues can
-        # still contain events accepted before the fence; drain and persist
-        # them while the old daemon still owns the handover lock.
+        # Freeze supervisor input before draining pumps. Keep adapters alive
+        # while lifecycle events and accepted commands reach durable storage.
+        for run_id, adapter in tuple(self.adapters.items()):
+            stream_key = id(adapter)
+            self.expected_stream_ends.add(stream_key)
+            try:
+                await self._drain_stopped_adapter(run_id, adapter)
+            finally:
+                self.expected_stream_ends.discard(stream_key)
+        await self._capture_live_handover_events()
+        await self._flush_all_handover_events()
+
+        while self.monitor_tasks:
+            await asyncio.gather(
+                *(asyncio.shield(task) for task in tuple(self.monitor_tasks)),
+                return_exceptions=True,
+            )
+        rotation = self.codex_rotation_task
+        if rotation is not None and not rotation.done():
+            await asyncio.gather(asyncio.shield(rotation), return_exceptions=True)
+
+        await self.command_queue.close()
+
+        # Commands may have accepted more provider events while the queue
+        # drained. Persist those events before stopping their adapters.
+        for run_id, adapter in tuple(self.adapters.items()):
+            stream_key = id(adapter)
+            self.expected_stream_ends.add(stream_key)
+            try:
+                await self._drain_stopped_adapter(run_id, adapter)
+            finally:
+                self.expected_stream_ends.discard(stream_key)
+        await self._capture_live_handover_events()
+        await self._flush_all_handover_events()
+
+        # Stop transports only after lifecycle and accepted command writes
+        # have drained. Stop can publish a final lifecycle event, so drain it
+        # once more before the lock handoff.
         for run_id, adapter in tuple(self.adapters.items()):
             stream_key = id(adapter)
             self.expected_stream_ends.add(stream_key)
@@ -6792,21 +6827,6 @@ Preserve the same identity, role, worktree, orchestrator grouping, PR gates, and
         await self._capture_live_handover_events()
         await self._flush_all_handover_events()
 
-        for task in tuple(self.event_tasks.values()):
-            task.cancel()
-        if self.event_tasks:
-            await asyncio.gather(*self.event_tasks.values(), return_exceptions=True)
-
-        while self.monitor_tasks:
-            await asyncio.gather(
-                *(asyncio.shield(task) for task in tuple(self.monitor_tasks)),
-                return_exceptions=True,
-            )
-        rotation = self.codex_rotation_task
-        if rotation is not None and not rotation.done():
-            await asyncio.gather(asyncio.shield(rotation), return_exceptions=True)
-
-        await self.command_queue.close()
         for task in tuple(self.event_tasks.values()):
             task.cancel()
         if self.event_tasks:
