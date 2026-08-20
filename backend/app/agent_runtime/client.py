@@ -76,6 +76,10 @@ class SupervisorUnavailable(RuntimeError):
     pass
 
 
+class SupervisorListenerUnavailable(SupervisorUnavailable):
+    """The listener could not be reached while opening the socket."""
+
+
 class SupervisorRemoteError(RuntimeError):
     def __init__(self, message: str, *, error_type: str | None = None):
         super().__init__(message)
@@ -124,13 +128,22 @@ class SupervisorClient:
         timeout = self._timeout_for(method)
         connection.settimeout(timeout)
         try:
-            connection.connect(str(self.paths.socket_path))
+            try:
+                connection.connect(str(self.paths.socket_path))
+            except socket.timeout:
+                raise
+            except OSError as exc:
+                raise SupervisorListenerUnavailable(
+                    f"supervisor listener unavailable: {exc}"
+                ) from exc
             connection.sendall(json.dumps(request, separators=(",", ":")).encode("utf-8") + b"\n")
             with connection.makefile("rb") as reader:
                 line = reader.readline()
         except socket.timeout as exc:
             raise SupervisorUnavailable(self._timeout_message(method, timeout)) from exc
-        except (FileNotFoundError, ConnectionRefusedError, OSError) as exc:
+        except SupervisorListenerUnavailable:
+            raise
+        except OSError as exc:
             raise SupervisorUnavailable(str(exc)) from exc
         finally:
             connection.close()

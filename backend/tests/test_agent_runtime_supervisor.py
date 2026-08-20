@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import errno
 import fcntl
 import json
 import os
@@ -11115,6 +11116,141 @@ class UnixClientTests(unittest.IsolatedAsyncioTestCase):
         self.paths.socket_path.write_text("not a socket", encoding="utf-8")
         with self.assertRaisesRegex(RuntimeError, "non-socket"):
             await self.server.start()
+
+    async def test_listener_crash_logs_and_rebinds_before_serving_again(self) -> None:
+        await self.server.close()
+        broken_listener = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        broken_listener.setblocking(False)
+        self.server._closing = False  # noqa: SLF001 - accept-path fixture
+        self.server._listener = broken_listener  # noqa: SLF001 - accept-path fixture
+        self.server._listener_task = asyncio.create_task(  # noqa: SLF001
+            self.server._supervise_listener()  # noqa: SLF001
+        )
+        with self.assertLogs(
+            "backend.app.agent_runtime.protocol", level="ERROR"
+        ) as logs:
+            for _ in range(100):
+                if self.paths.socket_path.exists():
+                    break
+                await asyncio.sleep(0.01)
+            result = await asyncio.to_thread(self.client.ping)
+
+        self.assertEqual(result["status"], "ok")
+        self.assertTrue(self.paths.socket_path.exists())
+        crashes = [line for line in logs.output if "listener crashed" in line]
+        self.assertEqual(len(crashes), 1)
+        crash = crashes[0]
+        self.assertIn("exception=OSError", crash)
+        self.assertIn("fd_count=", crash)
+        self.assertIn("active_connections=", crash)
+
+    async def test_fd_exhaustion_restarts_with_backoff_and_rebinds(self) -> None:
+        await self.server.close()
+        original_accept_loop = self.server._accept_loop
+        attempts = 0
+
+        async def fail_twice() -> None:
+            nonlocal attempts
+            attempts += 1
+            if attempts <= 2:
+                raise OSError(errno.EMFILE, "too many open files")
+            await original_accept_loop()
+
+        self.server._accept_loop = fail_twice  # type: ignore[method-assign]
+        with (
+            mock.patch(
+                "backend.app.agent_runtime.protocol._LISTENER_BACKOFF_INITIAL_SECONDS",
+                0.02,
+            ),
+            mock.patch(
+                "backend.app.agent_runtime.protocol._LISTENER_BACKOFF_MAX_SECONDS",
+                0.04,
+            ),
+        ):
+            await self.server.start()
+            await asyncio.sleep(0.005)
+            self.assertEqual(attempts, 1)
+            for _ in range(100):
+                if attempts >= 3 and self.paths.socket_path.exists():
+                    break
+                await asyncio.sleep(0.01)
+            result = await asyncio.to_thread(self.client.ping)
+
+        self.assertEqual(result["status"], "ok")
+        self.assertEqual(attempts, 3)
+        self.assertTrue(self.paths.socket_path.exists())
+
+    async def test_listener_shutdown_does_not_log_a_crash_or_restart(self) -> None:
+        with (
+            mock.patch.object(self.server, "_bind_listener") as bind_listener,
+            self.assertNoLogs("backend.app.agent_runtime.protocol", level="ERROR"),
+        ):
+            await self.server.close()
+        bind_listener.assert_not_called()
+        self.assertFalse(self.paths.socket_path.exists())
+
+    async def test_listener_shutdown_cancels_stalled_dispatch(self) -> None:
+        started = asyncio.Event()
+        cancelled = asyncio.Event()
+
+        async def stalled_dispatch(method: str, params: dict[str, Any]) -> None:
+            del method, params
+            started.set()
+            try:
+                await asyncio.Future()
+            except asyncio.CancelledError:
+                cancelled.set()
+                raise
+
+        with mock.patch.object(self.supervisor, "dispatch", stalled_dispatch):
+            reader, writer = await asyncio.open_unix_connection(
+                str(self.paths.socket_path)
+            )
+            writer.write(b'{"id":"stalled","method":"ping","params":{}}\n')
+            await writer.drain()
+            await asyncio.wait_for(started.wait(), timeout=1)
+            await asyncio.wait_for(self.server.close(), timeout=1)
+
+        self.assertTrue(cancelled.is_set())
+        self.assertFalse(self.paths.socket_path.exists())
+        del reader
+        writer.close()
+        await writer.wait_closed()
+
+    async def test_listener_downtime_has_a_distinguishable_client_error(self) -> None:
+        await self.server.close()
+        original_accept_loop = self.server._accept_loop
+
+        async def fail_once() -> None:
+            raise RuntimeError("synthetic accept failure")
+
+        self.server._accept_loop = fail_once  # type: ignore[method-assign]
+        with mock.patch(
+            "backend.app.agent_runtime.protocol._LISTENER_BACKOFF_INITIAL_SECONDS",
+            0.2,
+        ):
+            await self.server.start()
+            for _ in range(100):
+                if not self.paths.socket_path.exists():
+                    break
+                await asyncio.sleep(0.01)
+            with self.assertRaisesRegex(
+                SupervisorUnavailable, "supervisor listener unavailable"
+            ):
+                await asyncio.to_thread(self.client.ping)
+
+        self.server._accept_loop = original_accept_loop  # type: ignore[method-assign]
+
+    def test_client_send_failure_is_not_listener_downtime(self) -> None:
+        connection = mock.Mock()
+        connection.sendall.side_effect = BrokenPipeError("send failed")
+        with mock.patch(
+            "backend.app.agent_runtime.client.socket.socket",
+            return_value=connection,
+        ):
+            with self.assertRaises(SupervisorUnavailable) as failure:
+                self.client.ping()
+        self.assertNotIn("listener unavailable", str(failure.exception))
 
     async def test_second_server_refuses_to_unlink_active_socket(self) -> None:
         second = UnixSupervisorServer(self.supervisor, self.paths.socket_path)
