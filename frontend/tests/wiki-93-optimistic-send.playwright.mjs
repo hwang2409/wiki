@@ -130,7 +130,7 @@ async function main() {
 
       if (body.text === "retry me" && attempt === 1) {
         await route.fulfill({
-          status: 503,
+          status: 400,
           contentType: "application/json",
           body: JSON.stringify({ detail: "fixture send failure" }),
         });

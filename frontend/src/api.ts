@@ -784,6 +784,10 @@ export type SessionEvent = {
   artifact?: SessionArtifact;
   source?: string | null;
   pending_id?: string | null;
+  pending_request_id?: string | null;
+  pending_status?: "sending" | "sent" | "uncertain" | "failed";
+  pending_mode?: "now" | "on-idle";
+  pending_error?: string;
   claude_init?: SessionInit;
   claude_task?: SessionTaskNotification;
   claude_api_retry?: SessionApiRetry;
@@ -900,6 +904,8 @@ export function sendAgentMessage(
   mode: "now" | "on-idle",
   pendingId?: string,
   dedupeKey?: string,
+  requestId?: string,
+  signal?: AbortSignal,
 ) {
   return request<{
     status: string;
@@ -911,7 +917,14 @@ export function sendAgentMessage(
     `/api/agents/${encodeURIComponent(ticket)}/message`,
     {
       method: "POST",
-      body: JSON.stringify({ text, mode, pending_id: pendingId, dedupe_key: dedupeKey }),
+      body: JSON.stringify({
+        text,
+        mode,
+        pending_id: pendingId,
+        dedupe_key: dedupeKey,
+        request_id: requestId,
+      }),
+      signal,
     }
   );
 }

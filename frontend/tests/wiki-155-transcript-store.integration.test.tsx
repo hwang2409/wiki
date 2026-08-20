@@ -18,7 +18,9 @@ vi.mock("../src/api", async () => {
 });
 
 import {
+  addPendingUserMessage,
   retryTranscript,
+  updatePendingUserMessage,
   useTranscriptSession,
   type TranscriptSnapshot,
 } from "../src/transcript-store";
@@ -60,7 +62,7 @@ let latest: TranscriptSnapshot | null = null;
 function Probe({ ticket }: { ticket: string }) {
   // Stable target identity across renders — otherwise useTranscriptSession's
   // effect resubscribes on every emit, re-triggering fetchEntry in a loop.
-  const target = useMemo(() => ({ ticket }), [ticket]);
+  const target = useMemo(() => ({ mode: "live" as const, ticket }), [ticket]);
   // Disable polling — each test controls fetches explicitly via mock ordering
   // + retryTranscript(). Polling would consume unrelated mock returns.
   const snapshot = useTranscriptSession(target, false);
@@ -216,4 +218,47 @@ test("retryTranscript on a cold-error snapshot resets and re-fetches, resolving 
   expect(latest?.error).toBeNull();
   expect(latest?.refreshError).toBeNull();
   expect(latest?.session).not.toBeNull();
+});
+
+test("pending recovery marks sent rows uncertain and expires idle entries", async () => {
+  vi.useFakeTimers();
+  getAgentSession.mockResolvedValue(baseSession());
+
+  const view = render(<Probe ticket="WIKI-PENDING-RECOVERY" />);
+  await act(async () => {
+    await Promise.resolve();
+    await Promise.resolve();
+  });
+
+  await act(async () => {
+    addPendingUserMessage("WIKI-PENDING-RECOVERY", {
+      id: "pending-recovery",
+      requestId: "pending-recovery",
+      text: "recover me",
+      mode: "now",
+    });
+    updatePendingUserMessage("WIKI-PENDING-RECOVERY", "pending-recovery", { status: "sent" });
+    await Promise.resolve();
+  });
+  expect(latest?.pendingUserMessages[0]?.status).toBe("sent");
+
+  await act(async () => {
+    vi.advanceTimersByTime(30_000);
+    await Promise.resolve();
+  });
+  expect(latest?.pendingUserMessages[0]?.status).toBe("uncertain");
+
+  view.unmount();
+  await act(async () => {
+    vi.advanceTimersByTime(60_000);
+    await Promise.resolve();
+    await Promise.resolve();
+  });
+  render(<Probe ticket="WIKI-PENDING-RECOVERY" />);
+  await act(async () => {
+    await Promise.resolve();
+    await Promise.resolve();
+  });
+  expect(getAgentSession).toHaveBeenCalledTimes(2);
+  expect(latest?.pendingUserMessages).toEqual([]);
 });

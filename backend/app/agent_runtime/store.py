@@ -337,6 +337,9 @@ _UNREAD_SKIP_KINDS = frozenset(
     | {
         # Inbound Claude user echo — same rule as Codex user items below.
         "claude_user",
+        # Provider startup metadata is retained for cursor and session state,
+        # but has no visible transcript row for the operator.
+        "claude_init",
         # (``codex_user`` is unreachable in practice — Codex user turns are
         #  ``item_started`` / ``item_completed`` with ``item.type ==
         #  "userMessage"``; those are filtered by payload inspection below.)

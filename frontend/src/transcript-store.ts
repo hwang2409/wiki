@@ -17,6 +17,8 @@ import {
 import { mergeQueueSources, mergeSession, prependOlderEvents } from "./transcript-merge";
 
 const POLL_MS = 2500;
+const PENDING_RECOVERY_MS = 30_000;
+const ENTRY_RETENTION_MS = 60_000;
 
 export type TranscriptTarget =
   | { mode: "live"; ticket: string; subagent?: string; archivedAt?: never }
@@ -88,8 +90,9 @@ export type PanelState = {
 
 export type PendingUserMessage = {
   id: string;
+  requestId: string;
   text: string;
-  status: "sending" | "sent" | "failed";
+  status: "sending" | "sent" | "uncertain" | "failed";
   mode: "now" | "on-idle";
   firstSeenTs: number;
   eventIdFloor: number;
@@ -114,6 +117,8 @@ type Entry = {
   inFlight: Promise<void> | null;
   dirty: boolean;
   lastLoadedAt: number;
+  cleanupHandle: number | null;
+  pendingRecoveryHandle: number | null;
 };
 
 const entries = new Map<string, Entry>();
@@ -200,6 +205,8 @@ function createEntry(target: TranscriptTarget): Entry {
     inFlight: null,
     dirty: false,
     lastLoadedAt: 0,
+    cleanupHandle: null,
+    pendingRecoveryHandle: null,
   };
 }
 
@@ -250,7 +257,21 @@ function reconcilePendingUserMessages(
   }
   // Text matching is only a fallback for providers without durable ids. One
   // event consumes one optimistic row, so identical sends remain FIFO-safe.
-  return remaining.length === pending.length ? pending : remaining;
+  if (remaining.length === 0) return remaining;
+  const now = Date.now();
+  return remaining.map((message) => {
+    if (
+      message.status === "sent" &&
+      now - message.firstSeenTs >= PENDING_RECOVERY_MS
+    ) {
+      return {
+        ...message,
+        status: "uncertain" as const,
+        error: "Delivery is uncertain. Verify it before sending again.",
+      };
+    }
+    return message;
+  });
 }
 
 function getEntry(target: TranscriptTarget): Entry {
@@ -260,6 +281,58 @@ function getEntry(target: TranscriptTarget): Entry {
   const created = createEntry(target);
   entries.set(key, created);
   return created;
+}
+
+function scheduleEntryCleanup(entry: Entry) {
+  if (entry.cleanupHandle !== null) return;
+  entry.cleanupHandle = window.setTimeout(() => {
+    entry.cleanupHandle = null;
+    if (entry.listeners.size > 0 || entry.pollers.size > 0) return;
+    if (entry.inFlight) {
+      scheduleEntryCleanup(entry);
+      return;
+    }
+    if (entry.pendingRecoveryHandle !== null) {
+      window.clearTimeout(entry.pendingRecoveryHandle);
+      entry.pendingRecoveryHandle = null;
+    }
+    entries.delete(entry.key);
+  }, ENTRY_RETENTION_MS);
+}
+
+function schedulePendingRecovery(entry: Entry) {
+  if (entry.pendingRecoveryHandle !== null) {
+    window.clearTimeout(entry.pendingRecoveryHandle);
+    entry.pendingRecoveryHandle = null;
+  }
+  const next = entry.snapshot.pendingUserMessages
+    .filter((message) => message.status === "sent")
+    .reduce<number | null>((earliest, message) => {
+      const dueAt = message.firstSeenTs + PENDING_RECOVERY_MS;
+      return earliest === null ? dueAt : Math.min(earliest, dueAt);
+    }, null);
+  if (next === null) return;
+  entry.pendingRecoveryHandle = window.setTimeout(() => {
+    entry.pendingRecoveryHandle = null;
+    const now = Date.now();
+    let changed = false;
+    const pendingUserMessages = entry.snapshot.pendingUserMessages.map((message) => {
+      if (message.status !== "sent" || now - message.firstSeenTs < PENDING_RECOVERY_MS) {
+        return message;
+      }
+      changed = true;
+      return {
+        ...message,
+        status: "uncertain" as const,
+        error: "Delivery is uncertain. Verify it before sending again.",
+      };
+    });
+    if (changed) {
+      entry.snapshot = { ...entry.snapshot, pendingUserMessages };
+      emit(entry);
+    }
+    schedulePendingRecovery(entry);
+  }, Math.max(0, next - Date.now()));
 }
 
 function emit(entry: Entry) {
@@ -349,6 +422,7 @@ function fetchEntry(entry: Entry): Promise<void> {
         refreshError: null,
         loading: false,
       };
+      schedulePendingRecovery(entry);
       entry.lastLoadedAt = Date.now();
     } catch (error) {
       const message = error instanceof Error ? error.message : "No session transcript found.";
@@ -382,12 +456,17 @@ function shouldRefreshImmediately(entry: Entry): boolean {
 
 function subscribeEntry(target: TranscriptTarget, listener: Listener) {
   const entry = getEntry(target);
+  if (entry.cleanupHandle !== null) {
+    window.clearTimeout(entry.cleanupHandle);
+    entry.cleanupHandle = null;
+  }
   entry.listeners.add(listener);
   if (!entry.snapshot.session && !entry.inFlight) {
     void fetchEntry(entry);
   }
   return () => {
     entry.listeners.delete(listener);
+    if (entry.listeners.size === 0 && entry.pollers.size === 0) scheduleEntryCleanup(entry);
   };
 }
 
@@ -399,6 +478,9 @@ function setPolling(target: TranscriptTarget, subscriberId: string, polling: boo
   const entry = getEntry(target);
   if (polling) entry.pollers.add(subscriberId);
   else entry.pollers.delete(subscriberId);
+  if (!polling && entry.listeners.size === 0 && entry.pollers.size === 0) {
+    scheduleEntryCleanup(entry);
+  }
   setPollerState();
   if (polling && shouldRefreshImmediately(entry)) {
     void fetchEntry(entry);
@@ -447,6 +529,14 @@ export function retryTranscript(target: TranscriptTarget): Promise<void> {
   const entry = getEntry(target);
   entry.dirty = true;
   return fetchEntry(entry);
+}
+
+export function pendingUserMessageIsAcknowledged(ticket: string, pendingId: string): boolean {
+  const entry = getEntry({ mode: "live", ticket });
+  return Boolean(
+    entry.snapshot.session?.events.some((event) => event.pending_id === pendingId) ||
+    entry.snapshot.session?.composerMessages.some((message) => message.pending_id === pendingId),
+  );
 }
 
 export function refreshTranscript(ticket: string) {
@@ -505,13 +595,14 @@ export function replaceTranscriptQueue(
         queue: mergeQueueSources(entry.snapshot.session.queue, annotated),
       },
     };
+    schedulePendingRecovery(entry);
     emit(entry);
   });
 }
 
 export function addPendingUserMessage(
   ticket: string,
-  message: Pick<PendingUserMessage, "id" | "text" | "mode">,
+  message: Pick<PendingUserMessage, "id" | "requestId" | "text" | "mode">,
 ) {
   const entry = getEntry({ mode: "live", ticket });
   const events = entry.snapshot.session?.events ?? [];
@@ -526,6 +617,7 @@ export function addPendingUserMessage(
     ...entry.snapshot,
     pendingUserMessages: [...entry.snapshot.pendingUserMessages, pending],
   };
+  schedulePendingRecovery(entry);
   emit(entry);
 }
 
@@ -543,10 +635,16 @@ export function updatePendingUserMessage(
   });
   if (!changed) return;
   entry.snapshot = { ...entry.snapshot, pendingUserMessages };
+  schedulePendingRecovery(entry);
   emit(entry);
 }
 
-export function retryPendingUserMessage(ticket: string, id: string) {
+export function getPendingUserMessage(ticket: string, id: string): PendingUserMessage | null {
+  const entry = getEntry({ mode: "live", ticket });
+  return entry.snapshot.pendingUserMessages.find((message) => message.id === id) ?? null;
+}
+
+export function retryPendingUserMessage(ticket: string, id: string, requestId?: string) {
   const entry = getEntry({ mode: "live", ticket });
   const events = entry.snapshot.session?.events ?? [];
   const eventIdFloor = events.length > 0 ? events[events.length - 1].id : -1;
@@ -556,6 +654,7 @@ export function retryPendingUserMessage(ticket: string, id: string) {
     changed = true;
     return {
       ...message,
+      requestId: requestId ?? message.requestId,
       status: "sending" as const,
       error: undefined,
       firstSeenTs: Date.now(),
@@ -564,6 +663,7 @@ export function retryPendingUserMessage(ticket: string, id: string) {
   });
   if (!changed) return;
   entry.snapshot = { ...entry.snapshot, pendingUserMessages };
+  schedulePendingRecovery(entry);
   emit(entry);
 }
 
@@ -572,6 +672,7 @@ export function removePendingUserMessage(ticket: string, id: string) {
   const pendingUserMessages = entry.snapshot.pendingUserMessages.filter((message) => message.id !== id);
   if (pendingUserMessages.length === entry.snapshot.pendingUserMessages.length) return;
   entry.snapshot = { ...entry.snapshot, pendingUserMessages };
+  schedulePendingRecovery(entry);
   emit(entry);
 }
 
