@@ -11190,6 +11190,22 @@ class UnixClientTests(unittest.IsolatedAsyncioTestCase):
                     (await asyncio.to_thread(client.ping))["status"],
                     "ok",
                 )
+                with mock.patch.object(
+                    restarted,
+                    "request_codex_rotation",
+                    return_value={"status": "rotated"},
+                ) as rotate:
+                    self.assertEqual(
+                        await restarted.dispatch(
+                            "fleet/rotate_codex",
+                            {"operation_id": "cold-boot-rotation"},
+                        ),
+                        {"status": "rotated"},
+                    )
+                    rotate.assert_awaited_once_with(
+                        operation_id="cold-boot-rotation",
+                        force_target=None,
+                    )
                 release_rebuild.set()
                 await asyncio.wait_for(pending_recovery_started.wait(), timeout=10)
                 started = await asyncio.to_thread(

@@ -72,6 +72,26 @@ _IDEMPOTENT_METHODS = frozenset({"run/start", "run/send_now", "run/send_on_idle"
 _COMMAND_METHODS = frozenset(
     {"run/start", "run/send_now", "run/send_on_idle", "run/archive", "run/replace"}
 )
+_RUN_SCOPED_METHODS = frozenset(
+    {
+        "run/status",
+        "run/integrity_block",
+        "run/mark_viewed",
+        "run/resume",
+        "run/send_now",
+        "run/send_on_idle",
+        "run/queue",
+        "run/queue/delete",
+        "run/queue_model_change",
+        "run/cancel_model_change",
+        "run/interrupt",
+        "run/stop",
+        "run/archive",
+        "run/replace",
+        "run/respond",
+        "events/read",
+    }
+)
 DEFAULT_APPROVAL_RECOVERY_TIMEOUT_SECONDS = 30.0
 AMBIGUOUS_SEND_ECHO_GRACE_SECONDS = 0.05
 _AUTO_ARCHIVE_FORBIDDEN_ROLES = frozenset({"implement", "plan"})
@@ -6057,14 +6077,7 @@ Preserve the same identity, role, worktree, orchestrator grouping, PR gates, and
         return execute
 
     async def dispatch(self, method: str, params: dict[str, Any]) -> Any:
-        if method not in {
-            "ping",
-            "idempotency/status",
-            "run/list",
-            "run/start",
-            "supervisor/recover",
-            "supervisor/handover",
-        }:
+        if method in _RUN_SCOPED_METHODS:
             try:
                 await self._ensure_projection_ready(self._resolve_run_id(params))
             except RunNotFound:
