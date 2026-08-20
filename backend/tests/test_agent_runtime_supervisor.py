@@ -11382,6 +11382,121 @@ class UnixClientTests(unittest.IsolatedAsyncioTestCase):
             await server.close()
             await restarted.close()
 
+    async def test_run_daemon_registers_rebuilds_before_binding_reads(self) -> None:
+        await self.server.close()
+        await self.supervisor.close()
+        self.paths.socket_path.unlink(missing_ok=True)
+        record = self.store.create(
+            RunRecord.new(
+                agent_id="WIKI-DAEMON-BOOT",
+                provider=ProviderKind.CODEX,
+                role="implement",
+                model="fixture-codex",
+                worktree=str(self.worktree),
+                prompt="daemon boot ownership",
+            )
+        )
+        self.store.append_raw(
+            record.run_id,
+            provider="codex",
+            direction="provider",
+            payload={"method": "turn/diff/updated", "params": {"diff": "boot"}},
+        )
+        status_path = self.store.status_path(record.agent_id)
+        status_path.parent.mkdir(parents=True, exist_ok=True)
+        status_path.write_text(
+            json.dumps({"state": "working", "step": "booting"}),
+            encoding="utf-8",
+        )
+
+        registered = threading.Event()
+        bound = threading.Event()
+        rebuild_started = threading.Event()
+        release_rebuild = threading.Event()
+        captured: list[Supervisor] = []
+        original_prepare = Supervisor.prepare_startup_recovery
+        original_server_start = UnixSupervisorServer.start
+        original_rebuild = Supervisor._rebuild_materializer_database_sync
+
+        def prepare(supervisor: Supervisor) -> None:
+            original_prepare(supervisor)
+            captured.append(supervisor)
+            registered.set()
+
+        async def start(server: UnixSupervisorServer) -> None:
+            self.assertTrue(registered.is_set())
+            self.assertTrue(captured)
+            self.assertFalse(captured[0].projection_rebuild_ready.is_set())
+            self.assertFalse(self.paths.socket_path.exists())
+            bound.set()
+            await original_server_start(server)
+
+        def paused_rebuild(supervisor: Supervisor, run_id: str) -> None:
+            rebuild_started.set()
+            if not release_rebuild.wait(timeout=5):
+                raise AssertionError("daemon rebuild was not released")
+            original_rebuild(supervisor, run_id)
+
+        args = argparse.Namespace(
+            runtime_dir=str(self.paths.runtime_dir),
+            socket=str(self.paths.socket_path),
+            registry=str(self.paths.registry_path),
+            fake_fixture_dir=str(FIXTURES),
+        )
+        daemon = asyncio.create_task(agent_daemon.run_daemon(args))
+        try:
+            with (
+                mock.patch.object(
+                    Supervisor,
+                    "prepare_startup_recovery",
+                    autospec=True,
+                    side_effect=prepare,
+                ),
+                mock.patch.object(
+                    UnixSupervisorServer,
+                    "start",
+                    autospec=True,
+                    side_effect=start,
+                ),
+                mock.patch.object(
+                    Supervisor,
+                    "_rebuild_materializer_database_sync",
+                    autospec=True,
+                    side_effect=paused_rebuild,
+                ),
+                mock.patch.object(
+                    agent_daemon,
+                    "_paths_from_args",
+                    return_value=self.paths,
+                ),
+            ):
+                self.assertTrue(await asyncio.to_thread(registered.wait, 5))
+                self.assertTrue(await asyncio.to_thread(bound.wait, 5))
+                client = SupervisorClient(self.paths, timeout=2)
+                self.assertTrue(await asyncio.to_thread(rebuild_started.wait, 5))
+                listed = asyncio.create_task(
+                    asyncio.to_thread(client.request, "run/list")
+                )
+                status = asyncio.create_task(
+                    asyncio.to_thread(
+                        client.request,
+                        "run/status",
+                        {"run_id": record.run_id},
+                    )
+                )
+                await asyncio.sleep(0.05)
+                self.assertFalse(listed.done())
+                self.assertFalse(status.done())
+                release_rebuild.set()
+                result = await asyncio.wait_for(listed, timeout=5)
+                await asyncio.wait_for(status, timeout=5)
+                self.assertEqual(len(result["runs"]), 1)
+        finally:
+            release_rebuild.set()
+            if not daemon.done():
+                daemon.cancel()
+            await asyncio.gather(daemon, return_exceptions=True)
+
     async def test_fleet_monitor_waits_for_transient_recovery_retry(self) -> None:
         started = asyncio.Event()
         stop = asyncio.Event()
@@ -11417,6 +11532,110 @@ class UnixClientTests(unittest.IsolatedAsyncioTestCase):
         finally:
             stop.set()
             await asyncio.gather(fleet_task, return_exceptions=True)
+
+    async def test_run_daemon_retries_recovery_before_starting_real_fleet_monitor(
+        self,
+    ) -> None:
+        await self.server.close()
+        await self.supervisor.close()
+        record = self.store.create(
+            RunRecord.new(
+                agent_id="WIKI-DAEMON-FLEET",
+                provider=ProviderKind.CODEX,
+                role="implement",
+                model="fixture-codex",
+                worktree=str(self.worktree),
+                prompt="daemon fleet retry",
+                orchestrator_id="wiki",
+            )
+        )
+        status_path = self.store.status_path(record.agent_id)
+        status_path.parent.mkdir(parents=True, exist_ok=True)
+        status_path.write_text(
+            json.dumps({"state": "working", "step": "booting"}),
+            encoding="utf-8",
+        )
+        first_failure = asyncio.Event()
+        recovery_success = asyncio.Event()
+        callback_seen = asyncio.Event()
+        callbacks: list[str] = []
+        attempts = 0
+        original_recover = Supervisor.recover_on_start
+        original_monitor_init = agent_daemon.FleetMonitor.__init__
+
+        async def flaky_recovery(supervisor: Supervisor) -> list[dict[str, str]]:
+            nonlocal attempts
+            attempts += 1
+            if attempts == 1:
+                first_failure.set()
+                raise RuntimeError("transient startup recovery failure")
+            result = await original_recover(supervisor)
+            status_path.write_text(
+                json.dumps(
+                    {
+                        "state": "merge-ready",
+                        "step": "ready",
+                        "pr": "https://gh.example/pull/360",
+                    }
+                ),
+                encoding="utf-8",
+            )
+            recovery_success.set()
+            return result
+
+        async def capture_transition(event: dict[str, Any]) -> bool:
+            callbacks.append(str(event["status_state"]))
+            callback_seen.set()
+            return True
+
+        def fast_monitor_init(
+            monitor: agent_daemon.FleetMonitor,
+            *args: Any,
+            **kwargs: Any,
+        ) -> None:
+            original_monitor_init(monitor, *args, **kwargs)
+            monitor.interval = 0.01
+            monitor.on_transition = capture_transition
+
+        args = argparse.Namespace(
+            runtime_dir=str(self.paths.runtime_dir),
+            socket=str(self.paths.socket_path),
+            registry=str(self.paths.registry_path),
+            fake_fixture_dir=str(FIXTURES),
+        )
+        daemon = asyncio.create_task(agent_daemon.run_daemon(args))
+        try:
+            with (
+                mock.patch.object(
+                    Supervisor,
+                    "recover_on_start",
+                    autospec=True,
+                    side_effect=flaky_recovery,
+                ),
+                mock.patch.object(
+                    agent_daemon.FleetMonitor,
+                    "__init__",
+                    autospec=True,
+                    side_effect=fast_monitor_init,
+                ),
+                mock.patch.object(
+                    agent_daemon,
+                    "_paths_from_args",
+                    return_value=self.paths,
+                ),
+            ):
+                await asyncio.wait_for(first_failure.wait(), timeout=5)
+                await asyncio.sleep(0.05)
+                self.assertEqual(callbacks, [])
+                self.assertFalse(recovery_success.is_set())
+                await asyncio.wait_for(recovery_success.wait(), timeout=5)
+                await asyncio.wait_for(callback_seen.wait(), timeout=5)
+                self.assertEqual(callbacks, ["merge-ready"])
+                self.assertGreaterEqual(attempts, 2)
+        finally:
+            if not daemon.done():
+                daemon.cancel()
+            await asyncio.gather(daemon, return_exceptions=True)
 
     def test_default_client_timeout_is_lane_aware_and_retry_safe(self) -> None:
         client = SupervisorClient(self.paths)
@@ -12138,6 +12357,99 @@ class DaemonShutdownTests(unittest.IsolatedAsyncioTestCase):
             self.assertIsNotNone(release_at)
             assert write_at is not None and release_at is not None
             self.assertLess(write_at, release_at)
+
+    async def test_shutdown_races_real_run_start_without_late_stream_loss_write(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            paths = _paths(root)
+            store = RunStore(paths)
+            supervisor = Supervisor(store, FixtureAdapterFactory(FIXTURES))
+            start_entered = asyncio.Event()
+            release_start = asyncio.Event()
+            stream_loss_writes: list[float] = []
+            original_factory = supervisor.adapter_factory
+
+            class BlockingStartAdapter(CodexFixtureAdapter):
+                async def start(self, request: StartRequest) -> AdapterStatus:
+                    start_entered.set()
+                    await release_start.wait()
+                    return await super().start(request)
+
+            def factory(record: RunRecord) -> ProviderAdapter:
+                if record.provider is ProviderKind.CODEX:
+                    return BlockingStartAdapter(
+                        FIXTURES / "codex_app_server_success.jsonl",
+                        FIXTURES / "codex_app_server_control.jsonl",
+                        generation=record.provider_generation,
+                    )
+                return original_factory(record)
+
+            supervisor.adapter_factory = factory
+            original_stream_loss = supervisor._record_stream_loss
+
+            async def record_stream_loss(
+                run_id: str,
+                adapter: ProviderAdapter,
+                reason: str,
+            ) -> None:
+                stream_loss_writes.append(time.monotonic())
+                await original_stream_loss(run_id, adapter, reason)
+
+            start = asyncio.create_task(
+                supervisor.dispatch(
+                    "run/start",
+                    {
+                        "agent_id": "WIKI-SHUTDOWN-RACE",
+                        "provider": "codex",
+                        "role": "implement",
+                        "model": "fixture-codex",
+                        "effort": "high",
+                        "worktree": str(root),
+                        "prompt": "shutdown race",
+                    },
+                )
+            )
+            await start_entered.wait()
+            self.assertEqual(len(supervisor.event_tasks), 1)
+            lock = agent_daemon._acquire_single_instance(paths)
+            release_at: float | None = None
+            original_flock = agent_daemon.fcntl.flock
+
+            def tracked_flock(handle: Any, operation: int) -> None:
+                nonlocal release_at
+                if operation == fcntl.LOCK_UN:
+                    release_at = time.monotonic()
+                original_flock(handle, operation)
+
+            class ClosedServer:
+                async def close(self) -> None:
+                    pass
+
+            with mock.patch.object(
+                supervisor,
+                "_record_stream_loss",
+                side_effect=record_stream_loss,
+            ), mock.patch.object(agent_daemon.fcntl, "flock", tracked_flock):
+                shutdown = asyncio.create_task(
+                    agent_daemon._shutdown(
+                        ClosedServer(),
+                        supervisor,
+                        [],
+                        lock,
+                        paths,
+                    )
+                )
+                await asyncio.sleep(0)
+                self.assertFalse(shutdown.done())
+                release_start.set()
+                await asyncio.wait_for(start, timeout=5)
+                await asyncio.wait_for(shutdown, timeout=5)
+
+            self.assertIsNotNone(release_at)
+            assert release_at is not None
+            self.assertTrue(all(write <= release_at for write in stream_loss_writes))
 
 
 class DaemonProcessTests(unittest.TestCase):

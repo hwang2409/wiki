@@ -550,6 +550,81 @@ class CommandLogTests(unittest.TestCase):
 
         asyncio.run(run())
 
+    def test_startup_retry_promotes_only_the_next_recovery_head(self) -> None:
+        async def run() -> None:
+            with tempfile.TemporaryDirectory() as tmp:
+                log = CommandLog(Path(tmp) / "command-log.sqlite3")
+                first = AgentCommand.steer(
+                    agent_id="WIKI-A",
+                    request_id="send-a-old",
+                    payload={
+                        "method": "run/send_now",
+                        "run_id": "run-a",
+                        "text": "first",
+                    },
+                )
+                second = AgentCommand.steer(
+                    agent_id="WIKI-A",
+                    request_id="send-a-next",
+                    payload={
+                        "method": "run/send_now",
+                        "run_id": "run-a",
+                        "text": "second",
+                    },
+                )
+                state = {"WIKI-A": {"current": {"run_id": "run-a"}}}
+                log.append_intent(first, state)
+                log.append_intent(second, state)
+                attempts = 0
+                effects: list[str] = []
+                second_started = asyncio.Event()
+                release_second = asyncio.Event()
+
+                def factory(command: AgentCommand):
+                    async def effect() -> dict[str, str]:
+                        nonlocal attempts
+                        if command.request_id == first.request_id:
+                            attempts += 1
+                            if attempts == 1:
+                                raise CommandRetryable("provider is detached")
+                        else:
+                            second_started.set()
+                            await release_second.wait()
+                        effects.append(command.request_id)
+                        return {"status": "sent"}
+
+                    return effect
+
+                queue = CommandQueue(log, lambda: {}, recovery_factory=factory)
+                await queue.recover_pending()
+                self.assertEqual(effects, [])
+                self.assertEqual(
+                    [command.request_id for command in queue._deferred["WIKI-A"]],
+                    [first.request_id, second.request_id],
+                )
+                self.assertNotIn(
+                    (second.method, second.request_id), queue._inflight
+                )
+
+                await queue.recover_pending()
+                self.assertEqual(effects, [first.request_id])
+                await second_started.wait()
+                self.assertIn(
+                    (second.method, second.request_id), queue._inflight
+                )
+                self.assertEqual(
+                    [command.request_id for command in queue._deferred["WIKI-A"]],
+                    [second.request_id],
+                )
+
+                release_second.set()
+                await queue.recover_pending()
+                self.assertEqual(effects, [first.request_id, second.request_id])
+                self.assertEqual(log.pending(), [])
+                await queue.close()
+
+        asyncio.run(run())
+
     def test_failed_start_restores_authoritative_projection_for_corrected_command(
         self,
     ) -> None:
