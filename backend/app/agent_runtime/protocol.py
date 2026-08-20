@@ -143,24 +143,26 @@ class UnixSupervisorServer:
                 self._close_listener()
                 if self._closing:
                     return
-                await asyncio.sleep(backoff)
-                if self._closing:
-                    return
-                try:
-                    self._bind_listener()
-                except asyncio.CancelledError:
-                    raise
-                except Exception as restart_exc:
-                    logger.error(
-                        "supervisor listener restart failed exception=%s message=%s fd_count=%s active_connections=%s",
-                        type(restart_exc).__name__,
-                        str(restart_exc),
-                        self._fd_count(),
-                        len(self._client_tasks),
-                    )
-                    backoff = min(backoff * 2, _LISTENER_BACKOFF_MAX_SECONDS)
-                    continue
-                backoff = min(backoff * 2, _LISTENER_BACKOFF_MAX_SECONDS)
+                while not self._closing:
+                    await asyncio.sleep(backoff)
+                    if self._closing:
+                        return
+                    try:
+                        self._bind_listener()
+                    except asyncio.CancelledError:
+                        raise
+                    except Exception as restart_exc:
+                        logger.error(
+                            "supervisor listener restart failed exception=%s message=%s fd_count=%s active_connections=%s",
+                            type(restart_exc).__name__,
+                            str(restart_exc),
+                            self._fd_count(),
+                            len(self._client_tasks),
+                        )
+                        backoff = min(backoff * 2, _LISTENER_BACKOFF_MAX_SECONDS)
+                    else:
+                        backoff = _LISTENER_BACKOFF_INITIAL_SECONDS
+                        break
 
     @staticmethod
     def _fd_count() -> int:
@@ -277,8 +279,11 @@ class UnixSupervisorServer:
             await asyncio.gather(listener_task, return_exceptions=True)
         for writer in list(self._writers):
             writer.close()
-        if self._client_tasks:
-            await asyncio.gather(*self._client_tasks, return_exceptions=True)
+        client_tasks = list(self._client_tasks)
+        for task in client_tasks:
+            task.cancel()
+        if client_tasks:
+            await asyncio.gather(*client_tasks, return_exceptions=True)
         self.server = None
 
     async def __aenter__(self) -> UnixSupervisorServer:
