@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import asyncio
 import json
+import logging
+import os
 import socket
 import stat
 from pathlib import Path
@@ -13,6 +15,10 @@ from .supervisor import Supervisor
 # Existing agent kickoff prompts may be 100 KiB. Leave bounded headroom for
 # JSON metadata and future protocol fields while rejecting unbounded lines.
 MAX_PROTOCOL_LINE_BYTES = 256 * 1024
+_LISTENER_BACKOFF_INITIAL_SECONDS = 0.05
+_LISTENER_BACKOFF_MAX_SECONDS = 1.0
+_LISTENER_BACKLOG = 100
+logger = logging.getLogger(__name__)
 
 
 class UnixSupervisorServer:
@@ -21,8 +27,16 @@ class UnixSupervisorServer:
         self.socket_path = socket_path
         self.server: asyncio.AbstractServer | None = None
         self._bound_ino: int | None = None
+        self._listener: socket.socket | None = None
+        self._listener_task: asyncio.Task[None] | None = None
+        self._client_tasks: set[asyncio.Task[None]] = set()
+        self._writers: set[asyncio.StreamWriter] = set()
+        self._closing = False
 
     async def start(self) -> None:
+        if self._listener_task is not None:
+            raise RuntimeError("supervisor server is already running")
+        self._closing = False
         self.socket_path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
         if self.socket_path.exists() or self.socket_path.is_symlink():
             mode = self.socket_path.lstat().st_mode
@@ -43,13 +57,143 @@ class UnixSupervisorServer:
             finally:
                 probe.close()
             self.socket_path.unlink()
-        self.server = await asyncio.start_unix_server(
-            self._handle_client,
-            path=self.socket_path,
-            limit=MAX_PROTOCOL_LINE_BYTES,
+        self._bind_listener()
+        self._listener_task = asyncio.create_task(
+            self._supervise_listener(),
+            name="agent-supervisor-socket-listener",
         )
-        self.socket_path.chmod(0o600)
-        self._bound_ino = self.socket_path.lstat().st_ino
+
+    def _bind_listener(self) -> None:
+        listener = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        bound_ino: int | None = None
+        try:
+            listener.setblocking(False)
+            listener.bind(str(self.socket_path))
+            listener.listen(_LISTENER_BACKLOG)
+            bound_ino = self.socket_path.lstat().st_ino
+            self.socket_path.chmod(0o600)
+        except BaseException:
+            listener.close()
+            if bound_ino is not None:
+                self._unlink_bound_socket_at(bound_ino)
+            raise
+        self._bound_ino = bound_ino
+        self._listener = listener
+
+    def _unlink_bound_socket(self) -> None:
+        if self._bound_ino is not None:
+            self._unlink_bound_socket_at(self._bound_ino)
+
+    def _unlink_bound_socket_at(self, bound_ino: int) -> None:
+        try:
+            current = self.socket_path.lstat()
+            if stat.S_ISSOCK(current.st_mode) and current.st_ino == bound_ino:
+                self.socket_path.unlink()
+        except OSError:
+            pass
+
+    async def _accept_loop(self) -> None:
+        listener = self._listener
+        if listener is None:
+            raise RuntimeError("supervisor listener is not bound")
+        loop = asyncio.get_running_loop()
+        while True:
+            try:
+                connection, _ = await loop.sock_accept(listener)
+            except ConnectionAbortedError:
+                continue
+            except (BlockingIOError, InterruptedError):
+                continue
+            try:
+                connection.setblocking(False)
+                task = asyncio.create_task(
+                    self._serve_connection(connection),
+                    name="agent-supervisor-client",
+                )
+            except BaseException:
+                connection.close()
+                raise
+            self._client_tasks.add(task)
+            task.add_done_callback(self._client_task_done)
+
+    def _client_task_done(self, task: asyncio.Task[None]) -> None:
+        self._client_tasks.discard(task)
+        if not task.cancelled() and (exception := task.exception()) is not None:
+            logger.warning(
+                "supervisor client task failed exception=%s message=%s",
+                type(exception).__name__,
+                str(exception),
+            )
+
+    async def _supervise_listener(self) -> None:
+        backoff = _LISTENER_BACKOFF_INITIAL_SECONDS
+        while not self._closing:
+            try:
+                await self._accept_loop()
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:
+                logger.error(
+                    "supervisor listener crashed exception=%s message=%s fd_count=%s active_connections=%s",
+                    type(exc).__name__,
+                    str(exc),
+                    self._fd_count(),
+                    len(self._client_tasks),
+                )
+                self._close_listener()
+                if self._closing:
+                    return
+                await asyncio.sleep(backoff)
+                if self._closing:
+                    return
+                try:
+                    self._bind_listener()
+                except asyncio.CancelledError:
+                    raise
+                except Exception as restart_exc:
+                    logger.error(
+                        "supervisor listener restart failed exception=%s message=%s fd_count=%s active_connections=%s",
+                        type(restart_exc).__name__,
+                        str(restart_exc),
+                        self._fd_count(),
+                        len(self._client_tasks),
+                    )
+                    backoff = min(backoff * 2, _LISTENER_BACKOFF_MAX_SECONDS)
+                    continue
+                backoff = min(backoff * 2, _LISTENER_BACKOFF_MAX_SECONDS)
+
+    @staticmethod
+    def _fd_count() -> int:
+        try:
+            return len(os.listdir("/dev/fd"))
+        except OSError:
+            return -1
+
+    def _close_listener(self) -> None:
+        listener = self._listener
+        self._listener = None
+        if listener is not None:
+            listener.close()
+        self._unlink_bound_socket()
+
+    async def _serve_connection(self, connection: socket.socket) -> None:
+        loop = asyncio.get_running_loop()
+        reader = asyncio.StreamReader(limit=MAX_PROTOCOL_LINE_BYTES)
+        protocol = asyncio.StreamReaderProtocol(reader, loop=loop)
+        try:
+            transport, _ = await loop.connect_accepted_socket(
+                lambda: protocol,
+                connection,
+            )
+        except BaseException:
+            connection.close()
+            raise
+        writer = asyncio.StreamWriter(transport, protocol, reader, loop)
+        self._writers.add(writer)
+        try:
+            await self._handle_client(reader, writer)
+        finally:
+            self._writers.discard(writer)
 
     async def _write(self, writer: asyncio.StreamWriter, payload: dict[str, Any]) -> None:
         writer.write(json.dumps(payload, separators=(",", ":")).encode("utf-8") + b"\n")
@@ -92,7 +236,7 @@ class UnixSupervisorServer:
             writer.close()
             try:
                 await writer.wait_closed()
-            except (BrokenPipeError, ConnectionResetError):
+            except (BrokenPipeError, ConnectionResetError, OSError):
                 pass
 
     async def _subscribe(
@@ -124,18 +268,18 @@ class UnixSupervisorServer:
             self.supervisor.unsubscribe(queue)
 
     async def close(self) -> None:
-        if self.server is not None:
-            self.server.close()
-            await self.server.wait_closed()
-            self.server = None
-        try:
-            # A successor daemon may have rebound this path; only remove the
-            # socket this server created (WIKI-217).
-            current = self.socket_path.lstat()
-            if stat.S_ISSOCK(current.st_mode) and current.st_ino == self._bound_ino:
-                self.socket_path.unlink()
-        except OSError:
-            pass
+        self._closing = True
+        self._close_listener()
+        listener_task = self._listener_task
+        self._listener_task = None
+        if listener_task is not None:
+            listener_task.cancel()
+            await asyncio.gather(listener_task, return_exceptions=True)
+        for writer in list(self._writers):
+            writer.close()
+        if self._client_tasks:
+            await asyncio.gather(*self._client_tasks, return_exceptions=True)
+        self.server = None
 
     async def __aenter__(self) -> UnixSupervisorServer:
         await self.start()

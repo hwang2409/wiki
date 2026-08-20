@@ -131,7 +131,9 @@ class SupervisorClient:
         except socket.timeout as exc:
             raise SupervisorUnavailable(self._timeout_message(method, timeout)) from exc
         except (FileNotFoundError, ConnectionRefusedError, OSError) as exc:
-            raise SupervisorUnavailable(str(exc)) from exc
+            raise SupervisorUnavailable(
+                f"supervisor listener unavailable: {exc}"
+            ) from exc
         finally:
             connection.close()
         if not line:
