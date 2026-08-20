@@ -633,9 +633,15 @@ def backfill_headless_runs(
     cursor = event_store.backfill_cursor(NORMALIZER_VERSION)
     candidates = [record for record in terminal if record.run_id > cursor]
     candidates.extend(record for record in terminal if record.run_id <= cursor)
+    batch = candidates[:batch_size]
+    metadata_by_run = {
+        record.run_id: _cursor_metadata(event_store, record.run_id)
+        for record in batch
+    }
 
-    for record in candidates[:batch_size]:
-        version = _safe_normalizer_version(event_store, record.run_id)
+    for record in batch:
+        metadata = metadata_by_run[record.run_id]
+        version = metadata[0] if metadata is not None else NORMALIZER_VERSION
         lock = event_store.run_lock(record.run_id)
         if not lock.acquire(blocking=False):
             _record_backfill_skip(
@@ -664,7 +670,6 @@ def backfill_headless_runs(
                     BackfillResult(record.run_id, "skipped", version, "nonterminal")
                 )
                 continue
-            metadata = _cursor_metadata(event_store, record.run_id)
             if metadata is not None:
                 version, rebuild_state = metadata
                 if version != NORMALIZER_VERSION:
