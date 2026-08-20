@@ -508,6 +508,7 @@ class Supervisor:
         self.projection_rebuilds_started = False
         self.projection_rebuild_ready = asyncio.Event()
         self.projection_rebuild_ready.set()
+        self.startup_recovery_succeeded = asyncio.Event()
         self.archive_queue_limit = archive_queue_limit
         self.archive_pending = 0
         self.archive_inflight: set[str] = set()
@@ -2384,6 +2385,8 @@ Preserve the same identity, role, worktree, orchestrator grouping, PR gates, and
         }
 
     def _attach_adapter(self, run_id: str, adapter: ProviderAdapter) -> None:
+        if self._writers_fenced:
+            raise CommandRetryable("supervisor is shutting down")
         existing = self.adapters.get(run_id)
         if existing is not None and existing is not adapter:
             raise StoreConflict(
@@ -3032,41 +3035,61 @@ Preserve the same identity, role, worktree, orchestrator grouping, PR gates, and
             if self._terminal_run_can_prune(record)
         )
 
-    async def recover_on_start(self) -> list[dict[str, str]]:
+    def prepare_startup_recovery(self) -> None:
+        """Claim retained runs before any client can reach the socket."""
+
+        if self.projection_rebuilds_started:
+            return
         self.projection_rebuild_ready.clear()
+        self.projection_rebuilds_started = True
+        for record in self.store.list_runs():
+            if (
+                record.run_id in self.materializer_failed_runs
+                or record.run_id in self.adapters
+            ):
+                continue
+            self.projection_rebuild_tasks[record.run_id] = asyncio.create_task(
+                self._rebuild_startup_projection(record.run_id),
+                name=f"agent-materializer-rebuild-{record.run_id}",
+            )
+
+    async def recover_on_start(self) -> list[dict[str, str]]:
+        self.prepare_startup_recovery()
         try:
             await self._rebuild_startup_projections()
-        finally:
             self.projection_rebuild_ready.set()
-        async with self._run_mutation_admission():
-            async with self.recovery_scan_lock:
-                self.store.abort_uncommitted_starts()
-                # Projection rebuilds also recover orphan raw rows before
-                # ``_recover_once`` attaches any live provider event pumps.
-                self._orphan_raw_events_normalized = True
-                for record in self.store.list_runs():
-                    if is_wk_kind(record.execution_kind):
-                        self.store.rebuild_wk_status_projection(record.run_id)
-                results = await self._recover_once()
-                await self._reconcile_sending_steer_effects()
-                prune_ids = self._terminal_run_prune_ids()
-                await self._run_archive_worker(
-                    self.store.prune_terminal_runs,
-                    prune_ids,
-                )
-                if self._reaper_due():
-                    by_run_id = {
-                        item["run_id"]: index for index, item in enumerate(results)
-                    }
-                    for reaped in await self._reap_lost_runs():
-                        index = by_run_id.get(reaped["run_id"])
-                        if index is None:
-                            results.append(reaped)
-                        else:
-                            results[index] = reaped
-                results.extend(await self._auto_archive_sweep())
-                self._schedule_archive_backfill()
-        await self.command_queue.recover_pending()
+            async with self._run_mutation_admission():
+                async with self.recovery_scan_lock:
+                    self.store.abort_uncommitted_starts()
+                    # Projection rebuilds also recover orphan raw rows before
+                    # ``_recover_once`` attaches any live provider event pumps.
+                    self._orphan_raw_events_normalized = True
+                    for record in self.store.list_runs():
+                        if is_wk_kind(record.execution_kind):
+                            self.store.rebuild_wk_status_projection(record.run_id)
+                    results = await self._recover_once()
+                    await self._reconcile_sending_steer_effects()
+                    prune_ids = self._terminal_run_prune_ids()
+                    await self._run_archive_worker(
+                        self.store.prune_terminal_runs,
+                        prune_ids,
+                    )
+                    if self._reaper_due():
+                        by_run_id = {
+                            item["run_id"]: index for index, item in enumerate(results)
+                        }
+                        for reaped in await self._reap_lost_runs():
+                            index = by_run_id.get(reaped["run_id"])
+                            if index is None:
+                                results.append(reaped)
+                            else:
+                                results[index] = reaped
+                    results.extend(await self._auto_archive_sweep())
+                    self._schedule_archive_backfill()
+            await self.command_queue.recover_pending()
+        except BaseException:
+            raise
+        self.startup_recovery_succeeded.set()
         return results
 
     async def _rebuild_startup_projections(self) -> None:
@@ -3077,18 +3100,7 @@ Preserve the same identity, role, worktree, orchestrator grouping, PR gates, and
             # Attached event pumps already own their live shards. Preserve
             # the existing lock-coordinated orphan repair for those runs.
             await self._normalize_orphan_raw_events(attached_run_ids)
-        if not self.projection_rebuilds_started:
-            self.projection_rebuilds_started = True
-            for record in self.store.list_runs():
-                if (
-                    record.run_id in self.materializer_failed_runs
-                    or record.run_id in self.adapters
-                ):
-                    continue
-                self.projection_rebuild_tasks[record.run_id] = asyncio.create_task(
-                    self._rebuild_startup_projection(record.run_id),
-                    name=f"agent-materializer-rebuild-{record.run_id}",
-                )
+        self.prepare_startup_recovery()
         if self.projection_rebuild_tasks:
             await asyncio.gather(
                 *self.projection_rebuild_tasks.values(),
@@ -3121,15 +3133,20 @@ Preserve the same identity, role, worktree, orchestrator grouping, PR gates, and
     def _rebuild_startup_projection_sync(self, run_id: str) -> None:
         """Repair one run when raw sequence coverage has a gap."""
 
+        self._repair_and_validate_projection(run_id)
+
+    def _repair_and_validate_projection(self, run_id: str) -> set[int]:
+        """Repair one run and require raw, legacy, and SQLite parity."""
+
         try:
-            record = self.store.get(run_id)
+            self.store.get(run_id)
             normalized_rows = list(self.store.iter_normalized_events(run_id))
             normalized_by_raw_seq = {
                 int(event.get("raw_seq", 0)): event for event in normalized_rows
             }
             raw_rows = list(self.store.iter_raw_events(run_id))
         except RunNotFound:
-            return
+            return set()
         raw_seqs = {int(envelope.get("seq", 0)) for envelope in raw_rows}
         normalized_seqs = set(normalized_by_raw_seq)
         try:
@@ -3139,7 +3156,7 @@ Preserve the same identity, role, worktree, orchestrator grouping, PR gates, and
         missing_normalized = raw_seqs - normalized_seqs
         missing_materialized = raw_seqs - materialized_seqs
         if not missing_normalized and not missing_materialized:
-            return
+            return raw_seqs
         for envelope in raw_rows:
             raw_seq = int(envelope.get("seq", 0))
             if raw_seq in normalized_by_raw_seq:
@@ -3155,8 +3172,18 @@ Preserve the same identity, role, worktree, orchestrator grouping, PR gates, and
         if missing_normalized:
             self.store.rebuild_projections_from_normalized(run_id)
         self._rebuild_materializer_database_sync(run_id)
-        if record.state in TERMINAL_STATES:
-            return
+        normalized_seqs = {
+            int(event.get("raw_seq", 0))
+            for event in self.store.iter_normalized_events(run_id)
+        }
+        materialized_seqs = self.event_store.materialized_raw_seqs(run_id)
+        if raw_seqs != normalized_seqs or raw_seqs != materialized_seqs:
+            raise StoreError(
+                f"projection parity failed for {run_id}: "
+                f"raw={len(raw_seqs)} normalized={len(normalized_seqs)} "
+                f"materialized={len(materialized_seqs)}"
+            )
+        return raw_seqs
 
     async def _ensure_projection_ready(self, run_id: str) -> None:
         task = self.projection_rebuild_tasks.get(run_id)
@@ -5483,34 +5510,7 @@ Preserve the same identity, role, worktree, orchestrator grouping, PR gates, and
         record = self.store.get(run_id)
         if record.state not in TERMINAL_STATES:
             return
-        raw_rows = list(self.store.iter_raw_events(run_id))
-        normalized_rows = list(self.store.iter_normalized_events(run_id))
-        raw_seqs = {int(row.get("seq", 0)) for row in raw_rows}
-        normalized_seqs = {
-            int(row.get("raw_seq", 0)) for row in normalized_rows
-        }
-        try:
-            materialized_seqs = self.event_store.materialized_raw_seqs(run_id)
-        except (sqlite3.DatabaseError, ValueError):
-            materialized_seqs = set()
-        missing_normalized = raw_seqs - normalized_seqs
-        missing_materialized = raw_seqs - materialized_seqs
-        if not missing_normalized and not missing_materialized:
-            return
-        orphans = [
-            row for row in raw_rows if int(row.get("seq", 0)) not in normalized_seqs
-        ]
-        for envelope in orphans:
-            asyncio.run(
-                self._recover_orphan_raw_event(
-                    run_id,
-                    envelope,
-                    materialize=False,
-                )
-            )
-        if missing_normalized:
-            self.store.rebuild_projections_from_normalized(run_id)
-        self._rebuild_materializer_database_sync(run_id)
+        self._repair_and_validate_projection(run_id)
 
     def _validate_terminal_archive(self, run_id: str, session_dir: Path) -> None:
         """Reject terminal archives whose normalized rows do not cover raw rows."""
@@ -6781,6 +6781,12 @@ Preserve the same identity, role, worktree, orchestrator grouping, PR gates, and
             await asyncio.gather(asyncio.shield(rotation), return_exceptions=True)
 
         await self.command_queue.close()
+        for task in tuple(self.event_tasks.values()):
+            task.cancel()
+        if self.event_tasks:
+            await asyncio.gather(
+                *self.event_tasks.values(), return_exceptions=True
+            )
         for task in tuple(self.idempotency_tasks.values()):
             if not task.done():
                 task.cancel()

@@ -455,7 +455,8 @@ class CommandLogTests(unittest.TestCase):
                 queue = CommandQueue(log, lambda: {}, recovery_factory=factory)
                 await queue.recover_pending()
                 self.assertIn(
-                    (deferred.method, deferred.request_id), queue._deferred  # noqa: SLF001
+                    deferred,
+                    queue._deferred[deferred.agent_id],  # noqa: SLF001
                 )
 
                 admission_failure = RuntimeError("command log is unavailable")
@@ -496,6 +497,55 @@ class CommandLogTests(unittest.TestCase):
                     await blocked,
                     {"status": "started"},
                 )
+                await queue.close()
+
+        asyncio.run(run())
+
+    def test_deferred_retries_keep_same_agent_order(self) -> None:
+        async def run() -> None:
+            with tempfile.TemporaryDirectory() as tmp:
+                log = CommandLog(Path(tmp) / "command-log.sqlite3")
+                first = AgentCommand(
+                    "run/send_now",
+                    agent_id="WIKI-A",
+                    request_id="send-a-old",
+                    payload={"run_id": "run-a-old"},
+                )
+                second = AgentCommand(
+                    "run/send_now",
+                    agent_id="WIKI-A",
+                    request_id="send-a-next",
+                    payload={"run_id": "run-a-old"},
+                )
+                effects: list[str] = []
+                first_started = asyncio.Event()
+                release_first = asyncio.Event()
+                second_started = asyncio.Event()
+
+                def factory(command: AgentCommand):
+                    async def effect() -> dict[str, str]:
+                        if command.request_id == first.request_id:
+                            first_started.set()
+                            await release_first.wait()
+                            effects.append("a")
+                        else:
+                            second_started.set()
+                            effects.append("b")
+                        return {"run_id": str(command.payload["run_id"])}
+
+                    return effect
+
+                queue = CommandQueue(log, lambda: {}, recovery_factory=factory)
+                queue._defer(first)  # noqa: SLF001 - ordered retry fixture
+                queue._defer(second)  # noqa: SLF001 - ordered retry fixture
+                recovery = asyncio.create_task(queue.recover_pending())
+                await asyncio.wait_for(first_started.wait(), timeout=2)
+                self.assertFalse(second_started.is_set())
+                release_first.set()
+                await recovery
+                self.assertEqual(effects, ["a"])
+                await queue.recover_pending()
+                self.assertEqual(effects, ["a", "b"])
                 await queue.close()
 
         asyncio.run(run())

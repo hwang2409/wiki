@@ -117,6 +117,18 @@ async def _recovery_loop(supervisor: Supervisor, stop: asyncio.Event) -> None:
                 traceback.print_exc()
 
 
+async def run_fleet_after_startup(
+    supervisor: Supervisor,
+    fleet_monitor: FleetMonitor,
+    stop: asyncio.Event,
+) -> None:
+    """Start fleet observation after the first successful recovery."""
+
+    await supervisor.startup_recovery_succeeded.wait()
+    if not stop.is_set():
+        await fleet_monitor.run(stop)
+
+
 async def _shutdown(
     server: UnixSupervisorServer,
     supervisor: Supervisor,
@@ -171,11 +183,12 @@ async def run_daemon(args: argparse.Namespace) -> None:
     recovery_task: asyncio.Task[None] | None = None
     fleet_task: asyncio.Task[None] | None = None
     try:
+        # Register every retained run before the socket can serve a read.
+        supervisor.prepare_startup_recovery()
         await server.start()
         # Bind before replaying retained event history. Recovery rebuilds one
         # run at a time in the supervisor's worker, so ping and new commands
         # remain available while cold-start projections catch up.
-        supervisor.projection_rebuild_ready.clear()
         startup_recovery_task = asyncio.create_task(
             supervisor.recover_on_start(),
             name="agent-supervisor-startup-recovery",
@@ -201,19 +214,8 @@ async def run_daemon(args: argparse.Namespace) -> None:
                 notify=AutopilotController.live_notify,
             ).on_transition,
         )
-        async def run_fleet_after_startup() -> None:
-            try:
-                await asyncio.shield(startup_recovery_task)
-            except asyncio.CancelledError:
-                raise
-            except Exception:
-                traceback.print_exc()
-                return
-            if not stop.is_set():
-                await fleet_monitor.run(stop)
-
         fleet_task = asyncio.create_task(
-            run_fleet_after_startup(),
+            run_fleet_after_startup(supervisor, fleet_monitor, stop),
             name="agent-supervisor-fleet-monitor",
         )
         await stop.wait()

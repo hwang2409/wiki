@@ -73,8 +73,9 @@ class CommandQueue:
             tuple[str, str], tuple[AgentCommand, asyncio.Future[Any]]
         ] = {}
         self._recovery_commands: dict[asyncio.Future[Any], AgentCommand] = {}
+        self._recovery_queued: set[tuple[str, str]] = set()
         self._recovery_agent_events: dict[str, asyncio.Event] = {}
-        self._deferred: dict[tuple[str, str], AgentCommand] = {}
+        self._deferred: dict[str, list[AgentCommand]] = {}
         self.recovery_failures: list[tuple[AgentCommand, Exception]] = []
         self.recovery_retries: list[tuple[AgentCommand, CommandRetryable]] = []
         self._closed = False
@@ -94,6 +95,59 @@ class CommandQueue:
     @staticmethod
     def _same_binding(left: AgentCommand, right: AgentCommand) -> bool:
         return left.agent_id == right.agent_id and left.command_hash == right.command_hash
+
+    def _deferred_for_key(
+        self, key: tuple[str, str]
+    ) -> AgentCommand | None:
+        for commands in self._deferred.values():
+            for command in commands:
+                if (command.method, command.request_id) == key:
+                    return command
+        return None
+
+    def _defer(self, command: AgentCommand) -> None:
+        commands = self._deferred.setdefault(command.agent_id, [])
+        key = (command.method, command.request_id)
+        if not any((item.method, item.request_id) == key for item in commands):
+            commands.append(command)
+
+    def _remove_deferred(self, command: AgentCommand) -> None:
+        commands = self._deferred.get(command.agent_id)
+        if commands is None:
+            return
+        key = (command.method, command.request_id)
+        commands[:] = [
+            item for item in commands
+            if (item.method, item.request_id) != key
+        ]
+        if not commands:
+            self._deferred.pop(command.agent_id, None)
+
+    async def _queue_deferred_heads(self) -> list[asyncio.Future[Any]]:
+        if not self._deferred:
+            return []
+        if self.recovery_factory is None:
+            raise CommandError("deferred command intents need a recovery executor")
+        futures: list[asyncio.Future[Any]] = []
+        for commands in tuple(self._deferred.values()):
+            if not commands:
+                continue
+            command = commands[0]
+            key = (command.method, command.request_id)
+            if key in self._inflight or any(
+                pending.agent_id == command.agent_id
+                for pending, _future in self._inflight.values()
+            ):
+                continue
+            future = self._new_recovery_future(command)
+            futures.append(future)
+            await self._recovery_queue.put(
+                _QueuedCommand(command, self.recovery_factory(command), future, True)
+            )
+            self._recovery_queued.add(key)
+        if futures:
+            self._start_recovery_worker()
+        return futures
 
     def _new_recovery_future(
         self, command: AgentCommand
@@ -117,6 +171,7 @@ class CommandQueue:
             if pending and self.recovery_factory is None:
                 raise CommandError("pending command intents need a recovery executor")
             futures: list[asyncio.Future[Any]] = []
+            queued_agents: set[str] = set()
             for command in pending:
                 key = (command.method, command.request_id)
                 existing = self._inflight.get(key)
@@ -130,14 +185,17 @@ class CommandQueue:
                 future = self._new_recovery_future(command)
                 futures.append(future)
                 assert self.recovery_factory is not None
-                await self._recovery_queue.put(
-                    _QueuedCommand(
-                        command,
-                        self.recovery_factory(command),
-                        future,
-                        recovering=True,
+                if command.agent_id not in queued_agents:
+                    await self._recovery_queue.put(
+                        _QueuedCommand(
+                            command,
+                            self.recovery_factory(command),
+                            future,
+                            recovering=True,
+                        )
                     )
-                )
+                    self._recovery_queued.add(key)
+                    queued_agents.add(command.agent_id)
             self._recovered = True
             if pending:
                 self._start_recovery_worker()
@@ -147,19 +205,7 @@ class CommandQueue:
         """Replay all pending intents before startup accepts new mutations."""
 
         futures = await self._ensure_recovered()
-        if self._deferred:
-            if self.recovery_factory is None:
-                raise CommandError("deferred command intents need a recovery executor")
-            for key, command in list(self._deferred.items()):
-                if key in self._inflight:
-                    continue
-                future = self._new_recovery_future(command)
-                futures.append(future)
-                await self._recovery_queue.put(
-                    _QueuedCommand(command, self.recovery_factory(command), future, True)
-                )
-            if futures:
-                self._start_recovery_worker()
+        futures.extend(await self._queue_deferred_heads())
         if futures:
             results = await asyncio.gather(
                 *(asyncio.shield(future) for future in futures),
@@ -186,9 +232,11 @@ class CommandQueue:
         try:
             future.result()
         except _RecoveredCommandFailure as failure:
+            self._remove_deferred(command)
             self.recovery_failures.append((command, failure.error))
+            self._queue_next_recovery(command.agent_id)
         except _RecoveredCommandRetry as retry:
-            self._deferred[(command.method, command.request_id)] = command
+            self._defer(command)
             self.recovery_retries.append((command, retry.error))
             return
         except BaseException as error:
@@ -198,16 +246,44 @@ class CommandQueue:
                 "recovery failed before completion: "
                 f"{type(error).__name__}: {error}"
             )
-            self._deferred[(command.method, command.request_id)] = command
+            self._defer(command)
             self.recovery_retries.append((command, retry))
             return
+        self._remove_deferred(command)
+        self._queue_next_recovery(command.agent_id)
         self._open_recovery_barrier_if_ready(command.agent_id)
+
+    def _queue_next_recovery(self, agent_id: str) -> None:
+        if any(
+            pending.agent_id == agent_id
+            for commands in self._deferred.values()
+            for pending in commands
+        ):
+            return
+        for future, pending in self._recovery_commands.items():
+            key = (pending.method, pending.request_id)
+            if pending.agent_id != agent_id or key in self._recovery_queued:
+                continue
+            assert self.recovery_factory is not None
+            self._recovery_queue.put_nowait(
+                _QueuedCommand(
+                    pending,
+                    self.recovery_factory(pending),
+                    future,
+                    recovering=True,
+                )
+            )
+            self._recovery_queued.add(key)
+            self._start_recovery_worker()
+            return
 
     def _open_recovery_barrier_if_ready(self, agent_id: str) -> None:
         if not any(
             pending.agent_id == agent_id for pending in self._recovery_commands.values()
         ) and not any(
-            pending.agent_id == agent_id for pending in self._deferred.values()
+            pending.agent_id == agent_id
+            for commands in self._deferred.values()
+            for pending in commands
         ):
             self._recovery_agent_events[agent_id].set()
 
@@ -223,9 +299,14 @@ class CommandQueue:
                     f"request_id {command.request_id} has a conflicting command"
                 )
             return await asyncio.shield(existing[1])
-        deferred = self._deferred.get(key)
+        deferred = self._deferred_for_key(key)
+        deferred_head = self._deferred.get(command.agent_id, [None])[0]
         recovery_event = self._recovery_agent_events.get(command.agent_id)
-        if deferred is None and recovery_event is not None and not recovery_event.is_set():
+        if (
+            deferred is not deferred_head
+            and recovery_event is not None
+            and not recovery_event.is_set()
+        ):
             await recovery_event.wait()
         loop = asyncio.get_running_loop()
         future: asyncio.Future[Any] = loop.create_future()
@@ -238,13 +319,10 @@ class CommandQueue:
                     else self.state_provider()
                 )
                 intent = await asyncio.to_thread(self.log.append_intent, command, state)
-            if deferred is not None:
-                self._deferred.pop(key, None)
-                self._open_recovery_barrier_if_ready(command.agent_id)
             if intent.replay:
                 # A receipt is terminal. It also closes any deferred retry
                 # left by an earlier provider-control outage.
-                self._deferred.pop(key, None)
+                self._remove_deferred(command)
                 future.set_result(intent.result)
                 self._inflight.pop(key, None)
                 return await asyncio.shield(future)
@@ -270,6 +348,8 @@ class CommandQueue:
                 except BaseException as exc:
                     if isinstance(exc, CommandRetryable):
                         retryable = True
+                        if item.recovering:
+                            self._defer(command)
                         if not future.done():
                             if item.recovering:
                                 future.set_exception(_RecoveredCommandRetry(exc))
@@ -314,15 +394,18 @@ class CommandQueue:
                     future.set_exception(exc)
             finally:
                 key = (command.method, command.request_id)
+                self._recovery_queued.discard(key)
                 if self._inflight.get(key, (None, None))[1] is future:
                     self._inflight.pop(key, None)
                 if retryable:
                     # A normal client retry can hit the same detached
                     # provider as recovered work. Keep it eligible for the
                     # next recovery poll without a daemon restart.
-                    self._deferred[key] = command
+                    self._defer(command)
                 else:
-                    self._deferred.pop(key, None)
+                    self._remove_deferred(command)
+                    if not item.recovering and not retryable:
+                        self._queue_next_recovery(command.agent_id)
                 queue.task_done()
 
     async def close(self) -> None:

@@ -11192,6 +11192,7 @@ class UnixClientTests(unittest.IsolatedAsyncioTestCase):
                     model="fixture-codex",
                     worktree=str(self.worktree),
                     prompt="cold boot projection test",
+                    orchestrator_id="wiki",
                 )
             )
             for event_index in range(20):
@@ -11219,6 +11220,12 @@ class UnixClientTests(unittest.IsolatedAsyncioTestCase):
             pending,
             self.store.command_state_for(records[0].agent_id),
         )
+        status_path = self.store.status_path(records[0].agent_id)
+        status_path.parent.mkdir(parents=True, exist_ok=True)
+        status_path.write_text(
+            json.dumps({"state": "working", "step": "waiting"}),
+            encoding="utf-8",
+        )
 
         await self.server.close()
         await self.supervisor.close()
@@ -11230,6 +11237,8 @@ class UnixClientTests(unittest.IsolatedAsyncioTestCase):
         release_rebuild = threading.Event()
         pending_recovery_started = asyncio.Event()
         release_pending_recovery = asyncio.Event()
+        monitor_callbacks: list[dict[str, Any]] = []
+        monitor_callback_seen = asyncio.Event()
         original_rebuild = restarted._rebuild_materializer_database_sync
 
         def paused_rebuild(run_id: str) -> None:
@@ -11245,6 +11254,21 @@ class UnixClientTests(unittest.IsolatedAsyncioTestCase):
 
         restarted.command_queue.recovery_factory = lambda _command: blocked_pending_recovery
 
+        async def monitor_callback(payload: dict[str, Any]) -> None:
+            monitor_callbacks.append(payload)
+            monitor_callback_seen.set()
+
+        async def monitor_send_now(
+            _run_id: str,
+            _message: str,
+            _dedupe_key: str | None,
+            _source: str | None = None,
+        ) -> dict[str, str]:
+            return {"status": "sent"}
+
+        fleet_stop = asyncio.Event()
+        fleet_task: asyncio.Task[None] | None = None
+
         recovery = asyncio.create_task(restarted.recover_on_start())
         try:
             with mock.patch.object(
@@ -11253,15 +11277,36 @@ class UnixClientTests(unittest.IsolatedAsyncioTestCase):
                 side_effect=paused_rebuild,
             ):
                 self.assertTrue(await asyncio.to_thread(rebuild_started.wait, 5))
+                await asyncio.sleep(0.05)
+                self.assertEqual(monitor_callbacks, [])
                 self.assertEqual(
                     (await asyncio.to_thread(client.ping))["status"],
                     "ok",
                 )
+                fleet_monitor = agent_daemon.FleetMonitor(
+                    restarted.store,
+                    monitor_send_now,
+                    interval=0.01,
+                    on_transition=monitor_callback,
+                )
+                fleet_task = asyncio.create_task(
+                    agent_daemon.run_fleet_after_startup(
+                        restarted,
+                        fleet_monitor,
+                        fleet_stop,
+                    )
+                )
                 listed_during_rebuild = asyncio.create_task(
                     restarted.dispatch("run/list", {})
                 )
+                status_during_rebuild = asyncio.create_task(
+                    restarted.dispatch(
+                        "run/status", {"run_id": records[0].run_id}
+                    )
+                )
                 await asyncio.sleep(0)
                 self.assertFalse(listed_during_rebuild.done())
+                self.assertFalse(status_during_rebuild.done())
                 with mock.patch.object(
                     restarted,
                     "request_codex_rotation",
@@ -11280,6 +11325,7 @@ class UnixClientTests(unittest.IsolatedAsyncioTestCase):
                     )
                 release_rebuild.set()
                 listed = await asyncio.wait_for(listed_during_rebuild, timeout=10)
+                await asyncio.wait_for(status_during_rebuild, timeout=10)
                 self.assertEqual(len(listed["runs"]), len(records))
                 await asyncio.wait_for(pending_recovery_started.wait(), timeout=10)
                 started = await asyncio.to_thread(
@@ -11301,6 +11347,22 @@ class UnixClientTests(unittest.IsolatedAsyncioTestCase):
                 self.assertFalse(recovery.done())
                 release_pending_recovery.set()
                 await asyncio.wait_for(recovery, timeout=10)
+                await asyncio.sleep(0.1)
+                status_path.write_text(
+                    json.dumps(
+                        {
+                            "state": "merge-ready",
+                            "step": "ready",
+                            "pr": "https://gh.example/pull/360",
+                        }
+                    ),
+                    encoding="utf-8",
+                )
+                await asyncio.wait_for(monitor_callback_seen.wait(), timeout=10)
+                self.assertEqual(
+                    [payload["status_state"] for payload in monitor_callbacks],
+                    ["merge-ready"],
+                )
                 for record in records:
                     raw_seqs = {
                         int(event["seq"])
@@ -11314,8 +11376,47 @@ class UnixClientTests(unittest.IsolatedAsyncioTestCase):
             release_rebuild.set()
             if not recovery.done():
                 await recovery
+            fleet_stop.set()
+            if fleet_task is not None:
+                await asyncio.gather(fleet_task, return_exceptions=True)
             await server.close()
             await restarted.close()
+
+    async def test_fleet_monitor_waits_for_transient_recovery_retry(self) -> None:
+        started = asyncio.Event()
+        stop = asyncio.Event()
+        attempts = 0
+
+        class Monitor:
+            async def run(self, monitor_stop: asyncio.Event) -> None:
+                started.set()
+                await monitor_stop.wait()
+
+        async def recovery_attempt() -> None:
+            nonlocal attempts
+            attempts += 1
+            if attempts == 1:
+                raise RuntimeError("transient startup recovery failure")
+            self.supervisor.startup_recovery_succeeded.set()
+
+        self.supervisor.startup_recovery_succeeded.clear()
+        fleet_task = asyncio.create_task(
+            agent_daemon.run_fleet_after_startup(
+                self.supervisor,
+                Monitor(),
+                stop,
+            )
+        )
+        try:
+            with self.assertRaisesRegex(RuntimeError, "transient"):
+                await recovery_attempt()
+            self.assertFalse(started.is_set())
+            await recovery_attempt()
+            await asyncio.wait_for(started.wait(), timeout=2)
+            self.assertEqual(attempts, 2)
+        finally:
+            stop.set()
+            await asyncio.gather(fleet_task, return_exceptions=True)
 
     def test_default_client_timeout_is_lane_aware_and_retry_safe(self) -> None:
         client = SupervisorClient(self.paths)
