@@ -11652,7 +11652,10 @@ class UnixClientTests(unittest.IsolatedAsyncioTestCase):
         release_rebuild = threading.Event()
         snapshot_raw_seq: int | None = None
 
-        def paused_after_snapshot(run_id: str) -> None:
+        event_store = self.supervisor.event_store.for_run(record.run_id)
+        original_replace = event_store.replace_run_from
+
+        def paused_replace(source: Path | str, run_id: str) -> None:
             nonlocal snapshot_raw_seq
             snapshot_raw_seq = max(
                 int(event["seq"])
@@ -11661,72 +11664,73 @@ class UnixClientTests(unittest.IsolatedAsyncioTestCase):
             rebuild_started.set()
             if not release_rebuild.wait(timeout=5):
                 raise AssertionError("projection rebuild was not released")
+            original_replace(source, run_id)
 
         operation_id = "00000000-0000-4000-8000-000000000360"
-        self.supervisor._post_snapshot_hook = paused_after_snapshot  # noqa: SLF001
         with (
             mock.patch.dict(os.environ, env),
             mock.patch.object(accounts, "codex_login_status", return_value=True),
+            mock.patch.object(
+                event_store,
+                "replace_run_from",
+                side_effect=paused_replace,
+            ),
         ):
-            try:
-                self.supervisor.prepare_startup_recovery()
-                self.assertTrue(await asyncio.to_thread(rebuild_started.wait, 5))
-                rotation = asyncio.create_task(
-                    self.supervisor.dispatch(
-                        "fleet/rotate_codex",
-                        {"operation_id": operation_id, "account": "beta"},
-                    )
+            self.supervisor.prepare_startup_recovery()
+            self.assertTrue(await asyncio.to_thread(rebuild_started.wait, 5))
+            rotation = asyncio.create_task(
+                self.supervisor.dispatch(
+                    "fleet/rotate_codex",
+                    {"operation_id": operation_id, "account": "beta"},
                 )
-                for _ in range(200):
-                    current = self.store.get(record.run_id)
-                    if (
-                        current.quiesce_operation_id == operation_id
-                        and record.run_id not in self.supervisor.adapters
-                    ):
-                        break
-                    await asyncio.sleep(0.01)
-                else:
-                    self.fail("rotation did not quiesce the run")
-                self.assertFalse(rotation.done())
-                release_rebuild.set()
-                result = await asyncio.wait_for(rotation, timeout=10)
+            )
+            for _ in range(200):
+                current = self.store.get(record.run_id)
+                if (
+                    current.quiesce_operation_id == operation_id
+                    and record.run_id not in self.supervisor.adapters
+                ):
+                    break
+                await asyncio.sleep(0.01)
+            else:
+                self.fail("rotation did not quiesce the run")
+            self.assertFalse(rotation.done())
+            release_rebuild.set()
+            result = await asyncio.wait_for(rotation, timeout=10)
 
-                resumed_adapter = self.supervisor.adapters[record.run_id]
-                await resumed_adapter._events.put(  # noqa: SLF001 - race fixture
-                    ProviderEvent(
-                        ProviderKind.CODEX,
-                        {
-                            "method": "rotation/resumed-write",
-                            "params": {"after": snapshot_raw_seq},
-                        },
-                        generation=max(1, resumed_adapter.snapshot().generation),
+            resumed_adapter = self.supervisor.adapters[record.run_id]
+            await resumed_adapter._events.put(  # noqa: SLF001 - race fixture
+                ProviderEvent(
+                    ProviderKind.CODEX,
+                    {
+                        "method": "rotation/resumed-write",
+                        "params": {"after": snapshot_raw_seq},
+                    },
+                    generation=max(1, resumed_adapter.snapshot().generation),
+                )
+            )
+            for _ in range(200):
+                resumed_events = [
+                    event
+                    for event in self.store.read_raw_events(record.run_id)
+                    if event["payload"].get("method") == "rotation/resumed-write"
+                ]
+                if resumed_events:
+                    break
+                await asyncio.sleep(0.01)
+            else:
+                self.fail("rotation did not produce a resumed raw write")
+            assert snapshot_raw_seq is not None
+            resumed_seq = int(resumed_events[0]["seq"])
+            self.assertGreater(resumed_seq, snapshot_raw_seq)
+            self.assertGreaterEqual(
+                max(
+                    self.supervisor.event_store.materialized_raw_seqs(
+                        record.run_id
                     )
-                )
-                for _ in range(200):
-                    resumed_events = [
-                        event
-                        for event in self.store.read_raw_events(record.run_id)
-                        if event["payload"].get("method") == "rotation/resumed-write"
-                    ]
-                    if resumed_events:
-                        break
-                    await asyncio.sleep(0.01)
-                else:
-                    self.fail("rotation did not produce a resumed raw write")
-                assert snapshot_raw_seq is not None
-                resumed_seq = int(resumed_events[0]["seq"])
-                self.assertGreater(resumed_seq, snapshot_raw_seq)
-                self.assertGreaterEqual(
-                    max(
-                        self.supervisor.event_store.materialized_raw_seqs(
-                            record.run_id
-                        )
-                    ),
-                    resumed_seq,
-                )
-            finally:
-                self.supervisor._post_snapshot_hook = None  # noqa: SLF001
-                release_rebuild.set()
+                ),
+                resumed_seq,
+            )
 
         self.assertEqual(result["revived_run_ids"], {record.agent_id: record.run_id})
         raw_seqs = {
@@ -13023,14 +13027,33 @@ class DaemonShutdownTests(unittest.IsolatedAsyncioTestCase):
                 json.dumps({"state": "working", "step": "race"}),
                 encoding="utf-8",
             )
+            stale_record = store.create(
+                RunRecord.new(
+                    agent_id="WIKI-360-RACE-0",
+                    provider=ProviderKind.CLAUDE,
+                    role="implement",
+                    model="fixture-claude",
+                    worktree=str(root),
+                    prompt="staleness race",
+                    orchestrator_id=orchestrator.agent_id,
+                )
+            )
+            store.transition(stale_record.run_id, LifecycleState.WORKING)
+            stale_status_path = store.status_path(stale_record.agent_id)
+            stale_status_path.parent.mkdir(parents=True, exist_ok=True)
+            stale_status_path.write_text(
+                json.dumps({"state": "working", "step": "stale"}),
+                encoding="utf-8",
+            )
             fleet_monitor = agent_daemon.FleetMonitor(
                 store,
                 agent_daemon.build_fleet_monitor_dispatch(supervisor),
                 staleness_threshold=1.0,
+                ownership_lock=supervisor._agent_lock,  # noqa: SLF001
             )
             await fleet_monitor.tick()
             stale_at = time.time() - 120.0
-            os.utime(status_path, (stale_at, stale_at))
+            os.utime(stale_status_path, (stale_at, stale_at))
             send_pinned = asyncio.Event()
             send_may_complete = asyncio.Event()
             adapter._send_gate = (send_pinned, send_may_complete)
