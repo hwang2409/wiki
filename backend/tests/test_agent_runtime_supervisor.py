@@ -61,6 +61,7 @@ from backend.app.agent_runtime.store import (
     RunNotFound,
     RunStore,
     RuntimePaths,
+    StoreError,
     StoreConflict,
 )
 from backend.app.agent_runtime.supervisor import Supervisor, resolve_safe_worktree
@@ -92,6 +93,41 @@ class StartFailureAdapter(CodexFixtureAdapter):
             )
         )
         raise RuntimeError("fixture start failure")
+
+
+class ShutdownRaceAdapter(CodexFixtureAdapter):
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self._send_gate: tuple[asyncio.Event, asyncio.Event] | None = None
+
+    async def send_now(self, message: str) -> AdapterStatus:
+        gate = self._send_gate
+        if gate is not None:
+            pinned, may_complete = gate
+            pinned.set()
+            await may_complete.wait()
+        return await super().send_now(message)
+
+    async def emit_provider_event(self, payload: dict[str, Any]) -> None:
+        await self._events.put(  # noqa: SLF001 - production event-path fixture
+            ProviderEvent(
+                ProviderKind.CODEX,
+                payload,
+                generation=max(1, self.snapshot().generation),
+            )
+        )
+
+
+class ShutdownRaceFactory(FixtureAdapterFactory):
+    def __call__(self, record: RunRecord) -> ProviderAdapter:
+        if record.provider is ProviderKind.CODEX:
+            return ShutdownRaceAdapter(
+                self.fixture_dir / "codex_app_server_success.jsonl",
+                self.fixture_dir / "codex_app_server_control.jsonl",
+                pid=self.pid,
+                generation=record.provider_generation,
+            )
+        return super().__call__(record)
 
 
 class ResumeFailureAdapter(CodexFixtureAdapter):
@@ -452,6 +488,196 @@ class SupervisorTests(unittest.IsolatedAsyncioTestCase):
             ).read_text().splitlines()
         ]
         self.assertEqual([item["raw_seq"] for item in normalized], [1])
+
+    async def test_large_terminal_orphan_archive_preserves_every_raw_event(self) -> None:
+        record = self.store.create(
+            RunRecord.new(
+                agent_id="WIKI-LARGE-TERMINAL-ORPHAN",
+                provider=ProviderKind.CODEX,
+                role="implement",
+                model="fixture-codex",
+                worktree=str(self.worktree),
+                prompt="large terminal orphan fixture",
+            )
+        )
+        raw_rows: list[dict[str, Any]] = []
+        for event_index in range(300):
+            raw = self.store.append_raw(
+                record.run_id,
+                provider=ProviderKind.CODEX.value,
+                direction="provider",
+                payload={
+                    "method": "turn/diff/updated",
+                    "params": {"diff": str(event_index)},
+                },
+            )
+            raw_rows.append(raw)
+            if event_index < 260:
+                await self.supervisor._recover_orphan_raw_event(  # noqa: SLF001
+                    record.run_id,
+                    raw,
+                    materialize=False,
+                )
+        record = self.store.transition(record.run_id, LifecycleState.COMPLETED)
+
+        await self.supervisor.archive(record.run_id, outcome="closed")
+
+        sessions = sorted(
+            (self.paths.archive_dir / record.agent_id).iterdir()
+        )
+        archived_events = [
+            json.loads(line)
+            for line in (sessions[-1] / "events.jsonl").read_text().splitlines()
+        ]
+        self.assertEqual(
+            {int(event["raw_seq"]) for event in archived_events},
+            {int(raw["seq"]) for raw in raw_rows},
+        )
+
+    async def test_archive_allows_multiple_normalized_rows_for_one_raw_seq(self) -> None:
+        record = self.store.create(
+            RunRecord.new(
+                agent_id="WIKI-ARCHIVE-MULTI-ROW",
+                provider=ProviderKind.CODEX,
+                role="implement",
+                model="fixture-codex",
+                worktree=str(self.worktree),
+                prompt="multi-row archive fixture",
+            )
+        )
+        raw = self.store.append_raw(
+            record.run_id,
+            provider=ProviderKind.CODEX.value,
+            direction="provider",
+            payload={"method": "item/completed", "params": {"index": 1}},
+        )
+        for index in range(3):
+            self.store.append_normalized(
+                record.run_id,
+                raw_seq=int(raw["seq"]),
+                disposition=EventDisposition.RENDERED,
+                kind="artifact",
+                payload={"index": index},
+            )
+        self.store.transition(record.run_id, LifecycleState.COMPLETED)
+
+        await self.supervisor.archive(record.run_id, outcome="closed")
+
+        sessions = sorted((self.paths.archive_dir / record.agent_id).iterdir())
+        archived_events = [
+            json.loads(line)
+            for line in (sessions[-1] / "events.jsonl").read_text().splitlines()
+        ]
+        self.assertEqual(len(archived_events), 3)
+        self.assertEqual({int(event["raw_seq"]) for event in archived_events}, {1})
+
+    async def test_terminal_recovery_uses_raw_coverage_at_256_row_boundary(self) -> None:
+        cases = (
+            ("boundary-orphan", 255),
+            ("all-orphan", 0),
+            ("empty-shard", 256),
+        )
+        expected_seqs = set(range(1, 257))
+        records: dict[str, RunRecord] = {}
+        for suffix, normalized_count in cases:
+            with self.subTest(suffix=suffix):
+                record = self.store.create(
+                    RunRecord.new(
+                        agent_id=f"WIKI-TERMINAL-{suffix}",
+                        provider=ProviderKind.CODEX,
+                        role="implement",
+                        model="fixture-codex",
+                        worktree=str(self.worktree),
+                        prompt="terminal coverage recovery",
+                    )
+                )
+                records[suffix] = record
+                raw_rows = [
+                    self.store.append_raw(
+                        record.run_id,
+                        provider=ProviderKind.CODEX.value,
+                        direction="provider",
+                        payload={
+                            "method": "turn/diff/updated",
+                            "params": {"diff": str(index)},
+                        },
+                    )
+                    for index in range(256)
+                ]
+                for raw in raw_rows[:normalized_count]:
+                    await self.supervisor._recover_orphan_raw_event(  # noqa: SLF001
+                        record.run_id,
+                        raw,
+                        materialize=False,
+                    )
+                self.store.transition(record.run_id, LifecycleState.COMPLETED)
+
+        await self.supervisor._rebuild_startup_projections()  # noqa: SLF001
+        for suffix, _normalized_count in cases:
+            record = records[suffix]
+            self.assertEqual(
+                self.supervisor.event_store.materialized_raw_seqs(record.run_id),
+                expected_seqs,
+            )
+            self.assertEqual(
+                {
+                    int(event["raw_seq"])
+                    for event in self.store.iter_normalized_events(record.run_id)
+                },
+                expected_seqs,
+            )
+            await self.supervisor.archive(record.run_id, outcome="closed")
+            session_dir = sorted(
+                (self.paths.archive_dir / record.agent_id).iterdir()
+            )[-1]
+            self.assertEqual(
+                {
+                    int(json.loads(line)["raw_seq"])
+                    for line in (session_dir / "events.jsonl").read_text().splitlines()
+                },
+                expected_seqs,
+            )
+
+    async def test_startup_rebuilds_matching_raw_sequences_with_unhealthy_sqlite(self) -> None:
+        record = self.store.create(
+            RunRecord.new(
+                agent_id="WIKI-UNHEALTHY-SQLITE",
+                provider=ProviderKind.CODEX,
+                role="implement",
+                model="fixture-codex",
+                worktree=str(self.worktree),
+                prompt="unhealthy sqlite fixture",
+            )
+        )
+        raw = self.store.append_raw(
+            record.run_id,
+            provider="codex",
+            direction="provider",
+            payload={"method": "turn/diff/updated", "params": {"diff": "one"}},
+        )
+        await self.supervisor._recover_orphan_raw_event(  # noqa: SLF001
+            record.run_id,
+            raw,
+            materialize=False,
+        )
+        self.supervisor._rebuild_materializer_database_sync(record.run_id)  # noqa: SLF001
+        with self.supervisor.event_store.connection() as connection:
+            connection.execute("DROP TABLE run_projections")
+        self.assertEqual(
+            self.supervisor.event_store.materialized_raw_seqs(record.run_id),
+            {1},
+        )
+        self.assertFalse(self.supervisor.event_store.run_is_healthy(record.run_id))
+
+        with mock.patch.object(
+            self.supervisor,
+            "_rebuild_materializer_database_sync",
+            wraps=self.supervisor._rebuild_materializer_database_sync,  # noqa: SLF001
+        ) as rebuild:
+            self.supervisor._rebuild_startup_projection_sync(record.run_id)  # noqa: SLF001
+
+        rebuild.assert_called_once_with(record.run_id)
+        self.assertTrue(self.supervisor.event_store.run_is_healthy(record.run_id))
 
     async def _spawn_orphan_process(self, *, ignore_sigterm: bool = False) -> int:
         child_code = (
@@ -10167,11 +10393,24 @@ class SupervisorTests(unittest.IsolatedAsyncioTestCase):
             )
         )
         for index in range(1000):
-            self.store.append_raw(
+            payload = {"method": "item/completed", "params": {"index": index}}
+            raw = self.store.append_raw(
                 record.run_id,
                 provider="codex",
                 direction="stdout",
-                payload={"method": "item/completed", "params": {"index": index}},
+                payload=payload,
+            )
+            normalized = supervisor_module.normalize_provider_event(
+                ProviderKind.CODEX,
+                payload,
+            )
+            self.store.append_normalized(
+                record.run_id,
+                raw_seq=int(raw["seq"]),
+                disposition=normalized.disposition,
+                kind=normalized.kind,
+                payload=normalized.payload,
+                lifecycle_state=normalized.lifecycle_state,
             )
         return self.store.transition(record.run_id, LifecycleState.COMPLETED)
 
@@ -10691,6 +10930,98 @@ class SupervisorTests(unittest.IsolatedAsyncioTestCase):
         self.assertNotIn(record.run_id, self.supervisor.adapters)
         self.assertNotIn(record.run_id, self.supervisor.detached_at_monotonic)
 
+    async def test_archive_rejects_raw_sequence_gaps_and_duplicates(self) -> None:
+        def seed(
+            agent_id: str,
+            raw_seqs: list[int],
+            normalized: list[tuple[int, str]],
+        ) -> RunRecord:
+            record = self.store.create(
+                RunRecord.new(
+                    agent_id=agent_id,
+                    provider=ProviderKind.CODEX,
+                    role="implement",
+                    model="fixture-codex",
+                    worktree=str(self.worktree),
+                    prompt="archive parity fixture",
+                )
+            )
+            raw_rows = [
+                {
+                    "seq": seq,
+                    "received_at": "2026-08-20T00:00:00+00:00",
+                    "provider": "codex",
+                    "direction": "provider",
+                    "generation": 1,
+                    "payload": {"method": "item/completed", "params": {}},
+                }
+                for seq in raw_seqs
+            ]
+            normalized_rows = [
+                {
+                    "seq": index,
+                    "raw_seq": raw_seq,
+                    "normalized_at": "2026-08-20T00:00:00+00:00",
+                    "disposition": EventDisposition.RENDERED.value,
+                    "kind": kind,
+                    "payload": {},
+                    "lifecycle_state": None,
+                }
+                for index, (raw_seq, kind) in enumerate(normalized, start=1)
+            ]
+            self.store.raw_events_path(record.run_id).write_text(
+                "".join(json.dumps(row) + "\n" for row in raw_rows),
+                encoding="utf-8",
+            )
+            self.store.normalized_events_path(record.run_id).write_text(
+                "".join(json.dumps(row) + "\n" for row in normalized_rows),
+                encoding="utf-8",
+            )
+            record.raw_event_count = max(raw_seqs, default=0)
+            record.normalized_event_count = len(normalized_rows)
+            record = self.store.transition(record.run_id, LifecycleState.COMPLETED)
+            return record
+
+        gap = seed(
+            "WIKI-ARCHIVE-GAP",
+            [1, 2, 4],
+            [(1, "a"), (2, "b"), (4, "c")],
+        )
+        with self.assertRaisesRegex(StoreError, r"missing=\[3\]"):
+            await self.supervisor.archive(gap.run_id)
+
+        duplicate = seed(
+            "WIKI-ARCHIVE-DUPLICATE",
+            [1, 1, 2],
+            [(1, "a"), (1, "b"), (2, "c")],
+        )
+        with self.assertRaisesRegex(StoreError, r"duplicate raw_seq=\[1\]"):
+            await self.supervisor.archive(duplicate.run_id)
+
+        baseline = seed(
+            "WIKI-ARCHIVE-BASELINE",
+            [5, 6, 7],
+            [(5, "a"), (6, "b"), (7, "c")],
+        )
+        archived = await self.supervisor.archive(baseline.run_id)
+        self.assertEqual(archived.run_id, baseline.run_id)
+
+        shifted_gap = seed(
+            "WIKI-ARCHIVE-SHIFTED-GAP",
+            [5, 6, 8],
+            [(5, "a"), (6, "b"), (8, "c")],
+        )
+        with self.assertRaisesRegex(StoreError, r"missing=\[7\]"):
+            await self.supervisor.archive(shifted_gap.run_id)
+
+        fanout = seed(
+            "WIKI-ARCHIVE-FANOUT",
+            [1, 2],
+            [(1, "a"), (1, "b"), (2, "x")],
+        )
+        archived = await self.supervisor.archive(fanout.run_id)
+        self.assertEqual(archived.run_id, fanout.run_id)
+
     async def test_archive_allows_detached_dead_run(self) -> None:
         record = await self.supervisor.start_run(
             agent_id="WIKI-ARCHIVE-DEAD",
@@ -11055,6 +11386,808 @@ class UnixClientTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(current["control_attached"])
         self.assertTrue(current["provider_alive"])
         await stream.aclose()
+
+    async def test_cold_boot_serves_commands_while_projections_rebuild(self) -> None:
+        records = []
+        for index in range(4):
+            record = self.store.create(
+                RunRecord.new(
+                    agent_id=f"WIKI-COLD-BOOT-{index}",
+                    provider=ProviderKind.CODEX,
+                    role="implement",
+                    model="fixture-codex",
+                    worktree=str(self.worktree),
+                    prompt="cold boot projection test",
+                    orchestrator_id="wiki",
+                )
+            )
+            for event_index in range(20):
+                self.store.append_raw(
+                    record.run_id,
+                    provider=ProviderKind.CODEX.value,
+                    direction="provider",
+                    payload={
+                        "method": "turn/diff/updated",
+                        "params": {"diff": f"{index}-{event_index}"},
+                    },
+                )
+            records.append(record)
+
+        pending = AgentCommand.steer(
+            agent_id=records[0].agent_id,
+            request_id="cold-boot-pending-send",
+            payload={
+                "method": "run/send_now",
+                "run_id": records[0].run_id,
+                "text": "pending while projection rebuilds",
+            },
+        )
+        self.store.command_log.append_intent(
+            pending,
+            self.store.command_state_for(records[0].agent_id),
+        )
+        status_path = self.store.status_path(records[0].agent_id)
+        status_path.parent.mkdir(parents=True, exist_ok=True)
+        status_path.write_text(
+            json.dumps({"state": "working", "step": "waiting"}),
+            encoding="utf-8",
+        )
+
+        await self.server.close()
+        await self.supervisor.close()
+        restarted = Supervisor(self.store, FixtureAdapterFactory(FIXTURES))
+        server = UnixSupervisorServer(restarted, self.paths.socket_path)
+        await server.start()
+        client = SupervisorClient(self.paths, timeout=2)
+        rebuild_started = threading.Event()
+        release_rebuild = threading.Event()
+        pending_recovery_started = asyncio.Event()
+        release_pending_recovery = asyncio.Event()
+        monitor_callbacks: list[dict[str, Any]] = []
+        monitor_callback_seen = asyncio.Event()
+        original_rebuild = restarted._rebuild_materializer_database_sync
+
+        def paused_rebuild(run_id: str) -> None:
+            rebuild_started.set()
+            if not release_rebuild.wait(timeout=5):
+                raise AssertionError("startup rebuild was not released")
+            original_rebuild(run_id)
+
+        async def blocked_pending_recovery() -> dict[str, str]:
+            pending_recovery_started.set()
+            await release_pending_recovery.wait()
+            return {"status": "recovered"}
+
+        restarted.command_queue.recovery_factory = lambda _command: blocked_pending_recovery
+
+        async def monitor_callback(payload: dict[str, Any]) -> None:
+            monitor_callbacks.append(payload)
+            monitor_callback_seen.set()
+
+        async def monitor_send_now(
+            _run_id: str,
+            _message: str,
+            _dedupe_key: str | None,
+            _source: str | None = None,
+        ) -> dict[str, str]:
+            return {"status": "sent"}
+
+        fleet_stop = asyncio.Event()
+        fleet_task: asyncio.Task[None] | None = None
+
+        recovery = asyncio.create_task(restarted.recover_on_start())
+        try:
+            with mock.patch.object(
+                restarted,
+                "_rebuild_materializer_database_sync",
+                side_effect=paused_rebuild,
+            ):
+                self.assertTrue(await asyncio.to_thread(rebuild_started.wait, 5))
+                await asyncio.sleep(0.05)
+                self.assertEqual(monitor_callbacks, [])
+                self.assertEqual(
+                    (await asyncio.to_thread(client.ping))["status"],
+                    "ok",
+                )
+                fleet_monitor = agent_daemon.FleetMonitor(
+                    restarted.store,
+                    monitor_send_now,
+                    interval=0.01,
+                    on_transition=monitor_callback,
+                )
+                fleet_task = asyncio.create_task(
+                    agent_daemon.run_fleet_after_startup(
+                        restarted,
+                        fleet_monitor,
+                        fleet_stop,
+                    )
+                )
+                listed_during_rebuild = asyncio.create_task(
+                    restarted.dispatch("run/list", {})
+                )
+                status_during_rebuild = asyncio.create_task(
+                    restarted.dispatch(
+                        "run/status", {"run_id": records[0].run_id}
+                    )
+                )
+                listed = await asyncio.wait_for(listed_during_rebuild, timeout=0.1)
+                status = await asyncio.wait_for(
+                    status_during_rebuild, timeout=0.1
+                )
+                self.assertTrue(listed["partial"])
+                self.assertGreater(listed["runs_pending"], 0)
+                self.assertTrue(status["partial"])
+                with mock.patch.object(
+                    restarted,
+                    "request_codex_rotation",
+                    return_value={"status": "rotated"},
+                ) as rotate:
+                    self.assertEqual(
+                        await restarted.dispatch(
+                            "fleet/rotate_codex",
+                            {"operation_id": "cold-boot-rotation"},
+                        ),
+                        {"status": "rotated"},
+                    )
+                    rotate.assert_awaited_once_with(
+                        operation_id="cold-boot-rotation",
+                        force_target=None,
+                    )
+                release_rebuild.set()
+                self.assertEqual(len(listed["runs"]), len(records))
+                await asyncio.wait_for(pending_recovery_started.wait(), timeout=10)
+                started = await asyncio.to_thread(
+                    client.request,
+                    "run/start",
+                    {
+                        "agent_id": "WIKI-COLD-BOOT-NEW",
+                        "provider": "codex",
+                        "role": "implement",
+                        "model": "fixture-codex",
+                        "effort": "high",
+                        "worktree": str(self.worktree),
+                        "prompt": "start while projections rebuild",
+                    },
+                )
+                self.assertEqual(started["agent_id"], "WIKI-COLD-BOOT-NEW")
+                listed = await asyncio.to_thread(client.request, "run/list")
+                self.assertEqual(len(listed["runs"]), len(records) + 1)
+                self.assertFalse(recovery.done())
+                self.assertFalse(restarted.startup_recovery_succeeded.is_set())
+                release_pending_recovery.set()
+                await asyncio.wait_for(recovery, timeout=10)
+                self.assertTrue(restarted.startup_recovery_succeeded.is_set())
+                await asyncio.sleep(0.1)
+                status_path.write_text(
+                    json.dumps(
+                        {
+                            "state": "merge-ready",
+                            "step": "ready",
+                            "pr": "https://gh.example/pull/360",
+                        }
+                    ),
+                    encoding="utf-8",
+                )
+                await asyncio.wait_for(monitor_callback_seen.wait(), timeout=10)
+                self.assertEqual(
+                    [payload["status_state"] for payload in monitor_callbacks],
+                    ["merge-ready"],
+                )
+                for record in records:
+                    raw_seqs = {
+                        int(event["seq"])
+                        for event in self.store.iter_raw_events(record.run_id)
+                    }
+                    self.assertEqual(
+                        restarted.event_store.materialized_raw_seqs(record.run_id),
+                        raw_seqs,
+                    )
+        finally:
+            release_rebuild.set()
+            if not recovery.done():
+                await recovery
+            fleet_stop.set()
+            if fleet_task is not None:
+                await asyncio.gather(fleet_task, return_exceptions=True)
+            await server.close()
+            await restarted.close()
+
+    async def test_rotation_waits_for_projection_swap_before_resuming_run(self) -> None:
+        await self.supervisor.close()
+        auth = self.root / "codex" / "auth.json"
+        account_dir = self.root / "codex-accounts"
+        for name in ("alpha", "beta"):
+            account = account_dir / name
+            account.mkdir(parents=True)
+            (account / "auth.json").write_text(
+                json.dumps({"tokens": name}), encoding="utf-8"
+            )
+        auth.parent.mkdir(parents=True)
+        auth.write_text('{"tokens":"alpha"}', encoding="utf-8")
+        env = {
+            "WIKI_CODEX_AUTH_PATH": str(auth),
+            "WIKI_CODEX_ACCOUNTS_DIR": str(account_dir),
+            "WIKI_ROTATION_LOG_PATH": str(account_dir / "rotation.log"),
+            "WIKI_CODEX_SESSIONS_DIR": str(self.root / "codex" / "sessions"),
+            "WIKI_ACCOUNT_HOME_OVERRIDE": str(self.root / "account-home"),
+            "WIKI_CLI_PATH": str(self.root / "missing-wiki"),
+            "TMUX": "",
+            "TMUX_PANE": "",
+        }
+        with mock.patch.dict(os.environ, env):
+            accounts.write_state(
+                accounts.AccountState(
+                    active="alpha",
+                    accounts={
+                        "alpha": {"limit_reset_at": None},
+                        "beta": {"limit_reset_at": None},
+                    },
+                )
+            )
+        self.supervisor = Supervisor(
+            self.store,
+            FixtureAdapterFactory(FIXTURES, pid=987_654),
+            pid_alive=lambda _pid: False,
+        )
+        record = await self.supervisor.start_run(
+            agent_id="WIKI-ROTATION-REBUILD-RACE",
+            provider=ProviderKind.CODEX,
+            role="implement",
+            model="fixture-codex",
+            effort="high",
+            worktree=str(self.worktree),
+            prompt="rotation rebuild race",
+        )
+        await self.supervisor._close_and_drain_adapter(  # noqa: SLF001 - boot fixture
+            record.run_id,
+            self.supervisor.adapters[record.run_id],
+        )
+        self.store.append_raw(
+            record.run_id,
+            provider=ProviderKind.CODEX.value,
+            direction="provider",
+            payload={"method": "turn/diff/updated", "params": {"diff": "late"}},
+        )
+        rebuild_started = threading.Event()
+        release_rebuild = threading.Event()
+        snapshot_raw_seq: int | None = None
+
+        event_store = self.supervisor.event_store.for_run(record.run_id)
+        original_replace = event_store.replace_run_from
+
+        def paused_replace(source: Path | str, run_id: str) -> None:
+            nonlocal snapshot_raw_seq
+            snapshot_raw_seq = max(
+                int(event["seq"])
+                for event in self.store.read_raw_events(run_id)
+            )
+            rebuild_started.set()
+            if not release_rebuild.wait(timeout=5):
+                raise AssertionError("projection rebuild was not released")
+            original_replace(source, run_id)
+
+        operation_id = "00000000-0000-4000-8000-000000000360"
+        with (
+            mock.patch.dict(os.environ, env),
+            mock.patch.object(accounts, "codex_login_status", return_value=True),
+            mock.patch.object(
+                event_store,
+                "replace_run_from",
+                side_effect=paused_replace,
+            ),
+        ):
+            self.supervisor.prepare_startup_recovery()
+            self.assertTrue(await asyncio.to_thread(rebuild_started.wait, 5))
+            rotation = asyncio.create_task(
+                self.supervisor.dispatch(
+                    "fleet/rotate_codex",
+                    {"operation_id": operation_id, "account": "beta"},
+                )
+            )
+            for _ in range(200):
+                current = self.store.get(record.run_id)
+                if (
+                    current.quiesce_operation_id == operation_id
+                    and record.run_id not in self.supervisor.adapters
+                ):
+                    break
+                await asyncio.sleep(0.01)
+            else:
+                self.fail("rotation did not quiesce the run")
+            self.assertFalse(rotation.done())
+            release_rebuild.set()
+            result = await asyncio.wait_for(rotation, timeout=10)
+
+            resumed_adapter = self.supervisor.adapters[record.run_id]
+            await resumed_adapter._events.put(  # noqa: SLF001 - race fixture
+                ProviderEvent(
+                    ProviderKind.CODEX,
+                    {
+                        "method": "rotation/resumed-write",
+                        "params": {"after": snapshot_raw_seq},
+                    },
+                    generation=max(1, resumed_adapter.snapshot().generation),
+                )
+            )
+            for _ in range(200):
+                resumed_events = [
+                    event
+                    for event in self.store.read_raw_events(record.run_id)
+                    if event["payload"].get("method") == "rotation/resumed-write"
+                ]
+                if resumed_events:
+                    break
+                await asyncio.sleep(0.01)
+            else:
+                self.fail("rotation did not produce a resumed raw write")
+            assert snapshot_raw_seq is not None
+            resumed_seq = int(resumed_events[0]["seq"])
+            self.assertGreater(resumed_seq, snapshot_raw_seq)
+            self.assertGreaterEqual(
+                max(
+                    self.supervisor.event_store.materialized_raw_seqs(
+                        record.run_id
+                    )
+                ),
+                resumed_seq,
+            )
+
+        self.assertEqual(result["revived_run_ids"], {record.agent_id: record.run_id})
+        raw_seqs = {
+            int(event["seq"])
+            for event in self.store.iter_raw_events(record.run_id)
+        }
+        self.assertEqual(
+            self.supervisor.event_store.materialized_raw_seqs(record.run_id),
+            raw_seqs,
+        )
+
+    async def test_startup_recovery_waits_for_retryable_intent_before_ready(self) -> None:
+        record = self.store.create(
+            RunRecord.new(
+                agent_id="WIKI-STARTUP-RETRY",
+                provider=ProviderKind.CODEX,
+                role="implement",
+                model="fixture-codex",
+                worktree=str(self.worktree),
+                prompt="startup retry fixture",
+            )
+        )
+        command = AgentCommand.steer(
+            agent_id="WIKI-STARTUP-RETRY",
+            request_id="startup-retry",
+            payload={
+                "method": "run/send_now",
+                "run_id": record.run_id,
+                "text": "retry me",
+            },
+        )
+        self.store.command_log.append_intent(
+            command,
+            self.store.command_state_for(command.agent_id),
+        )
+        attempts = 0
+
+        async def execute_recovery() -> dict[str, str]:
+            nonlocal attempts
+            attempts += 1
+            if attempts == 1:
+                raise CommandRetryable("provider is not ready")
+            return {"status": "recovered"}
+
+        self.supervisor.command_queue.recovery_factory = lambda _command: execute_recovery
+        self.supervisor.startup_recovery_succeeded.clear()
+
+        await self.supervisor.recover_on_start()
+        self.assertFalse(self.supervisor.startup_recovery_succeeded.is_set())
+        self.assertEqual(
+            self.supervisor.command_queue.recovery_queue(command.agent_id),
+            (command.request_id,),
+        )
+
+        await self.supervisor.recover_on_start()
+        self.assertTrue(self.supervisor.startup_recovery_succeeded.is_set())
+        self.assertEqual(attempts, 2)
+
+    async def test_daemon_blocks_fleet_until_promotion_recovers(self) -> None:
+        record = RunRecord.new(
+            agent_id="WIKI-DAEMON-PROMOTION",
+            provider=ProviderKind.CODEX,
+            role="implement",
+            model="fixture-codex",
+            worktree=str(self.worktree),
+            prompt="promotion recovery integration",
+        )
+        record.state = LifecycleState.IDLE
+        record.provider_session_id = "thread-1"
+        self.store.create(record)
+        command = AgentCommand.steer(
+            agent_id=record.agent_id,
+            request_id="daemon-promotion",
+            payload={
+                "method": "run/send_now",
+                "run_id": record.run_id,
+                "text": "replay after promotion recovers",
+            },
+        )
+        self.store.command_log.append_intent(
+            command,
+            self.store.command_state_for(command.agent_id),
+        )
+
+        await self.server.close()
+        await self.supervisor.close()
+        self.paths.socket_path.unlink(missing_ok=True)
+
+        args = argparse.Namespace(
+            runtime_dir=str(self.paths.runtime_dir),
+            socket=str(self.paths.socket_path),
+            registry=str(self.paths.registry_path),
+            fake_fixture_dir=str(FIXTURES),
+        )
+        promotion_failed = True
+        executions = 0
+        captured: list[Supervisor] = []
+        fleet_started = asyncio.Event()
+        original_recover = Supervisor.recover_on_start
+        original_executor = Supervisor._recovery_executor
+
+        async def capture_recovery(supervisor: Supervisor) -> list[dict[str, str]]:
+            if not captured:
+                captured.append(supervisor)
+            return await original_recover(supervisor)
+
+        def promotion_executor(
+            supervisor: Supervisor,
+            pending: AgentCommand,
+        ) -> Any:
+            if promotion_failed:
+                raise RuntimeError("promotion adapter unavailable")
+            execute = original_executor(supervisor, pending)
+
+            async def counted_execute() -> Any:
+                nonlocal executions
+                executions += 1
+                return await execute()
+
+            return counted_execute
+
+        async def fleet_run(
+            _monitor: agent_daemon.FleetMonitor,
+            stop: asyncio.Event,
+        ) -> None:
+            fleet_started.set()
+            await stop.wait()
+
+        daemon = asyncio.create_task(agent_daemon.run_daemon(args))
+        try:
+            with (
+                mock.patch.object(
+                    Supervisor,
+                    "recover_on_start",
+                    autospec=True,
+                    side_effect=capture_recovery,
+                ),
+                mock.patch.object(
+                    Supervisor,
+                    "_recovery_executor",
+                    autospec=True,
+                    side_effect=promotion_executor,
+                ),
+                mock.patch.object(
+                    agent_daemon.FleetMonitor,
+                    "run",
+                    autospec=True,
+                    side_effect=fleet_run,
+                ),
+                mock.patch.object(
+                    agent_daemon,
+                    "_paths_from_args",
+                    return_value=self.paths,
+                ),
+            ):
+                deadline = time.monotonic() + 5
+                while (
+                    time.monotonic() < deadline
+                    and (
+                        not captured
+                        or captured[0].command_queue.recovery_queue(record.agent_id)
+                        != (command.request_id,)
+                    )
+                ):
+                    await asyncio.sleep(0.01)
+                self.assertTrue(captured)
+                restarted = captured[0]
+                self.assertEqual(
+                    restarted.command_queue.recovery_queue(record.agent_id),
+                    (command.request_id,),
+                )
+                self.assertFalse(restarted.command_queue.recovery_ready())
+                self.assertFalse(restarted.startup_recovery_succeeded.is_set())
+                self.assertFalse(fleet_started.is_set())
+
+                promotion_failed = False
+                await restarted.recover_on_start()
+                self.assertTrue(
+                    restarted.startup_recovery_succeeded.is_set(),
+                    f"ready={restarted.command_queue.recovery_ready()} "
+                    f"queue={restarted.command_queue.recovery_queue(record.agent_id)} "
+                    f"failures={restarted.command_queue.recovery_failures} "
+                    f"retries={restarted.command_queue.recovery_retries}",
+                )
+                await asyncio.wait_for(fleet_started.wait(), timeout=5)
+                self.assertTrue(restarted.startup_recovery_succeeded.is_set())
+                self.assertTrue(restarted.command_queue.recovery_ready())
+                self.assertEqual(executions, 1)
+                self.assertEqual(
+                    restarted.command_queue.recovery_queue(record.agent_id), ()
+                )
+                receipt = restarted.store.command_log.receipt(
+                    command.method, command.request_id
+                )
+                self.assertIsNotNone(receipt)
+                self.assertTrue(receipt.ok)
+        finally:
+            promotion_failed = False
+            if not daemon.done():
+                daemon.cancel()
+            await asyncio.gather(daemon, return_exceptions=True)
+
+    async def test_run_daemon_registers_rebuilds_before_binding_reads(self) -> None:
+        await self.server.close()
+        await self.supervisor.close()
+        self.paths.socket_path.unlink(missing_ok=True)
+        record = self.store.create(
+            RunRecord.new(
+                agent_id="WIKI-DAEMON-BOOT",
+                provider=ProviderKind.CODEX,
+                role="implement",
+                model="fixture-codex",
+                worktree=str(self.worktree),
+                prompt="daemon boot ownership",
+            )
+        )
+        self.store.append_raw(
+            record.run_id,
+            provider="codex",
+            direction="provider",
+            payload={"method": "turn/diff/updated", "params": {"diff": "boot"}},
+        )
+        status_path = self.store.status_path(record.agent_id)
+        status_path.parent.mkdir(parents=True, exist_ok=True)
+        status_path.write_text(
+            json.dumps({"state": "working", "step": "booting"}),
+            encoding="utf-8",
+        )
+
+        registered = threading.Event()
+        bound = threading.Event()
+        rebuild_started = threading.Event()
+        release_rebuild = threading.Event()
+        captured: list[Supervisor] = []
+        original_prepare = Supervisor.prepare_startup_recovery
+        original_server_start = UnixSupervisorServer.start
+        original_rebuild = Supervisor._rebuild_materializer_database_sync
+
+        def prepare(supervisor: Supervisor) -> None:
+            original_prepare(supervisor)
+            captured.append(supervisor)
+            registered.set()
+
+        async def start(server: UnixSupervisorServer) -> None:
+            self.assertTrue(registered.is_set())
+            self.assertTrue(captured)
+            self.assertFalse(captured[0].projection_rebuild_ready.is_set())
+            self.assertFalse(self.paths.socket_path.exists())
+            bound.set()
+            await original_server_start(server)
+
+        def paused_rebuild(supervisor: Supervisor, run_id: str) -> None:
+            rebuild_started.set()
+            if not release_rebuild.wait(timeout=5):
+                raise AssertionError("daemon rebuild was not released")
+            original_rebuild(supervisor, run_id)
+
+        args = argparse.Namespace(
+            runtime_dir=str(self.paths.runtime_dir),
+            socket=str(self.paths.socket_path),
+            registry=str(self.paths.registry_path),
+            fake_fixture_dir=str(FIXTURES),
+        )
+        daemon = asyncio.create_task(agent_daemon.run_daemon(args))
+        try:
+            with (
+                mock.patch.object(
+                    Supervisor,
+                    "prepare_startup_recovery",
+                    autospec=True,
+                    side_effect=prepare,
+                ),
+                mock.patch.object(
+                    UnixSupervisorServer,
+                    "start",
+                    autospec=True,
+                    side_effect=start,
+                ),
+                mock.patch.object(
+                    Supervisor,
+                    "_rebuild_materializer_database_sync",
+                    autospec=True,
+                    side_effect=paused_rebuild,
+                ),
+                mock.patch.object(
+                    agent_daemon,
+                    "_paths_from_args",
+                    return_value=self.paths,
+                ),
+            ):
+                self.assertTrue(await asyncio.to_thread(registered.wait, 5))
+                self.assertTrue(await asyncio.to_thread(bound.wait, 5))
+                client = SupervisorClient(self.paths, timeout=2)
+                self.assertTrue(await asyncio.to_thread(rebuild_started.wait, 5))
+                listed = asyncio.create_task(
+                    asyncio.to_thread(client.request, "run/list")
+                )
+                status = asyncio.create_task(
+                    asyncio.to_thread(
+                        client.request,
+                        "run/status",
+                        {"run_id": record.run_id},
+                    )
+                )
+                await asyncio.sleep(0.05)
+                self.assertTrue(listed.done())
+                self.assertTrue(status.done())
+                self.assertTrue(listed.result()["partial"])
+                release_rebuild.set()
+                result = await asyncio.wait_for(listed, timeout=5)
+                await asyncio.wait_for(status, timeout=5)
+                self.assertEqual(len(result["runs"]), 1)
+        finally:
+            release_rebuild.set()
+            if not daemon.done():
+                daemon.cancel()
+            await asyncio.gather(daemon, return_exceptions=True)
+
+    async def test_fleet_monitor_waits_for_transient_recovery_retry(self) -> None:
+        started = asyncio.Event()
+        stop = asyncio.Event()
+        attempts = 0
+
+        class Monitor:
+            async def run(self, monitor_stop: asyncio.Event) -> None:
+                started.set()
+                await monitor_stop.wait()
+
+        async def recovery_attempt() -> None:
+            nonlocal attempts
+            attempts += 1
+            if attempts == 1:
+                raise RuntimeError("transient startup recovery failure")
+            self.supervisor.startup_recovery_succeeded.set()
+
+        self.supervisor.startup_recovery_succeeded.clear()
+        fleet_task = asyncio.create_task(
+            agent_daemon.run_fleet_after_startup(
+                self.supervisor,
+                Monitor(),
+                stop,
+            )
+        )
+        try:
+            with self.assertRaisesRegex(RuntimeError, "transient"):
+                await recovery_attempt()
+            self.assertFalse(started.is_set())
+            await recovery_attempt()
+            await asyncio.wait_for(started.wait(), timeout=2)
+            self.assertEqual(attempts, 2)
+        finally:
+            stop.set()
+            await asyncio.gather(fleet_task, return_exceptions=True)
+
+    async def test_run_daemon_retries_recovery_before_starting_real_fleet_monitor(
+        self,
+    ) -> None:
+        await self.server.close()
+        await self.supervisor.close()
+        record = self.store.create(
+            RunRecord.new(
+                agent_id="WIKI-DAEMON-FLEET",
+                provider=ProviderKind.CODEX,
+                role="implement",
+                model="fixture-codex",
+                worktree=str(self.worktree),
+                prompt="daemon fleet retry",
+                orchestrator_id="wiki",
+            )
+        )
+        status_path = self.store.status_path(record.agent_id)
+        status_path.parent.mkdir(parents=True, exist_ok=True)
+        status_path.write_text(
+            json.dumps({"state": "working", "step": "booting"}),
+            encoding="utf-8",
+        )
+        first_failure = asyncio.Event()
+        recovery_success = asyncio.Event()
+        callback_seen = asyncio.Event()
+        callbacks: list[str] = []
+        attempts = 0
+        original_recover = Supervisor.recover_on_start
+        original_monitor_init = agent_daemon.FleetMonitor.__init__
+
+        async def flaky_recovery(supervisor: Supervisor) -> list[dict[str, str]]:
+            nonlocal attempts
+            attempts += 1
+            if attempts == 1:
+                first_failure.set()
+                raise RuntimeError("transient startup recovery failure")
+            result = await original_recover(supervisor)
+            status_path.write_text(
+                json.dumps(
+                    {
+                        "state": "merge-ready",
+                        "step": "ready",
+                        "pr": "https://gh.example/pull/360",
+                    }
+                ),
+                encoding="utf-8",
+            )
+            recovery_success.set()
+            return result
+
+        async def capture_transition(event: dict[str, Any]) -> bool:
+            callbacks.append(str(event["status_state"]))
+            callback_seen.set()
+            return True
+
+        def fast_monitor_init(
+            monitor: agent_daemon.FleetMonitor,
+            *args: Any,
+            **kwargs: Any,
+        ) -> None:
+            original_monitor_init(monitor, *args, **kwargs)
+            monitor.interval = 0.01
+            monitor.on_transition = capture_transition
+
+        args = argparse.Namespace(
+            runtime_dir=str(self.paths.runtime_dir),
+            socket=str(self.paths.socket_path),
+            registry=str(self.paths.registry_path),
+            fake_fixture_dir=str(FIXTURES),
+        )
+        daemon = asyncio.create_task(agent_daemon.run_daemon(args))
+        try:
+            with (
+                mock.patch.object(
+                    Supervisor,
+                    "recover_on_start",
+                    autospec=True,
+                    side_effect=flaky_recovery,
+                ),
+                mock.patch.object(
+                    agent_daemon.FleetMonitor,
+                    "__init__",
+                    autospec=True,
+                    side_effect=fast_monitor_init,
+                ),
+                mock.patch.object(
+                    agent_daemon,
+                    "_paths_from_args",
+                    return_value=self.paths,
+                ),
+            ):
+                await asyncio.wait_for(first_failure.wait(), timeout=5)
+                await asyncio.sleep(0.05)
+                self.assertEqual(callbacks, [])
+                self.assertFalse(recovery_success.is_set())
+                await asyncio.wait_for(recovery_success.wait(), timeout=5)
+                await asyncio.wait_for(callback_seen.wait(), timeout=5)
+                self.assertEqual(callbacks, ["merge-ready"])
+                self.assertGreaterEqual(attempts, 2)
+        finally:
+            if not daemon.done():
+                daemon.cancel()
+            await asyncio.gather(daemon, return_exceptions=True)
 
     def test_default_client_timeout_is_lane_aware_and_retry_safe(self) -> None:
         client = SupervisorClient(self.paths)
@@ -11540,6 +12673,55 @@ class RecoveryLoopTests(unittest.IsolatedAsyncioTestCase):
 
 
 class DaemonShutdownTests(unittest.IsolatedAsyncioTestCase):
+    async def test_lock_stays_held_until_materializer_writes_finish(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            paths = _paths(root)
+            store = RunStore(paths)
+            supervisor = Supervisor(store, FixtureAdapterFactory(FIXTURES))
+            lock = agent_daemon._acquire_single_instance(paths)
+            callback_started = threading.Event()
+            release_callback = threading.Event()
+            callback_finished = threading.Event()
+
+            def paused_callback() -> None:
+                callback_started.set()
+                if not release_callback.wait(timeout=5):
+                    raise AssertionError("materializer callback was not released")
+                callback_finished.set()
+
+            supervisor.materializer_executor.submit(paused_callback)
+
+            class ClosedServer:
+                async def close(self) -> None:
+                    pass
+
+            shutdown = asyncio.create_task(
+                agent_daemon._shutdown(
+                    ClosedServer(),
+                    supervisor,
+                    [],
+                    lock,
+                    paths,
+                )
+            )
+            try:
+                self.assertTrue(await asyncio.to_thread(callback_started.wait, 5))
+                self.assertFalse(shutdown.done())
+                probe = paths.lock_path.open("a+b")
+                try:
+                    with self.assertRaises(BlockingIOError):
+                        fcntl.flock(probe.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+                finally:
+                    probe.close()
+                release_callback.set()
+                await asyncio.wait_for(shutdown, timeout=10)
+                self.assertTrue(callback_finished.is_set())
+            finally:
+                release_callback.set()
+                if not shutdown.done():
+                    await shutdown
+
     async def test_lock_and_pid_release_before_provider_drain(self) -> None:
         """WIKI-217: a replacement must be able to start while the old daemon drains."""
 
@@ -11549,6 +12731,12 @@ class DaemonShutdownTests(unittest.IsolatedAsyncioTestCase):
             observed: dict[str, bool] = {}
 
             class DrainingSupervisor:
+                async def drain_writers_before_lock_release(self) -> None:
+                    pass
+
+                def mark_lock_released(self) -> None:
+                    pass
+
                 async def close(self) -> None:
                     probe = paths.lock_path.open("a+b")
                     try:
@@ -11574,6 +12762,548 @@ class DaemonShutdownTests(unittest.IsolatedAsyncioTestCase):
             )
             self.assertTrue(observed["lock_free"])
             self.assertTrue(observed["pid_gone"])
+
+    async def test_shutdown_persists_buffered_adapter_events_for_restart_replay(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            paths = _paths(root)
+            store = RunStore(paths)
+            supervisor = Supervisor(store, FixtureAdapterFactory(FIXTURES))
+            record = store.create(
+                RunRecord.new(
+                    agent_id="WIKI-SHUTDOWN-BUFFER",
+                    provider=ProviderKind.CODEX,
+                    role="implement",
+                    model="fixture-codex",
+                    worktree=str(root),
+                    prompt="shutdown buffered events",
+                )
+            )
+            store.transition(record.run_id, LifecycleState.IDLE)
+            adapter = supervisor.adapter_factory(record)
+            original_stop = adapter.stop
+            raw_count_at_stop: list[int] = []
+            capture_calls = 0
+
+            async def tracked_stop() -> AdapterStatus:
+                raw_count_at_stop.append(len(store.read_raw_events(record.run_id)))
+                await adapter._events.put(  # noqa: SLF001 - shutdown audit fixture
+                    ProviderEvent(
+                        ProviderKind.CODEX,
+                        {
+                            "method": "turn/completed",
+                            "params": {"turn": {"status": "interrupted"}},
+                        },
+                    )
+                )
+                return await original_stop()
+
+            adapter.stop = tracked_stop  # type: ignore[method-assign]
+
+            original_capture = supervisor._capture_live_handover_events
+
+            async def capture_with_pump_race() -> None:
+                nonlocal capture_calls
+                capture_calls += 1
+                if supervisor.shutdown_phase.adapter_finalizer_active:
+                    await adapter._events.put(  # noqa: SLF001 - pump-race fixture
+                        ProviderEvent(
+                            ProviderKind.CODEX,
+                            {
+                                "method": "turn/completed",
+                                "params": {"turn": {"status": "interrupted"}},
+                            },
+                        )
+                    )
+                await original_capture()
+
+            for index in range(3):
+                await adapter._events.put(  # noqa: SLF001 - shutdown buffer fixture
+                    ProviderEvent(
+                        ProviderKind.CODEX,
+                        {
+                            "method": "item/completed",
+                            "params": {
+                                "item": {
+                                    "type": "agentMessage",
+                                    "text": f"buffered-{index}",
+                                }
+                            },
+                        },
+                    )
+                )
+            supervisor._attach_adapter(record.run_id, adapter)  # noqa: SLF001
+
+            with mock.patch.object(
+                supervisor,
+                "_capture_live_handover_events",
+                side_effect=capture_with_pump_race,
+            ):
+                await supervisor.drain_writers_before_lock_release()
+            self.assertEqual(raw_count_at_stop, [3])
+            self.assertEqual(capture_calls, 3)
+            self.assertEqual(len(store.read_raw_events(record.run_id)), 5)
+            self.assertEqual(store.get(record.run_id).state, LifecycleState.IDLE)
+            audit_rows = [
+                row
+                for row in store.iter_normalized_events(record.run_id)
+                if row["kind"] == "shutdown_observation"
+            ]
+            self.assertEqual(len(audit_rows), 2)
+            await supervisor.close()
+
+            restarted_store = RunStore(paths)
+            restarted = Supervisor(
+                restarted_store,
+                FixtureAdapterFactory(FIXTURES),
+            )
+            restarted_adapter = restarted.adapter_factory(restarted_store.get(record.run_id))
+            restarted._attach_adapter(  # noqa: SLF001 - exact-session restart fixture
+                record.run_id,
+                restarted_adapter,
+            )
+            await restarted.recover_on_start()
+            self.assertEqual(len(restarted_store.read_raw_events(record.run_id)), 5)
+            self.assertEqual(
+                restarted_store.get(record.run_id).state,
+                LifecycleState.IDLE,
+            )
+            await restarted.close()
+
+    async def test_shutdown_drains_inflight_queue_write_before_lock_release(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            paths = _paths(root)
+            store = RunStore(paths)
+            supervisor = Supervisor(store, FixtureAdapterFactory(FIXTURES))
+            record = store.create(
+                RunRecord.new(
+                    agent_id="WIKI-SHUTDOWN-QUEUE",
+                    provider=ProviderKind.CODEX,
+                    role="implement",
+                    model="fixture-codex",
+                    worktree=str(root),
+                    prompt="shutdown queue",
+                )
+            )
+            started = asyncio.Event()
+            release = asyncio.Event()
+            write_at: float | None = None
+
+            async def execute() -> dict[str, str]:
+                nonlocal write_at
+                started.set()
+                await release.wait()
+                store.append_raw(
+                    record.run_id,
+                    provider="codex",
+                    direction="provider",
+                    payload={"method": "shutdown/queue"},
+                )
+                write_at = time.monotonic()
+                return {"status": "ok"}
+
+            command = AgentCommand.steer(
+                agent_id=record.agent_id,
+                request_id="shutdown-queue",
+                payload={"method": "run/send_now", "run_id": record.run_id},
+            )
+            submit = asyncio.create_task(supervisor.command_queue.submit(command, execute))
+            await started.wait()
+            lock = agent_daemon._acquire_single_instance(paths)
+            release_at: float | None = None
+            original_flock = agent_daemon.fcntl.flock
+
+            def tracked_flock(handle: Any, operation: int) -> None:
+                nonlocal release_at
+                if operation == fcntl.LOCK_UN:
+                    release_at = time.monotonic()
+                original_flock(handle, operation)
+
+            class ClosedServer:
+                async def close(self) -> None:
+                    pass
+
+            shutdown: asyncio.Task[None]
+            with mock.patch.object(agent_daemon.fcntl, "flock", tracked_flock):
+                shutdown = asyncio.create_task(
+                    agent_daemon._shutdown(
+                        ClosedServer(),
+                        supervisor,
+                        [],
+                        lock,
+                        paths,
+                    )
+                )
+                await asyncio.sleep(0)
+                self.assertFalse(shutdown.done())
+                release.set()
+                await asyncio.wait_for(submit, timeout=5)
+                await asyncio.wait_for(shutdown, timeout=5)
+            self.assertIsNotNone(write_at)
+            self.assertIsNotNone(release_at)
+            assert write_at is not None and release_at is not None
+            self.assertLess(write_at, release_at)
+
+    def test_adapter_stop_calls_have_one_phase_guarded_owner(self) -> None:
+        source = Path(supervisor_module.__file__).read_text(encoding="utf-8")
+        owner: str | None = None
+        owners: list[str] = []
+        for line in source.splitlines():
+            if line.startswith("    async def "):
+                owner = line.split("async def ", 1)[1].split("(", 1)[0]
+            if "await adapter.stop()" in line:
+                self.assertIsNotNone(owner)
+                assert owner is not None
+                owners.append(owner)
+        self.assertEqual(
+            owners,
+            ["_stop_adapter_for_shutdown", "_stop_adapter_for_rotation"],
+        )
+
+    async def test_real_production_tasks_race_accepted_send_during_shutdown(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            paths = _paths(root)
+            store = RunStore(paths)
+            auth = root / "codex" / "auth.json"
+            account_dir = root / "codex-accounts"
+            for name in ("alpha", "beta"):
+                account = account_dir / name
+                account.mkdir(parents=True)
+                (account / "auth.json").write_text(
+                    json.dumps({"tokens": name}), encoding="utf-8"
+                )
+            auth.parent.mkdir(parents=True)
+            auth.write_text('{"tokens":"alpha"}', encoding="utf-8")
+            env = {
+                "WIKI_CODEX_AUTH_PATH": str(auth),
+                "WIKI_CODEX_ACCOUNTS_DIR": str(account_dir),
+                "WIKI_ROTATION_LOG_PATH": str(account_dir / "rotation.log"),
+                "WIKI_CODEX_SESSIONS_DIR": str(root / "codex" / "sessions"),
+                "WIKI_ACCOUNT_HOME_OVERRIDE": str(root / "account-home"),
+                "WIKI_CLI_PATH": str(root / "missing-wiki"),
+                "TMUX": "",
+                "TMUX_PANE": "",
+            }
+            with mock.patch.dict(os.environ, env):
+                accounts.write_state(
+                    accounts.AccountState(
+                        active="alpha",
+                        accounts={
+                            "alpha": {"limit_reset_at": None},
+                            "beta": {"limit_reset_at": None},
+                        },
+                    )
+                )
+            supervisor = Supervisor(
+                store,
+                ShutdownRaceFactory(FIXTURES, pid=987_654),
+                pid_alive=lambda _pid: False,
+            )
+            orchestrator = await supervisor.start_run(
+                agent_id="WIKI-360-ORCH",
+                provider=ProviderKind.CLAUDE,
+                role="orchestrator",
+                model="fixture-claude",
+                worktree=str(root),
+                prompt="shutdown race orchestrator",
+            )
+            record = await supervisor.start_run(
+                agent_id="WIKI-360-RACE-1",
+                provider=ProviderKind.CODEX,
+                role="implement",
+                model="fixture-codex",
+                effort="high",
+                worktree=str(root),
+                prompt="shutdown race",
+                orchestrator_id=orchestrator.agent_id,
+            )
+            adapter = supervisor.adapters[record.run_id]
+            assert isinstance(adapter, ShutdownRaceAdapter)
+            status_path = store.status_path(record.agent_id)
+            status_path.parent.mkdir(parents=True, exist_ok=True)
+            status_path.write_text(
+                json.dumps({"state": "working", "step": "race"}),
+                encoding="utf-8",
+            )
+            stale_record = store.create(
+                RunRecord.new(
+                    agent_id="WIKI-360-RACE-0",
+                    provider=ProviderKind.CLAUDE,
+                    role="implement",
+                    model="fixture-claude",
+                    worktree=str(root),
+                    prompt="staleness race",
+                    orchestrator_id=orchestrator.agent_id,
+                )
+            )
+            store.transition(stale_record.run_id, LifecycleState.WORKING)
+            stale_status_path = store.status_path(stale_record.agent_id)
+            stale_status_path.parent.mkdir(parents=True, exist_ok=True)
+            stale_status_path.write_text(
+                json.dumps({"state": "working", "step": "stale"}),
+                encoding="utf-8",
+            )
+            fleet_monitor = agent_daemon.FleetMonitor(
+                store,
+                agent_daemon.build_fleet_monitor_dispatch(supervisor),
+                staleness_threshold=1.0,
+                ownership_lock=supervisor._agent_lock,  # noqa: SLF001
+            )
+            await fleet_monitor.tick()
+            stale_at = time.time() - 120.0
+            os.utime(stale_status_path, (stale_at, stale_at))
+            send_pinned = asyncio.Event()
+            send_may_complete = asyncio.Event()
+            adapter._send_gate = (send_pinned, send_may_complete)
+            send_task = asyncio.create_task(
+                supervisor.dispatch(
+                    "run/send_now",
+                    {
+                        "agent_id": "WIKI-360-RACE-1",
+                        "request_id": "race-send-1",
+                        "text": "race",
+                    },
+                )
+            )
+            await send_pinned.wait()
+            stale_tick = asyncio.create_task(fleet_monitor.tick())
+            for _ in range(200):
+                if any(
+                    command.payload.get("source") == "fleet-monitor"
+                    for command in store.command_log.pending()
+                ):
+                    break
+                await asyncio.sleep(0.01)
+            else:
+                self.fail("real FleetMonitor staleness dispatch did not queue")
+
+            with mock.patch.dict(os.environ, env), mock.patch.object(
+                accounts, "codex_login_status", return_value=True
+            ):
+                await adapter.emit_provider_event(
+                    {
+                        "method": "error",
+                        "params": {
+                            "message": (
+                                "Your access token could not be refreshed because you "
+                                "have since logged out or signed in to another account."
+                            ),
+                            "willRetry": False,
+                        },
+                    }
+                )
+                await adapter.emit_provider_event(
+                    {
+                        "method": "account/rateLimits/updated",
+                        "params": {
+                            "rateLimits": {
+                                "primary": {"resetsAt": 1_750_001_234},
+                                "rateLimitReachedType": "rate_limit_reached",
+                            }
+                        },
+                    }
+                )
+                for _ in range(200):
+                    task_names = {task.get_name() for task in supervisor.monitor_tasks}
+                    if {
+                        f"codex-auth-dead-{record.run_id}",
+                        f"codex-rate-limit-{record.run_id}",
+                    } <= task_names:
+                        break
+                    await asyncio.sleep(0.01)
+                else:
+                    self.fail("real auth and rotation monitor tasks did not start")
+
+                lock = agent_daemon._acquire_single_instance(paths)
+
+                class ClosedServer:
+                    async def close(self) -> None:
+                        pass
+
+                shutdown = asyncio.create_task(
+                    agent_daemon._shutdown(
+                        ClosedServer(),
+                        supervisor,
+                        [],
+                        lock,
+                        paths,
+                    )
+                )
+                send_may_complete.set()
+                self.assertEqual(
+                    await asyncio.wait_for(send_task, timeout=5),
+                    {"status": "sent"},
+                )
+                await asyncio.wait_for(shutdown, timeout=5)
+                stale_notifications = await asyncio.wait_for(stale_tick, timeout=5)
+                self.assertTrue(
+                    any(
+                        notification.event_type == "staleness"
+                        for notification in stale_notifications
+                    )
+                )
+            receipt = store.command_log.receipt("run/send_now", "race-send-1")
+            self.assertIsNotNone(receipt)
+            assert receipt is not None
+            self.assertTrue(receipt.ok)
+
+    async def test_shutdown_drains_shielded_recovery_write_before_lock_release(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            paths = _paths(root)
+            store = RunStore(paths)
+            supervisor = Supervisor(store, FixtureAdapterFactory(FIXTURES))
+            record = store.create(
+                RunRecord.new(
+                    agent_id="WIKI-SHUTDOWN-RECOVERY",
+                    provider=ProviderKind.CODEX,
+                    role="implement",
+                    model="fixture-codex",
+                    worktree=str(root),
+                    prompt="shutdown recovery",
+                )
+            )
+            pending = AgentCommand.spawn(
+                agent_id=record.agent_id,
+                request_id="shutdown-recovery",
+                payload={"run_id": "shutdown-recovery-run"},
+            )
+            store.command_log.append_intent(pending, {})
+            started = asyncio.Event()
+            release = asyncio.Event()
+            write_at: float | None = None
+
+            async def recover() -> dict[str, str]:
+                nonlocal write_at
+                started.set()
+                await release.wait()
+                store.append_raw(
+                    record.run_id,
+                    provider="codex",
+                    direction="provider",
+                    payload={"method": "shutdown/recovery"},
+                )
+                write_at = time.monotonic()
+                return {"status": "recovered"}
+
+            supervisor.command_queue.recovery_factory = lambda _command: recover
+            recovery = asyncio.create_task(supervisor.command_queue.recover_pending())
+            await started.wait()
+            lock = agent_daemon._acquire_single_instance(paths)
+            release_at: float | None = None
+            original_flock = agent_daemon.fcntl.flock
+
+            def tracked_flock(handle: Any, operation: int) -> None:
+                nonlocal release_at
+                if operation == fcntl.LOCK_UN:
+                    release_at = time.monotonic()
+                original_flock(handle, operation)
+
+            class ClosedServer:
+                async def close(self) -> None:
+                    pass
+
+            with mock.patch.object(agent_daemon.fcntl, "flock", tracked_flock):
+                shutdown = asyncio.create_task(
+                    agent_daemon._shutdown(
+                        ClosedServer(),
+                        supervisor,
+                        [recovery],
+                        lock,
+                        paths,
+                    )
+                )
+                await asyncio.sleep(0)
+                self.assertFalse(shutdown.done())
+                release.set()
+                await asyncio.wait_for(shutdown, timeout=5)
+            self.assertIsNotNone(write_at)
+            self.assertIsNotNone(release_at)
+            assert write_at is not None and release_at is not None
+            self.assertLess(write_at, release_at)
+
+    async def test_shutdown_races_real_run_start_without_late_stream_loss_write(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            paths = _paths(root)
+            store = RunStore(paths)
+            supervisor = Supervisor(store, FixtureAdapterFactory(FIXTURES))
+            stream_loss_writes: list[float] = []
+            original_stream_loss = supervisor._record_stream_loss
+            original_close = supervisor.command_queue.close
+            late_start: asyncio.Task[Any] | None = None
+
+            async def record_stream_loss(
+                run_id: str,
+                adapter: ProviderAdapter,
+                reason: str,
+            ) -> None:
+                stream_loss_writes.append(time.monotonic())
+                await original_stream_loss(run_id, adapter, reason)
+
+            async def close_queue_with_late_start() -> None:
+                nonlocal late_start
+                late_start = asyncio.create_task(
+                    supervisor.dispatch(
+                        "run/start",
+                        {
+                            "agent_id": "WIKI-SHUTDOWN-RACE",
+                            "provider": "codex",
+                            "role": "implement",
+                            "model": "fixture-codex",
+                            "effort": "high",
+                            "worktree": str(root),
+                            "prompt": "shutdown race",
+                        },
+                    )
+                )
+                await original_close()
+
+            lock = agent_daemon._acquire_single_instance(paths)
+            release_at: float | None = None
+            original_flock = agent_daemon.fcntl.flock
+
+            def tracked_flock(handle: Any, operation: int) -> None:
+                nonlocal release_at
+                if operation == fcntl.LOCK_UN:
+                    release_at = time.monotonic()
+                original_flock(handle, operation)
+
+            class ClosedServer:
+                async def close(self) -> None:
+                    pass
+
+            with mock.patch.object(
+                supervisor,
+                "_record_stream_loss",
+                side_effect=record_stream_loss,
+            ), mock.patch.object(
+                supervisor.command_queue,
+                "close",
+                side_effect=close_queue_with_late_start,
+            ), mock.patch.object(agent_daemon.fcntl, "flock", tracked_flock):
+                shutdown = asyncio.create_task(
+                    agent_daemon._shutdown(
+                        ClosedServer(),
+                        supervisor,
+                        [],
+                        lock,
+                        paths,
+                    )
+                )
+                await asyncio.wait_for(shutdown, timeout=5)
+                self.assertIsNotNone(late_start)
+                assert late_start is not None
+                with self.assertRaises(Exception):
+                    await asyncio.wait_for(late_start, timeout=5)
+
+            self.assertIsNotNone(release_at)
+            assert release_at is not None
+            self.assertTrue(all(write <= release_at for write in stream_loss_writes))
 
 
 class DaemonProcessTests(unittest.TestCase):

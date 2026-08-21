@@ -748,6 +748,8 @@ class RunStore:
         self._start_registry_snapshots: dict[str, dict[str, Any]] = {}
         self._terminal_run_prune_guard: Callable[[RunRecord], bool] | None = None
         self._archive_events_exporter: Callable[[str, Path, Path], bool] | None = None
+        self._archive_events_preparer: Callable[[str], None] | None = None
+        self._archive_events_validator: Callable[[str, Path], None] | None = None
         self._archive_inflight: set[str] = set()
         _ensure_private_dir(paths.runtime_dir)
         _ensure_private_dir(paths.runs_dir)
@@ -792,6 +794,22 @@ class RunStore:
         """Set the SQLite archive exporter used before archive commit."""
 
         self._archive_events_exporter = exporter
+
+    def set_archive_events_preparer(
+        self,
+        preparer: Callable[[str], None] | None,
+    ) -> None:
+        """Set the terminal archive repair hook run before copying events."""
+
+        self._archive_events_preparer = preparer
+
+    def set_archive_events_validator(
+        self,
+        validator: Callable[[str, Path], None] | None,
+    ) -> None:
+        """Set the terminal archive parity hook run before archive commit."""
+
+        self._archive_events_validator = validator
 
     def _export_archive_events(
         self,
@@ -1436,6 +1454,8 @@ class RunStore:
             current = entry.get("current") if isinstance(entry, dict) else None
             archive_worker = self._registry_current(record)
         if isinstance(current, dict) and current.get("run_id") == record.run_id:
+            if self._archive_events_preparer is not None:
+                self._archive_events_preparer(record.run_id)
             self.archive_current(record.run_id, outcome=record.outcome)
             return
         with self._lock:
@@ -1449,6 +1469,9 @@ class RunStore:
             # only the redundant hot-store removal and keep the archive intact.
             shutil.rmtree(self.run_dir(record.run_id))
             return
+        if self._archive_events_preparer is not None:
+            self._archive_events_preparer(record.run_id)
+            record = self.get(record.run_id)
         session_dir = self._next_archive_session_dir(record.agent_id)
         ended_at = record.updated_at
         history = [
@@ -1497,6 +1520,8 @@ class RunStore:
             if source.is_file():
                 expected_paths.append(destination)
             self._copy_archive_file(source, destination)
+        if self._archive_events_validator is not None:
+            self._archive_events_validator(record.run_id, session_dir)
         if record.initial_prompt:
             prompt_path = session_dir / f"{record.provider.legacy_kind}-{record.agent_id}-prompt.md"
             expected_paths.append(prompt_path)
@@ -2097,6 +2122,8 @@ class RunStore:
             if source.is_file():
                 expected_paths.append(destination)
             self._copy_archive_file(source, destination)
+        if self._archive_events_validator is not None:
+            self._archive_events_validator(run_id, session_dir)
         knowledge.enqueue_refresh(runtime_dir=self.paths.runtime_dir)
         provider_log = self.provider_log_path(run_id)
         if provider_log.is_file():

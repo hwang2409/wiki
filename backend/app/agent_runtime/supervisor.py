@@ -12,7 +12,7 @@ import tempfile
 import time
 import warnings
 from collections import OrderedDict, deque
-from collections.abc import Callable, Iterator, Mapping
+from collections.abc import Callable, Collection, Iterator, Mapping
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import asynccontextmanager
 from copy import deepcopy
@@ -45,7 +45,7 @@ from .provider import (
     StartRequest,
 )
 from .runtime_card import inject_runtime_card
-from .store import RunNotFound, RunStore, StoreConflict
+from .store import RunNotFound, RunStore, StoreConflict, StoreError
 from .types import (
     MAX_PENDING_USER_MESSAGES,
     TERMINAL_STATES,
@@ -71,6 +71,27 @@ _IDEMPOTENT_METHODS = frozenset({"run/start", "run/send_now", "run/send_on_idle"
 _COMMAND_METHODS = frozenset(
     {"run/start", "run/send_now", "run/send_on_idle", "run/archive", "run/replace"}
 )
+_RUN_SCOPED_METHODS = frozenset(
+    {
+        "run/status",
+        "run/integrity_block",
+        "run/mark_viewed",
+        "run/resume",
+        "run/send_now",
+        "run/send_on_idle",
+        "run/queue",
+        "run/queue/delete",
+        "run/queue_model_change",
+        "run/cancel_model_change",
+        "run/interrupt",
+        "run/stop",
+        "run/archive",
+        "run/replace",
+        "run/respond",
+        "events/read",
+    }
+)
+_PROJECTION_READ_METHODS = frozenset({"run/list", "run/status"})
 DEFAULT_APPROVAL_RECOVERY_TIMEOUT_SECONDS = 30.0
 AMBIGUOUS_SEND_ECHO_GRACE_SECONDS = 0.05
 _AUTO_ARCHIVE_FORBIDDEN_ROLES = frozenset({"implement", "plan"})
@@ -79,6 +100,74 @@ _VERDICT_STEP_RE = re.compile(
     re.IGNORECASE | re.MULTILINE,
 )
 logger = logging.getLogger(__name__)
+
+
+class _ShutdownPhase(str, Enum):
+    RUNNING = "running"
+    ADAPTER_INPUT_FREEZE = "adapter-input-freeze"
+    LIFECYCLE_DRAIN = "lifecycle-drain"
+    COMMAND_DRAIN = "command-drain"
+    ADAPTER_STOP = "adapter-stop"
+    LOCK_RELEASE = "lock-release"
+
+
+class _ShutdownPhaseOwner:
+    """Own the only legal order for daemon shutdown writes."""
+
+    _ORDER = (
+        _ShutdownPhase.RUNNING,
+        _ShutdownPhase.ADAPTER_INPUT_FREEZE,
+        _ShutdownPhase.LIFECYCLE_DRAIN,
+        _ShutdownPhase.COMMAND_DRAIN,
+        _ShutdownPhase.ADAPTER_STOP,
+        _ShutdownPhase.LOCK_RELEASE,
+    )
+
+    def __init__(self) -> None:
+        self._phase = _ShutdownPhase.RUNNING
+        self._audit_states: dict[str, LifecycleState] = {}
+
+    @property
+    def phase(self) -> _ShutdownPhase:
+        return self._phase
+
+    @property
+    def input_frozen(self) -> bool:
+        return self._phase is not _ShutdownPhase.RUNNING
+
+    @property
+    def writers_drained(self) -> bool:
+        return self._phase in {
+            _ShutdownPhase.ADAPTER_STOP,
+            _ShutdownPhase.LOCK_RELEASE,
+        }
+
+    @property
+    def audit_only(self) -> bool:
+        return self._phase is _ShutdownPhase.ADAPTER_STOP
+
+    @property
+    def adapter_finalizer_active(self) -> bool:
+        return self._phase is _ShutdownPhase.ADAPTER_STOP
+
+    def begin_adapter_stop(self, states: Mapping[str, LifecycleState]) -> None:
+        self.advance(_ShutdownPhase.ADAPTER_STOP)
+        self._audit_states = dict(states)
+
+    def audit_state(self, run_id: str) -> LifecycleState | None:
+        return self._audit_states.get(run_id)
+
+    def advance(self, next_phase: _ShutdownPhase) -> None:
+        if self._phase is next_phase:
+            return
+        current_index = self._ORDER.index(self._phase)
+        next_index = self._ORDER.index(next_phase)
+        if next_index != current_index + 1:
+            raise RuntimeError(
+                f"invalid shutdown phase transition: "
+                f"{self._phase.value} -> {next_phase.value}"
+            )
+        self._phase = next_phase
 
 
 class _HandoverDrainOutcome(str, Enum):
@@ -377,6 +466,8 @@ class Supervisor:
             store.paths.runtime_dir,
             archive_dir=store.paths.archive_dir,
         )
+        self.store.set_archive_events_preparer(self._prepare_terminal_archive)
+        self.store.set_archive_events_validator(self._validate_terminal_archive)
         for run_id in self.event_store.corrupt_raw_run_ids:
             reason = "raw event log is corrupt"
             self.materializer_failed_runs[run_id] = reason
@@ -475,6 +566,17 @@ class Supervisor:
             max_workers=1,
             thread_name_prefix="wiki-archive",
         )
+        self.materializer_executor = ThreadPoolExecutor(
+            max_workers=1,
+            thread_name_prefix="wiki-materializer",
+        )
+        self._materializer_executor_closed = False
+        self.projection_rebuild_tasks: dict[str, asyncio.Task[None]] = {}
+        self.projection_rebuild_errors: dict[str, BaseException] = {}
+        self.projection_rebuilds_started = False
+        self.projection_rebuild_ready = asyncio.Event()
+        self.projection_rebuild_ready.set()
+        self.startup_recovery_succeeded = asyncio.Event()
         self.archive_queue_limit = archive_queue_limit
         self.archive_pending = 0
         self.archive_inflight: set[str] = set()
@@ -494,6 +596,7 @@ class Supervisor:
         self.recovery_scan_lock = asyncio.Lock()
         self.archive_backfill_task: asyncio.Task[Any] | None = None
         self.archive_backfill_worker: asyncio.Task[Any] | None = None
+        self.shutdown_phase = _ShutdownPhaseOwner()
         # A supervisor boot invalidates any provider stdin write that had not
         # completed before shutdown: even if the row is at "sending", the
         # previous transport is gone. Sweep once per boot so the on-idle
@@ -793,6 +896,11 @@ class Supervisor:
         *,
         name: str,
     ) -> asyncio.Task[Any]:
+        if self.shutdown_phase.input_frozen:
+            close = getattr(coro, "close", None)
+            if close is not None:
+                close()
+            return asyncio.create_task(asyncio.sleep(0), name=name)
         task = asyncio.create_task(coro, name=name)
         self.monitor_tasks.add(task)
 
@@ -1274,6 +1382,12 @@ Preserve the same identity, role, worktree, orchestrator grouping, PR gates, and
         adapter: ProviderAdapter,
         event: ProviderEvent,
     ) -> None:
+        if self.shutdown_phase.input_frozen:
+            async with self.handover_condition:
+                self.handover_event_queue.setdefault(run_id, []).append(
+                    (adapter, event)
+                )
+            return
         async with self._event_mutation_admission(run_id, adapter, event) as admitted:
             if not admitted:
                 return
@@ -1297,6 +1411,7 @@ Preserve the same identity, role, worktree, orchestrator grouping, PR gates, and
         raw: dict[str, Any] | None = None,
         normalized: NormalizedProviderEvent | None = None,
         prior_state: LifecycleState | None = None,
+        shutdown_observation: bool = False,
     ) -> None:
         record_before_event = self.store.get(run_id)
         if prior_state is None:
@@ -1310,6 +1425,22 @@ Preserve the same identity, role, worktree, orchestrator grouping, PR gates, and
                 generation=event.generation,
                 received_at=event.received_at,
             )
+        if shutdown_observation:
+            observation_payload = {
+                "prior_state": prior_state.value,
+                "event_payload": event.payload,
+            }
+            await self._dual_write_normalized_async(
+                record_before_event,
+                raw,
+                NormalizedProviderEvent(
+                    EventDisposition.IGNORED,
+                    "shutdown_observation",
+                    observation_payload,
+                ),
+                observation_payload,
+            )
+            return
         if (
             event.generation > 0
             and event.generation < record_before_event.provider_generation
@@ -1538,7 +1669,7 @@ Preserve the same identity, role, worktree, orchestrator grouping, PR gates, and
                     normalized=normalized,
                     prior_state=prior_state,
                 )
-        except BaseException as exc:
+        except Exception as exc:
             if barrier is not None and not barrier.done():
                 barrier.set_exception(exc)
                 # The flush caller already receives this exception. Mark the
@@ -1572,12 +1703,15 @@ Preserve the same identity, role, worktree, orchestrator grouping, PR gates, and
                 return
             for index, (adapter, event) in enumerate(events):
                 try:
+                    audit_only = self.shutdown_phase.audit_only
                     await self._handle_provider_event_without_admission(
                         run_id,
                         adapter,
                         event,
                         update_adapter_snapshot=False,
                         schedule_monitor_actions=schedule_monitor_actions,
+                        shutdown_observation=audit_only,
+                        prior_state=self.shutdown_phase.audit_state(run_id),
                     )
                 except BaseException:
                     async with self.handover_condition:
@@ -1620,7 +1754,12 @@ Preserve the same identity, role, worktree, orchestrator grouping, PR gates, and
                         ).append((adapter, event))
 
     async def _drain_stopped_adapter(
-        self, run_id: str, adapter: ProviderAdapter
+        self,
+        run_id: str,
+        adapter: ProviderAdapter,
+        *,
+        shutdown_observation: bool = False,
+        prior_state: LifecycleState | None = None,
     ) -> None:
         """Drain the adapter and every event already taken by its pump."""
 
@@ -1640,12 +1779,20 @@ Preserve the same identity, role, worktree, orchestrator grouping, PR gates, and
                                 event_run_id, []
                             ).append((adapter, event))
                     if not handover_active:
+                        audit_only = self.shutdown_phase.audit_only
                         await self._handle_provider_event_without_admission(
                             event_run_id,
                             adapter,
                             event,
                             update_adapter_snapshot=True,
                             schedule_monitor_actions=True,
+                            shutdown_observation=(
+                                audit_only or shutdown_observation
+                            ),
+                            prior_state=(
+                                self.shutdown_phase.audit_state(event_run_id)
+                                or prior_state
+                            ),
                         )
             async with self.event_drain_condition:
                 if not self.event_inflight_counts.get(run_id):
@@ -1797,6 +1944,8 @@ Preserve the same identity, role, worktree, orchestrator grouping, PR gates, and
         *,
         prior_state: LifecycleState,
     ) -> None:
+        if self.shutdown_phase.input_frozen:
+            return
         if prior_state not in {LifecycleState.WORKING, LifecycleState.IDLE}:
             return
         try:
@@ -1828,6 +1977,8 @@ Preserve the same identity, role, worktree, orchestrator grouping, PR gates, and
         async with self._run_mutation_admission():
             async with self._run_lock(run_id):
                 try:
+                    if self.shutdown_phase.input_frozen:
+                        return
                     record = self.store.get(run_id)
                     if (
                         not self.store.is_current(record)
@@ -2347,6 +2498,8 @@ Preserve the same identity, role, worktree, orchestrator grouping, PR gates, and
         }
 
     def _attach_adapter(self, run_id: str, adapter: ProviderAdapter) -> None:
+        if self.shutdown_phase.input_frozen:
+            raise CommandRetryable("supervisor is shutting down")
         existing = self.adapters.get(run_id)
         if existing is not None and existing is not adapter:
             raise StoreConflict(
@@ -2417,7 +2570,7 @@ Preserve the same identity, role, worktree, orchestrator grouping, PR gates, and
             if finalize in {"stop", "archive"}:
                 try:
                     status = (
-                        await adapter.stop()
+                        await self._stop_adapter_for_rotation(adapter)
                         if finalize == "stop"
                         else await adapter.archive()
                     )
@@ -2443,6 +2596,24 @@ Preserve the same identity, role, worktree, orchestrator grouping, PR gates, and
             raise operation_error
         return status
 
+    async def _stop_adapter_for_shutdown(
+        self, adapter: ProviderAdapter
+    ) -> AdapterStatus:
+        if not self.shutdown_phase.adapter_finalizer_active:
+            raise AssertionError(
+                "adapter.stop() is only allowed in the shutdown finalizer phase"
+            )
+        return await adapter.stop()
+
+    async def _stop_adapter_for_rotation(
+        self, adapter: ProviderAdapter
+    ) -> AdapterStatus:
+        if self.shutdown_phase.input_frozen:
+            raise AssertionError(
+                "adapter.stop() is forbidden after shutdown input freeze"
+            )
+        return await adapter.stop()
+
     def _reset_status_for_replacement(self, agent_id: str) -> None:
         """Detach the prior run's status before replacement ownership changes."""
 
@@ -2462,7 +2633,7 @@ Preserve the same identity, role, worktree, orchestrator grouping, PR gates, and
         stream_key = id(adapter)
         self.expected_stream_ends.add(stream_key)
         try:
-            await adapter.stop()
+            await self._stop_adapter_for_rotation(adapter)
             # Keep the pump attached through provider stop. This barrier
             # covers both its local event and the adapter's buffered queue.
             await self._drain_stopped_adapter(run_id, adapter)
@@ -2897,6 +3068,9 @@ Preserve the same identity, role, worktree, orchestrator grouping, PR gates, and
             raise StoreConflict(
                 "provider PID is live without attached control; refusing duplicate resume"
             )
+        # A rebuild swaps the shard after its snapshot. Wait for that swap
+        # before any resume can append events to the original shard.
+        await self._ensure_projection_ready(run_id)
         # All resume callers share this dead-transport boundary: explicit
         # resume, account rotation, auth recovery, and startup recovery must
         # retire pre-upgrade overflow before a new adapter can emit events.
@@ -2995,39 +3169,195 @@ Preserve the same identity, role, worktree, orchestrator grouping, PR gates, and
             if self._terminal_run_can_prune(record)
         )
 
+    def prepare_startup_recovery(self) -> None:
+        """Claim retained runs before any client can reach the socket."""
+
+        if self.projection_rebuilds_started:
+            return
+        self.projection_rebuild_ready.clear()
+        self.projection_rebuilds_started = True
+        for record in self.store.list_runs():
+            if (
+                record.run_id in self.materializer_failed_runs
+                or record.run_id in self.adapters
+            ):
+                continue
+            self.projection_rebuild_tasks[record.run_id] = asyncio.create_task(
+                self._rebuild_startup_projection(record.run_id),
+                name=f"agent-materializer-rebuild-{record.run_id}",
+            )
+
     async def recover_on_start(self) -> list[dict[str, str]]:
-        async with self._run_mutation_admission():
-            async with self.recovery_scan_lock:
-                self.store.abort_uncommitted_starts()
-                # Normalize orphan raw rows before ``_recover_once`` attaches
-                # any live provider event pumps. Running after recovery let an
-                # in-flight normalize race the sweep and the middle-gap case
-                # go undetected (WIKI-232 REVIEW9 F2).
-                await self._normalize_orphan_raw_events()
-                for record in self.store.list_runs():
-                    if is_wk_kind(record.execution_kind):
-                        self.store.rebuild_wk_status_projection(record.run_id)
-                results = await self._recover_once()
-                await self._reconcile_sending_steer_effects()
-                prune_ids = self._terminal_run_prune_ids()
-                await self._run_archive_worker(
-                    self.store.prune_terminal_runs,
-                    prune_ids,
-                )
-                await self.command_queue.recover_pending()
-                if self._reaper_due():
-                    by_run_id = {
-                        item["run_id"]: index for index, item in enumerate(results)
-                    }
-                    for reaped in await self._reap_lost_runs():
-                        index = by_run_id.get(reaped["run_id"])
-                        if index is None:
-                            results.append(reaped)
-                        else:
-                            results[index] = reaped
-                results.extend(await self._auto_archive_sweep())
-                self._schedule_archive_backfill()
+        self.prepare_startup_recovery()
+        try:
+            await self._rebuild_startup_projections()
+            self.projection_rebuild_ready.set()
+            async with self._run_mutation_admission():
+                async with self.recovery_scan_lock:
+                    self.store.abort_uncommitted_starts()
+                    # Projection rebuilds also recover orphan raw rows before
+                    # ``_recover_once`` attaches any live provider event pumps.
+                    self._orphan_raw_events_normalized = True
+                    for record in self.store.list_runs():
+                        if is_wk_kind(record.execution_kind):
+                            self.store.rebuild_wk_status_projection(record.run_id)
+                    results = await self._recover_once()
+                    await self._reconcile_sending_steer_effects()
+                    prune_ids = self._terminal_run_prune_ids()
+                    await self._run_archive_worker(
+                        self.store.prune_terminal_runs,
+                        prune_ids,
+                    )
+                    if self._reaper_due():
+                        by_run_id = {
+                            item["run_id"]: index for index, item in enumerate(results)
+                        }
+                        for reaped in await self._reap_lost_runs():
+                            index = by_run_id.get(reaped["run_id"])
+                            if index is None:
+                                results.append(reaped)
+                            else:
+                                results[index] = reaped
+                    results.extend(await self._auto_archive_sweep())
+                    self._schedule_archive_backfill()
+            await self.command_queue.recover_pending()
+            if not self.command_queue.recovery_ready():
                 return results
+        except BaseException:
+            raise
+        self.startup_recovery_succeeded.set()
+        return results
+
+    async def _rebuild_startup_projections(self) -> None:
+        """Rebuild retained run projections without blocking the event loop."""
+
+        attached_run_ids = frozenset(self.adapters)
+        if attached_run_ids:
+            # Attached event pumps already own their live shards. Preserve
+            # the existing lock-coordinated orphan repair for those runs.
+            await self._normalize_orphan_raw_events(attached_run_ids)
+        self.prepare_startup_recovery()
+        if self.projection_rebuild_tasks:
+            await asyncio.gather(
+                *self.projection_rebuild_tasks.values(),
+                return_exceptions=True,
+            )
+
+    async def _rebuild_startup_projection(self, run_id: str) -> None:
+        loop = asyncio.get_running_loop()
+        try:
+            await loop.run_in_executor(
+                self.materializer_executor,
+                partial(self._rebuild_startup_projection_sync, run_id),
+            )
+        except Exception as exc:
+            self.projection_rebuild_errors[run_id] = exc
+            reason = f"event materializer rebuild failed: {exc}"
+            self.materializer_failed_runs[run_id] = reason
+            try:
+                record = self.store.get(run_id)
+                recovery_state = record.recovery_from_state or record.state
+                self.store.mark_automatic_resume_failed(
+                    run_id,
+                    reason=reason,
+                    recovery_state=recovery_state,
+                )
+            except Exception:
+                logger.exception("could not block failed materializer run %s", run_id)
+            logger.exception("event materializer rebuild failed for %s", run_id)
+
+    def _rebuild_startup_projection_sync(self, run_id: str) -> None:
+        """Repair one run when raw sequence coverage has a gap."""
+
+        self._repair_and_validate_projection(run_id)
+
+    def _repair_and_validate_projection(self, run_id: str) -> set[int]:
+        """Repair one run and require raw, legacy, and SQLite parity."""
+
+        try:
+            self.store.get(run_id)
+            normalized_rows = list(self.store.iter_normalized_events(run_id))
+            normalized_by_raw_seq = {
+                int(event.get("raw_seq", 0)): event for event in normalized_rows
+            }
+            raw_rows = list(self.store.iter_raw_events(run_id))
+        except RunNotFound:
+            return set()
+        raw_seqs = {int(envelope.get("seq", 0)) for envelope in raw_rows}
+        normalized_seqs = set(normalized_by_raw_seq)
+        try:
+            materialized_seqs = self.event_store.materialized_raw_seqs(run_id)
+        except (sqlite3.DatabaseError, ValueError):
+            materialized_seqs = set()
+        missing_normalized = raw_seqs - normalized_seqs
+        missing_materialized = raw_seqs - materialized_seqs
+        if (
+            not missing_normalized
+            and not missing_materialized
+            and self.event_store.run_is_healthy(run_id)
+        ):
+            return raw_seqs
+        for envelope in raw_rows:
+            raw_seq = int(envelope.get("seq", 0))
+            if raw_seq in normalized_by_raw_seq:
+                continue
+            # Keep the legacy projection complete before rebuilding SQLite.
+            asyncio.run(
+                self._recover_orphan_raw_event(
+                    run_id,
+                    envelope,
+                    materialize=False,
+                )
+            )
+        if missing_normalized:
+            self.store.rebuild_projections_from_normalized(run_id)
+        self._rebuild_materializer_database_sync(run_id)
+        normalized_seqs = {
+            int(event.get("raw_seq", 0))
+            for event in self.store.iter_normalized_events(run_id)
+        }
+        materialized_seqs = self.event_store.materialized_raw_seqs(run_id)
+        if raw_seqs != normalized_seqs or raw_seqs != materialized_seqs:
+            raise StoreError(
+                f"projection parity failed for {run_id}: "
+                f"raw={len(raw_seqs)} normalized={len(normalized_seqs)} "
+                f"materialized={len(materialized_seqs)}"
+            )
+        return raw_seqs
+
+    async def _ensure_projection_ready(self, run_id: str) -> None:
+        task = self.projection_rebuild_tasks.get(run_id)
+        if task is None:
+            return
+        await asyncio.shield(task)
+        error = self.projection_rebuild_errors.get(run_id)
+        if error is not None:
+            raise CommandRetryable(
+                f"event projection is unavailable for run {run_id}: {error}"
+            ) from error
+
+    def _projection_read_status(self) -> dict[str, Any]:
+        """Report projection freshness without delaying a read."""
+
+        if not self.projection_rebuilds_started:
+            return {"partial": False, "runs_ready": 0, "runs_pending": 0}
+        total = len(self.projection_rebuild_tasks)
+        pending = sum(
+            1 for task in self.projection_rebuild_tasks.values() if not task.done()
+        )
+        return {
+            "partial": pending > 0,
+            "runs_ready": total - pending,
+            "runs_pending": pending,
+        }
+
+    async def _ensure_recovery_projection_ready(self, run_id: str) -> None:
+        task = self.projection_rebuild_tasks.get(run_id)
+        if task is not None and not task.done():
+            raise CommandRetryable(
+                f"event projection is still rebuilding for run {run_id}"
+            )
+        await self._ensure_projection_ready(run_id)
 
     def _schedule_archive_backfill(self) -> None:
         """Run a bounded archive parity backfill off the recovery path."""
@@ -3057,7 +3387,9 @@ Preserve the same identity, role, worktree, orchestrator grouping, PR gates, and
             name="archive-parity-backfill",
         )
 
-    async def _normalize_orphan_raw_events(self) -> None:
+    async def _normalize_orphan_raw_events(
+        self, run_ids: Collection[str] | None = None
+    ) -> None:
         """Normalize raw provider rows whose normalization did not commit.
 
         ``_handle_provider_event_without_admission`` appends the raw row
@@ -3082,6 +3414,8 @@ Preserve the same identity, role, worktree, orchestrator grouping, PR gates, and
             return
         for record in self.store.list_runs():
             run_id = record.run_id
+            if run_ids is not None and run_id not in run_ids:
+                continue
             if run_id in self.materializer_failed_runs:
                 continue
             # WIKI-243: stream both logs to detect orphans instead of
@@ -3378,6 +3712,9 @@ Preserve the same identity, role, worktree, orchestrator grouping, PR gates, and
         return True
 
     async def _rebuild_materializer_database(self, run_id: str) -> None:
+        self._rebuild_materializer_database_sync(run_id)
+
+    def _rebuild_materializer_database_sync(self, run_id: str) -> None:
         record = self.store.get(run_id)
         target = self.event_store.for_run(run_id)
         temp_directory = Path(
@@ -3630,6 +3967,9 @@ Preserve the same identity, role, worktree, orchestrator grouping, PR gates, and
     ) -> dict[str, Any]:
         """Run or join one shielded, daemon-owned account rotation."""
 
+        if self.shutdown_phase.input_frozen:
+            raise CommandRetryable("shutdown in progress")
+
         try:
             parsed = UUID(operation_id)
         except (ValueError, AttributeError) as exc:
@@ -3679,6 +4019,8 @@ Preserve the same identity, role, worktree, orchestrator grouping, PR gates, and
         *,
         outgoing_reset_at: str | None,
     ) -> dict[str, Any]:
+        if self.shutdown_phase.input_frozen:
+            raise CommandRetryable("shutdown in progress")
         async with self._run_mutation_admission():
             return await self._rotate_codex_fleet_without_admission(
                 operation_id,
@@ -3693,6 +4035,8 @@ Preserve the same identity, role, worktree, orchestrator grouping, PR gates, and
         *,
         outgoing_reset_at: str | None,
     ) -> dict[str, Any]:
+        if self.shutdown_phase.input_frozen:
+            raise CommandRetryable("shutdown in progress")
         async with self.codex_fleet_lock:
             recovered = await self._recover_codex_rotation_locked()
             if not recovered:
@@ -3896,12 +4240,6 @@ Preserve the same identity, role, worktree, orchestrator grouping, PR gates, and
     async def _quiesce_rotation_runs_locked(self, journal: dict[str, Any]) -> None:
         operation_id = str(journal["operation_id"])
         rows = journal["runs"]
-        for row in rows:
-            self.store.mark_quiesce_intent(
-                row["run_id"],
-                operation_id,
-                row["session_id"],
-            )
         journal["phase"] = "quiescing"
         self._write_rotation_journal(journal)
 
@@ -3930,6 +4268,11 @@ Preserve the same identity, role, worktree, orchestrator grouping, PR gates, and
         for row in rows:
             run_id = row["run_id"]
             async with self._run_lock(run_id):
+                self.store.mark_quiesce_intent(
+                    run_id,
+                    operation_id,
+                    row["session_id"],
+                )
                 adapter = self.adapters.get(run_id)
                 if adapter is not None:
                     status = await adapter.status()
@@ -4936,9 +5279,9 @@ Preserve the same identity, role, worktree, orchestrator grouping, PR gates, and
             self.store.command_log.update_steer_effect(
                 "run/send_now", effect_id, "sent"
             )
-        await self._flush_deferred_delivery_events(run_id)
         record = self.store.update_adapter_status(run_id, status)
         record = self.store.clear_automatic_resume_suppression(run_id)
+        await self._flush_deferred_delivery_events(run_id)
         await self._publish_agent_change(record.agent_id)
         response: dict[str, Any] = {"status": "sent"}
         if pending_id is not None and expose_pending_id:
@@ -5287,6 +5630,7 @@ Preserve the same identity, role, worktree, orchestrator grouping, PR gates, and
         command_hash: str | None = None,
         command_hash_payload: Mapping[str, Any] | None = None,
     ) -> tuple[RunRecord, Path]:
+        self._prepare_terminal_archive(run_id)
         archived, session_dir = self.store.archive_current(run_id, outcome=outcome)
         if effect_id is not None:
             effect_payload: dict[str, Any] = {
@@ -5312,6 +5656,87 @@ Preserve the same identity, role, worktree, orchestrator grouping, PR gates, and
                 command_hash=command_hash,
             )
         return archived, session_dir
+
+    def _prepare_terminal_archive(self, run_id: str) -> None:
+        """Repair skipped terminal normalization before archive export."""
+
+        record = self.store.get(run_id)
+        if record.state not in TERMINAL_STATES:
+            return
+        self._validate_archive_raw_sequences(
+            run_id,
+            [
+                int(row["seq"])
+                for row in self.store._iter_json_lines(  # noqa: SLF001
+                    self.store.raw_events_path(run_id)
+                )
+            ],
+        )
+        self._repair_and_validate_projection(run_id)
+
+    @staticmethod
+    def _validate_archive_raw_sequences(run_id: str, raw_seqs: list[int]) -> None:
+        if raw_seqs != sorted(raw_seqs):
+            raise StoreError(
+                f"archive event parity failed for {run_id}: raw_seq is not ordered"
+            )
+        counts: dict[int, int] = {}
+        for seq in raw_seqs:
+            counts[seq] = counts.get(seq, 0) + 1
+        duplicates = sorted(seq for seq, count in counts.items() if count > 1)
+        if duplicates:
+            raise StoreError(
+                f"archive event parity failed for {run_id}: "
+                f"duplicate raw_seq={duplicates}"
+            )
+        if raw_seqs:
+            missing = sorted(
+                set(range(min(raw_seqs), max(raw_seqs) + 1)) - set(raw_seqs)
+            )
+            if missing:
+                raise StoreError(
+                    f"archive event parity failed for {run_id}: missing={missing}"
+                )
+
+    def _validate_terminal_archive(self, run_id: str, session_dir: Path) -> None:
+        """Reject terminal archives whose normalized rows do not cover raw rows."""
+
+        record = self.store.get(run_id)
+        if record.state not in TERMINAL_STATES:
+            return
+        raw_seqs = [
+            int(row["seq"])
+            for row in self.store._iter_json_lines(session_dir / "raw.jsonl")  # noqa: SLF001
+        ]
+        normalized_seqs: list[int] = []
+        for row in self.store._iter_json_lines(  # noqa: SLF001
+            session_dir / "events.jsonl"
+        ):
+            if not isinstance(row.get("kind"), str) or not row["kind"]:
+                raise StoreError(
+                    f"archive event parity failed for {run_id}: missing kind"
+                )
+            try:
+                raw_seq = int(row["raw_seq"])
+            except (KeyError, TypeError, ValueError) as exc:
+                raise StoreError(
+                    f"archive event parity failed for {run_id}: invalid raw_seq"
+                ) from exc
+            if raw_seq < 1:
+                raise StoreError(
+                    f"archive event parity failed for {run_id}: invalid raw_seq"
+                )
+            normalized_seqs.append(raw_seq)
+        self._validate_archive_raw_sequences(run_id, raw_seqs)
+        raw_seq_set = set(raw_seqs)
+        normalized_seq_set = set(normalized_seqs)
+        missing = raw_seq_set - normalized_seq_set
+        unknown = normalized_seq_set - raw_seq_set
+        if missing or unknown:
+            raise StoreError(
+                f"archive event parity failed for {run_id}: "
+                f"missing={sorted(missing)} unknown={sorted(unknown)}"
+            )
 
     async def _archive_locked(
         self,
@@ -5854,6 +6279,14 @@ Preserve the same identity, role, worktree, orchestrator grouping, PR gates, and
         command_params["_recovery_replay"] = True
 
         async def execute() -> Any:
+            if command.method != "run/start":
+                try:
+                    await self._ensure_recovery_projection_ready(
+                        self._resolve_run_id(command_params)
+                    )
+                except RunNotFound:
+                    if command.method != "run/archive":
+                        raise
             return await self._dispatch(
                 command.method,
                 command_params,
@@ -5863,9 +6296,17 @@ Preserve the same identity, role, worktree, orchestrator grouping, PR gates, and
         return execute
 
     async def dispatch(self, method: str, params: dict[str, Any]) -> Any:
+        if method not in _PROJECTION_READ_METHODS:
+            if method in _RUN_SCOPED_METHODS:
+                try:
+                    await self._ensure_projection_ready(self._resolve_run_id(params))
+                except RunNotFound:
+                    # Archive can still resolve a run from its durable archive
+                    # record when no current run remains.
+                    if method != "run/archive":
+                        raise
         if method in _COMMAND_METHODS:
             self._reject_archive_inflight(params)
-            await self.command_queue.recover_pending()
             command_params = dict(params)
             request_id = _validated_idempotency_request_id(
                 command_params.get("request_id")
@@ -5898,6 +6339,7 @@ Preserve the same identity, role, worktree, orchestrator grouping, PR gates, and
                     current_run_id = self.store.current_run_id(agent_id)
                     if current_run_id:
                         command_params.setdefault("run_id", current_run_id)
+                await self.command_queue.recover_pending_for(agent_id)
             if method == "run/start":
                 command_params.setdefault(
                     "run_id", str(uuid5(NAMESPACE_URL, f"{method}:{request_id}:run"))
@@ -6156,6 +6598,7 @@ Preserve the same identity, role, worktree, orchestrator grouping, PR gates, and
                 "status": "ok",
                 "pid": os.getpid(),
                 "runs": runs,
+                **self._projection_read_status(),
             }
         if method == "fleet/rotate_codex":
             account = params.get("account")
@@ -6166,7 +6609,10 @@ Preserve the same identity, role, worktree, orchestrator grouping, PR gates, and
                 force_target=account,
             )
         if method == "run/status":
-            return self._runtime_status(self.store.get(self._resolve_run_id(params)))
+            return {
+                **self._runtime_status(self.store.get(self._resolve_run_id(params))),
+                **self._projection_read_status(),
+            }
         if method == "run/integrity_block":
             run_id = self._resolve_run_id(params)
             reason = str(params.get("reason") or "wk integrity state mismatch")
@@ -6518,7 +6964,142 @@ Preserve the same identity, role, worktree, orchestrator grouping, PR gates, and
             return await self.prepare_handover(run_ids)
         raise ValueError(f"unknown supervisor method: {method}")
 
+    async def _freeze_stop_capable_tasks(self) -> None:
+        """Wait for every existing task that can stop provider control."""
+
+        while self.monitor_tasks:
+            await asyncio.gather(
+                *(asyncio.shield(task) for task in tuple(self.monitor_tasks)),
+                return_exceptions=True,
+            )
+        rotation = self.codex_rotation_task
+        if rotation is not None and not rotation.done():
+            await asyncio.gather(asyncio.shield(rotation), return_exceptions=True)
+
+    async def drain_writers_before_lock_release(self) -> None:
+        """Finish every supervisor-owned write before daemon handover."""
+
+        if self.shutdown_phase.writers_drained:
+            return
+        self.shutdown_phase.advance(_ShutdownPhase.ADAPTER_INPUT_FREEZE)
+        await self._freeze_stop_capable_tasks()
+        self.shutdown_phase.advance(_ShutdownPhase.LIFECYCLE_DRAIN)
+
+        # Freeze supervisor input before draining pumps. Keep adapters alive
+        # while lifecycle events and accepted commands reach durable storage.
+        for run_id, adapter in tuple(self.adapters.items()):
+            stream_key = id(adapter)
+            self.expected_stream_ends.add(stream_key)
+            try:
+                await self._drain_stopped_adapter(run_id, adapter)
+            finally:
+                self.expected_stream_ends.discard(stream_key)
+        await self._capture_live_handover_events()
+        await self._flush_all_handover_events()
+
+        self.shutdown_phase.advance(_ShutdownPhase.COMMAND_DRAIN)
+        await self.command_queue.close()
+
+        # Commands may have accepted more provider events while the queue
+        # drained. Persist those events before stopping their adapters.
+        for run_id, adapter in tuple(self.adapters.items()):
+            stream_key = id(adapter)
+            self.expected_stream_ends.add(stream_key)
+            try:
+                await self._drain_stopped_adapter(run_id, adapter)
+            finally:
+                self.expected_stream_ends.discard(stream_key)
+        await self._capture_live_handover_events()
+        await self._flush_all_handover_events()
+
+        # Stop transports only after lifecycle and accepted command writes
+        # have drained. Entering this phase also makes every later event an
+        # audit observation, including events captured by the final pump race.
+        self.shutdown_phase.begin_adapter_stop(
+            {
+                run_id: self.store.get(run_id).state
+                for run_id in self.adapters
+            }
+        )
+        for run_id, adapter in tuple(self.adapters.items()):
+            stream_key = id(adapter)
+            self.expected_stream_ends.add(stream_key)
+            prior_state = self.store.get(run_id).state
+            try:
+                try:
+                    await self._stop_adapter_for_shutdown(adapter)
+                except BaseException:
+                    pass
+                await self._drain_stopped_adapter(
+                    run_id,
+                    adapter,
+                    shutdown_observation=True,
+                    prior_state=prior_state,
+                )
+            finally:
+                self.expected_stream_ends.discard(stream_key)
+        await self._capture_live_handover_events()
+        await self._flush_all_handover_events()
+
+        for task in tuple(self.event_tasks.values()):
+            task.cancel()
+        if self.event_tasks:
+            await asyncio.gather(
+                *self.event_tasks.values(), return_exceptions=True
+            )
+        for task in tuple(self.idempotency_tasks.values()):
+            if not task.done():
+                task.cancel()
+        if self.idempotency_tasks:
+            await asyncio.gather(
+                *(asyncio.shield(task) for task in self.idempotency_tasks.values()),
+                return_exceptions=True,
+            )
+        worker = self.archive_backfill_worker
+        if worker is not None and not worker.done():
+            await asyncio.gather(asyncio.shield(worker), return_exceptions=True)
+        if self.archive_jobs:
+            await asyncio.gather(
+                *(asyncio.shield(job) for job in tuple(self.archive_jobs)),
+                return_exceptions=True,
+            )
+        await asyncio.to_thread(self.archive_executor.shutdown, wait=True)
+        await self.close_materializer_executor()
+        if self.projection_rebuild_tasks:
+            await asyncio.gather(
+                *(
+                    asyncio.shield(task)
+                    for task in self.projection_rebuild_tasks.values()
+                ),
+                return_exceptions=True,
+            )
+        self.shutdown_phase.advance(_ShutdownPhase.ADAPTER_STOP)
+
+    def mark_lock_released(self) -> None:
+        self.shutdown_phase.advance(_ShutdownPhase.LOCK_RELEASE)
+
     async def close(self) -> None:
+        if self.shutdown_phase.writers_drained:
+            adapters: list[ProviderAdapter] = []
+            seen: set[int] = set()
+            for adapter in self.adapters.values():
+                if id(adapter) in seen:
+                    continue
+                seen.add(id(adapter))
+                adapters.append(adapter)
+            for adapter in adapters:
+                try:
+                    await self._await_cleanup(adapter.close())
+                except BaseException:
+                    continue
+            self.event_tasks.clear()
+            self.adapters.clear()
+            self.event_routes.clear()
+            self.archive_jobs.clear()
+            self.archive_backfill_worker = None
+            self.archive_backfill_task = None
+            self.event_store.close()
+            return
         rotation = self.codex_rotation_task
         if rotation is not None and not rotation.done():
             try:
@@ -6603,7 +7184,14 @@ Preserve the same identity, role, worktree, orchestrator grouping, PR gates, and
                     return_exceptions=True,
                 )
             self.archive_executor.shutdown(wait=True)
+            await self.close_materializer_executor()
             self.archive_jobs.clear()
             self.event_store.close()
         if worker_error is not None:
             raise worker_error
+
+    async def close_materializer_executor(self) -> None:
+        if getattr(self, "_materializer_executor_closed", False):
+            return
+        await asyncio.to_thread(self.materializer_executor.shutdown, wait=True)
+        self._materializer_executor_closed = True

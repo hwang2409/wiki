@@ -117,6 +117,18 @@ async def _recovery_loop(supervisor: Supervisor, stop: asyncio.Event) -> None:
                 traceback.print_exc()
 
 
+async def run_fleet_after_startup(
+    supervisor: Supervisor,
+    fleet_monitor: FleetMonitor,
+    stop: asyncio.Event,
+) -> None:
+    """Start fleet observation after the first successful recovery."""
+
+    await supervisor.startup_recovery_succeeded.wait()
+    if not stop.is_set():
+        await fleet_monitor.run(stop)
+
+
 async def _shutdown(
     server: UnixSupervisorServer,
     supervisor: Supervisor,
@@ -131,14 +143,19 @@ async def _shutdown(
     if pending:
         await asyncio.gather(*pending, return_exceptions=True)
     await server.close()
-    # Release the single-instance lock before the provider drain: the drain
-    # waits on long-lived provider turns, and holding the lock through it
-    # blocks every replacement daemon from binding (WIKI-217).
+    # Drain every writer before handover: command-queue work, shielded
+    # recovery and monitor tasks, the materializer executor, and the archive
+    # store executor. Supervisor.close() runs after the lock release and may
+    # only close provider transports.
+    await supervisor.drain_writers_before_lock_release()
+    # Release the single-instance lock before the provider transport drain.
+    # Long-lived provider turns must not block a replacement daemon (WIKI-217).
     paths.pid_path.unlink(missing_ok=True)
     try:
         fcntl.flock(lock.fileno(), fcntl.LOCK_UN)
     finally:
         lock.close()
+    supervisor.mark_lock_released()
     await supervisor.close()
 
 
@@ -163,11 +180,20 @@ async def run_daemon(args: argparse.Namespace) -> None:
             loop.add_signal_handler(sig, stop.set)
         except NotImplementedError:
             pass
+    startup_recovery_task: asyncio.Task[None] | None = None
     recovery_task: asyncio.Task[None] | None = None
     fleet_task: asyncio.Task[None] | None = None
     try:
-        await supervisor.recover_on_start()
+        # Register every retained run before the socket can serve a read.
+        supervisor.prepare_startup_recovery()
         await server.start()
+        # Bind before replaying retained event history. Recovery rebuilds one
+        # run at a time in the supervisor's worker, so ping and new commands
+        # remain available while cold-start projections catch up.
+        startup_recovery_task = asyncio.create_task(
+            supervisor.recover_on_start(),
+            name="agent-supervisor-startup-recovery",
+        )
         recovery_task = asyncio.create_task(
             _recovery_loop(supervisor, stop),
             name="agent-supervisor-recovery",
@@ -190,12 +216,18 @@ async def run_daemon(args: argparse.Namespace) -> None:
             ).on_transition,
         )
         fleet_task = asyncio.create_task(
-            fleet_monitor.run(stop),
+            run_fleet_after_startup(supervisor, fleet_monitor, stop),
             name="agent-supervisor-fleet-monitor",
         )
         await stop.wait()
     finally:
-        await _shutdown(server, supervisor, [recovery_task, fleet_task], lock, paths)
+        await _shutdown(
+            server,
+            supervisor,
+            [startup_recovery_task, recovery_task, fleet_task],
+            lock,
+            paths,
+        )
 
 
 def main() -> None:

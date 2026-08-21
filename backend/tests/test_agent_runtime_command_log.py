@@ -5,6 +5,7 @@ import json
 import tempfile
 import unittest
 from pathlib import Path
+from unittest import mock
 
 from backend.app.agent_runtime.command_log import (
     AgentCommand,
@@ -14,8 +15,43 @@ from backend.app.agent_runtime.command_log import (
     CommandRetryable,
     decide,
 )
+from backend.app.agent_runtime.fake import CodexFixtureAdapter, FixtureAdapterFactory
+from backend.app.agent_runtime.supervisor import Supervisor
 from backend.app.agent_runtime.store import RunStore, RuntimePaths
 from backend.app.agent_runtime.types import ProviderKind, RunRecord
+
+FIXTURES = Path(__file__).parent / "fixtures" / "agent_runtime"
+
+
+class BlockingRecoveryAdapter(CodexFixtureAdapter):
+    def __init__(self, *args, release: asyncio.Event, started: asyncio.Event, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.release = release
+        self.started = started
+
+    async def send_now(self, message: str):
+        self.started.set()
+        await self.release.wait()
+        return await super().send_now(message)
+
+
+class BlockingRecoveryFactory(FixtureAdapterFactory):
+    def __init__(self, *args, release: asyncio.Event, started: asyncio.Event, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.release = release
+        self.started = started
+
+    def __call__(self, record):
+        if record.agent_id == "WIKI-A":
+            return BlockingRecoveryAdapter(
+                self.fixture_dir / "codex_app_server_success.jsonl",
+                self.fixture_dir / "codex_app_server_control.jsonl",
+                pid=self.pid,
+                generation=record.provider_generation,
+                release=self.release,
+                started=self.started,
+            )
+        return super().__call__(record)
 
 
 async def _raise_runtime_error(message: str) -> None:
@@ -278,6 +314,98 @@ class CommandLogTests(unittest.TestCase):
 
         self.assertEqual(asyncio.run(run()), ["spawn-a", "spawn-b"])
 
+    def test_wiki_b_dispatch_does_not_wait_on_wiki_a_recovery(self) -> None:
+        async def run() -> None:
+            with tempfile.TemporaryDirectory() as tmp:
+                root = Path(tmp)
+                worktree = root / "worktree"
+                worktree.mkdir()
+                paths = RuntimePaths(
+                    runtime_dir=root / "runtime",
+                    socket_path=root / "runtime" / "supervisor.sock",
+                    registry_path=root / "registry.json",
+                    archive_dir=root / "archive",
+                    status_dir=root / "status",
+                )
+                store = RunStore(paths)
+                release_a = asyncio.Event()
+                recovery_started = asyncio.Event()
+                supervisor = Supervisor(
+                    store,
+                    BlockingRecoveryFactory(
+                        FIXTURES,
+                        release=release_a,
+                        started=recovery_started,
+                    ),
+                )
+                run_a = await supervisor.start_run(
+                    agent_id="WIKI-A",
+                    provider=ProviderKind.CODEX,
+                    role="implement",
+                    model="fixture-codex",
+                    effort="high",
+                    worktree=str(worktree),
+                    prompt="recovery barrier A",
+                )
+                run_b = await supervisor.start_run(
+                    agent_id="WIKI-B",
+                    provider=ProviderKind.CODEX,
+                    role="implement",
+                    model="fixture-codex",
+                    effort="high",
+                    worktree=str(worktree),
+                    prompt="dispatch barrier B",
+                )
+                for agent_id, run_id in (
+                    ("WIKI-A", run_a.run_id),
+                    ("WIKI-B", run_b.run_id),
+                ):
+                    store.command_log.seed_projection(
+                        agent_id,
+                        {agent_id: {"current": {"run_id": run_id}}},
+                    )
+
+                pending = AgentCommand.steer(
+                    agent_id="WIKI-A",
+                    request_id="wiki-a-blocked-1",
+                    payload={"run_id": run_a.run_id, "text": "blocked"},
+                )
+                store.command_log.append_intent(
+                    pending,
+                    store.command_state_for("WIKI-A"),
+                )
+                a_recovery = asyncio.create_task(
+                    supervisor.command_queue.recover_pending_for("WIKI-A")
+                )
+                await asyncio.wait_for(recovery_started.wait(), timeout=2)
+
+                t0 = asyncio.get_running_loop().time()
+                result = await asyncio.wait_for(
+                    supervisor.dispatch(
+                        "run/send_now",
+                        {
+                            "agent_id": "WIKI-B",
+                            "request_id": "wiki-b-send-1",
+                            "text": "should not wait on wiki-a",
+                        },
+                    ),
+                    timeout=2.0,
+                )
+                elapsed = asyncio.get_running_loop().time() - t0
+                self.assertLess(
+                    elapsed,
+                    0.5,
+                    f"WIKI-B dispatch waited {elapsed:.2f}s on WIKI-A recovery",
+                )
+                self.assertEqual(result["status"], "sent")
+                self.assertFalse(a_recovery.done())
+
+                release_a.set()
+                await asyncio.wait_for(a_recovery, timeout=2)
+                await supervisor.close()
+
+        asyncio.run(run())
+
     def test_failed_recovery_receipt_does_not_block_healthy_recovery(self) -> None:
         async def run() -> tuple[list[str], list[tuple[str, str]]]:
             with tempfile.TemporaryDirectory() as tmp:
@@ -318,6 +446,573 @@ class CommandLogTests(unittest.TestCase):
         completed, failures = asyncio.run(run())
         self.assertEqual(completed, ["spawn-healthy"])
         self.assertEqual(failures, [("spawn-failed", "provider failed during recovery")])
+
+    def test_unexpected_recovery_failure_keeps_same_agent_barrier_closed(self) -> None:
+        async def run() -> None:
+            class UnexpectedRecoveryFailure(BaseException):
+                pass
+
+            with tempfile.TemporaryDirectory() as tmp:
+                log = CommandLog(Path(tmp) / "command-log.sqlite3")
+                pending = AgentCommand.spawn(
+                    agent_id="WIKI-A",
+                    request_id="spawn-unexpected",
+                    payload={"run_id": "run-a"},
+                )
+                log.append_intent(pending, {})
+                attempts = 0
+
+                def factory(command: AgentCommand):
+                    async def effect() -> dict[str, str]:
+                        nonlocal attempts
+                        attempts += 1
+                        if attempts == 1:
+                            raise UnexpectedRecoveryFailure("recovery interrupted")
+                        return {"run_id": str(command.payload["run_id"])}
+
+                    return effect
+
+                queue = CommandQueue(log, lambda: {}, recovery_factory=factory)
+                with self.assertRaises(UnexpectedRecoveryFailure):
+                    await queue.recover_pending()
+                self.assertEqual([item.request_id for item in log.pending()], [pending.request_id])
+
+                next_start = AgentCommand.spawn(
+                    agent_id="WIKI-A",
+                    request_id="spawn-next",
+                    payload={"run_id": "run-next"},
+                )
+                blocked = asyncio.create_task(
+                    queue.submit(next_start, lambda: _return_result({"status": "started"}))
+                )
+                await asyncio.sleep(0)
+                self.assertFalse(blocked.done())
+                blocked.cancel()
+                await asyncio.gather(blocked, return_exceptions=True)
+
+                await queue.recover_pending()
+                self.assertEqual(
+                    await queue.submit(
+                        next_start,
+                        lambda: _return_result({"status": "started"}),
+                    ),
+                    {"status": "started"},
+                )
+                await queue.close()
+
+        asyncio.run(run())
+
+    def test_recovered_barriers_open_per_agent_before_other_recovery_finishes(self) -> None:
+        async def run() -> None:
+            with tempfile.TemporaryDirectory() as tmp:
+                log = CommandLog(Path(tmp) / "command-log.sqlite3")
+                first = AgentCommand.spawn(
+                    agent_id="WIKI-A",
+                    request_id="spawn-a-old",
+                    payload={"run_id": "run-a-old"},
+                )
+                second = AgentCommand.spawn(
+                    agent_id="WIKI-B",
+                    request_id="spawn-b-old",
+                    payload={"run_id": "run-b-old"},
+                )
+                log.append_intent(first, {})
+                log.append_intent(second, {})
+                first_done = asyncio.Event()
+                second_started = asyncio.Event()
+                release_second = asyncio.Event()
+
+                def factory(command: AgentCommand):
+                    async def effect() -> dict[str, str]:
+                        if command.agent_id == "WIKI-A":
+                            first_done.set()
+                        else:
+                            second_started.set()
+                            await release_second.wait()
+                        return {"run_id": str(command.payload["run_id"])}
+
+                    return effect
+
+                queue = CommandQueue(log, lambda: {}, recovery_factory=factory)
+                recovery = asyncio.create_task(queue.recover_pending())
+                await second_started.wait()
+                await first_done.wait()
+
+                next_start = AgentCommand.spawn(
+                    agent_id="WIKI-A",
+                    request_id="spawn-a-new",
+                    payload={"run_id": "run-a-new"},
+                )
+                self.assertEqual(
+                    await queue.submit(
+                        next_start,
+                        lambda: _return_result({"status": "started"}),
+                    ),
+                    {"status": "started"},
+                )
+                self.assertFalse(recovery.done())
+                release_second.set()
+                await recovery
+                await queue.close()
+
+        asyncio.run(run())
+
+    def test_deferred_admission_failure_restores_intent_and_barrier(self) -> None:
+        async def run() -> None:
+            with tempfile.TemporaryDirectory() as tmp:
+                log = CommandLog(Path(tmp) / "command-log.sqlite3")
+                deferred = AgentCommand.spawn(
+                    agent_id="WIKI-A",
+                    request_id="spawn-deferred",
+                    payload={"run_id": "run-deferred"},
+                )
+                log.append_intent(deferred, {})
+                attempts = 0
+
+                def factory(command: AgentCommand):
+                    async def effect() -> dict[str, str]:
+                        nonlocal attempts
+                        attempts += 1
+                        if attempts == 1:
+                            raise CommandRetryable("provider control is unavailable")
+                        return {"run_id": str(command.payload["run_id"])}
+
+                    return effect
+
+                queue = CommandQueue(log, lambda: {}, recovery_factory=factory)
+                await queue.recover_pending()
+                self.assertIn(
+                    deferred.request_id,
+                    queue.recovery_queue(deferred.agent_id),
+                )
+
+                admission_failure = RuntimeError("command log is unavailable")
+                replacement = AgentCommand.spawn(
+                    agent_id="WIKI-A",
+                    request_id=deferred.request_id,
+                    payload={"run_id": "run-deferred"},
+                )
+                with mock.patch.object(
+                    log,
+                    "append_intent",
+                    side_effect=admission_failure,
+                ):
+                    with self.assertRaisesRegex(RuntimeError, "command log is unavailable"):
+                        await queue.submit(
+                            replacement,
+                            lambda: _return_result({"status": "started"}),
+                        )
+                self.assertEqual(
+                    [item.request_id for item in log.pending()],
+                    [deferred.request_id],
+                )
+                self.assertFalse(queue.recovery_barrier_open("WIKI-A"))
+
+                next_start = AgentCommand.spawn(
+                    agent_id="WIKI-A",
+                    request_id="spawn-after-deferred",
+                    payload={"run_id": "run-next"},
+                )
+                blocked = asyncio.create_task(
+                    queue.submit(next_start, lambda: _return_result({"status": "started"}))
+                )
+                await asyncio.sleep(0)
+                self.assertFalse(blocked.done())
+
+                await queue.recover_pending()
+                self.assertEqual(
+                    await blocked,
+                    {"status": "started"},
+                )
+                await queue.close()
+
+        asyncio.run(run())
+
+    def test_deferred_retries_keep_same_agent_order(self) -> None:
+        async def run() -> None:
+            with tempfile.TemporaryDirectory() as tmp:
+                log = CommandLog(Path(tmp) / "command-log.sqlite3")
+                first = AgentCommand(
+                    "run/send_now",
+                    agent_id="WIKI-A",
+                    request_id="send-a-old",
+                    payload={"run_id": "run-a-old"},
+                )
+                second = AgentCommand(
+                    "run/send_now",
+                    agent_id="WIKI-A",
+                    request_id="send-a-next",
+                    payload={"run_id": "run-a-old"},
+                )
+                effects: list[str] = []
+                first_started = asyncio.Event()
+                release_first = asyncio.Event()
+                second_started = asyncio.Event()
+
+                def factory(command: AgentCommand):
+                    async def effect() -> dict[str, str]:
+                        if command.request_id == first.request_id:
+                            first_started.set()
+                            await release_first.wait()
+                            effects.append("a")
+                        else:
+                            second_started.set()
+                            effects.append("b")
+                        return {"run_id": str(command.payload["run_id"])}
+
+                    return effect
+
+                queue = CommandQueue(log, lambda: {}, recovery_factory=factory)
+                queue.defer_for_recovery(first)
+                queue.defer_for_recovery(second)
+                recovery = asyncio.create_task(queue.recover_pending())
+                await asyncio.wait_for(first_started.wait(), timeout=2)
+                self.assertFalse(second_started.is_set())
+                release_first.set()
+                await recovery
+                await asyncio.wait_for(second_started.wait(), timeout=2)
+                self.assertEqual(effects, ["a", "b"])
+                await queue.close()
+
+        asyncio.run(run())
+
+    def test_startup_retry_promotes_only_the_next_recovery_head(self) -> None:
+        async def run() -> None:
+            with tempfile.TemporaryDirectory() as tmp:
+                log = CommandLog(Path(tmp) / "command-log.sqlite3")
+                first = AgentCommand.steer(
+                    agent_id="WIKI-A",
+                    request_id="send-a-old",
+                    payload={
+                        "method": "run/send_now",
+                        "run_id": "run-a",
+                        "text": "first",
+                    },
+                )
+                second = AgentCommand.steer(
+                    agent_id="WIKI-A",
+                    request_id="send-a-next",
+                    payload={
+                        "method": "run/send_now",
+                        "run_id": "run-a",
+                        "text": "second",
+                    },
+                )
+                state = {"WIKI-A": {"current": {"run_id": "run-a"}}}
+                log.append_intent(first, state)
+                log.append_intent(second, state)
+                attempts = 0
+                effects: list[str] = []
+                second_started = asyncio.Event()
+                release_second = asyncio.Event()
+
+                def factory(command: AgentCommand):
+                    async def effect() -> dict[str, str]:
+                        nonlocal attempts
+                        if command.request_id == first.request_id:
+                            attempts += 1
+                            if attempts == 1:
+                                raise CommandRetryable("provider is detached")
+                        else:
+                            second_started.set()
+                            await release_second.wait()
+                        effects.append(command.request_id)
+                        return {"status": "sent"}
+
+                    return effect
+
+                queue = CommandQueue(log, lambda: {}, recovery_factory=factory)
+                await queue.recover_pending()
+                self.assertEqual(effects, [])
+                self.assertEqual(
+                    queue.recovery_queue("WIKI-A"),
+                    (first.request_id, second.request_id),
+                )
+                self.assertIsNone(queue.recovery_admitted("WIKI-A"))
+
+                recovery = asyncio.create_task(queue.recover_pending())
+                await second_started.wait()
+                self.assertEqual(effects, [first.request_id])
+                self.assertFalse(recovery.done())
+                self.assertEqual(queue.recovery_admitted("WIKI-A"), second.request_id)
+                self.assertEqual(
+                    queue.recovery_queue("WIKI-A"),
+                    (second.request_id,),
+                )
+
+                release_second.set()
+                await recovery
+                self.assertEqual(effects, [first.request_id, second.request_id])
+                self.assertEqual(log.pending(), [])
+                await queue.close()
+
+        asyncio.run(run())
+
+    def test_deferred_start_blocks_same_agent_until_recovery_finishes(self) -> None:
+        async def run() -> None:
+            with tempfile.TemporaryDirectory() as tmp:
+                log = CommandLog(Path(tmp) / "command-log.sqlite3")
+                old = AgentCommand.spawn(
+                    agent_id="WIKI-A",
+                    request_id="send-a-old",
+                    payload={"run_id": "run-a-old"},
+                )
+                log.append_intent(old, {})
+                old_started = asyncio.Event()
+                release_old = asyncio.Event()
+
+                async def recover_old() -> dict[str, str]:
+                    old_started.set()
+                    await release_old.wait()
+                    return {"run_id": "run-a-old"}
+
+                queue = CommandQueue(
+                    log,
+                    lambda: {},
+                    recovery_factory=lambda _command: recover_old,
+                )
+                new = AgentCommand.spawn(
+                    agent_id="WIKI-A",
+                    request_id="send-a-new",
+                    payload={"run_id": "run-a-new"},
+                )
+                blocked = asyncio.create_task(
+                    queue.submit(
+                        new,
+                        lambda: _return_result({"run_id": "run-a-new"}),
+                    )
+                )
+                await asyncio.sleep(0)
+                self.assertFalse(blocked.done())
+                recovery = asyncio.create_task(queue.recover_pending())
+                await old_started.wait()
+                self.assertFalse(blocked.done())
+                release_old.set()
+                await recovery
+                self.assertEqual(
+                    await asyncio.wait_for(blocked, timeout=5),
+                    {"run_id": "run-a-new"},
+                )
+                await queue.close()
+
+        asyncio.run(run())
+
+    def test_barrier_uses_method_and_request_id_composite_key(self) -> None:
+        async def run() -> None:
+            with tempfile.TemporaryDirectory() as tmp:
+                log = CommandLog(Path(tmp) / "command-log.sqlite3")
+                first = AgentCommand.steer(
+                    agent_id="WIKI-A",
+                    request_id="shared-request",
+                    payload={
+                        "method": "run/send_now",
+                        "run_id": "run-a",
+                        "text": "first",
+                    },
+                )
+                second = AgentCommand.archive(
+                    agent_id="WIKI-A",
+                    request_id="shared-request",
+                    payload={"run_id": "run-a"},
+                )
+                first_started = asyncio.Event()
+                release_first = asyncio.Event()
+
+                async def recover_first() -> dict[str, str]:
+                    first_started.set()
+                    await release_first.wait()
+                    return {"status": "sent"}
+
+                async def recover_second() -> dict[str, str]:
+                    return {"status": "archived"}
+
+                def factory(command: AgentCommand):
+                    return recover_first if command is first else recover_second
+
+                queue = CommandQueue(log, lambda: {}, recovery_factory=factory)
+                queue.defer_for_recovery(first)
+                queue.defer_for_recovery(second)
+                recovery = asyncio.create_task(queue.recover_pending())
+                await first_started.wait()
+
+                blocked = asyncio.create_task(
+                    queue.submit(
+                        second,
+                        lambda: _return_result({"status": "wrong-path"}),
+                    )
+                )
+                await asyncio.sleep(0)
+                self.assertFalse(blocked.done())
+                release_first.set()
+                await recovery
+                self.assertEqual(await blocked, {"status": "archived"})
+                await queue.close()
+
+        asyncio.run(run())
+
+    def test_receipt_error_keeps_recovered_head_and_barrier_closed(self) -> None:
+        async def run() -> None:
+            with tempfile.TemporaryDirectory() as tmp:
+                log = CommandLog(Path(tmp) / "command-log.sqlite3")
+                old = AgentCommand.spawn(
+                    agent_id="WIKI-A",
+                    request_id="receipt-error-old",
+                    payload={"run_id": "run-a"},
+                )
+                log.append_intent(old, {})
+
+                async def recover() -> dict[str, str]:
+                    return {"status": "started"}
+
+                queue = CommandQueue(
+                    log,
+                    lambda: {},
+                    recovery_factory=lambda _command: recover,
+                )
+
+                with mock.patch.object(
+                    log,
+                    "complete",
+                    side_effect=RuntimeError("receipt write failed"),
+                ):
+                    await queue.recover_pending()
+
+                self.assertEqual(
+                    [item.request_id for item in log.pending()],
+                    [old.request_id],
+                )
+                self.assertEqual(
+                    queue.recovery_queue(old.agent_id),
+                    (old.request_id,),
+                )
+                self.assertIsNone(queue.recovery_admitted(old.agent_id))
+                self.assertFalse(queue.recovery_barrier_open(old.agent_id))
+
+                newer = AgentCommand.spawn(
+                    agent_id="WIKI-A",
+                    request_id="receipt-error-new",
+                    payload={"run_id": "run-a-new"},
+                )
+                blocked = asyncio.create_task(
+                    queue.submit(
+                        newer,
+                        lambda: _return_result({"status": "started"}),
+                    )
+                )
+                await asyncio.sleep(0)
+                self.assertFalse(blocked.done())
+                blocked.cancel()
+                await asyncio.gather(blocked, return_exceptions=True)
+                await queue.close()
+
+        asyncio.run(run())
+
+    def test_promotion_factory_error_rolls_back_successor_admission(self) -> None:
+        async def run() -> None:
+            with tempfile.TemporaryDirectory() as tmp:
+                log = CommandLog(Path(tmp) / "command-log.sqlite3")
+                first = AgentCommand.steer(
+                    agent_id="WIKI-A",
+                    request_id="promotion-first",
+                    payload={
+                        "method": "run/send_now",
+                        "run_id": "run-first",
+                        "text": "first",
+                    },
+                )
+                second = AgentCommand.steer(
+                    agent_id="WIKI-A",
+                    request_id="promotion-second",
+                    payload={
+                        "method": "run/send_now",
+                        "run_id": "run-first",
+                        "text": "second",
+                    },
+                )
+                state = {"WIKI-A": {"current": {"run_id": "run-first"}}}
+                log.append_intent(first, state)
+                log.append_intent(second, state)
+                second_attempts = 0
+
+                def factory(command: AgentCommand):
+                    nonlocal second_attempts
+                    if command.request_id == second.request_id:
+                        second_attempts += 1
+                        if second_attempts == 1:
+                            raise RuntimeError("factory failed during promotion")
+
+                    async def recover() -> dict[str, str]:
+                        return {"status": "sent"}
+
+                    return recover
+
+                queue = CommandQueue(log, lambda: state, recovery_factory=factory)
+                await queue.recover_pending()
+                self.assertEqual(
+                    queue.recovery_queue(first.agent_id),
+                    (second.request_id,),
+                )
+                self.assertIsNone(queue.recovery_admitted(first.agent_id))
+                self.assertFalse(queue.recovery_barrier_open(first.agent_id))
+                self.assertEqual(queue._recovery_queue.qsize(), 0)  # noqa: SLF001
+
+                await queue.recover_pending()
+                self.assertEqual(log.pending(), [])
+                self.assertTrue(queue.recovery_barrier_open(first.agent_id))
+                await queue.close()
+
+        asyncio.run(run())
+
+    def test_terminal_recovery_paths_open_empty_agent_barrier(self) -> None:
+        async def run() -> None:
+            for outcome in ("failure", "success", "timeout"):
+                with self.subTest(outcome=outcome), tempfile.TemporaryDirectory() as tmp:
+                    log = CommandLog(Path(tmp) / "command-log.sqlite3")
+                    old = AgentCommand.steer(
+                        agent_id="WIKI-A",
+                        request_id=f"send-{outcome}",
+                        payload={
+                            "method": "run/send_now",
+                            "run_id": "run-a",
+                            "text": outcome,
+                        },
+                    )
+                    state = {"WIKI-A": {"current": {"run_id": "run-a"}}}
+                    log.append_intent(old, state)
+
+                    async def recover_old() -> dict[str, str]:
+                        if outcome == "failure":
+                            raise RuntimeError("recovery failed")
+                        if outcome == "timeout":
+                            raise asyncio.TimeoutError("recovery timed out")
+                        return {"status": "sent"}
+
+                    queue = CommandQueue(
+                        log,
+                        lambda: state,
+                        recovery_factory=lambda _command: recover_old,
+                    )
+                    await queue.recover_pending()
+                    self.assertTrue(queue.recovery_barrier_open("WIKI-A"))
+                    new = AgentCommand.steer(
+                        agent_id="WIKI-A",
+                        request_id=f"next-{outcome}",
+                        payload={
+                            "method": "run/send_now",
+                            "run_id": "run-a",
+                            "text": "next",
+                        },
+                    )
+                    self.assertEqual(
+                        await queue.submit(
+                            new,
+                            lambda: _return_result({"status": "sent"}),
+                        ),
+                        {"status": "sent"},
+                    )
+                    await queue.close()
+
+        asyncio.run(run())
 
     def test_failed_start_restores_authoritative_projection_for_corrected_command(
         self,

@@ -1950,7 +1950,7 @@ class SQLiteEventStore:
         normalized_rows.sort(
             key=lambda row: (int(row[1].get("seq", 0)), int(row[0]))
         )
-        legacy_rows: dict[int, dict[str, Any]] = {}
+        legacy_rows: list[dict[str, Any]] = []
         if legacy_source is not None:
             try:
                 with Path(legacy_source).open(encoding="utf-8") as handle:
@@ -1959,9 +1959,27 @@ class SQLiteEventStore:
                             continue
                         value = json.loads(line)
                         if isinstance(value, dict):
-                            legacy_rows[int(value["raw_seq"])] = value
+                            legacy_rows.append(value)
             except (OSError, TypeError, ValueError, KeyError):
-                legacy_rows = {}
+                legacy_rows = []
+        if legacy_rows:
+            sqlite_raw_seqs = {raw_seq for raw_seq, _ in normalized_rows}
+            legacy_raw_seqs: set[int] = set()
+            try:
+                for value in legacy_rows:
+                    raw_seq = int(value["raw_seq"])
+                    if raw_seq < 1 or raw_seq not in sqlite_raw_seqs:
+                        return False
+                    legacy_raw_seqs.add(raw_seq)
+            except (KeyError, TypeError, ValueError):
+                return False
+            if legacy_raw_seqs != sqlite_raw_seqs:
+                return False
+            # The legacy stream is authoritative for archive shape. Keep its
+            # full row list: one raw event may fan out into many rows.
+            export_rows = legacy_rows
+        else:
+            export_rows = [value for _, value in normalized_rows]
         destination.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
         if destination.is_symlink():
             raise OSError(f"refusing symlink archive export: {destination}")
@@ -1972,15 +1990,8 @@ class SQLiteEventStore:
         temporary = Path(raw_tmp)
         try:
             with os.fdopen(fd, "w", encoding="utf-8") as handle:
-                for raw_seq, value in normalized_rows:
+                for value in export_rows:
                     exported = dict(value)
-                    legacy_row = legacy_rows.get(raw_seq)
-                    if legacy_row is not None:
-                        exported["normalized_at"] = str(
-                            legacy_row.get("normalized_at") or ""
-                        )
-                        if "lifecycle_state" not in legacy_row:
-                            exported.pop("lifecycle_state", None)
                     handle.write(_json_bytes(exported))
                     handle.write("\n")
                 handle.flush()

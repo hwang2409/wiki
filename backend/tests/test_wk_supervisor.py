@@ -14,6 +14,7 @@ from backend.app.agent_runtime.autopilot import AutopilotController
 from backend.app.agent_runtime.fleet_monitor import FleetMonitor
 from backend.app.agent_runtime.factory import RealAdapterFactory
 from backend.app.agent_runtime.provider import StartRequest
+from backend.app.agent_runtime.protocol import UnixSupervisorServer
 from backend.app.agent_runtime.store import RunStore, RuntimePaths
 from backend.app.agent_runtime.supervisor import Supervisor
 from backend.app.agent_runtime.types import LifecycleState, ProviderKind, RunRecord
@@ -218,15 +219,26 @@ def test_wk_dual_stack_routes_start_real_run_and_show_archive(
     paths = _paths(tmp_path)
     store = RunStore(paths)
     supervisor = Supervisor(store, _factory(tmp_path, paths), pid_alive=lambda _pid: False)
+    paths = RuntimePaths(
+        runtime_dir=paths.runtime_dir,
+        socket_path=Path("/tmp") / f"wiki-wk-{os.getpid()}-{id(supervisor)}.sock",
+        registry_path=paths.registry_path,
+        archive_dir=paths.archive_dir,
+        status_dir=paths.status_dir,
+    )
     monkeypatch.setattr(main, "AGENT_REGISTRY_PATH", paths.registry_path)
     monkeypatch.setattr(main, "AGENT_STATUS_DIR", paths.status_dir)
     monkeypatch.setattr(main, "AGENT_RUNTIME_DIR", paths.runtime_dir)
     monkeypatch.setattr(main, "AGENT_RUNS_DIR", paths.runs_dir)
     monkeypatch.setattr(main, "AGENT_ARCHIVE_DIR", paths.archive_dir)
     monkeypatch.setattr(main, "AGENT_VIEWED_PATH", tmp_path / "viewed.json")
+    monkeypatch.setattr(main.SUPERVISOR_CLIENT, "paths", paths)
+    monkeypatch.setattr(main.SUPERVISOR_CLIENT, "runtime_frozen", False)
     main._session_paths.clear()
 
     async def run() -> None:
+        server = UnixSupervisorServer(supervisor, paths.socket_path)
+        await server.start()
         record = await supervisor.start_run(
             agent_id="WIKI-289",
             provider=ProviderKind.CODEX,
@@ -238,7 +250,9 @@ def test_wk_dual_stack_routes_start_real_run_and_show_archive(
             execution_kind="wk-codex",
         )
         await asyncio.sleep(0.5)
-        session = main.agent_session("WIKI-289", cursor=0, client_path=None)
+        session = await asyncio.to_thread(
+            main.agent_session, "WIKI-289", cursor=0, client_path=None
+        )
         dashboard = main.dashboard_tickets()
         assert session["path"].startswith("sqlite://")
         assert session["events"]
@@ -252,8 +266,11 @@ def test_wk_dual_stack_routes_start_real_run_and_show_archive(
         }
         status_path = paths.status_dir / "WIKI-289.json"
         status_path.write_text(json.dumps(forged) + "\n", encoding="utf-8")
+        agents_payload = await asyncio.to_thread(main.agents)
         worker = next(
-            item for item in main.agents()["workers"] if item["ticket"] == "WIKI-289"
+            item
+            for item in agents_payload["workers"]
+            if item["ticket"] == "WIKI-289"
         )
         assert worker["state"] != "merge-ready"
         assert worker["pr"] != forged["pr"]
@@ -293,7 +310,7 @@ def test_wk_dual_stack_routes_start_real_run_and_show_archive(
         status_path.write_text(json.dumps(forged) + "\n", encoding="utf-8")
         archived = await supervisor.archive(record.run_id, outcome="review")
         assert archived.state is LifecycleState.COMPLETED
-        archived_payload = main.agents()["archived"]
+        archived_payload = (await asyncio.to_thread(main.agents))["archived"]
         assert any(item.get("run_id") == record.run_id for item in archived_payload)
         assert any(paths.archive_dir.rglob("archive-complete.json"))
         final_status_path = next(paths.archive_dir.rglob("final-status.json"))
@@ -302,6 +319,7 @@ def test_wk_dual_stack_routes_start_real_run_and_show_archive(
             key: archived_status.get(key)
             for key in ledger_status
         } == ledger_status
+        await server.close()
         await supervisor.close()
 
     asyncio.run(run())
