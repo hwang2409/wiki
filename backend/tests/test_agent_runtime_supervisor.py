@@ -525,8 +525,7 @@ class SupervisorTests(unittest.IsolatedAsyncioTestCase):
             )
         self.store.transition(record.run_id, LifecycleState.COMPLETED)
 
-        with mock.patch.object(self.store, "_export_archive_events", return_value=False):
-            await self.supervisor.archive(record.run_id, outcome="closed")
+        await self.supervisor.archive(record.run_id, outcome="closed")
 
         sessions = sorted((self.paths.archive_dir / record.agent_id).iterdir())
         archived_events = [
@@ -11510,6 +11509,133 @@ class UnixClientTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(self.supervisor.startup_recovery_succeeded.is_set())
         self.assertEqual(attempts, 2)
 
+    async def test_daemon_blocks_fleet_until_promotion_recovers(self) -> None:
+        record = RunRecord.new(
+            agent_id="WIKI-DAEMON-PROMOTION",
+            provider=ProviderKind.CODEX,
+            role="implement",
+            model="fixture-codex",
+            worktree=str(self.worktree),
+            prompt="promotion recovery integration",
+        )
+        record.state = LifecycleState.IDLE
+        record.provider_session_id = "thread-1"
+        self.store.create(record)
+        command = AgentCommand.steer(
+            agent_id=record.agent_id,
+            request_id="daemon-promotion",
+            payload={
+                "method": "run/send_now",
+                "run_id": record.run_id,
+                "text": "replay after promotion recovers",
+            },
+        )
+        self.store.command_log.append_intent(
+            command,
+            self.store.command_state_for(command.agent_id),
+        )
+
+        await self.server.close()
+        await self.supervisor.close()
+        self.paths.socket_path.unlink(missing_ok=True)
+
+        args = argparse.Namespace(
+            runtime_dir=str(self.paths.runtime_dir),
+            socket=str(self.paths.socket_path),
+            registry=str(self.paths.registry_path),
+            fake_fixture_dir=str(FIXTURES),
+        )
+        promotion_failed = True
+        captured: list[Supervisor] = []
+        fleet_started = asyncio.Event()
+        original_recover = Supervisor.recover_on_start
+        original_executor = Supervisor._recovery_executor
+
+        async def capture_recovery(supervisor: Supervisor) -> list[dict[str, str]]:
+            if not captured:
+                captured.append(supervisor)
+            return await original_recover(supervisor)
+
+        def promotion_executor(
+            supervisor: Supervisor,
+            pending: AgentCommand,
+        ) -> Any:
+            if promotion_failed:
+                raise RuntimeError("promotion adapter unavailable")
+            return original_executor(supervisor, pending)
+
+        async def fleet_run(
+            _monitor: agent_daemon.FleetMonitor,
+            stop: asyncio.Event,
+        ) -> None:
+            fleet_started.set()
+            await stop.wait()
+
+        daemon = asyncio.create_task(agent_daemon.run_daemon(args))
+        try:
+            with (
+                mock.patch.object(
+                    Supervisor,
+                    "recover_on_start",
+                    autospec=True,
+                    side_effect=capture_recovery,
+                ),
+                mock.patch.object(
+                    Supervisor,
+                    "_recovery_executor",
+                    autospec=True,
+                    side_effect=promotion_executor,
+                ),
+                mock.patch.object(
+                    agent_daemon.FleetMonitor,
+                    "run",
+                    autospec=True,
+                    side_effect=fleet_run,
+                ),
+                mock.patch.object(
+                    agent_daemon,
+                    "_paths_from_args",
+                    return_value=self.paths,
+                ),
+            ):
+                deadline = time.monotonic() + 5
+                while (
+                    time.monotonic() < deadline
+                    and (
+                        not captured
+                        or captured[0].command_queue.recovery_queue(record.agent_id)
+                        != (command.request_id,)
+                    )
+                ):
+                    await asyncio.sleep(0.01)
+                self.assertTrue(captured)
+                restarted = captured[0]
+                self.assertEqual(
+                    restarted.command_queue.recovery_queue(record.agent_id),
+                    (command.request_id,),
+                )
+                self.assertFalse(restarted.command_queue.recovery_ready())
+                self.assertFalse(restarted.startup_recovery_succeeded.is_set())
+                self.assertFalse(fleet_started.is_set())
+
+                promotion_failed = False
+                await restarted.recover_on_start()
+                self.assertTrue(
+                    restarted.startup_recovery_succeeded.is_set(),
+                    f"ready={restarted.command_queue.recovery_ready()} "
+                    f"queue={restarted.command_queue.recovery_queue(record.agent_id)} "
+                    f"failures={restarted.command_queue.recovery_failures} "
+                    f"retries={restarted.command_queue.recovery_retries}",
+                )
+                await asyncio.wait_for(fleet_started.wait(), timeout=5)
+                self.assertTrue(restarted.startup_recovery_succeeded.is_set())
+                self.assertTrue(restarted.command_queue.recovery_ready())
+        finally:
+            promotion_failed = False
+            if not daemon.done():
+                daemon.cancel()
+            await asyncio.gather(daemon, return_exceptions=True)
+
     async def test_run_daemon_registers_rebuilds_before_binding_reads(self) -> None:
         await self.server.close()
         await self.supervisor.close()
@@ -12359,6 +12485,7 @@ class DaemonShutdownTests(unittest.IsolatedAsyncioTestCase):
             adapter = supervisor.adapter_factory(record)
             original_stop = adapter.stop
             raw_count_at_stop: list[int] = []
+            capture_calls = 0
 
             async def tracked_stop() -> AdapterStatus:
                 raw_count_at_stop.append(len(store.read_raw_events(record.run_id)))
@@ -12374,6 +12501,24 @@ class DaemonShutdownTests(unittest.IsolatedAsyncioTestCase):
                 return await original_stop()
 
             adapter.stop = tracked_stop  # type: ignore[method-assign]
+
+            original_capture = supervisor._capture_live_handover_events
+
+            async def capture_with_pump_race() -> None:
+                nonlocal capture_calls
+                capture_calls += 1
+                if supervisor.shutdown_phase.adapter_finalizer_active:
+                    await adapter._events.put(  # noqa: SLF001 - pump-race fixture
+                        ProviderEvent(
+                            ProviderKind.CODEX,
+                            {
+                                "method": "turn/completed",
+                                "params": {"turn": {"status": "interrupted"}},
+                            },
+                        )
+                    )
+                await original_capture()
+
             for index in range(3):
                 await adapter._events.put(  # noqa: SLF001 - shutdown buffer fixture
                     ProviderEvent(
@@ -12391,10 +12536,22 @@ class DaemonShutdownTests(unittest.IsolatedAsyncioTestCase):
                 )
             supervisor._attach_adapter(record.run_id, adapter)  # noqa: SLF001
 
-            await supervisor.drain_writers_before_lock_release()
+            with mock.patch.object(
+                supervisor,
+                "_capture_live_handover_events",
+                side_effect=capture_with_pump_race,
+            ):
+                await supervisor.drain_writers_before_lock_release()
             self.assertEqual(raw_count_at_stop, [3])
-            self.assertEqual(len(store.read_raw_events(record.run_id)), 4)
+            self.assertEqual(capture_calls, 3)
+            self.assertEqual(len(store.read_raw_events(record.run_id)), 5)
             self.assertEqual(store.get(record.run_id).state, LifecycleState.IDLE)
+            audit_rows = [
+                row
+                for row in store.iter_normalized_events(record.run_id)
+                if row["kind"] == "shutdown_observation"
+            ]
+            self.assertEqual(len(audit_rows), 2)
             await supervisor.close()
 
             restarted_store = RunStore(paths)
@@ -12408,7 +12565,7 @@ class DaemonShutdownTests(unittest.IsolatedAsyncioTestCase):
                 restarted_adapter,
             )
             await restarted.recover_on_start()
-            self.assertEqual(len(restarted_store.read_raw_events(record.run_id)), 4)
+            self.assertEqual(len(restarted_store.read_raw_events(record.run_id)), 5)
             self.assertEqual(
                 restarted_store.get(record.run_id).state,
                 LifecycleState.IDLE,
@@ -12536,6 +12693,20 @@ class DaemonShutdownTests(unittest.IsolatedAsyncioTestCase):
             adapter.stop = tracked_stop  # type: ignore[method-assign]
             submit = asyncio.create_task(supervisor.command_queue.submit(command, execute))
             await command_started.wait()
+
+            stop_attempted = asyncio.Event()
+
+            async def rotation_like_stop() -> None:
+                while not supervisor.shutdown_phase.input_frozen:
+                    await asyncio.sleep(0)
+                stop_attempted.set()
+                with self.assertRaises(AssertionError):
+                    await supervisor._stop_adapter_for_shutdown(adapter)  # noqa: SLF001
+
+            supervisor._spawn_monitor_task(  # noqa: SLF001 - shutdown race fixture
+                rotation_like_stop(),
+                name="shutdown-rotation-race",
+            )
             lock = agent_daemon._acquire_single_instance(paths)
 
             class ClosedServer:
@@ -12556,6 +12727,7 @@ class DaemonShutdownTests(unittest.IsolatedAsyncioTestCase):
             release_command.set()
             self.assertEqual(await asyncio.wait_for(submit, timeout=5), {"status": "sent"})
             await asyncio.wait_for(shutdown, timeout=5)
+            self.assertTrue(stop_attempted.is_set())
 
             restarted = Supervisor(RunStore(paths), FixtureAdapterFactory(FIXTURES))
 

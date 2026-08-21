@@ -125,6 +125,7 @@ class _ShutdownPhaseOwner:
 
     def __init__(self) -> None:
         self._phase = _ShutdownPhase.RUNNING
+        self._audit_states: dict[str, LifecycleState] = {}
 
     @property
     def phase(self) -> _ShutdownPhase:
@@ -140,6 +141,21 @@ class _ShutdownPhaseOwner:
             _ShutdownPhase.ADAPTER_STOP,
             _ShutdownPhase.LOCK_RELEASE,
         }
+
+    @property
+    def audit_only(self) -> bool:
+        return self._phase is _ShutdownPhase.ADAPTER_STOP
+
+    @property
+    def adapter_finalizer_active(self) -> bool:
+        return self._phase is _ShutdownPhase.ADAPTER_STOP
+
+    def begin_adapter_stop(self, states: Mapping[str, LifecycleState]) -> None:
+        self.advance(_ShutdownPhase.ADAPTER_STOP)
+        self._audit_states = dict(states)
+
+    def audit_state(self, run_id: str) -> LifecycleState | None:
+        return self._audit_states.get(run_id)
 
     def advance(self, next_phase: _ShutdownPhase) -> None:
         if self._phase is next_phase:
@@ -1687,12 +1703,15 @@ Preserve the same identity, role, worktree, orchestrator grouping, PR gates, and
                 return
             for index, (adapter, event) in enumerate(events):
                 try:
+                    audit_only = self.shutdown_phase.audit_only
                     await self._handle_provider_event_without_admission(
                         run_id,
                         adapter,
                         event,
                         update_adapter_snapshot=False,
                         schedule_monitor_actions=schedule_monitor_actions,
+                        shutdown_observation=audit_only,
+                        prior_state=self.shutdown_phase.audit_state(run_id),
                     )
                 except BaseException:
                     async with self.handover_condition:
@@ -1760,14 +1779,20 @@ Preserve the same identity, role, worktree, orchestrator grouping, PR gates, and
                                 event_run_id, []
                             ).append((adapter, event))
                     if not handover_active:
+                        audit_only = self.shutdown_phase.audit_only
                         await self._handle_provider_event_without_admission(
                             event_run_id,
                             adapter,
                             event,
                             update_adapter_snapshot=True,
                             schedule_monitor_actions=True,
-                            shutdown_observation=shutdown_observation,
-                            prior_state=prior_state,
+                            shutdown_observation=(
+                                audit_only or shutdown_observation
+                            ),
+                            prior_state=(
+                                self.shutdown_phase.audit_state(event_run_id)
+                                or prior_state
+                            ),
                         )
             async with self.event_drain_condition:
                 if not self.event_inflight_counts.get(run_id):
@@ -1919,6 +1944,8 @@ Preserve the same identity, role, worktree, orchestrator grouping, PR gates, and
         *,
         prior_state: LifecycleState,
     ) -> None:
+        if self.shutdown_phase.input_frozen:
+            return
         if prior_state not in {LifecycleState.WORKING, LifecycleState.IDLE}:
             return
         try:
@@ -1950,6 +1977,8 @@ Preserve the same identity, role, worktree, orchestrator grouping, PR gates, and
         async with self._run_mutation_admission():
             async with self._run_lock(run_id):
                 try:
+                    if self.shutdown_phase.input_frozen:
+                        return
                     record = self.store.get(run_id)
                     if (
                         not self.store.is_current(record)
@@ -2567,6 +2596,18 @@ Preserve the same identity, role, worktree, orchestrator grouping, PR gates, and
             raise operation_error
         return status
 
+    async def _stop_adapter_for_shutdown(
+        self, adapter: ProviderAdapter
+    ) -> AdapterStatus:
+        if (
+            self.shutdown_phase.input_frozen
+            and not self.shutdown_phase.adapter_finalizer_active
+        ):
+            raise AssertionError(
+                "adapter.stop() is only allowed in the shutdown finalizer phase"
+            )
+        return await adapter.stop()
+
     def _reset_status_for_replacement(self, agent_id: str) -> None:
         """Detach the prior run's status before replacement ownership changes."""
 
@@ -2586,7 +2627,10 @@ Preserve the same identity, role, worktree, orchestrator grouping, PR gates, and
         stream_key = id(adapter)
         self.expected_stream_ends.add(stream_key)
         try:
-            await adapter.stop()
+            if self.codex_rotation_task is asyncio.current_task():
+                await self._stop_adapter_for_shutdown(adapter)
+            else:
+                await adapter.stop()
             # Keep the pump attached through provider stop. This barrier
             # covers both its local event and the adapter's buffered queue.
             await self._drain_stopped_adapter(run_id, adapter)
@@ -3910,6 +3954,9 @@ Preserve the same identity, role, worktree, orchestrator grouping, PR gates, and
     ) -> dict[str, Any]:
         """Run or join one shielded, daemon-owned account rotation."""
 
+        if self.shutdown_phase.input_frozen:
+            raise CommandRetryable("shutdown in progress")
+
         try:
             parsed = UUID(operation_id)
         except (ValueError, AttributeError) as exc:
@@ -3959,6 +4006,8 @@ Preserve the same identity, role, worktree, orchestrator grouping, PR gates, and
         *,
         outgoing_reset_at: str | None,
     ) -> dict[str, Any]:
+        if self.shutdown_phase.input_frozen:
+            raise CommandRetryable("shutdown in progress")
         async with self._run_mutation_admission():
             return await self._rotate_codex_fleet_without_admission(
                 operation_id,
@@ -3973,6 +4022,8 @@ Preserve the same identity, role, worktree, orchestrator grouping, PR gates, and
         *,
         outgoing_reset_at: str | None,
     ) -> dict[str, Any]:
+        if self.shutdown_phase.input_frozen:
+            raise CommandRetryable("shutdown in progress")
         async with self.codex_fleet_lock:
             recovered = await self._recover_codex_rotation_locked()
             if not recovered:
@@ -5612,12 +5663,25 @@ Preserve the same identity, role, worktree, orchestrator grouping, PR gates, and
             int(row["seq"])
             for row in self.store._iter_json_lines(session_dir / "raw.jsonl")  # noqa: SLF001
         ]
-        normalized_seqs = [
-            int(row["raw_seq"])
-            for row in self.store._iter_json_lines(  # noqa: SLF001
-                session_dir / "events.jsonl"
-            )
-        ]
+        normalized_seqs: list[int] = []
+        for row in self.store._iter_json_lines(  # noqa: SLF001
+            session_dir / "events.jsonl"
+        ):
+            if not isinstance(row.get("kind"), str) or not row["kind"]:
+                raise StoreError(
+                    f"archive event parity failed for {run_id}: missing kind"
+                )
+            try:
+                raw_seq = int(row["raw_seq"])
+            except (KeyError, TypeError, ValueError) as exc:
+                raise StoreError(
+                    f"archive event parity failed for {run_id}: invalid raw_seq"
+                ) from exc
+            if raw_seq < 1:
+                raise StoreError(
+                    f"archive event parity failed for {run_id}: invalid raw_seq"
+                )
+            normalized_seqs.append(raw_seq)
         raw_seq_set = set(raw_seqs)
         normalized_seq_set = set(normalized_seqs)
         missing = raw_seq_set - normalized_seq_set
@@ -6852,12 +6916,25 @@ Preserve the same identity, role, worktree, orchestrator grouping, PR gates, and
             return await self.prepare_handover(run_ids)
         raise ValueError(f"unknown supervisor method: {method}")
 
+    async def _freeze_stop_capable_tasks(self) -> None:
+        """Wait for every existing task that can stop provider control."""
+
+        while self.monitor_tasks:
+            await asyncio.gather(
+                *(asyncio.shield(task) for task in tuple(self.monitor_tasks)),
+                return_exceptions=True,
+            )
+        rotation = self.codex_rotation_task
+        if rotation is not None and not rotation.done():
+            await asyncio.gather(asyncio.shield(rotation), return_exceptions=True)
+
     async def drain_writers_before_lock_release(self) -> None:
         """Finish every supervisor-owned write before daemon handover."""
 
         if self.shutdown_phase.writers_drained:
             return
         self.shutdown_phase.advance(_ShutdownPhase.ADAPTER_INPUT_FREEZE)
+        await self._freeze_stop_capable_tasks()
         self.shutdown_phase.advance(_ShutdownPhase.LIFECYCLE_DRAIN)
 
         # Freeze supervisor input before draining pumps. Keep adapters alive
@@ -6875,18 +6952,6 @@ Preserve the same identity, role, worktree, orchestrator grouping, PR gates, and
         self.shutdown_phase.advance(_ShutdownPhase.COMMAND_DRAIN)
         await self.command_queue.close()
 
-        # Stop-capable tasks were frozen with adapter input. Let accepted
-        # commands finish first, then wait for those tasks before transport
-        # stop. They may still flush work that was accepted before freeze.
-        while self.monitor_tasks:
-            await asyncio.gather(
-                *(asyncio.shield(task) for task in tuple(self.monitor_tasks)),
-                return_exceptions=True,
-            )
-        rotation = self.codex_rotation_task
-        if rotation is not None and not rotation.done():
-            await asyncio.gather(asyncio.shield(rotation), return_exceptions=True)
-
         # Commands may have accepted more provider events while the queue
         # drained. Persist those events before stopping their adapters.
         for run_id, adapter in tuple(self.adapters.items()):
@@ -6900,15 +6965,21 @@ Preserve the same identity, role, worktree, orchestrator grouping, PR gates, and
         await self._flush_all_handover_events()
 
         # Stop transports only after lifecycle and accepted command writes
-        # have drained. Shutdown observations are audit-only and cannot change
-        # the resumable lifecycle state.
+        # have drained. Entering this phase also makes every later event an
+        # audit observation, including events captured by the final pump race.
+        self.shutdown_phase.begin_adapter_stop(
+            {
+                run_id: self.store.get(run_id).state
+                for run_id in self.adapters
+            }
+        )
         for run_id, adapter in tuple(self.adapters.items()):
             stream_key = id(adapter)
             self.expected_stream_ends.add(stream_key)
             prior_state = self.store.get(run_id).state
             try:
                 try:
-                    await adapter.stop()
+                    await self._stop_adapter_for_shutdown(adapter)
                 except BaseException:
                     pass
                 await self._drain_stopped_adapter(
