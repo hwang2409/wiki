@@ -15,8 +15,12 @@ from backend.app.agent_runtime.command_log import (
     CommandRetryable,
     decide,
 )
+from backend.app.agent_runtime.fake import FixtureAdapterFactory
+from backend.app.agent_runtime.supervisor import Supervisor
 from backend.app.agent_runtime.store import RunStore, RuntimePaths
 from backend.app.agent_runtime.types import ProviderKind, RunRecord
+
+FIXTURES = Path(__file__).parent / "fixtures" / "agent_runtime"
 
 
 async def _raise_runtime_error(message: str) -> None:
@@ -279,49 +283,72 @@ class CommandLogTests(unittest.TestCase):
 
         self.assertEqual(asyncio.run(run()), ["spawn-a", "spawn-b"])
 
-    def test_scoped_recovery_does_not_block_another_agent(self) -> None:
+    def test_dispatch_send_does_not_block_on_another_agent_recovery(self) -> None:
         async def run() -> None:
             with tempfile.TemporaryDirectory() as tmp:
-                log = CommandLog(Path(tmp) / "command-log.sqlite3")
-                first = AgentCommand.spawn(
+                root = Path(tmp)
+                worktree = root / "worktree"
+                worktree.mkdir()
+                store = RunStore(
+                    RuntimePaths(
+                        runtime_dir=root / "runtime",
+                        socket_path=root / "runtime" / "supervisor.sock",
+                        registry_path=root / "registry.json",
+                        archive_dir=root / "archive",
+                        status_dir=root / "status",
+                    )
+                )
+                supervisor = Supervisor(store, FixtureAdapterFactory(FIXTURES))
+                await supervisor.start_run(
                     agent_id="WIKI-A",
-                    request_id="spawn-a",
-                    payload={"run_id": "run-a"},
+                    provider=ProviderKind.CODEX,
+                    role="implement",
+                    model="fixture-codex",
+                    worktree=str(worktree),
+                    prompt="recovery barrier A",
                 )
-                second = AgentCommand.spawn(
+                run_b = await supervisor.start_run(
                     agent_id="WIKI-B",
-                    request_id="spawn-b",
-                    payload={"run_id": "run-b"},
+                    provider=ProviderKind.CODEX,
+                    role="implement",
+                    model="fixture-codex",
+                    worktree=str(worktree),
+                    prompt="dispatch barrier B",
                 )
-                log.append_intent(first, {})
-                log.append_intent(second, {})
                 release_a = asyncio.Event()
-                b_finished = asyncio.Event()
+                original_recover = supervisor.command_queue.recover_pending_for
 
-                def factory(command: AgentCommand):
-                    async def effect() -> dict[str, str]:
-                        if command.agent_id == "WIKI-A":
-                            await release_a.wait()
-                        else:
-                            b_finished.set()
-                        return {"run_id": str(command.payload["run_id"])}
+                async def scoped_recover(agent_id: str) -> None:
+                    if agent_id == "WIKI-A":
+                        await release_a.wait()
+                        return
+                    await original_recover(agent_id)
 
-                    return effect
-
-                queue = CommandQueue(log, lambda: {}, recovery_factory=factory)
-                a_recovery = asyncio.create_task(queue.recover_pending())
-                await asyncio.sleep(0)
-                b_recovery = asyncio.create_task(
-                    queue.recover_pending_for("WIKI-B")
-                )
-                await asyncio.wait_for(b_finished.wait(), timeout=1)
-                self.assertFalse(a_recovery.done())
-                release_a.set()
-                await asyncio.gather(a_recovery, b_recovery)
-                self.assertEqual(log.pending(), [])
-                self.assertIsNotNone(log.receipt(first.method, first.request_id))
-                self.assertIsNotNone(log.receipt(second.method, second.request_id))
-                await queue.close()
+                with mock.patch.object(
+                    supervisor.command_queue,
+                    "recover_pending_for",
+                    side_effect=scoped_recover,
+                ):
+                    a_recovery = asyncio.create_task(
+                        supervisor.command_queue.recover_pending_for("WIKI-A")
+                    )
+                    await asyncio.sleep(0)
+                    result = await asyncio.wait_for(
+                        supervisor.dispatch(
+                            "run/send_now",
+                            {
+                                "run_id": run_b.run_id,
+                                "text": "send through dispatch",
+                                "request_id": "dispatch-barrier-b",
+                            },
+                        ),
+                        timeout=0.5,
+                    )
+                    self.assertEqual(result["status"], "sent")
+                    self.assertFalse(a_recovery.done())
+                    release_a.set()
+                    await a_recovery
+                await supervisor.close()
 
         asyncio.run(run())
 

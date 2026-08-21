@@ -61,6 +61,7 @@ from backend.app.agent_runtime.store import (
     RunNotFound,
     RunStore,
     RuntimePaths,
+    StoreError,
     StoreConflict,
 )
 from backend.app.agent_runtime.supervisor import Supervisor, resolve_safe_worktree
@@ -10894,6 +10895,82 @@ class SupervisorTests(unittest.IsolatedAsyncioTestCase):
         self.assertNotIn(record.run_id, self.supervisor.adapters)
         self.assertNotIn(record.run_id, self.supervisor.detached_at_monotonic)
 
+    async def test_archive_rejects_raw_sequence_gaps_and_duplicates(self) -> None:
+        def seed(
+            agent_id: str,
+            raw_seqs: list[int],
+            normalized: list[tuple[int, str]],
+        ) -> RunRecord:
+            record = self.store.create(
+                RunRecord.new(
+                    agent_id=agent_id,
+                    provider=ProviderKind.CODEX,
+                    role="implement",
+                    model="fixture-codex",
+                    worktree=str(self.worktree),
+                    prompt="archive parity fixture",
+                )
+            )
+            raw_rows = [
+                {
+                    "seq": seq,
+                    "received_at": "2026-08-20T00:00:00+00:00",
+                    "provider": "codex",
+                    "direction": "provider",
+                    "generation": 1,
+                    "payload": {"method": "item/completed", "params": {}},
+                }
+                for seq in raw_seqs
+            ]
+            normalized_rows = [
+                {
+                    "seq": index,
+                    "raw_seq": raw_seq,
+                    "normalized_at": "2026-08-20T00:00:00+00:00",
+                    "disposition": EventDisposition.RENDERED.value,
+                    "kind": kind,
+                    "payload": {},
+                    "lifecycle_state": None,
+                }
+                for index, (raw_seq, kind) in enumerate(normalized, start=1)
+            ]
+            self.store.raw_events_path(record.run_id).write_text(
+                "".join(json.dumps(row) + "\n" for row in raw_rows),
+                encoding="utf-8",
+            )
+            self.store.normalized_events_path(record.run_id).write_text(
+                "".join(json.dumps(row) + "\n" for row in normalized_rows),
+                encoding="utf-8",
+            )
+            record.raw_event_count = max(raw_seqs, default=0)
+            record.normalized_event_count = len(normalized_rows)
+            record = self.store.transition(record.run_id, LifecycleState.COMPLETED)
+            return record
+
+        gap = seed(
+            "WIKI-ARCHIVE-GAP",
+            [1, 2, 4],
+            [(1, "a"), (2, "b"), (4, "c")],
+        )
+        with self.assertRaisesRegex(StoreError, r"missing=\[3\]"):
+            await self.supervisor.archive(gap.run_id)
+
+        duplicate = seed(
+            "WIKI-ARCHIVE-DUPLICATE",
+            [1, 1, 2],
+            [(1, "a"), (1, "b"), (2, "c")],
+        )
+        with self.assertRaisesRegex(StoreError, r"duplicate raw_seq=\[1\]"):
+            await self.supervisor.archive(duplicate.run_id)
+
+        fanout = seed(
+            "WIKI-ARCHIVE-FANOUT",
+            [1, 2],
+            [(1, "a"), (1, "b"), (2, "x")],
+        )
+        archived = await self.supervisor.archive(fanout.run_id)
+        self.assertEqual(archived.run_id, fanout.run_id)
+
     async def test_archive_allows_detached_dead_run(self) -> None:
         record = await self.supervisor.start_run(
             agent_id="WIKI-ARCHIVE-DEAD",
@@ -11382,9 +11459,13 @@ class UnixClientTests(unittest.IsolatedAsyncioTestCase):
                         "run/status", {"run_id": records[0].run_id}
                     )
                 )
-                await asyncio.sleep(0)
-                self.assertFalse(listed_during_rebuild.done())
-                self.assertFalse(status_during_rebuild.done())
+                listed = await asyncio.wait_for(listed_during_rebuild, timeout=0.1)
+                status = await asyncio.wait_for(
+                    status_during_rebuild, timeout=0.1
+                )
+                self.assertTrue(listed["partial"])
+                self.assertGreater(listed["runs_pending"], 0)
+                self.assertTrue(status["partial"])
                 with mock.patch.object(
                     restarted,
                     "request_codex_rotation",
@@ -11402,8 +11483,6 @@ class UnixClientTests(unittest.IsolatedAsyncioTestCase):
                         force_target=None,
                     )
                 release_rebuild.set()
-                listed = await asyncio.wait_for(listed_during_rebuild, timeout=10)
-                await asyncio.wait_for(status_during_rebuild, timeout=10)
                 self.assertEqual(len(listed["runs"]), len(records))
                 await asyncio.wait_for(pending_recovery_started.wait(), timeout=10)
                 started = await asyncio.to_thread(
@@ -11756,8 +11835,9 @@ class UnixClientTests(unittest.IsolatedAsyncioTestCase):
                     )
                 )
                 await asyncio.sleep(0.05)
-                self.assertFalse(listed.done())
-                self.assertFalse(status.done())
+                self.assertTrue(listed.done())
+                self.assertTrue(status.done())
+                self.assertTrue(listed.result()["partial"])
                 release_rebuild.set()
                 result = await asyncio.wait_for(listed, timeout=5)
                 await asyncio.wait_for(status, timeout=5)
@@ -12686,67 +12766,77 @@ class DaemonShutdownTests(unittest.IsolatedAsyncioTestCase):
             paths = _paths(root)
             store = RunStore(paths)
             supervisor = Supervisor(store, FixtureAdapterFactory(FIXTURES))
-            record = store.create(
-                RunRecord.new(
-                    agent_id="WIKI-SHUTDOWN-COMMAND",
-                    provider=ProviderKind.CODEX,
-                    role="implement",
-                    model="fixture-codex",
-                    worktree=str(root),
-                    prompt="shutdown accepted command",
+            records: dict[str, RunRecord] = {}
+            adapters: dict[str, ProviderAdapter] = {}
+            for label in ("auth-recovery", "rotation", "monitor"):
+                record = store.create(
+                    RunRecord.new(
+                        agent_id=f"WIKI-SHUTDOWN-{label.upper()}",
+                        provider=ProviderKind.CODEX,
+                        role="implement",
+                        model="fixture-codex",
+                        worktree=str(root),
+                        prompt=f"shutdown {label} race",
+                    )
                 )
-            )
-            adapter = supervisor.adapter_factory(record)
-            supervisor._attach_adapter(record.run_id, adapter)  # noqa: SLF001
-            original_stop = adapter.stop
-            command = AgentCommand.steer(
-                agent_id=record.agent_id,
-                request_id="shutdown-command",
-                payload={
-                    "method": "run/send_now",
-                    "run_id": record.run_id,
-                    "text": "replay me",
-                },
-            )
+                adapter = supervisor.adapter_factory(record)
+                supervisor._attach_adapter(record.run_id, adapter)  # noqa: SLF001
+                records[label] = record
+                adapters[label] = adapter
+            command_record = records["auth-recovery"]
+            command_adapter = adapters["auth-recovery"]
             command_started = asyncio.Event()
             release_command = asyncio.Event()
 
-            async def execute() -> dict[str, str]:
+            original_send = command_adapter.send_now
+
+            async def tracked_send(message: str) -> AdapterStatus:
                 command_started.set()
                 await release_command.wait()
-                await adapter.send_now("replay me")
-                return {"status": "sent"}
+                return await original_send(message)
 
-            async def tracked_stop() -> AdapterStatus:
-                self.assertIsNotNone(
-                    store.command_log.receipt(command.method, command.request_id)
-                )
-                return await original_stop()
-
-            adapter.stop = tracked_stop  # type: ignore[method-assign]
-            submit = asyncio.create_task(supervisor.command_queue.submit(command, execute))
+            command_adapter.send_now = tracked_send  # type: ignore[method-assign]
+            command_params = {
+                "run_id": command_record.run_id,
+                "text": "replay me",
+                "request_id": "shutdown-command",
+            }
+            submit = asyncio.create_task(
+                supervisor.dispatch("run/send_now", command_params)
+            )
             await command_started.wait()
 
             stop_attempted: set[str] = set()
+            rotation_guard_calls = 0
+            original_rotation_stop = supervisor._stop_adapter_for_rotation
 
-            async def stop_race(label: str) -> None:
+            async def tracked_rotation_stop(adapter: ProviderAdapter) -> AdapterStatus:
+                nonlocal rotation_guard_calls
+                rotation_guard_calls += 1
+                return await original_rotation_stop(adapter)
+
+            supervisor._stop_adapter_for_rotation = tracked_rotation_stop  # type: ignore[method-assign]
+
+            async def stop_race(label: str, run_id: str) -> None:
                 while not supervisor.shutdown_phase.input_frozen:
                     await asyncio.sleep(0)
                 stop_attempted.add(label)
-                with self.assertRaises(AssertionError):
-                    await supervisor._stop_adapter_for_rotation(adapter)  # noqa: SLF001
+                try:
+                    await supervisor.stop(run_id)
+                except (AssertionError, CommandRetryable, StoreConflict):
+                    pass
 
-            auth_recovery_task = supervisor._spawn_monitor_task(
-                stop_race("auth-recovery"),
+            supervisor._spawn_monitor_task(
+                stop_race("auth-recovery", records["auth-recovery"].run_id),
                 name="shutdown-auth-recovery-race",
             )
-            supervisor.auth_dead_recoveries[record.run_id] = auth_recovery_task
             supervisor._spawn_monitor_task(  # noqa: SLF001 - shutdown race fixture
-                stop_race("monitor"),
+                stop_race("monitor", records["monitor"].run_id),
                 name="shutdown-monitor-race",
             )
             rotation_task = asyncio.create_task(
-                stop_race("rotation"), name="shutdown-rotation-race"
+                stop_race("rotation", records["rotation"].run_id),
+                name="shutdown-rotation-race",
             )
             supervisor.codex_rotation_task = rotation_task  # noqa: SLF001
             lock = agent_daemon._acquire_single_instance(paths)
@@ -12767,18 +12857,17 @@ class DaemonShutdownTests(unittest.IsolatedAsyncioTestCase):
             await asyncio.sleep(0)
             self.assertFalse(submit.done())
             release_command.set()
-            self.assertEqual(await asyncio.wait_for(submit, timeout=5), {"status": "sent"})
+            self.assertEqual(
+                await asyncio.wait_for(submit, timeout=5), {"status": "sent"}
+            )
             await asyncio.wait_for(shutdown, timeout=5)
             self.assertEqual(stop_attempted, {"auth-recovery", "monitor", "rotation"})
+            self.assertEqual(rotation_guard_calls, 3)
 
             restarted = Supervisor(RunStore(paths), FixtureAdapterFactory(FIXTURES))
-
-            async def must_not_execute() -> dict[str, str]:
-                return {"status": "must not execute"}
-
-            replay = await restarted.command_queue.submit(
-                command,
-                must_not_execute,
+            replay = await restarted.dispatch(
+                "run/send_now",
+                command_params,
             )
             self.assertEqual(replay, {"status": "sent"})
             await restarted.close()

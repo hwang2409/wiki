@@ -92,6 +92,7 @@ _RUN_SCOPED_METHODS = frozenset(
     }
 )
 _AGGREGATE_READ_METHODS = frozenset({"run/list"})
+_PROJECTION_READ_METHODS = frozenset({"run/list", "run/status"})
 DEFAULT_APPROVAL_RECOVERY_TIMEOUT_SECONDS = 30.0
 AMBIGUOUS_SEND_ECHO_GRACE_SECONDS = 0.05
 _AUTO_ARCHIVE_FORBIDDEN_ROLES = frozenset({"implement", "plan"})
@@ -3334,12 +3335,26 @@ Preserve the same identity, role, worktree, orchestrator grouping, PR gates, and
             ) from error
 
     async def _ensure_aggregate_projection_ready(self) -> None:
-        await self.projection_rebuild_ready.wait()
         if self.projection_rebuild_errors:
             run_id, error = next(iter(self.projection_rebuild_errors.items()))
             raise CommandRetryable(
                 f"event projection is unavailable for run {run_id}: {error}"
             ) from error
+
+    def _projection_read_status(self) -> dict[str, Any]:
+        """Report projection freshness without delaying a read."""
+
+        if not self.projection_rebuilds_started:
+            return {"partial": False, "runs_ready": 0, "runs_pending": 0}
+        total = len(self.projection_rebuild_tasks)
+        pending = sum(
+            1 for task in self.projection_rebuild_tasks.values() if not task.done()
+        )
+        return {
+            "partial": pending > 0,
+            "runs_ready": total - pending,
+            "runs_pending": pending,
+        }
 
     async def _ensure_recovery_projection_ready(self, run_id: str) -> None:
         task = self.projection_rebuild_tasks.get(run_id)
@@ -5654,7 +5669,38 @@ Preserve the same identity, role, worktree, orchestrator grouping, PR gates, and
         record = self.store.get(run_id)
         if record.state not in TERMINAL_STATES:
             return
+        self._validate_archive_raw_sequences(
+            run_id,
+            [
+                int(row["seq"])
+                for row in self.store._iter_json_lines(  # noqa: SLF001
+                    self.store.raw_events_path(run_id)
+                )
+            ],
+        )
         self._repair_and_validate_projection(run_id)
+
+    @staticmethod
+    def _validate_archive_raw_sequences(run_id: str, raw_seqs: list[int]) -> None:
+        if raw_seqs != sorted(raw_seqs):
+            raise StoreError(
+                f"archive event parity failed for {run_id}: raw_seq is not ordered"
+            )
+        counts: dict[int, int] = {}
+        for seq in raw_seqs:
+            counts[seq] = counts.get(seq, 0) + 1
+        duplicates = sorted(seq for seq, count in counts.items() if count > 1)
+        if duplicates:
+            raise StoreError(
+                f"archive event parity failed for {run_id}: "
+                f"duplicate raw_seq={duplicates}"
+            )
+        if raw_seqs:
+            missing = sorted(set(range(1, max(raw_seqs) + 1)) - set(raw_seqs))
+            if missing:
+                raise StoreError(
+                    f"archive event parity failed for {run_id}: missing={missing}"
+                )
 
     def _validate_terminal_archive(self, run_id: str, session_dir: Path) -> None:
         """Reject terminal archives whose normalized rows do not cover raw rows."""
@@ -5685,6 +5731,7 @@ Preserve the same identity, role, worktree, orchestrator grouping, PR gates, and
                     f"archive event parity failed for {run_id}: invalid raw_seq"
                 )
             normalized_seqs.append(raw_seq)
+        self._validate_archive_raw_sequences(run_id, raw_seqs)
         raw_seq_set = set(raw_seqs)
         normalized_seq_set = set(normalized_seqs)
         missing = raw_seq_set - normalized_seq_set
@@ -6253,16 +6300,17 @@ Preserve the same identity, role, worktree, orchestrator grouping, PR gates, and
         return execute
 
     async def dispatch(self, method: str, params: dict[str, Any]) -> Any:
-        if method in _RUN_SCOPED_METHODS:
-            try:
-                await self._ensure_projection_ready(self._resolve_run_id(params))
-            except RunNotFound:
-                # Archive can still resolve a run from its durable archive
-                # record when no current run remains.
-                if method != "run/archive":
-                    raise
-        elif method in _AGGREGATE_READ_METHODS:
-            await self._ensure_aggregate_projection_ready()
+        if method not in _PROJECTION_READ_METHODS:
+            if method in _RUN_SCOPED_METHODS:
+                try:
+                    await self._ensure_projection_ready(self._resolve_run_id(params))
+                except RunNotFound:
+                    # Archive can still resolve a run from its durable archive
+                    # record when no current run remains.
+                    if method != "run/archive":
+                        raise
+            elif method in _AGGREGATE_READ_METHODS:
+                await self._ensure_aggregate_projection_ready()
         if method in _COMMAND_METHODS:
             self._reject_archive_inflight(params)
             command_params = dict(params)
@@ -6556,6 +6604,7 @@ Preserve the same identity, role, worktree, orchestrator grouping, PR gates, and
                 "status": "ok",
                 "pid": os.getpid(),
                 "runs": runs,
+                **self._projection_read_status(),
             }
         if method == "fleet/rotate_codex":
             account = params.get("account")
@@ -6566,7 +6615,10 @@ Preserve the same identity, role, worktree, orchestrator grouping, PR gates, and
                 force_target=account,
             )
         if method == "run/status":
-            return self._runtime_status(self.store.get(self._resolve_run_id(params)))
+            return {
+                **self._runtime_status(self.store.get(self._resolve_run_id(params))),
+                **self._projection_read_status(),
+            }
         if method == "run/integrity_block":
             run_id = self._resolve_run_id(params)
             reason = str(params.get("reason") or "wk integrity state mismatch")
