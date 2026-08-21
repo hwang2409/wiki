@@ -201,8 +201,16 @@ class CommandQueue:
         self.failure_state_provider = failure_state_provider
         self._queue: asyncio.Queue[_QueuedCommand] = asyncio.Queue()
         self._recovery_queue: asyncio.Queue[_QueuedCommand] = asyncio.Queue()
+        # Command-scoped recovery uses one lane per agent. Boot recovery keeps
+        # its durable global FIFO so startup replay order stays stable.
+        self._scoped_recovery_queues: dict[
+            str, asyncio.Queue[_QueuedCommand]
+        ] = {}
         self._worker: asyncio.Task[None] | None = None
         self._recovery_worker: asyncio.Task[None] | None = None
+        self._scoped_recovery_workers: dict[str, asyncio.Task[None]] = {}
+        self._scoped_recovery_agents: set[str] = set()
+        self._promotion_failures: set[str] = set()
         self._append_lock = asyncio.Lock()
         self._commit_lock = asyncio.Lock()
         self._recovery_lock = asyncio.Lock()
@@ -222,6 +230,14 @@ class CommandQueue:
         if self._recovery_worker is None or self._recovery_worker.done():
             self._recovery_worker = asyncio.create_task(
                 self._run(recovery=True), name="recovered-command-reactor"
+            )
+
+    def _start_scoped_recovery_worker(self, agent_id: str) -> None:
+        worker = self._scoped_recovery_workers.get(agent_id)
+        if worker is None or worker.done():
+            self._scoped_recovery_workers[agent_id] = asyncio.create_task(
+                self._run(recovery=True, agent_id=agent_id),
+                name=f"scoped-recovered-command-reactor-{agent_id}",
             )
 
     @staticmethod
@@ -254,9 +270,16 @@ class CommandQueue:
         state = self._agent_state(agent_id)
         if self.recovery_factory is None:
             raise CommandError("deferred command intents need a recovery executor")
+        scoped = agent_id in self._scoped_recovery_agents
+        if scoped:
+            recovery_queue = self._scoped_recovery_queues.setdefault(
+                agent_id, asyncio.Queue()
+            )
+        else:
+            recovery_queue = self._recovery_queue
         admission = state.promote_next(
             self.recovery_factory,
-            self._recovery_queue.put_nowait,
+            recovery_queue.put_nowait,
         )
         if admission is None:
             return None
@@ -264,24 +287,21 @@ class CommandQueue:
         future.add_done_callback(
             lambda completed: self._finish_recovery(command, completed)
         )
-        self._start_recovery_worker()
+        if scoped:
+            self._start_scoped_recovery_worker(agent_id)
+        else:
+            self._start_recovery_worker()
         return future
 
-    async def _queue_deferred_heads(self) -> list[asyncio.Future[Any]]:
-        if not self._agent_recovery:
-            return []
-        if self.recovery_factory is None:
-            raise CommandError("deferred command intents need a recovery executor")
-        futures: list[asyncio.Future[Any]] = []
+    def _next_recovery_future(self) -> asyncio.Future[Any] | None:
         for agent_id, state in tuple(self._agent_recovery.items()):
             existing = state.admitted_future()
             if existing is not None:
-                futures.append(existing)
-                continue
+                return existing
             future = self._admit_recovery_head(agent_id)
             if future is not None:
-                futures.append(future)
-        return futures
+                return future
+        return None
 
     async def _ensure_recovered(self) -> list[asyncio.Future[Any]]:
         if self._pending_loaded:
@@ -319,14 +339,56 @@ class CommandQueue:
     async def recover_pending(self) -> None:
         """Replay all pending intents before startup accepts new mutations."""
 
+        self._promotion_failures.clear()
         futures = await self._ensure_recovered()
-        known = set(futures)
-        for future in await self._queue_deferred_heads():
-            if future not in known:
-                futures.append(future)
-                known.add(future)
         for state in self._agent_recovery.values():
             state.take_promoted_futures()
+        while True:
+            if not futures:
+                future = self._next_recovery_future()
+                if future is None:
+                    return
+                futures.append(future)
+            current = futures
+            futures = []
+            results = await asyncio.gather(
+                *(asyncio.shield(future) for future in current),
+                return_exceptions=True,
+            )
+            for future, result in zip(current, results, strict=True):
+                if not isinstance(result, BaseException):
+                    continue
+                if isinstance(result, (_RecoveredCommandFailure, _RecoveredCommandRetry)):
+                    if isinstance(result, _RecoveredCommandRetry):
+                        return
+                    continue
+                if isinstance(
+                    result,
+                    (asyncio.CancelledError, KeyboardInterrupt, SystemExit),
+                ):
+                    raise result
+                if isinstance(result, sqlite3.DatabaseError):
+                    raise result
+                raise result
+            if self._promotion_failures:
+                return
+            for state in self._agent_recovery.values():
+                futures.extend(state.take_promoted_futures())
+
+    async def recover_pending_for(self, agent_id: str) -> None:
+        """Replay one agent's pending intents without a fleet-wide wait."""
+
+        await self._ensure_recovered()
+        futures: list[asyncio.Future[Any]] = []
+        self._scoped_recovery_agents.add(agent_id)
+        state = self._agent_state(agent_id)
+        admitted = state.admitted_future()
+        if admitted is not None:
+            futures.append(admitted)
+        promoted = self._admit_recovery_head(agent_id)
+        if promoted is not None and promoted not in futures:
+            futures.append(promoted)
+        state.take_promoted_futures()
         while futures:
             current = futures
             futures = []
@@ -347,8 +409,9 @@ class CommandQueue:
                 if isinstance(result, sqlite3.DatabaseError):
                     raise result
                 raise result
-            for state in self._agent_recovery.values():
-                futures.extend(state.take_promoted_futures())
+            futures.extend(state.take_promoted_futures())
+        if state.recovery_idle():
+            self._scoped_recovery_agents.discard(agent_id)
 
     def _finish_recovery(
         self, command: AgentCommand, future: asyncio.Future[Any]
@@ -381,10 +444,12 @@ class CommandQueue:
             return
         successor = state.head()
         if successor is None:
+            self._scoped_recovery_agents.discard(command.agent_id)
             return
         try:
             self._admit_recovery_head(command.agent_id)
         except BaseException as error:
+            self._promotion_failures.add(command.agent_id)
             self.recovery_retries.append(
                 (
                     successor,
@@ -439,8 +504,15 @@ class CommandQueue:
                 future.set_exception(exc)
         return await future
 
-    async def _run(self, *, recovery: bool = False) -> None:
-        queue = self._recovery_queue if recovery else self._queue
+    async def _run(
+        self, *, recovery: bool = False, agent_id: str | None = None
+    ) -> None:
+        if not recovery:
+            queue = self._queue
+        elif agent_id is None:
+            queue = self._recovery_queue
+        else:
+            queue = self._scoped_recovery_queues[agent_id]
         while True:
             item = await queue.get()
             command, execute, future = item.command, item.execute, item.future
@@ -531,7 +603,10 @@ class CommandQueue:
     async def close(self) -> None:
         self._closed = True
         await self._queue.join()
-        await self._recovery_queue.join()
+        await asyncio.gather(
+            self._recovery_queue.join(),
+            *(queue.join() for queue in self._scoped_recovery_queues.values()),
+        )
         if self._worker is not None:
             self._worker.cancel()
             await asyncio.gather(self._worker, return_exceptions=True)
@@ -540,3 +615,10 @@ class CommandQueue:
             self._recovery_worker.cancel()
             await asyncio.gather(self._recovery_worker, return_exceptions=True)
         self._recovery_worker = None
+        for worker in self._scoped_recovery_workers.values():
+            worker.cancel()
+        if self._scoped_recovery_workers:
+            await asyncio.gather(
+                *self._scoped_recovery_workers.values(), return_exceptions=True
+            )
+        self._scoped_recovery_workers.clear()

@@ -2570,7 +2570,7 @@ Preserve the same identity, role, worktree, orchestrator grouping, PR gates, and
             if finalize in {"stop", "archive"}:
                 try:
                     status = (
-                        await adapter.stop()
+                        await self._stop_adapter_for_rotation(adapter)
                         if finalize == "stop"
                         else await adapter.archive()
                     )
@@ -2599,12 +2599,18 @@ Preserve the same identity, role, worktree, orchestrator grouping, PR gates, and
     async def _stop_adapter_for_shutdown(
         self, adapter: ProviderAdapter
     ) -> AdapterStatus:
-        if (
-            self.shutdown_phase.input_frozen
-            and not self.shutdown_phase.adapter_finalizer_active
-        ):
+        if not self.shutdown_phase.adapter_finalizer_active:
             raise AssertionError(
                 "adapter.stop() is only allowed in the shutdown finalizer phase"
+            )
+        return await adapter.stop()
+
+    async def _stop_adapter_for_rotation(
+        self, adapter: ProviderAdapter
+    ) -> AdapterStatus:
+        if self.shutdown_phase.input_frozen:
+            raise AssertionError(
+                "adapter.stop() is forbidden after shutdown input freeze"
             )
         return await adapter.stop()
 
@@ -2627,10 +2633,7 @@ Preserve the same identity, role, worktree, orchestrator grouping, PR gates, and
         stream_key = id(adapter)
         self.expected_stream_ends.add(stream_key)
         try:
-            if self.codex_rotation_task is asyncio.current_task():
-                await self._stop_adapter_for_shutdown(adapter)
-            else:
-                await adapter.stop()
+            await self._stop_adapter_for_rotation(adapter)
             # Keep the pump attached through provider stop. This barrier
             # covers both its local event and the adapter's buffered queue.
             await self._drain_stopped_adapter(run_id, adapter)
@@ -6262,8 +6265,6 @@ Preserve the same identity, role, worktree, orchestrator grouping, PR gates, and
             await self._ensure_aggregate_projection_ready()
         if method in _COMMAND_METHODS:
             self._reject_archive_inflight(params)
-            if method != "run/start":
-                await self.command_queue.recover_pending()
             command_params = dict(params)
             request_id = _validated_idempotency_request_id(
                 command_params.get("request_id")
@@ -6296,6 +6297,7 @@ Preserve the same identity, role, worktree, orchestrator grouping, PR gates, and
                     current_run_id = self.store.current_run_id(agent_id)
                     if current_run_id:
                         command_params.setdefault("run_id", current_run_id)
+                await self.command_queue.recover_pending_for(agent_id)
             if method == "run/start":
                 command_params.setdefault(
                     "run_id", str(uuid5(NAMESPACE_URL, f"{method}:{request_id}:run"))

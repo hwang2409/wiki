@@ -279,6 +279,52 @@ class CommandLogTests(unittest.TestCase):
 
         self.assertEqual(asyncio.run(run()), ["spawn-a", "spawn-b"])
 
+    def test_scoped_recovery_does_not_block_another_agent(self) -> None:
+        async def run() -> None:
+            with tempfile.TemporaryDirectory() as tmp:
+                log = CommandLog(Path(tmp) / "command-log.sqlite3")
+                first = AgentCommand.spawn(
+                    agent_id="WIKI-A",
+                    request_id="spawn-a",
+                    payload={"run_id": "run-a"},
+                )
+                second = AgentCommand.spawn(
+                    agent_id="WIKI-B",
+                    request_id="spawn-b",
+                    payload={"run_id": "run-b"},
+                )
+                log.append_intent(first, {})
+                log.append_intent(second, {})
+                release_a = asyncio.Event()
+                b_finished = asyncio.Event()
+
+                def factory(command: AgentCommand):
+                    async def effect() -> dict[str, str]:
+                        if command.agent_id == "WIKI-A":
+                            await release_a.wait()
+                        else:
+                            b_finished.set()
+                        return {"run_id": str(command.payload["run_id"])}
+
+                    return effect
+
+                queue = CommandQueue(log, lambda: {}, recovery_factory=factory)
+                a_recovery = asyncio.create_task(queue.recover_pending())
+                await asyncio.sleep(0)
+                b_recovery = asyncio.create_task(
+                    queue.recover_pending_for("WIKI-B")
+                )
+                await asyncio.wait_for(b_finished.wait(), timeout=1)
+                self.assertFalse(a_recovery.done())
+                release_a.set()
+                await asyncio.gather(a_recovery, b_recovery)
+                self.assertEqual(log.pending(), [])
+                self.assertIsNotNone(log.receipt(first.method, first.request_id))
+                self.assertIsNotNone(log.receipt(second.method, second.request_id))
+                await queue.close()
+
+        asyncio.run(run())
+
     def test_failed_recovery_receipt_does_not_block_healthy_recovery(self) -> None:
         async def run() -> tuple[list[str], list[tuple[str, str]]]:
             with tempfile.TemporaryDirectory() as tmp:

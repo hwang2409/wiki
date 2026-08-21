@@ -11546,6 +11546,7 @@ class UnixClientTests(unittest.IsolatedAsyncioTestCase):
             fake_fixture_dir=str(FIXTURES),
         )
         promotion_failed = True
+        executions = 0
         captured: list[Supervisor] = []
         fleet_started = asyncio.Event()
         original_recover = Supervisor.recover_on_start
@@ -11562,7 +11563,14 @@ class UnixClientTests(unittest.IsolatedAsyncioTestCase):
         ) -> Any:
             if promotion_failed:
                 raise RuntimeError("promotion adapter unavailable")
-            return original_executor(supervisor, pending)
+            execute = original_executor(supervisor, pending)
+
+            async def counted_execute() -> Any:
+                nonlocal executions
+                executions += 1
+                return await execute()
+
+            return counted_execute
 
         async def fleet_run(
             _monitor: agent_daemon.FleetMonitor,
@@ -11630,6 +11638,15 @@ class UnixClientTests(unittest.IsolatedAsyncioTestCase):
                 await asyncio.wait_for(fleet_started.wait(), timeout=5)
                 self.assertTrue(restarted.startup_recovery_succeeded.is_set())
                 self.assertTrue(restarted.command_queue.recovery_ready())
+                self.assertEqual(executions, 1)
+                self.assertEqual(
+                    restarted.command_queue.recovery_queue(record.agent_id), ()
+                )
+                receipt = restarted.store.command_log.receipt(
+                    command.method, command.request_id
+                )
+                self.assertIsNotNone(receipt)
+                self.assertTrue(receipt.ok)
         finally:
             promotion_failed = False
             if not daemon.done():
@@ -12647,6 +12664,22 @@ class DaemonShutdownTests(unittest.IsolatedAsyncioTestCase):
             assert write_at is not None and release_at is not None
             self.assertLess(write_at, release_at)
 
+    def test_adapter_stop_calls_have_one_phase_guarded_owner(self) -> None:
+        source = Path(supervisor_module.__file__).read_text(encoding="utf-8")
+        owner: str | None = None
+        owners: list[str] = []
+        for line in source.splitlines():
+            if line.startswith("    async def "):
+                owner = line.split("async def ", 1)[1].split("(", 1)[0]
+            if "await adapter.stop()" in line:
+                self.assertIsNotNone(owner)
+                assert owner is not None
+                owners.append(owner)
+        self.assertEqual(
+            owners,
+            ["_stop_adapter_for_shutdown", "_stop_adapter_for_rotation"],
+        )
+
     async def test_shutdown_drains_accepted_command_before_stopping_adapter(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
@@ -12694,19 +12727,28 @@ class DaemonShutdownTests(unittest.IsolatedAsyncioTestCase):
             submit = asyncio.create_task(supervisor.command_queue.submit(command, execute))
             await command_started.wait()
 
-            stop_attempted = asyncio.Event()
+            stop_attempted: set[str] = set()
 
-            async def rotation_like_stop() -> None:
+            async def stop_race(label: str) -> None:
                 while not supervisor.shutdown_phase.input_frozen:
                     await asyncio.sleep(0)
-                stop_attempted.set()
+                stop_attempted.add(label)
                 with self.assertRaises(AssertionError):
-                    await supervisor._stop_adapter_for_shutdown(adapter)  # noqa: SLF001
+                    await supervisor._stop_adapter_for_rotation(adapter)  # noqa: SLF001
 
-            supervisor._spawn_monitor_task(  # noqa: SLF001 - shutdown race fixture
-                rotation_like_stop(),
-                name="shutdown-rotation-race",
+            auth_recovery_task = supervisor._spawn_monitor_task(
+                stop_race("auth-recovery"),
+                name="shutdown-auth-recovery-race",
             )
+            supervisor.auth_dead_recoveries[record.run_id] = auth_recovery_task
+            supervisor._spawn_monitor_task(  # noqa: SLF001 - shutdown race fixture
+                stop_race("monitor"),
+                name="shutdown-monitor-race",
+            )
+            rotation_task = asyncio.create_task(
+                stop_race("rotation"), name="shutdown-rotation-race"
+            )
+            supervisor.codex_rotation_task = rotation_task  # noqa: SLF001
             lock = agent_daemon._acquire_single_instance(paths)
 
             class ClosedServer:
@@ -12727,7 +12769,7 @@ class DaemonShutdownTests(unittest.IsolatedAsyncioTestCase):
             release_command.set()
             self.assertEqual(await asyncio.wait_for(submit, timeout=5), {"status": "sent"})
             await asyncio.wait_for(shutdown, timeout=5)
-            self.assertTrue(stop_attempted.is_set())
+            self.assertEqual(stop_attempted, {"auth-recovery", "monitor", "rotation"})
 
             restarted = Supervisor(RunStore(paths), FixtureAdapterFactory(FIXTURES))
 
