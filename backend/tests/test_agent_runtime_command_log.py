@@ -15,12 +15,43 @@ from backend.app.agent_runtime.command_log import (
     CommandRetryable,
     decide,
 )
-from backend.app.agent_runtime.fake import FixtureAdapterFactory
+from backend.app.agent_runtime.fake import CodexFixtureAdapter, FixtureAdapterFactory
 from backend.app.agent_runtime.supervisor import Supervisor
 from backend.app.agent_runtime.store import RunStore, RuntimePaths
 from backend.app.agent_runtime.types import ProviderKind, RunRecord
 
 FIXTURES = Path(__file__).parent / "fixtures" / "agent_runtime"
+
+
+class BlockingRecoveryAdapter(CodexFixtureAdapter):
+    def __init__(self, *args, release: asyncio.Event, started: asyncio.Event, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.release = release
+        self.started = started
+
+    async def send_now(self, message: str):
+        self.started.set()
+        await self.release.wait()
+        return await super().send_now(message)
+
+
+class BlockingRecoveryFactory(FixtureAdapterFactory):
+    def __init__(self, *args, release: asyncio.Event, started: asyncio.Event, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.release = release
+        self.started = started
+
+    def __call__(self, record):
+        if record.agent_id == "WIKI-A":
+            return BlockingRecoveryAdapter(
+                self.fixture_dir / "codex_app_server_success.jsonl",
+                self.fixture_dir / "codex_app_server_control.jsonl",
+                pid=self.pid,
+                generation=record.provider_generation,
+                release=self.release,
+                started=self.started,
+            )
+        return super().__call__(record)
 
 
 async def _raise_runtime_error(message: str) -> None:
@@ -283,27 +314,36 @@ class CommandLogTests(unittest.TestCase):
 
         self.assertEqual(asyncio.run(run()), ["spawn-a", "spawn-b"])
 
-    def test_dispatch_send_does_not_block_on_another_agent_recovery(self) -> None:
+    def test_wiki_b_dispatch_does_not_wait_on_wiki_a_recovery(self) -> None:
         async def run() -> None:
             with tempfile.TemporaryDirectory() as tmp:
                 root = Path(tmp)
                 worktree = root / "worktree"
                 worktree.mkdir()
-                store = RunStore(
-                    RuntimePaths(
-                        runtime_dir=root / "runtime",
-                        socket_path=root / "runtime" / "supervisor.sock",
-                        registry_path=root / "registry.json",
-                        archive_dir=root / "archive",
-                        status_dir=root / "status",
-                    )
+                paths = RuntimePaths(
+                    runtime_dir=root / "runtime",
+                    socket_path=root / "runtime" / "supervisor.sock",
+                    registry_path=root / "registry.json",
+                    archive_dir=root / "archive",
+                    status_dir=root / "status",
                 )
-                supervisor = Supervisor(store, FixtureAdapterFactory(FIXTURES))
-                await supervisor.start_run(
+                store = RunStore(paths)
+                release_a = asyncio.Event()
+                recovery_started = asyncio.Event()
+                supervisor = Supervisor(
+                    store,
+                    BlockingRecoveryFactory(
+                        FIXTURES,
+                        release=release_a,
+                        started=recovery_started,
+                    ),
+                )
+                run_a = await supervisor.start_run(
                     agent_id="WIKI-A",
                     provider=ProviderKind.CODEX,
                     role="implement",
                     model="fixture-codex",
+                    effort="high",
                     worktree=str(worktree),
                     prompt="recovery barrier A",
                 )
@@ -312,42 +352,56 @@ class CommandLogTests(unittest.TestCase):
                     provider=ProviderKind.CODEX,
                     role="implement",
                     model="fixture-codex",
+                    effort="high",
                     worktree=str(worktree),
                     prompt="dispatch barrier B",
                 )
-                release_a = asyncio.Event()
-                original_recover = supervisor.command_queue.recover_pending_for
-
-                async def scoped_recover(agent_id: str) -> None:
-                    if agent_id == "WIKI-A":
-                        await release_a.wait()
-                        return
-                    await original_recover(agent_id)
-
-                with mock.patch.object(
-                    supervisor.command_queue,
-                    "recover_pending_for",
-                    side_effect=scoped_recover,
+                for agent_id, run_id in (
+                    ("WIKI-A", run_a.run_id),
+                    ("WIKI-B", run_b.run_id),
                 ):
-                    a_recovery = asyncio.create_task(
-                        supervisor.command_queue.recover_pending_for("WIKI-A")
+                    store.command_log.seed_projection(
+                        agent_id,
+                        {agent_id: {"current": {"run_id": run_id}}},
                     )
-                    await asyncio.sleep(0)
-                    result = await asyncio.wait_for(
-                        supervisor.dispatch(
-                            "run/send_now",
-                            {
-                                "run_id": run_b.run_id,
-                                "text": "send through dispatch",
-                                "request_id": "dispatch-barrier-b",
-                            },
-                        ),
-                        timeout=0.5,
-                    )
-                    self.assertEqual(result["status"], "sent")
-                    self.assertFalse(a_recovery.done())
-                    release_a.set()
-                    await a_recovery
+
+                pending = AgentCommand.steer(
+                    agent_id="WIKI-A",
+                    request_id="wiki-a-blocked-1",
+                    payload={"run_id": run_a.run_id, "text": "blocked"},
+                )
+                store.command_log.append_intent(
+                    pending,
+                    store.command_state_for("WIKI-A"),
+                )
+                a_recovery = asyncio.create_task(
+                    supervisor.command_queue.recover_pending_for("WIKI-A")
+                )
+                await asyncio.wait_for(recovery_started.wait(), timeout=2)
+
+                t0 = asyncio.get_running_loop().time()
+                result = await asyncio.wait_for(
+                    supervisor.dispatch(
+                        "run/send_now",
+                        {
+                            "agent_id": "WIKI-B",
+                            "request_id": "wiki-b-send-1",
+                            "text": "should not wait on wiki-a",
+                        },
+                    ),
+                    timeout=2.0,
+                )
+                elapsed = asyncio.get_running_loop().time() - t0
+                self.assertLess(
+                    elapsed,
+                    0.5,
+                    f"WIKI-B dispatch waited {elapsed:.2f}s on WIKI-A recovery",
+                )
+                self.assertEqual(result["status"], "sent")
+                self.assertFalse(a_recovery.done())
+
+                release_a.set()
+                await asyncio.wait_for(a_recovery, timeout=2)
                 await supervisor.close()
 
         asyncio.run(run())

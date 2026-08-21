@@ -91,7 +91,6 @@ _RUN_SCOPED_METHODS = frozenset(
         "events/read",
     }
 )
-_AGGREGATE_READ_METHODS = frozenset({"run/list"})
 _PROJECTION_READ_METHODS = frozenset({"run/list", "run/status"})
 DEFAULT_APPROVAL_RECOVERY_TIMEOUT_SECONDS = 30.0
 AMBIGUOUS_SEND_ECHO_GRACE_SECONDS = 0.05
@@ -3069,6 +3068,9 @@ Preserve the same identity, role, worktree, orchestrator grouping, PR gates, and
             raise StoreConflict(
                 "provider PID is live without attached control; refusing duplicate resume"
             )
+        # A rebuild swaps the shard after its snapshot. Wait for that swap
+        # before any resume can append events to the original shard.
+        await self._ensure_projection_ready(run_id)
         # All resume callers share this dead-transport boundary: explicit
         # resume, account rotation, auth recovery, and startup recovery must
         # retire pre-upgrade overflow before a new adapter can emit events.
@@ -3330,13 +3332,6 @@ Preserve the same identity, role, worktree, orchestrator grouping, PR gates, and
         await asyncio.shield(task)
         error = self.projection_rebuild_errors.get(run_id)
         if error is not None:
-            raise CommandRetryable(
-                f"event projection is unavailable for run {run_id}: {error}"
-            ) from error
-
-    async def _ensure_aggregate_projection_ready(self) -> None:
-        if self.projection_rebuild_errors:
-            run_id, error = next(iter(self.projection_rebuild_errors.items()))
             raise CommandRetryable(
                 f"event projection is unavailable for run {run_id}: {error}"
             ) from error
@@ -4245,12 +4240,6 @@ Preserve the same identity, role, worktree, orchestrator grouping, PR gates, and
     async def _quiesce_rotation_runs_locked(self, journal: dict[str, Any]) -> None:
         operation_id = str(journal["operation_id"])
         rows = journal["runs"]
-        for row in rows:
-            self.store.mark_quiesce_intent(
-                row["run_id"],
-                operation_id,
-                row["session_id"],
-            )
         journal["phase"] = "quiescing"
         self._write_rotation_journal(journal)
 
@@ -4279,6 +4268,11 @@ Preserve the same identity, role, worktree, orchestrator grouping, PR gates, and
         for row in rows:
             run_id = row["run_id"]
             async with self._run_lock(run_id):
+                self.store.mark_quiesce_intent(
+                    run_id,
+                    operation_id,
+                    row["session_id"],
+                )
                 adapter = self.adapters.get(run_id)
                 if adapter is not None:
                     status = await adapter.status()
@@ -5285,9 +5279,9 @@ Preserve the same identity, role, worktree, orchestrator grouping, PR gates, and
             self.store.command_log.update_steer_effect(
                 "run/send_now", effect_id, "sent"
             )
-        await self._flush_deferred_delivery_events(run_id)
         record = self.store.update_adapter_status(run_id, status)
         record = self.store.clear_automatic_resume_suppression(run_id)
+        await self._flush_deferred_delivery_events(run_id)
         await self._publish_agent_change(record.agent_id)
         response: dict[str, Any] = {"status": "sent"}
         if pending_id is not None and expose_pending_id:
@@ -6309,8 +6303,6 @@ Preserve the same identity, role, worktree, orchestrator grouping, PR gates, and
                     # record when no current run remains.
                     if method != "run/archive":
                         raise
-            elif method in _AGGREGATE_READ_METHODS:
-                await self._ensure_aggregate_projection_ready()
         if method in _COMMAND_METHODS:
             self._reject_archive_inflight(params)
             command_params = dict(params)

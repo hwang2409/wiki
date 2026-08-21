@@ -95,6 +95,41 @@ class StartFailureAdapter(CodexFixtureAdapter):
         raise RuntimeError("fixture start failure")
 
 
+class ShutdownRaceAdapter(CodexFixtureAdapter):
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self._send_gate: tuple[asyncio.Event, asyncio.Event] | None = None
+
+    async def send_now(self, message: str) -> AdapterStatus:
+        gate = self._send_gate
+        if gate is not None:
+            pinned, may_complete = gate
+            pinned.set()
+            await may_complete.wait()
+        return await super().send_now(message)
+
+    async def emit_provider_event(self, payload: dict[str, Any]) -> None:
+        await self._events.put(  # noqa: SLF001 - production event-path fixture
+            ProviderEvent(
+                ProviderKind.CODEX,
+                payload,
+                generation=max(1, self.snapshot().generation),
+            )
+        )
+
+
+class ShutdownRaceFactory(FixtureAdapterFactory):
+    def __call__(self, record: RunRecord) -> ProviderAdapter:
+        if record.provider is ProviderKind.CODEX:
+            return ShutdownRaceAdapter(
+                self.fixture_dir / "codex_app_server_success.jsonl",
+                self.fixture_dir / "codex_app_server_control.jsonl",
+                pid=self.pid,
+                generation=record.provider_generation,
+            )
+        return super().__call__(record)
+
+
 class ResumeFailureAdapter(CodexFixtureAdapter):
     def __init__(self, *args, attempts: list[str], **kwargs):
         super().__init__(*args, **kwargs)
@@ -11541,6 +11576,114 @@ class UnixClientTests(unittest.IsolatedAsyncioTestCase):
             await server.close()
             await restarted.close()
 
+    async def test_rotation_waits_for_projection_swap_before_resuming_run(self) -> None:
+        await self.supervisor.close()
+        auth = self.root / "codex" / "auth.json"
+        account_dir = self.root / "codex-accounts"
+        for name in ("alpha", "beta"):
+            account = account_dir / name
+            account.mkdir(parents=True)
+            (account / "auth.json").write_text(
+                json.dumps({"tokens": name}), encoding="utf-8"
+            )
+        auth.parent.mkdir(parents=True)
+        auth.write_text('{"tokens":"alpha"}', encoding="utf-8")
+        env = {
+            "WIKI_CODEX_AUTH_PATH": str(auth),
+            "WIKI_CODEX_ACCOUNTS_DIR": str(account_dir),
+            "WIKI_ROTATION_LOG_PATH": str(account_dir / "rotation.log"),
+            "WIKI_CODEX_SESSIONS_DIR": str(self.root / "codex" / "sessions"),
+            "WIKI_ACCOUNT_HOME_OVERRIDE": str(self.root / "account-home"),
+            "WIKI_CLI_PATH": str(self.root / "missing-wiki"),
+            "TMUX": "",
+            "TMUX_PANE": "",
+        }
+        with mock.patch.dict(os.environ, env):
+            accounts.write_state(
+                accounts.AccountState(
+                    active="alpha",
+                    accounts={
+                        "alpha": {"limit_reset_at": None},
+                        "beta": {"limit_reset_at": None},
+                    },
+                )
+            )
+        self.supervisor = Supervisor(
+            self.store,
+            FixtureAdapterFactory(FIXTURES, pid=987_654),
+            pid_alive=lambda _pid: False,
+        )
+        record = await self.supervisor.start_run(
+            agent_id="WIKI-ROTATION-REBUILD-RACE",
+            provider=ProviderKind.CODEX,
+            role="implement",
+            model="fixture-codex",
+            effort="high",
+            worktree=str(self.worktree),
+            prompt="rotation rebuild race",
+        )
+        await self.supervisor._close_and_drain_adapter(  # noqa: SLF001 - boot fixture
+            record.run_id,
+            self.supervisor.adapters[record.run_id],
+        )
+        self.store.append_raw(
+            record.run_id,
+            provider=ProviderKind.CODEX.value,
+            direction="provider",
+            payload={"method": "turn/diff/updated", "params": {"diff": "late"}},
+        )
+        rebuild_started = threading.Event()
+        release_rebuild = threading.Event()
+        original_rebuild = self.supervisor._rebuild_materializer_database_sync
+
+        def paused_rebuild(run_id: str) -> None:
+            rebuild_started.set()
+            if not release_rebuild.wait(timeout=5):
+                raise AssertionError("projection rebuild was not released")
+            original_rebuild(run_id)
+
+        operation_id = "00000000-0000-4000-8000-000000000360"
+        with (
+            mock.patch.dict(os.environ, env),
+            mock.patch.object(accounts, "codex_login_status", return_value=True),
+            mock.patch.object(
+                self.supervisor,
+                "_rebuild_materializer_database_sync",
+                side_effect=paused_rebuild,
+            ),
+        ):
+            self.supervisor.prepare_startup_recovery()
+            self.assertTrue(await asyncio.to_thread(rebuild_started.wait, 5))
+            rotation = asyncio.create_task(
+                self.supervisor.request_codex_rotation(
+                    operation_id=operation_id,
+                    force_target="beta",
+                )
+            )
+            for _ in range(200):
+                current = self.store.get(record.run_id)
+                if (
+                    current.quiesce_operation_id == operation_id
+                    and record.run_id not in self.supervisor.adapters
+                ):
+                    break
+                await asyncio.sleep(0.01)
+            else:
+                self.fail("rotation did not quiesce the run")
+            self.assertFalse(rotation.done())
+            release_rebuild.set()
+            result = await asyncio.wait_for(rotation, timeout=10)
+
+        self.assertEqual(result["revived_run_ids"], {record.agent_id: record.run_id})
+        raw_seqs = {
+            int(event["seq"])
+            for event in self.store.iter_raw_events(record.run_id)
+        }
+        self.assertEqual(
+            self.supervisor.event_store.materialized_raw_seqs(record.run_id),
+            raw_seqs,
+        )
+
     async def test_startup_recovery_waits_for_retryable_intent_before_ready(self) -> None:
         record = self.store.create(
             RunRecord.new(
@@ -12760,117 +12903,130 @@ class DaemonShutdownTests(unittest.IsolatedAsyncioTestCase):
             ["_stop_adapter_for_shutdown", "_stop_adapter_for_rotation"],
         )
 
-    async def test_shutdown_drains_accepted_command_before_stopping_adapter(self) -> None:
+    async def test_real_production_tasks_race_accepted_send_during_shutdown(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
             paths = _paths(root)
             store = RunStore(paths)
-            supervisor = Supervisor(store, FixtureAdapterFactory(FIXTURES))
-            records: dict[str, RunRecord] = {}
-            adapters: dict[str, ProviderAdapter] = {}
-            for label in ("auth-recovery", "rotation", "monitor"):
-                record = store.create(
-                    RunRecord.new(
-                        agent_id=f"WIKI-SHUTDOWN-{label.upper()}",
-                        provider=ProviderKind.CODEX,
-                        role="implement",
-                        model="fixture-codex",
-                        worktree=str(root),
-                        prompt=f"shutdown {label} race",
+            auth = root / "codex" / "auth.json"
+            account_dir = root / "codex-accounts"
+            for name in ("alpha", "beta"):
+                account = account_dir / name
+                account.mkdir(parents=True)
+                (account / "auth.json").write_text(
+                    json.dumps({"tokens": name}), encoding="utf-8"
+                )
+            auth.parent.mkdir(parents=True)
+            auth.write_text('{"tokens":"alpha"}', encoding="utf-8")
+            env = {
+                "WIKI_CODEX_AUTH_PATH": str(auth),
+                "WIKI_CODEX_ACCOUNTS_DIR": str(account_dir),
+                "WIKI_ROTATION_LOG_PATH": str(account_dir / "rotation.log"),
+                "WIKI_CODEX_SESSIONS_DIR": str(root / "codex" / "sessions"),
+                "WIKI_ACCOUNT_HOME_OVERRIDE": str(root / "account-home"),
+                "WIKI_CLI_PATH": str(root / "missing-wiki"),
+                "TMUX": "",
+                "TMUX_PANE": "",
+            }
+            with mock.patch.dict(os.environ, env):
+                accounts.write_state(
+                    accounts.AccountState(
+                        active="alpha",
+                        accounts={
+                            "alpha": {"limit_reset_at": None},
+                            "beta": {"limit_reset_at": None},
+                        },
                     )
                 )
-                adapter = supervisor.adapter_factory(record)
-                supervisor._attach_adapter(record.run_id, adapter)  # noqa: SLF001
-                records[label] = record
-                adapters[label] = adapter
-            command_record = records["auth-recovery"]
-            command_adapter = adapters["auth-recovery"]
-            command_started = asyncio.Event()
-            release_command = asyncio.Event()
-
-            original_send = command_adapter.send_now
-
-            async def tracked_send(message: str) -> AdapterStatus:
-                command_started.set()
-                await release_command.wait()
-                return await original_send(message)
-
-            command_adapter.send_now = tracked_send  # type: ignore[method-assign]
-            command_params = {
-                "run_id": command_record.run_id,
-                "text": "replay me",
-                "request_id": "shutdown-command",
-            }
-            submit = asyncio.create_task(
-                supervisor.dispatch("run/send_now", command_params)
+            supervisor = Supervisor(
+                store,
+                ShutdownRaceFactory(FIXTURES, pid=987_654),
+                pid_alive=lambda _pid: False,
             )
-            await command_started.wait()
-
-            stop_attempted: set[str] = set()
-            rotation_guard_calls = 0
-            original_rotation_stop = supervisor._stop_adapter_for_rotation
-
-            async def tracked_rotation_stop(adapter: ProviderAdapter) -> AdapterStatus:
-                nonlocal rotation_guard_calls
-                rotation_guard_calls += 1
-                return await original_rotation_stop(adapter)
-
-            supervisor._stop_adapter_for_rotation = tracked_rotation_stop  # type: ignore[method-assign]
-
-            async def stop_race(label: str, run_id: str) -> None:
-                while not supervisor.shutdown_phase.input_frozen:
-                    await asyncio.sleep(0)
-                stop_attempted.add(label)
-                try:
-                    await supervisor.stop(run_id)
-                except (AssertionError, CommandRetryable, StoreConflict):
-                    pass
-
-            supervisor._spawn_monitor_task(
-                stop_race("auth-recovery", records["auth-recovery"].run_id),
-                name="shutdown-auth-recovery-race",
+            record = await supervisor.start_run(
+                agent_id="WIKI-RACE-1",
+                provider=ProviderKind.CODEX,
+                role="implement",
+                model="fixture-codex",
+                effort="high",
+                worktree=str(root),
+                prompt="shutdown race",
             )
-            supervisor._spawn_monitor_task(  # noqa: SLF001 - shutdown race fixture
-                stop_race("monitor", records["monitor"].run_id),
-                name="shutdown-monitor-race",
-            )
-            rotation_task = asyncio.create_task(
-                stop_race("rotation", records["rotation"].run_id),
-                name="shutdown-rotation-race",
-            )
-            supervisor.codex_rotation_task = rotation_task  # noqa: SLF001
-            lock = agent_daemon._acquire_single_instance(paths)
-
-            class ClosedServer:
-                async def close(self) -> None:
-                    pass
-
-            shutdown = asyncio.create_task(
-                agent_daemon._shutdown(
-                    ClosedServer(),
-                    supervisor,
-                    [],
-                    lock,
-                    paths,
+            adapter = supervisor.adapters[record.run_id]
+            assert isinstance(adapter, ShutdownRaceAdapter)
+            send_pinned = asyncio.Event()
+            send_may_complete = asyncio.Event()
+            adapter._send_gate = (send_pinned, send_may_complete)
+            send_task = asyncio.create_task(
+                supervisor.dispatch(
+                    "run/send_now",
+                    {
+                        "agent_id": "WIKI-RACE-1",
+                        "request_id": "race-send-1",
+                        "text": "race",
+                    },
                 )
             )
-            await asyncio.sleep(0)
-            self.assertFalse(submit.done())
-            release_command.set()
-            self.assertEqual(
-                await asyncio.wait_for(submit, timeout=5), {"status": "sent"}
-            )
-            await asyncio.wait_for(shutdown, timeout=5)
-            self.assertEqual(stop_attempted, {"auth-recovery", "monitor", "rotation"})
-            self.assertEqual(rotation_guard_calls, 3)
+            await send_pinned.wait()
 
-            restarted = Supervisor(RunStore(paths), FixtureAdapterFactory(FIXTURES))
-            replay = await restarted.dispatch(
-                "run/send_now",
-                command_params,
-            )
-            self.assertEqual(replay, {"status": "sent"})
-            await restarted.close()
+            with mock.patch.dict(os.environ, env), mock.patch.object(
+                accounts, "codex_login_status", return_value=True
+            ):
+                await adapter.emit_provider_event(
+                    {
+                        "method": "error",
+                        "params": {
+                            "message": (
+                                "Your access token could not be refreshed because you "
+                                "have since logged out or signed in to another account."
+                            ),
+                            "willRetry": False,
+                        },
+                    }
+                )
+                await adapter.emit_provider_event(
+                    {
+                        "method": "account/rateLimits/updated",
+                        "params": {
+                            "rateLimits": {
+                                "primary": {"resetsAt": 1_750_001_234},
+                                "rateLimitReachedType": "rate_limit_reached",
+                            }
+                        },
+                    }
+                )
+                for _ in range(200):
+                    task_names = {task.get_name() for task in supervisor.monitor_tasks}
+                    if {
+                        f"codex-auth-dead-{record.run_id}",
+                        f"codex-rate-limit-{record.run_id}",
+                    } <= task_names:
+                        break
+                    await asyncio.sleep(0.01)
+                else:
+                    self.fail("real auth and rotation monitor tasks did not start")
+
+                lock = agent_daemon._acquire_single_instance(paths)
+
+                class ClosedServer:
+                    async def close(self) -> None:
+                        pass
+
+                shutdown = asyncio.create_task(
+                    agent_daemon._shutdown(
+                        ClosedServer(),
+                        supervisor,
+                        [],
+                        lock,
+                        paths,
+                    )
+                )
+                send_may_complete.set()
+                self.assertEqual(
+                    await asyncio.wait_for(send_task, timeout=5),
+                    {"status": "sent"},
+                )
+                await asyncio.wait_for(shutdown, timeout=5)
 
     async def test_shutdown_drains_shielded_recovery_write_before_lock_release(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
