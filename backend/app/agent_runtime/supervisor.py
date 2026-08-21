@@ -573,6 +573,7 @@ class Supervisor:
         self._materializer_executor_closed = False
         self.projection_rebuild_tasks: dict[str, asyncio.Task[None]] = {}
         self.projection_rebuild_errors: dict[str, BaseException] = {}
+        self._post_snapshot_hook: Callable[[str], None] | None = None
         self.projection_rebuilds_started = False
         self.projection_rebuild_ready = asyncio.Event()
         self.projection_rebuild_ready.set()
@@ -3781,6 +3782,8 @@ Preserve the same identity, role, worktree, orchestrator grouping, PR gates, and
                 connection.execute("PRAGMA wal_checkpoint(TRUNCATE)")
             rebuilt.close()
             rebuilt = None
+            if self._post_snapshot_hook is not None:
+                self._post_snapshot_hook(run_id)
             target.replace_run_from(temporary_path, run_id)
             self.materializer_failed_runs.pop(run_id, None)
         finally:
@@ -5690,7 +5693,9 @@ Preserve the same identity, role, worktree, orchestrator grouping, PR gates, and
                 f"duplicate raw_seq={duplicates}"
             )
         if raw_seqs:
-            missing = sorted(set(range(1, max(raw_seqs) + 1)) - set(raw_seqs))
+            missing = sorted(
+                set(range(min(raw_seqs), max(raw_seqs) + 1)) - set(raw_seqs)
+            )
             if missing:
                 raise StoreError(
                     f"archive event parity failed for {run_id}: missing={missing}"

@@ -10998,6 +10998,22 @@ class SupervisorTests(unittest.IsolatedAsyncioTestCase):
         with self.assertRaisesRegex(StoreError, r"duplicate raw_seq=\[1\]"):
             await self.supervisor.archive(duplicate.run_id)
 
+        baseline = seed(
+            "WIKI-ARCHIVE-BASELINE",
+            [5, 6, 7],
+            [(5, "a"), (6, "b"), (7, "c")],
+        )
+        archived = await self.supervisor.archive(baseline.run_id)
+        self.assertEqual(archived.run_id, baseline.run_id)
+
+        shifted_gap = seed(
+            "WIKI-ARCHIVE-SHIFTED-GAP",
+            [5, 6, 8],
+            [(5, "a"), (6, "b"), (8, "c")],
+        )
+        with self.assertRaisesRegex(StoreError, r"missing=\[7\]"):
+            await self.supervisor.archive(shifted_gap.run_id)
+
         fanout = seed(
             "WIKI-ARCHIVE-FANOUT",
             [1, 2],
@@ -11634,45 +11650,83 @@ class UnixClientTests(unittest.IsolatedAsyncioTestCase):
         )
         rebuild_started = threading.Event()
         release_rebuild = threading.Event()
-        original_rebuild = self.supervisor._rebuild_materializer_database_sync
+        snapshot_raw_seq: int | None = None
 
-        def paused_rebuild(run_id: str) -> None:
+        def paused_after_snapshot(run_id: str) -> None:
+            nonlocal snapshot_raw_seq
+            snapshot_raw_seq = max(
+                int(event["seq"])
+                for event in self.store.read_raw_events(run_id)
+            )
             rebuild_started.set()
             if not release_rebuild.wait(timeout=5):
                 raise AssertionError("projection rebuild was not released")
-            original_rebuild(run_id)
 
         operation_id = "00000000-0000-4000-8000-000000000360"
+        self.supervisor._post_snapshot_hook = paused_after_snapshot  # noqa: SLF001
         with (
             mock.patch.dict(os.environ, env),
             mock.patch.object(accounts, "codex_login_status", return_value=True),
-            mock.patch.object(
-                self.supervisor,
-                "_rebuild_materializer_database_sync",
-                side_effect=paused_rebuild,
-            ),
         ):
-            self.supervisor.prepare_startup_recovery()
-            self.assertTrue(await asyncio.to_thread(rebuild_started.wait, 5))
-            rotation = asyncio.create_task(
-                self.supervisor.request_codex_rotation(
-                    operation_id=operation_id,
-                    force_target="beta",
+            try:
+                self.supervisor.prepare_startup_recovery()
+                self.assertTrue(await asyncio.to_thread(rebuild_started.wait, 5))
+                rotation = asyncio.create_task(
+                    self.supervisor.dispatch(
+                        "fleet/rotate_codex",
+                        {"operation_id": operation_id, "account": "beta"},
+                    )
                 )
-            )
-            for _ in range(200):
-                current = self.store.get(record.run_id)
-                if (
-                    current.quiesce_operation_id == operation_id
-                    and record.run_id not in self.supervisor.adapters
-                ):
-                    break
-                await asyncio.sleep(0.01)
-            else:
-                self.fail("rotation did not quiesce the run")
-            self.assertFalse(rotation.done())
-            release_rebuild.set()
-            result = await asyncio.wait_for(rotation, timeout=10)
+                for _ in range(200):
+                    current = self.store.get(record.run_id)
+                    if (
+                        current.quiesce_operation_id == operation_id
+                        and record.run_id not in self.supervisor.adapters
+                    ):
+                        break
+                    await asyncio.sleep(0.01)
+                else:
+                    self.fail("rotation did not quiesce the run")
+                self.assertFalse(rotation.done())
+                release_rebuild.set()
+                result = await asyncio.wait_for(rotation, timeout=10)
+
+                resumed_adapter = self.supervisor.adapters[record.run_id]
+                await resumed_adapter._events.put(  # noqa: SLF001 - race fixture
+                    ProviderEvent(
+                        ProviderKind.CODEX,
+                        {
+                            "method": "rotation/resumed-write",
+                            "params": {"after": snapshot_raw_seq},
+                        },
+                        generation=max(1, resumed_adapter.snapshot().generation),
+                    )
+                )
+                for _ in range(200):
+                    resumed_events = [
+                        event
+                        for event in self.store.read_raw_events(record.run_id)
+                        if event["payload"].get("method") == "rotation/resumed-write"
+                    ]
+                    if resumed_events:
+                        break
+                    await asyncio.sleep(0.01)
+                else:
+                    self.fail("rotation did not produce a resumed raw write")
+                assert snapshot_raw_seq is not None
+                resumed_seq = int(resumed_events[0]["seq"])
+                self.assertGreater(resumed_seq, snapshot_raw_seq)
+                self.assertGreaterEqual(
+                    max(
+                        self.supervisor.event_store.materialized_raw_seqs(
+                            record.run_id
+                        )
+                    ),
+                    resumed_seq,
+                )
+            finally:
+                self.supervisor._post_snapshot_hook = None  # noqa: SLF001
+                release_rebuild.set()
 
         self.assertEqual(result["revived_run_ids"], {record.agent_id: record.run_id})
         raw_seqs = {
@@ -12943,17 +12997,40 @@ class DaemonShutdownTests(unittest.IsolatedAsyncioTestCase):
                 ShutdownRaceFactory(FIXTURES, pid=987_654),
                 pid_alive=lambda _pid: False,
             )
+            orchestrator = await supervisor.start_run(
+                agent_id="WIKI-360-ORCH",
+                provider=ProviderKind.CLAUDE,
+                role="orchestrator",
+                model="fixture-claude",
+                worktree=str(root),
+                prompt="shutdown race orchestrator",
+            )
             record = await supervisor.start_run(
-                agent_id="WIKI-RACE-1",
+                agent_id="WIKI-360-RACE-1",
                 provider=ProviderKind.CODEX,
                 role="implement",
                 model="fixture-codex",
                 effort="high",
                 worktree=str(root),
                 prompt="shutdown race",
+                orchestrator_id=orchestrator.agent_id,
             )
             adapter = supervisor.adapters[record.run_id]
             assert isinstance(adapter, ShutdownRaceAdapter)
+            status_path = store.status_path(record.agent_id)
+            status_path.parent.mkdir(parents=True, exist_ok=True)
+            status_path.write_text(
+                json.dumps({"state": "working", "step": "race"}),
+                encoding="utf-8",
+            )
+            fleet_monitor = agent_daemon.FleetMonitor(
+                store,
+                agent_daemon.build_fleet_monitor_dispatch(supervisor),
+                staleness_threshold=1.0,
+            )
+            await fleet_monitor.tick()
+            stale_at = time.time() - 120.0
+            os.utime(status_path, (stale_at, stale_at))
             send_pinned = asyncio.Event()
             send_may_complete = asyncio.Event()
             adapter._send_gate = (send_pinned, send_may_complete)
@@ -12961,13 +13038,23 @@ class DaemonShutdownTests(unittest.IsolatedAsyncioTestCase):
                 supervisor.dispatch(
                     "run/send_now",
                     {
-                        "agent_id": "WIKI-RACE-1",
+                        "agent_id": "WIKI-360-RACE-1",
                         "request_id": "race-send-1",
                         "text": "race",
                     },
                 )
             )
             await send_pinned.wait()
+            stale_tick = asyncio.create_task(fleet_monitor.tick())
+            for _ in range(200):
+                if any(
+                    command.payload.get("source") == "fleet-monitor"
+                    for command in store.command_log.pending()
+                ):
+                    break
+                await asyncio.sleep(0.01)
+            else:
+                self.fail("real FleetMonitor staleness dispatch did not queue")
 
             with mock.patch.dict(os.environ, env), mock.patch.object(
                 accounts, "codex_login_status", return_value=True
@@ -13027,6 +13114,17 @@ class DaemonShutdownTests(unittest.IsolatedAsyncioTestCase):
                     {"status": "sent"},
                 )
                 await asyncio.wait_for(shutdown, timeout=5)
+                stale_notifications = await asyncio.wait_for(stale_tick, timeout=5)
+                self.assertTrue(
+                    any(
+                        notification.event_type == "staleness"
+                        for notification in stale_notifications
+                    )
+                )
+            receipt = store.command_log.receipt("run/send_now", "race-send-1")
+            self.assertIsNotNone(receipt)
+            assert receipt is not None
+            self.assertTrue(receipt.ok)
 
     async def test_shutdown_drains_shielded_recovery_write_before_lock_release(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
