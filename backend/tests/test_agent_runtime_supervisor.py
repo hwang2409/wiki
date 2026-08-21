@@ -498,6 +498,44 @@ class SupervisorTests(unittest.IsolatedAsyncioTestCase):
             {int(raw["seq"]) for raw in raw_rows},
         )
 
+    async def test_archive_allows_multiple_normalized_rows_for_one_raw_seq(self) -> None:
+        record = self.store.create(
+            RunRecord.new(
+                agent_id="WIKI-ARCHIVE-MULTI-ROW",
+                provider=ProviderKind.CODEX,
+                role="implement",
+                model="fixture-codex",
+                worktree=str(self.worktree),
+                prompt="multi-row archive fixture",
+            )
+        )
+        raw = self.store.append_raw(
+            record.run_id,
+            provider=ProviderKind.CODEX.value,
+            direction="provider",
+            payload={"method": "item/completed", "params": {"index": 1}},
+        )
+        for index in range(3):
+            self.store.append_normalized(
+                record.run_id,
+                raw_seq=int(raw["seq"]),
+                disposition=EventDisposition.RENDERED,
+                kind="artifact",
+                payload={"index": index},
+            )
+        self.store.transition(record.run_id, LifecycleState.COMPLETED)
+
+        with mock.patch.object(self.store, "_export_archive_events", return_value=False):
+            await self.supervisor.archive(record.run_id, outcome="closed")
+
+        sessions = sorted((self.paths.archive_dir / record.agent_id).iterdir())
+        archived_events = [
+            json.loads(line)
+            for line in (sessions[-1] / "events.jsonl").read_text().splitlines()
+        ]
+        self.assertEqual(len(archived_events), 3)
+        self.assertEqual({int(event["raw_seq"]) for event in archived_events}, {1})
+
     async def test_terminal_recovery_uses_raw_coverage_at_256_row_boundary(self) -> None:
         cases = (
             ("boundary-orphan", 255),
@@ -11386,8 +11424,10 @@ class UnixClientTests(unittest.IsolatedAsyncioTestCase):
                 listed = await asyncio.to_thread(client.request, "run/list")
                 self.assertEqual(len(listed["runs"]), len(records) + 1)
                 self.assertFalse(recovery.done())
+                self.assertFalse(restarted.startup_recovery_succeeded.is_set())
                 release_pending_recovery.set()
                 await asyncio.wait_for(recovery, timeout=10)
+                self.assertTrue(restarted.startup_recovery_succeeded.is_set())
                 await asyncio.sleep(0.1)
                 status_path.write_text(
                     json.dumps(
@@ -11422,6 +11462,53 @@ class UnixClientTests(unittest.IsolatedAsyncioTestCase):
                 await asyncio.gather(fleet_task, return_exceptions=True)
             await server.close()
             await restarted.close()
+
+    async def test_startup_recovery_waits_for_retryable_intent_before_ready(self) -> None:
+        record = self.store.create(
+            RunRecord.new(
+                agent_id="WIKI-STARTUP-RETRY",
+                provider=ProviderKind.CODEX,
+                role="implement",
+                model="fixture-codex",
+                worktree=str(self.worktree),
+                prompt="startup retry fixture",
+            )
+        )
+        command = AgentCommand.steer(
+            agent_id="WIKI-STARTUP-RETRY",
+            request_id="startup-retry",
+            payload={
+                "method": "run/send_now",
+                "run_id": record.run_id,
+                "text": "retry me",
+            },
+        )
+        self.store.command_log.append_intent(
+            command,
+            self.store.command_state_for(command.agent_id),
+        )
+        attempts = 0
+
+        async def execute_recovery() -> dict[str, str]:
+            nonlocal attempts
+            attempts += 1
+            if attempts == 1:
+                raise CommandRetryable("provider is not ready")
+            return {"status": "recovered"}
+
+        self.supervisor.command_queue.recovery_factory = lambda _command: execute_recovery
+        self.supervisor.startup_recovery_succeeded.clear()
+
+        await self.supervisor.recover_on_start()
+        self.assertFalse(self.supervisor.startup_recovery_succeeded.is_set())
+        self.assertEqual(
+            self.supervisor.command_queue.recovery_queue(command.agent_id),
+            (command.request_id,),
+        )
+
+        await self.supervisor.recover_on_start()
+        self.assertTrue(self.supervisor.startup_recovery_succeeded.is_set())
+        self.assertEqual(attempts, 2)
 
     async def test_run_daemon_registers_rebuilds_before_binding_reads(self) -> None:
         await self.server.close()
@@ -12223,6 +12310,9 @@ class DaemonShutdownTests(unittest.IsolatedAsyncioTestCase):
                 async def drain_writers_before_lock_release(self) -> None:
                     pass
 
+                def mark_lock_released(self) -> None:
+                    pass
+
                 async def close(self) -> None:
                     probe = paths.lock_path.open("a+b")
                     try:
@@ -12265,12 +12355,22 @@ class DaemonShutdownTests(unittest.IsolatedAsyncioTestCase):
                     prompt="shutdown buffered events",
                 )
             )
+            store.transition(record.run_id, LifecycleState.IDLE)
             adapter = supervisor.adapter_factory(record)
             original_stop = adapter.stop
             raw_count_at_stop: list[int] = []
 
             async def tracked_stop() -> AdapterStatus:
                 raw_count_at_stop.append(len(store.read_raw_events(record.run_id)))
+                await adapter._events.put(  # noqa: SLF001 - shutdown audit fixture
+                    ProviderEvent(
+                        ProviderKind.CODEX,
+                        {
+                            "method": "turn/completed",
+                            "params": {"turn": {"status": "interrupted"}},
+                        },
+                    )
+                )
                 return await original_stop()
 
             adapter.stop = tracked_stop  # type: ignore[method-assign]
@@ -12293,7 +12393,8 @@ class DaemonShutdownTests(unittest.IsolatedAsyncioTestCase):
 
             await supervisor.drain_writers_before_lock_release()
             self.assertEqual(raw_count_at_stop, [3])
-            self.assertEqual(len(store.read_raw_events(record.run_id)), 3)
+            self.assertEqual(len(store.read_raw_events(record.run_id)), 4)
+            self.assertEqual(store.get(record.run_id).state, LifecycleState.IDLE)
             await supervisor.close()
 
             restarted_store = RunStore(paths)
@@ -12301,8 +12402,17 @@ class DaemonShutdownTests(unittest.IsolatedAsyncioTestCase):
                 restarted_store,
                 FixtureAdapterFactory(FIXTURES),
             )
+            restarted_adapter = restarted.adapter_factory(restarted_store.get(record.run_id))
+            restarted._attach_adapter(  # noqa: SLF001 - exact-session restart fixture
+                record.run_id,
+                restarted_adapter,
+            )
             await restarted.recover_on_start()
-            self.assertEqual(len(restarted_store.read_raw_events(record.run_id)), 3)
+            self.assertEqual(len(restarted_store.read_raw_events(record.run_id)), 4)
+            self.assertEqual(
+                restarted_store.get(record.run_id).state,
+                LifecycleState.IDLE,
+            )
             await restarted.close()
 
     async def test_shutdown_drains_inflight_queue_write_before_lock_release(self) -> None:
@@ -12542,23 +12652,10 @@ class DaemonShutdownTests(unittest.IsolatedAsyncioTestCase):
             paths = _paths(root)
             store = RunStore(paths)
             supervisor = Supervisor(store, FixtureAdapterFactory(FIXTURES))
-            late_attach = asyncio.Event()
             stream_loss_writes: list[float] = []
             original_stream_loss = supervisor._record_stream_loss
-            original_attach = supervisor._attach_adapter
             original_close = supervisor.command_queue.close
             late_start: asyncio.Task[Any] | None = None
-
-            def admit_late_adapter(run_id: str, adapter: ProviderAdapter) -> None:
-                # This models a run/start that won admission before the door
-                # closed but registers its pump after the first task snapshot.
-                writers_fenced = supervisor._writers_fenced  # noqa: SLF001
-                supervisor._writers_fenced = False  # noqa: SLF001
-                try:
-                    original_attach(run_id, adapter)
-                finally:
-                    supervisor._writers_fenced = writers_fenced  # noqa: SLF001
-                late_attach.set()
 
             async def record_stream_loss(
                 run_id: str,
@@ -12584,7 +12681,6 @@ class DaemonShutdownTests(unittest.IsolatedAsyncioTestCase):
                         },
                     )
                 )
-                await asyncio.wait_for(late_attach.wait(), timeout=5)
                 await original_close()
 
             lock = agent_daemon._acquire_single_instance(paths)
@@ -12606,10 +12702,6 @@ class DaemonShutdownTests(unittest.IsolatedAsyncioTestCase):
                 "_record_stream_loss",
                 side_effect=record_stream_loss,
             ), mock.patch.object(
-                supervisor,
-                "_attach_adapter",
-                side_effect=admit_late_adapter,
-            ), mock.patch.object(
                 supervisor.command_queue,
                 "close",
                 side_effect=close_queue_with_late_start,
@@ -12626,7 +12718,8 @@ class DaemonShutdownTests(unittest.IsolatedAsyncioTestCase):
                 await asyncio.wait_for(shutdown, timeout=5)
                 self.assertIsNotNone(late_start)
                 assert late_start is not None
-                await asyncio.wait_for(late_start, timeout=5)
+                with self.assertRaises(Exception):
+                    await asyncio.wait_for(late_start, timeout=5)
 
             self.assertIsNotNone(release_at)
             assert release_at is not None

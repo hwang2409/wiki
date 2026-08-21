@@ -174,6 +174,9 @@ class PerAgentQueueOwner:
     def admitted_future(self) -> asyncio.Future[Any] | None:
         return self._admitted[1] if self._admitted is not None else None
 
+    def recovery_idle(self) -> bool:
+        return not self._commands and self._admitted is None
+
     def take_promoted_futures(self) -> list[asyncio.Future[Any]]:
         futures = self._promoted_futures
         self._promoted_futures = []
@@ -239,6 +242,11 @@ class CommandQueue:
 
     def recovery_barrier_open(self, agent_id: str) -> bool:
         return self._agent_state(agent_id).barrier_open()
+
+    def recovery_ready(self) -> bool:
+        """Report whether every recovered agent queue is fully drained."""
+
+        return all(state.recovery_idle() for state in self._agent_recovery.values())
 
     def _admit_recovery_head(
         self, agent_id: str
@@ -509,6 +517,8 @@ class CommandQueue:
                         if not future.done():
                             future.set_result(result)
             except BaseException as exc:
+                if item.recovering:
+                    outcome = "retry"
                 if not future.done():
                     future.set_exception(exc)
             finally:

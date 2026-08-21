@@ -102,6 +102,58 @@ _VERDICT_STEP_RE = re.compile(
 logger = logging.getLogger(__name__)
 
 
+class _ShutdownPhase(str, Enum):
+    RUNNING = "running"
+    ADAPTER_INPUT_FREEZE = "adapter-input-freeze"
+    LIFECYCLE_DRAIN = "lifecycle-drain"
+    COMMAND_DRAIN = "command-drain"
+    ADAPTER_STOP = "adapter-stop"
+    LOCK_RELEASE = "lock-release"
+
+
+class _ShutdownPhaseOwner:
+    """Own the only legal order for daemon shutdown writes."""
+
+    _ORDER = (
+        _ShutdownPhase.RUNNING,
+        _ShutdownPhase.ADAPTER_INPUT_FREEZE,
+        _ShutdownPhase.LIFECYCLE_DRAIN,
+        _ShutdownPhase.COMMAND_DRAIN,
+        _ShutdownPhase.ADAPTER_STOP,
+        _ShutdownPhase.LOCK_RELEASE,
+    )
+
+    def __init__(self) -> None:
+        self._phase = _ShutdownPhase.RUNNING
+
+    @property
+    def phase(self) -> _ShutdownPhase:
+        return self._phase
+
+    @property
+    def input_frozen(self) -> bool:
+        return self._phase is not _ShutdownPhase.RUNNING
+
+    @property
+    def writers_drained(self) -> bool:
+        return self._phase in {
+            _ShutdownPhase.ADAPTER_STOP,
+            _ShutdownPhase.LOCK_RELEASE,
+        }
+
+    def advance(self, next_phase: _ShutdownPhase) -> None:
+        if self._phase is next_phase:
+            return
+        current_index = self._ORDER.index(self._phase)
+        next_index = self._ORDER.index(next_phase)
+        if next_index != current_index + 1:
+            raise RuntimeError(
+                f"invalid shutdown phase transition: "
+                f"{self._phase.value} -> {next_phase.value}"
+            )
+        self._phase = next_phase
+
+
 class _HandoverDrainOutcome(str, Enum):
     SUPERVISOR_INTERRUPTED = "supervisor-interrupted"
     NATURAL_COMPLETED = "natural-completed"
@@ -528,8 +580,7 @@ class Supervisor:
         self.recovery_scan_lock = asyncio.Lock()
         self.archive_backfill_task: asyncio.Task[Any] | None = None
         self.archive_backfill_worker: asyncio.Task[Any] | None = None
-        self._writers_drained_before_lock_release = False
-        self._writers_fenced = False
+        self.shutdown_phase = _ShutdownPhaseOwner()
         # A supervisor boot invalidates any provider stdin write that had not
         # completed before shutdown: even if the row is at "sending", the
         # previous transport is gone. Sweep once per boot so the on-idle
@@ -829,6 +880,11 @@ class Supervisor:
         *,
         name: str,
     ) -> asyncio.Task[Any]:
+        if self.shutdown_phase.input_frozen:
+            close = getattr(coro, "close", None)
+            if close is not None:
+                close()
+            return asyncio.create_task(asyncio.sleep(0), name=name)
         task = asyncio.create_task(coro, name=name)
         self.monitor_tasks.add(task)
 
@@ -1310,7 +1366,7 @@ Preserve the same identity, role, worktree, orchestrator grouping, PR gates, and
         adapter: ProviderAdapter,
         event: ProviderEvent,
     ) -> None:
-        if self._writers_fenced:
+        if self.shutdown_phase.input_frozen:
             async with self.handover_condition:
                 self.handover_event_queue.setdefault(run_id, []).append(
                     (adapter, event)
@@ -1339,6 +1395,7 @@ Preserve the same identity, role, worktree, orchestrator grouping, PR gates, and
         raw: dict[str, Any] | None = None,
         normalized: NormalizedProviderEvent | None = None,
         prior_state: LifecycleState | None = None,
+        shutdown_observation: bool = False,
     ) -> None:
         record_before_event = self.store.get(run_id)
         if prior_state is None:
@@ -1352,6 +1409,22 @@ Preserve the same identity, role, worktree, orchestrator grouping, PR gates, and
                 generation=event.generation,
                 received_at=event.received_at,
             )
+        if shutdown_observation:
+            observation_payload = {
+                "prior_state": prior_state.value,
+                "event_payload": event.payload,
+            }
+            await self._dual_write_normalized_async(
+                record_before_event,
+                raw,
+                NormalizedProviderEvent(
+                    EventDisposition.IGNORED,
+                    "shutdown_observation",
+                    observation_payload,
+                ),
+                observation_payload,
+            )
+            return
         if (
             event.generation > 0
             and event.generation < record_before_event.provider_generation
@@ -1662,7 +1735,12 @@ Preserve the same identity, role, worktree, orchestrator grouping, PR gates, and
                         ).append((adapter, event))
 
     async def _drain_stopped_adapter(
-        self, run_id: str, adapter: ProviderAdapter
+        self,
+        run_id: str,
+        adapter: ProviderAdapter,
+        *,
+        shutdown_observation: bool = False,
+        prior_state: LifecycleState | None = None,
     ) -> None:
         """Drain the adapter and every event already taken by its pump."""
 
@@ -1688,6 +1766,8 @@ Preserve the same identity, role, worktree, orchestrator grouping, PR gates, and
                             event,
                             update_adapter_snapshot=True,
                             schedule_monitor_actions=True,
+                            shutdown_observation=shutdown_observation,
+                            prior_state=prior_state,
                         )
             async with self.event_drain_condition:
                 if not self.event_inflight_counts.get(run_id):
@@ -2389,7 +2469,7 @@ Preserve the same identity, role, worktree, orchestrator grouping, PR gates, and
         }
 
     def _attach_adapter(self, run_id: str, adapter: ProviderAdapter) -> None:
-        if self._writers_fenced:
+        if self.shutdown_phase.input_frozen:
             raise CommandRetryable("supervisor is shutting down")
         existing = self.adapters.get(run_id)
         if existing is not None and existing is not adapter:
@@ -3091,6 +3171,8 @@ Preserve the same identity, role, worktree, orchestrator grouping, PR gates, and
                     results.extend(await self._auto_archive_sweep())
                     self._schedule_archive_backfill()
             await self.command_queue.recover_pending()
+            if not self.command_queue.recovery_ready():
+                return results
         except BaseException:
             raise
         self.startup_recovery_succeeded.set()
@@ -5536,12 +5618,14 @@ Preserve the same identity, role, worktree, orchestrator grouping, PR gates, and
                 session_dir / "events.jsonl"
             )
         ]
-        if len(raw_seqs) != len(normalized_seqs) or set(raw_seqs) != set(
-            normalized_seqs
-        ):
+        raw_seq_set = set(raw_seqs)
+        normalized_seq_set = set(normalized_seqs)
+        missing = raw_seq_set - normalized_seq_set
+        unknown = normalized_seq_set - raw_seq_set
+        if missing or unknown:
             raise StoreError(
                 f"archive event parity failed for {run_id}: "
-                f"raw={len(raw_seqs)} normalized={len(normalized_seqs)}"
+                f"missing={sorted(missing)} unknown={sorted(unknown)}"
             )
 
     async def _archive_locked(
@@ -6771,9 +6855,10 @@ Preserve the same identity, role, worktree, orchestrator grouping, PR gates, and
     async def drain_writers_before_lock_release(self) -> None:
         """Finish every supervisor-owned write before daemon handover."""
 
-        if self._writers_drained_before_lock_release:
+        if self.shutdown_phase.writers_drained:
             return
-        self._writers_fenced = True
+        self.shutdown_phase.advance(_ShutdownPhase.ADAPTER_INPUT_FREEZE)
+        self.shutdown_phase.advance(_ShutdownPhase.LIFECYCLE_DRAIN)
 
         # Freeze supervisor input before draining pumps. Keep adapters alive
         # while lifecycle events and accepted commands reach durable storage.
@@ -6787,6 +6872,12 @@ Preserve the same identity, role, worktree, orchestrator grouping, PR gates, and
         await self._capture_live_handover_events()
         await self._flush_all_handover_events()
 
+        self.shutdown_phase.advance(_ShutdownPhase.COMMAND_DRAIN)
+        await self.command_queue.close()
+
+        # Stop-capable tasks were frozen with adapter input. Let accepted
+        # commands finish first, then wait for those tasks before transport
+        # stop. They may still flush work that was accepted before freeze.
         while self.monitor_tasks:
             await asyncio.gather(
                 *(asyncio.shield(task) for task in tuple(self.monitor_tasks)),
@@ -6795,8 +6886,6 @@ Preserve the same identity, role, worktree, orchestrator grouping, PR gates, and
         rotation = self.codex_rotation_task
         if rotation is not None and not rotation.done():
             await asyncio.gather(asyncio.shield(rotation), return_exceptions=True)
-
-        await self.command_queue.close()
 
         # Commands may have accepted more provider events while the queue
         # drained. Persist those events before stopping their adapters.
@@ -6811,17 +6900,23 @@ Preserve the same identity, role, worktree, orchestrator grouping, PR gates, and
         await self._flush_all_handover_events()
 
         # Stop transports only after lifecycle and accepted command writes
-        # have drained. Stop can publish a final lifecycle event, so drain it
-        # once more before the lock handoff.
+        # have drained. Shutdown observations are audit-only and cannot change
+        # the resumable lifecycle state.
         for run_id, adapter in tuple(self.adapters.items()):
             stream_key = id(adapter)
             self.expected_stream_ends.add(stream_key)
+            prior_state = self.store.get(run_id).state
             try:
                 try:
                     await adapter.stop()
                 except BaseException:
                     pass
-                await self._drain_stopped_adapter(run_id, adapter)
+                await self._drain_stopped_adapter(
+                    run_id,
+                    adapter,
+                    shutdown_observation=True,
+                    prior_state=prior_state,
+                )
             finally:
                 self.expected_stream_ends.discard(stream_key)
         await self._capture_live_handover_events()
@@ -6859,10 +6954,13 @@ Preserve the same identity, role, worktree, orchestrator grouping, PR gates, and
                 ),
                 return_exceptions=True,
             )
-        self._writers_drained_before_lock_release = True
+        self.shutdown_phase.advance(_ShutdownPhase.ADAPTER_STOP)
+
+    def mark_lock_released(self) -> None:
+        self.shutdown_phase.advance(_ShutdownPhase.LOCK_RELEASE)
 
     async def close(self) -> None:
-        if self._writers_drained_before_lock_release:
+        if self.shutdown_phase.writers_drained:
             adapters: list[ProviderAdapter] = []
             seen: set[int] = set()
             for adapter in self.adapters.values():

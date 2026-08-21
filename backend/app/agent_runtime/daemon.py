@@ -155,6 +155,7 @@ async def _shutdown(
         fcntl.flock(lock.fileno(), fcntl.LOCK_UN)
     finally:
         lock.close()
+    supervisor.mark_lock_released()
     await supervisor.close()
 
 
