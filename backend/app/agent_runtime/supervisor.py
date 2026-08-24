@@ -740,6 +740,8 @@ class Supervisor:
         self.event_processing_locks: dict[str, asyncio.Lock] = {}
         self.event_inflight_counts: dict[str, int] = {}
         self.event_drain_condition = asyncio.Condition()
+        self.event_burst_completions: dict[str, asyncio.Event] = {}
+        self.event_monitor_barriers: dict[str, asyncio.Event] = {}
         self.event_routes: dict[tuple[int, int], str] = {}
         self.queue_locks: dict[str, asyncio.Lock] = {}
         self._queued_delivery_attempts: set[tuple[str, str]] = set()
@@ -1259,12 +1261,22 @@ class Supervisor:
         coro: Any,
         *,
         name: str,
+        run_id: str | None = None,
     ) -> asyncio.Task[Any]:
         if self.shutdown_phase.input_frozen:
             close = getattr(coro, "close", None)
             if close is not None:
                 close()
             return asyncio.create_task(asyncio.sleep(0), name=name)
+        barrier = self.event_monitor_barriers.get(run_id) if run_id else None
+        if barrier is not None:
+            deferred_coro = coro
+
+            async def after_event_burst() -> Any:
+                await barrier.wait()
+                return await deferred_coro
+
+            coro = after_event_burst()
         task = asyncio.create_task(coro, name=name)
         self.monitor_tasks.add(task)
 
@@ -1655,41 +1667,130 @@ Preserve the same identity, role, worktree, orchestrator grouping, PR gates, and
 
     async def _pump_events(self, run_id: str, adapter: ProviderAdapter) -> None:
         stream_key = id(adapter)
+
+        async def process_event(
+            event: ProviderEvent,
+            *,
+            health_actions_scheduled: bool = False,
+        ) -> bool:
+            event_run_id = self.event_routes.get(
+                (id(adapter), event.generation),
+                run_id,
+            )
+            self.event_inflight_counts[event_run_id] = (
+                self.event_inflight_counts.get(event_run_id, 0) + 1
+            )
+            try:
+                async with self.event_drain_condition:
+                    self.event_drain_condition.notify_all()
+                event_lock = self.event_processing_locks.setdefault(
+                    event_run_id, asyncio.Lock()
+                )
+                async with event_lock:
+                    await self._handle_provider_event(
+                        event_run_id,
+                        adapter,
+                        event,
+                        health_actions_scheduled=health_actions_scheduled,
+                    )
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:
+                await self._record_pipeline_failure(
+                    event_run_id,
+                    adapter,
+                    f"provider event persistence failed: {exc}",
+                )
+                return False
+            finally:
+                remaining = self.event_inflight_counts.get(event_run_id, 1) - 1
+                if remaining:
+                    self.event_inflight_counts[event_run_id] = remaining
+                else:
+                    self.event_inflight_counts.pop(event_run_id, None)
+                async with self.event_drain_condition:
+                    self.event_drain_condition.notify_all()
+            return True
+
         try:
             async for event in adapter.events():
-                # Mark the local slot before the first await. The detach
-                # barrier cannot observe an event between queue removal and
-                # this increment.
-                self.event_inflight_counts[run_id] = (
-                    self.event_inflight_counts.get(run_id, 0) + 1
+                claimed_run_id = self.event_routes.get(
+                    (id(adapter), event.generation),
+                    run_id,
                 )
+                self.event_inflight_counts[claimed_run_id] = (
+                    self.event_inflight_counts.get(claimed_run_id, 0) + 1
+                )
+                async with self.event_drain_condition:
+                    self.event_drain_condition.notify_all()
                 try:
+                    events = [event, *(await adapter.drain_events())]
+                except BaseException:
+                    remaining = self.event_inflight_counts.get(claimed_run_id, 1) - 1
+                    if remaining:
+                        self.event_inflight_counts[claimed_run_id] = remaining
+                    else:
+                        self.event_inflight_counts.pop(claimed_run_id, None)
                     async with self.event_drain_condition:
                         self.event_drain_condition.notify_all()
-                    event_run_id = self.event_routes.get(
-                        (id(adapter), event.generation),
-                        run_id,
-                    )
-                    event_lock = self.event_processing_locks.setdefault(
-                        event_run_id, asyncio.Lock()
-                    )
-                    async with event_lock:
-                        await self._handle_provider_event(event_run_id, adapter, event)
-                except asyncio.CancelledError:
                     raise
-                except Exception as exc:
-                    await self._record_pipeline_failure(
-                        run_id,
-                        adapter,
-                        f"provider event persistence failed: {exc}",
-                    )
-                    return
+                batched_run_ids = {
+                    self.event_routes.get((id(adapter), item.generation), run_id)
+                    for item in events
+                }
+                batch_counts = len(events) > 1 and len(batched_run_ids) == 1
+                batch_run_id = next(iter(batched_run_ids))
+                burst_completion = asyncio.Event()
+                self.event_burst_completions[batch_run_id] = burst_completion
+                if batch_counts:
+                    self.store.begin_raw_event_batch(batch_run_id)
+                    self.event_monitor_barriers[batch_run_id] = burst_completion
+                    for queued_event in events:
+                        current = self.store.get(batch_run_id)
+                        self._schedule_monitor_actions(
+                            batch_run_id,
+                            adapter,
+                            queued_event,
+                            prior_state=current.state,
+                            record=current,
+                        )
+                    if any(
+                        accounts.codex_rate_limit_reached_type(item.payload) is not None
+                        or accounts.detect_codex_auth_dead_payload(item.payload)
+                        for item in events
+                    ):
+                        await asyncio.sleep(0.01)
+                try:
+                    for queued_event in events:
+                        if not await process_event(
+                            queued_event,
+                            health_actions_scheduled=batch_counts,
+                        ):
+                            return
                 finally:
-                    remaining = self.event_inflight_counts.get(run_id, 1) - 1
+                    if batch_counts:
+                        await self.persistence_writer.submit(
+                            batch_run_id,
+                            self.store.end_raw_event_batch,
+                            batch_run_id,
+                        )
+                        await asyncio.sleep(0)
+                    burst_completion.set()
+                    if (
+                        self.event_monitor_barriers.get(batch_run_id)
+                        is burst_completion
+                    ):
+                        self.event_monitor_barriers.pop(batch_run_id, None)
+                    if (
+                        self.event_burst_completions.get(batch_run_id)
+                        is burst_completion
+                    ):
+                        self.event_burst_completions.pop(batch_run_id, None)
+                    remaining = self.event_inflight_counts.get(claimed_run_id, 1) - 1
                     if remaining:
-                        self.event_inflight_counts[run_id] = remaining
+                        self.event_inflight_counts[claimed_run_id] = remaining
                     else:
-                        self.event_inflight_counts.pop(run_id, None)
+                        self.event_inflight_counts.pop(claimed_run_id, None)
                     async with self.event_drain_condition:
                         self.event_drain_condition.notify_all()
         except asyncio.CancelledError:
@@ -1771,6 +1872,9 @@ Preserve the same identity, role, worktree, orchestrator grouping, PR gates, and
         run_id: str,
         adapter: ProviderAdapter,
         event: ProviderEvent,
+        *,
+        schedule_monitor_actions: bool = True,
+        health_actions_scheduled: bool = False,
     ) -> None:
         if self.shutdown_phase.input_frozen:
             async with self.handover_condition:
@@ -1788,6 +1892,8 @@ Preserve the same identity, role, worktree, orchestrator grouping, PR gates, and
                 run_id,
                 adapter,
                 event,
+                schedule_monitor_actions=schedule_monitor_actions,
+                health_actions_scheduled=health_actions_scheduled,
             )
 
     async def _handle_provider_event_without_admission(
@@ -1804,6 +1910,7 @@ Preserve the same identity, role, worktree, orchestrator grouping, PR gates, and
         shutdown_observation: bool = False,
         publish_session: bool = True,
         persist: bool = True,
+        health_actions_scheduled: bool = False,
     ) -> None:
         record_before_event = self.store.get(run_id)
         if prior_state is None:
@@ -1964,8 +2071,14 @@ Preserve the same identity, role, worktree, orchestrator grouping, PR gates, and
             try:
                 adapter_status = adapter.snapshot()
                 if not (
-                    normalized.lifecycle_state is LifecycleState.BLOCKED
-                    and adapter_status.state is not LifecycleState.BLOCKED
+                    (
+                        normalized.lifecycle_state is LifecycleState.BLOCKED
+                        and adapter_status.state is not LifecycleState.BLOCKED
+                    )
+                    or (
+                        adapter_status.state is LifecycleState.BLOCKED
+                        and normalized.lifecycle_state is not LifecycleState.BLOCKED
+                    )
                 ):
                     record = self.store.update_adapter_status(run_id, adapter_status)
             except Exception:
@@ -2032,7 +2145,11 @@ Preserve the same identity, role, worktree, orchestrator grouping, PR gates, and
             and event.direction != "stdin"
             and accounts.claude_turn_succeeded(event.payload)
         )
-        if schedule_monitor_actions and not claude_turn_succeeded:
+        if (
+            schedule_monitor_actions
+            and not health_actions_scheduled
+            and not claude_turn_succeeded
+        ):
             self._schedule_monitor_actions(
                 run_id,
                 adapter,
@@ -2231,6 +2348,7 @@ Preserve the same identity, role, worktree, orchestrator grouping, PR gates, and
                         outgoing_reset_at=outgoing_reset_at,
                     ),
                     name=f"codex-rate-limit-{run_id}",
+                    run_id=run_id,
                 )
             if event.direction != "client" and accounts.detect_codex_auth_dead_payload(
                 event.payload
@@ -2244,6 +2362,7 @@ Preserve the same identity, role, worktree, orchestrator grouping, PR gates, and
                             prior_state=prior_state,
                         ),
                         name=f"codex-auth-dead-{run_id}",
+                        run_id=run_id,
                     )
                     self.auth_dead_recoveries[run_id] = task
 
@@ -2284,6 +2403,7 @@ Preserve the same identity, role, worktree, orchestrator grouping, PR gates, and
                     }
                 ),
                 name=f"claude-limit-{run_id}",
+                run_id=run_id,
             )
 
     async def _handle_codex_rate_limit_event(
@@ -2903,7 +3023,11 @@ Preserve the same identity, role, worktree, orchestrator grouping, PR gates, and
             if key[0] != adapter_key
         }
 
-    def _attach_adapter(self, run_id: str, adapter: ProviderAdapter) -> None:
+    def _attach_adapter(
+        self,
+        run_id: str,
+        adapter: ProviderAdapter,
+    ) -> None:
         if self.shutdown_phase.input_frozen:
             raise CommandRetryable("supervisor is shutting down")
         existing = self.adapters.get(run_id)
@@ -2950,6 +3074,7 @@ Preserve the same identity, role, worktree, orchestrator grouping, PR gates, and
                 for key, target in self.event_routes.items()
                 if key[0] != adapter_key
             }
+
     def _clear_auth_dead_recovery_state(self, run_id: str) -> None:
         self.auth_dead_attempts.pop(run_id, None)
         self.auth_dead_alert_at.pop(run_id, None)
@@ -3271,6 +3396,7 @@ Preserve the same identity, role, worktree, orchestrator grouping, PR gates, and
         run_id: str | None = None,
         implicit_request_id: bool = False,
         execution_kind: str | None = None,
+        wait_for_startup: bool = False,
     ) -> RunRecord:
         if execution_kind is not None:
             if not wk_enabled() or not is_wk_kind(execution_kind):
@@ -3335,14 +3461,24 @@ Preserve the same identity, role, worktree, orchestrator grouping, PR gates, and
                             migrate_legacy=migrate_legacy,
                             transactional_start=True,
                         )
-                        return await self._launch_record(record, prompt, rollback_start=True)
+                        return await self._launch_record(
+                            record,
+                            prompt,
+                            rollback_start=True,
+                            wait_for_startup=wait_for_startup,
+                        )
             async with self._agent_lock(record.agent_id):
                 self.store.create(
                     record,
                     migrate_legacy=migrate_legacy,
                     transactional_start=True,
                 )
-                return await self._launch_record(record, prompt, rollback_start=True)
+                return await self._launch_record(
+                    record,
+                    prompt,
+                    rollback_start=True,
+                    wait_for_startup=wait_for_startup,
+                )
 
     async def _launch_record(
         self,
@@ -3350,6 +3486,7 @@ Preserve the same identity, role, worktree, orchestrator grouping, PR gates, and
         prompt: str,
         *,
         rollback_start: bool = False,
+        wait_for_startup: bool = False,
     ) -> RunRecord:
         adapter: ProviderAdapter | None = None
         try:
@@ -3410,6 +3547,11 @@ Preserve the same identity, role, worktree, orchestrator grouping, PR gates, and
             raise
         self.store.commit_start(record.run_id)
         await self._publish_agent_change(record.agent_id)
+        if wait_for_startup or any(run_id != record.run_id for run_id in self.adapters):
+            await asyncio.sleep(0)
+            completion = self.event_burst_completions.get(record.run_id)
+            if completion is not None:
+                await completion.wait()
         return record
 
     async def resume_run(self, run_id: str) -> RunRecord:
@@ -6978,6 +7120,7 @@ Preserve the same identity, role, worktree, orchestrator grouping, PR gates, and
                 worktree=str(params["worktree"]),
                 prompt=str(params["prompt"]),
                 effort=params.get("effort"),
+                wait_for_startup=True,
                 execution_kind=(
                     str(params["execution_kind"])
                     if params.get("execution_kind") is not None
