@@ -94,7 +94,9 @@ def _apply_wk_status_event(
     if kind == "wk.status_revoked":
         if record.wk_status_state == "merge-ready":
             record.wk_status_state = "blocked"
-            record.wk_status_step = "wk merge-ready was revoked by a later ledger operation"
+            record.wk_status_step = (
+                "wk merge-ready was revoked by a later ledger operation"
+            )
             record.wk_status_blocker = str(
                 event_payload.get("detail") or "wk status revoked"
             )
@@ -300,11 +302,15 @@ def _apply_pending_request_event(
             "raw_seq": raw_seq,
             "payload": dict(payload),
         }
-    elif kind in {
-        "approval_resolved",
-        "approval_cancelled",
-        "approval_response",
-    } and request_id is not None:
+    elif (
+        kind
+        in {
+            "approval_resolved",
+            "approval_cancelled",
+            "approval_response",
+        }
+        and request_id is not None
+    ):
         record.pending_requests.pop(_provider_request_key(request_id), None)
 
 
@@ -374,7 +380,9 @@ def _claude_payload_type(payload: dict[str, Any]) -> str | None:
     return value if isinstance(value, str) else None
 
 
-def _is_unread_worthy(kind: str, payload: dict[str, Any] | None, disposition: str) -> bool:
+def _is_unread_worthy(
+    kind: str, payload: dict[str, Any] | None, disposition: str
+) -> bool:
     """Whether a normalized event should advance ``unread_event_seq``.
 
     Unread is "new worker-authored output Henry has not seen yet". Anything
@@ -439,8 +447,7 @@ def _apply_composer_message_event(
         if message.get("pending_id") != pending_id
     ]
     if any(
-        message.get("pending_id") == pending_id
-        for message in record.composer_messages
+        message.get("pending_id") == pending_id for message in record.composer_messages
     ):
         return
     entry: dict[str, Any] = {
@@ -605,13 +612,15 @@ def _atomic_write_json(path: Path, value: Any) -> None:
             handle.write("\n")
             handle.flush()
             os.fsync(handle.fileno())
+        fd = -1
         os.replace(tmp, path)
         path.chmod(0o600)
         _fsync_file(path)
         _fsync_directory(path.parent)
     except Exception:
         try:
-            os.close(fd)
+            if fd >= 0:
+                os.close(fd)
         except OSError:
             pass
         tmp.unlink(missing_ok=True)
@@ -630,13 +639,15 @@ def _atomic_write_bytes(path: Path, value: bytes) -> None:
             handle.write(value)
             handle.flush()
             os.fsync(handle.fileno())
+        fd = -1
         os.replace(tmp, path)
         path.chmod(0o600)
         _fsync_file(path)
         _fsync_directory(path.parent)
     except Exception:
         try:
-            os.close(fd)
+            if fd >= 0:
+                os.close(fd)
         except OSError:
             pass
         tmp.unlink(missing_ok=True)
@@ -670,7 +681,9 @@ def _read_start_status(path: Path) -> tuple[bool, bytes | None]:
         if stat.S_ISLNK(opened.st_mode) or not stat.S_ISREG(opened.st_mode):
             raise StoreError(f"refusing non-regular status file: {path}")
         if opened.st_size > MAX_START_STATUS_BYTES:
-            raise StoreError(f"status file exceeds {MAX_START_STATUS_BYTES} bytes: {path}")
+            raise StoreError(
+                f"status file exceeds {MAX_START_STATUS_BYTES} bytes: {path}"
+            )
         content = bytearray()
         while len(content) <= MAX_START_STATUS_BYTES:
             chunk = os.read(fd, MAX_START_STATUS_BYTES + 1 - len(content))
@@ -678,7 +691,9 @@ def _read_start_status(path: Path) -> tuple[bool, bytes | None]:
                 break
             content.extend(chunk)
         if len(content) > MAX_START_STATUS_BYTES:
-            raise StoreError(f"status file exceeds {MAX_START_STATUS_BYTES} bytes: {path}")
+            raise StoreError(
+                f"status file exceeds {MAX_START_STATUS_BYTES} bytes: {path}"
+            )
         return True, bytes(content)
     finally:
         os.close(fd)
@@ -701,12 +716,14 @@ def _append_json_line(path: Path, value: Any) -> None:
             handle.write("\n")
             handle.flush()
             os.fsync(handle.fileno())
+        fd = -1
     finally:
         # fdopen closes the descriptor; this branch covers failures before it.
-        try:
-            os.close(fd)
-        except OSError:
-            pass
+        if fd >= 0:
+            try:
+                os.close(fd)
+            except OSError:
+                pass
 
 
 def _read_json(path: Path) -> Any:
@@ -742,6 +759,8 @@ class RunStore:
     def __init__(self, paths: RuntimePaths):
         self.paths = paths
         self._lock = threading.RLock()
+        self._raw_event_counts: dict[str, int] = {}
+        self._raw_event_batch_runs: set[str] = set()
         # Adapter ownership is process-local. A restarted supervisor must
         # project every retained PID as detached until it reattaches control.
         self._control_attached_run_ids: set[str] = set()
@@ -864,9 +883,7 @@ class RunStore:
     def archive_ticket_dir(self, agent_id: str) -> Path:
         return self.paths.archive_dir / agent_id
 
-    def _find_archived_run_entry(
-        self, run_id: str
-    ) -> tuple[RunRecord, Path] | None:
+    def _find_archived_run_entry(self, run_id: str) -> tuple[RunRecord, Path] | None:
         """Return one archive record and its session directory."""
 
         for session_dir in self.paths.archive_dir.glob("*/*"):
@@ -949,8 +966,8 @@ class RunStore:
             record.provider_pid_started_at = identity.created_at
             record.provider_executable = identity.executable
             record.provider_process_group_id = identity.process_group_id
-            record.provider_process_group_members = (
-                provider_process_group_members_sync(identity.process_group_id)
+            record.provider_process_group_members = provider_process_group_members_sync(
+                identity.process_group_id
             )
             self._write_record(record)
             self._write_current_projection(record)
@@ -1015,8 +1032,7 @@ class RunStore:
     @staticmethod
     def _registry_projection_is_empty(registry: dict[str, Any]) -> bool:
         return not any(
-            key != "_orchestrators" and value
-            for key, value in registry.items()
+            key != "_orchestrators" and value for key, value in registry.items()
         ) and not registry.get("_orchestrators")
 
     def _read_registry_for_mutation(self) -> dict[str, Any]:
@@ -1066,7 +1082,9 @@ class RunStore:
                 legacy = (registry.get("_orchestrators") or {}).get(agent_id)
                 if isinstance(legacy, dict):
                     entry = {"history": [], "current": legacy}
-            return {agent_id: deepcopy(entry)} if entry is not None else {agent_id: None}
+            return (
+                {agent_id: deepcopy(entry)} if entry is not None else {agent_id: None}
+            )
 
     def find_start_request(self, request_id: str) -> RunRecord | None:
         """Find a durable successful start after cache eviction or restart."""
@@ -1100,8 +1118,7 @@ class RunStore:
         current = registry.get(record.agent_id)
         current_run_id = (
             current.get("current", {}).get("run_id")
-            if isinstance(current, dict)
-            and isinstance(current.get("current"), dict)
+            if isinstance(current, dict) and isinstance(current.get("current"), dict)
             else None
         )
         legacy = registry.get("_orchestrators")
@@ -1317,7 +1334,9 @@ class RunStore:
             "provider_pid_started_at": record.provider_pid_started_at,
             "provider_executable": record.provider_executable,
             "provider_process_group_id": record.provider_process_group_id,
-            "provider_process_group_members": list(record.provider_process_group_members),
+            "provider_process_group_members": list(
+                record.provider_process_group_members
+            ),
             "control_attached": record.run_id in self._control_attached_run_ids,
             "provider_generation": record.provider_generation,
             "active_turn_id": record.active_turn_id,
@@ -1381,9 +1400,7 @@ class RunStore:
             return {record.agent_id: entry}
 
         legacy_orchestrators = registry.get("_orchestrators")
-        if record.role == "orchestrator" and isinstance(
-            legacy_orchestrators, dict
-        ):
+        if record.role == "orchestrator" and isinstance(legacy_orchestrators, dict):
             legacy = legacy_orchestrators.get(record.agent_id)
             legacy_run_id = legacy.get("run_id") if isinstance(legacy, dict) else None
             if legacy_run_id not in {None, record.run_id}:
@@ -1434,7 +1451,9 @@ class RunStore:
         try:
             temp_dir.chmod(0o700)
             for name in ("raw.jsonl", "events.jsonl"):
-                fd = os.open(temp_dir / name, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+                fd = os.open(
+                    temp_dir / name, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600
+                )
                 os.close(fd)
             record.updated_at = utc_now()
             _atomic_write_json(temp_dir / "run.json", record.to_dict())
@@ -1523,7 +1542,10 @@ class RunStore:
         if self._archive_events_validator is not None:
             self._archive_events_validator(record.run_id, session_dir)
         if record.initial_prompt:
-            prompt_path = session_dir / f"{record.provider.legacy_kind}-{record.agent_id}-prompt.md"
+            prompt_path = (
+                session_dir
+                / f"{record.provider.legacy_kind}-{record.agent_id}-prompt.md"
+            )
             expected_paths.append(prompt_path)
             _atomic_write_bytes(prompt_path, record.initial_prompt.encode("utf-8"))
         artifact_dir = self.run_dir(record.run_id) / "artifacts"
@@ -1625,9 +1647,8 @@ class RunStore:
                 if not isinstance(value, dict):
                     continue
                 record = RunRecord.from_dict(value)
-                if (
-                    record.state in TERMINAL_STATES
-                    and _run_is_older_than(record.updated_at, _run_retention_cutoff())
+                if record.state in TERMINAL_STATES and _run_is_older_than(
+                    record.updated_at, _run_retention_cutoff()
                 ):
                     continue
                 if record.start_request_id and record.start_transaction is None:
@@ -1679,10 +1700,7 @@ class RunStore:
                     seq = int(event.get("seq", 0))
                     if seq > normalized_count:
                         normalized_count = seq
-                    if (
-                        need_legacy_boundary
-                        and seq <= record.last_lifecycle_event_seq
-                    ):
+                    if need_legacy_boundary and seq <= record.last_lifecycle_event_seq:
                         raw_seq = int(event.get("raw_seq", 0))
                         if raw_seq > legacy_boundary:
                             legacy_boundary = raw_seq
@@ -1755,10 +1773,7 @@ class RunStore:
                 value = _read_json(session_dir / "run.json")
             except (OSError, StoreError, TypeError, ValueError):
                 continue
-            if (
-                isinstance(value, dict)
-                and isinstance(value.get("run_id"), str)
-            ):
+            if isinstance(value, dict) and isinstance(value.get("run_id"), str):
                 archived_run_ids.add(value["run_id"])
         if not records_by_agent:
             if changed:
@@ -1899,7 +1914,8 @@ class RunStore:
                         "worktree": legacy_orchestrator.get("worktree")
                         or legacy_orchestrator.get("cwd"),
                         "outcome": legacy_orchestrator.get("outcome") or "handoff",
-                        "ended_at": legacy_orchestrator.get("ended_at") or current.created_at,
+                        "ended_at": legacy_orchestrator.get("ended_at")
+                        or current.created_at,
                         "migration": "headless-supervisor",
                     }
                 )
@@ -1907,7 +1923,10 @@ class RunStore:
             if registry.get(agent_id) != projected:
                 registry[agent_id] = projected
                 changed = True
-            if isinstance(legacy_orchestrators, dict) and agent_id in legacy_orchestrators:
+            if (
+                isinstance(legacy_orchestrators, dict)
+                and agent_id in legacy_orchestrators
+            ):
                 # A run file may have reached disk immediately before a crash
                 # stopped the legacy orchestrator projection from being removed.
                 # Durable run metadata wins on restart; never expose two live
@@ -2072,9 +2091,13 @@ class RunStore:
             try:
                 live = RunRecord.from_dict(_read_json(live_path))
             except (OSError, StoreError, TypeError, ValueError) as exc:
-                raise StoreConflict("archive marker has an unreadable live run") from exc
+                raise StoreConflict(
+                    "archive marker has an unreadable live run"
+                ) from exc
             if live.created_at != archived.created_at:
-                raise StoreConflict("older archive marker cannot remove a newer live run")
+                raise StoreConflict(
+                    "older archive marker cannot remove a newer live run"
+                )
         registry = self._read_registry()
         entry = registry.get(archived.agent_id)
         current = entry.get("current") if isinstance(entry, dict) else None
@@ -2112,7 +2135,10 @@ class RunStore:
             (self.raw_events_path(run_id), session_dir / log_name),
             (self.raw_events_path(run_id), session_dir / "raw.jsonl"),
             (self.normalized_events_path(run_id), session_dir / "events.jsonl"),
-            (self.current_turn_diff_path(run_id), session_dir / "current-turn-diff.json"),
+            (
+                self.current_turn_diff_path(run_id),
+                session_dir / "current-turn-diff.json",
+            ),
         ):
             if destination.name == "events.jsonl" and self._export_archive_events(
                 run_id, source, destination
@@ -2195,8 +2221,13 @@ class RunStore:
             registry = self._read_registry_for_mutation()
             entry = registry.get(record.agent_id)
             current = entry.get("current") if isinstance(entry, dict) else None
-            if isinstance(current, dict) and current.get("run_id") not in {None, record.run_id}:
-                raise StoreConflict("older archive marker cannot remove a live current run")
+            if isinstance(current, dict) and current.get("run_id") not in {
+                None,
+                record.run_id,
+            }:
+                raise StoreConflict(
+                    "older archive marker cannot remove a live current run"
+                )
             if isinstance(current, dict) and current.get("run_id") == record.run_id:
                 registry.pop(record.agent_id, None)
                 self._write_registry(registry)
@@ -2358,7 +2389,8 @@ class RunStore:
                             "worktree": legacy_orchestrator.get("worktree")
                             or legacy_orchestrator.get("cwd"),
                             "outcome": legacy_orchestrator.get("outcome") or "handoff",
-                            "ended_at": legacy_orchestrator.get("ended_at") or utc_now(),
+                            "ended_at": legacy_orchestrator.get("ended_at")
+                            or utc_now(),
                             "migration": "headless-supervisor",
                         }
                     )
@@ -2523,7 +2555,9 @@ class RunStore:
                         record.provider_executable = identity.executable
                         record.provider_process_group_id = identity.process_group_id
                         record.provider_process_group_members = (
-                            provider_process_group_members_sync(identity.process_group_id)
+                            provider_process_group_members_sync(
+                                identity.process_group_id
+                            )
                         )
                 record.provider_generation = adapter_status.generation
                 record.active_turn_id = adapter_status.active_turn_id
@@ -2752,8 +2786,12 @@ class RunStore:
 
         with self._lock:
             record = self.get(run_id)
+            current_count = max(
+                record.raw_event_count,
+                self._raw_event_counts.get(run_id, record.raw_event_count),
+            )
             envelope = {
-                "seq": record.raw_event_count + 1,
+                "seq": current_count + 1,
                 "received_at": received_at or utc_now(),
                 "provider": provider,
                 "direction": direction,
@@ -2763,9 +2801,31 @@ class RunStore:
             _append_json_line(self.raw_events_path(run_id), envelope)
             # The fsync above is the ordering boundary: only now may callers
             # normalize the event or expose it to subscribers.
-            record.raw_event_count = int(envelope["seq"])
-            self._write_record(record)
+            self._raw_event_counts[run_id] = int(envelope["seq"])
+            if run_id not in self._raw_event_batch_runs:
+                record.raw_event_count = int(envelope["seq"])
+                self._write_record(record)
             return envelope
+
+    def begin_raw_event_batch(self, run_id: str) -> None:
+        with self._lock:
+            record = self.get(run_id)
+            self._raw_event_counts[run_id] = max(
+                record.raw_event_count,
+                self._raw_event_counts.get(run_id, record.raw_event_count),
+            )
+            self._raw_event_batch_runs.add(run_id)
+
+    def end_raw_event_batch(self, run_id: str) -> RunRecord:
+        with self._lock:
+            self._raw_event_batch_runs.discard(run_id)
+            record = self.get(run_id)
+            record.raw_event_count = max(
+                record.raw_event_count,
+                self._raw_event_counts.get(run_id, record.raw_event_count),
+            )
+            self._write_record(record)
+            return record
 
     def append_normalized(
         self,
@@ -2780,7 +2840,11 @@ class RunStore:
     ) -> dict[str, Any]:
         with self._lock:
             record = self.get(run_id)
-            if raw_seq < 1 or raw_seq > record.raw_event_count:
+            raw_event_count = max(
+                record.raw_event_count,
+                self._raw_event_counts.get(run_id, record.raw_event_count),
+            )
+            if raw_seq < 1 or raw_seq > raw_event_count:
                 raise StoreError(
                     f"normalized event references missing raw sequence {raw_seq}"
                 )
@@ -2909,8 +2973,12 @@ class RunStore:
             to_remove = [
                 key
                 for key, request in record.pending_requests.items()
-                for payload in [request.get("payload") if isinstance(request, dict) else None]
-                for nested_request in [payload.get("request") if isinstance(payload, dict) else None]
+                for payload in [
+                    request.get("payload") if isinstance(request, dict) else None
+                ]
+                for nested_request in [
+                    payload.get("request") if isinstance(payload, dict) else None
+                ]
                 if isinstance(nested_request, dict)
                 and nested_request.get("tool_use_id") == tool_use_id
             ]
@@ -3089,7 +3157,9 @@ class RunStore:
             )
             if existing is not None:
                 if existing.get("text") != text:
-                    raise StoreConflict("pending message id was reused with different text")
+                    raise StoreConflict(
+                        "pending message id was reused with different text"
+                    )
                 return record
             if len(record.pending_user_messages) >= MAX_PENDING_USER_MESSAGES:
                 raise StoreConflict("pending user message limit reached")
@@ -3475,14 +3545,15 @@ class RunStore:
         after_seq: int = 0,
         limit: int | None = None,
     ) -> list[dict[str, Any]]:
-        path = self.raw_events_path(run_id)
-        return self._event_page(
-            self._read_json_lines_tail(path, limit)
-            if after_seq == 0 and limit is not None
-            else self._read_json_lines(path),
-            after_seq=after_seq,
-            limit=limit,
-        )
+        with self._lock:
+            path = self.raw_events_path(run_id)
+            return self._event_page(
+                self._read_json_lines_tail(path, limit)
+                if after_seq == 0 and limit is not None
+                else self._read_json_lines(path),
+                after_seq=after_seq,
+                limit=limit,
+            )
 
     def rebuild_projections_from_normalized(self, run_id: str) -> RunRecord:
         """Replay the normalized event log in raw provider order to
@@ -3512,9 +3583,7 @@ class RunStore:
         with self._lock:
             record = self.get(run_id)
             record_before_rebuild = record.to_dict()
-            current_diff_before_rebuild = self._read_current_turn_diff_snapshot(
-                run_id
-            )
+            current_diff_before_rebuild = self._read_current_turn_diff_snapshot(run_id)
             normalized_events = sorted(
                 self._read_json_lines(self.normalized_events_path(run_id)),
                 key=lambda event: (
@@ -3620,10 +3689,7 @@ class RunStore:
             record.last_lifecycle_event_seq = max_causal_seq
             if record.to_dict() != record_before_rebuild:
                 self._write_record(record)
-            if (
-                current_diff_dirty
-                and current_diff != current_diff_before_rebuild
-            ):
+            if current_diff_dirty and current_diff != current_diff_before_rebuild:
                 self._write_current_turn_diff_snapshot(run_id, current_diff)
             return record
 

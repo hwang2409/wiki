@@ -9,6 +9,7 @@ import re
 import shutil
 import sqlite3
 import tempfile
+import threading
 import time
 import warnings
 from collections import OrderedDict, deque
@@ -67,6 +68,9 @@ DEFAULT_ADAPTER_DETACH_GRACE_SECONDS = 1.0
 DEFAULT_IDEMPOTENCY_CACHE_SIZE = 256
 DEFAULT_WORKER_SOFT_CAP = 5
 DEFAULT_ARCHIVE_QUEUE_LIMIT = 4
+DEFAULT_PERSISTENCE_WRITER_WORKERS = 4
+DEFAULT_PERSISTENCE_WRITER_QUEUE_SIZE = 32
+DEFAULT_PERSISTENCE_WRITER_PER_RUN_QUEUE_SIZE = 1
 _IDEMPOTENT_METHODS = frozenset({"run/start", "run/send_now", "run/send_on_idle"})
 _COMMAND_METHODS = frozenset(
     {"run/start", "run/send_now", "run/send_on_idle", "run/archive", "run/replace"}
@@ -93,7 +97,7 @@ _RUN_SCOPED_METHODS = frozenset(
 )
 _PROJECTION_READ_METHODS = frozenset({"run/list", "run/status"})
 DEFAULT_APPROVAL_RECOVERY_TIMEOUT_SECONDS = 30.0
-AMBIGUOUS_SEND_ECHO_GRACE_SECONDS = 0.05
+AMBIGUOUS_SEND_ECHO_GRACE_SECONDS = 0.5
 _AUTO_ARCHIVE_FORBIDDEN_ROLES = frozenset({"implement", "plan"})
 _VERDICT_STEP_RE = re.compile(
     r"^[ \t]*(?:MERGE-READY|NOT-MERGE-READY|NEEDS-FIXES)\b",
@@ -177,6 +181,113 @@ class _HandoverDrainOutcome(str, Enum):
     CONTROL_CANCEL_REQUEST = "control-cancel-request"
     USER_RESPONSE = "user-response"
     NONE = "none"
+
+
+class _BoundedPersistenceWriter:
+    """Run synchronous persistence work behind bounded async admission."""
+
+    def __init__(
+        self,
+        *,
+        workers: int,
+        queue_size: int,
+        per_run_queue_size: int,
+    ) -> None:
+        self._executor: ThreadPoolExecutor | None = ThreadPoolExecutor(
+            max_workers=workers,
+            thread_name_prefix="wiki-event-writer",
+        )
+        self._capacity = asyncio.BoundedSemaphore(workers + queue_size)
+        self._capacity_size = workers + queue_size
+        self._per_run_queue_size = per_run_queue_size
+        self._per_run_slots: dict[str, asyncio.BoundedSemaphore] = {}
+        self._pending_by_run: dict[str, int] = {}
+        self._pending = 0
+        self._max_pending = 0
+        self._drain_condition = asyncio.Condition()
+        self._closed = False
+
+    def _slot_for_run(self, run_id: str) -> asyncio.BoundedSemaphore:
+        return self._per_run_slots.setdefault(
+            run_id,
+            asyncio.BoundedSemaphore(self._per_run_queue_size),
+        )
+
+    async def submit(
+        self,
+        run_id: str,
+        function: Callable[..., Any],
+        *args: Any,
+        **kwargs: Any,
+    ) -> Any:
+        if self._closed:
+            raise RuntimeError("persistence writer is closed")
+        run_slot = self._slot_for_run(run_id)
+        await run_slot.acquire()
+        capacity_acquired = False
+        try:
+            await self._capacity.acquire()
+            capacity_acquired = True
+            if self._closed:
+                raise RuntimeError("persistence writer is closed")
+            executor = self._executor
+            if executor is None:
+                raise RuntimeError("persistence writer is closed")
+            async with self._drain_condition:
+                self._pending += 1
+                self._pending_by_run[run_id] = self._pending_by_run.get(run_id, 0) + 1
+                self._max_pending = max(self._max_pending, self._pending)
+            loop = asyncio.get_running_loop()
+            future = loop.run_in_executor(
+                executor,
+                partial(function, *args, **kwargs),
+            )
+            try:
+                return await asyncio.shield(future)
+            except asyncio.CancelledError:
+                await asyncio.shield(future)
+                raise
+            finally:
+                async with self._drain_condition:
+                    self._pending -= 1
+                    remaining = self._pending_by_run[run_id] - 1
+                    if remaining:
+                        self._pending_by_run[run_id] = remaining
+                    else:
+                        self._pending_by_run.pop(run_id, None)
+                    self._drain_condition.notify_all()
+        finally:
+            if capacity_acquired:
+                self._capacity.release()
+            run_slot.release()
+
+    async def drain(self, run_id: str | None = None) -> None:
+        async with self._drain_condition:
+            while (
+                self._pending_by_run.get(run_id, 0)
+                if run_id is not None
+                else self._pending
+            ):
+                await self._drain_condition.wait()
+
+    async def close(self) -> None:
+        if self._closed and self._executor is None:
+            return
+        self._closed = True
+        await self.drain()
+        executor = self._executor
+        self._executor = None
+        if executor is not None:
+            executor.shutdown(wait=True)
+
+    def metrics(self) -> dict[str, Any]:
+        return {
+            "queue_depth": self._pending,
+            "queue_capacity": self._capacity_size,
+            "max_queue_depth": self._max_pending,
+            "per_run_queue_depth": dict(self._pending_by_run),
+            "per_run_queue_capacity": self._per_run_queue_size,
+        }
 
 
 class _HandoverPendingDisposition(str, Enum):
@@ -317,9 +428,7 @@ def _validated_source(value: object) -> str | None:
             f"source must be a non-empty string up to {_SOURCE_MAX_LENGTH} characters"
         )
     if not _SOURCE_PATTERN.match(value):
-        raise ValueError(
-            "source may only contain letters, digits, and _.:- characters"
-        )
+        raise ValueError("source may only contain letters, digits, and _.:- characters")
     return value
 
 
@@ -432,9 +541,7 @@ def _public_run(record: RunRecord) -> dict[str, Any]:
 
 def _validate_auto_archive_policy(role: str, auto_archive: bool | None) -> None:
     if auto_archive is True and role.casefold() in _AUTO_ARCHIVE_FORBIDDEN_ROLES:
-        raise ValueError(
-            f"auto_archive=one-shot is not allowed for role={role!r}"
-        )
+        raise ValueError(f"auto_archive=one-shot is not allowed for role={role!r}")
 
 
 class Supervisor:
@@ -483,8 +590,15 @@ class Supervisor:
                 logger.exception("could not block corrupt raw run %s", run_id)
         self.materializer_reducers: dict[str, EventReducerAdapter] = {}
         self.materializer_latency_seconds: deque[float] = deque(maxlen=256)
+        self.persistence_latency_seconds: deque[float] = deque(maxlen=256)
         self.materializer_queue_depth: dict[str, int] = {}
         self.materializer_failures = 0
+        self._materializer_metrics_lock = threading.Lock()
+        self.persistence_writer = _BoundedPersistenceWriter(
+            workers=DEFAULT_PERSISTENCE_WRITER_WORKERS,
+            queue_size=DEFAULT_PERSISTENCE_WRITER_QUEUE_SIZE,
+            per_run_queue_size=DEFAULT_PERSISTENCE_WRITER_PER_RUN_QUEUE_SIZE,
+        )
         self.pid_alive = pid_alive
         self.recovery_stability_seconds = recovery_stability_seconds
         self.approval_recovery_timeout_seconds = _validated_seconds(
@@ -545,9 +659,7 @@ class Supervisor:
         self.event_routes: dict[tuple[int, int], str] = {}
         self.queue_locks: dict[str, asyncio.Lock] = {}
         self._queued_delivery_attempts: set[tuple[str, str]] = set()
-        self._delivery_attempt_echoes: dict[
-            tuple[str, str], asyncio.Future[None]
-        ] = {}
+        self._delivery_attempt_echoes: dict[tuple[str, str], asyncio.Future[None]] = {}
         self._deferred_provider_events: dict[
             str,
             list[
@@ -625,9 +737,9 @@ class Supervisor:
         self.last_limit_alert_at: dict[str, float] = {}
         self.last_no_eligible_alert: float = 0.0
         self.idempotency_cache_size = idempotency_cache_size
-        self.idempotency_results: OrderedDict[
-            tuple[str, str], tuple[str, Any]
-        ] = OrderedDict()
+        self.idempotency_results: OrderedDict[tuple[str, str], tuple[str, Any]] = (
+            OrderedDict()
+        )
         self.idempotency_tasks: dict[tuple[str, str], asyncio.Task[Any]] = {}
         # WIKI-219 owns durable implicit-id receipts across supervisor restarts.
         self.implicit_idempotency_keys: set[tuple[str, str]] = set()
@@ -658,13 +770,39 @@ class Supervisor:
             logger.exception("could not reconcile archived workgraph edges")
 
     def materializer_metrics(self) -> dict[str, Any]:
-        latencies = self.materializer_latency_seconds
+        with self._materializer_metrics_lock:
+            latencies = deque(self.materializer_latency_seconds)
+            queue_depth = dict(self.materializer_queue_depth)
+            materializer_failures = self.materializer_failures
+        persistence_latencies = self.persistence_latency_seconds
+
+        def quantiles(values: deque[float]) -> dict[str, float]:
+            if not values:
+                return {"p50": 0.0, "p95": 0.0, "p99": 0.0}
+            ordered = sorted(values)
+            return {
+                key: ordered[
+                    min(
+                        len(ordered) - 1,
+                        max(0, math.ceil(len(ordered) * rank) - 1),
+                    )
+                ]
+                for key, rank in (("p50", 0.50), ("p95", 0.95), ("p99", 0.99))
+            }
+
+        persistence = self.persistence_writer.metrics()
         return {
             "count": len(latencies),
             "last_latency_seconds": latencies[-1] if latencies else 0.0,
             "max_latency_seconds": max(latencies) if latencies else 0.0,
-            "queue_depth": dict(self.materializer_queue_depth),
-            "failures": self.materializer_failures,
+            "latency_seconds": quantiles(latencies),
+            "queue_depth": queue_depth,
+            "failures": materializer_failures,
+            "persistence": {
+                **persistence,
+                "count": len(persistence_latencies),
+                "latency_seconds": quantiles(persistence_latencies),
+            },
         }
 
     def sync_subagent_runs(self, parent_run_id: str) -> list[str]:
@@ -777,7 +915,8 @@ class Supervisor:
         reducer = self._materializer_for_record(record)
         if not self.event_store.has_disposition(record.run_id, raw_seq):
             started = time.perf_counter()
-            self.materializer_queue_depth[record.run_id] = 1
+            with self._materializer_metrics_lock:
+                self.materializer_queue_depth[record.run_id] = 1
             try:
                 materialized = NormalizedProviderEvent(
                     normalized.disposition,
@@ -795,13 +934,82 @@ class Supervisor:
                     normalized=materialized,
                 )
             except Exception:
-                self.materializer_failures += 1
+                with self._materializer_metrics_lock:
+                    self.materializer_failures += 1
                 raise
             finally:
-                self.materializer_latency_seconds.append(
-                    time.perf_counter() - started
+                with self._materializer_metrics_lock:
+                    self.materializer_latency_seconds.append(
+                        time.perf_counter() - started
+                    )
+                    self.materializer_queue_depth[record.run_id] = 0
+
+    def _persist_event_bundle(
+        self,
+        record: RunRecord,
+        event: ProviderEvent,
+        normalized: NormalizedProviderEvent,
+        payload: dict[str, Any],
+    ) -> dict[str, Any]:
+        with self.store._lock:  # noqa: SLF001 - keep raw visibility atomic
+            raw = self.store.append_raw(
+                record.run_id,
+                provider=event.provider.value,
+                direction=event.direction,
+                payload=event.payload,
+                generation=event.generation,
+                received_at=event.received_at,
+            )
+            self._dual_write_normalized(
+                record,
+                raw,
+                normalized,
+                payload,
+            )
+        return raw
+
+    def _persist_startup_batch(
+        self,
+        record: RunRecord,
+        entries: list[tuple[ProviderEvent, NormalizedProviderEvent, dict[str, Any]]],
+    ) -> list[dict[str, Any]]:
+        raws: list[dict[str, Any]] = []
+        self.store.begin_raw_event_batch(record.run_id)
+        try:
+            for event, normalized, payload in entries:
+                raw = self.store.append_raw(
+                    record.run_id,
+                    provider=event.provider.value,
+                    direction=event.direction,
+                    payload=event.payload,
+                    generation=event.generation,
+                    received_at=event.received_at,
                 )
-                self.materializer_queue_depth[record.run_id] = 0
+                self._dual_write_normalized(record, raw, normalized, payload)
+                raws.append(raw)
+        finally:
+            self.store.end_raw_event_batch(record.run_id)
+        return raws
+
+    async def _persist_event_bundle_async(
+        self,
+        record: RunRecord,
+        event: ProviderEvent,
+        normalized: NormalizedProviderEvent,
+        payload: dict[str, Any],
+    ) -> dict[str, Any]:
+        started = time.perf_counter()
+        try:
+            return await self.persistence_writer.submit(
+                record.run_id,
+                self._persist_event_bundle,
+                record,
+                event,
+                normalized,
+                payload,
+            )
+        finally:
+            self.persistence_latency_seconds.append(time.perf_counter() - started)
 
     async def _dual_write_normalized_async(
         self,
@@ -816,20 +1024,61 @@ class Supervisor:
         materializer_gate = getattr(self, "materializer_gate", None)
         if materializer_gate is not None:
             await materializer_gate.wait()
-        self._dual_write_normalized(
-            record,
-            raw,
-            normalized,
-            payload,
-            append_legacy=append_legacy,
-            normalized_seq=normalized_seq,
-        )
+        started = time.perf_counter()
+        try:
+            await self.persistence_writer.submit(
+                record.run_id,
+                self._dual_write_normalized,
+                record,
+                raw,
+                normalized,
+                payload,
+                append_legacy=append_legacy,
+                normalized_seq=normalized_seq,
+            )
+        finally:
+            self.persistence_latency_seconds.append(time.perf_counter() - started)
+
+    async def _append_raw_event_async(
+        self,
+        run_id: str,
+        *,
+        provider: str,
+        direction: str,
+        payload: dict[str, Any],
+        generation: int,
+        received_at: str,
+    ) -> dict[str, Any]:
+        started = time.perf_counter()
+        try:
+            return await self.persistence_writer.submit(
+                run_id,
+                self.store.append_raw,
+                run_id,
+                provider=provider,
+                direction=direction,
+                payload=payload,
+                generation=generation,
+                received_at=received_at,
+            )
+        finally:
+            self.persistence_latency_seconds.append(time.perf_counter() - started)
+
+    async def _sync_subagent_runs_async(self, run_id: str) -> None:
+        started = time.perf_counter()
+        try:
+            await self.persistence_writer.submit(
+                run_id,
+                self.sync_subagent_runs,
+                run_id,
+            )
+        finally:
+            self.persistence_latency_seconds.append(time.perf_counter() - started)
+
     def _runtime_status(self, record: RunRecord) -> dict[str, Any]:
         value = _public_run(record)
         value["archive_in_progress"] = record.run_id in self.archive_inflight
-        value["composer_messages"] = self.store.composer_messages_for_run(
-            record.run_id
-        )
+        value["composer_messages"] = self.store.composer_messages_for_run(record.run_id)
         adapter = self.adapters.get(record.run_id)
         snapshot = adapter.snapshot() if adapter is not None else None
         value["control_attached"] = adapter is not None
@@ -1180,13 +1429,20 @@ Preserve the same identity, role, worktree, orchestrator grouping, PR gates, and
             step = status.get("step")
             normalized_state = state.casefold() if isinstance(state, str) else None
             if normalized_state in {"merge-ready", "blocked"} and isinstance(step, str):
-                if _VERDICT_STEP_RE.search(step) or record.state is LifecycleState.COMPLETED:
+                if (
+                    _VERDICT_STEP_RE.search(step)
+                    or record.state is LifecycleState.COMPLETED
+                ):
                     return (
                         "verdict",
-                        record.last_lifecycle_event_seq or record.normalized_event_count,
+                        record.last_lifecycle_event_seq
+                        or record.normalized_event_count,
                     )
         if record.state is LifecycleState.COMPLETED:
-            return "completed", record.last_lifecycle_event_seq or record.normalized_event_count
+            return (
+                "completed",
+                record.last_lifecycle_event_seq or record.normalized_event_count,
+            )
         return None
 
     async def _auto_archive_one_locked(self, run_id: str) -> dict[str, str] | None:
@@ -1202,14 +1458,12 @@ Preserve the same identity, role, worktree, orchestrator grouping, PR gates, and
             return None
         try:
             age = (
-                datetime.now(timezone.utc)
-                - datetime.fromisoformat(terminal_at)
+                datetime.now(timezone.utc) - datetime.fromisoformat(terminal_at)
             ).total_seconds()
         except ValueError:
             age = self.auto_archive_grace_seconds
-        viewed = (
-            record.last_viewed_seq is not None
-            and record.last_viewed_seq >= (record.auto_archive_verdict_seq or 0)
+        viewed = record.last_viewed_seq is not None and record.last_viewed_seq >= (
+            record.auto_archive_verdict_seq or 0
         )
         if not viewed and age < self.auto_archive_grace_seconds:
             return None
@@ -1249,7 +1503,9 @@ Preserve the same identity, role, worktree, orchestrator grouping, PR gates, and
                 status_dir=self.store.paths.status_dir,
             )
         except Exception:
-            logger.exception("could not write archive workgraph edge for %s", record.agent_id)
+            logger.exception(
+                "could not write archive workgraph edge for %s", record.agent_id
+            )
 
     async def _auto_archive_sweep(self) -> list[dict[str, str]]:
         results: list[dict[str, str]] = []
@@ -1265,10 +1521,51 @@ Preserve the same identity, role, worktree, orchestrator grouping, PR gates, and
                     results.append(result)
         return results
 
-    async def _pump_events(self, run_id: str, adapter: ProviderAdapter) -> None:
+    async def _pump_events(
+        self, run_id: str, adapter: ProviderAdapter, startup_batch: bool = False
+    ) -> None:
         stream_key = id(adapter)
         try:
             async for event in adapter.events():
+                if startup_batch:
+                    startup_batch = False
+                    events = [event, *await adapter.drain_events()]
+                    record = self.store.get(run_id)
+                    entries = []
+                    for queued_event in events:
+                        normalized = normalize_provider_event(
+                            queued_event.provider,
+                            queued_event.payload,
+                            direction=queued_event.direction,
+                        )
+                        entries.append((queued_event, normalized, normalized.payload))
+                    self.event_inflight_counts[run_id] = len(events)
+                    async with self.event_drain_condition:
+                        self.event_drain_condition.notify_all()
+                    try:
+                        raws = await self.persistence_writer.submit(
+                            run_id, self._persist_startup_batch, record, entries
+                        )
+                        for queued_event, raw, normalized, _ in zip(
+                            events,
+                            raws,
+                            (item[1] for item in entries),
+                            entries,
+                            strict=True,
+                        ):
+                            await self._handle_provider_event_without_admission(
+                                run_id,
+                                adapter,
+                                queued_event,
+                                raw=raw,
+                                normalized=normalized,
+                                persist=False,
+                            )
+                    finally:
+                        self.event_inflight_counts.pop(run_id, None)
+                        async with self.event_drain_condition:
+                            self.event_drain_condition.notify_all()
+                    continue
                 # Mark the local slot before the first await. The detach
                 # barrier cannot observe an event between queue removal and
                 # this increment.
@@ -1278,6 +1575,7 @@ Preserve the same identity, role, worktree, orchestrator grouping, PR gates, and
                 try:
                     async with self.event_drain_condition:
                         self.event_drain_condition.notify_all()
+                    await asyncio.sleep(0)
                     event_run_id = self.event_routes.get(
                         (id(adapter), event.generation),
                         run_id,
@@ -1367,7 +1665,9 @@ Preserve the same identity, role, worktree, orchestrator grouping, PR gates, and
                     if record.state in {LifecycleState.DEAD, LifecycleState.COMPLETED}:
                         record = None
                     else:
-                        record = self.store.transition(run_id, record.state, reason=reason)
+                        record = self.store.transition(
+                            run_id, record.state, reason=reason
+                        )
                 except (RunNotFound, ValueError):
                     record = None
                 self._remove_adapter_mapping(run_id, adapter)
@@ -1412,24 +1712,26 @@ Preserve the same identity, role, worktree, orchestrator grouping, PR gates, and
         normalized: NormalizedProviderEvent | None = None,
         prior_state: LifecycleState | None = None,
         shutdown_observation: bool = False,
+        publish_session: bool = True,
+        persist: bool = True,
     ) -> None:
         record_before_event = self.store.get(run_id)
         if prior_state is None:
             prior_state = record_before_event.state
-        if raw is None:
-            raw = self.store.append_raw(
-                run_id,
-                provider=event.provider.value,
-                direction=event.direction,
-                payload=event.payload,
-                generation=event.generation,
-                received_at=event.received_at,
-            )
         if shutdown_observation:
             observation_payload = {
                 "prior_state": prior_state.value,
                 "event_payload": event.payload,
             }
+            if raw is None:
+                raw = await self._append_raw_event_async(
+                    run_id,
+                    provider=event.provider.value,
+                    direction=event.direction,
+                    payload=event.payload,
+                    generation=event.generation,
+                    received_at=event.received_at,
+                )
             await self._dual_write_normalized_async(
                 record_before_event,
                 raw,
@@ -1441,10 +1743,11 @@ Preserve the same identity, role, worktree, orchestrator grouping, PR gates, and
                 observation_payload,
             )
             return
-        if (
+        retired_generation = (
             event.generation > 0
             and event.generation < record_before_event.provider_generation
-        ):
+        )
+        if retired_generation:
             # A stopped transport cannot prove delivery for a matcher owned
             # by the resumed generation. Keep the raw event for audit, but
             # terminalize its normalization as ignored before text matching.
@@ -1452,25 +1755,12 @@ Preserve the same identity, role, worktree, orchestrator grouping, PR gates, and
                 "event_generation": event.generation,
                 "provider_generation": record_before_event.provider_generation,
             }
-            await self._dual_write_normalized_async(
-                record_before_event,
-                raw,
-                NormalizedProviderEvent(
-                    EventDisposition.IGNORED,
-                    "retired_generation_event",
-                    retired_payload,
-                ),
+            normalized = NormalizedProviderEvent(
+                EventDisposition.IGNORED,
+                "retired_generation_event",
                 retired_payload,
             )
-            await self._publish(
-                {
-                    "type": "session",
-                    "ticket": record_before_event.agent_id,
-                    "surface": "session",
-                }
-            )
-            return
-        if normalized is None:
+        elif normalized is None:
             try:
                 normalized = normalize_provider_event(
                     event.provider,
@@ -1483,6 +1773,7 @@ Preserve the same identity, role, worktree, orchestrator grouping, PR gates, and
                     "normalization_error",
                     {"error": str(exc), "raw_payload": event.payload},
                 )
+        assert normalized is not None
         pending_message = None
         echoed_text = _provider_user_text(
             event.provider,
@@ -1490,7 +1781,7 @@ Preserve the same identity, role, worktree, orchestrator grouping, PR gates, and
             normalized.payload,
         )
         normalized_payload = normalized.payload
-        if echoed_text is not None:
+        if not retired_generation and echoed_text is not None:
             pending_message = self.store.match_pending_user_message(
                 run_id,
                 echoed_text,
@@ -1524,22 +1815,60 @@ Preserve the same identity, role, worktree, orchestrator grouping, PR gates, and
                 pending_source = pending_message.get("source")
                 if isinstance(pending_source, str) and pending_source:
                     normalized_payload["source"] = pending_source
-        await self._dual_write_normalized_async(
-            record_before_event,
-            raw,
-            normalized,
-            normalized_payload,
-        )
-        try:
-            self.sync_subagent_runs(run_id)
-        except Exception:
-            logger.exception("could not sync Claude child runs for %s", run_id)
+        if raw is None and persist:
+            if getattr(self, "materializer_gate", None) is not None:
+                raw = await self._append_raw_event_async(
+                    run_id,
+                    provider=event.provider.value,
+                    direction=event.direction,
+                    payload=event.payload,
+                    generation=event.generation,
+                    received_at=event.received_at,
+                )
+                await self._dual_write_normalized_async(
+                    record_before_event,
+                    raw,
+                    normalized,
+                    normalized_payload,
+                )
+            else:
+                raw = await self._persist_event_bundle_async(
+                    record_before_event,
+                    event,
+                    normalized,
+                    normalized_payload,
+                )
+        elif persist:
+            await self._dual_write_normalized_async(
+                record_before_event,
+                raw,
+                normalized,
+                normalized_payload,
+            )
+        if retired_generation:
+            if publish_session:
+                await self._publish(
+                    {
+                        "type": "session",
+                        "ticket": record_before_event.agent_id,
+                        "surface": "session",
+                    }
+                )
+            return
+        if event.provider is ProviderKind.CLAUDE:
+            try:
+                await self._sync_subagent_runs_async(run_id)
+            except Exception:
+                logger.exception("could not sync Claude child runs for %s", run_id)
         if pending_message is not None:
             # The normalized row is the durable delivery proof. Do not make
             # the steer terminal before this append commits: a failed append
             # must remain recoverable from the already-durable raw echo
             # (REVIEW18 H1).
             self.store.command_log.acknowledge_steer_for_pending(
+                run_id, pending_message["pending_id"]
+            )
+            self.store.discard_pending_user_message(
                 run_id, pending_message["pending_id"]
             )
 
@@ -1581,9 +1910,10 @@ Preserve the same identity, role, worktree, orchestrator grouping, PR gates, and
                 provider_health.credential_fingerprint("cdx")
             )
 
-        await self._publish(
-            {"type": "session", "ticket": record.agent_id, "surface": "session"}
-        )
+        if publish_session:
+            await self._publish(
+                {"type": "session", "ticket": record.agent_id, "surface": "session"}
+            )
         turn_status = turn.get("status") if isinstance(turn, dict) else None
         credential_fingerprint = (
             self.codex_turn_fingerprints.pop((run_id, turn_id), None)
@@ -1740,18 +2070,16 @@ Preserve the same identity, role, worktree, orchestrator grouping, PR gates, and
         """Move buffered events from live adapters into the handover queue."""
 
         for run_id, adapter in list(self.adapters.items()):
-            event_lock = self.event_processing_locks.setdefault(
-                run_id, asyncio.Lock()
-            )
+            event_lock = self.event_processing_locks.setdefault(run_id, asyncio.Lock())
             async with event_lock:
                 for event in await adapter.drain_events():
                     event_run_id = self.event_routes.get(
                         (id(adapter), event.generation), run_id
                     )
                     async with self.handover_condition:
-                        self.handover_event_queue.setdefault(
-                            event_run_id, []
-                        ).append((adapter, event))
+                        self.handover_event_queue.setdefault(event_run_id, []).append(
+                            (adapter, event)
+                        )
 
     async def _drain_stopped_adapter(
         self,
@@ -1763,9 +2091,10 @@ Preserve the same identity, role, worktree, orchestrator grouping, PR gates, and
     ) -> None:
         """Drain the adapter and every event already taken by its pump."""
 
-        event_lock = self.event_processing_locks.setdefault(
-            run_id, asyncio.Lock()
-        )
+        event_lock = self.event_processing_locks.setdefault(run_id, asyncio.Lock())
+        async with self.event_drain_condition:
+            while self.event_inflight_counts.get(run_id):
+                await self.event_drain_condition.wait()
         while True:
             async with event_lock:
                 for event in await adapter.drain_events():
@@ -1786,9 +2115,7 @@ Preserve the same identity, role, worktree, orchestrator grouping, PR gates, and
                             event,
                             update_adapter_snapshot=True,
                             schedule_monitor_actions=True,
-                            shutdown_observation=(
-                                audit_only or shutdown_observation
-                            ),
+                            shutdown_observation=(audit_only or shutdown_observation),
                             prior_state=(
                                 self.shutdown_phase.audit_state(event_run_id)
                                 or prior_state
@@ -1796,6 +2123,7 @@ Preserve the same identity, role, worktree, orchestrator grouping, PR gates, and
                         )
             async with self.event_drain_condition:
                 if not self.event_inflight_counts.get(run_id):
+                    await self.persistence_writer.drain(run_id)
                     return
                 await self.event_drain_condition.wait()
 
@@ -1824,9 +2152,8 @@ Preserve the same identity, role, worktree, orchestrator grouping, PR gates, and
                     ),
                     name=f"codex-rate-limit-{run_id}",
                 )
-            if (
-                event.direction != "client"
-                and accounts.detect_codex_auth_dead_payload(event.payload)
+            if event.direction != "client" and accounts.detect_codex_auth_dead_payload(
+                event.payload
             ):
                 existing = self.auth_dead_recoveries.get(run_id)
                 if existing is None or existing.done():
@@ -1855,7 +2182,10 @@ Preserve the same identity, role, worktree, orchestrator grouping, PR gates, and
             # Throttle per run_id so a replacement run under the same
             # ticket can emit its own limit notice within the hour. See
             # last_limit_alert_at comment.
-            if self._seconds_since(self.last_limit_alert_at.get(record.run_id, 0.0)) < 3600:
+            if (
+                self._seconds_since(self.last_limit_alert_at.get(record.run_id, 0.0))
+                < 3600
+            ):
                 return
             self.last_limit_alert_at[record.run_id] = time.monotonic()
             self._spawn_monitor_task(
@@ -1955,15 +2285,17 @@ Preserve the same identity, role, worktree, orchestrator grouping, PR gates, and
         now_mono = time.monotonic()
         history = self.auth_dead_attempts.setdefault(initial.run_id, [])
         history[:] = [
-            ts
-            for ts in history
-            if now_mono - ts < accounts.AUTH_DEAD_WINDOW_SECONDS
+            ts for ts in history if now_mono - ts < accounts.AUTH_DEAD_WINDOW_SECONDS
         ]
         if history and now_mono - history[-1] < accounts.AUTH_DEAD_COOLDOWN_SECONDS:
-            await self._publish_auth_dead_exhausted(initial.agent_id, initial.run_id, now_mono)
+            await self._publish_auth_dead_exhausted(
+                initial.agent_id, initial.run_id, now_mono
+            )
             return
         if len(history) >= accounts.AUTH_DEAD_MAX_ATTEMPTS:
-            await self._publish_auth_dead_exhausted(initial.agent_id, initial.run_id, now_mono)
+            await self._publish_auth_dead_exhausted(
+                initial.agent_id, initial.run_id, now_mono
+            )
             return
         history.append(now_mono)
 
@@ -2256,12 +2588,8 @@ Preserve the same identity, role, worktree, orchestrator grouping, PR gates, and
                     return
             if pending_id is not None:
                 current_pending = self.store.get(run_id).pending_user_messages
-                if (
-                    len(current_pending) >= MAX_PENDING_USER_MESSAGES
-                    and not any(
-                        item.get("pending_id") == pending_id
-                        for item in current_pending
-                    )
+                if len(current_pending) >= MAX_PENDING_USER_MESSAGES and not any(
+                    item.get("pending_id") == pending_id for item in current_pending
                 ):
                     adapter = await self._rotate_pending_matcher_transport_locked(
                         run_id,
@@ -2359,9 +2687,7 @@ Preserve the same identity, role, worktree, orchestrator grouping, PR gates, and
                             run_id, pending_id
                         )
                     else:
-                        self.store.discard_pending_user_message(
-                            run_id, pending_id
-                        )
+                        self.store.discard_pending_user_message(run_id, pending_id)
                     # The "sending" marker was written above and cannot
                     # revert to "queued" after an unknown transport result.
                     # Without durable delivery evidence, record uncertainty
@@ -2497,7 +2823,13 @@ Preserve the same identity, role, worktree, orchestrator grouping, PR gates, and
             if key[0] != adapter_key
         }
 
-    def _attach_adapter(self, run_id: str, adapter: ProviderAdapter) -> None:
+    def _attach_adapter(
+        self,
+        run_id: str,
+        adapter: ProviderAdapter,
+        *,
+        startup_batch: bool = False,
+    ) -> None:
         if self.shutdown_phase.input_frozen:
             raise CommandRetryable("supervisor is shutting down")
         existing = self.adapters.get(run_id)
@@ -2515,7 +2847,7 @@ Preserve the same identity, role, worktree, orchestrator grouping, PR gates, and
         )
         self.store.set_control_attached(run_id, True)
         self.event_tasks[run_id] = asyncio.create_task(
-            self._pump_events(run_id, adapter),
+            self._pump_events(run_id, adapter, startup_batch),
             name=f"agent-events-{run_id}",
         )
 
@@ -2582,6 +2914,7 @@ Preserve the same identity, role, worktree, orchestrator grouping, PR gates, and
                 await adapter.close()
             except Exception:
                 pass
+            await self.persistence_writer.drain(run_id)
             task = self.event_tasks.get(run_id)
             if task is not None and task is not asyncio.current_task():
                 try:
@@ -2864,6 +3197,7 @@ Preserve the same identity, role, worktree, orchestrator grouping, PR gates, and
         run_id: str | None = None,
         implicit_request_id: bool = False,
         execution_kind: str | None = None,
+        wait_for_startup: bool = False,
     ) -> RunRecord:
         if execution_kind is not None:
             if not wk_enabled() or not is_wk_kind(execution_kind):
@@ -2892,7 +3226,9 @@ Preserve the same identity, role, worktree, orchestrator grouping, PR gates, and
             if durable is not None:
                 return durable
         resolved = resolve_safe_worktree(worktree)
-        resolved_auto_archive = role == "review" if auto_archive is None else auto_archive
+        resolved_auto_archive = (
+            role == "review" if auto_archive is None else auto_archive
+        )
         record = RunRecord.new(
             agent_id=agent_id,
             provider=provider,
@@ -2926,14 +3262,24 @@ Preserve the same identity, role, worktree, orchestrator grouping, PR gates, and
                             migrate_legacy=migrate_legacy,
                             transactional_start=True,
                         )
-                        return await self._launch_record(record, prompt, rollback_start=True)
+                        return await self._launch_record(
+                            record,
+                            prompt,
+                            rollback_start=True,
+                            wait_for_startup=wait_for_startup,
+                        )
             async with self._agent_lock(record.agent_id):
                 self.store.create(
                     record,
                     migrate_legacy=migrate_legacy,
                     transactional_start=True,
                 )
-                return await self._launch_record(record, prompt, rollback_start=True)
+                return await self._launch_record(
+                    record,
+                    prompt,
+                    rollback_start=True,
+                    wait_for_startup=wait_for_startup,
+                )
 
     async def _launch_record(
         self,
@@ -2941,11 +3287,12 @@ Preserve the same identity, role, worktree, orchestrator grouping, PR gates, and
         prompt: str,
         *,
         rollback_start: bool = False,
+        wait_for_startup: bool = False,
     ) -> RunRecord:
         adapter: ProviderAdapter | None = None
         try:
             adapter = self.adapter_factory(record)
-            self._attach_adapter(record.run_id, adapter)
+            self._attach_adapter(record.run_id, adapter, startup_batch=True)
         except asyncio.CancelledError:
             if adapter is not None:
                 await self._cleanup_precommit_adapter(record.run_id, adapter)
@@ -3001,7 +3348,12 @@ Preserve the same identity, role, worktree, orchestrator grouping, PR gates, and
             raise
         self.store.commit_start(record.run_id)
         await self._publish_agent_change(record.agent_id)
-        return record
+        if wait_for_startup:
+            await asyncio.sleep(0)
+        if any(other_id != record.run_id for other_id in self.adapters):
+            await asyncio.sleep(0)
+        await self.persistence_writer.drain(record.run_id)
+        return self.store.get(record.run_id)
 
     async def resume_run(self, run_id: str) -> RunRecord:
         async with self._run_mutation_admission():
@@ -3119,9 +3471,7 @@ Preserve the same identity, role, worktree, orchestrator grouping, PR gates, and
                         "provider did not re-emit the pending approval after transport recovery"
                     )
                 for key, pending in old_pending_requests.items():
-                    if (
-                        record.pending_requests.get(key) == pending
-                    ):
+                    if record.pending_requests.get(key) == pending:
                         record = self.store.clear_pending_request_key(run_id, key)
         except asyncio.CancelledError:
             if approval_prompt is not None:
@@ -3191,6 +3541,7 @@ Preserve the same identity, role, worktree, orchestrator grouping, PR gates, and
         self.prepare_startup_recovery()
         try:
             await self._rebuild_startup_projections()
+            await self.persistence_writer.drain()
             self.projection_rebuild_ready.set()
             async with self._run_mutation_admission():
                 async with self.recovery_scan_lock:
@@ -3434,8 +3785,7 @@ Preserve the same identity, role, worktree, orchestrator grouping, PR gates, and
                     int(event.get("raw_seq", 0)) for event in normalized_rows
                 }
                 normalized_by_raw_seq = {
-                    int(event.get("raw_seq", 0)): event
-                    for event in normalized_rows
+                    int(event.get("raw_seq", 0)): event for event in normalized_rows
                 }
             except RunNotFound:
                 normalized_rows = []
@@ -3471,9 +3821,7 @@ Preserve the same identity, role, worktree, orchestrator grouping, PR gates, and
             # Hold the per-run event-processing lock so a live event that
             # arrives mid-scan cannot append a duplicate normalize row for
             # a raw seq this pass is already replaying.
-            event_lock = self.event_processing_locks.setdefault(
-                run_id, asyncio.Lock()
-            )
+            event_lock = self.event_processing_locks.setdefault(run_id, asyncio.Lock())
             recovered_any = False
             async with event_lock:
                 # Reload after acquiring the lock so a normalize that landed
@@ -3484,8 +3832,7 @@ Preserve the same identity, role, worktree, orchestrator grouping, PR gates, and
                         int(event.get("raw_seq", 0)) for event in normalized_rows
                     }
                     normalized_by_raw_seq = {
-                        int(event.get("raw_seq", 0)): event
-                        for event in normalized_rows
+                        int(event.get("raw_seq", 0)): event for event in normalized_rows
                     }
                 except RunNotFound:
                     continue
@@ -3498,7 +3845,10 @@ Preserve the same identity, role, worktree, orchestrator grouping, PR gates, and
                     database_healthy = False
                 for envelope in orphans:
                     orphan_seq = int(envelope.get("seq", 0))
-                    if orphan_seq in normalized_seqs and orphan_seq in materialized_seqs:
+                    if (
+                        orphan_seq in normalized_seqs
+                        and orphan_seq in materialized_seqs
+                    ):
                         continue
                     appended = await self._recover_orphan_raw_event(
                         run_id,
@@ -3516,9 +3866,8 @@ Preserve the same identity, role, worktree, orchestrator grouping, PR gates, and
                 if (
                     not database_healthy
                     or recovered_any
-                    or materialized_seqs != {
-                    int(event.get("seq", 0)) for event in raw_rows
-                    }
+                    or materialized_seqs
+                    != {int(event.get("seq", 0)) for event in raw_rows}
                 ):
                     try:
                         await self._rebuild_materializer_database(run_id)
@@ -3527,9 +3876,7 @@ Preserve the same identity, role, worktree, orchestrator grouping, PR gates, and
                         self.materializer_failed_runs[run_id] = reason
                         try:
                             record = self.store.get(run_id)
-                            recovery_state = (
-                                record.recovery_from_state or record.state
-                            )
+                            recovery_state = record.recovery_from_state or record.state
                             self.store.mark_automatic_resume_failed(
                                 run_id,
                                 reason=reason,
@@ -3586,8 +3933,8 @@ Preserve the same identity, role, worktree, orchestrator grouping, PR gates, and
             and raw_generation < record.provider_generation
         ):
             retired_payload = {
-                    "event_generation": raw_generation,
-                    "provider_generation": record.provider_generation,
+                "event_generation": raw_generation,
+                "provider_generation": record.provider_generation,
             }
             retired = NormalizedProviderEvent(
                 EventDisposition.IGNORED,
@@ -3706,9 +4053,7 @@ Preserve the same identity, role, worktree, orchestrator grouping, PR gates, and
             # Without it the queued row survives ``recover_on_start``,
             # every later ``send_on_idle`` sees a stale head, and the
             # queue never drains (WIKI-232 REVIEW11 M2).
-            self.store.remove_queued_message_by_pending_id(
-                run_id, matched_pending_id
-            )
+            self.store.remove_queued_message_by_pending_id(run_id, matched_pending_id)
         return True
 
     async def _rebuild_materializer_database(self, run_id: str) -> None:
@@ -3749,7 +4094,8 @@ Preserve the same identity, role, worktree, orchestrator grouping, PR gates, and
                     disposition = row.get("disposition")
                     event_disposition = (
                         EventDisposition.IGNORED
-                        if disposition in {
+                        if disposition
+                        in {
                             "ignored",
                             "intentionally_ignored",
                             EventDisposition.IGNORED.value,
@@ -3817,9 +4163,7 @@ Preserve the same identity, role, worktree, orchestrator grouping, PR gates, and
             if not run_id or not method or not request_id:
                 continue
             pending_id = effect.get("pending_id")
-            pending_id_str = (
-                str(pending_id) if isinstance(pending_id, str) else None
-            )
+            pending_id_str = str(pending_id) if isinstance(pending_id, str) else None
             try:
                 record = self.store.get(run_id)
             except RunNotFound:
@@ -4176,7 +4520,9 @@ Preserve the same identity, role, worktree, orchestrator grouping, PR gates, and
                     "provider PID is live without supervisor control"
                 )
                 continue
-            current = self.store.is_current(snapshot) and not snapshot.replaced_by_run_id
+            current = (
+                self.store.is_current(snapshot) and not snapshot.replaced_by_run_id
+            )
             resumable = snapshot.state in {
                 LifecycleState.WORKING,
                 LifecycleState.IDLE,
@@ -4368,13 +4714,17 @@ Preserve the same identity, role, worktree, orchestrator grouping, PR gates, and
     @staticmethod
     def _ensure_committed_account(journal: dict[str, Any]) -> None:
         incoming = journal.get("incoming")
-        if not isinstance(incoming, str) or not accounts.install_incoming_auth(incoming):
+        if not isinstance(incoming, str) or not accounts.install_incoming_auth(
+            incoming
+        ):
             raise accounts.RotationError("committed incoming auth.json is missing")
         if not accounts.codex_login_status():
             raise accounts.RotationError("committed Codex login verification failed")
         committed = journal.get("committed_state")
         if not isinstance(committed, dict):
-            raise accounts.RotationError("rotation journal lost committed account state")
+            raise accounts.RotationError(
+                "rotation journal lost committed account state"
+            )
         accounts.write_state(accounts.AccountState.from_dict(committed))
 
     async def _resume_rotation_runs_locked(
@@ -4584,9 +4934,9 @@ Preserve the same identity, role, worktree, orchestrator grouping, PR gates, and
                         f"cannot hand over {record.agent_id}: state "
                         f"{runtime.get('state') or 'unknown'} is not resumable"
                     )
-                if not isinstance(runtime.get("provider_session_id"), str) or not runtime.get(
-                    "provider_session_id"
-                ):
+                if not isinstance(
+                    runtime.get("provider_session_id"), str
+                ) or not runtime.get("provider_session_id"):
                     raise StoreConflict(
                         f"cannot hand over {record.agent_id}: provider session id is missing"
                     )
@@ -4643,7 +4993,10 @@ Preserve the same identity, role, worktree, orchestrator grouping, PR gates, and
             ) from exc
         if pending_disposition is _HandoverPendingDisposition.CLEAR:
             pending_requests: dict[str, dict[str, Any]] = {}
-        elif pending_disposition is _HandoverPendingDisposition.MERGE_CAPTURED_AND_DRAINED:
+        elif (
+            pending_disposition
+            is _HandoverPendingDisposition.MERGE_CAPTURED_AND_DRAINED
+        ):
             pending_requests = {
                 **captured_pending_requests,
                 **drained_pending_requests,
@@ -4652,7 +5005,9 @@ Preserve the same identity, role, worktree, orchestrator grouping, PR gates, and
             pending_requests = dict(captured_pending_requests)
         return final_state, pending_requests
 
-    async def prepare_handover(self, _run_ids: list[str] | None = None) -> dict[str, Any]:
+    async def prepare_handover(
+        self, _run_ids: list[str] | None = None
+    ) -> dict[str, Any]:
         """Block admission, validate providers, then drain that exact set."""
 
         async with self.handover_condition:
@@ -4705,7 +5060,10 @@ Preserve the same identity, role, worktree, orchestrator grouping, PR gates, and
                             f"{runtime.get('state') or 'unknown'} is not resumable"
                         )
                     provider_session_id = runtime.get("provider_session_id")
-                    if not isinstance(provider_session_id, str) or not provider_session_id:
+                    if (
+                        not isinstance(provider_session_id, str)
+                        or not provider_session_id
+                    ):
                         raise StoreConflict(
                             f"cannot hand over {record.agent_id}: provider session id is missing"
                         )
@@ -4783,9 +5141,7 @@ Preserve the same identity, role, worktree, orchestrator grouping, PR gates, and
                 self.handover_result = None
                 self.handover_condition.notify_all()
             try:
-                await self._flush_all_handover_events(
-                    schedule_monitor_actions=True
-                )
+                await self._flush_all_handover_events(schedule_monitor_actions=True)
             except BaseException:
                 raise
             if capture_error is not None:
@@ -4968,7 +5324,9 @@ Preserve the same identity, role, worktree, orchestrator grouping, PR gates, and
         try:
             status = await adapter.status()
         except Exception as exc:
-            raise CommandRetryable("replacement provider control is unavailable") from exc
+            raise CommandRetryable(
+                "replacement provider control is unavailable"
+            ) from exc
         if status.state is LifecycleState.BLOCKED:
             raise CommandRetryable("replacement provider is blocked")
         record = self.store.update_adapter_status(run_id, status)
@@ -5073,20 +5431,17 @@ Preserve the same identity, role, worktree, orchestrator grouping, PR gates, and
         if normalized_message:
             current_record = self.store.get(run_id)
             unresolved_match = None
-            rotate_matcher_transport = (
-                len(current_record.pending_user_messages)
-                >= MAX_PENDING_USER_MESSAGES
-                and not any(
-                    item.get("pending_id") == pending_id
-                    for item in current_record.pending_user_messages
-                )
+            rotate_matcher_transport = len(
+                current_record.pending_user_messages
+            ) >= MAX_PENDING_USER_MESSAGES and not any(
+                item.get("pending_id") == pending_id
+                for item in current_record.pending_user_messages
             )
             for item in current_record.pending_user_messages:
                 old_pending_id = item.get("pending_id")
                 if (
                     old_pending_id == pending_id
-                    or str(item.get("text") or "").strip()
-                    != normalized_message
+                    or str(item.get("text") or "").strip() != normalized_message
                     or not isinstance(old_pending_id, str)
                 ):
                     continue
@@ -5101,9 +5456,7 @@ Preserve the same identity, role, worktree, orchestrator grouping, PR gates, and
                     )
                     inherited_from_replacement = True
                 old_result = (
-                    old_effect.get("result")
-                    if isinstance(old_effect, dict)
-                    else None
+                    old_effect.get("result") if isinstance(old_effect, dict) else None
                 )
                 accepted = bool(
                     isinstance(old_effect, dict)
@@ -5118,9 +5471,7 @@ Preserve the same identity, role, worktree, orchestrator grouping, PR gates, and
                     # this legacy guard for snapshots written before that
                     # migration. The old transport was quiesced and drained,
                     # so its matcher cannot consume the new alarm's echo.
-                    self.store.discard_pending_user_message(
-                        run_id, old_pending_id
-                    )
+                    self.store.discard_pending_user_message(run_id, old_pending_id)
                     continue
                 if accepted:
                     # Keep accepted same-run matchers in FIFO order. They are
@@ -5366,9 +5717,7 @@ Preserve the same identity, role, worktree, orchestrator grouping, PR gates, and
                 return {"status": "uncertain", "pending_id": pending_id}
         if dedupe_key is not None:
             # Method-scope the owner: see the twin comment in _send_now.
-            owner = (
-                f"run/send_on_idle:{effect_id}" if effect_id is not None else None
-            )
+            owner = f"run/send_on_idle:{effect_id}" if effect_id is not None else None
             record, claimed = self.store.claim_message_dedupe_key(
                 run_id, dedupe_key, owner=owner
             )
@@ -5425,17 +5774,14 @@ Preserve the same identity, role, worktree, orchestrator grouping, PR gates, and
                 terminal = self.store.command_log.steer_effect_for_pending(
                     run_id, pending_id
                 )
-                if (
-                    terminal is not None
-                    and terminal["status"] in {"sent", "acknowledged"}
-                ):
+                if terminal is not None and terminal["status"] in {
+                    "sent",
+                    "acknowledged",
+                }:
                     terminal_result = terminal.get("result")
                     if isinstance(terminal_result, dict):
                         enriched = dict(terminal_result)
-                        if (
-                            dedupe_key is not None
-                            and "dedupe_key" not in enriched
-                        ):
+                        if dedupe_key is not None and "dedupe_key" not in enriched:
                             enriched["dedupe_key"] = dedupe_key
                         return enriched
                 return {
@@ -5779,7 +6125,9 @@ Preserve the same identity, role, worktree, orchestrator grouping, PR gates, and
                 record = self.store.transition(
                     run_id,
                     target,
-                    reason=record.state_reason if target in TERMINAL_STATES else "archived",
+                    reason=record.state_reason
+                    if target in TERMINAL_STATES
+                    else "archived",
                     adapter_status=self._detached_terminal_status(
                         record,
                         target,
@@ -6386,6 +6734,7 @@ Preserve the same identity, role, worktree, orchestrator grouping, PR gates, and
                         )
                     return result
             if method in _IDEMPOTENT_METHODS:
+
                 async def execute() -> Any:
                     return await self._dispatch_idempotently(
                         method,
@@ -6394,12 +6743,14 @@ Preserve the same identity, role, worktree, orchestrator grouping, PR gates, and
                         command_hash=command.command_hash,
                     )
             else:
+
                 async def execute() -> Any:
                     return await self._dispatch(
                         method,
                         command_params,
                         command_hash=command.command_hash,
                     )
+
             return await self.command_queue.submit(command, execute)
         if method not in _IDEMPOTENT_METHODS:
             return await self._dispatch(method, params)
@@ -6516,7 +6867,10 @@ Preserve the same identity, role, worktree, orchestrator grouping, PR gates, and
                     raise CommandConflict(
                         f"request_id {request_id} belongs to another agent"
                     )
-                if requested_hash is not None and receipt.command_hash != requested_hash:
+                if (
+                    requested_hash is not None
+                    and receipt.command_hash != requested_hash
+                ):
                     raise CommandConflict(
                         f"request_id {request_id} was used with a different payload"
                     )
@@ -6567,6 +6921,7 @@ Preserve the same identity, role, worktree, orchestrator grouping, PR gates, and
                 worktree=str(params["worktree"]),
                 prompt=str(params["prompt"]),
                 effort=params.get("effort"),
+                wait_for_startup=True,
                 execution_kind=(
                     str(params["execution_kind"])
                     if params.get("execution_kind") is not None
@@ -6581,7 +6936,10 @@ Preserve the same identity, role, worktree, orchestrator grouping, PR gates, and
             )
             result = _public_run(record)
             active_worker_count = self._active_worker_count()
-            if record.role != "orchestrator" and active_worker_count >= self.worker_soft_cap:
+            if (
+                record.role != "orchestrator"
+                and active_worker_count >= self.worker_soft_cap
+            ):
                 result["warning"] = (
                     f"{active_worker_count} active workers; soft cap {self.worker_soft_cap} "
                     "— expect provider timeouts under load"
@@ -6636,9 +6994,7 @@ Preserve the same identity, role, worktree, orchestrator grouping, PR gates, and
                 raise ValueError("seq must be a non-negative integer or null")
             if requested_seq is not None and requested_seq < 0:
                 raise ValueError("seq must be a non-negative integer or null")
-            record = await self.mark_viewed(
-                self._resolve_run_id(params), requested_seq
-            )
+            record = await self.mark_viewed(self._resolve_run_id(params), requested_seq)
             return _public_run(record)
         if method == "run/resume":
             return _public_run(await self.resume_run(self._resolve_run_id(params)))
@@ -6775,7 +7131,9 @@ Preserve the same identity, role, worktree, orchestrator grouping, PR gates, and
                     ):
                         await self._require_replacement_control(replacement_run_id)
                         saved = effect.get("result")
-                        return saved if isinstance(saved, dict) else _public_run(current)
+                        return (
+                            saved if isinstance(saved, dict) else _public_run(current)
+                        )
                     if (
                         current.replaces_run_id == params.get("run_id")
                         and effect is not None
@@ -6849,7 +7207,9 @@ Preserve the same identity, role, worktree, orchestrator grouping, PR gates, and
                             self.store.update_adapter_status(
                                 replacement_run_id,
                                 AdapterStatus(
-                                    state=LifecycleState(str(saved.get("state", "starting"))),
+                                    state=LifecycleState(
+                                        str(saved.get("state", "starting"))
+                                    ),
                                     session_id=saved.get("session_id"),
                                     pid=saved.get("pid"),
                                     generation=int(saved.get("generation", 1)),
@@ -6918,7 +7278,11 @@ Preserve the same identity, role, worktree, orchestrator grouping, PR gates, and
             run_id = self._resolve_run_id(params)
             after_seq = params.get("after_seq", 0)
             limit = params.get("limit", 200)
-            if not isinstance(after_seq, int) or isinstance(after_seq, bool) or after_seq < 0:
+            if (
+                not isinstance(after_seq, int)
+                or isinstance(after_seq, bool)
+                or after_seq < 0
+            ):
                 raise ValueError("event cursor must be a non-negative integer")
             if (
                 not isinstance(limit, int)
@@ -7016,10 +7380,7 @@ Preserve the same identity, role, worktree, orchestrator grouping, PR gates, and
         # have drained. Entering this phase also makes every later event an
         # audit observation, including events captured by the final pump race.
         self.shutdown_phase.begin_adapter_stop(
-            {
-                run_id: self.store.get(run_id).state
-                for run_id in self.adapters
-            }
+            {run_id: self.store.get(run_id).state for run_id in self.adapters}
         )
         for run_id, adapter in tuple(self.adapters.items()):
             stream_key = id(adapter)
@@ -7044,9 +7405,7 @@ Preserve the same identity, role, worktree, orchestrator grouping, PR gates, and
         for task in tuple(self.event_tasks.values()):
             task.cancel()
         if self.event_tasks:
-            await asyncio.gather(
-                *self.event_tasks.values(), return_exceptions=True
-            )
+            await asyncio.gather(*self.event_tasks.values(), return_exceptions=True)
         for task in tuple(self.idempotency_tasks.values()):
             if not task.done():
                 task.cancel()
@@ -7098,6 +7457,7 @@ Preserve the same identity, role, worktree, orchestrator grouping, PR gates, and
             self.archive_jobs.clear()
             self.archive_backfill_worker = None
             self.archive_backfill_task = None
+            await self.persistence_writer.close()
             self.event_store.close()
             return
         rotation = self.codex_rotation_task
@@ -7175,6 +7535,7 @@ Preserve the same identity, role, worktree, orchestrator grouping, PR gates, and
         self.archive_inflight_agents.clear()
         self.adapters.clear()
         try:
+            await self.persistence_writer.close()
             await self.command_queue.close()
         finally:
             archive_jobs = tuple(self.archive_jobs)
