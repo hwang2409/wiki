@@ -97,6 +97,9 @@ _RUN_SCOPED_METHODS = frozenset(
 )
 _PROJECTION_READ_METHODS = frozenset({"run/list", "run/status"})
 DEFAULT_APPROVAL_RECOVERY_TIMEOUT_SECONDS = 30.0
+# Echo evidence now lands via the persistence writer, not inline on the loop,
+# so an ambiguous send must wait out writer queueing before declaring the echo
+# missing. 0.05s was tuned for on-loop persistence; do not shrink it back.
 AMBIGUOUS_SEND_ECHO_GRACE_SECONDS = 0.5
 _AUTO_ARCHIVE_FORBIDDEN_ROLES = frozenset({"implement", "plan"})
 _VERDICT_STEP_RE = re.compile(
@@ -201,9 +204,15 @@ class _BoundedPersistenceWriter:
         self._capacity_size = workers + queue_size
         self._per_run_queue_size = per_run_queue_size
         self._per_run_slots: dict[str, asyncio.BoundedSemaphore] = {}
+        self._per_run_order_locks: dict[str, asyncio.Lock] = {}
         self._pending_by_run: dict[str, int] = {}
         self._pending = 0
+        self._running = 0
+        self._queued = 0
+        self._admission_waiting = 0
+        self._admitted = 0
         self._max_pending = 0
+        self._metrics_lock = threading.Lock()
         self._drain_condition = asyncio.Condition()
         self._closed = False
 
@@ -212,6 +221,9 @@ class _BoundedPersistenceWriter:
             run_id,
             asyncio.BoundedSemaphore(self._per_run_queue_size),
         )
+
+    def _order_lock_for_run(self, run_id: str) -> asyncio.Lock:
+        return self._per_run_order_locks.setdefault(run_id, asyncio.Lock())
 
     async def submit(
         self,
@@ -222,14 +234,27 @@ class _BoundedPersistenceWriter:
     ) -> Any:
         if self._closed:
             raise RuntimeError("persistence writer is closed")
+        # Admission happens before the first await. close() flips _closed in
+        # the same event-loop turn, so every submit admitted here is drained.
+        self._admitted += 1
         run_slot = self._slot_for_run(run_id)
-        await run_slot.acquire()
+        order_lock = self._order_lock_for_run(run_id)
         capacity_acquired = False
+        order_acquired = False
+        slot_acquired = False
+        admission_counted = True
+        with self._metrics_lock:
+            self._admission_waiting += 1
         try:
+            await run_slot.acquire()
+            slot_acquired = True
+            await order_lock.acquire()
+            order_acquired = True
             await self._capacity.acquire()
             capacity_acquired = True
-            if self._closed:
-                raise RuntimeError("persistence writer is closed")
+            with self._metrics_lock:
+                self._admission_waiting -= 1
+            admission_counted = False
             executor = self._executor
             if executor is None:
                 raise RuntimeError("persistence writer is closed")
@@ -237,10 +262,15 @@ class _BoundedPersistenceWriter:
                 self._pending += 1
                 self._pending_by_run[run_id] = self._pending_by_run.get(run_id, 0) + 1
                 self._max_pending = max(self._max_pending, self._pending)
+            with self._metrics_lock:
+                self._queued += 1
             loop = asyncio.get_running_loop()
             future = loop.run_in_executor(
                 executor,
-                partial(function, *args, **kwargs),
+                self._run,
+                function,
+                args,
+                kwargs,
             )
             try:
                 return await asyncio.shield(future)
@@ -257,9 +287,33 @@ class _BoundedPersistenceWriter:
                         self._pending_by_run.pop(run_id, None)
                     self._drain_condition.notify_all()
         finally:
+            self._admitted -= 1
+            async with self._drain_condition:
+                self._drain_condition.notify_all()
+            if admission_counted:
+                with self._metrics_lock:
+                    self._admission_waiting -= 1
             if capacity_acquired:
                 self._capacity.release()
-            run_slot.release()
+            if slot_acquired:
+                run_slot.release()
+            if order_acquired:
+                order_lock.release()
+
+    def _run(
+        self,
+        function: Callable[..., Any],
+        args: tuple[Any, ...],
+        kwargs: dict[str, Any],
+    ) -> Any:
+        with self._metrics_lock:
+            self._queued -= 1
+            self._running += 1
+        try:
+            return function(*args, **kwargs)
+        finally:
+            with self._metrics_lock:
+                self._running -= 1
 
     async def drain(self, run_id: str | None = None) -> None:
         async with self._drain_condition:
@@ -274,17 +328,47 @@ class _BoundedPersistenceWriter:
         if self._closed and self._executor is None:
             return
         self._closed = True
+        async with self._drain_condition:
+            while self._admitted:
+                await self._drain_condition.wait()
         await self.drain()
         executor = self._executor
         self._executor = None
         if executor is not None:
             executor.shutdown(wait=True)
 
+    def forget_run(self, run_id: str) -> None:
+        """Drop an idle per-run slot so archive churn cannot grow the map.
+
+        Only safe when the slot is unheld and no job is pending: a waiter
+        between acquire and execution still owns the old semaphore, and
+        dropping it would let a new submit run concurrently for the run.
+        This runs on the event loop with no awaits, so the check is atomic.
+        """
+        slot = self._per_run_slots.get(run_id)
+        order_lock = self._per_run_order_locks.get(run_id)
+        if (
+            slot is not None
+            and not slot.locked()
+            and (order_lock is None or not order_lock.locked())
+            and not self._pending_by_run.get(run_id)
+        ):
+            self._per_run_slots.pop(run_id, None)
+            if order_lock is not None and not order_lock.locked():
+                self._per_run_order_locks.pop(run_id, None)
+
     def metrics(self) -> dict[str, Any]:
+        with self._metrics_lock:
+            running = self._running
+            queued = self._queued
+            admission_waiting = self._admission_waiting
         return {
             "queue_depth": self._pending,
             "queue_capacity": self._capacity_size,
             "max_queue_depth": self._max_pending,
+            "running": running,
+            "queued": queued,
+            "admission_waiting": admission_waiting,
             "per_run_queue_depth": dict(self._pending_by_run),
             "per_run_queue_capacity": self._per_run_queue_size,
         }
@@ -653,6 +737,8 @@ class Supervisor:
         self.orphan_archive_grace_seconds = orphan_archive_grace_seconds
         self.adapters: dict[str, ProviderAdapter] = {}
         self.event_tasks: dict[str, asyncio.Task[None]] = {}
+        self._startup_event_barriers: dict[str, asyncio.Event] = {}
+        self._startup_event_completions: dict[str, asyncio.Event] = {}
         self.event_processing_locks: dict[str, asyncio.Lock] = {}
         self.event_inflight_counts: dict[str, int] = {}
         self.event_drain_condition = asyncio.Condition()
@@ -900,11 +986,30 @@ class Supervisor:
         append_legacy: bool = True,
         normalized_seq: int | None = None,
     ) -> None:
-        raw_seq = int(raw["seq"])
+        normalized_seq = self._append_normalized_row(
+            record,
+            raw,
+            normalized,
+            payload,
+            append_legacy=append_legacy,
+            normalized_seq=normalized_seq,
+        )
+        self._materialize_normalized(record, raw, normalized, payload, normalized_seq)
+
+    def _append_normalized_row(
+        self,
+        record: RunRecord,
+        raw: dict[str, Any],
+        normalized: NormalizedProviderEvent,
+        payload: dict[str, Any],
+        *,
+        append_legacy: bool = True,
+        normalized_seq: int | None = None,
+    ) -> int | None:
         if append_legacy:
             legacy = self.store.append_normalized(
                 record.run_id,
-                raw_seq=raw_seq,
+                raw_seq=int(raw["seq"]),
                 disposition=normalized.disposition,
                 kind=normalized.kind,
                 payload=payload,
@@ -912,6 +1017,17 @@ class Supervisor:
                 normalized_at=str(raw.get("received_at") or ""),
             )
             normalized_seq = int(legacy["seq"])
+        return normalized_seq
+
+    def _materialize_normalized(
+        self,
+        record: RunRecord,
+        raw: dict[str, Any],
+        normalized: NormalizedProviderEvent,
+        payload: dict[str, Any],
+        normalized_seq: int | None,
+    ) -> None:
+        raw_seq = int(raw["seq"])
         reducer = self._materializer_for_record(record)
         if not self.event_store.has_disposition(record.run_id, raw_seq):
             started = time.perf_counter()
@@ -951,45 +1067,21 @@ class Supervisor:
         normalized: NormalizedProviderEvent,
         payload: dict[str, Any],
     ) -> dict[str, Any]:
-        with self.store._lock:  # noqa: SLF001 - keep raw visibility atomic
-            raw = self.store.append_raw(
-                record.run_id,
-                provider=event.provider.value,
-                direction=event.direction,
-                payload=event.payload,
-                generation=event.generation,
-                received_at=event.received_at,
-            )
-            self._dual_write_normalized(
-                record,
-                raw,
-                normalized,
-                payload,
-            )
+        raw = self.store.append_raw(
+            record.run_id,
+            provider=event.provider.value,
+            direction=event.direction,
+            payload=event.payload,
+            generation=event.generation,
+            received_at=event.received_at,
+        )
+        self._dual_write_normalized(
+            record,
+            raw,
+            normalized,
+            payload,
+        )
         return raw
-
-    def _persist_startup_batch(
-        self,
-        record: RunRecord,
-        entries: list[tuple[ProviderEvent, NormalizedProviderEvent, dict[str, Any]]],
-    ) -> list[dict[str, Any]]:
-        raws: list[dict[str, Any]] = []
-        self.store.begin_raw_event_batch(record.run_id)
-        try:
-            for event, normalized, payload in entries:
-                raw = self.store.append_raw(
-                    record.run_id,
-                    provider=event.provider.value,
-                    direction=event.direction,
-                    payload=event.payload,
-                    generation=event.generation,
-                    received_at=event.received_at,
-                )
-                self._dual_write_normalized(record, raw, normalized, payload)
-                raws.append(raw)
-        finally:
-            self.store.end_raw_event_batch(record.run_id)
-        return raws
 
     async def _persist_event_bundle_async(
         self,
@@ -1060,6 +1152,31 @@ class Supervisor:
                 payload=payload,
                 generation=generation,
                 received_at=received_at,
+            )
+        finally:
+            self.persistence_latency_seconds.append(time.perf_counter() - started)
+
+    async def _append_normalized_async(
+        self,
+        run_id: str,
+        *,
+        raw_seq: int,
+        disposition: EventDisposition,
+        kind: str,
+        payload: dict[str, Any],
+        lifecycle_state: LifecycleState | None = None,
+    ) -> dict[str, Any]:
+        started = time.perf_counter()
+        try:
+            return await self.persistence_writer.submit(
+                run_id,
+                self.store.append_normalized,
+                run_id,
+                raw_seq=raw_seq,
+                disposition=disposition,
+                kind=kind,
+                payload=payload,
+                lifecycle_state=lifecycle_state,
             )
         finally:
             self.persistence_latency_seconds.append(time.perf_counter() - started)
@@ -1305,7 +1422,7 @@ Recover context from:
 Preserve the same identity, role, worktree, orchestrator grouping, PR gates, and status-file contract. Re-read the current ticket/PR state, update the status file before long operations, then continue from the last durable step.
 """
 
-    def _append_model_changed_event(
+    def _persist_model_changed_event(
         self,
         record: RunRecord,
         *,
@@ -1337,6 +1454,23 @@ Preserve the same identity, role, worktree, orchestrator grouping, PR gates, and
                 record.state,
             ),
             payload,
+        )
+
+    async def _append_model_changed_event(
+        self,
+        record: RunRecord,
+        *,
+        old_model: str,
+        new_model: str,
+        trigger: str,
+    ) -> None:
+        await self.persistence_writer.submit(
+            record.run_id,
+            self._persist_model_changed_event,
+            record,
+            old_model=old_model,
+            new_model=new_model,
+            trigger=trigger,
         )
 
     def _codex_rotation_active(self) -> bool:
@@ -1525,83 +1659,70 @@ Preserve the same identity, role, worktree, orchestrator grouping, PR gates, and
         self, run_id: str, adapter: ProviderAdapter, startup_batch: bool = False
     ) -> None:
         stream_key = id(adapter)
+
+        async def process_event(event: ProviderEvent) -> bool:
+            self.event_inflight_counts[run_id] = (
+                self.event_inflight_counts.get(run_id, 0) + 1
+            )
+            try:
+                async with self.event_drain_condition:
+                    self.event_drain_condition.notify_all()
+                await asyncio.sleep(0)
+                event_run_id = self.event_routes.get(
+                    (id(adapter), event.generation),
+                    run_id,
+                )
+                event_lock = self.event_processing_locks.setdefault(
+                    event_run_id, asyncio.Lock()
+                )
+                async with event_lock:
+                    await self._handle_provider_event(event_run_id, adapter, event)
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:
+                await self._record_pipeline_failure(
+                    run_id,
+                    adapter,
+                    f"provider event persistence failed: {exc}",
+                )
+                return False
+            finally:
+                remaining = self.event_inflight_counts.get(run_id, 1) - 1
+                if remaining:
+                    self.event_inflight_counts[run_id] = remaining
+                else:
+                    self.event_inflight_counts.pop(run_id, None)
+                async with self.event_drain_condition:
+                    self.event_drain_condition.notify_all()
+            return True
+
         try:
             async for event in adapter.events():
+                events = [event]
                 if startup_batch:
                     startup_batch = False
-                    events = [event, *await adapter.drain_events()]
-                    record = self.store.get(run_id)
-                    entries = []
-                    for queued_event in events:
-                        normalized = normalize_provider_event(
-                            queued_event.provider,
-                            queued_event.payload,
-                            direction=queued_event.direction,
-                        )
-                        entries.append((queued_event, normalized, normalized.payload))
-                    self.event_inflight_counts[run_id] = len(events)
-                    async with self.event_drain_condition:
-                        self.event_drain_condition.notify_all()
+                    barrier = self._startup_event_barriers.get(run_id)
+                    if barrier is not None:
+                        await barrier.wait()
+                    idle_passes = 0
+                    while idle_passes < 2:
+                        tail = await adapter.drain_events()
+                        if tail:
+                            events.extend(tail)
+                            idle_passes = 0
+                        else:
+                            idle_passes += 1
+                        await asyncio.sleep(0)
+                    completion = self._startup_event_completions.get(run_id)
                     try:
-                        raws = await self.persistence_writer.submit(
-                            run_id, self._persist_startup_batch, record, entries
-                        )
-                        for queued_event, raw, normalized, _ in zip(
-                            events,
-                            raws,
-                            (item[1] for item in entries),
-                            entries,
-                            strict=True,
-                        ):
-                            await self._handle_provider_event_without_admission(
-                                run_id,
-                                adapter,
-                                queued_event,
-                                raw=raw,
-                                normalized=normalized,
-                                persist=False,
-                            )
+                        for queued_event in events:
+                            if not await process_event(queued_event):
+                                return
                     finally:
-                        self.event_inflight_counts.pop(run_id, None)
-                        async with self.event_drain_condition:
-                            self.event_drain_condition.notify_all()
-                    continue
-                # Mark the local slot before the first await. The detach
-                # barrier cannot observe an event between queue removal and
-                # this increment.
-                self.event_inflight_counts[run_id] = (
-                    self.event_inflight_counts.get(run_id, 0) + 1
-                )
-                try:
-                    async with self.event_drain_condition:
-                        self.event_drain_condition.notify_all()
-                    await asyncio.sleep(0)
-                    event_run_id = self.event_routes.get(
-                        (id(adapter), event.generation),
-                        run_id,
-                    )
-                    event_lock = self.event_processing_locks.setdefault(
-                        event_run_id, asyncio.Lock()
-                    )
-                    async with event_lock:
-                        await self._handle_provider_event(event_run_id, adapter, event)
-                except asyncio.CancelledError:
-                    raise
-                except Exception as exc:
-                    await self._record_pipeline_failure(
-                        run_id,
-                        adapter,
-                        f"provider event persistence failed: {exc}",
-                    )
+                        if completion is not None:
+                            completion.set()
+                elif not await process_event(event):
                     return
-                finally:
-                    remaining = self.event_inflight_counts.get(run_id, 1) - 1
-                    if remaining:
-                        self.event_inflight_counts[run_id] = remaining
-                    else:
-                        self.event_inflight_counts.pop(run_id, None)
-                    async with self.event_drain_condition:
-                        self.event_drain_condition.notify_all()
         except asyncio.CancelledError:
             raise
         except Exception as exc:
@@ -1816,28 +1937,12 @@ Preserve the same identity, role, worktree, orchestrator grouping, PR gates, and
                 if isinstance(pending_source, str) and pending_source:
                     normalized_payload["source"] = pending_source
         if raw is None and persist:
-            if getattr(self, "materializer_gate", None) is not None:
-                raw = await self._append_raw_event_async(
-                    run_id,
-                    provider=event.provider.value,
-                    direction=event.direction,
-                    payload=event.payload,
-                    generation=event.generation,
-                    received_at=event.received_at,
-                )
-                await self._dual_write_normalized_async(
-                    record_before_event,
-                    raw,
-                    normalized,
-                    normalized_payload,
-                )
-            else:
-                raw = await self._persist_event_bundle_async(
-                    record_before_event,
-                    event,
-                    normalized,
-                    normalized_payload,
-                )
+            raw = await self._persist_event_bundle_async(
+                record_before_event,
+                event,
+                normalized,
+                normalized_payload,
+            )
         elif persist:
             await self._dual_write_normalized_async(
                 record_before_event,
@@ -1855,6 +1960,8 @@ Preserve the same identity, role, worktree, orchestrator grouping, PR gates, and
                     }
                 )
             return
+        # Only Claude sessions spawn child transcripts; skipping the sync for
+        # Codex events removes a full-transcript reparse from every event.
         if event.provider is ProviderKind.CLAUDE:
             try:
                 await self._sync_subagent_runs_async(run_id)
@@ -1887,7 +1994,11 @@ Preserve the same identity, role, worktree, orchestrator grouping, PR gates, and
         if normalized.lifecycle_state is not None and update_adapter_snapshot:
             try:
                 adapter_status = adapter.snapshot()
-                record = self.store.update_adapter_status(run_id, adapter_status)
+                if not (
+                    normalized.lifecycle_state is LifecycleState.BLOCKED
+                    and adapter_status.state is not LifecycleState.BLOCKED
+                ):
+                    record = self.store.update_adapter_status(run_id, adapter_status)
             except Exception:
                 # The durable normalized lifecycle event is still authoritative
                 # if a late provider snapshot conflicts with a terminal state.
@@ -2469,7 +2580,7 @@ Preserve the same identity, role, worktree, orchestrator grouping, PR gates, and
                 replacement.run_id,
                 queued_messages,
             )
-        self._append_model_changed_event(
+        await self._append_model_changed_event(
             replacement,
             old_model=old_model,
             new_model=desired_model,
@@ -2842,6 +2953,9 @@ Preserve the same identity, role, worktree, orchestrator grouping, PR gates, and
         if old_task is not None:
             old_task.cancel()
         self.adapters[run_id] = adapter
+        if startup_batch:
+            self._startup_event_barriers[run_id] = asyncio.Event()
+            self._startup_event_completions[run_id] = asyncio.Event()
         adapter.set_process_created_callback(
             lambda pid: self.store.record_provider_process_created(run_id, pid)
         )
@@ -2876,6 +2990,8 @@ Preserve the same identity, role, worktree, orchestrator grouping, PR gates, and
                 for key, target in self.event_routes.items()
                 if key[0] != adapter_key
             }
+        self._startup_event_barriers.pop(run_id, None)
+        self._startup_event_completions.pop(run_id, None)
 
     def _clear_auth_dead_recovery_state(self, run_id: str) -> None:
         self.auth_dead_attempts.pop(run_id, None)
@@ -2915,6 +3031,7 @@ Preserve the same identity, role, worktree, orchestrator grouping, PR gates, and
             except Exception:
                 pass
             await self.persistence_writer.drain(run_id)
+            self.persistence_writer.forget_run(run_id)
             task = self.event_tasks.get(run_id)
             if task is not None and task is not asyncio.current_task():
                 try:
@@ -3322,9 +3439,26 @@ Preserve the same identity, role, worktree, orchestrator grouping, PR gates, and
         )
         try:
             status = await adapter.start(request)
+            # Adapters may finish start() before a background turn task emits
+            # its rejection event. Let that task enqueue its durable evidence
+            # before opening the startup completion barrier.
+            while getattr(adapter, "_turn_start_pending", False):
+                if (await adapter.status()).state is not LifecycleState.BLOCKED:
+                    break
+                await asyncio.sleep(0)
+            await asyncio.sleep(0)
+            startup_barrier = self._startup_event_barriers.get(record.run_id)
+            if startup_barrier is not None:
+                startup_barrier.set()
             record = self.store.update_adapter_status(record.run_id, status)
             self._route_adapter_generation(record.run_id, adapter, status.generation)
+            startup_completion = self._startup_event_completions.get(record.run_id)
+            if startup_completion is not None:
+                await startup_completion.wait()
         except asyncio.CancelledError:
+            startup_barrier = self._startup_event_barriers.get(record.run_id)
+            if startup_barrier is not None:
+                startup_barrier.set()
             await self._cleanup_cancelled_launch(
                 record,
                 adapter,
@@ -3332,6 +3466,9 @@ Preserve the same identity, role, worktree, orchestrator grouping, PR gates, and
             )
             raise
         except Exception as exc:
+            startup_barrier = self._startup_event_barriers.get(record.run_id)
+            if startup_barrier is not None:
+                startup_barrier.set()
             await self._close_and_drain_adapter(record.run_id, adapter)
             reason = f"provider start failed: {exc}"
             if rollback_start:
@@ -3951,7 +4088,7 @@ Preserve the same identity, role, worktree, orchestrator grouping, PR gates, and
                     normalized_seq=normalized_seq,
                 )
             elif append_normalized:
-                legacy = self.store.append_normalized(
+                legacy = await self._append_normalized_async(
                     run_id,
                     raw_seq=raw_seq,
                     disposition=retired.disposition,
@@ -4032,7 +4169,7 @@ Preserve the same identity, role, worktree, orchestrator grouping, PR gates, and
                 normalized_seq=normalized_seq,
             )
         elif append_normalized:
-            legacy = self.store.append_normalized(
+            legacy = await self._append_normalized_async(
                 run_id,
                 raw_seq=raw_seq,
                 disposition=normalized.disposition,
@@ -6258,7 +6395,7 @@ Preserve the same identity, role, worktree, orchestrator grouping, PR gates, and
                         execution_kind=execution_kind,
                     )
         if old.model != replacement.model:
-            self._append_model_changed_event(
+            await self._append_model_changed_event(
                 replacement,
                 old_model=old.model,
                 new_model=replacement.model,

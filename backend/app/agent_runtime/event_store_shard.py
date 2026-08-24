@@ -816,7 +816,8 @@ def _persistent_event_connection(path: Path) -> _PersistentEventConnection:
 
 
 def migrate_event_db(path: Path | str) -> None:
-    with connect_event_db(path) as connection:
+    connection = connect_event_db(path)
+    try:
         connection.execute(
             "CREATE TABLE IF NOT EXISTS schema_migrations "
             "(version INTEGER PRIMARY KEY, applied_at TEXT NOT NULL)"
@@ -877,6 +878,13 @@ def migrate_event_db(path: Path | str) -> None:
             "run_id TEXT PRIMARY KEY, generation INTEGER NOT NULL DEFAULT 0"
             ")"
         )
+    except BaseException:
+        connection.rollback()
+        raise
+    else:
+        connection.commit()
+    finally:
+        connection.close()
 
 
 

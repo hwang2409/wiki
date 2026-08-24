@@ -3838,7 +3838,7 @@ class SupervisorTests(unittest.IsolatedAsyncioTestCase):
             side_effect=OSError("model change normalize crash"),
         ):
             with self.assertRaisesRegex(OSError, "model change normalize crash"):
-                self.supervisor._append_model_changed_event(  # noqa: SLF001
+                await self.supervisor._append_model_changed_event(  # noqa: SLF001
                     record,
                     old_model="fixture-codex",
                     new_model="fixture-codex-new",
