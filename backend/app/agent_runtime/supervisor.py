@@ -467,29 +467,6 @@ def _env_positive_int(name: str, default: int) -> int:
     return value
 
 
-def _env_nonnegative_int(name: str, default: int) -> int:
-    raw = os.environ.get(name)
-    if raw is None or not raw.strip():
-        return default
-    try:
-        value = int(raw)
-    except ValueError:
-        warnings.warn(
-            f"{name} must be a non-negative integer; using default {default}",
-            RuntimeWarning,
-            stacklevel=2,
-        )
-        return default
-    if value < 0:
-        warnings.warn(
-            f"{name} must be a non-negative integer; using default {default}",
-            RuntimeWarning,
-            stacklevel=2,
-        )
-        return default
-    return value
-
-
 def _provider_user_text(
     provider: ProviderKind,
     kind: str,
@@ -519,18 +496,6 @@ def _provider_user_text(
 def _validated_seconds(name: str, value: float) -> float:
     if not math.isfinite(value) or value < 0:
         raise ValueError(f"{name} must be a finite, non-negative number")
-    return value
-
-
-def _validated_positive_int(name: str, value: int) -> int:
-    if not isinstance(value, int) or isinstance(value, bool) or value < 1:
-        raise ValueError(f"{name} must be a positive integer")
-    return value
-
-
-def _validated_nonnegative_int(name: str, value: int) -> int:
-    if not isinstance(value, int) or isinstance(value, bool) or value < 0:
-        raise ValueError(f"{name} must be a non-negative integer")
     return value
 
 
@@ -602,9 +567,6 @@ class Supervisor:
         idempotency_cache_size: int = DEFAULT_IDEMPOTENCY_CACHE_SIZE,
         worker_soft_cap: int | None = None,
         archive_queue_limit: int = DEFAULT_ARCHIVE_QUEUE_LIMIT,
-        persistence_writer_workers: int | None = None,
-        persistence_writer_queue_size: int | None = None,
-        persistence_writer_per_run_queue_size: int | None = None,
     ):
         if idempotency_cache_size < 1:
             raise ValueError("idempotency_cache_size must be positive")
@@ -638,43 +600,10 @@ class Supervisor:
         self.materializer_queue_depth: dict[str, int] = {}
         self.materializer_failures = 0
         self._materializer_metrics_lock = threading.Lock()
-        writer_workers = _validated_positive_int(
-            "persistence_writer_workers",
-            (
-                persistence_writer_workers
-                if persistence_writer_workers is not None
-                else _env_positive_int(
-                    "WIKI_PERSISTENCE_WRITER_WORKERS",
-                    DEFAULT_PERSISTENCE_WRITER_WORKERS,
-                )
-            ),
-        )
-        writer_queue_size = _validated_nonnegative_int(
-            "persistence_writer_queue_size",
-            (
-                persistence_writer_queue_size
-                if persistence_writer_queue_size is not None
-                else _env_nonnegative_int(
-                    "WIKI_PERSISTENCE_WRITER_QUEUE_SIZE",
-                    DEFAULT_PERSISTENCE_WRITER_QUEUE_SIZE,
-                )
-            ),
-        )
-        writer_per_run_queue_size = _validated_positive_int(
-            "persistence_writer_per_run_queue_size",
-            (
-                persistence_writer_per_run_queue_size
-                if persistence_writer_per_run_queue_size is not None
-                else _env_positive_int(
-                    "WIKI_PERSISTENCE_WRITER_PER_RUN_QUEUE_SIZE",
-                    DEFAULT_PERSISTENCE_WRITER_PER_RUN_QUEUE_SIZE,
-                )
-            ),
-        )
         self.persistence_writer = _BoundedPersistenceWriter(
-            workers=writer_workers,
-            queue_size=writer_queue_size,
-            per_run_queue_size=writer_per_run_queue_size,
+            workers=DEFAULT_PERSISTENCE_WRITER_WORKERS,
+            queue_size=DEFAULT_PERSISTENCE_WRITER_QUEUE_SIZE,
+            per_run_queue_size=DEFAULT_PERSISTENCE_WRITER_PER_RUN_QUEUE_SIZE,
         )
         self.pid_alive = pid_alive
         self.recovery_stability_seconds = recovery_stability_seconds
@@ -1591,6 +1520,7 @@ Preserve the same identity, role, worktree, orchestrator grouping, PR gates, and
                 try:
                     async with self.event_drain_condition:
                         self.event_drain_condition.notify_all()
+                    await asyncio.sleep(0)
                     event_run_id = self.event_routes.get(
                         (id(adapter), event.generation),
                         run_id,
@@ -2147,27 +2077,6 @@ Preserve the same identity, role, worktree, orchestrator grouping, PR gates, and
                     return
                 await self.event_drain_condition.wait()
 
-    async def _drain_buffered_provider_events(
-        self, run_id: str, adapter: ProviderAdapter
-    ) -> None:
-        """Process events already buffered at an ambiguous send boundary."""
-
-        event_lock = self.event_processing_locks.setdefault(
-            run_id, asyncio.Lock()
-        )
-        async with event_lock:
-            for event in await adapter.drain_events():
-                event_run_id = self.event_routes.get(
-                    (id(adapter), event.generation), run_id
-                )
-                await self._handle_provider_event_without_admission(
-                    event_run_id,
-                    adapter,
-                    event,
-                    publish_session=False,
-                )
-        await self.persistence_writer.drain(run_id)
-
     def _schedule_monitor_actions(
         self,
         run_id: str,
@@ -2696,8 +2605,6 @@ Preserve the same identity, role, worktree, orchestrator grouping, PR gates, and
                         )
                     except TimeoutError:
                         pass
-                if adapter.provider is ProviderKind.CODEX:
-                    await self._drain_buffered_provider_events(run_id, adapter)
                 if attempt_key is not None:
                     self._queued_delivery_attempts.discard(attempt_key)
                     self._delivery_attempt_echoes.pop(attempt_key, None)
@@ -5598,8 +5505,6 @@ Preserve the same identity, role, worktree, orchestrator grouping, PR gates, and
                     )
                 except TimeoutError:
                     pass
-            if adapter.provider is ProviderKind.CODEX:
-                await self._drain_buffered_provider_events(run_id, adapter)
             if attempt_key is not None:
                 self._queued_delivery_attempts.discard(attempt_key)
                 self._delivery_attempt_echoes.pop(attempt_key, None)

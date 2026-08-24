@@ -19,7 +19,7 @@ from backend.app.agent_runtime.event_store import (
 from backend.app.agent_runtime.fake import FixtureAdapterFactory
 from backend.app.agent_runtime.provider import ProviderEvent
 from backend.app.agent_runtime.store import RunStore, RuntimePaths
-from backend.app.agent_runtime.supervisor import Supervisor
+from backend.app.agent_runtime.supervisor import _BoundedPersistenceWriter, Supervisor
 from backend.app.agent_runtime.types import (
     EventDisposition,
     LifecycleState,
@@ -149,6 +149,13 @@ class SupervisorDualWriteTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(
             self.supervisor.event_store.materialized_raw_seqs(self.record.run_id),
             {int(row["seq"]) for row in raw_rows},
+        )
+        persistence = self.supervisor.materializer_metrics()["persistence"]
+        self.assertGreaterEqual(persistence["count"], 3)
+        self.assertEqual(persistence["queue_depth"], 0)
+        self.assertEqual(
+            set(persistence["latency_seconds"]),
+            {"p50", "p95", "p99"},
         )
 
     async def test_recovery_schedules_archive_backfill(self) -> None:
@@ -970,12 +977,11 @@ class SupervisorDualWriteTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_writer_backpressure_waits_and_recovers(self) -> None:
         await self.supervisor.close()
-        self.supervisor = Supervisor(
-            self.store,
-            self.factory,
-            persistence_writer_workers=1,
-            persistence_writer_queue_size=0,
-            persistence_writer_per_run_queue_size=1,
+        self.supervisor = Supervisor(self.store, self.factory)
+        self.supervisor.persistence_writer = _BoundedPersistenceWriter(
+            workers=1,
+            queue_size=0,
+            per_run_queue_size=1,
         )
         other = self.store.create(
             RunRecord.new(
