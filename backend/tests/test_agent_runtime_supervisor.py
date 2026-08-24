@@ -373,10 +373,6 @@ class HandoverCancelFactory(FixtureAdapterFactory):
 
 
 class StartupProbeAdapter(CodexFixtureAdapter):
-    def __init__(self, *args, buffered: bool, **kwargs):
-        super().__init__(*args, **kwargs)
-        self.buffered = buffered
-
     async def start(self, request: StartRequest) -> AdapterStatus:
         self._request = request  # noqa: SLF001 - startup barrier fixture
         generation = self._status.generation + 1  # noqa: SLF001
@@ -386,32 +382,16 @@ class StartupProbeAdapter(CodexFixtureAdapter):
             self.pid,
             generation=generation,
         )
-        if self.buffered:
-            await self._events.put(  # noqa: SLF001 - startup barrier fixture
-                ProviderEvent(
-                    ProviderKind.CODEX,
-                    {
-                        "method": "turn/started",
-                        "params": {"turn": {"id": "startup-turn"}},
-                    },
-                    generation=generation,
-                )
-            )
         return self._status
 
 
 class StartupProbeFactory(FixtureAdapterFactory):
-    def __init__(self, *args, buffered: bool, **kwargs):
-        super().__init__(*args, **kwargs)
-        self.buffered = buffered
-
     def __call__(self, record: RunRecord) -> ProviderAdapter:
         return StartupProbeAdapter(
             self.fixture_dir / "codex_app_server_success.jsonl",
             self.fixture_dir / "codex_app_server_control.jsonl",
             pid=self.pid,
             generation=record.provider_generation,
-            buffered=self.buffered,
         )
 
 
@@ -471,7 +451,7 @@ class SupervisorTests(unittest.IsolatedAsyncioTestCase):
         await self.supervisor.close()
         self.supervisor = Supervisor(
             self.store,
-            StartupProbeFactory(FIXTURES, pid=os.getpid(), buffered=False),
+            StartupProbeFactory(FIXTURES, pid=os.getpid()),
         )
 
         record = await asyncio.wait_for(
@@ -489,35 +469,6 @@ class SupervisorTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual(record.state, LifecycleState.IDLE)
         self.assertEqual(record.raw_event_count, 0)
-
-    async def test_buffered_startup_events_are_visible_before_start_returns(self) -> None:
-        await self.supervisor.close()
-        self.supervisor = Supervisor(
-            self.store,
-            StartupProbeFactory(FIXTURES, pid=os.getpid(), buffered=True),
-        )
-
-        result = await asyncio.wait_for(
-            self.supervisor.dispatch(
-                "run/start",
-                {
-                    "agent_id": "WIKI-358-BUFFERED-STARTUP-EVENT",
-                    "provider": "codex",
-                    "role": "implement",
-                    "model": "fixture-codex",
-                    "effort": "high",
-                    "worktree": str(self.worktree),
-                    "prompt": "start with a buffered provider event",
-                },
-            ),
-            timeout=1,
-        )
-
-        self.assertEqual(result["raw_event_count"], 1)
-        self.assertEqual(
-            self.store.read_raw_events(result["run_id"])[0]["payload"]["method"],
-            "turn/started",
-        )
 
     async def test_terminal_run_with_pending_deferred_events_survives_prune(self) -> None:
         record = self.store.create(
