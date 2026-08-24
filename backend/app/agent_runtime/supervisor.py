@@ -739,6 +739,7 @@ class Supervisor:
         self.event_tasks: dict[str, asyncio.Task[None]] = {}
         self._startup_event_barriers: dict[str, asyncio.Event] = {}
         self._startup_event_completions: dict[str, asyncio.Event] = {}
+        self._startup_event_batches: dict[str, list[ProviderEvent]] = {}
         self.event_processing_locks: dict[str, asyncio.Lock] = {}
         self.event_inflight_counts: dict[str, int] = {}
         self.event_drain_condition = asyncio.Condition()
@@ -1697,31 +1698,22 @@ Preserve the same identity, role, worktree, orchestrator grouping, PR gates, and
             return True
 
         try:
+            if startup_batch:
+                barrier = self._startup_event_barriers.get(run_id)
+                if barrier is not None:
+                    await barrier.wait()
+                startup_events = self._startup_event_batches.pop(run_id, [])
+                completion = self._startup_event_completions.get(run_id)
+                try:
+                    for startup_event in startup_events:
+                        if not await process_event(startup_event):
+                            return
+                finally:
+                    if completion is not None:
+                        completion.set()
+
             async for event in adapter.events():
-                events = [event]
-                if startup_batch:
-                    startup_batch = False
-                    barrier = self._startup_event_barriers.get(run_id)
-                    if barrier is not None:
-                        await barrier.wait()
-                    idle_passes = 0
-                    while idle_passes < 2:
-                        tail = await adapter.drain_events()
-                        if tail:
-                            events.extend(tail)
-                            idle_passes = 0
-                        else:
-                            idle_passes += 1
-                        await asyncio.sleep(0)
-                    completion = self._startup_event_completions.get(run_id)
-                    try:
-                        for queued_event in events:
-                            if not await process_event(queued_event):
-                                return
-                    finally:
-                        if completion is not None:
-                            completion.set()
-                elif not await process_event(event):
+                if not await process_event(event):
                     return
         except asyncio.CancelledError:
             raise
@@ -2956,6 +2948,7 @@ Preserve the same identity, role, worktree, orchestrator grouping, PR gates, and
         if startup_batch:
             self._startup_event_barriers[run_id] = asyncio.Event()
             self._startup_event_completions[run_id] = asyncio.Event()
+            self._startup_event_batches[run_id] = []
         adapter.set_process_created_callback(
             lambda pid: self.store.record_provider_process_created(run_id, pid)
         )
@@ -2992,6 +2985,7 @@ Preserve the same identity, role, worktree, orchestrator grouping, PR gates, and
             }
         self._startup_event_barriers.pop(run_id, None)
         self._startup_event_completions.pop(run_id, None)
+        self._startup_event_batches.pop(run_id, None)
 
     def _clear_auth_dead_recovery_state(self, run_id: str) -> None:
         self.auth_dead_attempts.pop(run_id, None)
@@ -3446,12 +3440,13 @@ Preserve the same identity, role, worktree, orchestrator grouping, PR gates, and
                 if (await adapter.status()).state is not LifecycleState.BLOCKED:
                     break
                 await asyncio.sleep(0)
-            await asyncio.sleep(0)
+            startup_events = await adapter.drain_events()
+            self._startup_event_batches[record.run_id] = startup_events
+            record = self.store.update_adapter_status(record.run_id, status)
+            self._route_adapter_generation(record.run_id, adapter, status.generation)
             startup_barrier = self._startup_event_barriers.get(record.run_id)
             if startup_barrier is not None:
                 startup_barrier.set()
-            record = self.store.update_adapter_status(record.run_id, status)
-            self._route_adapter_generation(record.run_id, adapter, status.generation)
             startup_completion = self._startup_event_completions.get(record.run_id)
             if startup_completion is not None:
                 await startup_completion.wait()
