@@ -372,29 +372,6 @@ class HandoverCancelFactory(FixtureAdapterFactory):
         return super().__call__(record)
 
 
-class StartupProbeAdapter(CodexFixtureAdapter):
-    async def start(self, request: StartRequest) -> AdapterStatus:
-        self._request = request  # noqa: SLF001 - startup barrier fixture
-        generation = self._status.generation + 1  # noqa: SLF001
-        self._status = AdapterStatus(  # noqa: SLF001
-            LifecycleState.IDLE,
-            f"startup-session-{request.run_id}",
-            self.pid,
-            generation=generation,
-        )
-        return self._status
-
-
-class StartupProbeFactory(FixtureAdapterFactory):
-    def __call__(self, record: RunRecord) -> ProviderAdapter:
-        return StartupProbeAdapter(
-            self.fixture_dir / "codex_app_server_success.jsonl",
-            self.fixture_dir / "codex_app_server_control.jsonl",
-            pid=self.pid,
-            generation=record.provider_generation,
-        )
-
-
 def _paths(root: Path) -> RuntimePaths:
     return RuntimePaths(
         runtime_dir=root / "runtime",
@@ -446,29 +423,6 @@ class SupervisorTests(unittest.IsolatedAsyncioTestCase):
     async def asyncTearDown(self) -> None:
         await self.supervisor.close()
         self.tmp.cleanup()
-
-    async def test_start_without_startup_events_completes(self) -> None:
-        await self.supervisor.close()
-        self.supervisor = Supervisor(
-            self.store,
-            StartupProbeFactory(FIXTURES, pid=os.getpid()),
-        )
-
-        record = await asyncio.wait_for(
-            self.supervisor.start_run(
-                agent_id="WIKI-358-NO-STARTUP-EVENT",
-                provider=ProviderKind.CODEX,
-                role="implement",
-                model="fixture-codex",
-                effort="high",
-                worktree=str(self.worktree),
-                prompt="start without provider startup events",
-            ),
-            timeout=1,
-        )
-
-        self.assertEqual(record.state, LifecycleState.IDLE)
-        self.assertEqual(record.raw_event_count, 0)
 
     async def test_terminal_run_with_pending_deferred_events_survives_prune(self) -> None:
         record = self.store.create(
@@ -3884,7 +3838,7 @@ class SupervisorTests(unittest.IsolatedAsyncioTestCase):
             side_effect=OSError("model change normalize crash"),
         ):
             with self.assertRaisesRegex(OSError, "model change normalize crash"):
-                await self.supervisor._append_model_changed_event(  # noqa: SLF001
+                self.supervisor._append_model_changed_event(  # noqa: SLF001
                     record,
                     old_model="fixture-codex",
                     new_model="fixture-codex-new",

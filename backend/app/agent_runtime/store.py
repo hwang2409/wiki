@@ -761,7 +761,6 @@ class RunStore:
         self._lock = threading.RLock()
         self._raw_event_counts: dict[str, int] = {}
         self._raw_event_batch_runs: set[str] = set()
-        self._event_locks: dict[str, threading.RLock] = {}
         # Adapter ownership is process-local. A restarted supervisor must
         # project every retained PID as detached until it reattaches control.
         self._control_attached_run_ids: set[str] = set()
@@ -1231,7 +1230,6 @@ class RunStore:
             self.command_log.remove_start_request(record.start_request_id)
         self._start_registry_snapshots.pop(record.run_id, None)
         shutil.rmtree(self.run_dir(record.run_id), ignore_errors=True)
-        self._forget_run_event_caches(record.run_id)
         return True
 
     @staticmethod
@@ -1489,7 +1487,6 @@ class RunStore:
             # A prior boot published a complete archive before cleanup. Finish
             # only the redundant hot-store removal and keep the archive intact.
             shutil.rmtree(self.run_dir(record.run_id))
-            self._forget_run_event_caches(record.run_id)
             return
         if self._archive_events_preparer is not None:
             self._archive_events_preparer(record.run_id)
@@ -1597,7 +1594,6 @@ class RunStore:
                     {record.agent_id: registry[record.agent_id]},
                 )
         shutil.rmtree(self.run_dir(record.run_id))
-        self._forget_run_event_caches(record.run_id)
         if self.run_dir(record.run_id).exists():
             raise StoreConflict("pruned terminal run remains in the hot store")
 
@@ -2218,7 +2214,6 @@ class RunStore:
             status_path.unlink(missing_ok=True)
         if run_dir.exists():
             shutil.rmtree(run_dir)
-        self._forget_run_event_caches(record.run_id)
         if run_dir.exists():
             raise StoreConflict("archived run directory remains after cleanup")
         self.command_log.forget_implicit_for_run(record.run_id)
@@ -2462,7 +2457,6 @@ class RunStore:
             if record.start_request_id:
                 self.command_log.remove_start_request(record.start_request_id)
             shutil.rmtree(self.run_dir(run_id))
-            self._forget_run_event_caches(run_id)
 
     def get(self, run_id: str) -> RunRecord:
         with self._lock:
@@ -2520,70 +2514,65 @@ class RunStore:
         adapter_status: AdapterStatus | None = None,
         guard_automatic_resume: bool = False,
     ) -> RunRecord:
-        # Keep lifecycle writes in the same per-run order as event writes.
-        # Always take the event lock before the store lock.
-        with self._event_lock_for(run_id):
-            with self._lock:
-                record = self.get(run_id)
-                if (
-                    record.state is target
-                    and record.state_reason == reason
-                    and adapter_status is None
-                ):
-                    return record
-                validate_transition(record.state, target)
-                record.state = target
-                record.state_reason = reason
-                if (
-                    target is not LifecycleState.BLOCKED
-                    and record.quiesce_operation_id is None
-                ):
-                    record.recovery_from_state = None
-                if target in TERMINAL_STATES:
-                    record.pending_requests.clear()
-                if adapter_status is not None:
-                    if record.execution_kind is not None:
-                        record.provider_state = adapter_status.state
-                    if adapter_status.session_id is not None:
-                        record.provider_session_id = adapter_status.session_id
-                    record.provider_pid = adapter_status.pid
-                    if adapter_status.pid is None:
+        with self._lock:
+            record = self.get(run_id)
+            if (
+                record.state is target
+                and record.state_reason == reason
+                and adapter_status is None
+            ):
+                return record
+            validate_transition(record.state, target)
+            record.state = target
+            record.state_reason = reason
+            if (
+                target is not LifecycleState.BLOCKED
+                and record.quiesce_operation_id is None
+            ):
+                record.recovery_from_state = None
+            if target in TERMINAL_STATES:
+                record.pending_requests.clear()
+            if adapter_status is not None:
+                if record.execution_kind is not None:
+                    record.provider_state = adapter_status.state
+                if adapter_status.session_id is not None:
+                    record.provider_session_id = adapter_status.session_id
+                record.provider_pid = adapter_status.pid
+                if adapter_status.pid is None:
+                    record.provider_pid_started_at = None
+                    record.provider_executable = None
+                    record.provider_process_group_id = None
+                    record.provider_process_group_members = []
+                else:
+                    identity = provider_process_status_sync(adapter_status.pid)
+                    if identity is None or identity.executable is None:
                         record.provider_pid_started_at = None
                         record.provider_executable = None
                         record.provider_process_group_id = None
                         record.provider_process_group_members = []
                     else:
-                        identity = provider_process_status_sync(adapter_status.pid)
-                        if identity is None or identity.executable is None:
-                            record.provider_pid_started_at = None
-                            record.provider_executable = None
-                            record.provider_process_group_id = None
-                            record.provider_process_group_members = []
-                        else:
-                            record.provider_pid_started_at = identity.created_at
-                            record.provider_executable = identity.executable
-                            record.provider_process_group_id = (
+                        record.provider_pid_started_at = identity.created_at
+                        record.provider_executable = identity.executable
+                        record.provider_process_group_id = identity.process_group_id
+                        record.provider_process_group_members = (
+                            provider_process_group_members_sync(
                                 identity.process_group_id
                             )
-                            record.provider_process_group_members = (
-                                provider_process_group_members_sync(
-                                    identity.process_group_id
-                                )
-                            )
-                    record.provider_generation = adapter_status.generation
-                    record.active_turn_id = adapter_status.active_turn_id
-                    if adapter_status.core_phase is not None:
-                        record.core_phase = adapter_status.core_phase
-                    if adapter_status.transcript_path is not None:
-                        record.transcript_path = adapter_status.transcript_path
-                    if adapter_status.detail and reason is None:
-                        record.state_reason = adapter_status.detail
-                if guard_automatic_resume:
-                    record.automatic_resume_suppressed = True
-                    record.automatic_resume_guarded_at = utc_now()
-                self._write_record(record)
-                self._write_current_projection(record)
-                return record
+                        )
+                record.provider_generation = adapter_status.generation
+                record.active_turn_id = adapter_status.active_turn_id
+                if adapter_status.core_phase is not None:
+                    record.core_phase = adapter_status.core_phase
+                if adapter_status.transcript_path is not None:
+                    record.transcript_path = adapter_status.transcript_path
+                if adapter_status.detail and reason is None:
+                    record.state_reason = adapter_status.detail
+            if guard_automatic_resume:
+                record.automatic_resume_suppressed = True
+                record.automatic_resume_guarded_at = utc_now()
+            self._write_record(record)
+            self._write_current_projection(record)
+            return record
 
     def mark_recovery_blocked(self, run_id: str, *, reason: str) -> RunRecord:
         """Block an unowned live PID while preserving automatic-resume intent."""
@@ -2677,9 +2666,8 @@ class RunStore:
     def mark_viewed(self, run_id: str, requested_seq: int | None = None) -> RunRecord:
         """Persist the monotonic event cursor owned by the supervisor."""
 
-        with self._event_lock_for(run_id):
-            with self._lock:
-                record = self.get(run_id)
+        with self._lock:
+            record = self.get(run_id)
             current_seq = record.normalized_event_count
             accepted_seq = (
                 current_seq
@@ -2784,20 +2772,6 @@ class RunStore:
             self._write_current_projection(record)
             return record
 
-    def _forget_run_event_caches(self, run_id: str) -> None:
-        """Drop per-run raw counters when the hot run tree is removed.
-
-        A recycled run_id (WIKI-354 uuid5 collisions) must never inherit a
-        previous run's raw sequence, and long-lived supervisors must not grow
-        these maps across archive churn.
-        """
-        self._raw_event_counts.pop(run_id, None)
-        self._raw_event_batch_runs.discard(run_id)
-        self._event_locks.pop(run_id, None)
-
-    def _event_lock_for(self, run_id: str) -> threading.RLock:
-        return self._event_locks.setdefault(run_id, threading.RLock())
-
     def append_raw(
         self,
         run_id: str,
@@ -2810,13 +2784,8 @@ class RunStore:
     ) -> dict[str, Any]:
         """Durably append raw provider input before normalization is attempted."""
 
-        # Per-run event locks serialize event writes with lifecycle mutations.
-        # The event lock is acquired before the store lock. This preserves
-        # cross-run file I/O while preventing a stale event record from
-        # overwriting a concurrent transition or viewed cursor.
-        with self._event_lock_for(run_id):
-            with self._lock:
-                record = self.get(run_id)
+        with self._lock:
+            record = self.get(run_id)
             current_count = max(
                 record.raw_event_count,
                 self._raw_event_counts.get(run_id, record.raw_event_count),
@@ -2839,9 +2808,8 @@ class RunStore:
             return envelope
 
     def begin_raw_event_batch(self, run_id: str) -> None:
-        with self._event_lock_for(run_id):
-            with self._lock:
-                record = self.get(run_id)
+        with self._lock:
+            record = self.get(run_id)
             self._raw_event_counts[run_id] = max(
                 record.raw_event_count,
                 self._raw_event_counts.get(run_id, record.raw_event_count),
@@ -2849,10 +2817,9 @@ class RunStore:
             self._raw_event_batch_runs.add(run_id)
 
     def end_raw_event_batch(self, run_id: str) -> RunRecord:
-        with self._event_lock_for(run_id):
+        with self._lock:
             self._raw_event_batch_runs.discard(run_id)
-            with self._lock:
-                record = self.get(run_id)
+            record = self.get(run_id)
             record.raw_event_count = max(
                 record.raw_event_count,
                 self._raw_event_counts.get(run_id, record.raw_event_count),
@@ -2871,9 +2838,8 @@ class RunStore:
         lifecycle_state: LifecycleState | None = None,
         normalized_at: str | None = None,
     ) -> dict[str, Any]:
-        with self._event_lock_for(run_id):
-            with self._lock:
-                record = self.get(run_id)
+        with self._lock:
+            record = self.get(run_id)
             raw_event_count = max(
                 record.raw_event_count,
                 self._raw_event_counts.get(run_id, record.raw_event_count),

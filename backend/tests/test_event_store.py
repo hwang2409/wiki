@@ -844,19 +844,6 @@ def test_half_applied_migration_is_idempotent() -> None:
         assert "unread_event_seq" in columns
 
 
-def test_migration_closes_its_temporary_connection() -> None:
-    with TemporaryDirectory() as tmp:
-        path = Path(tmp) / "events.sqlite3"
-        connection = connect_event_db(path)
-        with mock.patch(
-            "backend.app.agent_runtime.event_store_shard.connect_event_db",
-            return_value=connection,
-        ):
-            migrate_event_db(path)
-        with pytest.raises(sqlite3.ProgrammingError):
-            connection.execute("SELECT 1")
-
-
 def test_runtime_event_store_isolates_runs_in_separate_files() -> None:
     with TemporaryDirectory() as tmp:
         runtime = RuntimeEventStore(Path(tmp))

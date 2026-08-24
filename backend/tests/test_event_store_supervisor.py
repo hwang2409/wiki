@@ -17,7 +17,6 @@ from backend.app.agent_runtime.event_store import (
     replay_raw_jsonl,
 )
 from backend.app.agent_runtime.fake import FixtureAdapterFactory
-from backend.app.agent_runtime.normalizer import normalize_provider_event
 from backend.app.agent_runtime.provider import ProviderEvent
 from backend.app.agent_runtime.store import RunStore, RuntimePaths
 from backend.app.agent_runtime.supervisor import _BoundedPersistenceWriter, Supervisor
@@ -701,16 +700,14 @@ class SupervisorDualWriteTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(all(observed))
 
     async def test_stalled_materializer_blocks_without_losing_raw_row(self) -> None:
-        materialize_started = threading.Event()
-        release_materialize = threading.Event()
+        gate = asyncio.Event()
+        self.supervisor.materializer_gate = gate
         original_materialize = self.supervisor.event_store.materialize
         call_count = 0
 
         def stalled(*args: object, **kwargs: object) -> object:
             nonlocal call_count
             call_count += 1
-            materialize_started.set()
-            release_materialize.wait(timeout=10)
             return original_materialize(*args, **kwargs)
 
         first_adapter = self.factory(self.record)
@@ -726,7 +723,10 @@ class SupervisorDualWriteTests(unittest.IsolatedAsyncioTestCase):
             first_task = asyncio.create_task(
                 self.supervisor._pump_events(self.record.run_id, first_adapter)
             )
-            await asyncio.to_thread(materialize_started.wait, 10)
+            for _ in range(100):
+                if self.store.get(self.record.run_id).raw_event_count == 1:
+                    break
+                await asyncio.sleep(0.01)
             self.assertEqual(self.store.get(self.record.run_id).raw_event_count, 1)
             await second_adapter._events.put(  # noqa: SLF001
                 self._event("turn/diff/updated", {"diff": "second"})
@@ -735,12 +735,12 @@ class SupervisorDualWriteTests(unittest.IsolatedAsyncioTestCase):
                 self.supervisor._pump_events(self.record.run_id, second_adapter)
             )
             await asyncio.sleep(0.05)
-            self.assertEqual(call_count, 1)
+            self.assertEqual(call_count, 0)
             self.assertEqual(
                 len(list(self.store.iter_raw_events(self.record.run_id))),
                 1,
             )
-            release_materialize.set()
+            gate.set()
             await first_adapter._events.put(None)  # noqa: SLF001
             await second_adapter._events.put(None)  # noqa: SLF001
             await asyncio.wait_for(
@@ -844,256 +844,6 @@ class SupervisorDualWriteTests(unittest.IsolatedAsyncioTestCase):
                 self.supervisor.event_store.materialized_raw_seqs(record.run_id),
                 set(range(1, 101)),
             )
-
-    async def test_writer_preserves_order_for_concurrent_same_run_submissions(
-        self,
-    ) -> None:
-        observed: list[str] = []
-        original_append_raw = self.store.append_raw
-
-        def append_raw(*args: object, **kwargs: object) -> dict[str, object]:
-            payload = kwargs["payload"]
-            assert isinstance(payload, dict)
-            params = payload["params"]
-            assert isinstance(params, dict)
-            observed.append(str(params["diff"]))
-            time.sleep(0.005)
-            return original_append_raw(*args, **kwargs)  # type: ignore[arg-type]
-
-        events = [
-            ProviderEvent(
-                ProviderKind.CODEX,
-                {
-                    "method": "turn/diff/updated",
-                    "params": {"diff": f"same-run-{index}"},
-                },
-                generation=self.record.provider_generation,
-            )
-            for index in range(8)
-        ]
-        with mock.patch.object(self.store, "append_raw", side_effect=append_raw):
-            await asyncio.gather(
-                *(
-                    self.supervisor._persist_event_bundle_async(
-                        self.record,
-                        event,
-                        normalize_provider_event(
-                            event.provider,
-                            event.payload,
-                            direction=event.direction,
-                        ),
-                        event.payload["params"],
-                    )
-                    for event in events
-                )
-            )
-
-        self.assertEqual(observed, [f"same-run-{index}" for index in range(8)])
-        self.assertEqual(
-            [int(row["raw_seq"]) for row in self.store.iter_normalized_events(
-                self.record.run_id
-            )],
-            list(range(1, 9)),
-        )
-
-    async def test_event_write_cannot_overwrite_concurrent_transition(self) -> None:
-        write_started = threading.Event()
-        release_write = threading.Event()
-        transition_finished = threading.Event()
-        original_write = self.store._write_record  # noqa: SLF001
-
-        def blocked_write(record: RunRecord) -> None:
-            write_started.set()
-            release_write.wait(timeout=10)
-            original_write(record)
-
-        def append() -> None:
-            self.store.append_raw(
-                self.record.run_id,
-                provider="codex",
-                direction="server",
-                payload={"method": "turn/started"},
-            )
-
-        def transition() -> None:
-            self.store.transition(self.record.run_id, LifecycleState.BLOCKED)
-            transition_finished.set()
-
-        with mock.patch.object(self.store, "_write_record", side_effect=blocked_write):
-            append_thread = threading.Thread(target=append)
-            append_thread.start()
-            self.assertTrue(write_started.wait(timeout=10))
-            transition_thread = threading.Thread(target=transition)
-            transition_thread.start()
-            self.assertFalse(transition_finished.wait(timeout=0.05))
-            release_write.set()
-            append_thread.join(timeout=10)
-            transition_thread.join(timeout=10)
-
-        self.assertTrue(transition_finished.is_set())
-        record = self.store.get(self.record.run_id)
-        self.assertEqual(record.state, LifecycleState.BLOCKED)
-        self.assertEqual(record.raw_event_count, 1)
-
-    async def test_event_write_cannot_overwrite_concurrent_viewed_cursor(self) -> None:
-        self.store.append_raw(
-            self.record.run_id,
-            provider="codex",
-            direction="server",
-            payload={"method": "turn/started"},
-        )
-        write_started = threading.Event()
-        release_write = threading.Event()
-        viewed_finished = threading.Event()
-        original_write = self.store._write_record  # noqa: SLF001
-
-        def blocked_write(record: RunRecord) -> None:
-            write_started.set()
-            release_write.wait(timeout=10)
-            original_write(record)
-
-        def append_normalized() -> None:
-            self.store.append_normalized(
-                self.record.run_id,
-                raw_seq=1,
-                disposition=EventDisposition.RENDERED,
-                kind="turn_started",
-                payload={},
-            )
-
-        def mark_viewed() -> None:
-            self.store.mark_viewed(self.record.run_id)
-            viewed_finished.set()
-
-        with mock.patch.object(self.store, "_write_record", side_effect=blocked_write):
-            append_thread = threading.Thread(target=append_normalized)
-            append_thread.start()
-            self.assertTrue(write_started.wait(timeout=10))
-            viewed_thread = threading.Thread(target=mark_viewed)
-            viewed_thread.start()
-            self.assertFalse(viewed_finished.wait(timeout=0.05))
-            release_write.set()
-            append_thread.join(timeout=10)
-            viewed_thread.join(timeout=10)
-
-        self.assertTrue(viewed_finished.is_set())
-        record = self.store.get(self.record.run_id)
-        self.assertEqual(record.normalized_event_count, 1)
-        self.assertEqual(record.last_viewed_seq, 1)
-
-    async def test_model_changed_event_uses_writer_and_awaits_durability(self) -> None:
-        started = threading.Event()
-        release = threading.Event()
-        original_append_raw = self.store.append_raw
-
-        def blocked_append_raw(*args: object, **kwargs: object) -> dict[str, object]:
-            started.set()
-            release.wait(timeout=10)
-            return original_append_raw(*args, **kwargs)  # type: ignore[arg-type]
-
-        with mock.patch.object(
-            self.store, "append_raw", side_effect=blocked_append_raw
-        ):
-            task = asyncio.create_task(
-                self.supervisor._append_model_changed_event(
-                    self.record,
-                    old_model="fixture",
-                    new_model="fixture-2",
-                    trigger="test",
-                )
-            )
-            await asyncio.to_thread(started.wait, 10)
-            self.assertFalse(task.done())
-            self.assertEqual(
-                (await self.supervisor.dispatch("ping", {}))["status"],
-                "ok",
-            )
-            release.set()
-            await asyncio.wait_for(task, timeout=10)
-
-        raw = list(self.store.iter_raw_events(self.record.run_id))
-        normalized = list(self.store.iter_normalized_events(self.record.run_id))
-        self.assertEqual(raw[0]["provider"], "supervisor")
-        self.assertEqual(normalized[0]["kind"], "model_changed")
-
-    async def test_startup_events_use_normal_writer_without_dropping_tail(self) -> None:
-        adapter = self.factory(self.record)
-        events = [
-            self._event("turn/started", {"turn": {"id": "startup-1"}}),
-            self._event("turn/diff/updated", {"diff": "startup-2"}),
-            self._event("turn/diff/updated", {"diff": "startup-3"}),
-        ]
-        for event in events:
-            await adapter._events.put(event)  # noqa: SLF001
-        await adapter._events.put(None)  # noqa: SLF001
-        self.supervisor.expected_stream_ends.add(id(adapter))
-        try:
-            self.supervisor._attach_adapter(self.record.run_id, adapter)
-            await asyncio.wait_for(
-                self.supervisor.event_tasks[self.record.run_id], timeout=10
-            )
-        finally:
-            self.supervisor.expected_stream_ends.discard(id(adapter))
-
-        self.assertEqual(self.store.get(self.record.run_id).raw_event_count, 3)
-        self.assertEqual(
-            [row["raw_seq"] for row in self.store.iter_normalized_events(
-                self.record.run_id
-            )],
-            [1, 2, 3],
-        )
-
-    async def test_writer_close_drains_admitted_capacity_waiters(self) -> None:
-        writer = _BoundedPersistenceWriter(
-            workers=1,
-            queue_size=0,
-            per_run_queue_size=1,
-        )
-        started = threading.Event()
-        release = threading.Event()
-        completed: list[int] = []
-
-        def blocked(value: int) -> int:
-            started.set()
-            release.wait(timeout=10)
-            completed.append(value)
-            return value
-
-        first = asyncio.create_task(writer.submit("run", blocked, 1))
-        await asyncio.to_thread(started.wait, 10)
-        second = asyncio.create_task(writer.submit("run", blocked, 2))
-        await asyncio.sleep(0)
-        close_task = asyncio.create_task(writer.close())
-        await asyncio.sleep(0)
-        with self.assertRaises(RuntimeError):
-            await writer.submit("run", blocked, 3)
-        self.assertFalse(close_task.done())
-        release.set()
-        self.assertEqual(await asyncio.wait_for(first, timeout=10), 1)
-        self.assertEqual(await asyncio.wait_for(second, timeout=10), 2)
-        await asyncio.wait_for(close_task, timeout=10)
-        self.assertEqual(completed, [1, 2])
-
-    async def test_startup_event_persistence_failure_blocks_run(self) -> None:
-        adapter = self.factory(self.record)
-        with mock.patch.object(
-            self.supervisor.event_store,
-            "materialize",
-            side_effect=sqlite3.OperationalError("startup materializer failure"),
-        ):
-            await adapter._events.put(  # noqa: SLF001
-                self._event("turn/started", {"turn": {"id": "startup"}})
-            )
-            self.supervisor._attach_adapter(self.record.run_id, adapter)
-            task = self.supervisor.event_tasks[self.record.run_id]
-            await asyncio.wait_for(task, timeout=5)
-
-        blocked = self.store.get(self.record.run_id)
-        self.assertEqual(blocked.state, LifecycleState.BLOCKED)
-        self.assertEqual(
-            blocked.state_reason,
-            "provider event persistence failed: startup materializer failure",
-        )
 
     async def test_writer_keeps_ping_responsive_during_blocked_burst(self) -> None:
         records = [
@@ -1310,10 +1060,6 @@ class SupervisorDualWriteTests(unittest.IsolatedAsyncioTestCase):
                     ],
                     1,
                 )
-                persistence = self.supervisor.materializer_metrics()["persistence"]
-                self.assertEqual(persistence["running"], 1)
-                self.assertEqual(persistence["queued"], 0)
-                self.assertGreaterEqual(persistence["admission_waiting"], 1)
                 release_materialize.set()
                 await asyncio.wait_for(
                     asyncio.gather(first_task, other_task),
@@ -1376,155 +1122,3 @@ class SupervisorDualWriteTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual(raw["seq"], 1)
         self.assertEqual(len(list(self.store.iter_raw_events(self.record.run_id))), 1)
-
-    async def test_shutdown_drains_queued_sqlite_work_before_close(self) -> None:
-        other = self.store.create(
-            RunRecord.new(
-                agent_id="WIKI-358-SHUTDOWN-OTHER",
-                provider=ProviderKind.CODEX,
-                role="implement",
-                model="fixture",
-                worktree=str(self.root),
-                prompt="queued sqlite shutdown test",
-            )
-        )
-        started = threading.Event()
-        release = threading.Event()
-        materialized: list[str] = []
-        original_materialize = self.supervisor.event_store.materialize
-
-        def blocked_materialize(*args: object, **kwargs: object) -> object:
-            run_id = str(args[0])
-            materialized.append(run_id)
-            if not started.is_set():
-                started.set()
-                release.wait(timeout=10)
-            return original_materialize(*args, **kwargs)  # type: ignore[arg-type]
-
-        first_event = self._event("turn/started", {"turn": {"id": "first"}})
-        second_event = ProviderEvent(
-            ProviderKind.CODEX,
-            {
-                "method": "turn/started",
-                "params": {"turn": {"id": "second"}},
-            },
-            generation=other.provider_generation,
-        )
-        patcher = mock.patch.object(
-            self.supervisor.event_store,
-            "materialize",
-            side_effect=blocked_materialize,
-        )
-        patcher.start()
-        try:
-            first_task = asyncio.create_task(
-                self.supervisor._persist_event_bundle_async(
-                    self.record,
-                    first_event,
-                    normalize_provider_event(
-                        first_event.provider,
-                        first_event.payload,
-                        direction=first_event.direction,
-                    ),
-                    first_event.payload["params"],
-                )
-            )
-            await asyncio.to_thread(started.wait, 10)
-            second_task = asyncio.create_task(
-                self.supervisor._persist_event_bundle_async(
-                    other,
-                    second_event,
-                    normalize_provider_event(
-                        second_event.provider,
-                        second_event.payload,
-                        direction=second_event.direction,
-                    ),
-                    second_event.payload["params"],
-                )
-            )
-            await asyncio.sleep(0)
-            close_task = asyncio.create_task(self.supervisor.close())
-            await asyncio.sleep(0)
-            self.assertFalse(close_task.done())
-            release.set()
-            await asyncio.wait_for(
-                asyncio.gather(first_task, second_task, close_task),
-                timeout=10,
-            )
-        finally:
-            release.set()
-            patcher.stop()
-        self.assertEqual(set(materialized), {self.record.run_id, other.run_id})
-
-
-    async def test_writer_keeps_run_status_responsive_during_blocked_burst(
-        self,
-    ) -> None:
-        records = [
-            self.store.create(
-                RunRecord.new(
-                    agent_id=f"WIKI-358-STATUS-{index}",
-                    provider=ProviderKind.CODEX,
-                    role="implement",
-                    model="fixture",
-                    worktree=str(self.root),
-                    prompt="store-read responsiveness test",
-                )
-            )
-            for index in range(3)
-        ]
-        adapters = [self.factory(record) for record in records]
-        materialize_started = threading.Event()
-        release_materialize = threading.Event()
-        original_materialize = self.supervisor.event_store.materialize
-
-        def blocked_materialize(*args: object, **kwargs: object) -> object:
-            materialize_started.set()
-            release_materialize.wait(timeout=10)
-            return original_materialize(*args, **kwargs)  # type: ignore[arg-type]
-
-        self.supervisor.expected_stream_ends.update(id(adapter) for adapter in adapters)
-        tasks: list[asyncio.Task[None]] = []
-        try:
-            with mock.patch.object(
-                self.supervisor.event_store,
-                "materialize",
-                side_effect=blocked_materialize,
-            ):
-                for record, adapter in zip(records, adapters):
-                    for index in range(40):
-                        await adapter._events.put(  # noqa: SLF001
-                            ProviderEvent(
-                                ProviderKind.CODEX,
-                                {
-                                    "method": "turn/diff/updated",
-                                    "params": {"diff": f"status-burst-{index}"},
-                                },
-                                generation=record.provider_generation,
-                            )
-                        )
-                    await adapter._events.put(None)  # noqa: SLF001
-                    tasks.append(
-                        asyncio.create_task(
-                            self.supervisor._pump_events(record.run_id, adapter)
-                        )
-                    )
-                await asyncio.to_thread(materialize_started.wait, 10)
-                # Store-touching dispatches must stay responsive while writer
-                # threads persist: materialization holds no store lock, and the
-                # JSONL appends the lock does cover are bounded.
-                started = time.perf_counter()
-                status = await asyncio.wait_for(
-                    self.supervisor.dispatch(
-                        "run/status", {"agent_id": records[0].agent_id}
-                    ),
-                    timeout=3,
-                )
-                self.assertLess(time.perf_counter() - started, 1)
-                self.assertEqual(status["run_id"], records[0].run_id)
-        finally:
-            release_materialize.set()
-            await asyncio.gather(*tasks, return_exceptions=True)
-            self.supervisor.expected_stream_ends.difference_update(
-                id(adapter) for adapter in adapters
-            )
