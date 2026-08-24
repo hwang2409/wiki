@@ -2865,6 +2865,20 @@ class RunStore:
                         payload=payload,
                         source_seq=int(payload.get("source_seq", envelope["seq"])),
                     )
+            elif all(
+                isinstance(payload.get(key), str)
+                for key in ("pending_id", "composer_text", "composer_sent_at")
+            ):
+                # A delayed provider echo can trail a later lifecycle event
+                # when a control boundary and the event pump overlap. Keep
+                # its delivery proof even when causal projections stay
+                # protected by the stale-order guard above.
+                _apply_composer_message_event(
+                    record,
+                    payload=payload,
+                    seq=int(envelope["seq"]),
+                    normalized_at=str(envelope["normalized_at"]),
+                )
             self._write_record(record)
             return envelope
 

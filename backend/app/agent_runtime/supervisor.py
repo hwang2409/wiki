@@ -9,6 +9,7 @@ import re
 import shutil
 import sqlite3
 import tempfile
+import threading
 import time
 import warnings
 from collections import OrderedDict, deque
@@ -67,6 +68,9 @@ DEFAULT_ADAPTER_DETACH_GRACE_SECONDS = 1.0
 DEFAULT_IDEMPOTENCY_CACHE_SIZE = 256
 DEFAULT_WORKER_SOFT_CAP = 5
 DEFAULT_ARCHIVE_QUEUE_LIMIT = 4
+DEFAULT_PERSISTENCE_WRITER_WORKERS = 4
+DEFAULT_PERSISTENCE_WRITER_QUEUE_SIZE = 32
+DEFAULT_PERSISTENCE_WRITER_PER_RUN_QUEUE_SIZE = 1
 _IDEMPOTENT_METHODS = frozenset({"run/start", "run/send_now", "run/send_on_idle"})
 _COMMAND_METHODS = frozenset(
     {"run/start", "run/send_now", "run/send_on_idle", "run/archive", "run/replace"}
@@ -177,6 +181,115 @@ class _HandoverDrainOutcome(str, Enum):
     CONTROL_CANCEL_REQUEST = "control-cancel-request"
     USER_RESPONSE = "user-response"
     NONE = "none"
+
+
+class _BoundedPersistenceWriter:
+    """Run synchronous persistence work behind bounded async admission."""
+
+    def __init__(
+        self,
+        *,
+        workers: int,
+        queue_size: int,
+        per_run_queue_size: int,
+    ) -> None:
+        self._executor: ThreadPoolExecutor | None = ThreadPoolExecutor(
+            max_workers=workers,
+            thread_name_prefix="wiki-event-writer",
+        )
+        self._capacity = asyncio.BoundedSemaphore(workers + queue_size)
+        self._capacity_size = workers + queue_size
+        self._per_run_queue_size = per_run_queue_size
+        self._per_run_slots: dict[str, asyncio.BoundedSemaphore] = {}
+        self._pending_by_run: dict[str, int] = {}
+        self._pending = 0
+        self._max_pending = 0
+        self._drain_condition = asyncio.Condition()
+        self._closed = False
+
+    def _slot_for_run(self, run_id: str) -> asyncio.BoundedSemaphore:
+        return self._per_run_slots.setdefault(
+            run_id,
+            asyncio.BoundedSemaphore(self._per_run_queue_size),
+        )
+
+    async def submit(
+        self,
+        run_id: str,
+        function: Callable[..., Any],
+        *args: Any,
+        **kwargs: Any,
+    ) -> Any:
+        if self._closed:
+            raise RuntimeError("persistence writer is closed")
+        run_slot = self._slot_for_run(run_id)
+        await run_slot.acquire()
+        capacity_acquired = False
+        try:
+            await self._capacity.acquire()
+            capacity_acquired = True
+            if self._closed:
+                raise RuntimeError("persistence writer is closed")
+            executor = self._executor
+            if executor is None:
+                raise RuntimeError("persistence writer is closed")
+            async with self._drain_condition:
+                self._pending += 1
+                self._pending_by_run[run_id] = (
+                    self._pending_by_run.get(run_id, 0) + 1
+                )
+                self._max_pending = max(self._max_pending, self._pending)
+            loop = asyncio.get_running_loop()
+            future = loop.run_in_executor(
+                executor,
+                partial(function, *args, **kwargs),
+            )
+            try:
+                return await asyncio.shield(future)
+            except asyncio.CancelledError:
+                await asyncio.shield(future)
+                raise
+            finally:
+                async with self._drain_condition:
+                    self._pending -= 1
+                    remaining = self._pending_by_run[run_id] - 1
+                    if remaining:
+                        self._pending_by_run[run_id] = remaining
+                    else:
+                        self._pending_by_run.pop(run_id, None)
+                    self._drain_condition.notify_all()
+        finally:
+            if capacity_acquired:
+                self._capacity.release()
+            run_slot.release()
+
+    async def drain(self, run_id: str | None = None) -> None:
+        async with self._drain_condition:
+            while (
+                self._pending_by_run.get(run_id, 0)
+                if run_id is not None
+                else self._pending
+            ):
+                await self._drain_condition.wait()
+
+    async def close(self) -> None:
+        if self._closed and self._executor is None:
+            return
+        self._closed = True
+        await self.drain()
+        executor = self._executor
+        self._executor = None
+        if executor is not None:
+            executor.shutdown(wait=True)
+
+    def metrics(self) -> dict[str, Any]:
+        return {
+            "queue_depth": self._pending,
+            "queue_capacity": self._capacity_size,
+            "max_queue_depth": self._max_pending,
+            "per_run_queue_depth": dict(self._pending_by_run),
+            "per_run_queue_capacity": self._per_run_queue_size,
+        }
 
 
 class _HandoverPendingDisposition(str, Enum):
@@ -354,6 +467,29 @@ def _env_positive_int(name: str, default: int) -> int:
     return value
 
 
+def _env_nonnegative_int(name: str, default: int) -> int:
+    raw = os.environ.get(name)
+    if raw is None or not raw.strip():
+        return default
+    try:
+        value = int(raw)
+    except ValueError:
+        warnings.warn(
+            f"{name} must be a non-negative integer; using default {default}",
+            RuntimeWarning,
+            stacklevel=2,
+        )
+        return default
+    if value < 0:
+        warnings.warn(
+            f"{name} must be a non-negative integer; using default {default}",
+            RuntimeWarning,
+            stacklevel=2,
+        )
+        return default
+    return value
+
+
 def _provider_user_text(
     provider: ProviderKind,
     kind: str,
@@ -383,6 +519,18 @@ def _provider_user_text(
 def _validated_seconds(name: str, value: float) -> float:
     if not math.isfinite(value) or value < 0:
         raise ValueError(f"{name} must be a finite, non-negative number")
+    return value
+
+
+def _validated_positive_int(name: str, value: int) -> int:
+    if not isinstance(value, int) or isinstance(value, bool) or value < 1:
+        raise ValueError(f"{name} must be a positive integer")
+    return value
+
+
+def _validated_nonnegative_int(name: str, value: int) -> int:
+    if not isinstance(value, int) or isinstance(value, bool) or value < 0:
+        raise ValueError(f"{name} must be a non-negative integer")
     return value
 
 
@@ -454,6 +602,9 @@ class Supervisor:
         idempotency_cache_size: int = DEFAULT_IDEMPOTENCY_CACHE_SIZE,
         worker_soft_cap: int | None = None,
         archive_queue_limit: int = DEFAULT_ARCHIVE_QUEUE_LIMIT,
+        persistence_writer_workers: int | None = None,
+        persistence_writer_queue_size: int | None = None,
+        persistence_writer_per_run_queue_size: int | None = None,
     ):
         if idempotency_cache_size < 1:
             raise ValueError("idempotency_cache_size must be positive")
@@ -483,8 +634,48 @@ class Supervisor:
                 logger.exception("could not block corrupt raw run %s", run_id)
         self.materializer_reducers: dict[str, EventReducerAdapter] = {}
         self.materializer_latency_seconds: deque[float] = deque(maxlen=256)
+        self.persistence_latency_seconds: deque[float] = deque(maxlen=256)
         self.materializer_queue_depth: dict[str, int] = {}
         self.materializer_failures = 0
+        self._materializer_metrics_lock = threading.Lock()
+        writer_workers = _validated_positive_int(
+            "persistence_writer_workers",
+            (
+                persistence_writer_workers
+                if persistence_writer_workers is not None
+                else _env_positive_int(
+                    "WIKI_PERSISTENCE_WRITER_WORKERS",
+                    DEFAULT_PERSISTENCE_WRITER_WORKERS,
+                )
+            ),
+        )
+        writer_queue_size = _validated_nonnegative_int(
+            "persistence_writer_queue_size",
+            (
+                persistence_writer_queue_size
+                if persistence_writer_queue_size is not None
+                else _env_nonnegative_int(
+                    "WIKI_PERSISTENCE_WRITER_QUEUE_SIZE",
+                    DEFAULT_PERSISTENCE_WRITER_QUEUE_SIZE,
+                )
+            ),
+        )
+        writer_per_run_queue_size = _validated_positive_int(
+            "persistence_writer_per_run_queue_size",
+            (
+                persistence_writer_per_run_queue_size
+                if persistence_writer_per_run_queue_size is not None
+                else _env_positive_int(
+                    "WIKI_PERSISTENCE_WRITER_PER_RUN_QUEUE_SIZE",
+                    DEFAULT_PERSISTENCE_WRITER_PER_RUN_QUEUE_SIZE,
+                )
+            ),
+        )
+        self.persistence_writer = _BoundedPersistenceWriter(
+            workers=writer_workers,
+            queue_size=writer_queue_size,
+            per_run_queue_size=writer_per_run_queue_size,
+        )
         self.pid_alive = pid_alive
         self.recovery_stability_seconds = recovery_stability_seconds
         self.approval_recovery_timeout_seconds = _validated_seconds(
@@ -658,13 +849,39 @@ class Supervisor:
             logger.exception("could not reconcile archived workgraph edges")
 
     def materializer_metrics(self) -> dict[str, Any]:
-        latencies = self.materializer_latency_seconds
+        with self._materializer_metrics_lock:
+            latencies = deque(self.materializer_latency_seconds)
+            queue_depth = dict(self.materializer_queue_depth)
+            materializer_failures = self.materializer_failures
+        persistence_latencies = self.persistence_latency_seconds
+
+        def quantiles(values: deque[float]) -> dict[str, float]:
+            if not values:
+                return {"p50": 0.0, "p95": 0.0, "p99": 0.0}
+            ordered = sorted(values)
+            return {
+                key: ordered[
+                    min(
+                        len(ordered) - 1,
+                        max(0, math.ceil(len(ordered) * rank) - 1),
+                    )
+                ]
+                for key, rank in (("p50", 0.50), ("p95", 0.95), ("p99", 0.99))
+            }
+
+        persistence = self.persistence_writer.metrics()
         return {
             "count": len(latencies),
             "last_latency_seconds": latencies[-1] if latencies else 0.0,
             "max_latency_seconds": max(latencies) if latencies else 0.0,
-            "queue_depth": dict(self.materializer_queue_depth),
-            "failures": self.materializer_failures,
+            "latency_seconds": quantiles(latencies),
+            "queue_depth": queue_depth,
+            "failures": materializer_failures,
+            "persistence": {
+                **persistence,
+                "count": len(persistence_latencies),
+                "latency_seconds": quantiles(persistence_latencies),
+            },
         }
 
     def sync_subagent_runs(self, parent_run_id: str) -> list[str]:
@@ -777,7 +994,8 @@ class Supervisor:
         reducer = self._materializer_for_record(record)
         if not self.event_store.has_disposition(record.run_id, raw_seq):
             started = time.perf_counter()
-            self.materializer_queue_depth[record.run_id] = 1
+            with self._materializer_metrics_lock:
+                self.materializer_queue_depth[record.run_id] = 1
             try:
                 materialized = NormalizedProviderEvent(
                     normalized.disposition,
@@ -795,13 +1013,60 @@ class Supervisor:
                     normalized=materialized,
                 )
             except Exception:
-                self.materializer_failures += 1
+                with self._materializer_metrics_lock:
+                    self.materializer_failures += 1
                 raise
             finally:
-                self.materializer_latency_seconds.append(
-                    time.perf_counter() - started
-                )
-                self.materializer_queue_depth[record.run_id] = 0
+                with self._materializer_metrics_lock:
+                    self.materializer_latency_seconds.append(
+                        time.perf_counter() - started
+                    )
+                    self.materializer_queue_depth[record.run_id] = 0
+
+    def _persist_event_bundle(
+        self,
+        record: RunRecord,
+        event: ProviderEvent,
+        normalized: NormalizedProviderEvent,
+        payload: dict[str, Any],
+    ) -> dict[str, Any]:
+        raw = self.store.append_raw(
+            record.run_id,
+            provider=event.provider.value,
+            direction=event.direction,
+            payload=event.payload,
+            generation=event.generation,
+            received_at=event.received_at,
+        )
+        self._dual_write_normalized(
+            record,
+            raw,
+            normalized,
+            payload,
+        )
+        return raw
+
+    async def _persist_event_bundle_async(
+        self,
+        record: RunRecord,
+        event: ProviderEvent,
+        normalized: NormalizedProviderEvent,
+        payload: dict[str, Any],
+    ) -> dict[str, Any]:
+        started = time.perf_counter()
+        try:
+            return await self.persistence_writer.submit(
+                record.run_id,
+                self._persist_event_bundle,
+                record,
+                event,
+                normalized,
+                payload,
+            )
+        finally:
+            self.persistence_latency_seconds.append(
+                time.perf_counter() - started
+            )
 
     async def _dual_write_normalized_async(
         self,
@@ -816,14 +1081,62 @@ class Supervisor:
         materializer_gate = getattr(self, "materializer_gate", None)
         if materializer_gate is not None:
             await materializer_gate.wait()
-        self._dual_write_normalized(
-            record,
-            raw,
-            normalized,
-            payload,
-            append_legacy=append_legacy,
-            normalized_seq=normalized_seq,
-        )
+        started = time.perf_counter()
+        try:
+            await self.persistence_writer.submit(
+                record.run_id,
+                self._dual_write_normalized,
+                record,
+                raw,
+                normalized,
+                payload,
+                append_legacy=append_legacy,
+                normalized_seq=normalized_seq,
+            )
+        finally:
+            self.persistence_latency_seconds.append(
+                time.perf_counter() - started
+            )
+
+    async def _append_raw_event_async(
+        self,
+        run_id: str,
+        *,
+        provider: str,
+        direction: str,
+        payload: dict[str, Any],
+        generation: int,
+        received_at: str,
+    ) -> dict[str, Any]:
+        started = time.perf_counter()
+        try:
+            return await self.persistence_writer.submit(
+                run_id,
+                self.store.append_raw,
+                run_id,
+                provider=provider,
+                direction=direction,
+                payload=payload,
+                generation=generation,
+                received_at=received_at,
+            )
+        finally:
+            self.persistence_latency_seconds.append(
+                time.perf_counter() - started
+            )
+
+    async def _sync_subagent_runs_async(self, run_id: str) -> None:
+        started = time.perf_counter()
+        try:
+            await self.persistence_writer.submit(
+                run_id,
+                self.sync_subagent_runs,
+                run_id,
+            )
+        finally:
+            self.persistence_latency_seconds.append(
+                time.perf_counter() - started
+            )
     def _runtime_status(self, record: RunRecord) -> dict[str, Any]:
         value = _public_run(record)
         value["archive_in_progress"] = record.run_id in self.archive_inflight
@@ -1412,24 +1725,25 @@ Preserve the same identity, role, worktree, orchestrator grouping, PR gates, and
         normalized: NormalizedProviderEvent | None = None,
         prior_state: LifecycleState | None = None,
         shutdown_observation: bool = False,
+        publish_session: bool = True,
     ) -> None:
         record_before_event = self.store.get(run_id)
         if prior_state is None:
             prior_state = record_before_event.state
-        if raw is None:
-            raw = self.store.append_raw(
-                run_id,
-                provider=event.provider.value,
-                direction=event.direction,
-                payload=event.payload,
-                generation=event.generation,
-                received_at=event.received_at,
-            )
         if shutdown_observation:
             observation_payload = {
                 "prior_state": prior_state.value,
                 "event_payload": event.payload,
             }
+            if raw is None:
+                raw = await self._append_raw_event_async(
+                    run_id,
+                    provider=event.provider.value,
+                    direction=event.direction,
+                    payload=event.payload,
+                    generation=event.generation,
+                    received_at=event.received_at,
+                )
             await self._dual_write_normalized_async(
                 record_before_event,
                 raw,
@@ -1441,10 +1755,11 @@ Preserve the same identity, role, worktree, orchestrator grouping, PR gates, and
                 observation_payload,
             )
             return
-        if (
+        retired_generation = (
             event.generation > 0
             and event.generation < record_before_event.provider_generation
-        ):
+        )
+        if retired_generation:
             # A stopped transport cannot prove delivery for a matcher owned
             # by the resumed generation. Keep the raw event for audit, but
             # terminalize its normalization as ignored before text matching.
@@ -1452,25 +1767,12 @@ Preserve the same identity, role, worktree, orchestrator grouping, PR gates, and
                 "event_generation": event.generation,
                 "provider_generation": record_before_event.provider_generation,
             }
-            await self._dual_write_normalized_async(
-                record_before_event,
-                raw,
-                NormalizedProviderEvent(
+            normalized = NormalizedProviderEvent(
                     EventDisposition.IGNORED,
                     "retired_generation_event",
                     retired_payload,
-                ),
-                retired_payload,
             )
-            await self._publish(
-                {
-                    "type": "session",
-                    "ticket": record_before_event.agent_id,
-                    "surface": "session",
-                }
-            )
-            return
-        if normalized is None:
+        elif normalized is None:
             try:
                 normalized = normalize_provider_event(
                     event.provider,
@@ -1483,6 +1785,7 @@ Preserve the same identity, role, worktree, orchestrator grouping, PR gates, and
                     "normalization_error",
                     {"error": str(exc), "raw_payload": event.payload},
                 )
+        assert normalized is not None
         pending_message = None
         echoed_text = _provider_user_text(
             event.provider,
@@ -1490,12 +1793,21 @@ Preserve the same identity, role, worktree, orchestrator grouping, PR gates, and
             normalized.payload,
         )
         normalized_payload = normalized.payload
-        if echoed_text is not None:
+        if not retired_generation and echoed_text is not None:
             pending_message = self.store.match_pending_user_message(
                 run_id,
                 echoed_text,
             )
             if pending_message is not None:
+                if raw is None:
+                    raw = await self._append_raw_event_async(
+                        run_id,
+                        provider=event.provider.value,
+                        direction=event.direction,
+                        payload=event.payload,
+                        generation=event.generation,
+                        received_at=event.received_at,
+                    )
                 attempt_key = (run_id, pending_message["pending_id"])
                 if attempt_key in self._queued_delivery_attempts:
                     barrier = self._deferred_provider_event_barriers.get(run_id)
@@ -1524,16 +1836,51 @@ Preserve the same identity, role, worktree, orchestrator grouping, PR gates, and
                 pending_source = pending_message.get("source")
                 if isinstance(pending_source, str) and pending_source:
                     normalized_payload["source"] = pending_source
-        await self._dual_write_normalized_async(
-            record_before_event,
-            raw,
-            normalized,
-            normalized_payload,
-        )
-        try:
-            self.sync_subagent_runs(run_id)
-        except Exception:
-            logger.exception("could not sync Claude child runs for %s", run_id)
+        if raw is None:
+            if getattr(self, "materializer_gate", None) is not None:
+                raw = await self._append_raw_event_async(
+                    run_id,
+                    provider=event.provider.value,
+                    direction=event.direction,
+                    payload=event.payload,
+                    generation=event.generation,
+                    received_at=event.received_at,
+                )
+                await self._dual_write_normalized_async(
+                    record_before_event,
+                    raw,
+                    normalized,
+                    normalized_payload,
+                )
+            else:
+                raw = await self._persist_event_bundle_async(
+                    record_before_event,
+                    event,
+                    normalized,
+                    normalized_payload,
+                )
+        else:
+            await self._dual_write_normalized_async(
+                record_before_event,
+                raw,
+                normalized,
+                normalized_payload,
+            )
+        if retired_generation:
+            if publish_session:
+                await self._publish(
+                    {
+                        "type": "session",
+                        "ticket": record_before_event.agent_id,
+                        "surface": "session",
+                    }
+                )
+            return
+        if event.provider is ProviderKind.CLAUDE:
+            try:
+                await self._sync_subagent_runs_async(run_id)
+            except Exception:
+                logger.exception("could not sync Claude child runs for %s", run_id)
         if pending_message is not None:
             # The normalized row is the durable delivery proof. Do not make
             # the steer terminal before this append commits: a failed append
@@ -1581,9 +1928,10 @@ Preserve the same identity, role, worktree, orchestrator grouping, PR gates, and
                 provider_health.credential_fingerprint("cdx")
             )
 
-        await self._publish(
-            {"type": "session", "ticket": record.agent_id, "surface": "session"}
-        )
+        if publish_session:
+            await self._publish(
+                {"type": "session", "ticket": record.agent_id, "surface": "session"}
+            )
         turn_status = turn.get("status") if isinstance(turn, dict) else None
         credential_fingerprint = (
             self.codex_turn_fingerprints.pop((run_id, turn_id), None)
@@ -1798,6 +2146,27 @@ Preserve the same identity, role, worktree, orchestrator grouping, PR gates, and
                 if not self.event_inflight_counts.get(run_id):
                     return
                 await self.event_drain_condition.wait()
+
+    async def _drain_buffered_provider_events(
+        self, run_id: str, adapter: ProviderAdapter
+    ) -> None:
+        """Process events already buffered at an ambiguous send boundary."""
+
+        event_lock = self.event_processing_locks.setdefault(
+            run_id, asyncio.Lock()
+        )
+        async with event_lock:
+            for event in await adapter.drain_events():
+                event_run_id = self.event_routes.get(
+                    (id(adapter), event.generation), run_id
+                )
+                await self._handle_provider_event_without_admission(
+                    event_run_id,
+                    adapter,
+                    event,
+                    publish_session=False,
+                )
+        await self.persistence_writer.drain(run_id)
 
     def _schedule_monitor_actions(
         self,
@@ -2327,6 +2696,8 @@ Preserve the same identity, role, worktree, orchestrator grouping, PR gates, and
                         )
                     except TimeoutError:
                         pass
+                if adapter.provider is ProviderKind.CODEX:
+                    await self._drain_buffered_provider_events(run_id, adapter)
                 if attempt_key is not None:
                     self._queued_delivery_attempts.discard(attempt_key)
                     self._delivery_attempt_echoes.pop(attempt_key, None)
@@ -2589,6 +2960,7 @@ Preserve the same identity, role, worktree, orchestrator grouping, PR gates, and
                 except TimeoutError:
                     task.cancel()
                     await asyncio.gather(task, return_exceptions=True)
+            await self.persistence_writer.drain(run_id)
         finally:
             self.expected_stream_ends.discard(stream_key)
             await self._detach_adapter(run_id)
@@ -3191,6 +3563,7 @@ Preserve the same identity, role, worktree, orchestrator grouping, PR gates, and
         self.prepare_startup_recovery()
         try:
             await self._rebuild_startup_projections()
+            await self.persistence_writer.drain()
             self.projection_rebuild_ready.set()
             async with self._run_mutation_admission():
                 async with self.recovery_scan_lock:
@@ -5225,6 +5598,8 @@ Preserve the same identity, role, worktree, orchestrator grouping, PR gates, and
                     )
                 except TimeoutError:
                     pass
+            if adapter.provider is ProviderKind.CODEX:
+                await self._drain_buffered_provider_events(run_id, adapter)
             if attempt_key is not None:
                 self._queued_delivery_attempts.discard(attempt_key)
                 self._delivery_attempt_echoes.pop(attempt_key, None)
@@ -7175,6 +7550,7 @@ Preserve the same identity, role, worktree, orchestrator grouping, PR gates, and
         self.archive_inflight_agents.clear()
         self.adapters.clear()
         try:
+            await self.persistence_writer.close()
             await self.command_queue.close()
         finally:
             archive_jobs = tuple(self.archive_jobs)
