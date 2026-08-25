@@ -1,6 +1,4 @@
-import { createPortal } from "react-dom";
 import { useCallback, useEffect, useLayoutEffect, useRef, useState, type KeyboardEvent, type ReactNode, type RefObject } from "react";
-import { useModalA11y } from "./modal-a11y";
 
 export const MEDIA_SPEED_OPTIONS: readonly number[] = [0.75, 1, 1.25, 1.5, 2];
 
@@ -16,6 +14,16 @@ export function formatMediaDuration(seconds: number): string {
 }
 
 type MediaIconName = "play" | "pause" | "volume" | "muted" | "fullscreen" | "exit-fullscreen";
+
+function showMediaDialog(dialog: HTMLDialogElement) {
+  if (dialog.showModal) dialog.showModal();
+  else dialog.open = true;
+}
+
+function closeMediaDialog(dialog: HTMLDialogElement) {
+  if (dialog.close) dialog.close();
+  else dialog.open = false;
+}
 
 function MediaIcon({ name }: { name: MediaIconName }) {
   const common = {
@@ -72,7 +80,7 @@ export function MediaControls({
   controlsClassName,
   additionalControls,
 }: MediaControlsProps) {
-  const playerRef = useRef<HTMLDivElement | null>(null);
+  const playerRef = useRef<HTMLDialogElement | null>(null);
   const expandButtonRef = useRef<HTMLElement | null>(null);
   const [playing, setPlaying] = useState(false);
   const [currentTime, setCurrentTime] = useState(0);
@@ -83,18 +91,41 @@ export function MediaControls({
   const [isExpanded, setIsExpanded] = useState(false);
   const lastNonZeroVolumeRef = useRef(1);
   const wasExpandedRef = useRef(false);
-  const closeExpanded = useCallback(() => setIsExpanded(false), []);
-  const dialogRef = useModalA11y<HTMLDivElement>(isExpanded, closeExpanded, expandButtonRef);
+  const dialogTransitionRef = useRef(false);
+  const closeExpanded = useCallback(() => {
+    setIsExpanded(false);
+    window.requestAnimationFrame(() => expandButtonRef.current?.focus());
+  }, []);
+  const handleDialogClose = useCallback(() => {
+    if (dialogTransitionRef.current) return;
+    closeExpanded();
+  }, [closeExpanded]);
 
   useLayoutEffect(() => {
+    const dialog = playerRef.current;
+    if (!dialog) return;
     if (isExpanded) {
       wasExpandedRef.current = true;
+      if (dialog.open) {
+        dialogTransitionRef.current = true;
+        closeMediaDialog(dialog);
+        showMediaDialog(dialog);
+      } else {
+        showMediaDialog(dialog);
+      }
       return;
     }
-    if (!wasExpandedRef.current) return;
-    wasExpandedRef.current = false;
-    expandButtonRef.current?.focus();
-  }, [isExpanded, expandButtonRef]);
+    if (wasExpandedRef.current) {
+      wasExpandedRef.current = false;
+      if (dialog.open) {
+        dialogTransitionRef.current = true;
+        closeMediaDialog(dialog);
+      }
+      dialog.open = true;
+      return;
+    }
+    dialog.open = true;
+  }, [isExpanded]);
 
   const syncFromMedia = useCallback(() => {
     const media = mediaRef.current;
@@ -184,7 +215,7 @@ export function MediaControls({
     const element = playerRef.current;
     if (!element) return;
     if (isExpanded) {
-      setIsExpanded(false);
+      closeExpanded();
       return;
     }
     if (document.fullscreenElement === element) {
@@ -195,7 +226,7 @@ export function MediaControls({
       }
       return;
     }
-    if (document.fullscreenEnabled && typeof element.requestFullscreen === "function") {
+    if (document.fullscreenEnabled && "requestFullscreen" in element) {
       try {
         await element.requestFullscreen();
         return;
@@ -205,9 +236,9 @@ export function MediaControls({
       }
     }
     setIsExpanded(true);
-  }, [isExpanded]);
+  }, [closeExpanded, isExpanded]);
 
-  const handleKeyDown = (event: KeyboardEvent<HTMLDivElement>) => {
+  const handleKeyDown = (event: KeyboardEvent<HTMLDialogElement>) => {
     if (event.target !== event.currentTarget && event.target !== mediaRef.current) return;
     switch (event.key.toLowerCase()) {
       case " ":
@@ -242,12 +273,9 @@ export function MediaControls({
   const keyboardShortcuts = ["Space", "K", "ArrowLeft", "ArrowRight", "M"];
   if (showFullscreen) keyboardShortcuts.push("F", "Escape");
   const player = (
-    <div
+    <dialog
       aria-modal={isExpanded ? "true" : undefined}
-      ref={(element) => {
-        playerRef.current = element;
-        dialogRef.current = element;
-      }}
+      ref={playerRef}
       aria-keyshortcuts={keyboardShortcuts.join(" ")}
       aria-label={mediaLabel}
       className={`artifact-media-player ${className}${isExpanded ? " is-media-expanded" : ""}`}
@@ -257,8 +285,10 @@ export function MediaControls({
           togglePlayback();
         }
       }}
+      onCancel={closeExpanded}
       onKeyDown={handleKeyDown}
       role={isExpanded ? "dialog" : "group"}
+      onClose={handleDialogClose}
       tabIndex={0}
     >
       {children}
@@ -338,9 +368,8 @@ export function MediaControls({
         ) : null}
         {additionalControls}
       </div>
-    </div>
+    </dialog>
   );
 
-  if (isExpanded && typeof document !== "undefined") return createPortal(player, document.body);
   return player;
 }

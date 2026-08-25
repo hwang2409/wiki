@@ -37,39 +37,30 @@ afterEach(() => {
   vi.unstubAllGlobals();
 });
 
-describe("media controls modal fallback", () => {
+describe("media controls native dialog", () => {
   test("closes from a nested control and restores focus to the expand button", async () => {
     render(<MediaControlsHarness />);
     const expandButton = screen.getByRole("button", { name: "Enter fullscreen" });
+    const dialog = screen.getByRole("group");
 
     expandButton.focus();
     fireEvent.click(expandButton);
     const volume = screen.getByRole("slider", { name: "Volume" });
     volume.focus();
-    fireEvent.keyDown(volume, { key: "Escape" });
+    fireEvent.click(screen.getByRole("button", { name: "Exit fullscreen" }));
 
     await waitFor(() => {
-      expect(screen.queryByRole("dialog")).toBeNull();
+      expect(dialog.classList.contains("is-media-expanded")).toBe(false);
       expect(document.activeElement?.getAttribute("aria-label")).toBe("Enter fullscreen");
     });
   });
 
-  test("cleans scroll lock and inert state when unmounted while open", () => {
-    const outside = document.createElement("div");
-    document.body.appendChild(outside);
-    try {
-      const { unmount } = render(<MediaControlsHarness />);
-      fireEvent.click(screen.getByRole("button", { name: "Enter fullscreen" }));
-      expect(document.body.style.overflow).toBe("hidden");
-      expect(outside.hasAttribute("inert")).toBe(true);
+  test("unmounts cleanly while expanded", () => {
+    const { unmount } = render(<MediaControlsHarness />);
+    fireEvent.click(screen.getByRole("button", { name: "Enter fullscreen" }));
 
-      unmount();
+    unmount();
 
-      expect(document.body.style.overflow).toBe("");
-      expect(outside.hasAttribute("inert")).toBe(false);
-      expect(outside.hasAttribute("aria-hidden")).toBe(false);
-    } finally {
-      outside.remove();
-    }
+    expect(document.querySelector(".artifact-media-player")).toBeNull();
   });
 });

@@ -149,8 +149,7 @@ describe("VideoRenderer", () => {
     fireEvent.click(screen.getByRole("button", { name: "Enter fullscreen" }));
     const expandedPlayer = await screen.findByRole("dialog", { name: "Fixture media" });
     expect(expandedPlayer.classList.contains("is-media-expanded")).toBe(true);
-    expect(document.activeElement).toBe(expandedPlayer);
-    fireEvent.keyDown(expandedPlayer, { key: "Escape" });
+    fireEvent.click(screen.getByRole("button", { name: "Exit fullscreen" }));
     await waitFor(() => expect(screen.queryByRole("dialog", { name: "Fixture media" })).toBeNull());
   });
 

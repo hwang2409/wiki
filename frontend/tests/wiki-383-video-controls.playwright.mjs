@@ -223,12 +223,40 @@ async function main() {
     for (let step = 0; step < 50; step += 1) await seekSlider.press("ArrowRight");
     const currentTime = await video.evaluate((node) => node.currentTime);
     if (Math.abs(currentTime - 0.5) > 0.1) throw new Error(`seek control did not update currentTime: ${currentTime}`);
+    await bar.getByRole("combobox", { name: "Playback speed" }).selectOption("1.5");
+    await page.waitForFunction(() => {
+      const videoElement = document.querySelector("[data-artifact-kind=video] video");
+      return videoElement instanceof HTMLVideoElement && Math.abs(videoElement.playbackRate - 1.5) < 0.01;
+    });
+    const videoHandle = await video.elementHandle();
+    if (!videoHandle) throw new Error("video element handle is missing");
+    const stateBeforeExpand = await video.evaluate((node) => ({ currentTime: node.currentTime, playbackRate: node.playbackRate }));
     await page.evaluate(() => {
       Object.defineProperty(document, "fullscreenEnabled", { configurable: true, value: false });
     });
     await bar.getByRole("button", { name: "Enter fullscreen" }).click();
-    const expandedPlayer = page.locator("body > .artifact-media-player.is-media-expanded");
+    const expandedPlayer = block.locator("dialog.artifact-media-player.is-media-expanded");
     await expandedPlayer.waitFor({ state: "visible" });
+    if (await expandedPlayer.evaluate((node) => node.tagName) !== "DIALOG") throw new Error("expanded player is not a native dialog");
+    const expandedVideo = expandedPlayer.locator("video");
+    const expandedVideoHandle = await expandedVideo.elementHandle();
+    if (!expandedVideoHandle) throw new Error("expanded video element handle is missing");
+    if (!(await videoHandle.evaluate((node, expanded) => node === expanded, expandedVideoHandle))) {
+      throw new Error("expansion replaced the video element");
+    }
+    const stateAfterExpand = await expandedVideo.evaluate((node) => ({ currentTime: node.currentTime, playbackRate: node.playbackRate }));
+    if (Math.abs(stateAfterExpand.currentTime - stateBeforeExpand.currentTime) > 0.05
+      || Math.abs(stateAfterExpand.playbackRate - stateBeforeExpand.playbackRate) > 0.01) {
+      throw new Error(`expansion changed media state: ${JSON.stringify({ stateBeforeExpand, stateAfterExpand })}`);
+    }
+    await expandedPlayer.getByRole("button", { name: "Play" }).click();
+    await page.waitForFunction(() => {
+      const videoElement = document.querySelector("[data-artifact-kind=video] video");
+      return videoElement instanceof HTMLVideoElement && !videoElement.paused;
+    });
+    if (await expandedPlayer.getByRole("button", { name: "Pause" }).count() !== 1) {
+      throw new Error("play/pause button is out of sync after expansion");
+    }
     const viewport = await expandedPlayer.boundingBox();
     const expectedViewport = await page.evaluate(() => ({ width: window.innerWidth, height: window.innerHeight }));
     if (!viewport || Math.abs(viewport.x) > 0.5 || Math.abs(viewport.y) > 0.5
@@ -239,24 +267,49 @@ async function main() {
     const expandedBar = expandedPlayer.locator(".artifact-video-controls");
     if (await expandedBar.isVisible() !== true) throw new Error("custom bar disappeared in fullscreen");
     if (await expandedPlayer.getAttribute("aria-modal") !== "true") throw new Error("expanded player is not modal");
-    if (await page.evaluate(() => document.body.style.overflow) !== "hidden") throw new Error("modal did not lock body scroll");
+    if (!(await expandedPlayer.evaluate((node) => node.matches(":modal")))) throw new Error("expanded player is not in the top layer");
 
-    const focusables = expandedPlayer.locator("button:not([disabled]), input:not([disabled]), select:not([disabled])");
-    const firstFocusable = focusables.first();
-    const lastFocusable = focusables.last();
-    await lastFocusable.focus();
-    await page.keyboard.press("Tab");
-    if (!(await firstFocusable.evaluate((element) => element === document.activeElement))) {
-      throw new Error("Tab did not wrap to the first modal control");
-    }
-    await firstFocusable.focus();
-    await page.keyboard.press("Shift+Tab");
-    if (!(await lastFocusable.evaluate((element) => element === document.activeElement))) {
-      throw new Error("Shift+Tab did not wrap to the last modal control");
+    await page.evaluate(() => {
+      const frame = document.querySelector("[data-artifact-kind=video] .artifact-video-frame");
+      const videoElement = document.querySelector("[data-artifact-kind=video] video");
+      if (!(frame instanceof HTMLElement) || !(videoElement instanceof HTMLVideoElement)) throw new Error("portrait probe elements are missing");
+      frame.style.aspectRatio = "1 / 1";
+      frame.style.maxWidth = "500px";
+      videoElement.setAttribute("width", "720");
+      videoElement.setAttribute("height", "1280");
+    });
+    const portraitGeometry = await expandedPlayer.evaluate((player) => {
+      const frame = player.querySelector(".artifact-video-frame").getBoundingClientRect();
+      const videoElement = player.querySelector("video").getBoundingClientRect();
+      return { frame, video: videoElement, objectFit: getComputedStyle(player.querySelector("video")).objectFit };
+    });
+    if (portraitGeometry.objectFit !== "contain"
+      || portraitGeometry.video.left < portraitGeometry.frame.left - 1
+      || portraitGeometry.video.right > portraitGeometry.frame.right + 1
+      || portraitGeometry.video.top < portraitGeometry.frame.top - 1
+      || portraitGeometry.video.bottom > portraitGeometry.frame.bottom + 1) {
+      throw new Error(`portrait video is not contained: ${JSON.stringify(portraitGeometry)}`);
     }
 
-    await expandedBar.getByRole("combobox", { name: "Playback speed" }).press("Escape");
+    await expandedBar.getByRole("button", { name: "Pause" }).click();
+    await page.waitForFunction(() => {
+      const videoElement = document.querySelector("[data-artifact-kind=video] video");
+      return videoElement instanceof HTMLVideoElement && videoElement.paused;
+    });
+    const stateBeforeCollapse = await expandedVideo.evaluate((node) => ({ currentTime: node.currentTime, playbackRate: node.playbackRate }));
+    await expandedPlayer.focus();
+    await page.keyboard.press("Escape");
     await page.waitForFunction(() => !document.querySelector(".artifact-media-player.is-media-expanded"));
+    const collapsedVideo = block.locator("video");
+    const collapsedVideoHandle = await collapsedVideo.elementHandle();
+    if (!collapsedVideoHandle || !(await videoHandle.evaluate((node, collapsed) => node === collapsed, collapsedVideoHandle))) {
+      throw new Error("collapse replaced the video element");
+    }
+    const stateAfterCollapse = await collapsedVideo.evaluate((node) => ({ currentTime: node.currentTime, playbackRate: node.playbackRate }));
+    if (Math.abs(stateAfterCollapse.currentTime - stateBeforeCollapse.currentTime) > 0.05
+      || Math.abs(stateAfterCollapse.playbackRate - stateBeforeCollapse.playbackRate) > 0.01) {
+      throw new Error(`collapse changed media state: ${JSON.stringify({ stateBeforeCollapse, stateAfterCollapse })}`);
+    }
     if (await page.evaluate(() => document.activeElement?.getAttribute("aria-label")) !== "Enter fullscreen") {
       throw new Error("focus was not restored to the expand button");
     }
