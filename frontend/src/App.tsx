@@ -2120,6 +2120,8 @@ export default function App() {
 
   function focusWindowPane(windowId: string, paneId: string) {
     preserveViewScrollRef.current = true;
+    const targetWindow = windowState.windows.find((window) => window.id === windowId);
+    const targetPath = targetWindow ? findPaneInfo(targetWindow.layout, paneId)?.path ?? null : null;
     setWindowState((current) => {
       const target = current.windows.find((window) => window.id === windowId);
       if (current.activeWindowId === windowId && target?.focusedPaneId === paneId) {
@@ -2133,7 +2135,7 @@ export default function App() {
         ),
       });
     });
-    requestAnimationFrame(() => paneRefs.current.get(paneId)?.focus());
+    requestAnimationFrame(() => focusPaneTarget(paneId, targetPath));
   }
 
   function syncRouteToPath(
@@ -2578,6 +2580,23 @@ export default function App() {
     else paneRefs.current.delete(key);
   }
 
+  function focusPaneTarget(paneId: string, path: string | null) {
+    const terminalId = terminalIdFromPanePath(path);
+    if (terminalId) {
+      const controller = terminalControllersRef.current.get(terminalId);
+      if (controller) {
+        controller.focus();
+        return;
+      }
+      paneRefs.current
+        .get(paneId)
+        ?.querySelector<HTMLTextAreaElement>('textarea[data-terminal-input="true"]')
+        ?.focus();
+      return;
+    }
+    paneRefs.current.get(paneId)?.focus();
+  }
+
   function focusPane(key: string) {
     if (!activeWindow) return;
     focusWindowPane(activeWindow.id, key);
@@ -2785,7 +2804,7 @@ export default function App() {
       ? findPaneInfo(nextActiveWindow.layout, nextActiveWindow.focusedPaneId)
       : null;
     if (nextPane) {
-      requestAnimationFrame(() => paneRefs.current.get(nextPane.key)?.focus());
+      requestAnimationFrame(() => focusPaneTarget(nextPane.key, nextPane.path));
     }
     syncRouteToPath(nextPane?.path ?? null, { resourceKind: nextPane?.resourceKind ?? undefined });
   }

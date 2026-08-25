@@ -16,6 +16,7 @@ import {
 } from "./terminal-runtime";
 
 export type TerminalPaneController = {
+  focus: () => void;
   sendInput: (data: string) => void;
 };
 
@@ -144,6 +145,9 @@ export function TerminalPane({
 
   useEffect(() => {
     const controller: TerminalPaneController = {
+      focus() {
+        runtime.focus();
+      },
       sendInput(data: string) {
         runtime.sendInput(data);
       },
