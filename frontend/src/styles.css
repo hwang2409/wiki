@@ -15846,7 +15846,9 @@ textarea.composer-command-input {
   background: transparent;
 }
 
-.artifact-media-player.is-media-expanded {
+.artifact-media-player:is(.is-media-expanded, :fullscreen) {
+  --artifact-media-expanded-max-height: calc(100dvh - 100px);
+  --artifact-media-expanded-max-width: min(calc(100dvw - 32px), 1280px);
   position: fixed;
   inset: 0;
   z-index: 1000;
@@ -15858,16 +15860,17 @@ textarea.composer-command-input {
   background: var(--background-primary);
 }
 
-.artifact-media-player.is-media-expanded .artifact-video-frame,
-.artifact-media-player.is-media-expanded .artifact-media-controls {
+.artifact-media-player:is(.is-media-expanded, :fullscreen) .artifact-video-frame,
+.artifact-media-player:is(.is-media-expanded, :fullscreen) .artifact-media-controls {
   width: min(100%, 1280px);
 }
 
-.artifact-media-player.is-media-expanded .artifact-video-frame {
-  max-height: calc(100vh - 100px);
+.artifact-media-player:is(.is-media-expanded, :fullscreen) .artifact-video-frame {
+  max-width: min(var(--artifact-media-expanded-max-width), var(--artifact-video-intrinsic-width, var(--artifact-media-expanded-max-width))) !important;
+  max-height: min(var(--artifact-media-expanded-max-height), var(--artifact-video-intrinsic-height, var(--artifact-media-expanded-max-height)));
 }
 
-.artifact-media-player.is-media-expanded .artifact-video-frame .artifact-video {
+.artifact-media-player:is(.is-media-expanded, :fullscreen) .artifact-video-frame .artifact-video {
   width: 100%;
   height: 100%;
   max-height: none;
@@ -15876,16 +15879,6 @@ textarea.composer-command-input {
 
 .artifact-media-player.is-media-expanded::backdrop {
   background: color-mix(in srgb, var(--background-primary) 80%, transparent);
-}
-
-.artifact-video-player:fullscreen {
-  justify-content: center;
-  padding: 16px;
-  background: var(--background-primary);
-}
-
-.artifact-video-player:fullscreen .artifact-video-frame {
-  width: min(100%, 1280px);
 }
 
 .artifact-video-wrap .artifact-video {

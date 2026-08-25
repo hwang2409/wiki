@@ -41,6 +41,30 @@ function logStep(message) {
   console.error(`[wiki-383-video-controls] ${message}`);
 }
 
+function buildPortraitVideo(outputPath) {
+  const result = spawnSync("ffmpeg", [
+    "-hide_banner",
+    "-loglevel",
+    "error",
+    "-f",
+    "lavfi",
+    "-i",
+    "color=c=navy:s=360x720:r=10",
+    "-t",
+    "1",
+    "-an",
+    "-c:v",
+    "libx264",
+    "-pix_fmt",
+    "yuv420p",
+    "-movflags",
+    "+faststart",
+    "-y",
+    outputPath,
+  ], { encoding: "utf8" });
+  if (result.status !== 0) throw new Error(`portrait fixture failed: ${result.stderr || result.stdout}`);
+}
+
 function invokeFixtureWorker(fixtures, input) {
   const requests = [
     {
@@ -114,7 +138,9 @@ async function writeFixture(fixtures, result, input) {
 }
 
 async function main() {
-  const videoPath = path.join(ROOT, "backend", "tests", "fixtures", "media", "tiny.mp4");
+  const fixtures = makeFixtureRoot("wiki-383-video-");
+  const videoPath = path.join(fixtures.root, "portrait.mp4");
+  buildPortraitVideo(videoPath);
   const bytes = await fs.readFile(videoPath);
   const input = {
     kind: "video",
@@ -122,7 +148,6 @@ async function main() {
     caption: "custom controls fixture",
     payload: { data_base64: bytes.toString("base64"), mime: "video/mp4" },
   };
-  const fixtures = makeFixtureRoot("wiki-383-video-");
   const result = invokeFixtureWorker(fixtures, input);
   await writeFixture(fixtures, result, input);
   const backend = await startBackend(fixtures);
@@ -269,26 +294,40 @@ async function main() {
     if (await expandedPlayer.getAttribute("aria-modal") !== "true") throw new Error("expanded player is not modal");
     if (!(await expandedPlayer.evaluate((node) => node.matches(":modal")))) throw new Error("expanded player is not in the top layer");
 
-    await page.evaluate(() => {
-      const frame = document.querySelector("[data-artifact-kind=video] .artifact-video-frame");
-      const videoElement = document.querySelector("[data-artifact-kind=video] video");
-      if (!(frame instanceof HTMLElement) || !(videoElement instanceof HTMLVideoElement)) throw new Error("portrait probe elements are missing");
-      frame.style.aspectRatio = "1 / 1";
-      frame.style.maxWidth = "500px";
-      videoElement.setAttribute("width", "720");
-      videoElement.setAttribute("height", "1280");
-    });
     const portraitGeometry = await expandedPlayer.evaluate((player) => {
       const frame = player.querySelector(".artifact-video-frame").getBoundingClientRect();
       const videoElement = player.querySelector("video").getBoundingClientRect();
-      return { frame, video: videoElement, objectFit: getComputedStyle(player.querySelector("video")).objectFit };
+      const video = player.querySelector("video");
+      return {
+        frame,
+        video: videoElement,
+        objectFit: getComputedStyle(video).objectFit,
+        intrinsicWidth: video.videoWidth,
+        intrinsicHeight: video.videoHeight,
+        viewport: { width: window.innerWidth, height: window.innerHeight },
+      };
     });
+    const expectedExpandedHeight = Math.min(portraitGeometry.intrinsicHeight, portraitGeometry.viewport.height - 100);
+    const expectedExpandedWidth = expectedExpandedHeight * portraitGeometry.intrinsicWidth / portraitGeometry.intrinsicHeight;
+    const videoCenter = {
+      x: portraitGeometry.video.left + portraitGeometry.video.width / 2,
+      y: portraitGeometry.video.top + portraitGeometry.video.height / 2,
+    };
+    const frameCenter = {
+      x: portraitGeometry.frame.left + portraitGeometry.frame.width / 2,
+      y: portraitGeometry.frame.top + portraitGeometry.frame.height / 2,
+    };
     if (portraitGeometry.objectFit !== "contain"
-      || portraitGeometry.video.left < portraitGeometry.frame.left - 1
-      || portraitGeometry.video.right > portraitGeometry.frame.right + 1
-      || portraitGeometry.video.top < portraitGeometry.frame.top - 1
-      || portraitGeometry.video.bottom > portraitGeometry.frame.bottom + 1) {
-      throw new Error(`portrait video is not contained: ${JSON.stringify(portraitGeometry)}`);
+      || Math.abs(portraitGeometry.frame.width - expectedExpandedWidth) > 1
+      || Math.abs(portraitGeometry.frame.height - expectedExpandedHeight) > 1
+      || Math.abs(portraitGeometry.video.width / portraitGeometry.video.height
+        - portraitGeometry.intrinsicWidth / portraitGeometry.intrinsicHeight) > 0.01
+      || portraitGeometry.video.width > portraitGeometry.intrinsicWidth + 1
+      || portraitGeometry.video.height > portraitGeometry.intrinsicHeight + 1
+      || portraitGeometry.video.height <= 560
+      || Math.abs(videoCenter.x - frameCenter.x) > 1
+      || Math.abs(videoCenter.y - frameCenter.y) > 1) {
+      throw new Error(`portrait video does not fit expanded viewport: ${JSON.stringify(portraitGeometry)}`);
     }
 
     await expandedBar.getByRole("button", { name: "Pause" }).click();
@@ -320,6 +359,47 @@ async function main() {
     if (cleanupState.bodyOverflow !== "" || cleanupState.inertCount !== 0) {
       throw new Error(`modal cleanup failed: ${JSON.stringify(cleanupState)}`);
     }
+
+    await page.evaluate(() => {
+      Object.defineProperty(document, "fullscreenEnabled", { configurable: true, value: true });
+      const player = document.querySelector(".artifact-media-player");
+      if (!(player instanceof HTMLElement)) throw new Error("media player is missing");
+      Object.defineProperty(document, "fullscreenElement", { configurable: true, value: null, writable: true });
+      Object.defineProperty(player, "requestFullscreen", {
+        configurable: true,
+        value: () => {
+          Object.defineProperty(document, "fullscreenElement", { configurable: true, value: player, writable: true });
+          document.dispatchEvent(new Event("fullscreenchange"));
+          return Promise.resolve();
+        },
+      });
+      Object.defineProperty(document, "exitFullscreen", {
+        configurable: true,
+        value: () => {
+          Object.defineProperty(document, "fullscreenElement", { configurable: true, value: null, writable: true });
+          document.dispatchEvent(new Event("fullscreenchange"));
+          return Promise.resolve();
+        },
+      });
+    });
+    await bar.getByRole("button", { name: "Enter fullscreen" }).click();
+    await page.waitForFunction(() => document.fullscreenElement instanceof HTMLElement);
+    const nativeFullscreenState = await page.evaluate(() => {
+      const player = document.querySelector(".artifact-media-player");
+      if (!(player instanceof HTMLElement)) throw new Error("native fullscreen player is missing");
+      return {
+        fullscreenElement: document.fullscreenElement === player,
+        expandedFallback: player.classList.contains("is-media-expanded"),
+        nativeExitButton: player.querySelector("button[aria-label='Exit fullscreen']") !== null,
+      };
+    });
+    if (!nativeFullscreenState.fullscreenElement
+      || nativeFullscreenState.expandedFallback
+      || !nativeFullscreenState.nativeExitButton) {
+      throw new Error(`native fullscreen path did not stay native: ${JSON.stringify(nativeFullscreenState)}`);
+    }
+    await page.getByRole("button", { name: "Exit fullscreen" }).click();
+    await page.waitForFunction(() => document.fullscreenElement === null);
 
     const pageErrorsBeforeRejectedRequest = pageErrors.length;
     await page.evaluate(() => {

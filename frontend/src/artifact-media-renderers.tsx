@@ -214,6 +214,8 @@ export function VideoRenderer({ artifact, event, ticket }: ArtifactRendererProps
   const frameStyle: CSSProperties = {
     ...ratioStyle,
     maxWidth: maxFrameWidth === undefined ? undefined : `${maxFrameWidth}px`,
+    ["--artifact-video-intrinsic-width" as string]: intrinsicWidth ? `${intrinsicWidth}px` : undefined,
+    ["--artifact-video-intrinsic-height" as string]: intrinsicHeight ? `${intrinsicHeight}px` : undefined,
   };
   return (
     <div className="artifact-video-wrap">
