@@ -137,6 +137,67 @@ async function writeFixture(fixtures, result, input) {
   if (commit.status !== 0) throw new Error(`archive commit failed: ${commit.stderr || commit.stdout}`);
 }
 
+async function readPortraitGeometry(player) {
+  return player.evaluate((node) => {
+    const frame = node.querySelector(".artifact-video-frame");
+    const video = node.querySelector("video");
+    if (!(frame instanceof HTMLElement) || !(video instanceof HTMLVideoElement)) {
+      throw new Error("portrait video geometry elements are missing");
+    }
+    return {
+      frame: frame.getBoundingClientRect(),
+      video: video.getBoundingClientRect(),
+      objectFit: getComputedStyle(video).objectFit,
+      intrinsicWidth: video.videoWidth,
+      intrinsicHeight: video.videoHeight,
+      viewport: { width: window.innerWidth, height: window.innerHeight },
+    };
+  });
+}
+
+function assertPortraitGeometry(geometry, label) {
+  const expectedExpandedHeight = Math.min(geometry.intrinsicHeight, geometry.viewport.height - 100);
+  const expectedExpandedWidth = expectedExpandedHeight * geometry.intrinsicWidth / geometry.intrinsicHeight;
+  const videoCenter = {
+    x: geometry.video.left + geometry.video.width / 2,
+    y: geometry.video.top + geometry.video.height / 2,
+  };
+  const frameCenter = {
+    x: geometry.frame.left + geometry.frame.width / 2,
+    y: geometry.frame.top + geometry.frame.height / 2,
+  };
+  if (geometry.objectFit !== "contain"
+    || Math.abs(geometry.frame.width - expectedExpandedWidth) > 1
+    || Math.abs(geometry.frame.height - expectedExpandedHeight) > 1
+    || Math.abs(geometry.video.width / geometry.video.height
+      - geometry.intrinsicWidth / geometry.intrinsicHeight) > 0.01
+    || geometry.video.width > geometry.intrinsicWidth + 1
+    || geometry.video.height > geometry.intrinsicHeight + 1
+    || geometry.video.height <= 560
+    || Math.abs(videoCenter.x - frameCenter.x) > 1
+    || Math.abs(videoCenter.y - frameCenter.y) > 1) {
+    throw new Error(`${label} portrait video does not fit expanded viewport: ${JSON.stringify(geometry)}`);
+  }
+}
+
+function waitForFullscreenChange(page) {
+  return page.evaluate(() => new Promise((resolve, reject) => {
+    const timeout = window.setTimeout(() => {
+      cleanup();
+      reject(new Error("fullscreenchange did not fire"));
+    }, 5000);
+    const cleanup = () => {
+      window.clearTimeout(timeout);
+      document.removeEventListener("fullscreenchange", handleChange);
+    };
+    const handleChange = () => {
+      cleanup();
+      resolve();
+    };
+    document.addEventListener("fullscreenchange", handleChange, { once: true });
+  }));
+}
+
 async function main() {
   const fixtures = makeFixtureRoot("wiki-383-video-");
   const videoPath = path.join(fixtures.root, "portrait.mp4");
@@ -294,41 +355,8 @@ async function main() {
     if (await expandedPlayer.getAttribute("aria-modal") !== "true") throw new Error("expanded player is not modal");
     if (!(await expandedPlayer.evaluate((node) => node.matches(":modal")))) throw new Error("expanded player is not in the top layer");
 
-    const portraitGeometry = await expandedPlayer.evaluate((player) => {
-      const frame = player.querySelector(".artifact-video-frame").getBoundingClientRect();
-      const videoElement = player.querySelector("video").getBoundingClientRect();
-      const video = player.querySelector("video");
-      return {
-        frame,
-        video: videoElement,
-        objectFit: getComputedStyle(video).objectFit,
-        intrinsicWidth: video.videoWidth,
-        intrinsicHeight: video.videoHeight,
-        viewport: { width: window.innerWidth, height: window.innerHeight },
-      };
-    });
-    const expectedExpandedHeight = Math.min(portraitGeometry.intrinsicHeight, portraitGeometry.viewport.height - 100);
-    const expectedExpandedWidth = expectedExpandedHeight * portraitGeometry.intrinsicWidth / portraitGeometry.intrinsicHeight;
-    const videoCenter = {
-      x: portraitGeometry.video.left + portraitGeometry.video.width / 2,
-      y: portraitGeometry.video.top + portraitGeometry.video.height / 2,
-    };
-    const frameCenter = {
-      x: portraitGeometry.frame.left + portraitGeometry.frame.width / 2,
-      y: portraitGeometry.frame.top + portraitGeometry.frame.height / 2,
-    };
-    if (portraitGeometry.objectFit !== "contain"
-      || Math.abs(portraitGeometry.frame.width - expectedExpandedWidth) > 1
-      || Math.abs(portraitGeometry.frame.height - expectedExpandedHeight) > 1
-      || Math.abs(portraitGeometry.video.width / portraitGeometry.video.height
-        - portraitGeometry.intrinsicWidth / portraitGeometry.intrinsicHeight) > 0.01
-      || portraitGeometry.video.width > portraitGeometry.intrinsicWidth + 1
-      || portraitGeometry.video.height > portraitGeometry.intrinsicHeight + 1
-      || portraitGeometry.video.height <= 560
-      || Math.abs(videoCenter.x - frameCenter.x) > 1
-      || Math.abs(videoCenter.y - frameCenter.y) > 1) {
-      throw new Error(`portrait video does not fit expanded viewport: ${JSON.stringify(portraitGeometry)}`);
-    }
+    const portraitGeometry = await readPortraitGeometry(expandedPlayer);
+    assertPortraitGeometry(portraitGeometry, "expanded");
 
     await expandedBar.getByRole("button", { name: "Pause" }).click();
     await page.waitForFunction(() => {
@@ -360,53 +388,85 @@ async function main() {
       throw new Error(`modal cleanup failed: ${JSON.stringify(cleanupState)}`);
     }
 
+    const inRowState = await page.evaluate(() => {
+      const player = document.querySelector(".artifact-media-player");
+      const frame = player?.querySelector(".artifact-video-frame");
+      if (!(player instanceof HTMLElement) || !(frame instanceof HTMLElement)) {
+        throw new Error("in-row media geometry is missing");
+      }
+      const playerRect = player.getBoundingClientRect();
+      const frameRect = frame.getBoundingClientRect();
+      return {
+        player: { left: playerRect.left, top: playerRect.top, width: playerRect.width, height: playerRect.height },
+        frame: { left: frameRect.left, top: frameRect.top, width: frameRect.width, height: frameRect.height },
+      };
+    });
     await page.evaluate(() => {
       Object.defineProperty(document, "fullscreenEnabled", { configurable: true, value: true });
-      const player = document.querySelector(".artifact-media-player");
-      if (!(player instanceof HTMLElement)) throw new Error("media player is missing");
-      Object.defineProperty(document, "fullscreenElement", { configurable: true, value: null, writable: true });
-      Object.defineProperty(player, "requestFullscreen", {
-        configurable: true,
-        value: () => {
-          Object.defineProperty(document, "fullscreenElement", { configurable: true, value: player, writable: true });
-          document.dispatchEvent(new Event("fullscreenchange"));
-          return Promise.resolve();
-        },
-      });
-      Object.defineProperty(document, "exitFullscreen", {
-        configurable: true,
-        value: () => {
-          Object.defineProperty(document, "fullscreenElement", { configurable: true, value: null, writable: true });
-          document.dispatchEvent(new Event("fullscreenchange"));
-          return Promise.resolve();
-        },
-      });
     });
+    const fullscreenChange = waitForFullscreenChange(page);
     await bar.getByRole("button", { name: "Enter fullscreen" }).click();
-    await page.waitForFunction(() => document.fullscreenElement instanceof HTMLElement);
+    await fullscreenChange;
     const nativeFullscreenState = await page.evaluate(() => {
       const player = document.querySelector(".artifact-media-player");
-      if (!(player instanceof HTMLElement)) throw new Error("native fullscreen player is missing");
+      const frame = player?.querySelector(".artifact-media-fullscreen-target");
+      if (!(player instanceof HTMLElement) || !(frame instanceof HTMLElement)) {
+        throw new Error("native fullscreen frame is missing");
+      }
       return {
-        fullscreenElement: document.fullscreenElement === player,
+        fullscreenElement: document.fullscreenElement === frame,
+        fullscreenFrame: frame.matches(":fullscreen"),
         expandedFallback: player.classList.contains("is-media-expanded"),
-        nativeExitButton: player.querySelector("button[aria-label='Exit fullscreen']") !== null,
       };
     });
     if (!nativeFullscreenState.fullscreenElement
+      || !nativeFullscreenState.fullscreenFrame
       || nativeFullscreenState.expandedFallback
-      || !nativeFullscreenState.nativeExitButton) {
+      || await bar.getByRole("button", { name: "Exit fullscreen" }).count() !== 1) {
       throw new Error(`native fullscreen path did not stay native: ${JSON.stringify(nativeFullscreenState)}`);
     }
-    await page.getByRole("button", { name: "Exit fullscreen" }).click();
-    await page.waitForFunction(() => document.fullscreenElement === null);
+    const nativePortraitGeometry = await readPortraitGeometry(block.locator(".artifact-media-fullscreen-target"));
+    assertPortraitGeometry(nativePortraitGeometry, "native fullscreen");
+    if (await block.locator(".artifact-media-player .artifact-video-controls").isVisible() !== true) {
+      throw new Error("custom bar disappeared in native fullscreen");
+    }
+    const exitFullscreenChange = waitForFullscreenChange(page);
+    await bar.getByRole("button", { name: "Exit fullscreen" }).click();
+    await exitFullscreenChange;
+    const restoredInRowState = await page.evaluate(() => {
+      const player = document.querySelector(".artifact-media-player");
+      const frame = player?.querySelector(".artifact-video-frame");
+      if (!(player instanceof HTMLElement) || !(frame instanceof HTMLElement)) {
+        throw new Error("restored in-row media geometry is missing");
+      }
+      const playerRect = player.getBoundingClientRect();
+      const frameRect = frame.getBoundingClientRect();
+      const fullscreenFrame = player.querySelector(".artifact-media-fullscreen-target");
+      if (!(fullscreenFrame instanceof HTMLElement)) throw new Error("restored fullscreen frame is missing");
+      return {
+        fullscreenElement: document.fullscreenElement,
+        fullscreenFrame: fullscreenFrame.matches(":fullscreen"),
+        expanded: player.classList.contains("is-media-expanded"),
+        player: { left: playerRect.left, top: playerRect.top, width: playerRect.width, height: playerRect.height },
+        frame: { left: frameRect.left, top: frameRect.top, width: frameRect.width, height: frameRect.height },
+      };
+    });
+    const sameRect = (first, second) => ["left", "top", "width", "height"].every((key) => Math.abs(first[key] - second[key]) <= 1);
+    if (restoredInRowState.fullscreenElement !== null
+      || restoredInRowState.fullscreenFrame
+      || restoredInRowState.expanded
+      || !sameRect(restoredInRowState.player, inRowState.player)
+      || !sameRect(restoredInRowState.frame, inRowState.frame)) {
+      throw new Error(`native fullscreen did not restore in-row state: ${JSON.stringify({ inRowState, restoredInRowState })}`);
+    }
 
     const pageErrorsBeforeRejectedRequest = pageErrors.length;
     await page.evaluate(() => {
       Object.defineProperty(document, "fullscreenEnabled", { configurable: true, value: true });
       const player = document.querySelector(".artifact-media-player");
-      if (!(player instanceof HTMLElement)) throw new Error("media player is missing");
-      Object.defineProperty(player, "requestFullscreen", {
+      const fullscreenTarget = player?.querySelector(".artifact-media-fullscreen-target");
+      if (!(fullscreenTarget instanceof HTMLElement)) throw new Error("fullscreen target is missing");
+      Object.defineProperty(fullscreenTarget, "requestFullscreen", {
         configurable: true,
         value: () => Promise.reject(new Error("fullscreen rejected by host")),
       });

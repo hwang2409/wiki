@@ -15846,7 +15846,16 @@ textarea.composer-command-input {
   background: transparent;
 }
 
-.artifact-media-player:is(.is-media-expanded, :fullscreen) {
+.artifact-media-fullscreen-target {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  width: 100%;
+  min-width: 0;
+}
+
+.artifact-media-player:is(.is-media-expanded, :fullscreen),
+.artifact-media-fullscreen-target:fullscreen {
   --artifact-media-expanded-max-height: calc(100dvh - 100px);
   --artifact-media-expanded-max-width: min(calc(100dvw - 32px), 1280px);
   position: fixed;
@@ -15861,16 +15870,20 @@ textarea.composer-command-input {
 }
 
 .artifact-media-player:is(.is-media-expanded, :fullscreen) .artifact-video-frame,
-.artifact-media-player:is(.is-media-expanded, :fullscreen) .artifact-media-controls {
+.artifact-media-player:is(.is-media-expanded, :fullscreen) .artifact-media-controls,
+.artifact-media-fullscreen-target:fullscreen .artifact-video-frame,
+.artifact-media-fullscreen-target:fullscreen .artifact-media-controls {
   width: min(100%, 1280px);
 }
 
-.artifact-media-player:is(.is-media-expanded, :fullscreen) .artifact-video-frame {
+.artifact-media-player:is(.is-media-expanded, :fullscreen) .artifact-video-frame,
+.artifact-media-fullscreen-target:fullscreen .artifact-video-frame {
   max-width: min(var(--artifact-media-expanded-max-width), var(--artifact-video-intrinsic-width, var(--artifact-media-expanded-max-width))) !important;
   max-height: min(var(--artifact-media-expanded-max-height), var(--artifact-video-intrinsic-height, var(--artifact-media-expanded-max-height)));
 }
 
-.artifact-media-player:is(.is-media-expanded, :fullscreen) .artifact-video-frame .artifact-video {
+.artifact-media-player:is(.is-media-expanded, :fullscreen) .artifact-video-frame .artifact-video,
+.artifact-media-fullscreen-target:fullscreen .artifact-video-frame .artifact-video {
   width: 100%;
   height: 100%;
   max-height: none;
@@ -15879,6 +15892,10 @@ textarea.composer-command-input {
 
 .artifact-media-player.is-media-expanded::backdrop {
   background: color-mix(in srgb, var(--background-primary) 80%, transparent);
+}
+
+.artifact-media-fullscreen-target:fullscreen::backdrop {
+  background: var(--background-primary);
 }
 
 .artifact-video-wrap .artifact-video {

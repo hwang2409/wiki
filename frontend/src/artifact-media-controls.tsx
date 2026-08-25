@@ -81,6 +81,7 @@ export function MediaControls({
   additionalControls,
 }: MediaControlsProps) {
   const playerRef = useRef<HTMLDialogElement | null>(null);
+  const fullscreenRef = useRef<HTMLDivElement | null>(null);
   const expandButtonRef = useRef<HTMLElement | null>(null);
   const [playing, setPlaying] = useState(false);
   const [currentTime, setCurrentTime] = useState(0);
@@ -150,7 +151,7 @@ export function MediaControls({
   }, [initialDuration, mediaKey, mediaRef, syncFromMedia]);
 
   useEffect(() => {
-    const updateFullscreen = () => setIsNativeFullscreen(document.fullscreenElement === playerRef.current);
+    const updateFullscreen = () => setIsNativeFullscreen(document.fullscreenElement === fullscreenRef.current);
     document.addEventListener("fullscreenchange", updateFullscreen);
     updateFullscreen();
     return () => document.removeEventListener("fullscreenchange", updateFullscreen);
@@ -201,12 +202,13 @@ export function MediaControls({
 
   const toggleFullscreen = useCallback(async () => {
     const element = playerRef.current;
-    if (!element) return;
+    const fullscreenTarget = fullscreenRef.current;
+    if (!element || !fullscreenTarget) return;
     if (isExpanded) {
       closeExpanded();
       return;
     }
-    if (document.fullscreenElement === element) {
+    if (document.fullscreenElement === fullscreenTarget) {
       try {
         await document.exitFullscreen();
       } catch {
@@ -214,9 +216,9 @@ export function MediaControls({
       }
       return;
     }
-    if (document.fullscreenEnabled && "requestFullscreen" in element) {
+    if (document.fullscreenEnabled && "requestFullscreen" in fullscreenTarget) {
       try {
-        await element.requestFullscreen();
+        await fullscreenTarget.requestFullscreen();
         return;
       } catch {
         setIsExpanded(true);
@@ -279,82 +281,84 @@ export function MediaControls({
       onClose={handleDialogClose}
       tabIndex={0}
     >
-      {children}
-      <div className={`artifact-media-controls ${controlsClassName} tabular-nums`}>
-        <button
-          aria-label={playing ? "Pause" : "Play"}
-          className="artifact-media-control-button"
-          onClick={togglePlayback}
-          type="button"
-        >
-          <MediaIcon name={playing ? "pause" : "play"} />
-        </button>
-        <span aria-label="Elapsed time" className="artifact-media-time">{formatMediaDuration(safeCurrentTime)}</span>
-        <input
-          aria-label="Seek"
-          aria-valuemax={safeDuration}
-          aria-valuemin={0}
-          aria-valuenow={safeCurrentTime}
-          aria-valuetext={`${formatMediaDuration(safeCurrentTime)} of ${formatMediaDuration(safeDuration)}`}
-          className="artifact-media-seek"
-          max={safeDuration}
-          min={0}
-          onChange={(event) => setSeek(Number(event.target.value))}
-          role="slider"
-          step={0.01}
-          type="range"
-          value={safeCurrentTime}
-        />
-        <span aria-label="Duration" className="artifact-media-time">{formatMediaDuration(safeDuration)}</span>
-        <div className="artifact-media-volume">
+      <div className="artifact-media-fullscreen-target" ref={fullscreenRef}>
+        {children}
+        <div className={`artifact-media-controls ${controlsClassName} tabular-nums`}>
           <button
-            aria-label={muted ? "Unmute" : "Mute"}
+            aria-label={playing ? "Pause" : "Play"}
             className="artifact-media-control-button"
-            onClick={toggleMute}
+            onClick={togglePlayback}
             type="button"
           >
-            <MediaIcon name={muted ? "muted" : "volume"} />
+            <MediaIcon name={playing ? "pause" : "play"} />
           </button>
+          <span aria-label="Elapsed time" className="artifact-media-time">{formatMediaDuration(safeCurrentTime)}</span>
           <input
-            aria-label="Volume"
-            aria-valuemax={1}
+            aria-label="Seek"
+            aria-valuemax={safeDuration}
             aria-valuemin={0}
-            aria-valuenow={volume}
-            aria-valuetext={`${Math.round(volume * 100)}%`}
-            className="artifact-media-volume-slider"
-            max={1}
+            aria-valuenow={safeCurrentTime}
+            aria-valuetext={`${formatMediaDuration(safeCurrentTime)} of ${formatMediaDuration(safeDuration)}`}
+            className="artifact-media-seek"
+            max={safeDuration}
             min={0}
-            onChange={(event) => setMediaVolume(Number(event.target.value))}
+            onChange={(event) => setSeek(Number(event.target.value))}
             role="slider"
             step={0.01}
             type="range"
-            value={volume}
+            value={safeCurrentTime}
           />
+          <span aria-label="Duration" className="artifact-media-time">{formatMediaDuration(safeDuration)}</span>
+          <div className="artifact-media-volume">
+            <button
+              aria-label={muted ? "Unmute" : "Mute"}
+              className="artifact-media-control-button"
+              onClick={toggleMute}
+              type="button"
+            >
+              <MediaIcon name={muted ? "muted" : "volume"} />
+            </button>
+            <input
+              aria-label="Volume"
+              aria-valuemax={1}
+              aria-valuemin={0}
+              aria-valuenow={volume}
+              aria-valuetext={`${Math.round(volume * 100)}%`}
+              className="artifact-media-volume-slider"
+              max={1}
+              min={0}
+              onChange={(event) => setMediaVolume(Number(event.target.value))}
+              role="slider"
+              step={0.01}
+              type="range"
+              value={volume}
+            />
+          </div>
+          <label className="artifact-media-speed">
+            <span>Speed</span>
+            <select
+              aria-label="Playback speed"
+              onChange={(event) => onSpeedChange(Number(event.target.value))}
+              value={speed}
+            >
+              {MEDIA_SPEED_OPTIONS.map((option) => (
+                <option key={option} value={option}>{option}x</option>
+              ))}
+            </select>
+          </label>
+          {showFullscreen ? (
+            <button
+              aria-label={isFullscreen ? "Exit fullscreen" : "Enter fullscreen"}
+              className="artifact-media-control-button"
+              onClick={toggleFullscreen}
+              ref={(element) => { expandButtonRef.current = element; }}
+              type="button"
+            >
+              <MediaIcon name={isFullscreen ? "exit-fullscreen" : "fullscreen"} />
+            </button>
+          ) : null}
+          {additionalControls}
         </div>
-        <label className="artifact-media-speed">
-          <span>Speed</span>
-          <select
-            aria-label="Playback speed"
-            onChange={(event) => onSpeedChange(Number(event.target.value))}
-            value={speed}
-          >
-            {MEDIA_SPEED_OPTIONS.map((option) => (
-              <option key={option} value={option}>{option}x</option>
-            ))}
-          </select>
-        </label>
-        {showFullscreen ? (
-          <button
-            aria-label={isFullscreen ? "Exit fullscreen" : "Enter fullscreen"}
-            className="artifact-media-control-button"
-            onClick={toggleFullscreen}
-            ref={(element) => { expandButtonRef.current = element; }}
-            type="button"
-          >
-            <MediaIcon name={isFullscreen ? "exit-fullscreen" : "fullscreen"} />
-          </button>
-        ) : null}
-        {additionalControls}
       </div>
     </dialog>
   );
