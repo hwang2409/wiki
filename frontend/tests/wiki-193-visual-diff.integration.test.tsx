@@ -408,7 +408,7 @@ describe("media artifacts in ArtifactPanel", () => {
         width={640}
       />,
     );
-    expect(await screen.findByLabelText(`${kind} fixture`)).toBeTruthy();
+    expect(await screen.findByRole("group", { name: `${kind} fixture` })).toBeTruthy();
     expect(screen.queryByText(/artifact unavailable/i)).toBeNull();
     expect(document.querySelector(`[data-artifact-detail-kind="${kind}"]`)).toBeTruthy();
   });

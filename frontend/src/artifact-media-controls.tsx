@@ -46,6 +46,7 @@ function MediaIcon({ name }: { name: MediaIconName }) {
 type MediaControlsProps = {
   children: ReactNode;
   mediaRef: RefObject<HTMLMediaElement | null>;
+  mediaLabel: string;
   initialDuration?: number;
   mediaKey: string;
   speed: number;
@@ -59,6 +60,7 @@ type MediaControlsProps = {
 export function MediaControls({
   children,
   mediaRef,
+  mediaLabel,
   initialDuration,
   mediaKey,
   speed,
@@ -74,7 +76,9 @@ export function MediaControls({
   const [duration, setDuration] = useState(initialDuration ?? 0);
   const [volume, setVolume] = useState(1);
   const [muted, setMuted] = useState(false);
-  const [isFullscreen, setIsFullscreen] = useState(false);
+  const [isNativeFullscreen, setIsNativeFullscreen] = useState(false);
+  const [isExpanded, setIsExpanded] = useState(false);
+  const lastNonZeroVolumeRef = useRef(1);
 
   const syncFromMedia = useCallback(() => {
     const media = mediaRef.current;
@@ -82,8 +86,9 @@ export function MediaControls({
     setPlaying(!media.paused && !media.ended);
     setCurrentTime(Number.isFinite(media.currentTime) ? media.currentTime : 0);
     if (Number.isFinite(media.duration) && media.duration > 0) setDuration(media.duration);
+    if (media.volume > 0) lastNonZeroVolumeRef.current = media.volume;
     setVolume(media.volume);
-    setMuted(media.muted || media.volume === 0);
+    setMuted(media.muted);
   }, [mediaRef]);
 
   useEffect(() => {
@@ -92,8 +97,9 @@ export function MediaControls({
     setPlaying(false);
     setCurrentTime(0);
     setDuration(initialDuration ?? 0);
+    if (media.volume > 0) lastNonZeroVolumeRef.current = media.volume;
     setVolume(media.volume);
-    setMuted(media.muted || media.volume === 0);
+    setMuted(media.muted);
     const events = [
       "durationchange",
       "loadedmetadata",
@@ -109,11 +115,23 @@ export function MediaControls({
   }, [initialDuration, mediaKey, mediaRef, syncFromMedia]);
 
   useEffect(() => {
-    const updateFullscreen = () => setIsFullscreen(document.fullscreenElement === playerRef.current);
+    const updateFullscreen = () => setIsNativeFullscreen(document.fullscreenElement === playerRef.current);
     document.addEventListener("fullscreenchange", updateFullscreen);
     updateFullscreen();
     return () => document.removeEventListener("fullscreenchange", updateFullscreen);
   }, []);
+
+  useEffect(() => {
+    if (!isExpanded) return;
+    const previouslyFocused = document.activeElement instanceof HTMLElement ? document.activeElement : null;
+    const previousOverflow = document.body.style.overflow;
+    document.body.style.overflow = "hidden";
+    playerRef.current?.focus();
+    return () => {
+      document.body.style.overflow = previousOverflow;
+      if (previouslyFocused?.isConnected) previouslyFocused.focus();
+    };
+  }, [isExpanded]);
 
   const togglePlayback = useCallback(() => {
     const media = mediaRef.current;
@@ -136,36 +154,54 @@ export function MediaControls({
   const toggleMute = useCallback(() => {
     const media = mediaRef.current;
     if (!media) return;
-    media.muted = !media.muted;
-    setMuted(media.muted || media.volume === 0);
+    if (media.muted) {
+      if (media.volume === 0) media.volume = lastNonZeroVolumeRef.current || 1;
+      media.muted = false;
+      setVolume(media.volume);
+      setMuted(false);
+      return;
+    }
+    if (media.volume > 0) lastNonZeroVolumeRef.current = media.volume;
+    media.muted = true;
+    setMuted(true);
   }, [mediaRef]);
 
   const setMediaVolume = useCallback((nextVolume: number) => {
     const media = mediaRef.current;
     if (!media) return;
+    if (nextVolume > 0) lastNonZeroVolumeRef.current = nextVolume;
     media.volume = nextVolume;
     media.muted = nextVolume === 0;
     setVolume(nextVolume);
     setMuted(media.muted);
   }, [mediaRef]);
 
-  const toggleFullscreen = useCallback(() => {
+  const toggleFullscreen = useCallback(async () => {
     const element = playerRef.current;
     if (!element) return;
+    if (isExpanded) {
+      setIsExpanded(false);
+      return;
+    }
     if (document.fullscreenElement === element) {
       try {
-        void document.exitFullscreen().catch(() => undefined);
+        await document.exitFullscreen();
       } catch {
-        /* jsdom does not implement fullscreen */
+        setIsExpanded(true);
       }
       return;
     }
-    try {
-      void element.requestFullscreen().catch(() => undefined);
-    } catch {
-      /* jsdom does not implement fullscreen */
+    if (document.fullscreenEnabled && typeof element.requestFullscreen === "function") {
+      try {
+        await element.requestFullscreen();
+        return;
+      } catch {
+        setIsExpanded(true);
+        return;
+      }
     }
-  }, []);
+    setIsExpanded(true);
+  }, [isExpanded]);
 
   const handleKeyDown = (event: KeyboardEvent<HTMLDivElement>) => {
     if (event.key === "Escape" && isFullscreen) {
@@ -203,11 +239,15 @@ export function MediaControls({
 
   const safeDuration = Math.max(duration, 0);
   const safeCurrentTime = Math.min(Math.max(currentTime, 0), safeDuration);
-  const isMuted = muted || volume === 0;
+  const isFullscreen = isNativeFullscreen || isExpanded;
+  const keyboardShortcuts = ["Space", "K", "ArrowLeft", "ArrowRight", "M"];
+  if (showFullscreen) keyboardShortcuts.push("F", "Escape");
   return (
     <div
       ref={playerRef}
-      className={`artifact-media-player ${className}`}
+      aria-keyshortcuts={keyboardShortcuts.join(" ")}
+      aria-label={mediaLabel}
+      className={`artifact-media-player ${className}${isExpanded ? " is-media-expanded" : ""}`}
       onClick={(event) => {
         if (event.target === mediaRef.current) {
           playerRef.current?.focus();
@@ -215,6 +255,7 @@ export function MediaControls({
         }
       }}
       onKeyDown={handleKeyDown}
+      role="group"
       tabIndex={0}
     >
       {children}
@@ -246,12 +287,12 @@ export function MediaControls({
         <span aria-label="Duration" className="artifact-media-time">{formatMediaDuration(safeDuration)}</span>
         <div className="artifact-media-volume">
           <button
-            aria-label={isMuted ? "Unmute" : "Mute"}
+            aria-label={muted ? "Unmute" : "Mute"}
             className="artifact-media-control-button"
             onClick={toggleMute}
             type="button"
           >
-            <MediaIcon name={isMuted ? "muted" : "volume"} />
+            <MediaIcon name={muted ? "muted" : "volume"} />
           </button>
           <input
             aria-label="Volume"

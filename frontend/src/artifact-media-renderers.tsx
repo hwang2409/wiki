@@ -10,6 +10,7 @@ import { MediaControls } from "./artifact-media-controls";
 // Keeps the frame the same size before and after `loadedmetadata` so the
 // transcript never jumps.
 const VIDEO_FALLBACK_ASPECT_RATIO = "16 / 9";
+const VIDEO_MAX_HEIGHT = 560;
 
 function usePrefersReducedMotion(): boolean {
   const [reduced, setReduced] = useState(() => {
@@ -198,7 +199,12 @@ export function VideoRenderer({ artifact, event, ticket }: ArtifactRendererProps
       />
     );
   }
-  const knownDims = artifact.width && artifact.height;
+  const intrinsicWidth = artifact.width;
+  const intrinsicHeight = artifact.height;
+  const knownDims = Boolean(intrinsicWidth && intrinsicHeight);
+  const maxFrameWidth = intrinsicWidth && intrinsicHeight
+    ? Math.min(intrinsicWidth, VIDEO_MAX_HEIGHT * (intrinsicWidth / intrinsicHeight))
+    : undefined;
   const ratioStyle: CSSProperties = knownDims
     ? { aspectRatio: `${artifact.width} / ${artifact.height}` }
     : { aspectRatio: VIDEO_FALLBACK_ASPECT_RATIO };
@@ -207,7 +213,7 @@ export function VideoRenderer({ artifact, event, ticket }: ArtifactRendererProps
     : undefined;
   const frameStyle: CSSProperties = {
     ...ratioStyle,
-    maxWidth: artifact.width ? `${artifact.width}px` : undefined,
+    maxWidth: maxFrameWidth === undefined ? undefined : `${maxFrameWidth}px`,
   };
   return (
     <div className="artifact-video-wrap">
@@ -215,6 +221,7 @@ export function VideoRenderer({ artifact, event, ticket }: ArtifactRendererProps
         className="artifact-video-player"
         controlsClassName="artifact-video-controls"
         initialDuration={durationSeconds}
+        mediaLabel={label}
         mediaKey={source}
         mediaRef={videoRef}
         onSpeedChange={setSpeed}
@@ -310,6 +317,7 @@ export function AudioRenderer({ artifact, event, ticket }: ArtifactRendererProps
         className="artifact-audio-player"
         controlsClassName="artifact-audio-controls"
         initialDuration={durationSeconds}
+        mediaLabel={label}
         mediaKey={source}
         mediaRef={audioRef}
         onSpeedChange={setSpeed}

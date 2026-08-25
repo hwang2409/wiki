@@ -148,7 +148,10 @@ async function main() {
     const positions = await block.evaluate((node) => {
       const body = node.querySelector(".artifact-body").getBoundingClientRect();
       const frame = node.querySelector(".artifact-video-frame").getBoundingClientRect();
-      return { bodyCenter: body.left + body.width / 2, frameCenter: frame.left + frame.width / 2 };
+      return {
+        bodyCenter: body.left + body.width / 2,
+        frameCenter: frame.left + frame.width / 2,
+      };
     });
     if (Math.abs(positions.bodyCenter - positions.frameCenter) > 1) throw new Error(`video frame is not centered: ${JSON.stringify(positions)}`);
     await block.screenshot({ path: BEFORE_SCREENSHOT });
@@ -177,6 +180,18 @@ async function main() {
         reject(new Error("video metadata timed out"));
       }, 15000);
     }));
+    const renderedDimensions = await block.evaluate((node) => {
+      const frame = node.querySelector(".artifact-video-frame").getBoundingClientRect();
+      const video = node.querySelector("video");
+      return {
+        frameWidth: frame.width,
+        intrinsicWidth: video.videoWidth || Number(video.getAttribute("width") || 0),
+      };
+    });
+    if (!renderedDimensions.intrinsicWidth) throw new Error(`video intrinsic width is unavailable: ${JSON.stringify(renderedDimensions)}`);
+    if (renderedDimensions.frameWidth > renderedDimensions.intrinsicWidth + 1) {
+      throw new Error(`video frame upscales the intrinsic width: ${JSON.stringify(renderedDimensions)}`);
+    }
 
     await bar.getByRole("button", { name: "Play" }).click();
     await page.waitForFunction(() => {
@@ -184,6 +199,10 @@ async function main() {
       return videoElement instanceof HTMLVideoElement && !videoElement.paused;
     });
     await bar.getByRole("button", { name: "Pause" }).click();
+    await page.waitForFunction(() => {
+      const videoElement = document.querySelector("[data-artifact-kind=video] video");
+      return videoElement instanceof HTMLVideoElement && videoElement.paused;
+    });
     await bar.getByRole("button", { name: "Mute" }).click();
     if (!(await video.evaluate((node) => node.muted))) throw new Error("mute button did not mute video");
     const volumeSlider = bar.getByRole("slider", { name: "Volume" });
@@ -196,11 +215,14 @@ async function main() {
     for (let step = 0; step < 50; step += 1) await seekSlider.press("ArrowRight");
     const currentTime = await video.evaluate((node) => node.currentTime);
     if (Math.abs(currentTime - 0.5) > 0.1) throw new Error(`seek control did not update currentTime: ${currentTime}`);
+    await page.evaluate(() => {
+      Object.defineProperty(document, "fullscreenEnabled", { configurable: true, value: false });
+    });
     await bar.getByRole("button", { name: "Enter fullscreen" }).click();
-    await page.waitForFunction(() => document.fullscreenElement !== null);
+    await page.waitForFunction(() => document.querySelector(".artifact-media-player")?.classList.contains("is-media-expanded"));
     if (await bar.isVisible() !== true) throw new Error("custom bar disappeared in fullscreen");
     await page.keyboard.press("Escape");
-    await page.waitForFunction(() => document.fullscreenElement === null);
+    await page.waitForFunction(() => !document.querySelector(".artifact-media-player")?.classList.contains("is-media-expanded"));
     await block.screenshot({ path: AFTER_SCREENSHOT });
     logStep(`screenshots: ${BEFORE_SCREENSHOT}, ${AFTER_SCREENSHOT}`);
   } finally {

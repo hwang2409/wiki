@@ -15838,6 +15838,21 @@ textarea.composer-command-input {
   min-width: 0;
 }
 
+.artifact-media-player.is-media-expanded {
+  position: fixed;
+  inset: 0;
+  z-index: 1000;
+  box-sizing: border-box;
+  justify-content: center;
+  padding: 16px;
+  background: var(--background-primary);
+}
+
+.artifact-media-player.is-media-expanded .artifact-video-frame,
+.artifact-media-player.is-media-expanded .artifact-media-controls {
+  width: min(100%, 1280px);
+}
+
 .artifact-video-player:fullscreen {
   justify-content: center;
   padding: 16px;
