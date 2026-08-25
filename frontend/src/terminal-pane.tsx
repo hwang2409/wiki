@@ -63,7 +63,6 @@ export function terminalDisplayTitle(snapshot: {
 
 export function TerminalPane({
   customName,
-  focused,
   launchNonce,
   onNameChange,
   onRegisterController,
@@ -71,7 +70,6 @@ export function TerminalPane({
   terminalId,
 }: {
   customName?: string | null;
-  focused: boolean;
   launchNonce: number;
   onNameChange?: (terminalId: string, name: string | null) => void;
   onRegisterController?: (terminalId: string, controller: TerminalPaneController | null) => void;
@@ -138,10 +136,6 @@ export function TerminalPane({
   useEffect(() => {
     runtime.ensureConnection(launchNonce);
   }, [launchNonce, runtime]);
-
-  useEffect(() => {
-    if (focused) runtime.focus();
-  }, [focused, runtime, snapshot.status]);
 
   useEffect(() => {
     const controller: TerminalPaneController = {

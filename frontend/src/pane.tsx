@@ -143,7 +143,6 @@ export function WorkspacePane({
     const terminalId = path.slice("terminal://".length);
     content = (
       <TerminalPane
-        focused={focused}
         launchNonce={terminalLaunchNonce ?? 0}
         onRegisterController={onRegisterTerminalController}
         onNameChange={onTerminalNameChange}

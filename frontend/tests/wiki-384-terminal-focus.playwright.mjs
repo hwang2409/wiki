@@ -64,6 +64,14 @@ async function assertFrameFocus(page, paneId) {
   );
 }
 
+async function assertFindFocus(page) {
+  await page.waitForFunction(
+    () =>
+      document.activeElement instanceof HTMLInputElement &&
+      document.activeElement.getAttribute("aria-label") === "Find in terminal",
+  );
+}
+
 async function createTerminal(page, { waitForLive = true } = {}) {
   const previousIds = await page.evaluate(() => Object.keys(window.__wikiTerminals ?? {}));
   await leader(page, "t");
@@ -130,9 +138,12 @@ const layout = {
 
 let backend = null;
 let browser = null;
+let soloPage = null;
 const result = {
   leaderTerminalFocus: false,
   createdTerminalFocus: false,
+  terminalSearchFocus: false,
+  soloTerminalFocus: false,
   backgroundConnectionFocus: false,
   nonTerminalFrameFocus: false,
   windowSwitchTerminalFocus: false,
@@ -192,13 +203,18 @@ try {
     terminalOne.terminalId
   );
   await assertTerminalFocus(page, terminalOne.terminalId, terminalOne.paneId);
+  result.createdTerminalFocus = true;
+  await page.keyboard.press("Control+f");
+  await assertFindFocus(page);
+  result.terminalSearchFocus = true;
   releaseFirstToken();
   await page.waitForFunction(
     (id) => window.__wikiTerminals?.[id]?.status?.() === "live",
     terminalOne.terminalId
   );
+  await assertFindFocus(page);
+  await page.getByRole("button", { name: "Close find" }).click();
   await assertTerminalFocus(page, terminalOne.terminalId, terminalOne.paneId);
-  result.createdTerminalFocus = true;
 
   await leader(page, "k");
   await assertFrameFocus(page, "pane-agent-one");
@@ -233,8 +249,50 @@ try {
   await assertTerminalFocus(page, terminalTwo.terminalId, terminalTwo.paneId);
   result.paneCloseTerminalFocus = true;
 
+  soloPage = await browser.newPage({ viewport: { width: 1600, height: 1000 } });
+  soloPage.on("pageerror", (error) => result.pageErrors.push(`solo: ${error.message}`));
+  await soloPage.route("**/api/agents**", (route) =>
+    route.fulfill({
+      status: 200,
+      contentType: "application/json",
+      body: JSON.stringify({ workers: [], orchestrators: [], archived: [] }),
+    })
+  );
+  let releaseSoloToken;
+  let resolveSoloTokenRequested;
+  const soloTokenRequested = new Promise((resolve) => {
+    resolveSoloTokenRequested = resolve;
+  });
+  const soloTokenReleased = new Promise((resolve) => {
+    releaseSoloToken = resolve;
+  });
+  await soloPage.route("**/api/terminal-token", async (route) => {
+    resolveSoloTokenRequested();
+    await soloTokenReleased;
+    await route.continue();
+  });
+  await soloPage.addInitScript(() => {
+    localStorage.setItem(
+      "wiki-window-layout-v2",
+      JSON.stringify({ version: 2, activeWindowId: null, windows: [] })
+    );
+    localStorage.setItem("wiki-sidebar-visible", "false");
+  });
+  await soloPage.goto(`${backend.baseUrl}/#/`, { waitUntil: "domcontentloaded" });
+  await soloPage.waitForSelector(".workspace-panes");
+  const soloTerminal = await createTerminal(soloPage, { waitForLive: false });
+  await soloTokenRequested;
+  await assertTerminalFocus(soloPage, soloTerminal.terminalId, soloTerminal.paneId);
+  result.soloTerminalFocus = true;
+  releaseSoloToken();
+  await soloPage.waitForFunction(
+    (id) => window.__wikiTerminals?.[id]?.status?.() === "live",
+    soloTerminal.terminalId
+  );
+
   if (result.pageErrors.length > 0) throw new Error(result.pageErrors.join("\n"));
 } finally {
+  if (soloPage) await soloPage.close().catch(() => {});
   if (browser) await browser.close().catch(() => {});
   if (backend) await backend.stop().catch(() => {});
   await fs.rm(fixtures.root, { force: true, recursive: true }).catch(() => {});
