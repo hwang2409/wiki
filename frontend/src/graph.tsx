@@ -92,7 +92,6 @@ export function GraphView({
 
   useEffect(() => {
     let cancelled = false;
-    setLinks(null);
     setError(null);
     getLinks()
       .then((result) => {
@@ -112,7 +111,6 @@ export function GraphView({
 
   const retry = useCallback(() => {
     setError(null);
-    setLinks(null);
     setRetryTick((tick) => tick + 1);
   }, []);
 
@@ -210,7 +208,7 @@ export function GraphView({
       scroll={false}
       bodyClassName="graph-page-body"
     >
-      {error ? (
+      {links === null && error ? (
         <UtilityError
           title="Link graph is unavailable"
           message={error}

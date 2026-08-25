@@ -134,7 +134,12 @@ export function GraphCanvas({
 
   useEffect(() => {
     const trackRaf = import.meta.env.DEV;
-    const metricsWindow = window as typeof window & { __wikiGraphRafCount?: number };
+    const metricsWindow = window as typeof window & {
+      __wikiGraphRafCount?: number;
+      __wikiGraphNodePositions?: Array<{ id: string; x: number; y: number }>;
+      __wikiGraphTestMode?: boolean;
+    };
+    const testMetrics = metricsWindow.__wikiGraphTestMode === true;
     if (trackRaf) metricsWindow.__wikiGraphRafCount = 0;
     const canvas = canvasRef.current;
     if (!canvas) return;
@@ -403,6 +408,9 @@ export function GraphCanvas({
         }
         context!.globalAlpha = 1;
       });
+      if (testMetrics) {
+        metricsWindow.__wikiGraphNodePositions = nodes.map(({ id, x, y }) => ({ id, x, y }));
+      }
 
       return viewAnimating;
     }
@@ -545,7 +553,6 @@ export function GraphCanvas({
       zoomOut: () => zoomAt(0.84),
       fit: () => {
         autoFit = true;
-        alpha = Math.max(alpha, 0.15);
         requestRender();
       },
     };

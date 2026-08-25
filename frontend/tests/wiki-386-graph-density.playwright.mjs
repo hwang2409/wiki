@@ -31,6 +31,23 @@ async function installCanvasProbe(context) {
   await context.addInitScript(() => {
     window.__wikiGraphLabels = [];
     window.__wikiGraphFrame = [];
+    window.__wikiGraphTestMode = true;
+    window.__wikiGraphFetchCount = 0;
+    const originalFetch = window.fetch.bind(window);
+    window.fetch = (...args) => {
+      if (String(args[0]).includes("/api/links")) window.__wikiGraphFetchCount += 1;
+      return originalFetch(...args);
+    };
+    class TestEventSource {
+      static instance;
+      constructor() {
+        TestEventSource.instance = this;
+      }
+      close() {}
+    }
+    window.EventSource = TestEventSource;
+    window.__wikiEmitEvent = (payload) =>
+      TestEventSource.instance?.onmessage?.({ data: JSON.stringify(payload) });
     const isGraphCanvas = (context) => context.canvas?.classList.contains("graph-canvas");
     const originalClearRect = CanvasRenderingContext2D.prototype.clearRect;
     const originalFillText = CanvasRenderingContext2D.prototype.fillText;
@@ -64,6 +81,10 @@ async function graphFrame(page) {
     })(),
     arcs: window.__wikiGraphFrame ?? [],
   }));
+}
+
+async function graphPositions(page) {
+  return page.evaluate(() => window.__wikiGraphNodePositions ?? []);
 }
 
 async function waitForGraph(page) {
@@ -168,18 +189,42 @@ async function main() {
       `sparse graph should default to Canvas (canvas=${await canvasButton.getAttribute("aria-pressed")}, list=${await listButton.getAttribute("aria-pressed")}, stored=${await page.evaluate(() => localStorage.getItem("wiki-graph-mode"))}, subtitle=${await page.locator(".utility-page-subtitle").innerText()})`,
     );
     await page.locator(".graph-canvas").waitFor();
-    await page.waitForTimeout(250);
+    await page.waitForTimeout(6_000);
     assert((await page.locator(".graph-canvas").getAttribute("data-graph-density")) === "sparse", "small graph should mark canvas as sparse");
     const sparseLabels = await graphLabels(page);
     assert(sparseLabels.length === SPARSE_NODE_COUNT, "sparse canvas should draw every node label");
 
+    const fetchesBeforeEvents = await page.evaluate(() => window.__wikiGraphFetchCount);
+    await page.evaluate(() => window.__wikiEmitEvent({ type: "session", ticket: "WIKI-386" }));
+    await page.waitForTimeout(700);
+    assert(await page.evaluate(() => window.__wikiGraphFetchCount) === fetchesBeforeEvents, "session events must not refetch or reset the graph");
+    assert(await page.locator(".graph-canvas").isVisible(), "session events must keep the graph rendered");
+
+    await seedVault(vaultDir, SPARSE_NODE_COUNT + 1);
+    await page.evaluate(() => window.__wikiEmitEvent({ type: "vault", paths: ["note-09.md"] }));
+    await page.getByText(/9 notes/).waitFor();
+    assert(await page.evaluate(() => window.__wikiGraphFetchCount) === fetchesBeforeEvents + 1, "vault events must refetch the graph");
+    await page.waitForTimeout(6_000);
+
     await page.getByRole("button", { name: "Zoom in" }).click();
     await page.waitForTimeout(100);
+    const positionsBeforeFit = await graphPositions(page);
     await page.getByRole("button", { name: "Fit graph" }).click();
     await page.waitForTimeout(1_200);
+    const positionsAfterFit = await graphPositions(page);
+    const maxPositionDelta = Math.max(
+      ...positionsBeforeFit.map((position, index) => {
+        const next = positionsAfterFit[index];
+        return Math.max(Math.abs(position.x - next.x), Math.abs(position.y - next.y));
+      }),
+    );
+    assert(
+      maxPositionDelta === 0,
+      `Fit graph must not change node positions (max delta ${maxPositionDelta})`,
+    );
     const frame = await graphFrame(page);
     assert(frame.canvas && frame.arcs.length >= SPARSE_NODE_COUNT, "Fit graph should draw every sparse node");
-    const nodeArcs = frame.arcs.slice(-SPARSE_NODE_COUNT);
+    const nodeArcs = frame.arcs.slice(-positionsAfterFit.length);
     const minX = Math.min(...nodeArcs.map((arc) => arc.x - arc.radius));
     const maxX = Math.max(...nodeArcs.map((arc) => arc.x + arc.radius));
     const minY = Math.min(...nodeArcs.map((arc) => arc.y - arc.radius));

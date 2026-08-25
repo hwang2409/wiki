@@ -1386,6 +1386,7 @@ export default function App() {
     error: null,
   });
   const [refreshTick, setRefreshTick] = useState(0);
+  const [vaultRefreshTick, setVaultRefreshTick] = useState(0);
   // WIKI-151: dedicated nonce for the file-explorer retry. This keeps a file
   // retry scoped to its fetch instead of changing unrelated refresh state.
   const [filesRetryNonce, setFilesRetryNonce] = useState(0);
@@ -1480,6 +1481,9 @@ export default function App() {
             }, 400);
           }
           return;
+        }
+        if (payload.type === "vault" || payload.type === "note") {
+          setVaultRefreshTick((tick) => tick + 1);
         }
         if (isAgentTopologyEvent(payload.type)) {
           setWorkspaceDiscoveryNonce((nonce) => nonce + 1);
@@ -3516,7 +3520,7 @@ export default function App() {
       return <ActivityFeed onOpenNote={openNote} refreshTick={refreshTick} />;
     }
     if (mode === "graph") {
-      return <GraphView onOpenNote={openNote} refreshTick={refreshTick} />;
+      return <GraphView onOpenNote={openNote} refreshTick={vaultRefreshTick} />;
     }
     if (mode === "health") {
       return <HealthView
@@ -4135,7 +4139,7 @@ export default function App() {
               {mode === "activity" ? (
                 <ActivityFeed onOpenNote={openNote} refreshTick={refreshTick} />
               ) : mode === "graph" ? (
-                <GraphView onOpenNote={openNote} refreshTick={refreshTick} />
+                <GraphView onOpenNote={openNote} refreshTick={vaultRefreshTick} />
               ) : mode === "health" ? (
                 <HealthView
                   error={notesError}
