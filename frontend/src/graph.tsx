@@ -94,7 +94,13 @@ function summariseLinks(links: LinksMap): GraphNodeSummary[] {
   return Array.from(summary.values());
 }
 
-export function GraphView({ onOpenNote }: { onOpenNote: (path: string) => void }) {
+export function GraphView({
+  onOpenNote,
+  refreshTick = 0,
+}: {
+  onOpenNote: (path: string) => void;
+  refreshTick?: number;
+}) {
   const [links, setLinks] = useState<LinksMap | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [retryTick, setRetryTick] = useState(0);
@@ -104,6 +110,8 @@ export function GraphView({ onOpenNote }: { onOpenNote: (path: string) => void }
 
   useEffect(() => {
     let cancelled = false;
+    setLinks(null);
+    setError(null);
     getLinks()
       .then((result) => {
         if (!cancelled) {
@@ -118,7 +126,7 @@ export function GraphView({ onOpenNote }: { onOpenNote: (path: string) => void }
     return () => {
       cancelled = true;
     };
-  }, [retryTick]);
+  }, [refreshTick, retryTick]);
 
   const retry = useCallback(() => {
     setError(null);
@@ -132,7 +140,8 @@ export function GraphView({ onOpenNote }: { onOpenNote: (path: string) => void }
   const noteCount = links ? Object.keys(links).length : 0;
   const unresolvedCount = summaries.filter((node) => node.unresolved).length;
   const denseGraph = summaries.length > GRAPH_DENSITY_THRESHOLD;
-  const activeMode = mode ?? (links && denseGraph ? "list" : "canvas");
+  const activeMode: GraphMode | null =
+    links === null ? null : mode ?? (denseGraph ? "list" : "canvas");
 
   const selectMode = useCallback((nextMode: GraphMode) => {
     setMode(nextMode);
@@ -427,6 +436,7 @@ function GraphCanvas({
   const openNoteRef = useRef(onOpenNote);
   const focusHandleRef = useRef<((id: string | null) => void) | null>(null);
   const canvasKeyboardRef = useRef<((key: string) => void) | null>(null);
+  const keyboardFocusRef = useRef(false);
   const orderedIdsRef = useRef<string[]>([]);
   const [instructionsShown, setInstructionsShown] = useState(false);
 
@@ -457,6 +467,7 @@ function GraphCanvas({
     const currentId = focusedIdRef.current;
     let index = currentId ? orderedIds.indexOf(currentId) : -1;
     const moveFocus = (id: string) => {
+      keyboardFocusRef.current = true;
       focusedIdRef.current = id;
       onFocus(id);
       canvasKeyboardRef.current?.(key);
@@ -706,7 +717,7 @@ function GraphCanvas({
       context!.clearRect(0, 0, width, height);
 
       focusedNode = findNode(focusedIdRef.current);
-      const spotlight = hovered ?? focusedNode;
+      const spotlight = keyboardFocusRef.current ? focusedNode : hovered ?? focusedNode;
       const neighborhood = new Set<number>();
       if (spotlight) {
         const spotlightIndex = nodes.indexOf(spotlight);
@@ -820,6 +831,7 @@ function GraphCanvas({
     }
 
     function onPointerMove(event: PointerEvent) {
+      keyboardFocusRef.current = false;
       const { x, y } = pointer(event);
       if (dragged) {
         dragTravel = Math.max(dragTravel, Math.hypot(x - dragOrigin.x, y - dragOrigin.y));
@@ -839,6 +851,7 @@ function GraphCanvas({
     }
 
     function onPointerDown(event: PointerEvent) {
+      keyboardFocusRef.current = false;
       const { x, y } = pointer(event);
       const node = nodeAt(x, y);
       if (node) {

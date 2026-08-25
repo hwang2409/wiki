@@ -68,7 +68,7 @@ async function graphFrame(page) {
 
 async function waitForGraph(page) {
   await page.getByRole("heading", { name: "Graph view", exact: true }).waitFor();
-  await page.getByText(/124 notes|8 notes/).waitFor();
+  await page.getByText(/72 notes|73 notes|124 notes|8 notes/).waitFor();
 }
 
 async function main() {
@@ -104,16 +104,37 @@ async function main() {
 
     await canvasButton.click();
     await page.locator(".graph-canvas").waitFor();
-    await page.waitForTimeout(250);
+    await page.waitForTimeout(6_000);
     assert((await page.locator(".graph-canvas").getAttribute("data-graph-density")) === "dense", "large graph should mark canvas as dense");
     assert((await graphLabels(page)).length === 0, "dense canvas should not draw labels before focus");
 
+    const canvasBox = await page.locator(".graph-canvas").boundingBox();
+    const hoverNodeArcs = (await graphFrame(page)).arcs.slice(-NODE_COUNT);
+    assert(canvasBox && hoverNodeArcs.length === NODE_COUNT, "dense graph should expose settled node positions");
+    let hoveredNote40 = false;
+    for (const arc of hoverNodeArcs) {
+      await page.evaluate(() => {
+        window.__wikiGraphLabels = [];
+      });
+      await page.mouse.move(canvasBox.x + arc.x, canvasBox.y + arc.y);
+      await page.waitForTimeout(20);
+      if ((await graphLabels(page)).includes("note-40")) {
+        hoveredNote40 = true;
+        break;
+      }
+    }
+    assert(hoveredNote40, "hover should label note 40");
+
+    await page.evaluate(() => {
+      window.__wikiGraphLabels = [];
+    });
     await page.locator(".graph-view").focus();
     await page.locator(".graph-view").press("ArrowRight");
     await page.waitForTimeout(150);
     const focusedLabels = await graphLabels(page);
     assert(focusedLabels.length > 0 && focusedLabels.length < NODE_COUNT, "dense canvas should label only the focus neighborhood");
-    assert(!focusedLabels.includes("note-40"), "dense canvas should keep distant labels hidden");
+    assert(focusedLabels.includes("note-01"), "keyboard focus should label note 1");
+    assert(!focusedLabels.includes("note-40"), `dense canvas should keep distant labels hidden: ${focusedLabels.join(", ")}`);
 
     await page.reload({ waitUntil: "domcontentloaded" });
     await waitForGraph(page);
@@ -122,6 +143,13 @@ async function main() {
     await page.reload({ waitUntil: "domcontentloaded" });
     await waitForGraph(page);
     assert(await listButton.getAttribute("aria-pressed") === "true", "explicit List choice should persist across reload");
+
+    await seedVault(vaultDir, 72);
+    const boundary72Api = await fetch(`${backend.baseUrl}/api/links`).then((response) => response.json());
+    assert(Object.keys(boundary72Api).length === 72, "exactly 72 notes should remain at the sparse boundary");
+    await seedVault(vaultDir, 73);
+    const boundary73Api = await fetch(`${backend.baseUrl}/api/links`).then((response) => response.json());
+    assert(Object.keys(boundary73Api).length === 73, "exactly 73 notes should cross the dense boundary");
 
     await seedVault(vaultDir, SPARSE_NODE_COUNT);
     const sparseApi = await fetch(`${backend.baseUrl}/api/links`).then((response) => response.json());

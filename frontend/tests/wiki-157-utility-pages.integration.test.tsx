@@ -38,6 +38,17 @@ function installFetch(handler: (input: RequestInfo | URL) => Promise<Response>) 
   };
 }
 
+function graphLinks(count: number) {
+  return Object.fromEntries(
+    Array.from({ length: count }, (_, index) => {
+      const current = `notes/note-${String(index + 1).padStart(2, "0")}.md`;
+      const next = `notes/note-${String((index + 1) % count + 1).padStart(2, "0")}.md`;
+      const previous = `notes/note-${String((index - 1 + count) % count + 1).padStart(2, "0")}.md`;
+      return [current, { outgoing: [next], incoming: [previous], unresolved: [] }];
+    }),
+  );
+}
+
 beforeEach(() => {
   window.localStorage.clear();
 });
@@ -275,6 +286,43 @@ test("graph page: loading -> data -> canvas/list toggle exists", async () => {
       .map((item) => item.querySelector(".graph-list-name")?.textContent)
       .filter(Boolean);
     expect(ghostLabels).toContain("ghost.md");
+  } finally {
+    restore();
+  }
+});
+
+test("graph page: refresh recomputes density defaults but keeps a stored mode", async () => {
+  let count = 72;
+  const restore = installFetch(async (input) => {
+    if (String(input).includes("/api/links")) return jsonResponse(graphLinks(count));
+    return jsonResponse({});
+  });
+  try {
+    const first = render(<GraphView onOpenNote={() => {}} refreshTick={0} />);
+    await waitFor(() => {
+      expect(screen.getByRole("button", { name: /^Canvas$/i, pressed: true })).toBeTruthy();
+    });
+
+    count = 73;
+    first.rerender(<GraphView onOpenNote={() => {}} refreshTick={1} />);
+    await waitFor(() => {
+      expect(screen.getByRole("button", { name: /^List$/i, pressed: true })).toBeTruthy();
+    });
+    expect(globalThis.fetch).toHaveBeenCalledTimes(2);
+
+    first.unmount();
+    window.localStorage.setItem("wiki-graph-mode", "canvas");
+    count = 73;
+    const stored = render(<GraphView onOpenNote={() => {}} refreshTick={0} />);
+    await waitFor(() => {
+      expect(screen.getByRole("button", { name: /^Canvas$/i, pressed: true })).toBeTruthy();
+    });
+
+    count = 72;
+    stored.rerender(<GraphView onOpenNote={() => {}} refreshTick={1} />);
+    await waitFor(() => {
+      expect(screen.getByRole("button", { name: /^Canvas$/i, pressed: true })).toBeTruthy();
+    });
   } finally {
     restore();
   }

@@ -3516,7 +3516,7 @@ export default function App() {
       return <ActivityFeed onOpenNote={openNote} refreshTick={refreshTick} />;
     }
     if (mode === "graph") {
-      return <GraphView onOpenNote={openNote} />;
+      return <GraphView onOpenNote={openNote} refreshTick={refreshTick} />;
     }
     if (mode === "health") {
       return <HealthView
@@ -4135,7 +4135,7 @@ export default function App() {
               {mode === "activity" ? (
                 <ActivityFeed onOpenNote={openNote} refreshTick={refreshTick} />
               ) : mode === "graph" ? (
-                <GraphView onOpenNote={openNote} />
+                <GraphView onOpenNote={openNote} refreshTick={refreshTick} />
               ) : mode === "health" ? (
                 <HealthView
                   error={notesError}
