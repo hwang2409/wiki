@@ -91,38 +91,26 @@ export function MediaControls({
   const [isExpanded, setIsExpanded] = useState(false);
   const lastNonZeroVolumeRef = useRef(1);
   const wasExpandedRef = useRef(false);
-  const dialogTransitionRef = useRef(false);
   const closeExpanded = useCallback(() => {
     setIsExpanded(false);
     window.requestAnimationFrame(() => expandButtonRef.current?.focus());
   }, []);
   const handleDialogClose = useCallback(() => {
-    if (dialogTransitionRef.current) return;
-    closeExpanded();
-  }, [closeExpanded]);
+    if (isExpanded) closeExpanded();
+  }, [closeExpanded, isExpanded]);
 
   useLayoutEffect(() => {
     const dialog = playerRef.current;
     if (!dialog) return;
     if (isExpanded) {
       wasExpandedRef.current = true;
-      if (dialog.open) {
-        dialogTransitionRef.current = true;
-        closeMediaDialog(dialog);
-        showMediaDialog(dialog);
-      } else {
-        showMediaDialog(dialog);
-      }
+      if (dialog.open) dialog.open = false;
+      showMediaDialog(dialog);
       return;
     }
     if (wasExpandedRef.current) {
       wasExpandedRef.current = false;
-      if (dialog.open) {
-        dialogTransitionRef.current = true;
-        closeMediaDialog(dialog);
-      }
-      dialog.open = true;
-      return;
+      closeMediaDialog(dialog);
     }
     dialog.open = true;
   }, [isExpanded]);
