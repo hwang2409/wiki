@@ -2,7 +2,7 @@
 type: reference
 tags: [hot]
 created: 2026-07-06
-updated: 2026-08-19
+updated: 2026-08-25
 ---
 
 # Hot Context
@@ -11,21 +11,31 @@ Rolling ≤500-word session cache. Rewrite (don't append) at work-arc boundaries
 
 ## Active threads
 
-- **WIKI — orchestrator `wiki-dev` (post-restart session, 2026-08-19).** Merged today: WIKI-340 (#275 font parity), WIKI-345 (#277 wk engine extraction), WIKI-346 (#278 wk render.py + authoritative normalizer enumeration, 10 review rounds), **WIKI-339 (#274 per-run event store sharding, 10 rounds — kills the provider-persistence-failed class)**. Live lanes: WIKI-352 (PR #279 persistent event-store connections; round-4 review MERGE-READY; now rebasing onto #274's per-shard connections, then confirmation review at rebased head); WIKI-361-PLAN (cdx luna xhigh, designing "wk owns the claude/codex agent loops", deliverable /tmp/wiki-361-plan.md -> vault).
-- **wk TUI ladder REPRIORITIZED (Henry 2026-08-19 ~15:30): WIKI-361 architectural refactor first.** WIKI-347 (TUI shell) spawned then parked/abandoned 15 min in — do not respawn until the WIKI-361 plan decides what survives. Ladder 348-351 gated behind 361. Design: [[wk-tui-design]].
-- **Supervisor bugs ticketed from today's incidents:** WIKI-353 (registry wipe on backend restart), WIKI-354 (deterministic run-id archive collision), WIKI-355 (uncontrolled recovery provider, /stop refuses), WIKI-356 DONE (timeout diagnosis: single-loop reactor + sync persistence/archive — [[supervisor-timeout-diagnosis-2026-08-19]]), WIKI-357/358/359 (P1 loop-offload fixes), WIKI-360 (recovery race noise). #279 is throughput only — 357/358 are the real timeout fixes.
-- Queue after current lanes: WIKI-341/342 (font parity layers 2-3, unblocked), WIKI-343 (P3), WIKI-357-360.
-- Henry switched claude accounts 2026-08-19 ~15:35 — no session limit concerns.
-- **NEWT (orch `tooling-dev`) — NEWT-33 analytic derivatives MERGED (PR #78, 985454f) 2026-08-19 ~19:45Z after 10 review rounds.** DECISION (Henry 2026-08-19): GitHub Actions REMOVED from tooling repo (workflows deleted 28a77b9, Actions disabled repo-level) — he won't pay for Actions; the tooling merge gate is now review + local validation (cargo test, alloc_guard, clippy -D warnings, fmt, libm-free grep). Queue: SDF, mesh-mesh, native-CCD alignment. GOTCHA: branch newt-convex-ccd + PR #76 = prior NEWT-32 WIP, don't touch without Henry.
+- **SUPERVISOR PERF ARC LANDED + SWAPPED (2026-08-25 ~14:52Z), THIRD FRESH-SLATE WIPE (~14:54Z, Henry-requested):** all timeout-prevention spec tickets implemented in one arc and live: WIKI-377 (parity-backfill lock release + bounded replace_run_from — the real 2026-08-24 outage cause; wait4 theory was WRONG, py-spy proved it), WIKI-364 (wk replay revision gate), WIKI-375 (size-checkpointed O(1) boot + projection-existence probe; terminal runs still repair when dirty), WIKI-359 (export cursor gate), WIKI-363 (archive catalog at commit), WIKI-376 (per-agent command lanes replace global FIFO + `wait:false` accepted-at-intent ack; `idempotency/status` is the receipt poll), WIKI-378 (bounded ingress 10k/64MB, forced puts on shutdown paths), WIKI-381 (`make load-gate`, PASS: ping p99 ~0ms, steer accepted p99 15.7ms; wired into orch gate contract). Full RCA: [[archive-stall-recurrence-2026-08-24]].
+- **ALL OF IT IS UNCOMMITTED working-tree state** — commit series per ticket is the immediate next step. Gate at swap time: 2269 passed; only pre-existing reds (see below) + pre-existing event_store_supervisor flake (reproduced on origin/main).
+- **Phoebe fleet resumed 2026-08-25 ~15:00Z** (Henry: "resume everything"). Three fresh cdx luna fix rounds spawned from archived sol verdicts: PHO-16929-PR3 (#15244, 7 blocking + 1 high: extension poll PHI leak, dedupe ON CONFLICT R10, realtime field mismatch, Unicode redaction bypass), PHO-16437-PR4 (#15133, 5 blocking: cooperative enforcement, unclaimed lease cancel, R9/R11 lock-order deadlock), PHO-16956-PR3 (#15253, 3 blocking + 1 high: Slack Connect org routing, R10 rolling-deploy leak, grant workflow unreachable; review pinned 53d32f0f, head had moved to 25cce2bf). Watchlist + fleet monitor armed. PHO-16593 #15003 merge-ready (REVIEW5 clean, head 4427115) — waits on lead approval then Henry merge auth; PR watcher armed.
+- Pre-wipe queue context elsewhere: tooling was NEWT-52-REVIEW9/NEWT-62-PR7 mid-arc; wiki next = WIKI-359 (now DONE in-tree); zeta orch live again 14:54Z.
+- **Phoebe workers (never merge):** respawn is Henry's call (authorized for this round 2026-08-25).
+- Primary phoebe checkout on `henry/github-sweep-422-fix`: uncommitted `shift_confirmations/notifications.py` edit + untracked v3-invariance workflow yaml + write-tools audit note — Henry's in-progress work, untouched.
+
+## Recent facts
+
+- Supervisor now idles at ~0.4% CPU on fresh runtime (was ~100%: the O(n^2) parity sweep + O(history) loops). Boot on wiped runtime: seconds. First boot over PRE-checkpoint run.json files still pays one full reconcile to stamp checkpoints; every later boot is O(1).
+- Pre-existing main reds (cite as baseline, not worker breakage): `test_agent_runtime_store.py::ProtocolFixtureTests::test_codex_failed_render_completion_preserves_write_time_event` and `test_accounts.py::AuthDeadAttemptCapTests::test_stops_reviving_after_max_attempts` (verified on clean origin/main worktree 2026-08-25). `test_native_build_guard::test_interrupt_after_exchange...` and `test_event_store_supervisor::test_failed_rebuild_does_not_reattach...` are pre-existing flakes.
+- `unknown-kind-telemetry.json` rehydrated itself within seconds of the fresh boot — WIKI-382's mystery source is live code, not stale state.
+- Agent_runtime PRs now owe `make load-gate` in the local gate ([[orchestrator-worker-protocol]] 2i).
+- Stage dirs: swapped stages self-clean; older ones in `.native-build-staging/` still need manual sweep. Stale worktrees/branches cleanup still pending.
+- Command-log backups from tonight's surgeries: `/tmp/command-log.backup-*.sqlite3`.
+- Spawn HTTP API rejects codex spawns without `effort` ("Reasoning effort is required for Codex workers") — always pass it.
+- `GET /api/agents/<id>` is 404; scriptable read path is `~/me/fun/wiki/wiki agent status <id>` (full path — `wiki` not on PATH in orch shells).
+- Reviewer verdict bodies survive archive in `~/me/fun/agent-archive/<TICKET>/<ts>/events.jsonl` (`item_completed` params.item.text) — fix contracts can be rebuilt after a full fleet archive.
 
 ## Watchouts
 
-- **GitHub Actions billing broken on hwang2409 account (2026-08-19): private-repo CI jobs die at scheduling (0 steps, runner_id=0, "payments failed" annotation).** Tooling repo is now CI-free by decision; wiki repo still has Actions — check the annotation before blaming runners. Henry fixes in Settings -> Billing & plans if/when he wants Actions back.
-- **Supervisor write calls (archive/steer/spawn) intermittently time out under fleet load but usually COMPLETE server-side.** Verify via reads (`wiki agent status <t>`; CLI needs full path /Users/henry/me/fun/wiki/wiki) before retrying; retries reuse request_id (idempotent). Diagnosed in WIKI-356; fixes ticketed.
-- **Archive-on-read: wait for runtime_state=idle before archiving a reviewer** — archiving mid-final-turn loses the findings body (protocol note updated 2026-08-19; WIKI-352-REVIEW2 lost this way).
-- **Registry repair playbooks** (wipe reseed w/ correct entry schema — `orch` not `orchestrator_id`; run-id collision re-id of OLD archive artifacts, never the live run; stranded runs) in [[orchestrator-worker-protocol]] 2026-08-19 entries.
-- Known pre-existing main red: test_agent_runtime_store.py test_codex_failed_render_completion_preserves_write_time_event.
-- Full-suite SIGKILL-at-71% on the old wiki-339 branch was unbounded artifact-index memory — fixed in #274. Exit-137 with no summary line = suspect memory, run with RSS capture.
-- Codex: credits balance 0 but pro-plan window healthy (16% used) — cdx luna/sol workers run fine.
-- PHOEBE/NEWT: owned by phoebe-dev / tooling-dev orchestrators this session; wiki-dev does not touch them.
-- Merge authority: wiki = orchestrator merges after clean review pass. Phoebe: never.
+- **Supervisor writes: HTTP-first is the RULE (Henry 2026-08-24c)** — client `request_id` on every write; `wait:false` now available for accepted-at-intent steers. [[orchestrator-worker-protocol]].
+- Fresh-slate recipe (3rd use): quit app -> SIGKILL supervisor if it survives -> wipe `~/.wiki/agent-runtime` contents keeping `*.lock` -> clear /tmp registry/status -> relaunch. Backup command-log first.
+- Archive of a run mid-events-rebuild waits briefly; a lock conflict now fails fast with retryable StoreConflict instead of wedging (WIKI-377).
+- Stray watchlist loops outlive sessions — sweep `ps ax | grep '[w]atchlist'`.
+- `~/.codex/sessions/` dirs can lose owner rx bits — `chmod u+rx`.
+- GitHub checks absent on wiki + zeta PRs (billing) — local gate authoritative.
+- Merge authority: wiki + zeta + tooling = orch merges after clean pass. Phoebe: never.

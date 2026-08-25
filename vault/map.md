@@ -47,6 +47,9 @@ Topic → note index. **Agents: read this file first, before grepping.** Every n
 - [[graph-engineering]] — graph engineering as next layer after loop engineering; org-graph + work-graph, nodes/edges/shared-state, maps onto orchestrator/worker stack
 - [[t3code]] — prior art for the wiki agent-control surface: theo/ping's open-source multi-provider harness controller
 - [[kickoff-defect-classes]] — recurring worker defect classes to name in kickoff contracts (stale caches, seam leaks)
+- [[newt-demo-convention]] — newt demo media (mp4/png/gif) lives in tooling/newt/demos/, untracked; never commit media
+- [[newt-arm-demo-spec]] — humanoid arm demo (newt muscles + chimy2 lit render) spec + status; queued as ARMDEMO-1
+- [[registry-wipe-cascade-rca]] — RCA: worker unassignment = registry wipe cascade (create() blind rewrite + abort unlink after file loss); repro + fingerprints + fix direction
 - [[newt-audit-2026-08-20]] — newt audit: penalty reactions and sensor-force timing risks
 
 ## Design
@@ -81,6 +84,9 @@ Topic → note index. **Agents: read this file first, before grepping.** Every n
 - [[agent-write-tools-audit-epic]] — code-grounded customer-facing write-tools audit: 90 tools, DB footprints, gates, side effects, and source reconciliation
 - [[write-tools-consolidation-design]] — v3 write-tools consolidation design: seven consolidation patterns, two side-effect tools, 90 migration mappings from the customer-facing audit
 - [[admin-v3-tools-plan-2026-08-19]] — PHO-15864 admin agent v3 tools rewrite plan: inventory, core query/write/bash design, compaction+artifacts rethink, revised ladder, 12 open decisions for Henry
+- [[admin-v3-rung12-family-design-2026-08-19]] — PHO-16438 rung-12 domain-family design proposal: three family builds on core v3 doors, digest-derived tool classes, no ledger edits
+- [[admin-v3-parked-lanes-2026-08-19]] — admin-v3 lanes parked 2026-08-19 (supervisor overload): exact per-lane resume state, cleanup debt, gated rungs
+- [[deploy-lag-misdiagnosis]] — RCA gotcha: merged fix read as broken because prod had not deployed it; verify with logfire service_version + git merge-base --is-ancestor
 
 ## Phoebe/til
 
@@ -138,6 +144,8 @@ Topic → note index. **Agents: read this file first, before grepping.** Every n
 - [[terminal-parity-fonts]] — layered plan to close Wiki.app-vs-Terminal.app font rendering gap (CSS AA parity → bundled .ttf → pixel discipline → native Core Text)
 - [[supervisor-timeout-diagnosis-2026-08-19]] — why supervisor commands time out under load: single-loop reactor + synchronous persistence/archive; ranked fixes
 - [[wk-owned-agent-loop-design]] — WIKI-361 design: wk owns the claude/codex agent loops; provider seams, pi prior art, migration ladder WIKI-362..371
+- [[supervisor-optimization-audit-2026-08-20]] — WIKI-361 audit: ranked supervisor/push-path optimizations post #284/#285; build-guard downtime, archive catalog, wk replay
+- [[archive-stall-recurrence-2026-08-24]] — archive-in-progress stall recurred on fresh runtime 21:58Z — live bug, not stale state; queue head-of-line evidence
 
 ## Wiki/til
 
