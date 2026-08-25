@@ -4581,6 +4581,7 @@ body.is-resizing-panes .pane-cell {
 
 .graph-view canvas {
   display: block;
+  touch-action: none;
 }
 
 .graph-keyboard-hint {
@@ -4619,6 +4620,35 @@ body.is-resizing-panes .pane-cell {
   gap: 4px;
   padding: 3px 8px;
   border-radius: var(--radius-xs);
+}
+
+.graph-canvas-controls {
+  display: inline-flex;
+  align-items: center;
+  gap: 2px;
+  padding-left: 4px;
+  border-left: 1px solid var(--background-modifier-border);
+}
+
+.graph-control-chip {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  gap: 4px;
+  min-width: 40px;
+  min-height: 40px;
+  border-radius: var(--radius-xs);
+  transition: background-color 120ms ease, color 120ms ease, transform 120ms ease;
+}
+
+.graph-control-chip:hover,
+.graph-control-chip:focus-visible {
+  background: var(--background-modifier-hover);
+  outline: none;
+}
+
+.graph-control-chip:active {
+  transform: scale(0.96);
 }
 
 .graph-focus-hint {
