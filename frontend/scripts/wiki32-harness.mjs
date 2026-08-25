@@ -14,11 +14,14 @@ function resolvePython() {
   const candidates = [
     process.env.WIKI_PYTHON,
     resolve(ROOT, ".venv", "bin", "python"),
-    resolve(ROOT, "..", "..", "..", ".venv", "bin", "python"),
+    resolve(ROOT, "..", "..", ".venv", "bin", "python"),
   ].filter(Boolean);
   const found = candidates.find((candidate) => existsSync(candidate));
   if (!found) {
-    throw new Error(`No Python runtime found for isolated backend: ${candidates.join(", ")}`);
+    throw new Error(
+      `No Python runtime found for isolated backend. Tried: ${candidates.join(", ")}. ` +
+        "Set WIKI_PYTHON to override."
+    );
   }
   return found;
 }

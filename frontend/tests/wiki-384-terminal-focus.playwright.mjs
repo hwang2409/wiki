@@ -64,7 +64,7 @@ async function assertFrameFocus(page, paneId) {
   );
 }
 
-async function createTerminal(page) {
+async function createTerminal(page, { waitForLive = true } = {}) {
   const previousIds = await page.evaluate(() => Object.keys(window.__wikiTerminals ?? {}));
   await leader(page, "t");
   await page.waitForFunction(
@@ -76,10 +76,12 @@ async function createTerminal(page) {
     previousIds
   );
   if (!terminalId) throw new Error("Terminal id was not created");
-  await page.waitForFunction(
-    (id) => window.__wikiTerminals?.[id]?.status?.() === "live",
-    terminalId
-  );
+  if (waitForLive) {
+    await page.waitForFunction(
+      (id) => window.__wikiTerminals?.[id]?.status?.() === "live",
+      terminalId
+    );
+  }
   const paneId = await page.evaluate((id) => {
     const pane = [...document.querySelectorAll(".terminal-pane")].find(
       (candidate) => candidate.getAttribute("aria-label") === `Terminal: ${id}`
@@ -130,6 +132,8 @@ let backend = null;
 let browser = null;
 const result = {
   leaderTerminalFocus: false,
+  createdTerminalFocus: false,
+  backgroundConnectionFocus: false,
   nonTerminalFrameFocus: false,
   windowSwitchTerminalFocus: false,
   paneCloseTerminalFocus: false,
@@ -144,6 +148,35 @@ try {
   });
   const page = await browser.newPage({ viewport: { width: 1600, height: 1000 } });
   page.on("pageerror", (error) => result.pageErrors.push(error.message));
+  let tokenRequestCount = 0;
+  let releaseFirstToken;
+  let releaseSecondToken;
+  let resolveFirstTokenRequested;
+  let resolveSecondTokenRequested;
+  const firstTokenRequested = new Promise((resolve) => {
+    resolveFirstTokenRequested = resolve;
+  });
+  const secondTokenRequested = new Promise((resolve) => {
+    resolveSecondTokenRequested = resolve;
+  });
+  const firstTokenReleased = new Promise((resolve) => {
+    releaseFirstToken = resolve;
+  });
+  const secondTokenReleased = new Promise((resolve) => {
+    releaseSecondToken = resolve;
+  });
+  await page.route("**/api/terminal-token", async (route) => {
+    tokenRequestCount += 1;
+    if (tokenRequestCount === 1) {
+      resolveFirstTokenRequested();
+      await firstTokenReleased;
+    }
+    if (tokenRequestCount === 2) {
+      resolveSecondTokenRequested();
+      await secondTokenReleased;
+    }
+    await route.continue();
+  });
   await page.addInitScript((storedLayout) => {
     localStorage.setItem("wiki-window-layout-v2", JSON.stringify(storedLayout));
     localStorage.setItem("wiki-sidebar-visible", "false");
@@ -152,7 +185,21 @@ try {
   await page.goto(`${backend.baseUrl}/#/agent/${TICKET_ONE}`, { waitUntil: "domcontentloaded" });
   await page.waitForSelector(".agent-session-surface-main .session-scroll");
 
-  const terminalOne = await createTerminal(page);
+  const terminalOne = await createTerminal(page, { waitForLive: false });
+  await firstTokenRequested;
+  await page.waitForFunction(
+    (id) => window.__wikiTerminals?.[id]?.status?.() === "connecting",
+    terminalOne.terminalId
+  );
+  await assertTerminalFocus(page, terminalOne.terminalId, terminalOne.paneId);
+  releaseFirstToken();
+  await page.waitForFunction(
+    (id) => window.__wikiTerminals?.[id]?.status?.() === "live",
+    terminalOne.terminalId
+  );
+  await assertTerminalFocus(page, terminalOne.terminalId, terminalOne.paneId);
+  result.createdTerminalFocus = true;
+
   await leader(page, "k");
   await assertFrameFocus(page, "pane-agent-one");
   await leader(page, "j");
@@ -160,7 +207,20 @@ try {
   result.leaderTerminalFocus = true;
 
   await page.locator(".tmux-status-item").nth(1).click();
-  const terminalTwo = await createTerminal(page);
+  const terminalTwo = await createTerminal(page, { waitForLive: false });
+  await secondTokenRequested;
+  await leader(page, "k");
+  await assertFrameFocus(page, "pane-agent-three");
+  releaseSecondToken();
+  await page.waitForFunction(
+    (id) => window.__wikiTerminals?.[id]?.status?.() === "live",
+    terminalTwo.terminalId
+  );
+  await assertFrameFocus(page, "pane-agent-three");
+  result.backgroundConnectionFocus = true;
+
+  await leader(page, "j");
+  await assertTerminalFocus(page, terminalTwo.terminalId, terminalTwo.paneId);
   await page.locator(".tmux-status-item").nth(0).click();
   await page.locator(".tmux-status-item").nth(1).click();
   await assertTerminalFocus(page, terminalTwo.terminalId, terminalTwo.paneId);

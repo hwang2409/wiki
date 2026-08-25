@@ -141,7 +141,7 @@ export function TerminalPane({
 
   useEffect(() => {
     if (focused) runtime.focus();
-  }, [focused, runtime]);
+  }, [focused, runtime, snapshot.status]);
 
   useEffect(() => {
     const controller: TerminalPaneController = {

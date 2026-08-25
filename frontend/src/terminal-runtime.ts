@@ -443,7 +443,6 @@ class TerminalRuntime {
       socket.onopen = () => {
         if (!this.isCurrentSocket(socket, generation)) return;
         this.setSnapshot({ message: "Live shell", status: "live" });
-        this.focus();
         this.syncTerminalSize(false);
         this.scheduleResize();
         if (socket.readyState === WebSocket.OPEN) {

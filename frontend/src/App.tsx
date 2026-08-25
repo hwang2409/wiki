@@ -2199,7 +2199,7 @@ export default function App() {
         windows: [...current.windows, createSoloWindow(windowId, paneId, path, resourceKind)],
       })
     );
-    requestAnimationFrame(() => paneRefs.current.get(paneId)?.focus());
+    requestAnimationFrame(() => focusPaneTarget(paneId, path));
   }
 
   async function showResourceRoute(
@@ -2422,7 +2422,7 @@ export default function App() {
         ),
       })
     );
-    requestAnimationFrame(() => paneRefs.current.get(newPaneId)?.focus());
+    requestAnimationFrame(() => focusPaneTarget(newPaneId, path));
   }
 
   function createBlankPane() {
