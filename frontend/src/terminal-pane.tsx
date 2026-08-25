@@ -16,6 +16,7 @@ import {
 } from "./terminal-runtime";
 
 export type TerminalPaneController = {
+  focus: () => void;
   sendInput: (data: string) => void;
 };
 
@@ -62,7 +63,6 @@ export function terminalDisplayTitle(snapshot: {
 
 export function TerminalPane({
   customName,
-  focused,
   launchNonce,
   onNameChange,
   onRegisterController,
@@ -70,7 +70,6 @@ export function TerminalPane({
   terminalId,
 }: {
   customName?: string | null;
-  focused: boolean;
   launchNonce: number;
   onNameChange?: (terminalId: string, name: string | null) => void;
   onRegisterController?: (terminalId: string, controller: TerminalPaneController | null) => void;
@@ -139,11 +138,10 @@ export function TerminalPane({
   }, [launchNonce, runtime]);
 
   useEffect(() => {
-    if (focused) runtime.focus();
-  }, [focused, runtime]);
-
-  useEffect(() => {
     const controller: TerminalPaneController = {
+      focus() {
+        runtime.focus();
+      },
       sendInput(data: string) {
         runtime.sendInput(data);
       },
