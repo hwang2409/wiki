@@ -1,4 +1,6 @@
-import { useCallback, useEffect, useRef, useState, type KeyboardEvent, type ReactNode, type RefObject } from "react";
+import { createPortal } from "react-dom";
+import { useCallback, useEffect, useLayoutEffect, useRef, useState, type KeyboardEvent, type ReactNode, type RefObject } from "react";
+import { useModalA11y } from "./modal-a11y";
 
 export const MEDIA_SPEED_OPTIONS: readonly number[] = [0.75, 1, 1.25, 1.5, 2];
 
@@ -71,6 +73,7 @@ export function MediaControls({
   additionalControls,
 }: MediaControlsProps) {
   const playerRef = useRef<HTMLDivElement | null>(null);
+  const expandButtonRef = useRef<HTMLElement | null>(null);
   const [playing, setPlaying] = useState(false);
   const [currentTime, setCurrentTime] = useState(0);
   const [duration, setDuration] = useState(initialDuration ?? 0);
@@ -79,6 +82,19 @@ export function MediaControls({
   const [isNativeFullscreen, setIsNativeFullscreen] = useState(false);
   const [isExpanded, setIsExpanded] = useState(false);
   const lastNonZeroVolumeRef = useRef(1);
+  const wasExpandedRef = useRef(false);
+  const closeExpanded = useCallback(() => setIsExpanded(false), []);
+  const dialogRef = useModalA11y<HTMLDivElement>(isExpanded, closeExpanded, expandButtonRef);
+
+  useLayoutEffect(() => {
+    if (isExpanded) {
+      wasExpandedRef.current = true;
+      return;
+    }
+    if (!wasExpandedRef.current) return;
+    wasExpandedRef.current = false;
+    expandButtonRef.current?.focus();
+  }, [isExpanded, expandButtonRef]);
 
   const syncFromMedia = useCallback(() => {
     const media = mediaRef.current;
@@ -120,18 +136,6 @@ export function MediaControls({
     updateFullscreen();
     return () => document.removeEventListener("fullscreenchange", updateFullscreen);
   }, []);
-
-  useEffect(() => {
-    if (!isExpanded) return;
-    const previouslyFocused = document.activeElement instanceof HTMLElement ? document.activeElement : null;
-    const previousOverflow = document.body.style.overflow;
-    document.body.style.overflow = "hidden";
-    playerRef.current?.focus();
-    return () => {
-      document.body.style.overflow = previousOverflow;
-      if (previouslyFocused?.isConnected) previouslyFocused.focus();
-    };
-  }, [isExpanded]);
 
   const togglePlayback = useCallback(() => {
     const media = mediaRef.current;
@@ -204,11 +208,6 @@ export function MediaControls({
   }, [isExpanded]);
 
   const handleKeyDown = (event: KeyboardEvent<HTMLDivElement>) => {
-    if (event.key === "Escape" && isFullscreen) {
-      event.preventDefault();
-      toggleFullscreen();
-      return;
-    }
     if (event.target !== event.currentTarget && event.target !== mediaRef.current) return;
     switch (event.key.toLowerCase()) {
       case " ":
@@ -242,9 +241,13 @@ export function MediaControls({
   const isFullscreen = isNativeFullscreen || isExpanded;
   const keyboardShortcuts = ["Space", "K", "ArrowLeft", "ArrowRight", "M"];
   if (showFullscreen) keyboardShortcuts.push("F", "Escape");
-  return (
+  const player = (
     <div
-      ref={playerRef}
+      aria-modal={isExpanded ? "true" : undefined}
+      ref={(element) => {
+        playerRef.current = element;
+        dialogRef.current = element;
+      }}
       aria-keyshortcuts={keyboardShortcuts.join(" ")}
       aria-label={mediaLabel}
       className={`artifact-media-player ${className}${isExpanded ? " is-media-expanded" : ""}`}
@@ -255,7 +258,7 @@ export function MediaControls({
         }
       }}
       onKeyDown={handleKeyDown}
-      role="group"
+      role={isExpanded ? "dialog" : "group"}
       tabIndex={0}
     >
       {children}
@@ -327,6 +330,7 @@ export function MediaControls({
             aria-label={isFullscreen ? "Exit fullscreen" : "Enter fullscreen"}
             className="artifact-media-control-button"
             onClick={toggleFullscreen}
+            ref={(element) => { expandButtonRef.current = element; }}
             type="button"
           >
             <MediaIcon name={isFullscreen ? "exit-fullscreen" : "fullscreen"} />
@@ -336,4 +340,7 @@ export function MediaControls({
       </div>
     </div>
   );
+
+  if (isExpanded && typeof document !== "undefined") return createPortal(player, document.body);
+  return player;
 }

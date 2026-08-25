@@ -147,10 +147,11 @@ describe("VideoRenderer", () => {
     const player = screen.getByRole("group", { name: "Fixture media" });
     expect(player.getAttribute("aria-keyshortcuts")).toContain("F");
     fireEvent.click(screen.getByRole("button", { name: "Enter fullscreen" }));
-    await waitFor(() => expect(player.classList.contains("is-media-expanded")).toBe(true));
-    expect(document.activeElement).toBe(player);
-    fireEvent.keyDown(player, { key: "Escape" });
-    await waitFor(() => expect(player.classList.contains("is-media-expanded")).toBe(false));
+    const expandedPlayer = await screen.findByRole("dialog", { name: "Fixture media" });
+    expect(expandedPlayer.classList.contains("is-media-expanded")).toBe(true);
+    expect(document.activeElement).toBe(expandedPlayer);
+    fireEvent.keyDown(expandedPlayer, { key: "Escape" });
+    await waitFor(() => expect(screen.queryByRole("dialog", { name: "Fixture media" })).toBeNull());
   });
 
   test("reserves aspect ratio to prevent CLS when width/height are known", () => {

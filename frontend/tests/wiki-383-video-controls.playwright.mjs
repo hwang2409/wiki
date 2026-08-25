@@ -129,7 +129,11 @@ async function main() {
   const browser = await chromium.launch({ headless: true });
   const context = await browser.newContext({ viewport: { width: 1280, height: 900 } });
   const page = await context.newPage();
-  page.on("pageerror", (error) => logStep(`page error: ${error.message}`));
+  const pageErrors = [];
+  page.on("pageerror", (error) => {
+    pageErrors.push(error.message);
+    logStep(`page error: ${error.message}`);
+  });
   page.on("response", (response) => {
     if (response.status() >= 400) logStep(`response ${response.status()}: ${response.url()}`);
   });
@@ -137,6 +141,10 @@ async function main() {
     await page.addInitScript(() => {
       localStorage.setItem("wiki-sidebar-visible", "false");
       localStorage.setItem("wiki-theme", "mono-light");
+      window.__wiki383UnhandledRejection = null;
+      window.addEventListener("unhandledrejection", (event) => {
+        window.__wiki383UnhandledRejection = String(event.reason?.message ?? event.reason);
+      });
     });
     await page.goto(`${backend.baseUrl}/#/agent/${TICKET}`, { waitUntil: "domcontentloaded" });
     const block = page.locator(`[data-artifact-kind="video"]`).first();
@@ -219,10 +227,68 @@ async function main() {
       Object.defineProperty(document, "fullscreenEnabled", { configurable: true, value: false });
     });
     await bar.getByRole("button", { name: "Enter fullscreen" }).click();
-    await page.waitForFunction(() => document.querySelector(".artifact-media-player")?.classList.contains("is-media-expanded"));
-    if (await bar.isVisible() !== true) throw new Error("custom bar disappeared in fullscreen");
+    const expandedPlayer = page.locator("body > .artifact-media-player.is-media-expanded");
+    await expandedPlayer.waitFor({ state: "visible" });
+    const viewport = await expandedPlayer.boundingBox();
+    const expectedViewport = await page.evaluate(() => ({ width: window.innerWidth, height: window.innerHeight }));
+    if (!viewport || Math.abs(viewport.x) > 0.5 || Math.abs(viewport.y) > 0.5
+      || Math.abs(viewport.width - expectedViewport.width) > 0.5
+      || Math.abs(viewport.height - expectedViewport.height) > 0.5) {
+      throw new Error(`expanded player does not fill viewport: ${JSON.stringify({ viewport, expectedViewport })}`);
+    }
+    const expandedBar = expandedPlayer.locator(".artifact-video-controls");
+    if (await expandedBar.isVisible() !== true) throw new Error("custom bar disappeared in fullscreen");
+    if (await expandedPlayer.getAttribute("aria-modal") !== "true") throw new Error("expanded player is not modal");
+    if (await page.evaluate(() => document.body.style.overflow) !== "hidden") throw new Error("modal did not lock body scroll");
+
+    const focusables = expandedPlayer.locator("button:not([disabled]), input:not([disabled]), select:not([disabled])");
+    const firstFocusable = focusables.first();
+    const lastFocusable = focusables.last();
+    await lastFocusable.focus();
+    await page.keyboard.press("Tab");
+    if (!(await firstFocusable.evaluate((element) => element === document.activeElement))) {
+      throw new Error("Tab did not wrap to the first modal control");
+    }
+    await firstFocusable.focus();
+    await page.keyboard.press("Shift+Tab");
+    if (!(await lastFocusable.evaluate((element) => element === document.activeElement))) {
+      throw new Error("Shift+Tab did not wrap to the last modal control");
+    }
+
+    await expandedBar.getByRole("combobox", { name: "Playback speed" }).press("Escape");
+    await page.waitForFunction(() => !document.querySelector(".artifact-media-player.is-media-expanded"));
+    if (await page.evaluate(() => document.activeElement?.getAttribute("aria-label")) !== "Enter fullscreen") {
+      throw new Error("focus was not restored to the expand button");
+    }
+    const cleanupState = await page.evaluate(() => ({
+      bodyOverflow: document.body.style.overflow,
+      inertCount: [...document.body.children].filter((element) => element.hasAttribute("inert")).length,
+    }));
+    if (cleanupState.bodyOverflow !== "" || cleanupState.inertCount !== 0) {
+      throw new Error(`modal cleanup failed: ${JSON.stringify(cleanupState)}`);
+    }
+
+    const pageErrorsBeforeRejectedRequest = pageErrors.length;
+    await page.evaluate(() => {
+      Object.defineProperty(document, "fullscreenEnabled", { configurable: true, value: true });
+      const player = document.querySelector(".artifact-media-player");
+      if (!(player instanceof HTMLElement)) throw new Error("media player is missing");
+      Object.defineProperty(player, "requestFullscreen", {
+        configurable: true,
+        value: () => Promise.reject(new Error("fullscreen rejected by host")),
+      });
+      window.__wiki383UnhandledRejection = null;
+    });
+    await bar.getByRole("button", { name: "Enter fullscreen" }).click();
+    await expandedPlayer.waitFor({ state: "visible" });
+    if (await page.evaluate(() => window.__wiki383UnhandledRejection) !== null) {
+      throw new Error("rejected requestFullscreen produced an unhandled rejection");
+    }
+    if (pageErrors.length !== pageErrorsBeforeRejectedRequest) {
+      throw new Error(`rejected requestFullscreen produced page errors: ${pageErrors.slice(pageErrorsBeforeRejectedRequest).join("; ")}`);
+    }
     await page.keyboard.press("Escape");
-    await page.waitForFunction(() => !document.querySelector(".artifact-media-player")?.classList.contains("is-media-expanded"));
+    await page.waitForFunction(() => !document.querySelector(".artifact-media-player.is-media-expanded"));
     await block.screenshot({ path: AFTER_SCREENSHOT });
     logStep(`screenshots: ${BEFORE_SCREENSHOT}, ${AFTER_SCREENSHOT}`);
   } finally {
