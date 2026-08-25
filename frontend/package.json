@@ -64,7 +64,8 @@
     "pretest:wiki-384": "npm run build",
     "test:wiki-384": "node tests/wiki-384-terminal-focus.playwright.mjs",
     "pretest:wiki-386": "npm run build",
-    "test:wiki-386": "node tests/wiki-386-graph-density.playwright.mjs"
+    "test:wiki-386": "node tests/wiki-386-graph-density.playwright.mjs",
+    "test:wiki-383": "node tests/wiki-383-video-controls.playwright.mjs"
   },
   "dependencies": {
     "@codemirror/commands": "^6.10.4",

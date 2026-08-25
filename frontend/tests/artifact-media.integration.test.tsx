@@ -70,7 +70,7 @@ describe("VideoRenderer", () => {
     expect(downloadName(event)).toBe("Fixture-media.webm");
   });
 
-  test("renders a native <video> with controls and preload=metadata", () => {
+  test("renders a custom control bar with preload=metadata", () => {
     const artifact: SessionArtifact = {
       kind: "video",
       mime: "video/mp4",
@@ -83,11 +83,42 @@ describe("VideoRenderer", () => {
     render(<VideoRenderer artifact={artifact} event={makeEvent(artifact)} ticket={TICKET} />);
     const video = screen.getByLabelText("Fixture media") as HTMLVideoElement;
     expect(video.tagName).toBe("VIDEO");
-    expect(video.hasAttribute("controls")).toBe(true);
+    expect(video.hasAttribute("controls")).toBe(false);
+    expect(video.hasAttribute("controlsList")).toBe(false);
     expect(video.getAttribute("preload")).toBe("metadata");
     expect(video.getAttribute("playsinline")).not.toBeNull();
     expect(video.getAttribute("src")).toContain("artifact");
     expect(screen.getByText("0:03")).toBeTruthy();
+    expect(screen.getByRole("button", { name: "Play" })).toBeTruthy();
+    expect(screen.getByRole("slider", { name: "Seek" })).toBeTruthy();
+    expect(screen.getByRole("slider", { name: "Volume" })).toBeTruthy();
+  });
+
+  test("video controls play, mute, volume, and seek the media element", () => {
+    const artifact: SessionArtifact = {
+      kind: "video",
+      mime: "video/mp4",
+      ref: "artifact://abc",
+      duration_ms: 10000,
+    };
+    const playSpy = vi.spyOn(HTMLMediaElement.prototype, "play").mockResolvedValue(undefined);
+    const pauseSpy = vi.spyOn(HTMLMediaElement.prototype, "pause").mockImplementation(() => undefined);
+    render(<VideoRenderer artifact={artifact} event={makeEvent(artifact)} ticket={TICKET} />);
+    const video = screen.getByLabelText("Fixture media") as HTMLVideoElement;
+    Object.defineProperty(video, "paused", { configurable: true, value: true });
+    fireEvent.click(screen.getByRole("button", { name: "Play" }));
+    expect(playSpy).toHaveBeenCalled();
+    Object.defineProperty(video, "paused", { configurable: true, value: false });
+    fireEvent(video, new Event("play"));
+    fireEvent.click(screen.getByRole("button", { name: "Pause" }));
+    expect(pauseSpy).toHaveBeenCalled();
+    fireEvent.click(screen.getByRole("button", { name: "Mute" }));
+    expect(video.muted).toBe(true);
+    fireEvent.change(screen.getByRole("slider", { name: "Volume" }), { target: { value: "0.5" } });
+    expect(video.volume).toBeCloseTo(0.5);
+    expect(video.muted).toBe(false);
+    fireEvent.change(screen.getByRole("slider", { name: "Seek" }), { target: { value: "4" } });
+    expect(video.currentTime).toBe(4);
   });
 
   test("reserves aspect ratio to prevent CLS when width/height are known", () => {
@@ -244,7 +275,7 @@ describe("VideoRenderer", () => {
 });
 
 describe("AudioRenderer", () => {
-  test("renders a native <audio> element with controls and preload=metadata", () => {
+  test("renders a custom control bar with preload=metadata", () => {
     const artifact: SessionArtifact = {
       kind: "audio",
       mime: "audio/wav",
@@ -254,9 +285,12 @@ describe("AudioRenderer", () => {
     render(<AudioRenderer artifact={artifact} event={makeEvent(artifact)} ticket={TICKET} />);
     const audio = screen.getByLabelText("Fixture media") as HTMLAudioElement;
     expect(audio.tagName).toBe("AUDIO");
-    expect(audio.hasAttribute("controls")).toBe(true);
+    expect(audio.hasAttribute("controls")).toBe(false);
+    expect(audio.hasAttribute("controlsList")).toBe(false);
     expect(audio.getAttribute("preload")).toBe("metadata");
     expect(screen.getByText("1:05")).toBeTruthy();
+    expect(screen.getByRole("button", { name: "Play" })).toBeTruthy();
+    expect(screen.queryByRole("button", { name: "Enter fullscreen" })).toBeNull();
   });
 
   test("speed selector updates playbackRate on the audio element", () => {
