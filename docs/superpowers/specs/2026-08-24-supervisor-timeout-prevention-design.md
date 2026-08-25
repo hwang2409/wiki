@@ -256,13 +256,14 @@ misbehaves in the field.
 
 | change | ticket |
 | --- | --- |
-| S1 writer executor | WIKI-358 (exists, worktree staged) |
-| S2 per-agent lanes + accepted ack + command/status | new |
+| S1 writer executor | WIKI-358 (merged, PR #289) |
+| S2 per-agent lanes + accepted ack + command/status | WIKI-376 |
 | S3 archive catalog | WIKI-363 (exists) |
 | S4 wk replay gating | WIKI-364 (exists) |
-| S5 ingress backpressure | new |
-| CLI `wk agent` + retire MCP | new (2 tickets: add CLI, remove MCP) |
-| load gate | new |
+| S5 ingress backpressure | WIKI-378 |
+| CLI `wk agent` + retire MCP | WIKI-379 (add CLI), WIKI-380 (remove MCP) |
+| load gate | WIKI-381 |
+| parity backfill holds run lock across O(n^2) compare, starving archives (root cause 6, found 2026-08-24 evening via py-spy) | WIKI-377 |
 
 ## 9. Risks and open questions
 

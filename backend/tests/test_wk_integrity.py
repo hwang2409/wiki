@@ -6,6 +6,7 @@ import os
 import subprocess
 from collections.abc import Mapping
 from pathlib import Path
+from unittest import mock
 
 import pytest
 
@@ -298,6 +299,99 @@ def test_wk_status_replay_uses_causal_sequence_after_orphan_append(tmp_path: Pat
     asyncio.run(restarted_supervisor.close())
     assert restored.wk_status_state == "blocked"
     assert restored.wk_status_source_seq == revoked.source_seq
+
+
+def test_wk_status_rebuild_skips_unchanged_source_log(tmp_path: Path) -> None:
+    # The 1s recovery loop calls rebuild_wk_status_projection for every wk
+    # run each pass; replaying an unchanged log is the WIKI-364 loop overrun.
+    paths = RuntimePaths(
+        runtime_dir=tmp_path / "runtime",
+        socket_path=tmp_path / "runtime" / "supervisor.sock",
+        registry_path=tmp_path / "registry.json",
+        archive_dir=tmp_path / "archive",
+        status_dir=tmp_path / "status",
+    )
+    store = RunStore(paths)
+    record = store.create(
+        RunRecord.new(
+            agent_id="WIKI-364",
+            provider=ProviderKind.CLAUDE,
+            role="implement",
+            model="claude-plan",
+            worktree=str(tmp_path),
+            prompt="gate",
+            execution_kind="wk-claude",
+        )
+    )
+    translator = _Translator()
+    ready = translator.sequencer.emit(
+        run_id=record.run_id,
+        agent_id=record.agent_id,
+        kind="wk.status",
+        phase=WkEventPhase.STATUS,
+        provider="claude",
+        lane="wk-claude",
+        disposition=WkDisposition.RENDERED,
+        ts=translator.timestamp(),
+        payload={
+            "state": "merge-ready",
+            "pr": "https://github.com/hwang2409/wiki/pull/234",
+            "step": "ready",
+            "blocker": None,
+        },
+    )
+    ready_raw = store.append_raw(
+        record.run_id,
+        provider="claude",
+        direction="inbound",
+        payload=ready.to_dict(),
+    )
+    store.append_normalized(
+        record.run_id,
+        raw_seq=int(ready_raw["seq"]),
+        disposition=EventDisposition.RENDERED,
+        kind=ready.kind,
+        payload=ready.to_dict(),
+    )
+
+    first = store.rebuild_wk_status_projection(record.run_id)
+    assert first.wk_status_state == "merge-ready"
+
+    with mock.patch.object(
+        store,
+        "iter_normalized_events",
+        wraps=store.iter_normalized_events,
+    ) as replay_spy:
+        gated = store.rebuild_wk_status_projection(record.run_id)
+    assert replay_spy.call_count == 0
+    assert gated.wk_status_state == "merge-ready"
+
+    revoked = translator.sequencer.emit(
+        run_id=record.run_id,
+        agent_id=record.agent_id,
+        kind="wk.status_revoked",
+        phase=WkEventPhase.STATUS,
+        provider="claude",
+        lane="wk-claude",
+        disposition=WkDisposition.RENDERED,
+        ts=translator.timestamp(),
+        payload={"detail": "failed gate"},
+    )
+    revoked_raw = store.append_raw(
+        record.run_id,
+        provider="claude",
+        direction="inbound",
+        payload=revoked.to_dict(),
+    )
+    store.append_normalized(
+        record.run_id,
+        raw_seq=int(revoked_raw["seq"]),
+        disposition=EventDisposition.RENDERED,
+        kind=revoked.kind,
+        payload=revoked.to_dict(),
+    )
+    updated = store.rebuild_wk_status_projection(record.run_id)
+    assert updated.wk_status_state == "blocked"
 
 
 def test_merge_ready_without_a_bound_ledger_fails_closed(tmp_path: Path) -> None:

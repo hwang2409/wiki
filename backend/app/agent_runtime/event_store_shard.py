@@ -1137,6 +1137,28 @@ class SQLiteEventStore:
             ).fetchall()
         return {int(row[0]) for row in rows}
 
+    def has_run_projection(self, run_id: str) -> bool:
+        """O(1) structural probe: the projection row (and table) exist."""
+
+        with self.connection(read_only=True) as connection:
+            row = connection.execute(
+                "SELECT 1 FROM run_projections WHERE run_id = ?",
+                (run_id,),
+            ).fetchone()
+        return row is not None
+
+    def disposition_coverage(self, run_id: str) -> tuple[int, int, int]:
+        """Return (count, max_raw_seq, min_raw_seq) without decoding rows."""
+
+        with self.connection(read_only=True) as connection:
+            row = connection.execute(
+                "SELECT COUNT(*), COALESCE(MAX(raw_seq), 0), "
+                "COALESCE(MIN(raw_seq), 0) "
+                "FROM dispositions WHERE run_id = ?",
+                (run_id,),
+            ).fetchone()
+        return int(row[0]), int(row[1]), int(row[2])
+
     def run_is_healthy(self, run_id: str) -> bool:
         try:
             with self.connection(read_only=True) as connection:
@@ -1929,12 +1951,28 @@ class SQLiteEventStore:
         """Export the committed SQLite dispositions in archive JSONL order."""
 
         destination = Path(destination)
-        if not self.path.is_file() or not self.run_is_healthy(run_id):
+        if not self.path.is_file():
             return False
-        cursor = self.cursor(run_id)
+        # WIKI-359: the export hot path trusts the durable cursor instead of
+        # run_is_healthy()'s full O(events) json-decoding walk. Coverage is
+        # checked with one aggregate; deep validation stays on the archive
+        # repair path (_prepare_terminal_archive / _validate_terminal_archive).
+        try:
+            cursor = self.cursor(run_id)
+        except KeyError:
+            return False
         if (
             cursor.normalizer_version != NORMALIZER_VERSION
             or cursor.rebuild_state != "ready"
+        ):
+            return False
+        disposition_count, max_raw_seq, min_raw_seq = self.disposition_coverage(
+            run_id
+        )
+        if max_raw_seq != int(cursor.raw_seq):
+            return False
+        if disposition_count and (
+            min_raw_seq != 1 or disposition_count != max_raw_seq
         ):
             return False
         with self.connection(read_only=True) as connection:
@@ -2013,10 +2051,20 @@ class SQLiteEventStore:
         self,
         source: Path | str,
         run_id: str,
+        *,
+        lock_timeout: float = 15.0,
     ) -> None:
         """Atomically replace one run from a validated temporary database."""
 
-        with self.run_lock(run_id):
+        lock = self.run_lock(run_id)
+        # A bounded wait keeps one long-held run lock (e.g. a parity sweep)
+        # from wedging the archive executor and, behind it, the whole
+        # command queue. Failing lets the caller surface a retryable error.
+        if not lock.acquire(timeout=lock_timeout):
+            raise runtime_store.StoreConflict(
+                f"run event store is busy for {run_id}; retry the operation"
+            )
+        try:
             source_path = Path(source).absolute()
             if not source_path.is_file():
                 raise FileNotFoundError(source_path)
@@ -2071,6 +2119,8 @@ class SQLiteEventStore:
                 path="replace_run_from",
                 detail={"source": str(source_path)},
             )
+        finally:
+            lock.release()
 
     def _invalidate_connections(self) -> None:
         """Force future operations to reopen after an atomic database swap."""

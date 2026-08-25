@@ -174,6 +174,9 @@ class ArchiveProtocolTests(unittest.TestCase):
                 mock.patch.object(protocol.os, "open", side_effect=open_file),
                 mock.patch.object(protocol.os, "fsync", side_effect=fsync),
                 mock.patch.object(protocol.os, "replace", side_effect=replace),
+                # The catalog is a projection outside the durability
+                # protocol under test (WIKI-363).
+                mock.patch.object(protocol, "_record_archive_in_catalog"),
             ):
                 commit_archive(
                     probe,
@@ -307,6 +310,7 @@ class ArchiveProtocolTests(unittest.TestCase):
                 mock.patch.object(
                     protocol, "_fsync_directory", side_effect=fsync_directory
                 ),
+                mock.patch.object(protocol, "_record_archive_in_catalog"),
             ):
                 commit_archive(
                     directory,
@@ -318,3 +322,39 @@ class ArchiveProtocolTests(unittest.TestCase):
             marker_replace = events.index(f"replace:{ARCHIVE_COMPLETION_MARKER}")
             self.assertEqual(events[-1], "directory-fsync")
             self.assertGreater(marker_replace, events.index("directory-fsync"))
+
+    def test_commit_archive_records_catalog_row(self) -> None:
+        # WIKI-363: the commit step also writes the catalog projection so
+        # listings can skip per-session verification.
+        with tempfile.TemporaryDirectory() as raw_root:
+            root = Path(raw_root)
+            directory, files = self._archive_fixture(root)
+            commit_archive(
+                directory,
+                run_id="run-1",
+                completed_at="2026-08-01T00:00:00Z",
+                expected_paths=files,
+            )
+            catalog = protocol.read_archive_catalog(root / "archive")
+            row = catalog.get("WIKI-272/session")
+            self.assertIsNotNone(row)
+            self.assertEqual(row["run_id"], "run-1")
+            self.assertEqual(row["completed_at"], "2026-08-01T00:00:00Z")
+
+    def test_catalog_failure_does_not_fail_commit(self) -> None:
+        with tempfile.TemporaryDirectory() as raw_root:
+            root = Path(raw_root)
+            directory, files = self._archive_fixture(root)
+            with mock.patch.object(
+                protocol,
+                "read_archive_catalog",
+                side_effect=OSError("catalog unavailable"),
+            ):
+                commit_archive(
+                    directory,
+                    run_id="run-1",
+                    completed_at="2026-08-01T00:00:00Z",
+                    expected_paths=files,
+                )
+            self.assertTrue(archive_is_committed(directory))
+            self.assertEqual(protocol.read_archive_catalog(root / "archive"), {})

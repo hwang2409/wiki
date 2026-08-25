@@ -656,6 +656,7 @@ def backfill_headless_runs(
                 BackfillResult(record.run_id, "skipped", version, "locked")
             )
             continue
+        lock_held = True
         try:
             current = store.get(record.run_id)
             if current.state not in TERMINAL_STATES:
@@ -737,6 +738,13 @@ def backfill_headless_runs(
                         f"backfill replay failed validation for {record.run_id}"
                     )
                 event_store.replace_run_from(temporary_path, record.run_id)
+            # The boundary compare replays every raw prefix — O(events^2).
+            # Holding the run lock across it starves a concurrent archive of
+            # the same run for the whole sweep (2026-08-24 write outage), so
+            # release now; a compare racing an archive fails into the
+            # harness_error path below, which is safe to retry.
+            lock.release()
+            lock_held = False
             reports = compare_run_boundaries(store, event_store, record.run_id)
             mismatches = tuple(
                 mismatch for report in reports for mismatch in report.mismatches
@@ -777,7 +785,8 @@ def backfill_headless_runs(
             results.append(
                 BackfillResult(record.run_id, "harness_error", version, str(exc)))
         finally:
-            lock.release()
+            if lock_held:
+                lock.release()
             event_store.advance_backfill_cursor(NORMALIZER_VERSION, record.run_id)
     return results
 

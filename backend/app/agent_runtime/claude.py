@@ -17,7 +17,9 @@ from .process import (
     terminate_process_group,
 )
 from .provider import (
+    INGRESS_DEFAULT_EVENT_SIZE,
     AdapterStatus,
+    BoundedProviderEventQueue,
     ProviderAdapter,
     ProviderBusy,
     ProviderEvent,
@@ -165,7 +167,7 @@ class ClaudeStreamAdapter(ProviderAdapter):
         self._process: asyncio.subprocess.Process | None = None
         self._reader_task: asyncio.Task[None] | None = None
         self._stderr_task: asyncio.Task[None] | None = None
-        self._events: asyncio.Queue[ProviderEvent | _StreamEnd] = asyncio.Queue()
+        self._events: BoundedProviderEventQueue = BoundedProviderEventQueue()
         self._pending: dict[str, _PendingControl] = {}
         self._server_request_ids: dict[str, _ServerControl] = {}
         self._pending_question_ids: set[str] = set()
@@ -261,16 +263,25 @@ class ClaudeStreamAdapter(ProviderAdapter):
         return tuple(args)
 
     async def _emit(
-        self, payload: dict[str, Any], *, direction: str, generation: int
+        self,
+        payload: dict[str, Any],
+        *,
+        direction: str,
+        generation: int,
+        size_hint: int = INGRESS_DEFAULT_EVENT_SIZE,
     ) -> None:
-        await self._events.put(
-            ProviderEvent(
-                provider=self.provider,
-                payload=payload,
-                direction=direction,
-                generation=generation,
-            )
+        event = ProviderEvent(
+            provider=self.provider,
+            payload=payload,
+            direction=direction,
+            generation=generation,
         )
+        if direction == "process":
+            # Terminal/diagnostic markers come from reader shutdown paths
+            # that must never park on a full queue (WIKI-378).
+            self._events.put_forced(event, size=size_hint)
+        else:
+            await self._events.put(event, size=size_hint)
 
     async def _spawn(self, session_id: str, *, resume: bool, generation: int) -> None:
         if self._process_is_alive():
@@ -608,7 +619,12 @@ class ClaudeStreamAdapter(ProviderAdapter):
                     await self._flush_deferred_question_answer(
                         *deferred_question_control
                     )
-                await self._emit(value, direction="stdout", generation=event_generation)
+                await self._emit(
+                    value,
+                    direction="stdout",
+                    generation=event_generation,
+                    size_hint=max(len(line), INGRESS_DEFAULT_EVENT_SIZE),
+                )
                 if value.get("type") != "control_response":
                     continue
                 response = value.get("response")
@@ -670,7 +686,7 @@ class ClaudeStreamAdapter(ProviderAdapter):
             for pending in self._pending.values():
                 if pending.generation == generation and not pending.future.done():
                     pending.future.set_exception(error)
-            await self._events.put(_StreamEnd(generation))
+            self._events.put_forced(_StreamEnd(generation))
 
     async def _stderr_loop(
         self,

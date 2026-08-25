@@ -234,6 +234,12 @@ class EventStoreRouter:
     def run_is_healthy(self, run_id: str) -> bool:
         return self.for_run(run_id).run_is_healthy(run_id)
 
+    def disposition_coverage(self, run_id: str) -> tuple[int, int, int]:
+        return self.for_run(run_id).disposition_coverage(run_id)
+
+    def has_run_projection(self, run_id: str) -> bool:
+        return self.for_run(run_id).has_run_projection(run_id)
+
     def rebuild_generation(self, run_id: str) -> int:
         return self.for_run(run_id).rebuild_generation(run_id)
 

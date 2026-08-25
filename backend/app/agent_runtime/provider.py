@@ -1,11 +1,92 @@
 from __future__ import annotations
 
+import asyncio
 from abc import ABC, abstractmethod
+from collections import deque
 from collections.abc import AsyncIterator, Callable
 from dataclasses import dataclass, field
 from typing import Any
 
 from .types import LifecycleState, ProviderKind, RunRecord, utc_now
+
+INGRESS_MAX_ITEMS = 10_000
+INGRESS_MAX_BYTES = 64 * 1024 * 1024
+INGRESS_DEFAULT_EVENT_SIZE = 256
+
+
+class BoundedProviderEventQueue:
+    """Provider ingress with count and byte caps (WIKI-378).
+
+    A full queue blocks ``put`` — backpressure reaches the provider pipe
+    instead of growing supervisor memory. ``put_forced`` bypasses the caps:
+    terminal markers (process exit, stream end) are emitted from reader
+    shutdown paths that must never park (the 2026-08-24 archive-stall class).
+    """
+
+    def __init__(
+        self,
+        *,
+        max_items: int = INGRESS_MAX_ITEMS,
+        max_bytes: int = INGRESS_MAX_BYTES,
+    ) -> None:
+        self._items: deque[tuple[Any, int]] = deque()
+        self._bytes = 0
+        self._max_items = max_items
+        self._max_bytes = max_bytes
+        self._not_empty = asyncio.Event()
+        self._not_full = asyncio.Event()
+        self._not_full.set()
+
+    def __len__(self) -> int:
+        return len(self._items)
+
+    @property
+    def buffered_bytes(self) -> int:
+        return self._bytes
+
+    def _full_for(self, size: int) -> bool:
+        if not self._items:
+            return False
+        return (
+            len(self._items) >= self._max_items
+            or self._bytes + size > self._max_bytes
+        )
+
+    def _append(self, item: Any, size: int) -> None:
+        self._items.append((item, size))
+        self._bytes += size
+        self._not_empty.set()
+
+    async def put(self, item: Any, *, size: int = INGRESS_DEFAULT_EVENT_SIZE) -> None:
+        while self._full_for(size):
+            self._not_full.clear()
+            await self._not_full.wait()
+        self._append(item, size)
+
+    def put_forced(
+        self, item: Any, *, size: int = INGRESS_DEFAULT_EVENT_SIZE
+    ) -> None:
+        self._append(item, size)
+
+    def _pop(self) -> Any:
+        item, size = self._items.popleft()
+        self._bytes -= size
+        if not self._items:
+            self._not_empty.clear()
+        if not self._full_for(INGRESS_DEFAULT_EVENT_SIZE):
+            self._not_full.set()
+        return item
+
+    async def get(self) -> Any:
+        while not self._items:
+            self._not_empty.clear()
+            await self._not_empty.wait()
+        return self._pop()
+
+    def get_nowait(self) -> Any:
+        if not self._items:
+            raise asyncio.QueueEmpty
+        return self._pop()
 
 
 class ProviderError(RuntimeError):

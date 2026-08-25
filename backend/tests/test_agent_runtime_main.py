@@ -25,6 +25,7 @@ from backend.app.agent_runtime.client import (
     SupervisorRemoteError,
     SupervisorUnavailable,
 )
+from backend.app.agent_runtime import archive_protocol as archive_protocol_module
 from backend.app.agent_runtime.archive_protocol import commit_archive
 from backend.app.agent_runtime.fake import FixtureAdapterFactory
 from backend.app.agent_runtime.protocol import UnixSupervisorServer
@@ -973,6 +974,38 @@ class HeadlessMainRouteTests(unittest.IsolatedAsyncioTestCase):
 
         surfaced = cast(list[dict[str, Any]], payload["account_notices"])
         self.assertEqual(surfaced, [])
+
+    async def test_archive_listing_trusts_catalog_and_verifies_uncataloged(
+        self,
+    ) -> None:
+        # WIKI-363: cataloged sessions skip archive_is_committed's per-file
+        # walk; sessions the catalog misses still get fully verified.
+        archive_dir = self.archive_dir / "WIKI-42"
+        cataloged = archive_dir / "20260601-100000"
+        self._commit_archive_fixture(cataloged, run_id="cat-run", kind="cdx")
+        uncataloged = archive_dir / "20260701-100000"
+        with mock.patch.object(
+            archive_protocol_module,
+            "_record_archive_in_catalog",
+        ):
+            self._commit_archive_fixture(
+                uncataloged, run_id="uncat-run", kind="cc"
+            )
+
+        with mock.patch.object(
+            main,
+            "archive_is_committed",
+            wraps=main.archive_is_committed,
+        ) as verify_spy:
+            listed = [
+                session_dir
+                for _at, session_dir in main._archive_sessions(archive_dir)
+            ]
+        self.assertIn(cataloged, listed)
+        self.assertIn(uncataloged, listed)
+        verified = [call.args[0] for call in verify_spy.call_args_list]
+        self.assertIn(uncataloged, verified)
+        self.assertNotIn(cataloged, verified)
 
     async def test_archive_hint_selects_the_requested_archived_at_not_the_newest(
         self,

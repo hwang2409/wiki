@@ -27,6 +27,7 @@ from uuid import NAMESPACE_URL, UUID, uuid4, uuid5
 from .. import accounts, provider_health, transcripts
 from .command_log import AgentCommand, CommandConflict, CommandQueue, CommandRetryable
 from .event_store import (
+    NORMALIZER_VERSION,
     EventReducerAdapter,
     RuntimeEventStore,
     SQLiteEventStore,
@@ -679,7 +680,10 @@ class Supervisor:
             thread_name_prefix="wiki-archive",
         )
         self.materializer_executor = ThreadPoolExecutor(
-            max_workers=1,
+            # Startup repairs are independent per run (separate sqlite shards
+            # and JSONL logs); running them serially made boot O(sum of runs)
+            # wall-clock (WIKI-375).
+            max_workers=4,
             thread_name_prefix="wiki-materializer",
         )
         self._materializer_executor_closed = False
@@ -3622,9 +3626,56 @@ Preserve the same identity, role, worktree, orchestrator grouping, PR gates, and
 
         self._repair_and_validate_projection(run_id)
 
+    def _projection_checkpoint_current(self, record: RunRecord) -> bool:
+        """O(1) repair gate: run.json is newer than both logs and the shard
+        cursor covers every appended raw event (WIKI-375)."""
+
+        sizes: list[int] = []
+        for path, persisted in (
+            (self.store.raw_events_path(record.run_id), record.raw_log_size),
+            (
+                self.store.normalized_events_path(record.run_id),
+                record.normalized_log_size,
+            ),
+        ):
+            try:
+                size = path.stat().st_size
+            except OSError:
+                return False
+            if size != persisted:
+                return False
+            sizes.append(size)
+        if not any(sizes):
+            return False
+        try:
+            cursor = self.event_store.cursor(record.run_id)
+            coverage = self.event_store.disposition_coverage(record.run_id)
+            if not self.event_store.has_run_projection(record.run_id):
+                return False
+        except Exception:
+            return False
+        disposition_count, max_raw_seq, min_raw_seq = coverage
+        if max_raw_seq != record.raw_event_count:
+            return False
+        if disposition_count and (
+            min_raw_seq != 1 or disposition_count != max_raw_seq
+        ):
+            return False
+        return (
+            cursor.rebuild_state == "ready"
+            and cursor.normalizer_version == NORMALIZER_VERSION
+            and int(cursor.raw_seq) == record.raw_event_count
+        )
+
     def _repair_and_validate_projection(self, run_id: str) -> set[int]:
         """Repair one run and require raw, legacy, and SQLite parity."""
 
+        try:
+            checkpoint_record = self.store.get(run_id)
+        except RunNotFound:
+            return set()
+        if self._projection_checkpoint_current(checkpoint_record):
+            return set(range(1, checkpoint_record.raw_event_count + 1))
         try:
             self.store.get(run_id)
             normalized_rows = list(self.store.iter_normalized_events(run_id))
@@ -6656,6 +6707,10 @@ Preserve the same identity, role, worktree, orchestrator grouping, PR gates, and
         if method in _COMMAND_METHODS:
             self._reject_archive_inflight(params)
             command_params = dict(params)
+            # WIKI-376: wait=False acknowledges at durable intent. Popped
+            # before command construction so the idempotency hash binds
+            # identically with and without it.
+            wait_for_completion = command_params.pop("wait", True) is not False
             request_id = _validated_idempotency_request_id(
                 command_params.get("request_id")
             )
@@ -6751,7 +6806,9 @@ Preserve the same identity, role, worktree, orchestrator grouping, PR gates, and
                         command_hash=command.command_hash,
                     )
 
-            return await self.command_queue.submit(command, execute)
+            return await self.command_queue.submit(
+                command, execute, wait=wait_for_completion
+            )
         if method not in _IDEMPOTENT_METHODS:
             return await self._dispatch(method, params)
         request_id = _validated_idempotency_request_id(params.get("request_id"))

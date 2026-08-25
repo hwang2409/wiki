@@ -1086,6 +1086,10 @@ class RunStoreTests(unittest.TestCase):
                 store.run_path(record.run_id).read_text(encoding="utf-8")
             )
             metadata["pending_requests"] = {}
+            # A run.json that predates the last JSONL append also predates
+            # the WIKI-375 size checkpoint stamped at that append.
+            metadata["raw_log_size"] = 0
+            metadata["normalized_log_size"] = 0
             store.run_path(record.run_id).write_text(
                 json.dumps(metadata),
                 encoding="utf-8",
@@ -1202,6 +1206,9 @@ class RunStoreTests(unittest.TestCase):
             )
             self.assertGreater(metadata.get("last_lifecycle_event_seq", 0), 0)
             metadata.pop("last_causal_raw_seq", None)
+            # Legacy snapshots also predate the WIKI-375 size checkpoint.
+            metadata.pop("raw_log_size", None)
+            metadata.pop("normalized_log_size", None)
             store.run_path(record.run_id).write_text(
                 json.dumps(metadata),
                 encoding="utf-8",
@@ -1459,6 +1466,9 @@ class RunStoreTests(unittest.TestCase):
             run_path = store.run_path(record.run_id)
             metadata = json.loads(run_path.read_text(encoding="utf-8"))
             metadata.pop("last_causal_raw_seq", None)
+            # Legacy snapshots also predate the WIKI-375 size checkpoint.
+            metadata.pop("raw_log_size", None)
+            metadata.pop("normalized_log_size", None)
             run_path.write_text(json.dumps(metadata), encoding="utf-8")
 
             raw_path = store.raw_events_path(record.run_id)

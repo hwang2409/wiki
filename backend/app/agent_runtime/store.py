@@ -770,6 +770,7 @@ class RunStore:
         self._archive_events_preparer: Callable[[str], None] | None = None
         self._archive_events_validator: Callable[[str, Path], None] | None = None
         self._archive_inflight: set[str] = set()
+        self._wk_status_replayed_revisions: dict[str, tuple[int, int]] = {}
         _ensure_private_dir(paths.runtime_dir)
         _ensure_private_dir(paths.runs_dir)
         staging_dir = paths.runs_dir / ".staging"
@@ -1426,6 +1427,14 @@ class RunStore:
 
     def _write_record(self, record: RunRecord) -> None:
         record.updated_at = utc_now()
+        for attribute, path in (
+            ("raw_log_size", self.raw_events_path(record.run_id)),
+            ("normalized_log_size", self.normalized_events_path(record.run_id)),
+        ):
+            try:
+                setattr(record, attribute, path.stat().st_size)
+            except OSError:
+                setattr(record, attribute, 0)
         _atomic_write_json(self.run_path(record.run_id), record.to_dict())
 
     def _write_current_turn_diff_snapshot(self, run_id: str, diff: str | None) -> None:
@@ -1661,6 +1670,21 @@ class RunStore:
                     )
                 raw_path = self.raw_events_path(record.run_id)
                 normalized_path = self.normalized_events_path(record.run_id)
+                sizes: list[int] = []
+                for log_path in (raw_path, normalized_path):
+                    try:
+                        sizes.append(log_path.stat().st_size)
+                    except OSError:
+                        sizes.append(0)
+                if (
+                    any(sizes)
+                    and record.raw_log_size == sizes[0]
+                    and record.normalized_log_size == sizes[1]
+                ):
+                    # run.json is newer than the last JSONL append, so every
+                    # projection it carries is current — skip the O(events)
+                    # replay (WIKI-375).
+                    continue
                 _repair_jsonl_tail(raw_path)
                 _repair_jsonl_tail(normalized_path)
                 # WIKI-243: stream both logs instead of materializing full
@@ -3785,6 +3809,18 @@ class RunStore:
             record = self.get(run_id)
             if record.execution_kind not in {"wk-claude", "wk-codex"}:
                 return record
+            # The 1s recovery loop rebuilds every wk run each pass; skip the
+            # full log replay when the source log has not changed (WIKI-364).
+            try:
+                stat = self.normalized_events_path(run_id).stat()
+                revision: tuple[int, int] | None = (stat.st_size, stat.st_mtime_ns)
+            except OSError:
+                revision = None
+            if (
+                revision is not None
+                and self._wk_status_replayed_revisions.get(run_id) == revision
+            ):
+                return record
             record.wk_status_state = None
             record.wk_status_pr = None
             record.wk_status_step = None
@@ -3812,6 +3848,8 @@ class RunStore:
                 )
             self._write_record(record)
             self._write_current_projection(record)
+            if revision is not None:
+                self._wk_status_replayed_revisions[run_id] = revision
             return record
 
     def _read_json_lines_tail(

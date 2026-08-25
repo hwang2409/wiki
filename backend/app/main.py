@@ -68,7 +68,10 @@ from .agent_runtime.command_log import AgentCommand
 from .agent_runtime import costs
 from .agent_runtime import graph_health
 from .agent_runtime.loop_state import derive_loop_state
-from .agent_runtime.archive_protocol import archive_is_committed
+from .agent_runtime.archive_protocol import (
+    archive_is_committed,
+    read_archive_catalog,
+)
 from .agent_runtime.event_store import RuntimeEventStore, SQLiteEventStore
 from .agent_runtime.store import RuntimePaths
 from .agent_runtime.ticket import (
@@ -1808,14 +1811,18 @@ def _archive_role(session_dir: Path) -> str | None:
 
 
 def _archive_sessions(ticket_dir: Path) -> list[tuple[datetime, Path]]:
+    # WIKI-363: sessions in the commit-time catalog skip the per-session
+    # verification walk (marker + manifest read, lstat of every file).
+    # Sessions the catalog misses fall back to full verification, and a
+    # missing catalog degrades to the pre-catalog behavior.
+    catalog = read_archive_catalog(ticket_dir.parent)
     sessions = []
     for session_dir in ticket_dir.iterdir():
         match = ARCHIVE_TS_PATTERN.fullmatch(session_dir.name)
-        if (
-            not session_dir.is_dir()
-            or not match
-            or not archive_is_committed(session_dir)
-        ):
+        if not session_dir.is_dir() or not match:
+            continue
+        cataloged = f"{ticket_dir.name}/{session_dir.name}" in catalog
+        if not cataloged and not archive_is_committed(session_dir):
             continue
         y, mo, d, h, mi, s = map(int, match.groups())
         sessions.append((datetime(y, mo, d, h, mi, s).astimezone(), session_dir))

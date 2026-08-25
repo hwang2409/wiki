@@ -197,7 +197,10 @@ class CommandLogTests(unittest.TestCase):
             ["start:one", "end:one", "start:two", "end:two"],
         )
 
-    def test_queue_preserves_global_order_across_agents(self) -> None:
+    def test_slow_agent_command_does_not_delay_other_agents(self) -> None:
+        # WIKI-376: commands serialize per agent, not globally. A slow
+        # command at one agent's head must not delay any other agent
+        # (the 2026-08-24 outage amplifier).
         async def run() -> list[str]:
             with tempfile.TemporaryDirectory() as tmp:
                 log = CommandLog(Path(tmp) / "command-log.sqlite3")
@@ -207,34 +210,82 @@ class CommandLogTests(unittest.TestCase):
                 }
                 queue = CommandQueue(log, lambda: state)
                 order: list[str] = []
+                release_slow = asyncio.Event()
 
-                async def effect(name: str) -> dict[str, str]:
-                    order.append(f"start:{name}")
-                    await asyncio.sleep(0)
-                    order.append(f"end:{name}")
-                    return {"name": name}
+                async def slow_effect() -> dict[str, str]:
+                    order.append("start:slow-a")
+                    # Only WIKI-B's completion releases this command; under a
+                    # global FIFO the test would deadlock here.
+                    await asyncio.wait_for(release_slow.wait(), timeout=5)
+                    order.append("end:slow-a")
+                    return {"name": "a"}
 
-                first = AgentCommand.steer(
+                async def fast_effect() -> dict[str, str]:
+                    order.append("start:fast-b")
+                    release_slow.set()
+                    order.append("end:fast-b")
+                    return {"name": "b"}
+
+                slow = AgentCommand.steer(
                     agent_id="WIKI-A",
                     request_id="steer-a",
                     payload={"method": "run/send_now", "run_id": "run-a"},
                 )
-                second = AgentCommand.steer(
+                fast = AgentCommand.steer(
                     agent_id="WIKI-B",
                     request_id="steer-b",
                     payload={"method": "run/send_now", "run_id": "run-b"},
                 )
                 await asyncio.gather(
-                    queue.submit(first, lambda: effect("a")),
-                    queue.submit(second, lambda: effect("b")),
+                    queue.submit(slow, slow_effect),
+                    queue.submit(fast, fast_effect),
                 )
                 await queue.close()
                 return order
 
+        order = asyncio.run(run())
         self.assertEqual(
-            asyncio.run(run()),
-            ["start:a", "end:a", "start:b", "end:b"],
+            sorted(order),
+            ["end:fast-b", "end:slow-a", "start:fast-b", "start:slow-a"],
         )
+        # WIKI-B finished while WIKI-A's command was still inflight; under
+        # the old global FIFO this scenario deadlocks instead.
+        self.assertLess(order.index("end:fast-b"), order.index("end:slow-a"))
+
+    def test_accepted_mode_returns_at_intent_and_receipt_lands_later(self) -> None:
+        # WIKI-376: wait=False acknowledges once the intent is durable; the
+        # effect and receipt continue in the agent's lane.
+        async def run() -> None:
+            with tempfile.TemporaryDirectory() as tmp:
+                log = CommandLog(Path(tmp) / "command-log.sqlite3")
+                state = {"WIKI-219": {"current": {"run_id": "run-1"}}}
+                queue = CommandQueue(log, lambda: state)
+                release = asyncio.Event()
+
+                async def effect() -> dict[str, str]:
+                    await asyncio.wait_for(release.wait(), timeout=5)
+                    return {"name": "done"}
+
+                command = AgentCommand.steer(
+                    agent_id="WIKI-219",
+                    request_id="steer-accepted",
+                    payload={"method": "run/send_now", "run_id": "run-1"},
+                )
+                response = await queue.submit(command, effect, wait=False)
+                self.assertEqual(response["status"], "accepted")
+                self.assertEqual(response["request_id"], "steer-accepted")
+                self.assertEqual(response["agent_id"], "WIKI-219")
+                self.assertIsNone(log.receipt("run/send_now", "steer-accepted"))
+                release.set()
+                for _ in range(200):
+                    if log.receipt("run/send_now", "steer-accepted") is not None:
+                        break
+                    await asyncio.sleep(0.01)
+                receipt = log.receipt("run/send_now", "steer-accepted")
+                self.assertIsNotNone(receipt)
+                await queue.close()
+
+        asyncio.run(run())
 
     def test_inflight_conflict_checks_agent_and_payload(self) -> None:
         async def run() -> None:

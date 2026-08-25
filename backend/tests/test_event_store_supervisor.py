@@ -78,6 +78,53 @@ class SupervisorDualWriteTests(unittest.IsolatedAsyncioTestCase):
             event,
         )
 
+    async def test_repair_skips_full_walk_when_checkpoint_current(self) -> None:
+        # WIKI-375: a clean run must not pay the O(events) repair walk at boot.
+        await self._apply(self._event("turn/started", {"turn": {"id": "turn-1"}}))
+        with (
+            mock.patch.object(
+                self.store,
+                "iter_raw_events",
+                side_effect=AssertionError("repair walked raw events"),
+            ),
+            mock.patch.object(
+                self.store,
+                "iter_normalized_events",
+                side_effect=AssertionError("repair walked normalized events"),
+            ),
+        ):
+            covered = await asyncio.to_thread(
+                self.supervisor._repair_and_validate_projection,
+                self.record.run_id,
+            )
+        self.assertEqual(covered, {1})
+
+    async def test_checkpoint_gate_rejects_untracked_jsonl_growth(self) -> None:
+        # A crash between the JSONL fsync and the run.json write must fall
+        # through to the full repair walk (WIKI-375).
+        await self._apply(self._event("turn/started", {"turn": {"id": "turn-1"}}))
+        record = self.store.get(self.record.run_id)
+        self.assertTrue(
+            self.supervisor._projection_checkpoint_current(record)
+        )
+        raw_path = self.store.raw_events_path(self.record.run_id)
+        with raw_path.open("a", encoding="utf-8") as handle:
+            handle.write(
+                json.dumps(
+                    {
+                        "seq": 2,
+                        "provider": "codex",
+                        "direction": "provider",
+                        "payload": {"method": "turn/completed", "params": {}},
+                        "generation": 1,
+                    }
+                )
+                + "\n"
+            )
+        self.assertFalse(
+            self.supervisor._projection_checkpoint_current(record)
+        )
+
     async def test_dual_write_parity(self) -> None:
         self.store.track_pending_user_message(
             self.record.run_id,

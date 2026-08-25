@@ -8,7 +8,7 @@ VENV_BIN := .venv/bin
 UVICORN := $(if $(wildcard $(VENV_BIN)/uvicorn),$(VENV_BIN)/uvicorn,uvicorn)
 TAURI := cargo tauri
 
-.PHONY: dev backend frontend build native-backend native-dev native-build native-smoke
+.PHONY: dev backend frontend build native-backend native-dev native-build native-smoke load-gate
 
 dev:
 	@set -e; \
@@ -38,3 +38,6 @@ native-build:
 
 native-smoke: native-backend
 	./scripts/native-smoke.sh
+
+load-gate:
+	.venv/bin/python scripts/load_gate.py

@@ -218,6 +218,11 @@ class RunRecord:
     start_transaction: dict[str, Any] | None = None
     raw_event_count: int = 0
     normalized_event_count: int = 0
+    # Byte sizes of the JSONL logs at the last run.json write. A boot whose
+    # stat() matches both knows run.json is newer than the last append and
+    # skips the full projection replay (WIKI-375).
+    raw_log_size: int = 0
+    normalized_log_size: int = 0
     # Every normalized event bumps ``normalized_event_count`` — including the
     # synthetic user echoes injected by fleet monitor / supervisor steers.
     # The unread-dot surface must not light on those, so we track a parallel
@@ -377,6 +382,8 @@ class RunRecord:
             "start_transaction": self.start_transaction,
             "raw_event_count": self.raw_event_count,
             "normalized_event_count": self.normalized_event_count,
+            "raw_log_size": self.raw_log_size,
+            "normalized_log_size": self.normalized_log_size,
             "unread_event_seq": self.unread_event_seq,
             "last_lifecycle_event_seq": self.last_lifecycle_event_seq,
             "last_causal_raw_seq": self.last_causal_raw_seq,
@@ -512,6 +519,8 @@ class RunRecord:
             ),
             raw_event_count=int(value.get("raw_event_count", 0)),
             normalized_event_count=int(value.get("normalized_event_count", 0)),
+            raw_log_size=int(value.get("raw_log_size", 0)),
+            normalized_log_size=int(value.get("normalized_log_size", 0)),
             unread_event_seq=int(
                 value.get(
                     "unread_event_seq",

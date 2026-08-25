@@ -5,6 +5,7 @@ synthetic-source user turns as marker rows without changing LLM semantics."""
 from __future__ import annotations
 
 import asyncio
+import json
 import os
 import tempfile
 import unittest
@@ -528,10 +529,15 @@ class SendNowSourceTests(unittest.IsolatedAsyncioTestCase):
         expected_unread = self.store.get(run_id).unread_event_seq
 
         # Simulate a crash after fsync but before run.json replace: reset
-        # the field on disk and reload via a fresh RunStore reconcile.
-        record = self.store.get(run_id)
-        record.unread_event_seq = 0
-        self.store._write_record(record)  # noqa: SLF001
+        # the field on disk with the pre-append size checkpoint (a stale
+        # run.json cannot carry the sizes stamped by the later append)
+        # and reload via a fresh RunStore reconcile.
+        run_path = self.store.run_path(run_id)
+        metadata = json.loads(run_path.read_text(encoding="utf-8"))
+        metadata["unread_event_seq"] = 0
+        metadata["raw_log_size"] = 0
+        metadata["normalized_log_size"] = 0
+        run_path.write_text(json.dumps(metadata), encoding="utf-8")
 
         fresh = RunStore(self.paths)
         rebuilt = fresh.get(run_id)

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import threading
 from contextlib import ExitStack
 from pathlib import Path
 from unittest import mock
@@ -678,4 +679,108 @@ def test_backfill_skips_live_materializer_lock_then_processes_after_release(
     assert any(
         row["record_type"] == "backfill_skipped" and row["path"] == "locked"
         for row in event_store.parity_records(record.run_id)
+    )
+
+
+def test_backfill_releases_run_lock_before_boundary_compare(tmp_path: Path) -> None:
+    # The boundary compare is O(events^2); holding the run lock across it
+    # blocks a concurrent archive of the same run for the whole sweep
+    # (2026-08-24 fleet write outage).
+    store = RunStore(_paths(tmp_path))
+    event_store = SQLiteEventStore(tmp_path / "runtime" / "events.sqlite3")
+    record = _add_terminal_run(store, event_store, index=1)
+    from backend.app.agent_runtime import archive_parity
+
+    acquired_during_compare: list[bool] = []
+
+    def probing_compare(*_args: object, **_kwargs: object) -> tuple:
+        lock = event_store.run_lock(record.run_id)
+        result: list[bool] = []
+
+        def probe() -> None:
+            acquired = lock.acquire(blocking=False)
+            if acquired:
+                lock.release()
+            result.append(acquired)
+
+        thread = threading.Thread(target=probe)
+        thread.start()
+        thread.join(timeout=5)
+        acquired_during_compare.append(bool(result and result[0]))
+        return ()
+
+    with mock.patch.object(
+        archive_parity,
+        "compare_run_boundaries",
+        side_effect=probing_compare,
+    ):
+        results = backfill_headless_runs(store, event_store, batch_size=1)
+
+    assert acquired_during_compare == [True]
+    assert results[0].status == "ready"
+
+
+def test_replace_run_from_fails_fast_when_run_lock_is_contended(
+    tmp_path: Path,
+) -> None:
+    store = RunStore(_paths(tmp_path))
+    event_store = SQLiteEventStore(tmp_path / "runtime" / "events.sqlite3")
+    record = _add_terminal_run(store, event_store, index=1)
+    from backend.app.agent_runtime.store import StoreConflict
+
+    source = tmp_path / "rebuilt.sqlite3"
+    source.write_bytes(b"")
+    lock = event_store.run_lock(record.run_id)
+    held = threading.Event()
+    release = threading.Event()
+
+    def holder() -> None:
+        lock.acquire()
+        held.set()
+        release.wait(timeout=10)
+        lock.release()
+
+    thread = threading.Thread(target=holder)
+    thread.start()
+    assert held.wait(timeout=5)
+    try:
+        raised: Exception | None = None
+        try:
+            event_store.replace_run_from(source, record.run_id, lock_timeout=0.2)
+        except StoreConflict as exc:
+            raised = exc
+        assert isinstance(raised, StoreConflict)
+    finally:
+        release.set()
+        thread.join(timeout=5)
+
+
+def test_export_uses_cursor_gate_not_full_health_walk(tmp_path: Path) -> None:
+    # WIKI-359: export must not pay run_is_healthy's O(events) json walk.
+    store, event_store, record = _run_with_one_event(tmp_path)
+    destination = tmp_path / "export.jsonl"
+    with mock.patch.object(
+        event_store,
+        "run_is_healthy",
+        side_effect=AssertionError("export must not call run_is_healthy"),
+    ):
+        assert event_store.export_events_jsonl(
+            record.run_id,
+            destination,
+            legacy_source=store.normalized_events_path(record.run_id),
+        )
+    assert destination.is_file()
+
+
+def test_export_refuses_disposition_coverage_gap(tmp_path: Path) -> None:
+    store, event_store, record = _run_with_one_event(tmp_path)
+    with event_store.connection() as connection:
+        connection.execute(
+            "DELETE FROM dispositions WHERE run_id = ?",
+            (record.run_id,),
+        )
+    assert not event_store.export_events_jsonl(
+        record.run_id,
+        tmp_path / "export.jsonl",
+        legacy_source=store.normalized_events_path(record.run_id),
     )

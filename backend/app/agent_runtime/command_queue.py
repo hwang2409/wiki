@@ -183,8 +183,17 @@ class PerAgentQueueOwner:
         return futures
 
 
+def _retrieve_accepted_outcome(future: asyncio.Future[Any]) -> None:
+    """Consume an accepted-mode outcome so asyncio never logs it as lost.
+
+    The durable receipt is the observable result for accepted commands."""
+
+    if not future.cancelled():
+        future.exception()
+
+
 class CommandQueue:
-    """Run durable provider effects in one global FIFO reactor."""
+    """Run durable provider effects in per-agent lanes."""
 
     def __init__(
         self,
@@ -199,14 +208,16 @@ class CommandQueue:
         self.agent_state_provider = agent_state_provider
         self.recovery_factory = recovery_factory
         self.failure_state_provider = failure_state_provider
-        self._queue: asyncio.Queue[_QueuedCommand] = asyncio.Queue()
+        # WIKI-376: live commands serialize per agent. One slow effect must
+        # not head-of-line block every other agent (2026-08-24 outage).
+        self._lanes: dict[str, asyncio.Queue[_QueuedCommand]] = {}
+        self._lane_workers: dict[str, asyncio.Task[None]] = {}
         self._recovery_queue: asyncio.Queue[_QueuedCommand] = asyncio.Queue()
         # Command-scoped recovery uses one lane per agent. Boot recovery keeps
         # its durable global FIFO so startup replay order stays stable.
         self._scoped_recovery_queues: dict[
             str, asyncio.Queue[_QueuedCommand]
         ] = {}
-        self._worker: asyncio.Task[None] | None = None
         self._recovery_worker: asyncio.Task[None] | None = None
         self._scoped_recovery_workers: dict[str, asyncio.Task[None]] = {}
         self._scoped_recovery_agents: set[str] = set()
@@ -220,10 +231,15 @@ class CommandQueue:
         self.recovery_retries: list[tuple[AgentCommand, CommandRetryable]] = []
         self._closed = False
 
-    def _start_worker(self) -> None:
-        if self._worker is None or self._worker.done():
-            self._worker = asyncio.create_task(
-                self._run(), name="global-command-reactor"
+    def _lane(self, agent_id: str) -> asyncio.Queue[_QueuedCommand]:
+        return self._lanes.setdefault(agent_id, asyncio.Queue())
+
+    def _start_lane_worker(self, agent_id: str) -> None:
+        worker = self._lane_workers.get(agent_id)
+        if worker is None or worker.done():
+            self._lane_workers[agent_id] = asyncio.create_task(
+                self._run(lane_agent_id=agent_id),
+                name=f"command-lane-{agent_id}",
             )
 
     def _start_recovery_worker(self) -> None:
@@ -460,7 +476,13 @@ class CommandQueue:
                 )
             )
 
-    async def submit(self, command: AgentCommand, execute: CommandExecutor) -> Any:
+    async def submit(
+        self,
+        command: AgentCommand,
+        execute: CommandExecutor,
+        *,
+        wait: bool = True,
+    ) -> Any:
         if self._closed:
             raise CommandError("command queue is closed")
         await self._ensure_recovered()
@@ -496,8 +518,21 @@ class CommandQueue:
                 future.set_result(intent.result)
                 owner.finish_live(command, future)
                 return await asyncio.shield(future)
-            self._start_worker()
-            await self._queue.put(_QueuedCommand(command, execute, future))
+            self._start_lane_worker(command.agent_id)
+            await self._lane(command.agent_id).put(
+                _QueuedCommand(command, execute, future)
+            )
+            if not wait:
+                # WIKI-376 accepted mode: the intent is fsynced, so the
+                # command is durable and will execute in the agent's lane.
+                # The receipt is pollable via idempotency/status.
+                future.add_done_callback(_retrieve_accepted_outcome)
+                return {
+                    "status": "accepted",
+                    "method": command.method,
+                    "request_id": command.request_id,
+                    "agent_id": command.agent_id,
+                }
         except BaseException as exc:
             owner.finish_live(command, future)
             if not future.done():
@@ -505,10 +540,15 @@ class CommandQueue:
         return await future
 
     async def _run(
-        self, *, recovery: bool = False, agent_id: str | None = None
+        self,
+        *,
+        recovery: bool = False,
+        agent_id: str | None = None,
+        lane_agent_id: str | None = None,
     ) -> None:
         if not recovery:
-            queue = self._queue
+            assert lane_agent_id is not None
+            queue = self._lane(lane_agent_id)
         elif agent_id is None:
             queue = self._recovery_queue
         else:
@@ -602,15 +642,18 @@ class CommandQueue:
 
     async def close(self) -> None:
         self._closed = True
-        await self._queue.join()
         await asyncio.gather(
             self._recovery_queue.join(),
+            *(queue.join() for queue in self._lanes.values()),
             *(queue.join() for queue in self._scoped_recovery_queues.values()),
         )
-        if self._worker is not None:
-            self._worker.cancel()
-            await asyncio.gather(self._worker, return_exceptions=True)
-        self._worker = None
+        for worker in self._lane_workers.values():
+            worker.cancel()
+        if self._lane_workers:
+            await asyncio.gather(
+                *self._lane_workers.values(), return_exceptions=True
+            )
+        self._lane_workers.clear()
         if self._recovery_worker is not None:
             self._recovery_worker.cancel()
             await asyncio.gather(self._recovery_worker, return_exceptions=True)

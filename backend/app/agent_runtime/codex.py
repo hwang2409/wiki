@@ -17,7 +17,9 @@ from .process import (
     terminate_process_group,
 )
 from .provider import (
+    INGRESS_DEFAULT_EVENT_SIZE,
     AdapterStatus,
+    BoundedProviderEventQueue,
     ProviderAdapter,
     ProviderBusy,
     ProviderEvent,
@@ -104,7 +106,7 @@ class CodexAppServerAdapter(ProviderAdapter):
         self._process: asyncio.subprocess.Process | None = None
         self._reader_task: asyncio.Task[None] | None = None
         self._stderr_task: asyncio.Task[None] | None = None
-        self._events: asyncio.Queue[ProviderEvent | _StreamEnd] = asyncio.Queue()
+        self._events: BoundedProviderEventQueue = BoundedProviderEventQueue()
         self._pending: dict[str, _PendingRequest] = {}
         self._server_request_ids: dict[tuple[str, str | int], _ServerRequest] = {}
         self._server_request_revision = 0
@@ -201,16 +203,25 @@ class CodexAppServerAdapter(ProviderAdapter):
         return self._process is not None and self._process.returncode is None
 
     async def _emit(
-        self, payload: dict[str, Any], *, direction: str, generation: int
+        self,
+        payload: dict[str, Any],
+        *,
+        direction: str,
+        generation: int,
+        size_hint: int = INGRESS_DEFAULT_EVENT_SIZE,
     ) -> None:
-        await self._events.put(
-            ProviderEvent(
-                provider=self.provider,
-                payload=payload,
-                direction=direction,
-                generation=generation,
-            )
+        event = ProviderEvent(
+            provider=self.provider,
+            payload=payload,
+            direction=direction,
+            generation=generation,
         )
+        if direction == "process":
+            # Terminal/diagnostic markers come from reader shutdown paths
+            # that must never park on a full queue (WIKI-378).
+            self._events.put_forced(event, size=size_hint)
+        else:
+            await self._events.put(event, size=size_hint)
 
     async def _spawn(self, generation: int) -> None:
         if self._process_is_alive():
@@ -497,7 +508,12 @@ class CodexAppServerAdapter(ProviderAdapter):
                     }
                 generation = self._message_generation(value)
                 self._apply_message_state(value, generation)
-                await self._emit(value, direction="server", generation=generation)
+                await self._emit(
+                    value,
+                    direction="server",
+                    generation=generation,
+                    size_hint=max(len(line), INGRESS_DEFAULT_EVENT_SIZE),
+                )
 
                 message_id = value.get("id")
                 if "method" in value or not isinstance(message_id, (str, int)):
@@ -563,7 +579,7 @@ class CodexAppServerAdapter(ProviderAdapter):
             for pending in self._pending.values():
                 if not pending.future.done():
                     pending.future.set_exception(error)
-            await self._events.put(_StreamEnd(process_generation))
+            self._events.put_forced(_StreamEnd(process_generation))
 
     async def _stderr_loop(self, process: asyncio.subprocess.Process) -> None:
         assert process.stderr is not None

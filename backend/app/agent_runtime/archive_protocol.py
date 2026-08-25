@@ -14,6 +14,7 @@ from typing import Any
 
 ARCHIVE_COMPLETION_MARKER = "archive-complete.json"
 ARCHIVE_MANIFEST_NAME = "archive-manifest.json"
+ARCHIVE_CATALOG_NAME = "archive-catalog.json"
 REQUIRED_ARCHIVE_FILES = ("raw.jsonl", "events.jsonl", "run.json")
 
 
@@ -178,6 +179,41 @@ def _archive_metadata(
     return run_id, completed_at
 
 
+def read_archive_catalog(archive_dir: Path) -> dict[str, dict[str, Any]]:
+    """Return committed-session rows keyed by "<ticket>/<session-name>"."""
+
+    value = _read_object(Path(archive_dir) / ARCHIVE_CATALOG_NAME)
+    sessions = value.get("sessions") if value is not None else None
+    return sessions if isinstance(sessions, dict) else {}
+
+
+def _record_archive_in_catalog(
+    directory: Path,
+    run_id: str | None,
+    completed_at: str,
+) -> None:
+    """Add one committed session to the catalog projection.
+
+    The supervisor is the only archive writer, so read-modify-replace is
+    race-free. The catalog is a projection: on any failure the reader falls
+    back to per-session verification, so errors must not fail the commit.
+    """
+
+    archive_dir = directory.parent.parent
+    try:
+        sessions = read_archive_catalog(archive_dir)
+        sessions[f"{directory.parent.name}/{directory.name}"] = {
+            "run_id": run_id,
+            "completed_at": completed_at,
+        }
+        _atomic_write_json(
+            archive_dir / ARCHIVE_CATALOG_NAME,
+            {"version": 1, "sessions": sessions},
+        )
+    except OSError:
+        pass
+
+
 def commit_archive(
     directory: Path,
     *,
@@ -232,6 +268,9 @@ def commit_archive(
             except OSError:
                 pass
         raise
+    # After this point the archive is committed; the catalog projection must
+    # not be able to undo that, so it stays outside the rollback block.
+    _record_archive_in_catalog(directory, run_id, completed_at)
 
 
 def _manifest_is_verified(directory: Path, marker: dict[str, Any]) -> bool:
