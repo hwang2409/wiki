@@ -1,11 +1,36 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
-import { CircleDot, LayoutGrid, ListTree } from "lucide-react";
+import { CircleDot, LayoutGrid, ListTree, Maximize2, ZoomIn, ZoomOut } from "lucide-react";
 import { getLinks } from "./api";
 import type { NoteLinks } from "./api";
 import { UtilityEmpty, UtilityError, UtilityLoading, UtilityPage } from "./utility-page";
 
 type LinksMap = Record<string, NoteLinks>;
 type GraphMode = "canvas" | "list";
+type GraphCanvasControls = {
+  zoomIn: () => void;
+  zoomOut: () => void;
+  fit: () => void;
+};
+
+export const GRAPH_DENSITY_THRESHOLD = 72;
+const GRAPH_MODE_STORAGE_KEY = "wiki-graph-mode";
+
+function readStoredGraphMode(): GraphMode | null {
+  try {
+    const stored = localStorage.getItem(GRAPH_MODE_STORAGE_KEY);
+    return stored === "canvas" || stored === "list" ? stored : null;
+  } catch {
+    return null;
+  }
+}
+
+function storeGraphMode(mode: GraphMode) {
+  try {
+    localStorage.setItem(GRAPH_MODE_STORAGE_KEY, mode);
+  } catch {
+    // The mode still works for this session when storage is unavailable.
+  }
+}
 
 type GraphNodeSummary = {
   id: string;
@@ -73,8 +98,9 @@ export function GraphView({ onOpenNote }: { onOpenNote: (path: string) => void }
   const [links, setLinks] = useState<LinksMap | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [retryTick, setRetryTick] = useState(0);
-  const [mode, setMode] = useState<GraphMode>("canvas");
+  const [mode, setMode] = useState<GraphMode | null>(() => readStoredGraphMode());
   const [focusedId, setFocusedId] = useState<string | null>(null);
+  const canvasControlsRef = useRef<GraphCanvasControls | null>(null);
 
   useEffect(() => {
     let cancelled = false;
@@ -105,6 +131,13 @@ export function GraphView({ onOpenNote }: { onOpenNote: (path: string) => void }
   // that does not exist yet is a *target*, not a note in the vault.
   const noteCount = links ? Object.keys(links).length : 0;
   const unresolvedCount = summaries.filter((node) => node.unresolved).length;
+  const denseGraph = summaries.length > GRAPH_DENSITY_THRESHOLD;
+  const activeMode = mode ?? (links && denseGraph ? "list" : "canvas");
+
+  const selectMode = useCallback((nextMode: GraphMode) => {
+    setMode(nextMode);
+    storeGraphMode(nextMode);
+  }, []);
 
   const subtitle =
     links === null
@@ -128,23 +161,53 @@ export function GraphView({ onOpenNote }: { onOpenNote: (path: string) => void }
       <div className="graph-mode-group" role="group" aria-label="Graph view mode">
         <button
           type="button"
-          className={`tokens-chip graph-mode-chip${mode === "canvas" ? " is-active" : ""}`}
-          aria-pressed={mode === "canvas"}
-          onClick={() => setMode("canvas")}
+          className={`tokens-chip graph-mode-chip${activeMode === "canvas" ? " is-active" : ""}`}
+          aria-pressed={activeMode === "canvas"}
+          onClick={() => selectMode("canvas")}
         >
           <LayoutGrid size={12} aria-hidden="true" />
           <span>Canvas</span>
         </button>
         <button
           type="button"
-          className={`tokens-chip graph-mode-chip${mode === "list" ? " is-active" : ""}`}
-          aria-pressed={mode === "list"}
-          onClick={() => setMode("list")}
+          className={`tokens-chip graph-mode-chip${activeMode === "list" ? " is-active" : ""}`}
+          aria-pressed={activeMode === "list"}
+          onClick={() => selectMode("list")}
         >
           <ListTree size={12} aria-hidden="true" />
           <span>List</span>
         </button>
       </div>
+      {activeMode === "canvas" ? (
+        <div className="graph-canvas-controls" role="group" aria-label="Canvas controls">
+          <button
+            type="button"
+            className="tokens-chip graph-control-chip"
+            aria-label="Zoom out"
+            title="Zoom out"
+            onClick={() => canvasControlsRef.current?.zoomOut()}
+          >
+            <ZoomOut size={13} aria-hidden="true" />
+          </button>
+          <button
+            type="button"
+            className="tokens-chip graph-control-chip"
+            aria-label="Zoom in"
+            title="Zoom in"
+            onClick={() => canvasControlsRef.current?.zoomIn()}
+          >
+            <ZoomIn size={13} aria-hidden="true" />
+          </button>
+          <button
+            type="button"
+            className="tokens-chip graph-control-chip graph-fit-control"
+            onClick={() => canvasControlsRef.current?.fit()}
+          >
+            <Maximize2 size={13} aria-hidden="true" />
+            <span>Fit graph</span>
+          </button>
+        </div>
+      ) : null}
     </>
   );
 
@@ -169,13 +232,15 @@ export function GraphView({ onOpenNote }: { onOpenNote: (path: string) => void }
           title="No linked notes yet"
           message="Add [[wikilinks]] between notes to see the graph populate."
         />
-      ) : mode === "canvas" ? (
+      ) : activeMode === "canvas" ? (
         <GraphCanvas
           links={links}
           summaries={summaries}
+          dense={denseGraph}
           focusedId={focusedId}
           onFocus={setFocusedId}
           onOpenNote={onOpenNote}
+          controlsRef={canvasControlsRef}
         />
       ) : (
         <GraphList summaries={summaries} onFocus={setFocusedId} onOpenNote={onOpenNote} />
@@ -342,15 +407,19 @@ type PhysicsEdge = {
 function GraphCanvas({
   links,
   summaries,
+  dense,
   focusedId,
   onFocus,
   onOpenNote,
+  controlsRef,
 }: {
   links: LinksMap;
   summaries: GraphNodeSummary[];
+  dense: boolean;
   focusedId: string | null;
   onFocus: (id: string | null) => void;
   onOpenNote: (path: string) => void;
+  controlsRef: { current: GraphCanvasControls | null };
 }) {
   const canvasRef = useRef<HTMLCanvasElement | null>(null);
   const containerRef = useRef<HTMLDivElement | null>(null);
@@ -385,32 +454,35 @@ function GraphCanvas({
 
   function handleKeyboardNav(key: string) {
     if (orderedIds.length === 0) return;
-    const currentId = focusedId;
+    const currentId = focusedIdRef.current;
     let index = currentId ? orderedIds.indexOf(currentId) : -1;
+    const moveFocus = (id: string) => {
+      focusedIdRef.current = id;
+      onFocus(id);
+      canvasKeyboardRef.current?.(key);
+    };
     if (key === "ArrowRight" || key === "ArrowDown" || key === "j") {
       index = index < 0 ? 0 : (index + 1) % orderedIds.length;
-      onFocus(orderedIds[index]);
-      canvasKeyboardRef.current?.(key);
+      moveFocus(orderedIds[index]);
       return;
     }
     if (key === "ArrowLeft" || key === "ArrowUp" || key === "k") {
       index = index <= 0 ? orderedIds.length - 1 : index - 1;
-      onFocus(orderedIds[index]);
-      canvasKeyboardRef.current?.(key);
+      moveFocus(orderedIds[index]);
       return;
     }
     if (key === "Home") {
-      onFocus(orderedIds[0] ?? null);
-      canvasKeyboardRef.current?.(key);
+      const firstId = orderedIds[0];
+      if (firstId) moveFocus(firstId);
       return;
     }
     if (key === "End") {
-      onFocus(orderedIds[orderedIds.length - 1] ?? null);
-      canvasKeyboardRef.current?.(key);
+      const lastId = orderedIds[orderedIds.length - 1];
+      if (lastId) moveFocus(lastId);
       return;
     }
     if (key === "Enter" || key === " ") {
-      const activeId = focusedId;
+      const activeId = focusedIdRef.current;
       if (!activeId) return;
       if (unresolvedById.get(activeId)) return;
       onOpenNote(activeId);
@@ -449,6 +521,9 @@ function GraphCanvas({
     let height = 0;
     const view = { scale: 1, ox: 0, oy: 0 };
     const settleAlpha = 0.003;
+    const minScale = 0.35;
+    const maxScale = 3.5;
+    let autoFit = true;
     let focusedNode: PhysicsNode | null = null;
 
     function findNode(id: string | null): PhysicsNode | null {
@@ -488,9 +563,10 @@ function GraphCanvas({
         (height - pad * 2) / spanY,
         2.2,
       );
-      const targetOx = (width - (minX + maxX) * target) / 2;
-      const targetOy = (height - (minY + maxY) * target) / 2;
-      const scaleDelta = target - view.scale;
+      const clampedTarget = Math.max(minScale, target);
+      const targetOx = (width - (minX + maxX) * clampedTarget) / 2;
+      const targetOy = (height - (minY + maxY) * clampedTarget) / 2;
+      const scaleDelta = clampedTarget - view.scale;
       const oxDelta = targetOx - view.ox;
       const oyDelta = targetOy - view.oy;
       const settled =
@@ -498,7 +574,7 @@ function GraphCanvas({
         Math.abs(oxDelta) <= 0.75 &&
         Math.abs(oyDelta) <= 0.75;
       if (settled) {
-        view.scale = target;
+        view.scale = clampedTarget;
         view.ox = targetOx;
         view.oy = targetOy;
         return false;
@@ -595,6 +671,29 @@ function GraphCanvas({
       return node.unresolved ? 3 : 4 + Math.min(6, node.degree * 1.2);
     }
 
+    function revealFocusedNode() {
+      const node = findNode(focusedIdRef.current);
+      if (!node) return;
+      const margin = 56;
+      const sx = toScreenX(node.x);
+      const sy = toScreenY(node.y);
+      if (sx < margin) view.ox += margin - sx;
+      if (sx > width - margin) view.ox -= sx - (width - margin);
+      if (sy < margin) view.oy += margin - sy;
+      if (sy > height - margin) view.oy -= sy - (height - margin);
+    }
+
+    function zoomAt(factor: number, px = width / 2, py = height / 2) {
+      const world = toWorld(px, py);
+      const nextScale = Math.max(minScale, Math.min(maxScale, view.scale * factor));
+      view.scale = nextScale;
+      view.ox = px - world.x * nextScale;
+      view.oy = py - world.y * nextScale;
+      autoFit = false;
+      revealFocusedNode();
+      requestRender();
+    }
+
     function draw() {
       const textNormal = cssVar("--text-normal") || "#1c1c1c";
       const textMuted = cssVar("--text-muted") || "#6b6b6b";
@@ -602,7 +701,8 @@ function GraphCanvas({
       const border = cssVar("--background-modifier-border") || "#dcdcdc";
       const accentPrimary = cssVar("--accent-primary") || textNormal;
 
-      const viewAnimating = fitView();
+      const viewAnimating = autoFit ? fitView() : false;
+      if (autoFit && !viewAnimating && alpha <= settleAlpha) autoFit = false;
       context!.clearRect(0, 0, width, height);
 
       focusedNode = findNode(focusedIdRef.current);
@@ -657,12 +757,15 @@ function GraphCanvas({
         context!.globalAlpha = active ? 1 : 0.35;
         context!.fill();
 
-        context!.font =
-          '10px -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif';
-        context!.fillStyle = node === hovered || node === focusedNode ? textNormal : textMuted;
-        context!.textAlign = "center";
-        context!.globalAlpha = active ? (node === hovered || node === focusedNode ? 1 : 0.85) : 0.25;
-        context!.fillText(node.label, sx, sy + r + 12);
+        const showLabel = !dense || Boolean(spotlight && active);
+        if (showLabel) {
+          context!.font =
+            '10px -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif';
+          context!.fillStyle = node === hovered || node === focusedNode ? textNormal : textMuted;
+          context!.textAlign = "center";
+          context!.globalAlpha = active ? (node === hovered || node === focusedNode ? 1 : 0.85) : 0.25;
+          context!.fillText(node.label, sx, sy + r + 12);
+        }
         context!.globalAlpha = 1;
       });
 
@@ -711,7 +814,7 @@ function GraphCanvas({
       return null;
     }
 
-    function pointer(event: PointerEvent) {
+    function pointer(event: { clientX: number; clientY: number }) {
       const rect = canvas!.getBoundingClientRect();
       return { x: event.clientX - rect.left, y: event.clientY - rect.top };
     }
@@ -769,6 +872,12 @@ function GraphCanvas({
       }
     }
 
+    function onWheel(event: WheelEvent) {
+      event.preventDefault();
+      const { x, y } = pointer(event);
+      zoomAt(event.deltaY < 0 ? 1.1 : 0.9, x, y);
+    }
+
     function onVisibilityChange() {
       hidden = document.visibilityState === "hidden";
       if (hidden) {
@@ -781,10 +890,28 @@ function GraphCanvas({
     // The container-level keyboard handler updates focusedId; here we only
     // nudge the physics alpha so the selection ring redraws.
     canvasKeyboardRef.current = () => {
+      autoFit = false;
+      revealFocusedNode();
       alpha = Math.max(alpha, 0.15);
       requestRender();
     };
-    focusHandleRef.current = (id) => onFocus(id);
+    focusHandleRef.current = (id) => {
+      focusedIdRef.current = id;
+      autoFit = false;
+      onFocus(id);
+      revealFocusedNode();
+      requestRender();
+    };
+
+    controlsRef.current = {
+      zoomIn: () => zoomAt(1.2),
+      zoomOut: () => zoomAt(0.84),
+      fit: () => {
+        autoFit = true;
+        alpha = Math.max(alpha, 0.15);
+        requestRender();
+      },
+    };
 
     resize();
 
@@ -844,6 +971,7 @@ function GraphCanvas({
     canvas.addEventListener("pointerdown", onPointerDown);
     canvas.addEventListener("pointerup", onPointerUp);
     canvas.addEventListener("pointerleave", onPointerLeave);
+    canvas.addEventListener("wheel", onWheel, { passive: false });
     document.addEventListener("visibilitychange", onVisibilityChange);
     requestRender();
 
@@ -855,11 +983,13 @@ function GraphCanvas({
       canvas.removeEventListener("pointerdown", onPointerDown);
       canvas.removeEventListener("pointerup", onPointerUp);
       canvas.removeEventListener("pointerleave", onPointerLeave);
+      canvas.removeEventListener("wheel", onWheel);
       document.removeEventListener("visibilitychange", onVisibilityChange);
       focusHandleRef.current = null;
       canvasKeyboardRef.current = null;
+      controlsRef.current = null;
     };
-  }, [links, onFocus]);
+  }, [controlsRef, dense, links, onFocus]);
 
   function onKeyDown(event: React.KeyboardEvent<HTMLDivElement>) {
     const key = event.key;
@@ -891,7 +1021,12 @@ function GraphCanvas({
         onFocus={() => setInstructionsShown(true)}
         onKeyDown={onKeyDown}
       >
-        <canvas ref={canvasRef} aria-hidden="true" />
+        <canvas
+          ref={canvasRef}
+          className="graph-canvas"
+          data-graph-density={dense ? "dense" : "sparse"}
+          aria-hidden="true"
+        />
         <div className={`graph-keyboard-hint${instructionsShown ? " is-visible" : ""}`}>
           Arrows or J / K move · Enter opens · switch to List for a flat, keyboard-first view.
         </div>

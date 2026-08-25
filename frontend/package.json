@@ -62,7 +62,9 @@
     "test:wiki-373-delayed-retry": "node tests/wiki-373-delayed-retry.playwright.mjs",
     "test:wiki-373-zero-state": "node tests/wiki-373-zero-state.playwright.mjs",
     "pretest:wiki-384": "npm run build",
-    "test:wiki-384": "node tests/wiki-384-terminal-focus.playwright.mjs"
+    "test:wiki-384": "node tests/wiki-384-terminal-focus.playwright.mjs",
+    "pretest:wiki-386": "npm run build",
+    "test:wiki-386": "node tests/wiki-386-graph-density.playwright.mjs"
   },
   "dependencies": {
     "@codemirror/commands": "^6.10.4",
