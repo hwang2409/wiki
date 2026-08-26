@@ -6,6 +6,7 @@ import fcntl
 import logging
 import os
 import signal
+import threading
 import time
 import traceback
 from pathlib import Path
@@ -23,6 +24,9 @@ from .fleet_monitor_ids import (
 from .protocol import UnixSupervisorServer
 from .store import RunStore, RuntimePaths
 from .supervisor import Supervisor
+
+_ARCHIVE_RECONCILE_START_DELAY_SECONDS = 10.0
+
 
 def build_fleet_monitor_dispatch(supervisor: Supervisor):
     """Return the durable dispatch callable that ``FleetMonitor`` uses.
@@ -129,6 +133,20 @@ async def run_fleet_after_startup(
         await fleet_monitor.run(stop)
 
 
+def reconcile_archive_edges_after_bind(supervisor: Supervisor) -> None:
+    """Reconcile archive edges after the control socket becomes available."""
+
+    try:
+        from .. import workgraph_service
+
+        workgraph_service.reconcile_archive_edges(
+            supervisor.store.paths.archive_dir,
+            status_dir=supervisor.store.paths.status_dir,
+        )
+    except Exception:
+        traceback.print_exc()
+
+
 async def _shutdown(
     server: UnixSupervisorServer,
     supervisor: Supervisor,
@@ -187,6 +205,14 @@ async def run_daemon(args: argparse.Namespace) -> None:
         # Register every retained run before the socket can serve a read.
         supervisor.prepare_startup_recovery()
         await server.start()
+        archive_reconcile_timer = threading.Timer(
+            _ARCHIVE_RECONCILE_START_DELAY_SECONDS,
+            reconcile_archive_edges_after_bind,
+            args=(supervisor,),
+        )
+        archive_reconcile_timer.daemon = True
+        archive_reconcile_timer.name = "agent-supervisor-archive-edge-reconcile"
+        archive_reconcile_timer.start()
         # Bind before replaying retained event history. Recovery rebuilds one
         # run at a time in the supervisor's worker, so ping and new commands
         # remain available while cold-start projections catch up.

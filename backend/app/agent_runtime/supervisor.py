@@ -763,16 +763,6 @@ class Supervisor:
         )
         if self.worker_soft_cap < 1:
             raise ValueError("worker_soft_cap must be positive")
-        try:
-            from .. import workgraph_service
-
-            workgraph_service.reconcile_archive_edges(
-                self.store.paths.archive_dir,
-                status_dir=self.store.paths.status_dir,
-            )
-        except Exception:
-            logger.exception("could not reconcile archived workgraph edges")
-
     def materializer_metrics(self) -> dict[str, Any]:
         with self._materializer_metrics_lock:
             latencies = deque(self.materializer_latency_seconds)
