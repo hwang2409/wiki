@@ -15870,8 +15870,29 @@ textarea.composer-command-input {
 }
 
 .artifact-media-player:is(.is-media-expanded, :fullscreen) .artifact-video-frame,
+.artifact-media-fullscreen-target:fullscreen .artifact-video-frame {
+  width: min(
+    var(--artifact-video-intrinsic-width, var(--artifact-media-expanded-max-width)),
+    var(--artifact-media-expanded-max-width),
+    calc(
+      var(--artifact-media-expanded-max-height)
+      * var(--artifact-video-aspect-width, 16)
+      / var(--artifact-video-aspect-height, 9)
+    )
+  ) !important;
+  height: min(
+    var(--artifact-video-intrinsic-height, var(--artifact-media-expanded-max-height)),
+    var(--artifact-media-expanded-max-height),
+    calc(
+      var(--artifact-media-expanded-max-width)
+      * var(--artifact-video-aspect-height, 9)
+      / var(--artifact-video-aspect-width, 16)
+    )
+  );
+  align-self: center;
+}
+
 .artifact-media-player:is(.is-media-expanded, :fullscreen) .artifact-media-controls,
-.artifact-media-fullscreen-target:fullscreen .artifact-video-frame,
 .artifact-media-fullscreen-target:fullscreen .artifact-media-controls {
   width: min(100%, 1280px);
 }

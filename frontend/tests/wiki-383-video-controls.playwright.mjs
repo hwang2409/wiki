@@ -49,7 +49,7 @@ function buildPortraitVideo(outputPath) {
     "-f",
     "lavfi",
     "-i",
-    "color=c=navy:s=360x720:r=10",
+    "color=c=navy:s=720x1280:r=10",
     "-t",
     "1",
     "-an",
