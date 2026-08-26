@@ -10837,6 +10837,40 @@ class SupervisorTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(archived.run_id, record.run_id)
         self.assertFalse(self.store.run_dir(record.run_id).exists())
 
+    async def test_archive_endpoint_resumes_manifest_after_live_run_file_move(
+        self,
+    ) -> None:
+        record = self._create_terminal_archive_run("WIKI-ARCHIVE-MANIFEST-RETRY")
+        real_commit = store_module.commit_archive
+        session_dir: Path | None = None
+
+        def fail_before_marker(directory: Path, **kwargs: Any) -> None:
+            nonlocal session_dir
+            real_commit(directory, **kwargs)
+            session_dir = directory
+            (directory / "archive-complete.json").unlink()
+            raise OSError("archive interrupted before commit marker")
+
+        with (
+            mock.patch.object(
+                store_module, "commit_archive", side_effect=fail_before_marker
+            ),
+            self.assertRaisesRegex(OSError, "before commit marker"),
+        ):
+            await self.supervisor.archive(record.run_id)
+
+        assert session_dir is not None
+        shutil.move(self.store.run_path(record.run_id), session_dir / "run.json")
+
+        result = await self.supervisor.dispatch(
+            "run/archive",
+            {"run_id": record.run_id},
+        )
+
+        self.assertEqual(result["run_id"], record.run_id)
+        self.assertFalse(self.store.run_dir(record.run_id).exists())
+        self.assertTrue((session_dir / "archive-complete.json").is_file())
+
     async def test_archive_worker_rejects_same_run_commands_while_in_flight(self) -> None:
         record = self._create_terminal_archive_run("WIKI-ARCHIVE-EXCLUSION")
         started = threading.Event()

@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import os
 import signal
+import shutil
 import subprocess
 import sys
 import tempfile
@@ -18,6 +19,7 @@ from uuid import uuid4
 from backend.app import transcripts
 from backend.app.agent_runtime.archive_protocol import (
     ARCHIVE_COMPLETION_MARKER,
+    ARCHIVE_MANIFEST_NAME,
     archive_is_committed,
 )
 from backend.app.agent_runtime import store as store_module
@@ -3358,6 +3360,42 @@ class RunStoreTests(unittest.TestCase):
                 self.assertFalse(store.run_dir(record.run_id).exists())
                 self.assertIsNone(store.current_run_id(record.agent_id))
 
+    def test_archive_manifest_retry_recovers_when_live_run_file_was_moved(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            paths = _paths(root)
+            store = RunStore(paths)
+            record = store.create(_record(root))
+            store.transition(record.run_id, LifecycleState.COMPLETED)
+            real_commit = store_module.commit_archive
+            session_dir: Path | None = None
+
+            def fail_before_marker(directory: Path, **kwargs: Any) -> None:
+                nonlocal session_dir
+                real_commit(directory, **kwargs)
+                session_dir = directory
+                (directory / ARCHIVE_COMPLETION_MARKER).unlink()
+                raise OSError("archive interrupted before commit marker")
+
+            with (
+                mock.patch.object(
+                    store_module, "commit_archive", side_effect=fail_before_marker
+                ),
+                self.assertRaisesRegex(OSError, "before commit marker"),
+            ):
+                store.archive_current(record.run_id)
+
+            assert session_dir is not None
+            self.assertTrue((session_dir / ARCHIVE_MANIFEST_NAME).is_file())
+            shutil.move(store.run_path(record.run_id), session_dir / "run.json")
+
+            archived = store.finalize_archived_run(record.run_id)
+
+            self.assertIsNotNone(archived)
+            self.assertTrue(archive_is_committed(session_dir))
+            self.assertFalse(store.run_dir(record.run_id).exists())
+            self.assertIsNone(store.current_run_id(record.agent_id))
+
     def test_archive_recovery_repairs_implicit_index_before_reuse(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
@@ -3394,12 +3432,16 @@ class RunStoreTests(unittest.TestCase):
             fresh.start_request_id = record.start_request_id
             fresh.implicit_start_request = True
             restarted.create(fresh)
+            restarted.transition(fresh.run_id, LifecycleState.COMPLETED)
             self.assertEqual(restarted.current_run_id(record.agent_id), fresh.run_id)
             with self.assertRaisesRegex(StoreConflict, "older archive marker"):
                 restarted.finalize_archived_run(record.run_id)
             self.assertEqual(restarted.current_run_id(record.agent_id), fresh.run_id)
 
-    def test_reconcile_prunes_headless_registry_rows_missing_run_files(self) -> None:
+            archived_fresh, _ = restarted.archive_current(fresh.run_id)
+            self.assertEqual(archived_fresh.run_id, fresh.run_id)
+
+    def test_reconcile_marks_headless_registry_rows_missing_run_files_corrupt(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
             paths = _paths(root)
@@ -3423,11 +3465,40 @@ class RunStoreTests(unittest.TestCase):
 
             store = RunStore(paths)
 
-            self.assertEqual(store.current_run_id("WIKI-42"), None)
+            registry = json.loads(paths.registry_path.read_text(encoding="utf-8"))
+            self.assertEqual(store.current_run_id("WIKI-42"), missing_run_id)
+            self.assertEqual(registry["WIKI-42"]["current"]["state"], "corrupt")
+
+    def test_reconcile_drops_registry_row_for_committed_archive(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            paths = _paths(root)
+            store = RunStore(paths)
+            record = store.create(_record(root, agent_id="WIKI-COMMITTED-GHOST"))
+            store.transition(record.run_id, LifecycleState.COMPLETED)
+
+            real_rmtree = store_module.shutil.rmtree
+
+            def fail_cleanup(
+                path: str | os.PathLike[str], *args: Any, **kwargs: Any
+            ) -> None:
+                if Path(path) == store.run_dir(record.run_id):
+                    raise OSError("fixture cleanup interruption")
+                real_rmtree(path, *args, **kwargs)
+
+            with (
+                mock.patch.object(store_module.shutil, "rmtree", side_effect=fail_cleanup),
+                self.assertRaisesRegex(OSError, "cleanup interruption"),
+            ):
+                store.archive_current(record.run_id)
+
+            restarted = RunStore(paths)
+
+            self.assertIsNone(restarted.current_run_id(record.agent_id))
             self.assertEqual(
-                json.loads(paths.registry_path.read_text(encoding="utf-8")),
-                {},
+                json.loads(paths.registry_path.read_text(encoding="utf-8")), {}
             )
+            self.assertEqual(restarted.command_state(), {})
 
     def test_env_paths_keep_every_live_surface_redirectable(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

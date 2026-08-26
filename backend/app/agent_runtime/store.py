@@ -18,7 +18,11 @@ from typing import Any
 from uuid import UUID
 
 from .. import knowledge
-from .archive_protocol import archive_is_committed, commit_archive
+from .archive_protocol import (
+    ARCHIVE_MANIFEST_NAME,
+    archive_is_committed,
+    commit_archive,
+)
 from .command_log import CommandLog
 from .process import (
     provider_process_group_members_sync,
@@ -884,6 +888,38 @@ class RunStore:
     def archive_ticket_dir(self, agent_id: str) -> Path:
         return self.paths.archive_dir / agent_id
 
+    def _find_archive_recovery_entry(
+        self, run_id: str
+    ) -> tuple[RunRecord, Path, bool] | None:
+        """Find the newest archive snapshot for a run, including partial ones."""
+
+        manifest_paths = sorted(
+            self.paths.archive_dir.glob(f"*/*/{ARCHIVE_MANIFEST_NAME}"),
+            key=lambda path: (path.parent.name, path.parent.parent.name),
+            reverse=True,
+        )
+        for manifest_path in manifest_paths:
+            session_dir = manifest_path.parent
+            try:
+                manifest = _read_json(manifest_path)
+                if not isinstance(manifest, dict) or manifest.get("run_id") != run_id:
+                    continue
+                value = _read_json(session_dir / "run.json")
+                if not isinstance(value, dict) or value.get("run_id") != run_id:
+                    return None
+                record = RunRecord.from_dict(value)
+            except (OSError, StoreError, TypeError, ValueError):
+                return None
+            return record, session_dir, archive_is_committed(session_dir)
+        return None
+
+    def find_archive_recovery_run(self, run_id: str) -> RunRecord | None:
+        """Find a run record in a committed or manifest-only archive snapshot."""
+
+        with self._lock:
+            entry = self._find_archive_recovery_entry(run_id)
+            return entry[0] if entry is not None else None
+
     def _find_archived_run_entry(self, run_id: str) -> tuple[RunRecord, Path] | None:
         """Return one archive record and its session directory."""
 
@@ -929,15 +965,38 @@ class RunStore:
         with self._lock:
             if run_id in self._archive_inflight:
                 raise StoreConflict("archive is already in progress")
-            archived_entry = self._find_archived_run_entry(run_id)
-            if archived_entry is None:
+            recovery_entry = self._find_archive_recovery_entry(run_id)
+            if recovery_entry is None:
                 return None
-            archived, session_dir = archived_entry
-            self._validate_committed_archive_locked(
-                run_id,
-                archived,
-                session_dir,
-            )
+            archived, session_dir, committed = recovery_entry
+            if committed:
+                self._validate_committed_archive_locked(run_id, archived, session_dir)
+            else:
+                manifest = _read_json(session_dir / ARCHIVE_MANIFEST_NAME)
+                files = manifest.get("files") if isinstance(manifest, dict) else None
+                completed_at = (
+                    manifest.get("completed_at")
+                    if isinstance(manifest, dict)
+                    else None
+                )
+                if not isinstance(files, dict) or not isinstance(completed_at, str):
+                    raise StoreConflict("archive manifest is incomplete")
+                expected_paths: list[Path] = []
+                for relative in files:
+                    if not isinstance(relative, str):
+                        raise StoreConflict("archive manifest contains an invalid path")
+                    relative_path = Path(relative)
+                    if relative_path.is_absolute() or ".." in relative_path.parts:
+                        raise StoreConflict("archive manifest contains an unsafe path")
+                    expected_paths.append(session_dir / relative_path)
+                commit_archive(
+                    session_dir,
+                    run_id=run_id,
+                    completed_at=completed_at,
+                    expected_paths=expected_paths,
+                )
+                if not archive_is_committed(session_dir):
+                    raise StoreConflict("archive commit failed verification")
             self._admit_archive_locked(run_id)
         try:
             self._finish_archive_cleanup(archived, session_dir)
@@ -1779,12 +1838,40 @@ class RunStore:
                 continue
             if self.run_path(run_id).is_file():
                 continue
-            # Archive finalization deletes the runtime run dir first, then
-            # drops the registry row. If the daemon stops between those steps,
-            # the missing run file is the durable signal that the current row
-            # must not survive restart.
-            registry.pop(agent_id, None)
-            changed = True
+            recovery_entry = self._find_archive_recovery_entry(run_id)
+            if recovery_entry is not None and recovery_entry[2]:
+                # Archive finalization deletes the runtime run dir first, then
+                # drops the registry row. If the daemon stops between those
+                # steps, a committed archive proves the row is safe to drop.
+                registry.pop(agent_id, None)
+                self.command_log.replace_projection(agent_id, {})
+                logger.info(
+                    "dropped registry entry after committed archive: "
+                    "agent_id=%s run_id=%s",
+                    agent_id,
+                    run_id,
+                )
+                changed = True
+                continue
+            # A missing run without a committed archive has no safe recovery
+            # source. Keep the row visible as terminal corruption for repair.
+            if (
+                current.get("state") != "corrupt"
+                or current.get("state_reason")
+                != "run directory missing without committed archive"
+            ):
+                current["state"] = "corrupt"
+                current["state_reason"] = (
+                    "run directory missing without committed archive"
+                )
+                changed = True
+            self.command_log.replace_projection(agent_id, {agent_id: registry[agent_id]})
+            logger.error(
+                "registry entry has missing run directory without committed archive: "
+                "agent_id=%s run_id=%s",
+                agent_id,
+                run_id,
+            )
 
         records_by_agent: dict[str, list[RunRecord]] = {}
         for record in self.list_runs():
