@@ -3,14 +3,14 @@ import type { CSSProperties } from "react";
 import { Play } from "lucide-react";
 import type { SessionArtifact, SessionEvent } from "./api";
 import { artifactUrl, type ArtifactRendererProps } from "./artifact-renderers-shared";
+import { MediaControls } from "./artifact-media-controls";
 
 // Fallback aspect ratio for videos whose containers do not carry stored
 // dimensions (currently only image/gif when the payload omits width/height).
 // Keeps the frame the same size before and after `loadedmetadata` so the
 // transcript never jumps.
 const VIDEO_FALLBACK_ASPECT_RATIO = "16 / 9";
-
-const MEDIA_SPEED_OPTIONS: readonly number[] = [0.75, 1, 1.25, 1.5, 2];
+const VIDEO_MAX_HEIGHT = 560;
 
 function usePrefersReducedMotion(): boolean {
   const [reduced, setReduced] = useState(() => {
@@ -29,17 +29,6 @@ function usePrefersReducedMotion(): boolean {
     return () => mq.removeListener(handler);
   }, []);
   return reduced;
-}
-
-function formatMediaDuration(seconds: number): string {
-  if (!Number.isFinite(seconds) || seconds < 0) return "";
-  const total = Math.round(seconds);
-  const hours = Math.floor(total / 3600);
-  const minutes = Math.floor((total % 3600) / 60);
-  const secs = total % 60;
-  const mm = String(minutes).padStart(hours ? 2 : 1, "0");
-  const ss = String(secs).padStart(2, "0");
-  return hours ? `${hours}:${mm}:${ss}` : `${mm}:${ss}`;
 }
 
 function artifactSource(artifact: SessionArtifact, event: SessionEvent, ticket: string, fallback: string): string {
@@ -135,7 +124,10 @@ function GifRenderer({
     ? { aspectRatio: `${width} / ${height}` }
     : { aspectRatio: VIDEO_FALLBACK_ASPECT_RATIO };
   return (
-    <div className="artifact-video-wrap artifact-gif-wrap" style={ratioStyle}>
+    <div
+      className="artifact-video-wrap artifact-gif-wrap"
+      style={{ ...ratioStyle, maxWidth: width ? `${width}px` : undefined }}
+    >
       <img
         ref={imgRef}
         src={source}
@@ -207,51 +199,53 @@ export function VideoRenderer({ artifact, event, ticket }: ArtifactRendererProps
       />
     );
   }
-  const knownDims = artifact.width && artifact.height;
+  const intrinsicWidth = artifact.width;
+  const intrinsicHeight = artifact.height;
+  const knownDims = Boolean(intrinsicWidth && intrinsicHeight);
+  const maxFrameWidth = intrinsicWidth && intrinsicHeight
+    ? Math.min(intrinsicWidth, VIDEO_MAX_HEIGHT * (intrinsicWidth / intrinsicHeight))
+    : undefined;
   const ratioStyle: CSSProperties = knownDims
     ? { aspectRatio: `${artifact.width} / ${artifact.height}` }
     : { aspectRatio: VIDEO_FALLBACK_ASPECT_RATIO };
   const durationSeconds = artifact.duration_ms
     ? artifact.duration_ms / 1000
     : undefined;
+  const frameStyle: CSSProperties = {
+    ...ratioStyle,
+    maxWidth: maxFrameWidth === undefined ? undefined : `${maxFrameWidth}px`,
+    ["--artifact-video-intrinsic-width" as string]: intrinsicWidth ? `${intrinsicWidth}px` : undefined,
+    ["--artifact-video-intrinsic-height" as string]: intrinsicHeight ? `${intrinsicHeight}px` : undefined,
+    ["--artifact-video-aspect-width" as string]: intrinsicWidth || undefined,
+    ["--artifact-video-aspect-height" as string]: intrinsicHeight || undefined,
+  };
   return (
     <div className="artifact-video-wrap">
-      <div className="artifact-video-frame" style={ratioStyle}>
-        <video
-          ref={attachVideoRef}
-          className="artifact-video"
-          controls
-          controlsList="nodownload"
-          preload="metadata"
-          playsInline
-          poster={artifact.poster_base64}
-          aria-label={label}
-          src={source}
-          width={artifact.width}
-          height={artifact.height}
-        />
-      </div>
-      <div className="artifact-video-controls tabular-nums">
-        {durationSeconds !== undefined ? (
-          <span className="artifact-video-duration">
-            {formatMediaDuration(durationSeconds)}
-          </span>
-        ) : null}
-        <label className="artifact-video-speed">
-          <span>Speed</span>
-          <select
-            aria-label="Playback speed"
-            onChange={(mediaEvent) => setSpeed(Number(mediaEvent.target.value))}
-            value={speed}
-          >
-            {MEDIA_SPEED_OPTIONS.map((option) => (
-              <option key={option} value={option}>
-                {option}x
-              </option>
-            ))}
-          </select>
-        </label>
-      </div>
+      <MediaControls
+        className="artifact-video-player"
+        controlsClassName="artifact-video-controls"
+        initialDuration={durationSeconds}
+        mediaLabel={label}
+        mediaKey={source}
+        mediaRef={videoRef}
+        onSpeedChange={setSpeed}
+        showFullscreen
+        speed={speed}
+      >
+        <div className="artifact-video-frame" style={frameStyle}>
+          <video
+            ref={attachVideoRef}
+            className="artifact-video"
+            preload="metadata"
+            playsInline
+            poster={artifact.poster_base64}
+            aria-label={label}
+            src={source}
+            width={artifact.width}
+            height={artifact.height}
+          />
+        </div>
+      </MediaControls>
     </div>
   );
 }
@@ -323,36 +317,17 @@ export function AudioRenderer({ artifact, event, ticket }: ArtifactRendererProps
       {artifact.peaks && artifact.peaks.length > 0 ? (
         <AudioWaveform peaks={artifact.peaks} label={label} />
       ) : null}
-      <audio
-        ref={attachAudioRef}
-        className="artifact-audio"
-        controls
-        controlsList="nodownload"
-        preload="metadata"
-        aria-label={label}
-        src={source}
-      />
-      <div className="artifact-audio-controls tabular-nums">
-        {durationSeconds !== undefined ? (
-          <span className="artifact-audio-duration">
-            {formatMediaDuration(durationSeconds)}
-          </span>
-        ) : null}
-        <label className="artifact-audio-speed">
-          <span>Speed</span>
-          <select
-            aria-label="Playback speed"
-            onChange={(mediaEvent) => setSpeed(Number(mediaEvent.target.value))}
-            value={speed}
-          >
-            {MEDIA_SPEED_OPTIONS.map((option) => (
-              <option key={option} value={option}>
-                {option}x
-              </option>
-            ))}
-          </select>
-        </label>
-        {artifact.transcript ? (
+      <MediaControls
+        className="artifact-audio-player"
+        controlsClassName="artifact-audio-controls"
+        initialDuration={durationSeconds}
+        mediaLabel={label}
+        mediaKey={source}
+        mediaRef={audioRef}
+        onSpeedChange={setSpeed}
+        showFullscreen={false}
+        speed={speed}
+        additionalControls={artifact.transcript ? (
           <button
             aria-expanded={showTranscript}
             className="artifact-audio-transcript-toggle"
@@ -361,8 +336,16 @@ export function AudioRenderer({ artifact, event, ticket }: ArtifactRendererProps
           >
             {showTranscript ? "Hide transcript" : "Show transcript"}
           </button>
-        ) : null}
-      </div>
+        ) : undefined}
+      >
+        <audio
+          ref={attachAudioRef}
+          className="artifact-audio"
+          preload="metadata"
+          aria-label={label}
+          src={source}
+        />
+      </MediaControls>
       {showTranscript && artifact.transcript ? (
         <div
           aria-label="Transcript"

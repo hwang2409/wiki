@@ -1,5 +1,5 @@
 // @vitest-environment jsdom
-import { cleanup, fireEvent, render, screen } from "@testing-library/react";
+import { cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react";
 import { afterEach, beforeEach, describe, expect, test, vi } from "vitest";
 
 import type { SessionArtifact, SessionEvent } from "../src/api";
@@ -20,6 +20,10 @@ function makeEvent(artifact: SessionArtifact, artifactId = "00000000-0000-4000-8
     caption: "test",
     artifact,
   };
+}
+
+function getMediaElement<T extends HTMLMediaElement>(tagName: "audio" | "video"): T {
+  return screen.getByRole("group", { name: "Fixture media" }).querySelector(tagName) as T;
 }
 
 let matchesReducedMotion = false;
@@ -64,13 +68,13 @@ describe("VideoRenderer", () => {
     };
     const event = makeEvent(artifact, "webm");
     render(<VideoRenderer artifact={artifact} event={event} ticket={TICKET} />);
-    const video = screen.getByLabelText("Fixture media") as HTMLVideoElement;
+    const video = getMediaElement<HTMLVideoElement>("video");
     expect(video.tagName).toBe("VIDEO");
     expect(video.getAttribute("src")).toContain("/artifact/webm");
     expect(downloadName(event)).toBe("Fixture-media.webm");
   });
 
-  test("renders a native <video> with controls and preload=metadata", () => {
+  test("renders a custom control bar with preload=metadata", () => {
     const artifact: SessionArtifact = {
       kind: "video",
       mime: "video/mp4",
@@ -81,13 +85,72 @@ describe("VideoRenderer", () => {
       height: 240,
     };
     render(<VideoRenderer artifact={artifact} event={makeEvent(artifact)} ticket={TICKET} />);
-    const video = screen.getByLabelText("Fixture media") as HTMLVideoElement;
+    const video = getMediaElement<HTMLVideoElement>("video");
     expect(video.tagName).toBe("VIDEO");
-    expect(video.hasAttribute("controls")).toBe(true);
+    expect(video.hasAttribute("controls")).toBe(false);
+    expect(video.hasAttribute("controlsList")).toBe(false);
     expect(video.getAttribute("preload")).toBe("metadata");
     expect(video.getAttribute("playsinline")).not.toBeNull();
     expect(video.getAttribute("src")).toContain("artifact");
     expect(screen.getByText("0:03")).toBeTruthy();
+    expect(screen.getByRole("button", { name: "Play" })).toBeTruthy();
+    expect(screen.getByRole("slider", { name: "Seek" })).toBeTruthy();
+    expect(screen.getByRole("slider", { name: "Volume" })).toBeTruthy();
+  });
+
+  test("video controls play, mute, volume, and seek the media element", () => {
+    const artifact: SessionArtifact = {
+      kind: "video",
+      mime: "video/mp4",
+      ref: "artifact://abc",
+      duration_ms: 10000,
+    };
+    const playSpy = vi.spyOn(HTMLMediaElement.prototype, "play").mockResolvedValue(undefined);
+    const pauseSpy = vi.spyOn(HTMLMediaElement.prototype, "pause").mockImplementation(() => undefined);
+    render(<VideoRenderer artifact={artifact} event={makeEvent(artifact)} ticket={TICKET} />);
+    const video = getMediaElement<HTMLVideoElement>("video");
+    Object.defineProperty(video, "paused", { configurable: true, value: true });
+    fireEvent.click(screen.getByRole("button", { name: "Play" }));
+    expect(playSpy).toHaveBeenCalled();
+    Object.defineProperty(video, "paused", { configurable: true, value: false });
+    fireEvent(video, new Event("play"));
+    fireEvent.click(screen.getByRole("button", { name: "Pause" }));
+    expect(pauseSpy).toHaveBeenCalled();
+    fireEvent.click(screen.getByRole("button", { name: "Mute" }));
+    expect(video.muted).toBe(true);
+    fireEvent.change(screen.getByRole("slider", { name: "Volume" }), { target: { value: "0.5" } });
+    expect(video.volume).toBeCloseTo(0.5);
+    expect(video.muted).toBe(false);
+    fireEvent.change(screen.getByRole("slider", { name: "Seek" }), { target: { value: "4" } });
+    expect(video.currentTime).toBe(4);
+  });
+
+  test("unmute restores volume after volume is set to zero", () => {
+    const artifact: SessionArtifact = { kind: "video", mime: "video/mp4", ref: "artifact://abc" };
+    render(<VideoRenderer artifact={artifact} event={makeEvent(artifact)} ticket={TICKET} />);
+    const video = getMediaElement<HTMLVideoElement>("video");
+    const volumeSlider = screen.getByRole("slider", { name: "Volume" });
+    fireEvent.change(volumeSlider, { target: { value: "0.5" } });
+    fireEvent.change(volumeSlider, { target: { value: "0" } });
+    expect(video.volume).toBe(0);
+    expect(video.muted).toBe(true);
+    fireEvent.click(screen.getByRole("button", { name: "Unmute" }));
+    expect(video.volume).toBeCloseTo(0.5);
+    expect(video.muted).toBe(false);
+    expect(screen.getByRole("button", { name: "Mute" })).toBeTruthy();
+  });
+
+  test("fullscreen falls back to an expanded, focusable player", async () => {
+    Object.defineProperty(document, "fullscreenEnabled", { configurable: true, value: false });
+    const artifact: SessionArtifact = { kind: "video", mime: "video/mp4", ref: "artifact://abc" };
+    render(<VideoRenderer artifact={artifact} event={makeEvent(artifact)} ticket={TICKET} />);
+    const player = screen.getByRole("group", { name: "Fixture media" });
+    expect(player.getAttribute("aria-keyshortcuts")).toContain("F");
+    fireEvent.click(screen.getByRole("button", { name: "Enter fullscreen" }));
+    const expandedPlayer = await screen.findByRole("dialog", { name: "Fixture media" });
+    expect(expandedPlayer.classList.contains("is-media-expanded")).toBe(true);
+    fireEvent.click(screen.getByRole("button", { name: "Exit fullscreen" }));
+    await waitFor(() => expect(screen.queryByRole("dialog", { name: "Fixture media" })).toBeNull());
   });
 
   test("reserves aspect ratio to prevent CLS when width/height are known", () => {
@@ -103,11 +166,24 @@ describe("VideoRenderer", () => {
     expect(frame.style.aspectRatio).toBe("640 / 480");
   });
 
+  test("caps portrait frame width at the video height limit", () => {
+    const artifact: SessionArtifact = {
+      kind: "video",
+      mime: "video/mp4",
+      ref: "artifact://portrait",
+      width: 720,
+      height: 1280,
+    };
+    render(<VideoRenderer artifact={artifact} event={makeEvent(artifact)} ticket={TICKET} />);
+    const frame = document.querySelector(".artifact-video-frame") as HTMLDivElement;
+    expect(frame.style.maxWidth).toBe("315px");
+  });
+
   test("speed selector updates playbackRate on the video element", () => {
     const artifact: SessionArtifact = { kind: "video", mime: "video/mp4", ref: "artifact://abc" };
     render(<VideoRenderer artifact={artifact} event={makeEvent(artifact)} ticket={TICKET} />);
     const select = screen.getByLabelText("Playback speed") as HTMLSelectElement;
-    const video = screen.getByLabelText("Fixture media") as HTMLVideoElement;
+    const video = getMediaElement<HTMLVideoElement>("video");
     fireEvent.change(select, { target: { value: "1.5" } });
     expect(video.playbackRate).toBeCloseTo(1.5);
   });
@@ -171,9 +247,9 @@ describe("VideoRenderer", () => {
     const { unmount } = render(
       <VideoRenderer artifact={artifact} event={makeEvent(artifact)} ticket={TICKET} />,
     );
-    expect(screen.queryByLabelText("Fixture media")).not.toBeNull();
+    expect(getMediaElement<HTMLVideoElement>("video")).not.toBeNull();
     unmount();
-    expect(screen.queryByLabelText("Fixture media")).toBeNull();
+    expect(screen.queryByRole("group", { name: "Fixture media" })).toBeNull();
   });
 
   test("same-kind navigation reloads the video and keeps playback rate", () => {
@@ -185,7 +261,7 @@ describe("VideoRenderer", () => {
     );
     const select = screen.getByLabelText("Playback speed") as HTMLSelectElement;
     fireEvent.change(select, { target: { value: "1.5" } });
-    const video = screen.getByLabelText("Fixture media") as HTMLVideoElement;
+    const video = getMediaElement<HTMLVideoElement>("video");
     const firstSrc = video.getAttribute("src");
     rerender(<VideoRenderer artifact={second} event={makeEvent(second, "second")} ticket={TICKET} />);
     expect(video.getAttribute("src")).not.toBe(firstSrc);
@@ -225,7 +301,7 @@ describe("VideoRenderer", () => {
       poster_base64: "data:image/jpeg;base64,AAAA",
     };
     render(<VideoRenderer artifact={artifact} event={makeEvent(artifact)} ticket={TICKET} />);
-    const video = screen.getByLabelText("Fixture media") as HTMLVideoElement;
+    const video = getMediaElement<HTMLVideoElement>("video");
     expect(video.getAttribute("poster")).toBe("data:image/jpeg;base64,AAAA");
   });
 
@@ -244,7 +320,7 @@ describe("VideoRenderer", () => {
 });
 
 describe("AudioRenderer", () => {
-  test("renders a native <audio> element with controls and preload=metadata", () => {
+  test("renders a custom control bar with preload=metadata", () => {
     const artifact: SessionArtifact = {
       kind: "audio",
       mime: "audio/wav",
@@ -252,18 +328,21 @@ describe("AudioRenderer", () => {
       duration_ms: 65000,
     };
     render(<AudioRenderer artifact={artifact} event={makeEvent(artifact)} ticket={TICKET} />);
-    const audio = screen.getByLabelText("Fixture media") as HTMLAudioElement;
+    const audio = getMediaElement<HTMLAudioElement>("audio");
     expect(audio.tagName).toBe("AUDIO");
-    expect(audio.hasAttribute("controls")).toBe(true);
+    expect(audio.hasAttribute("controls")).toBe(false);
+    expect(audio.hasAttribute("controlsList")).toBe(false);
     expect(audio.getAttribute("preload")).toBe("metadata");
     expect(screen.getByText("1:05")).toBeTruthy();
+    expect(screen.getByRole("button", { name: "Play" })).toBeTruthy();
+    expect(screen.queryByRole("button", { name: "Enter fullscreen" })).toBeNull();
   });
 
   test("speed selector updates playbackRate on the audio element", () => {
     const artifact: SessionArtifact = { kind: "audio", mime: "audio/wav", ref: "artifact://a" };
     render(<AudioRenderer artifact={artifact} event={makeEvent(artifact)} ticket={TICKET} />);
     const select = screen.getByLabelText("Playback speed") as HTMLSelectElement;
-    const audio = screen.getByLabelText("Fixture media") as HTMLAudioElement;
+    const audio = getMediaElement<HTMLAudioElement>("audio");
     fireEvent.change(select, { target: { value: "0.75" } });
     expect(audio.playbackRate).toBeCloseTo(0.75);
   });
@@ -277,7 +356,7 @@ describe("AudioRenderer", () => {
     );
     const select = screen.getByLabelText("Playback speed") as HTMLSelectElement;
     fireEvent.change(select, { target: { value: "1.5" } });
-    const audio = screen.getByLabelText("Fixture media") as HTMLAudioElement;
+    const audio = getMediaElement<HTMLAudioElement>("audio");
     const firstSrc = audio.getAttribute("src");
     rerender(<AudioRenderer artifact={second} event={makeEvent(second, "second")} ticket={TICKET} />);
     expect(audio.getAttribute("src")).not.toBe(firstSrc);
@@ -334,9 +413,9 @@ describe("AudioRenderer", () => {
     const { unmount } = render(
       <AudioRenderer artifact={artifact} event={makeEvent(artifact)} ticket={TICKET} />,
     );
-    expect(screen.queryByLabelText("Fixture media")).not.toBeNull();
+    expect(getMediaElement<HTMLAudioElement>("audio")).not.toBeNull();
     unmount();
-    expect(screen.queryByLabelText("Fixture media")).toBeNull();
+    expect(screen.queryByRole("group", { name: "Fixture media" })).toBeNull();
   });
 });
 
