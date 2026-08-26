@@ -6,12 +6,11 @@ type UseMenuKeyboardOptions = {
   open: boolean;
   onClose: (reason: MenuCloseReason) => void;
   triggerRef: RefObject<HTMLButtonElement | null>;
+  fallbackRef?: RefObject<HTMLElement | null>;
 };
 
 function getMenuItems(menu: HTMLDivElement | null): HTMLElement[] {
-  return Array.from(
-    menu?.querySelectorAll<HTMLElement>('[role="menuitem"]:not([aria-disabled="true"])') ?? [],
-  );
+  return Array.from(menu?.querySelectorAll<HTMLElement>('[role="menuitem"]') ?? []);
 }
 
 function focusMenuItem(items: HTMLElement[], index: number) {
@@ -21,7 +20,13 @@ function focusMenuItem(items: HTMLElement[], index: number) {
   items[index]?.focus();
 }
 
-export function useMenuKeyboard({ open, onClose, triggerRef }: UseMenuKeyboardOptions) {
+function focusConnected(element: HTMLElement | null | undefined): boolean {
+  if (!element?.isConnected) return false;
+  element.focus();
+  return true;
+}
+
+export function useMenuKeyboard({ open, onClose, triggerRef, fallbackRef }: UseMenuKeyboardOptions) {
   const menuRef = useRef<HTMLDivElement | null>(null);
 
   useEffect(() => {
@@ -40,14 +45,18 @@ export function useMenuKeyboard({ open, onClose, triggerRef }: UseMenuKeyboardOp
     }
     if (event.key === "Escape") {
       event.preventDefault();
+      event.stopPropagation();
       onClose("escape");
-      window.requestAnimationFrame(() => triggerRef.current?.focus());
+      window.requestAnimationFrame(() => {
+        if (!focusConnected(triggerRef.current)) focusConnected(fallbackRef?.current);
+      });
       return;
     }
 
     const items = getMenuItems(menuRef.current);
     if (items.length === 0) return;
-    const activeIndex = items.indexOf(document.activeElement as HTMLElement);
+    const activeElement = document.activeElement instanceof HTMLElement ? document.activeElement : null;
+    const activeIndex = activeElement ? items.indexOf(activeElement) : -1;
     let nextIndex: number | null = null;
     if (event.key === "ArrowDown") nextIndex = activeIndex < 0 ? 0 : (activeIndex + 1) % items.length;
     else if (event.key === "ArrowUp") nextIndex = activeIndex < 0 ? items.length - 1 : (activeIndex - 1 + items.length) % items.length;
@@ -63,7 +72,7 @@ export function useMenuKeyboard({ open, onClose, triggerRef }: UseMenuKeyboardOp
     if (nextIndex === null) return;
     event.preventDefault();
     focusMenuItem(items, nextIndex);
-  }, [onClose, triggerRef]);
+  }, [fallbackRef, onClose, triggerRef]);
 
   return { menuRef, onKeyDown };
 }

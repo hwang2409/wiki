@@ -1,4 +1,4 @@
-import { Fragment, useEffect, useRef, useState, type FormEvent, type ReactNode } from "react";
+import { Fragment, useEffect, useRef, useState, type FormEvent, type ReactNode, type RefObject } from "react";
 import {
   AlertTriangle,
   Archive,
@@ -114,6 +114,7 @@ function AgentActionMenu({
   onClose,
   onSelect,
   onToggle,
+  fallbackRef,
   registerTrigger,
 }: {
   id: string;
@@ -122,12 +123,12 @@ function AgentActionMenu({
   onClose: (reason: MenuCloseReason) => void;
   onSelect: (item: AgentMenuItem, trigger: HTMLButtonElement) => void;
   onToggle: () => void;
+  fallbackRef: RefObject<HTMLElement | null>;
   registerTrigger: (id: string, button: HTMLButtonElement | null) => void;
 }) {
   const triggerRef = useRef<HTMLButtonElement | null>(null);
   const menuId = `agent-menu-${id}`;
-  const { menuRef, onKeyDown } = useMenuKeyboard({ open, onClose, triggerRef });
-  const firstEnabledKey = items.find((candidate) => !candidate.disabled)?.key;
+  const { menuRef, onKeyDown } = useMenuKeyboard({ fallbackRef, open, onClose, triggerRef });
 
   return (
     <span className="agent-card-menu" data-agent-menu-for={id}>
@@ -148,7 +149,7 @@ function AgentActionMenu({
       </button>
       {open ? (
         <div className="agent-card-menu-popover" id={menuId} ref={menuRef} role="menu" onKeyDown={onKeyDown}>
-          {items.map((item) => {
+          {items.map((item, index) => {
             const reasonId = item.disabled ? `${menuId}-${item.key}-reason` : undefined;
             return (
               <span key={item.key}>
@@ -162,7 +163,7 @@ function AgentActionMenu({
                   aria-disabled={item.disabled ? "true" : undefined}
                   className="agent-card-menu-item"
                   role="menuitem"
-                  tabIndex={item.disabled || item.key === firstEnabledKey ? 0 : -1}
+                  tabIndex={index === 0 ? 0 : -1}
                   title={item.title}
                   type="button"
                   onClick={() => {
@@ -1347,6 +1348,7 @@ export function AgentsView({
   const [expandedDetails, setExpandedDetails] = useState<Set<string>>(new Set());
   const [openMenuTicket, setOpenMenuTicket] = useState<string | null>(null);
   const menuButtonRefs = useRef(new Map<string, HTMLButtonElement>());
+  const agentsViewRef = useRef<HTMLDivElement | null>(null);
 
   function closeMenu(_reason: "escape" | "pointer" | "tab") {
     setOpenMenuTicket(null);
@@ -1916,6 +1918,7 @@ export function AgentsView({
             </button>
             {menuItems.length > 0 ? (
               <AgentActionMenu
+                fallbackRef={agentsViewRef}
                 id={orch.id}
                 items={menuItems}
                 open={menuOpen}
@@ -2209,6 +2212,7 @@ export function AgentsView({
             </button>
             {menuItems.length > 0 ? (
               <AgentActionMenu
+                fallbackRef={agentsViewRef}
                 id={worker.ticket}
                 items={menuItems}
                 open={menuOpen}
@@ -2328,7 +2332,7 @@ export function AgentsView({
   return (
     <ScreencastProvider>
     <div className={`agents-layout${openWorker ? " has-sidebar" : ""}`}>
-      <div className="agents-view">
+      <div className="agents-view" ref={agentsViewRef} tabIndex={-1}>
         <div className="agents-page-tools">
           <span className="agents-run-count">
             {orchestrators.length} orchestrator{orchestrators.length === 1 ? "" : "s"} ·{" "}

@@ -440,7 +440,10 @@ export function AgentSessionSurface({
   const closeArtifactPanel = useCallback((restoreFocus = true) => {
     commitPanelState((current) => ({ ...current, open: false }));
     if (restoreFocus) {
-      window.requestAnimationFrame(() => artifactTriggerRef.current?.focus());
+      window.requestAnimationFrame(() => {
+        if (artifactTriggerRef.current?.isConnected) artifactTriggerRef.current.focus();
+        else rowRef.current?.focus();
+      });
     }
   }, [commitPanelState]);
 
@@ -501,11 +504,6 @@ export function AgentSessionSurface({
       // The fullscreen inspector traps and handles its own keys.
       if (inspectorOpenRef.current) return;
       const command = event.metaKey || event.ctrlKey;
-      if (event.key === "Escape" && panelState.open && panelState.focusedTab) {
-        event.preventDefault();
-        closeArtifactTab(panelState.focusedTab);
-        return;
-      }
       if (!command || !event.shiftKey) return;
       if (event.key.toLocaleLowerCase() === "a") {
         if (panelState.tabs.length === 0) return;
@@ -530,7 +528,7 @@ export function AgentSessionSurface({
     };
     window.addEventListener("keydown", onShortcut);
     return () => window.removeEventListener("keydown", onShortcut);
-  }, [closeArtifactTab, commitPanelState, panelState.focusedTab, panelState.open, panelState.tabs]);
+  }, [commitPanelState, panelState.open, panelState.tabs]);
 
   const {
     handleArtifactsChange: inspectorArtifactsChange,
@@ -607,7 +605,7 @@ export function AgentSessionSurface({
   const blocker = worker.blocker?.trim() || null;
   const state = worker.state ?? null;
   return (
-    <div className={`agent-session-surface-row is-${context}`} ref={rowRef}>
+    <div className={`agent-session-surface-row is-${context}`} ref={rowRef} tabIndex={-1}>
       <section className={`agent-session-surface is-${context}`}>
         <header className="session-header agent-session-surface-head">
           <div className="agent-session-head-primary" data-testid="session-header-primary">

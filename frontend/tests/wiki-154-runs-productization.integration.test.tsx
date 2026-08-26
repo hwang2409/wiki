@@ -461,7 +461,7 @@ test("Replace stays disabled with a reason when a worker has no live runtime", a
     const stop = view.getByRole("menuitem", { name: /^Stop$/ }) as HTMLButtonElement;
     expect(replace.disabled).toBe(false);
     expect(replace.getAttribute("aria-disabled")).toBe("true");
-    expect(replace.tabIndex).toBe(0);
+    expect(replace.tabIndex).toBe(-1);
     expect(replace.getAttribute("aria-describedby")).toBeTruthy();
     expect(replace.title).toBe("Legacy tmux runs must be migrated before Replace is available");
     expect(stop.getAttribute("aria-disabled")).toBe("true");

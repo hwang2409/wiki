@@ -55,6 +55,7 @@ export function ArtifactPanel({
   const detailId = useId();
   const overflowMenuId = "artifact-panel-overflow-menu";
   const { menuRef: overflowMenuRef, onKeyDown: onOverflowKeyDown } = useMenuKeyboard({
+    fallbackRef: panelRef,
     open: overflowOpen,
     onClose: () => setOverflowOpen(false),
     triggerRef: overflowTriggerRef,
@@ -76,10 +77,14 @@ export function ArtifactPanel({
 
   function closeTab(artifactId: string) {
     const index = state.tabs.indexOf(artifactId);
+    if (index < 0) return;
+    const shouldMoveFocus = artifactId === focusedId;
     const nextTabId = state.tabs[index + 1] ?? state.tabs[index - 1] ?? null;
     onCloseTab(artifactId);
+    if (!shouldMoveFocus) return;
     window.requestAnimationFrame(() => {
-      if (nextTabId) tabRefs.current.get(nextTabId)?.focus();
+      const nextTab = nextTabId ? tabRefs.current.get(nextTabId) : null;
+      if (nextTab?.isConnected) nextTab.focus();
       else panelRef.current?.focus();
     });
   }
@@ -107,6 +112,11 @@ export function ArtifactPanel({
 
   function onKeyDown(event: ReactKeyboardEvent<HTMLElement>) {
     const command = event.metaKey || event.ctrlKey;
+    if (event.key === "Escape" && focusedId) {
+      event.preventDefault();
+      closeTab(focusedId);
+      return;
+    }
     if (command && event.key.toLocaleLowerCase() === "w") {
       event.preventDefault();
       if (focusedId) closeTab(focusedId);
@@ -187,6 +197,9 @@ export function ArtifactPanel({
                   aria-label={`Close ${label}`}
                   className="bb-tab-pill__close"
                   type="button"
+                  onMouseDown={(event) => {
+                    if (artifactId !== focusedId) event.preventDefault();
+                  }}
                   onClick={() => closeTab(artifactId)}
                 >
                   <X aria-hidden="true" className="bb-tab-pill__close-glyph" />
@@ -271,7 +284,7 @@ export function ArtifactPanel({
                   <button
                     className="artifact-render-fallback-action"
                     type="button"
-                    onClick={() => onCloseTab(focusedId)}
+                    onClick={() => closeTab(focusedId)}
                   >
                     Close tab
                   </button>
