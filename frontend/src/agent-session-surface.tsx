@@ -508,10 +508,14 @@ export function AgentSessionSurface({
       if (event.key.toLocaleLowerCase() === "a") {
         if (panelState.tabs.length === 0) return;
         event.preventDefault();
+        if (panelState.open) {
+          closeArtifactPanel();
+          return;
+        }
         setPanel(null);
         commitPanelState((current) => ({
           ...current,
-          open: !current.open,
+          open: true,
           focusedTab: current.focusedTab ?? current.tabs.at(-1) ?? null,
         }));
         return;
@@ -528,7 +532,7 @@ export function AgentSessionSurface({
     };
     window.addEventListener("keydown", onShortcut);
     return () => window.removeEventListener("keydown", onShortcut);
-  }, [commitPanelState, panelState.open, panelState.tabs]);
+  }, [closeArtifactPanel, commitPanelState, panelState.open, panelState.tabs]);
 
   const {
     handleArtifactsChange: inspectorArtifactsChange,

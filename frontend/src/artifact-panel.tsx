@@ -52,6 +52,7 @@ export function ArtifactPanel({
   const overflowTriggerRef = useRef<HTMLButtonElement | null>(null);
   const panelRef = useRef<HTMLElement | null>(null);
   const tabRefs = useRef(new Map<string, HTMLButtonElement>());
+  const reopenFocusRef = useRef<string | null>(null);
   const detailId = useId();
   const overflowMenuId = "artifact-panel-overflow-menu";
   const { menuRef: overflowMenuRef, onKeyDown: onOverflowKeyDown } = useMenuKeyboard({
@@ -74,6 +75,18 @@ export function ArtifactPanel({
     document.addEventListener("mousedown", onDocDown);
     return () => document.removeEventListener("mousedown", onDocDown);
   }, [overflowOpen]);
+
+  useEffect(() => {
+    const artifactId = reopenFocusRef.current;
+    if (!artifactId || !state.tabs.includes(artifactId)) return;
+    reopenFocusRef.current = null;
+    const frame = window.requestAnimationFrame(() => {
+      const tab = tabRefs.current.get(artifactId);
+      if (tab?.isConnected) tab.focus();
+      else panelRef.current?.focus();
+    });
+    return () => window.cancelAnimationFrame(frame);
+  }, [state.focusedTab, state.tabs]);
 
   function closeTab(artifactId: string) {
     const index = state.tabs.indexOf(artifactId);
@@ -244,6 +257,7 @@ export function ArtifactPanel({
                         tabIndex={index === 0 ? 0 : -1}
                         type="button"
                         onClick={() => {
+                          reopenFocusRef.current = artifactId;
                           setOverflowOpen(false);
                           onReopen(artifactId);
                         }}

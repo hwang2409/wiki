@@ -1448,6 +1448,17 @@ export function AgentsView({
   const error = overrideData?.error ?? data?.error ?? fetchedError;
 
   useEffect(() => {
+    if (openMenuTicket === null) return;
+    const currentIds = new Set([
+      ...(workers ?? []).map((worker) => worker.ticket),
+      ...orchestrators.map((orch) => orch.id),
+    ]);
+    if (currentIds.has(openMenuTicket)) return;
+    setOpenMenuTicket(null);
+    window.requestAnimationFrame(() => agentsViewRef.current?.focus());
+  }, [openMenuTicket, orchestrators, workers]);
+
+  useEffect(() => {
     const currentIds = new Set([
       ...(workers ?? []).map((worker) => worker.ticket),
       ...orchestrators.map((orch) => orch.id),

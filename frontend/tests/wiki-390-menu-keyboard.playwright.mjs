@@ -15,6 +15,12 @@ function assert(condition, message) {
   if (!condition) throw new Error(message);
 }
 
+async function waitForFocusFrame(page) {
+  await page.evaluate(() => new Promise((resolve) => {
+    requestAnimationFrame(() => requestAnimationFrame(resolve));
+  }));
+}
+
 function artifactTranscript() {
   const source = Array.from({ length: 120 }, (_, index) => `const line${index + 1} = ${index + 1};`).join("\n");
   const artifacts = [
@@ -169,11 +175,12 @@ try {
   await sessionPage.keyboard.press("Enter");
   const artifactPanel = sessionPage.getByRole("complementary", { name: "Artifact panel" });
   await artifactPanel.waitFor();
+  const tabs = artifactPanel.getByRole("tab");
   await openButtons.nth(1).focus();
   await sessionPage.keyboard.press("Enter");
+  await tabs.nth(1).waitFor();
   await openButtons.nth(2).focus();
   await sessionPage.keyboard.press("Enter");
-  const tabs = artifactPanel.getByRole("tab");
   await tabs.nth(2).waitFor();
   await tabs.first().focus();
   await sessionPage.keyboard.press("Enter");
@@ -188,12 +195,43 @@ try {
   await sessionPage.keyboard.press("ControlOrMeta+w");
   await sessionPage.waitForFunction(() => document.activeElement?.getAttribute("aria-label") === "Artifact panel");
   assert(await tabs.count() === 0, "closing the only tab should leave the panel container focused");
+  await openButtons.first().focus();
+  await sessionPage.keyboard.press("Enter");
+  await sessionPage.waitForFunction(() => document.activeElement?.classList.contains("artifact-panel"));
+  await tabs.first().waitFor();
+  await sessionPage.keyboard.press("ControlOrMeta+Shift+a");
+  await sessionPage.waitForFunction(() => document.activeElement?.classList.contains("artifact-open-panel"));
+  await artifactPanel.waitFor({ state: "detached" });
+  assert(
+    await sessionPage.evaluate(() => document.activeElement?.classList.contains("artifact-open-panel")),
+    "Cmd-Shift-A should restore focus to the artifact trigger when it closes the panel",
+  );
 
   await openButtons.first().focus();
   await sessionPage.keyboard.press("Enter");
+  await artifactPanel.waitFor();
+  await tabs.first().waitFor();
   await openButtons.nth(1).focus();
   await sessionPage.keyboard.press("Enter");
   await tabs.nth(1).waitFor();
+  await artifactPanel.getByRole("button", { name: "Close Second artifact" }).click({ force: true });
+  await sessionPage.waitForFunction(() => document.activeElement?.textContent?.trim() === "First artifact");
+  const reopenMenuTrigger = artifactPanel.getByRole("button", { name: "Artifact panel menu" });
+  await reopenMenuTrigger.focus();
+  await sessionPage.keyboard.press("Enter");
+  const reopenMenuItems = artifactPanel.getByRole("menu").getByRole("menuitem");
+  await reopenMenuItems.first().waitFor();
+  await sessionPage.keyboard.press("Enter");
+  await waitForFocusFrame(sessionPage);
+  await sessionPage.waitForFunction(() => document.activeElement?.textContent?.trim() === "Second artifact");
+  await artifactPanel.getByRole("button", { name: "Close Second artifact" }).click({ force: true });
+  await sessionPage.waitForFunction(() => document.activeElement?.textContent?.trim() === "First artifact");
+  await reopenMenuTrigger.focus();
+  await sessionPage.keyboard.press("Enter");
+  await artifactPanel.getByRole("menu").getByRole("menuitem").first().waitFor();
+  await sessionPage.keyboard.press("Space");
+  await waitForFocusFrame(sessionPage);
+  await sessionPage.waitForFunction(() => document.activeElement?.textContent?.trim() === "Second artifact");
   await tabs.first().focus();
   await sessionPage.keyboard.press("ArrowRight");
   await sessionPage.waitForFunction(() => document.activeElement?.getAttribute("role") === "tab" && document.activeElement?.textContent?.trim() === "Second artifact");
@@ -222,8 +260,13 @@ try {
 
   await sessionPage.goto(`${backend.baseUrl}/?panel=${TICKET}&artifact=missing-artifact&tab=missing-artifact&focus=missing-artifact#/agent/${TICKET}`, { waitUntil: "domcontentloaded" });
   const fallbackPanel = sessionPage.getByRole("complementary", { name: "Artifact panel" });
-  await fallbackPanel.getByRole("button", { name: "Close tab" }).click();
+  await fallbackPanel.getByRole("button", { name: "Close tab" }).focus();
+  await sessionPage.keyboard.press("Enter");
   await sessionPage.waitForFunction(() => document.activeElement?.getAttribute("aria-label") === "Artifact panel");
+  assert(
+    await fallbackPanel.evaluate((panel) => getComputedStyle(panel).outlineStyle !== "none"),
+    "focused artifact fallback should have a visible focus ring",
+  );
 
   const agentsPage = await context.newPage();
   await agentsPage.route("**/api/agents*", async (route) => {
@@ -273,7 +316,12 @@ try {
   await legacyItems.first().waitFor();
   await agentsPage.locator('[data-agent-menu-for="WIKI-390-LEGACY"] > button').evaluate((button) => button.remove());
   await agentsPage.keyboard.press("Escape");
+  await waitForFocusFrame(agentsPage);
   await agentsPage.waitForFunction(() => document.activeElement?.classList.contains("agents-view"));
+  assert(
+    await agentsPage.locator(".agents-view").evaluate((view) => getComputedStyle(view).outlineStyle !== "none"),
+    "focused agents fallback should have a visible focus ring",
+  );
 
   const orchestratorTrigger = agentsPage.getByRole("button", { name: "More actions for WIKI-390-ORCH" });
   await orchestratorTrigger.focus();

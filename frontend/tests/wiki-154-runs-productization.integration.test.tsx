@@ -632,6 +632,31 @@ test("clicking a history row selects exactly the named archive over a live ticke
   expect(selectedCards[0]).toBe(historyCards[1]);
 });
 
+test("live removal of an open menu row clears the menu and restores focus", async () => {
+  const removed = { ...worker, ticket: "WIKI-REMOVED" };
+  const remaining = { ...worker, ticket: "WIKI-REMAINING" };
+  const view = renderView({
+    data: { workers: [removed, remaining], orchestrators: [], archived: [], error: null },
+  });
+  fireEvent.click(view.getByRole("button", { name: /More actions for WIKI-REMOVED/ }));
+  expect(view.getByRole("menu")).toBeTruthy();
+
+  view.rerender(
+    <AgentsView
+      data={{ workers: [remaining], orchestrators: [], archived: [], error: null }}
+      onOpenAgent={() => undefined}
+      refreshTick={1}
+      openTicket={null}
+      onOpenTicket={() => undefined}
+    />,
+  );
+
+  await waitFor(() => {
+    expect(view.queryByRole("menu")).toBeNull();
+    expect(document.activeElement).toBe(view.container.querySelector(".agents-view"));
+  });
+});
+
 test("history row is a quiet outcome/date summary with View transcript", async () => {
   const view = renderView({
     data: { ...data, workers: [], orchestrators: [], error: null },
