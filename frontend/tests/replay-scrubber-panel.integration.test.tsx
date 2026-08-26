@@ -215,6 +215,114 @@ describe("replay scrubber panel", () => {
     expect(screen.getByText("4 / 4")).toBeTruthy();
   });
 
+  test("ignores a delayed raw payload after the cursor moves on", async () => {
+    let resolveFirst: ((response: Response) => void) | null = null;
+    const timeline = singlePageTimeline();
+    timeline.events = [
+      event(1, { kind: "claude_assistant", summary: "timeline one" }),
+      event(2, { kind: "claude_assistant", summary: "timeline two" }),
+      event(3, { kind: "claude_assistant", summary: "timeline three" }),
+      event(4, { kind: "claude_assistant", summary: "timeline four" }),
+    ];
+    (global.fetch as ReturnType<typeof vi.fn>).mockImplementation(async (input, init) => {
+      const url = typeof input === "string" ? input : input.toString();
+      record(url, init);
+      if (url.includes("/replay/timeline")) return jsonResponse(timeline);
+      if (url.includes("/replay/events/1")) {
+        return new Promise<Response>((resolve) => {
+          resolveFirst = resolve;
+        });
+      }
+      if (url.includes("/replay/events/2")) {
+        return jsonResponse({
+          run_id: RUN_ID,
+          seq: 2,
+          raw: { payload: { message: { role: "assistant", content: [{ type: "text", text: "new payload" }] } } },
+        });
+      }
+      return respondDefault(url);
+    });
+
+    render(<ReplayScrubberPanel ticket="WIKI-174" />);
+    await flushAsync();
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(120);
+    });
+    expect(resolveFirst).toBeTruthy();
+
+    fireEvent.change(screen.getByRole("slider", { name: "Event cursor" }), { target: { value: "1" } });
+    await flushAsync();
+    expect(screen.getByText("timeline two")).toBeTruthy();
+    expect(screen.queryByText("old payload")).toBeNull();
+    expect(screen.getByText("loading event…")).toBeTruthy();
+
+    await act(async () => {
+      resolveFirst!(jsonResponse({
+        run_id: RUN_ID,
+        seq: 1,
+        raw: { payload: { message: { role: "assistant", content: [{ type: "text", text: "old payload" }] } } },
+      }));
+      await Promise.resolve();
+    });
+    expect(screen.queryByText("old payload")).toBeNull();
+
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(120);
+    });
+    await flushAsync();
+    expect(screen.getByText("new payload")).toBeTruthy();
+    expect(screen.queryByText("old payload")).toBeNull();
+  });
+
+  test("max-speed stepping shows summaries and settles on the final payload", async () => {
+    const timeline = singlePageTimeline();
+    timeline.events = timeline.events.map((current) => ({
+      ...current,
+      kind: "claude_assistant",
+      summary: `timeline ${current.seq}`,
+    }));
+    (global.fetch as ReturnType<typeof vi.fn>).mockImplementation(async (input, init) => {
+      const url = typeof input === "string" ? input : input.toString();
+      record(url, init);
+      if (url.includes("/replay/timeline")) return jsonResponse(timeline);
+      if (url.includes("/replay/events/")) {
+        const seq = Number(url.split("/replay/events/")[1]?.split("?")[0]);
+        return jsonResponse({
+          run_id: RUN_ID,
+          seq,
+          raw: { payload: { message: { role: "assistant", content: [{ type: "text", text: `payload ${seq}` }] } } },
+        });
+      }
+      return respondDefault(url);
+    });
+
+    render(<ReplayScrubberPanel ticket="WIKI-174" />);
+    await flushAsync();
+    fireEvent.change(screen.getByLabelText("Playback speed"), { target: { value: "max" } });
+    fireEvent.click(screen.getByRole("button", { name: "Play replay" }));
+    for (let step = 0; step < 3; step += 1) {
+      await act(async () => {
+        await vi.advanceTimersByTimeAsync(40);
+      });
+      await flushAsync();
+    }
+
+    expect(screen.getByText("4 / 4")).toBeTruthy();
+    expect(screen.queryByText("payload 1")).toBeNull();
+    expect(screen.queryByText("payload 2")).toBeNull();
+    expect(screen.queryByText("payload 3")).toBeNull();
+    expect(screen.getByText("loading event…")).toBeTruthy();
+
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(120);
+    });
+    await flushAsync();
+    expect(screen.getByText("payload 4")).toBeTruthy();
+    expect(screen.queryByText("payload 1")).toBeNull();
+    expect(screen.queryByText("payload 2")).toBeNull();
+    expect(screen.queryByText("payload 3")).toBeNull();
+  });
+
   test("bookmark buttons jump to their event", async () => {
     render(<ReplayScrubberPanel ticket="WIKI-174" />);
     await flushAsync();
