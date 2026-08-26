@@ -56,6 +56,8 @@
     "build": "tsc -p tsconfig.json --noEmit && tsc -p tsconfig.node.json --noEmit && vite build",
     "preview": "vite preview",
     "test:wiki-244": "node tests/wiki-244-opencode-transcript.playwright.mjs && node tests/wiki-244-runner-regression.mjs && node tests/wiki-105-font-weights.playwright.mjs",
+    "pretest:wiki-402": "npm run build",
+    "test:wiki-402": "node tests/wiki-402-vim-cursor.playwright.mjs",
     "test:wiki-301": "node tests/wiki-301-status-chips.playwright.mjs",
     "test:wiki-342": "node tests/wiki-342-pixel-discipline.playwright.mjs",
     "test:wiki-373": "node tests/wiki-373-instant-send.playwright.mjs",

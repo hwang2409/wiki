@@ -4270,29 +4270,20 @@ function MessageComposer({
     };
   }, [composerFocused]);
 
-  // WIKI-244: the cursor is a block in every vim mode. Insert mode hides the
-  // native line caret (CSS) and draws the same overlay block that normal mode
-  // uses at end-of-line, so the cursor never changes shape across mode
-  // switches. Normal/visual mode keeps the one-char-selection block for
-  // positions that have a character under them.
+  // WIKI-402: insert mode uses the native line caret. Non-insert modes keep
+  // the one-char-selection block for positions that have a character under
+  // them and use the overlay block at end-of-line.
   useLayoutEffect(() => {
     const el = inputRef.current;
-    if (!el || document.activeElement !== el) {
+    if (!el || document.activeElement !== el || vimMode === "insert") {
       setOverlayPos(null);
       return;
     }
-    // Insert mode reads the live DOM selection: programmatic value/selection
-    // changes (paste, external fill) update the DOM without firing the
-    // select/keyup events that keep caretPos state in sync, and a stale
-    // caretPos would paint the block over the wrong character or hide it.
-    const domCaret = el.selectionStart ?? caretPos;
-    const at = Math.min(vimMode === "insert" ? domCaret : caretPos, text.length);
-    if (vimMode !== "insert") {
-      const needsOverlay = text.length === 0 || at >= text.length || text[at] === "\n";
-      if (!needsOverlay) {
-        setOverlayPos(null);
-        return;
-      }
+    const at = Math.min(caretPos, text.length);
+    const needsOverlay = text.length === 0 || at >= text.length || text[at] === "\n";
+    if (!needsOverlay) {
+      setOverlayPos(null);
+      return;
     }
     const pos = measureCaret(el, at);
     // When the caret line is scrolled out of the textarea's visible box, hide
@@ -5050,7 +5041,7 @@ function MessageComposer({
                 id={composerInputId}
                 autoCapitalize="off"
                 autoCorrect="off"
-                className={vimMode === "normal" || vimMode === "visual" ? "is-vim-normal" : undefined}
+                className={`is-vim-${vimMode}`}
                 spellCheck={false}
                 placeholder={
                   vimMode === "insert"
