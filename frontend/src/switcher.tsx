@@ -50,11 +50,11 @@ type SwitcherGroup = {
   items: SwitcherItem[];
 };
 
-const PAGES: Array<{ page: SwitcherPage; label: string }> = [
+const PAGES: Array<{ page: SwitcherPage; label: string; aliases?: string[] }> = [
   { page: "graph", label: "Graph" },
   { page: "activity", label: "Activity" },
   { page: "health", label: "Health" },
-  { page: "agents", label: "Agents" }
+  { page: "agents", label: "Runs", aliases: ["agents", "agent list"] }
 ];
 
 const PAGE_ICONS = {
@@ -345,8 +345,8 @@ export function QuickSwitcher({
       .map((entry): SwitcherItem => ({ kind: "file", file: entry.file }));
 
     const pageItems = PAGES.filter((entry) =>
-      entry.label.toLowerCase().includes(needle)
-    ).map((entry): SwitcherItem => ({ kind: "page", ...entry }));
+      [entry.label, ...(entry.aliases ?? [])].some((label) => label.toLowerCase().includes(needle))
+    ).map((entry): SwitcherItem => ({ kind: "page", page: entry.page, label: entry.label }));
 
     return [
       { label: "Sessions", items: sessionItems },
