@@ -55,7 +55,9 @@ import type {
   ComposerMessage,
   ProviderEventInspector,
   ProviderPendingRequest,
+  ProviderStreamEvent,
   QueuedMessage,
+  ReplayTimelineEvent,
   SessionEvent,
   SessionInit,
   SessionPatch,
@@ -2807,6 +2809,90 @@ export function ActivityEventRow({
   );
 }
 
+function providerTimelineEvent(event: ProviderStreamEvent): ReplayTimelineEvent {
+  return {
+    seq: event.seq,
+    raw_seq: event.raw_seq,
+    ts: event.normalized_at,
+    kind: event.kind,
+    disposition: event.disposition,
+    lifecycle_state: event.lifecycle_state,
+    summary: event.kind,
+    bookmark: null,
+  };
+}
+
+function sessionDisposition(event: ProviderStreamEvent): SessionEvent["disposition"] {
+  return event.disposition === "ignored" ? "intentionally_ignored" : event.disposition;
+}
+
+export function ProviderEventRows({
+  events,
+  ticket,
+}: {
+  events: readonly ProviderStreamEvent[];
+  ticket: string;
+}) {
+  return (
+    <div className="session-provider-event-rows" data-testid="session-provider-event-rows">
+      {events.map((event) => {
+        const blocks = providerEventToBlocks(providerEventPayload(event), providerTimelineEvent(event));
+        return blocks.map((block, index) => {
+          const key = `${event.seq}:${block.type}:${index}`;
+          if (block.type === "message") {
+            return (
+              <div className="session-provider-event" data-provider-block-type="message" data-provider-event-seq={event.seq} key={key}>
+                <SessionMarkdown className={`session-provider-message is-${block.role}`} text={block.text} />
+              </div>
+            );
+          }
+          if (block.type === "thinking") {
+            const thinkingEvent: SessionEvent = {
+              id: event.seq,
+              kind: "thinking",
+              ts: event.normalized_at,
+              text: block.text,
+              disposition: sessionDisposition(event),
+              encrypted: block.encrypted,
+            };
+            return (
+              <div className="session-provider-event" data-provider-block-type="thinking" data-provider-event-seq={event.seq} key={key}>
+                <ThinkingRow event={thinkingEvent} />
+              </div>
+            );
+          }
+          if (block.type === "tool") {
+            const toolEvent: SessionEvent = {
+              id: event.seq,
+              kind: "tool",
+              ts: event.normalized_at,
+              text: "",
+              disposition: sessionDisposition(event),
+              tool: block.tool,
+            };
+            return (
+              <div
+                className="session-provider-event"
+                data-provider-block-type="tool"
+                data-provider-event-seq={event.seq}
+                data-tool-ok={String(block.tool.ok)}
+                key={key}
+              >
+                <ToolCallRow event={toolEvent} ticket={ticket} withResult={false} />
+              </div>
+            );
+          }
+          return (
+            <div className="session-provider-event" data-provider-block-type="marker" data-provider-event-seq={event.seq} key={key}>
+              <div className="session-provider-marker">{block.text}</div>
+            </div>
+          );
+        });
+      })}
+    </div>
+  );
+}
+
 function useMeasuredRow(row: EventRow, onHeightChange: (row: EventRow, height: number) => void) {
   const ref = useRef<HTMLDivElement | null>(null);
   useLayoutEffect(() => {
@@ -2947,8 +3033,7 @@ const VirtualSessionRow = memo(function VirtualSessionRow({
   const rowRef = useMeasuredRow(row, onHeightChange);
   const style: CSSProperties = { top: `${top}px` };
   const ts = showTimestamp ? rowTimestamp(row) : null;
-  const blocks = providerEventToBlocks(row.event);
-  const isActivity = row.event.kind === "thinking" || blocks.some((block) => block.type === "tool");
+  const isActivity = row.event.kind === "tool" || row.event.kind === "thinking";
   return (
     <div
       className="session-virtual-row"
@@ -3503,6 +3588,9 @@ export function SessionTab({
     return result;
   }, [displayEvents, session?.base, session?.eventsChangedFrom]);
   const rows = rowResult.rows;
+  const providerEventRows = session?.format === "provider-events" && rows.length === 0
+    ? session.providerInspector?.events ?? []
+    : [];
   const layout = useMemo(() => {
     const changedFrom = Math.min(rowResult.changedFrom, layoutDirtyFromRef.current);
     const result = buildVirtualLayoutIncremental(
@@ -3907,7 +3995,7 @@ export function SessionTab({
               {olderError ? <span role="alert">{olderError}</span> : null}
             </div>
           ) : null}
-          {rows.length === 0 && pendingUserMessages.length === 0 ? (
+          {rows.length === 0 && providerEventRows.length === 0 && pendingUserMessages.length === 0 ? (
             <div
               className="session-zero-events"
               role="status"
@@ -3926,6 +4014,9 @@ export function SessionTab({
                       : "This session has no events."}
               </div>
             </div>
+          ) : null}
+          {providerEventRows.length > 0 ? (
+            <ProviderEventRows events={providerEventRows} ticket={ticket} />
           ) : null}
           <div className="session-virtual-list" style={{ height: layout.totalHeight }}>
             {visibleRows.map(({ row, top }) => (

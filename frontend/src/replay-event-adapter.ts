@@ -1,24 +1,14 @@
 import type {
-  ProviderStreamEvent,
-  ReplayRawEvent,
   ReplayTimelineEvent,
-  SessionEvent,
   SessionTool,
 } from "./api";
 
 type RawRecord = Record<string, unknown>;
 
-type ProviderRawEventInput =
-  | Pick<ProviderStreamEvent, "payload">
-  | Pick<ReplayRawEvent, "raw">;
-
-type ProviderEventInput =
-  | Pick<SessionEvent, "kind" | "text" | "tool">
-  | ProviderRawEventInput;
-
 export type PresentationBlock =
   | { type: "message"; role: "user" | "assistant"; text: string }
   | { type: "tool"; tool: SessionTool }
+  | { type: "thinking"; text: string; encrypted: boolean }
   | { type: "marker"; text: string };
 
 function asRecord(value: unknown): RawRecord | null {
@@ -31,9 +21,8 @@ function stringValue(value: unknown): string | null {
   return typeof value === "string" && value.trim() ? value.trim() : null;
 }
 
-export function providerEventPayload(event: ProviderRawEventInput): RawRecord | null {
-  if ("payload" in event) return asRecord(event.payload);
-  return "raw" in event ? asRecord(event.raw.payload) : null;
+export function providerEventPayload(event: Record<string, unknown>): RawRecord | null {
+  return asRecord(event.payload);
 }
 
 function rawContentText(value: unknown): string | null {
@@ -157,6 +146,21 @@ function codexToolFromItem(item: RawRecord, event: ReplayTimelineEvent | null): 
   };
 }
 
+function codexThinkingFromItem(item: RawRecord): PresentationBlock | null {
+  if (item.type !== "reasoning") return null;
+  const summaryText = Array.isArray(item.summary)
+    ? item.summary
+      .flatMap((value) => {
+        const summary = asRecord(value);
+        const text = summary ? stringValue(summary.text) : stringValue(value);
+        return text ? [text] : [];
+      })
+      .join("\n")
+    : null;
+  const text = summaryText || rawContentText(item.content) || stringValue(item.text);
+  return text ? { type: "thinking", text, encrypted: typeof item.encrypted_content === "string" } : null;
+}
+
 function claudeToolFromBlock(block: RawRecord): SessionTool | null {
   if (block.type === "tool_use") {
     const name = stringValue(block.name) ?? "tool";
@@ -185,6 +189,12 @@ function claudeToolFromBlock(block: RawRecord): SessionTool | null {
   };
 }
 
+function claudeThinkingFromBlock(block: RawRecord): PresentationBlock | null {
+  if (block.type !== "thinking") return null;
+  const text = stringValue(block.thinking);
+  return text ? { type: "thinking", text, encrypted: false } : null;
+}
+
 function markerBlock(event: ReplayTimelineEvent): PresentationBlock {
   const label = event.summary.trim() || event.kind.trim() || "unknown event";
   return { type: "marker", text: `event · ${label}` };
@@ -205,10 +215,10 @@ function summaryToolFromEvent(event: ReplayTimelineEvent): SessionTool | null {
 }
 
 export function providerEventToBlocks(
-  rawEvent: ProviderEventInput | null,
+  payload: RawRecord | null,
   timelineEvent: ReplayTimelineEvent | null = null,
 ): PresentationBlock[] {
-  if (!rawEvent) {
+  if (!payload) {
     const summarizedTool = timelineEvent ? summaryToolFromEvent(timelineEvent) : null;
     if (summarizedTool) return [{ type: "tool", tool: summarizedTool }];
     if (timelineEvent && ["claude_user", "claude_assistant", "codex_user", "codex_assistant"].includes(timelineEvent.kind)) {
@@ -221,20 +231,6 @@ export function providerEventToBlocks(
     return timelineEvent ? [markerBlock(timelineEvent)] : [];
   }
 
-  if ("text" in rawEvent) {
-    if (rawEvent.kind === "tool" && rawEvent.tool) return [{ type: "tool", tool: rawEvent.tool }];
-    if (rawEvent.kind === "thinking") return [{ type: "marker", text: rawEvent.text }];
-    if (rawEvent.kind === "user" || rawEvent.kind === "assistant") {
-      return [{
-        type: "message",
-        role: rawEvent.kind,
-        text: rawEvent.text,
-      }];
-    }
-    return [{ type: "marker", text: rawEvent.text || rawEvent.kind }];
-  }
-
-  const payload = providerEventPayload(rawEvent);
   const item = codexItem(payload);
   if (item) {
     const itemType = stringValue(item.type) ?? "";
@@ -243,6 +239,8 @@ export function providerEventToBlocks(
       const text = stringValue(item.text) ?? rawContentText(item.content);
       if (text) return [{ type: "message", role, text }];
     }
+    const thinking = codexThinkingFromItem(item);
+    if (thinking) return [thinking];
     const tool = codexToolFromItem(item, timelineEvent);
     if (tool) return [{ type: "tool", tool }];
   }
@@ -259,6 +257,11 @@ export function providerEventToBlocks(
         if (block.type === "text") {
           const text = stringValue(block.text);
           if (text) blocks.push({ type: "message", role, text });
+          continue;
+        }
+        const thinking = claudeThinkingFromBlock(block);
+        if (thinking) {
+          blocks.push(thinking);
           continue;
         }
         const tool = claudeToolFromBlock(block);
@@ -281,5 +284,7 @@ export function providerEventToBlocks(
       text: timelineEvent.summary,
     }];
   }
-  return timelineEvent ? [markerBlock(timelineEvent)] : [];
+  if (timelineEvent) return [markerBlock(timelineEvent)];
+  const label = stringValue(payload.method) ?? stringValue(payload.type) ?? "unknown event";
+  return [{ type: "marker", text: `event · ${label}` }];
 }

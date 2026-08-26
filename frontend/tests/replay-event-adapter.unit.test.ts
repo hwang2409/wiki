@@ -55,7 +55,7 @@ describe("provider event adapter", () => {
   test("reads the same payload shape from transcript and replay events", () => {
     const payload = { message: "model changed" };
     expect(providerEventPayload(providerEvent(payload))).toEqual(payload);
-    expect(providerEventPayload(replayEvent(payload))).toEqual(payload);
+    expect(providerEventPayload(replayEvent(payload).raw)).toEqual(payload);
   });
 
   test.each([
@@ -125,8 +125,8 @@ describe("provider event adapter", () => {
     },
   ])("uses terminal status for the same $label fixture on both paths", ({ payload, expected }) => {
     const event = timelineEvent({ summary: "tool event" });
-    const transcriptBlocks = providerEventToBlocks(providerEvent(payload), event);
-    const replayBlocks = providerEventToBlocks(replayEvent(payload), event);
+    const transcriptBlocks = providerEventToBlocks(providerEventPayload(providerEvent(payload)), event);
+    const replayBlocks = providerEventToBlocks(providerEventPayload(replayEvent(payload).raw), event);
 
     expect(replayBlocks).toEqual(transcriptBlocks);
     expect(toolBlock(transcriptBlocks).tool.ok).toBe(expected);
@@ -144,8 +144,8 @@ describe("provider event adapter", () => {
       },
     };
     const event = timelineEvent({ kind: "claude_assistant", summary: "text and tool" });
-    const transcriptBlocks = providerEventToBlocks(providerEvent(payload), event);
-    const replayBlocks = providerEventToBlocks(replayEvent(payload), event);
+    const transcriptBlocks = providerEventToBlocks(providerEventPayload(providerEvent(payload)), event);
+    const replayBlocks = providerEventToBlocks(providerEventPayload(replayEvent(payload).raw), event);
 
     expect(replayBlocks).toEqual(transcriptBlocks);
     expect(transcriptBlocks.map((block) => block.type)).toEqual(["message", "tool", "message"]);
@@ -163,18 +163,31 @@ describe("provider event adapter", () => {
       },
     };
     const event = timelineEvent({ kind: "claude_user", summary: "tool result" });
-    const transcriptBlocks = providerEventToBlocks(providerEvent(payload), event);
-    const replayBlocks = providerEventToBlocks(replayEvent(payload), event);
+    const transcriptBlocks = providerEventToBlocks(providerEventPayload(providerEvent(payload)), event);
+    const replayBlocks = providerEventToBlocks(providerEventPayload(replayEvent(payload).raw), event);
 
     expect(replayBlocks).toEqual(transcriptBlocks);
     expect(toolBlock(transcriptBlocks).tool.ok).toBe(false);
   });
 
+  test("classifies Codex reasoning as thinking on both paths", () => {
+    const payload = {
+      method: "item/completed",
+      params: { item: { type: "reasoning", summary: [{ text: "check the evidence" }] } },
+    };
+    const event = timelineEvent({ kind: "item_completed", summary: "thinking" });
+    const transcriptBlocks = providerEventToBlocks(providerEventPayload(providerEvent(payload)), event);
+    const replayBlocks = providerEventToBlocks(providerEventPayload(replayEvent(payload).raw), event);
+
+    expect(replayBlocks).toEqual(transcriptBlocks);
+    expect(transcriptBlocks).toEqual([{ type: "thinking", text: "check the evidence", encrypted: false }]);
+  });
+
   test("keeps an unknown provider item visible as the same marker on both paths", () => {
     const payload = { params: { item: { type: "futureProviderItem" } } };
     const event = timelineEvent({ kind: "future_kind", summary: "mystery item" });
-    const transcriptBlocks = providerEventToBlocks(providerEvent(payload), event);
-    const replayBlocks = providerEventToBlocks(replayEvent(payload), event);
+    const transcriptBlocks = providerEventToBlocks(providerEventPayload(providerEvent(payload)), event);
+    const replayBlocks = providerEventToBlocks(providerEventPayload(replayEvent(payload).raw), event);
 
     expect(replayBlocks).toEqual(transcriptBlocks);
     expect(transcriptBlocks).toEqual([{ type: "marker", text: "event · mystery item" }]);

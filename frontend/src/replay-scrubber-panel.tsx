@@ -27,9 +27,9 @@ import {
   type SessionEvent,
 } from "./api";
 import { CopyPill } from "./copy-button";
-import { providerEventToBlocks, type PresentationBlock } from "./replay-event-adapter";
+import { providerEventPayload, providerEventToBlocks, type PresentationBlock } from "./replay-event-adapter";
 import { BoundedPreview } from "./transcript-preview";
-import { SessionMarkdown, ToolCallRow } from "./session";
+import { SessionMarkdown, ThinkingRow, ToolCallRow } from "./session";
 
 const SPEED_OPTIONS = [0.5, 1, 2, 5, 10] as const;
 const MAX_SPEED_LABEL = "max";
@@ -169,9 +169,9 @@ function ReplayToolOrMarker({
   tool: NonNullable<SessionEvent["tool"]> | null;
   ticket: string;
 }) {
-  if (marker) return <div className="replay-event-marker">{marker}</div>;
+  if (marker) return <div className="replay-event-marker" data-provider-block-type="marker" data-provider-event-seq={event.seq}>{marker}</div>;
   if (!tool) {
-    return <div className="replay-event-marker">{plainEventLabel(event)}</div>;
+    return <div className="replay-event-marker" data-provider-block-type="marker" data-provider-event-seq={event.seq}>{plainEventLabel(event)}</div>;
   }
   const toolEvent: SessionEvent = {
     id: event.seq,
@@ -181,7 +181,11 @@ function ReplayToolOrMarker({
     disposition: "rendered",
     tool,
   };
-  return <ToolCallRow event={toolEvent} ticket={ticket} withResult={false} />;
+  return (
+    <div data-provider-block-type="tool" data-provider-event-seq={event.seq} data-tool-ok={String(tool.ok)}>
+      <ToolCallRow event={toolEvent} ticket={ticket} withResult={false} />
+    </div>
+  );
 }
 
 function ReplayPresentationBlocks({
@@ -197,10 +201,29 @@ function ReplayPresentationBlocks({
     <>
       {blocks.map((block, index) => {
         if (block.type === "message") {
-          return <ReplayMessageSummary key={`message:${index}`} role={block.role} text={block.text} />;
+          return (
+            <div data-provider-block-type="message" data-provider-event-seq={event.seq} key={`message:${index}`}>
+              <ReplayMessageSummary role={block.role} text={block.text} />
+            </div>
+          );
         }
         if (block.type === "tool") {
           return <ReplayToolOrMarker key={`tool:${index}`} event={event} ticket={ticket} tool={block.tool} />;
+        }
+        if (block.type === "thinking") {
+          const thinkingEvent: SessionEvent = {
+            id: event.seq,
+            kind: "thinking",
+            ts: event.ts,
+            text: block.text,
+            disposition: event.disposition === "rendered" ? "rendered" : "unknown",
+            encrypted: block.encrypted,
+          };
+          return (
+            <div data-provider-block-type="thinking" data-provider-event-seq={event.seq} key={`thinking:${index}`}>
+              <ThinkingRow event={thinkingEvent} />
+            </div>
+          );
         }
         const marker = EVENT_KIND_LABELS[event.kind] ? plainEventLabel(event) : block.text;
         return <ReplayToolOrMarker key={`marker:${index}`} event={event} marker={marker} ticket={ticket} tool={null} />;
@@ -763,7 +786,7 @@ function ReplayScrubberBody({
     ? rawEvent.event
     : null;
   const presentation = currentEvent
-    ? providerEventToBlocks(selectedRawEvent, currentEvent)
+    ? providerEventToBlocks(selectedRawEvent ? providerEventPayload(selectedRawEvent.raw) : null, currentEvent)
     : null;
 
   useEffect(() => {
