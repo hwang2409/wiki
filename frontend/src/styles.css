@@ -9194,14 +9194,21 @@ body.is-resizing-panes .pane-cell {
   display: none;
 }
 
-/* WIKI-244: the composer cursor is a block in every vim mode. The native
-   line caret stays hidden; the overlay block (below) tracks the caret in
-   insert mode, and the one-char selection paints the block in normal mode. */
+/* WIKI-402: insert mode uses the native line caret. Non-insert modes hide it
+   and use the one-char selection or overlay block below. */
 .session-input-wrap textarea {
+  caret-color: var(--accent-primary);
+}
+
+.session-input-wrap textarea.is-vim-normal,
+.session-input-wrap textarea.is-vim-visual,
+.session-input-wrap textarea.is-vim-pane {
   caret-color: transparent;
 }
 
-.session-composer textarea.is-vim-normal::selection {
+.session-composer textarea.is-vim-normal::selection,
+.session-composer textarea.is-vim-visual::selection,
+.session-composer textarea.is-vim-pane::selection {
   background-color: var(--selection-inverse-background);
   color: var(--selection-inverse-color);
 }
