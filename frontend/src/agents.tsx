@@ -47,6 +47,7 @@ import type { SidebarTarget } from "./session";
 import { BranchPill } from "./branch-pill";
 import { StatusBadge } from "./status-badge";
 import { toast } from "./toast";
+import { useMenuKeyboard, type MenuCloseReason } from "./use-menu-keyboard";
 
 declare global {
   interface Window {
@@ -97,6 +98,87 @@ type OrchestratorSpawnNotice = {
   promptPath: string | null;
   note: string;
 };
+
+type AgentMenuItem = {
+  key: string;
+  label: string;
+  disabled?: boolean;
+  title?: string;
+  run: () => void;
+};
+
+function AgentActionMenu({
+  id,
+  items,
+  open,
+  onClose,
+  onSelect,
+  onToggle,
+  registerTrigger,
+}: {
+  id: string;
+  items: AgentMenuItem[];
+  open: boolean;
+  onClose: (reason: MenuCloseReason) => void;
+  onSelect: (item: AgentMenuItem, trigger: HTMLButtonElement) => void;
+  onToggle: () => void;
+  registerTrigger: (id: string, button: HTMLButtonElement | null) => void;
+}) {
+  const triggerRef = useRef<HTMLButtonElement | null>(null);
+  const menuId = `agent-menu-${id}`;
+  const { menuRef, onKeyDown } = useMenuKeyboard({ open, onClose, triggerRef });
+  const firstEnabledKey = items.find((candidate) => !candidate.disabled)?.key;
+
+  return (
+    <span className="agent-card-menu" data-agent-menu-for={id}>
+      <button
+        aria-controls={menuId}
+        aria-expanded={open}
+        aria-haspopup="menu"
+        aria-label={`More actions for ${id}`}
+        className="agent-log-toggle agent-card-menu-toggle"
+        type="button"
+        ref={(button) => {
+          triggerRef.current = button;
+          registerTrigger(id, button);
+        }}
+        onClick={onToggle}
+      >
+        <MoreHorizontal size={13} />
+      </button>
+      {open ? (
+        <div className="agent-card-menu-popover" id={menuId} ref={menuRef} role="menu" onKeyDown={onKeyDown}>
+          {items.map((item) => {
+            const reasonId = item.disabled ? `${menuId}-${item.key}-reason` : undefined;
+            return (
+              <span key={item.key}>
+                {item.disabled && item.title ? (
+                  <span className="sr-only" id={reasonId}>
+                    {item.title}
+                  </span>
+                ) : null}
+                <button
+                  aria-describedby={reasonId}
+                  aria-disabled={item.disabled ? "true" : undefined}
+                  className="agent-card-menu-item"
+                  role="menuitem"
+                  tabIndex={item.disabled || item.key === firstEnabledKey ? 0 : -1}
+                  title={item.title}
+                  type="button"
+                  onClick={() => {
+                    if (!item.disabled && triggerRef.current) onSelect(item, triggerRef.current);
+                  }}
+                >
+                  {item.label}
+                </button>
+              </span>
+            );
+          })}
+        </div>
+      ) : null}
+    </span>
+  );
+}
 
 function defaultOrchestratorModel(models: AgentModelOption[], kind: SpawnWorkerKind): string {
   const byKind = modelsForKind(models, kind);
@@ -1265,23 +1347,8 @@ export function AgentsView({
   const [expandedDetails, setExpandedDetails] = useState<Set<string>>(new Set());
   const [openMenuTicket, setOpenMenuTicket] = useState<string | null>(null);
   const menuButtonRefs = useRef(new Map<string, HTMLButtonElement>());
-  const previousOpenMenuRef = useRef<string | null>(null);
-  const closeReasonRef = useRef<"escape" | "pointer" | null>(null);
-  useEffect(() => {
-    if (
-      openMenuTicket === null &&
-      previousOpenMenuRef.current !== null &&
-      closeReasonRef.current === "escape"
-    ) {
-      const button = menuButtonRefs.current.get(previousOpenMenuRef.current);
-      window.requestAnimationFrame(() => button?.focus());
-    }
-    if (openMenuTicket === null) closeReasonRef.current = null;
-    previousOpenMenuRef.current = openMenuTicket;
-  }, [openMenuTicket]);
 
-  function closeMenu(reason: "escape" | "pointer") {
-    closeReasonRef.current = reason;
+  function closeMenu(_reason: "escape" | "pointer" | "tab") {
     setOpenMenuTicket(null);
   }
 
@@ -1292,14 +1359,9 @@ export function AgentsView({
       if (target && target.closest(`[data-agent-menu-for="${openMenuTicket}"]`)) return;
       closeMenu("pointer");
     }
-    function onKey(event: KeyboardEvent) {
-      if (event.key === "Escape") closeMenu("escape");
-    }
     window.addEventListener("mousedown", onDown);
-    window.addEventListener("keydown", onKey);
     return () => {
       window.removeEventListener("mousedown", onDown);
-      window.removeEventListener("keydown", onKey);
     };
   }, [openMenuTicket]);
 
@@ -1853,57 +1915,23 @@ export function AgentsView({
               details
             </button>
             {menuItems.length > 0 ? (
-              <span className="agent-card-menu" data-agent-menu-for={orch.id}>
-                <button
-                  aria-expanded={menuOpen}
-                  aria-haspopup="menu"
-                  aria-label={`More actions for ${orch.id}`}
-                  className="agent-log-toggle agent-card-menu-toggle"
-                  type="button"
-                  ref={(button) => {
-                    if (button) menuButtonRefs.current.set(orch.id, button);
-                    else menuButtonRefs.current.delete(orch.id);
-                  }}
-                  onClick={() => setOpenMenuTicket(menuOpen ? null : orch.id)}
-                >
-                  <MoreHorizontal size={13} />
-                </button>
-                {menuOpen ? (
-                  <div className="agent-card-menu-popover" role="menu">
-                    {menuItems.map((item) => {
-                      const reasonId = item.disabled ? `agent-menu-${orch.id}-${item.key}-reason` : undefined;
-                      return (
-                        <span key={item.key}>
-                          {item.disabled && item.title ? (
-                            <span className="sr-only" id={reasonId}>
-                              {item.title}
-                            </span>
-                          ) : null}
-                          <button
-                            aria-describedby={reasonId}
-                            aria-disabled={item.disabled ? "true" : undefined}
-                            className="agent-card-menu-item"
-                            key={item.key}
-                            role="menuitem"
-                            title={item.title}
-                            type="button"
-                            onClick={() => {
-                              if (item.disabled) return;
-                              const menuButton = menuButtonRefs.current.get(orch.id);
-                              replaceFallbackRef.current.current = menuButton ?? null;
-                              menuButton?.focus();
-                              closeMenu("pointer");
-                              item.run();
-                            }}
-                          >
-                            {item.label}
-                          </button>
-                        </span>
-                      );
-                    })}
-                  </div>
-                ) : null}
-              </span>
+              <AgentActionMenu
+                id={orch.id}
+                items={menuItems}
+                open={menuOpen}
+                onClose={closeMenu}
+                onSelect={(item, trigger) => {
+                  replaceFallbackRef.current.current = trigger;
+                  trigger.focus();
+                  closeMenu("pointer");
+                  item.run();
+                }}
+                onToggle={() => setOpenMenuTicket(menuOpen ? null : orch.id)}
+                registerTrigger={(id, button) => {
+                  if (button) menuButtonRefs.current.set(id, button);
+                  else menuButtonRefs.current.delete(id);
+                }}
+              />
             ) : null}
           </span>
         </div>
@@ -2180,59 +2208,23 @@ export function AgentsView({
               details
             </button>
             {menuItems.length > 0 ? (
-              <span className="agent-card-menu" data-agent-menu-for={worker.ticket}>
-                <button
-                  aria-expanded={menuOpen}
-                  aria-haspopup="menu"
-                  aria-label={`More actions for ${worker.ticket}`}
-                  className="agent-log-toggle agent-card-menu-toggle"
-                  type="button"
-                  ref={(button) => {
-                    if (button) menuButtonRefs.current.set(worker.ticket, button);
-                    else menuButtonRefs.current.delete(worker.ticket);
-                  }}
-                  onClick={() =>
-                    setOpenMenuTicket(menuOpen ? null : worker.ticket)
-                  }
-                >
-                  <MoreHorizontal size={13} />
-                </button>
-                {menuOpen ? (
-                  <div className="agent-card-menu-popover" role="menu">
-                    {menuItems.map((item) => {
-                      const reasonId = item.disabled ? `agent-menu-${worker.ticket}-${item.key}-reason` : undefined;
-                      return (
-                        <span key={item.key}>
-                          {item.disabled && item.title ? (
-                            <span className="sr-only" id={reasonId}>
-                              {item.title}
-                            </span>
-                          ) : null}
-                          <button
-                            aria-describedby={reasonId}
-                            aria-disabled={item.disabled ? "true" : undefined}
-                            className="agent-card-menu-item"
-                            key={item.key}
-                            role="menuitem"
-                            title={item.title}
-                            type="button"
-                            onClick={() => {
-                              if (item.disabled) return;
-                              const menuButton = menuButtonRefs.current.get(worker.ticket);
-                              replaceFallbackRef.current.current = menuButton ?? null;
-                              menuButton?.focus();
-                              setOpenMenuTicket(null);
-                              item.run();
-                            }}
-                          >
-                            {item.label}
-                          </button>
-                        </span>
-                      );
-                    })}
-                  </div>
-                ) : null}
-              </span>
+              <AgentActionMenu
+                id={worker.ticket}
+                items={menuItems}
+                open={menuOpen}
+                onClose={closeMenu}
+                onSelect={(item, trigger) => {
+                  replaceFallbackRef.current.current = trigger;
+                  trigger.focus();
+                  closeMenu("pointer");
+                  item.run();
+                }}
+                onToggle={() => setOpenMenuTicket(menuOpen ? null : worker.ticket)}
+                registerTrigger={(id, button) => {
+                  if (button) menuButtonRefs.current.set(id, button);
+                  else menuButtonRefs.current.delete(id);
+                }}
+              />
             ) : null}
           </span>
         </div>

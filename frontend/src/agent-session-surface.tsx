@@ -331,6 +331,7 @@ export function AgentSessionSurface({
   const tick = usePollTick(refreshTick);
   const canReview = worker.canReview ?? Boolean(worker.pr);
   const rowRef = useRef<HTMLDivElement | null>(null);
+  const artifactTriggerRef = useRef<HTMLElement | null>(null);
   const surfaceStateKey = `${stateKey ?? worker.ticket}:${worker.ticket}`;
   const sessionPanelKey = `${worker.ticket}:main`;
   const [panelWidth, setPanelWidth] = useState(() =>
@@ -376,6 +377,9 @@ export function AgentSessionSurface({
   const openArtifact = useCallback((event: SessionEvent) => {
     const artifactId = event.artifact_id;
     if (!artifactId) return;
+    artifactTriggerRef.current = document.activeElement instanceof HTMLElement
+      ? document.activeElement
+      : null;
     setPanel(null);
     if (!localStorage.getItem(ARTIFACT_PANEL_WIDTH_KEY)) {
       const containerWidth = rowRef.current?.getBoundingClientRect().width ?? window.innerWidth;
@@ -407,7 +411,7 @@ export function AgentSessionSurface({
       return {
         ...current,
         focusedTab,
-        open: tabs.length > 0 && current.open,
+        open: current.open,
         recentlyClosed: [artifactId, ...current.recentlyClosed.filter((id) => id !== artifactId)].slice(0, 10),
         tabs,
       };
@@ -433,8 +437,11 @@ export function AgentSessionSurface({
     });
   }, [commitPanelState]);
 
-  const closeArtifactPanel = useCallback(() => {
+  const closeArtifactPanel = useCallback((restoreFocus = true) => {
     commitPanelState((current) => ({ ...current, open: false }));
+    if (restoreFocus) {
+      window.requestAnimationFrame(() => artifactTriggerRef.current?.focus());
+    }
   }, [commitPanelState]);
 
   const updateArtifactViewState = useCallback((artifactId: string, viewState: ArtifactViewState) => {
@@ -641,7 +648,7 @@ export function AgentSessionSurface({
                   className={`agent-surface-action${panel?.kind === "review" ? " is-active" : ""}`}
                   type="button"
                   onClick={() => {
-                    if (panelState.open) closeArtifactPanel();
+                    if (panelState.open) closeArtifactPanel(false);
                     setPanel((current) => current?.kind === "review" ? null : { kind: "review" });
                   }}
                 >
@@ -653,7 +660,7 @@ export function AgentSessionSurface({
                 className={`agent-surface-action${panel?.kind === "graph" ? " is-active" : ""}`}
                 type="button"
                 onClick={() => {
-                  if (panelState.open) closeArtifactPanel();
+                  if (panelState.open) closeArtifactPanel(false);
                   setPanel((current) => (current?.kind === "graph" ? null : { kind: "graph" }));
                 }}
               >
@@ -664,7 +671,7 @@ export function AgentSessionSurface({
                 className={`agent-surface-action${panel?.kind === "replay" ? " is-active" : ""}`}
                 type="button"
                 onClick={() => {
-                  if (panelState.open) closeArtifactPanel();
+                  if (panelState.open) closeArtifactPanel(false);
                   setPanel((current) => (current?.kind === "replay" ? null : { kind: "replay" }));
                 }}
               >
@@ -695,7 +702,7 @@ export function AgentSessionSurface({
           />
         </div>
       </section>
-      {panelState.open && panelState.tabs.length > 0 ? (
+      {panelState.open ? (
         <ArtifactPanel
           artifacts={artifacts}
           onClosePanel={closeArtifactPanel}

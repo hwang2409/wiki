@@ -1,4 +1,4 @@
-import { useEffect, useRef, useState } from "react";
+import { useEffect, useId, useRef, useState } from "react";
 import type { KeyboardEvent as ReactKeyboardEvent, PointerEvent as ReactPointerEvent } from "react";
 import { Clock3, MoreHorizontal, X } from "lucide-react";
 import type { SessionEvent } from "./api";
@@ -17,6 +17,7 @@ import { AudioRenderer, VideoRenderer } from "./artifact-media-renderers";
 import { classifyArtifact, humanizeArtifactKind } from "./artifact-kind";
 import { ArtifactFallback } from "./artifact-state";
 import type { ArtifactViewState, PanelState } from "./transcript-store";
+import { useMenuKeyboard } from "./use-menu-keyboard";
 
 function tabLabelFor(event: SessionEvent | undefined): string {
   return event?.title || event?.artifact?.filename || humanizeArtifactKind(event?.artifact?.kind);
@@ -48,6 +49,16 @@ export function ArtifactPanel({
 }) {
   const [overflowOpen, setOverflowOpen] = useState(false);
   const overflowRef = useRef<HTMLDivElement | null>(null);
+  const overflowTriggerRef = useRef<HTMLButtonElement | null>(null);
+  const panelRef = useRef<HTMLElement | null>(null);
+  const tabRefs = useRef(new Map<string, HTMLButtonElement>());
+  const detailId = useId();
+  const overflowMenuId = "artifact-panel-overflow-menu";
+  const { menuRef: overflowMenuRef, onKeyDown: onOverflowKeyDown } = useMenuKeyboard({
+    open: overflowOpen,
+    onClose: () => setOverflowOpen(false),
+    triggerRef: overflowTriggerRef,
+  });
   const focusedId = state.focusedTab ?? state.tabs.at(-1) ?? null;
   const focusedEvent = focusedId ? artifacts.get(focusedId) : undefined;
   const artifact = focusedEvent?.artifact;
@@ -63,11 +74,42 @@ export function ArtifactPanel({
     return () => document.removeEventListener("mousedown", onDocDown);
   }, [overflowOpen]);
 
+  function closeTab(artifactId: string) {
+    const index = state.tabs.indexOf(artifactId);
+    const nextTabId = state.tabs[index + 1] ?? state.tabs[index - 1] ?? null;
+    onCloseTab(artifactId);
+    window.requestAnimationFrame(() => {
+      if (nextTabId) tabRefs.current.get(nextTabId)?.focus();
+      else panelRef.current?.focus();
+    });
+  }
+
+  function onTabKeyDown(event: ReactKeyboardEvent<HTMLButtonElement>, artifactId: string) {
+    const index = state.tabs.indexOf(artifactId);
+    if (index < 0 || state.tabs.length === 0) return;
+    let nextIndex: number | null = null;
+    if (event.key === "ArrowRight" || event.key === "ArrowDown") nextIndex = (index + 1) % state.tabs.length;
+    else if (event.key === "ArrowLeft" || event.key === "ArrowUp") nextIndex = (index - 1 + state.tabs.length) % state.tabs.length;
+    else if (event.key === "Home") nextIndex = 0;
+    else if (event.key === "End") nextIndex = state.tabs.length - 1;
+    else if (event.key === "Enter" || event.key === " ") {
+      event.preventDefault();
+      onFocusTab(artifactId);
+      return;
+    }
+    if (nextIndex === null) return;
+    event.preventDefault();
+    const nextTabId = state.tabs[nextIndex];
+    if (!nextTabId) return;
+    onFocusTab(nextTabId);
+    window.requestAnimationFrame(() => tabRefs.current.get(nextTabId)?.focus());
+  }
+
   function onKeyDown(event: ReactKeyboardEvent<HTMLElement>) {
     const command = event.metaKey || event.ctrlKey;
     if (command && event.key.toLocaleLowerCase() === "w") {
       event.preventDefault();
-      if (focusedId) onCloseTab(focusedId);
+      if (focusedId) closeTab(focusedId);
       return;
     }
     if (command && event.key === "0" && ["image", "svg", "mermaid", "pdf", "plot"].includes(artifact?.kind ?? "")) {
@@ -106,6 +148,7 @@ export function ArtifactPanel({
       aria-label="Artifact panel"
       className="session-side-panel artifact-panel"
       data-focused-artifact={focusedId ?? undefined}
+      ref={panelRef}
       style={{ width }}
       tabIndex={-1}
       onKeyDown={onKeyDown}
@@ -124,10 +167,18 @@ export function ArtifactPanel({
               >
                 <button
                   aria-selected={selected}
+                  aria-controls={detailId}
                   className="bb-tab-pill__button"
+                  id={`${detailId}-tab-${artifactId}`}
                   role="tab"
+                  ref={(button) => {
+                    if (button) tabRefs.current.set(artifactId, button);
+                    else tabRefs.current.delete(artifactId);
+                  }}
+                  tabIndex={selected ? 0 : -1}
                   title={label}
                   type="button"
+                  onKeyDown={(event) => onTabKeyDown(event, artifactId)}
                   onClick={() => onFocusTab(artifactId)}
                 >
                   <span className="bb-tab-pill__label">{label}</span>
@@ -136,7 +187,7 @@ export function ArtifactPanel({
                   aria-label={`Close ${label}`}
                   className="bb-tab-pill__close"
                   type="button"
-                  onClick={() => onCloseTab(artifactId)}
+                  onClick={() => closeTab(artifactId)}
                 >
                   <X aria-hidden="true" className="bb-tab-pill__close-glyph" />
                 </button>
@@ -147,28 +198,37 @@ export function ArtifactPanel({
         <div className="artifact-panel-actions">
           <div className="artifact-panel-overflow" ref={overflowRef}>
             <button
-              aria-controls="artifact-panel-overflow-menu"
+              aria-controls={overflowMenuId}
               aria-expanded={overflowOpen}
+              aria-haspopup="menu"
               aria-label="Artifact panel menu"
               className="bb-icon-button"
+              ref={overflowTriggerRef}
               type="button"
               onClick={() => setOverflowOpen((value) => !value)}
             >
               <MoreHorizontal aria-hidden="true" />
             </button>
             {overflowOpen ? (
-              <div className="artifact-panel-overflow-menu" id="artifact-panel-overflow-menu" role="menu">
+              <div
+                className="artifact-panel-overflow-menu"
+                id={overflowMenuId}
+                ref={overflowMenuRef}
+                role="menu"
+                onKeyDown={onOverflowKeyDown}
+              >
                 {state.recentlyClosed.length > 0 ? (
                   <>
                     <div className="artifact-panel-overflow-heading" role="presentation">
                       <Clock3 aria-hidden="true" size={11} />
                       <span>Recently closed</span>
                     </div>
-                    {state.recentlyClosed.map((artifactId) => (
+                    {state.recentlyClosed.map((artifactId, index) => (
                       <button
                         className="artifact-panel-overflow-item"
                         key={artifactId}
                         role="menuitem"
+                        tabIndex={index === 0 ? 0 : -1}
                         type="button"
                         onClick={() => {
                           setOverflowOpen(false);
@@ -195,7 +255,14 @@ export function ArtifactPanel({
           </button>
         </div>
       </div>
-      <div className="artifact-panel-detail" data-artifact-detail-kind={artifact?.kind}>
+      <div
+        aria-labelledby={focusedId ? `${detailId}-tab-${focusedId}` : undefined}
+        className="artifact-panel-detail"
+        data-artifact-detail-kind={artifact?.kind}
+        id={detailId}
+        role="tabpanel"
+        tabIndex={-1}
+      >
         {detail ?? (
           <div className="artifact-panel-missing">
             <ArtifactFallback
