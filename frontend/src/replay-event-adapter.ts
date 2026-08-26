@@ -2,6 +2,7 @@ import type {
   ProviderStreamEvent,
   ReplayRawEvent,
   ReplayTimelineEvent,
+  SessionEvent,
   SessionTool,
 } from "./api";
 
@@ -11,7 +12,17 @@ type ProviderEventInput =
   | Pick<ProviderStreamEvent, "payload">
   | Pick<ReplayRawEvent, "raw">;
 
-export type ReplayEventPresentation = {
+export type PresentationBlock =
+  | { type: "message"; role: "user" | "assistant"; text: string }
+  | { type: "tool"; tool: SessionTool }
+  | { type: "marker"; text: string };
+
+export type SessionEventPresentation = {
+  category: "message" | "activity" | "marker";
+  blocks: PresentationBlock[];
+};
+
+export type ReplayEventPresentation = SessionEventPresentation & {
   messageRole: "user" | "assistant";
   messageText: string | null;
   message: boolean;
@@ -36,13 +47,12 @@ function rawContentText(value: unknown): string | null {
   const direct = stringValue(value);
   if (direct) return direct;
   if (!Array.isArray(value)) return null;
-  for (const blockValue of value) {
+  const texts = value.flatMap((blockValue) => {
     const block = asRecord(blockValue);
-    if (!block || block.type !== "text") continue;
-    const text = stringValue(block.text);
-    if (text) return text;
-  }
-  return null;
+    const text = block?.type === "text" ? stringValue(block.text) : null;
+    return text ? [text] : [];
+  });
+  return texts.length ? texts.join("\n") : null;
 }
 
 function codexItem(payload: RawRecord | null): RawRecord | null {
@@ -63,7 +73,7 @@ function toolInputText(value: unknown): string {
 
 function firstToolTarget(input: RawRecord | null): string {
   if (!input) return "";
-  for (const key of ["command", "file_path", "filePath", "path", "pattern", "query", "url"]) {
+  for (const key of ["command", "file_path", "filePath", "path", "pattern", "query", "url", "tool", "action"]) {
     const value = stringValue(input[key]);
     if (value) return value;
   }
@@ -77,111 +87,231 @@ function archetypeForTool(name: string, itemType = ""): string {
   }
   if (["read", "cat", "notebookread"].includes(normalized)) return "read";
   if (["edit", "write", "apply_patch", "filechange"].includes(normalized)) return "edit";
-  if (["grep", "glob", "search"].includes(normalized)) return "search";
+  if (["grep", "glob", "search", "websearch"].includes(normalized)) return "search";
+  if (["task", "agent", "collabtoolcall", "collabagenttoolcall"].includes(normalized)) return "agent";
   return "tool";
+}
+
+function codexToolName(item: RawRecord, itemType: string): string {
+  if (itemType === "commandExecution") return "Bash";
+  if (itemType === "mcpToolCall") {
+    const server = stringValue(item.server) ?? "?";
+    const tool = stringValue(item.tool) ?? "?";
+    return `${itemType} ${server}.${tool}`;
+  }
+  return stringValue(item.tool) ?? stringValue(item.name) ?? itemType;
+}
+
+function codexToolInput(item: RawRecord, itemType: string): unknown {
+  if (itemType === "commandExecution") return item.command ?? item.cmd ?? item.input;
+  if (itemType === "fileChange") return item.changes ?? item.input ?? item.patch;
+  if (itemType === "webSearch") return item.query ?? item.input;
+  if (itemType === "imageView") return item.path ?? item.input;
+  if (itemType === "collabToolCall" || itemType === "collabAgentToolCall") {
+    return item.input ?? item.arguments ?? item.action;
+  }
+  return item.arguments ?? item.input ?? rawContentText(item.contentItems) ?? item.contentItems;
+}
+
+function codexToolTarget(item: RawRecord, input: unknown): string {
+  return (
+    stringValue(item.command) ||
+    stringValue(item.query) ||
+    stringValue(item.path) ||
+    firstToolTarget(asRecord(input)) ||
+    toolInputText(input)
+  );
+}
+
+function codexToolOk(item: RawRecord, event: ReplayTimelineEvent): boolean | null {
+  if (typeof item.success === "boolean") return item.success;
+  if (typeof item.exitCode === "number") return item.exitCode === 0;
+  if (item.error !== null && item.error !== undefined) return false;
+  const status = stringValue(item.status)?.toLowerCase();
+  if (status === "failed" || status === "error") return false;
+  return event.bookmark === "error" ? false : null;
+}
+
+function codexToolFromItem(item: RawRecord, event: ReplayTimelineEvent): SessionTool | null {
+  const itemType = stringValue(item.type) ?? "";
+  const toolTypes = [
+    "commandExecution",
+    "fileChange",
+    "mcpToolCall",
+    "dynamicToolCall",
+    "webSearch",
+    "webSearchCall",
+    "imageView",
+    "collabToolCall",
+    "collabAgentToolCall",
+    "functionCall",
+  ];
+  if (!toolTypes.includes(itemType)) return null;
+  const name = codexToolName(item, itemType);
+  const inputValue = codexToolInput(item, itemType);
+  const input = toolInputText(inputValue);
+  const target = codexToolTarget(item, inputValue);
+  return {
+    name,
+    input,
+    output: null,
+    ok: codexToolOk(item, event),
+    archetype: archetypeForTool(name, itemType),
+    summary: `${name.toLowerCase()}${target ? ` ${target}` : ""}`,
+  };
+}
+
+function claudeToolFromBlock(block: RawRecord): SessionTool | null {
+  if (block.type === "tool_use") {
+    const name = stringValue(block.name) ?? "tool";
+    const input = toolInputText(block.input);
+    const target = firstToolTarget(asRecord(block.input));
+    return {
+      name,
+      input,
+      output: null,
+      ok: null,
+      archetype: archetypeForTool(name),
+      summary: `${name}${target ? ` ${target}` : ""}`,
+    };
+  }
+  if (block.type !== "tool_result") return null;
+  const resultText = rawContentText(block.content) ?? toolInputText(block.content);
+  return {
+    name: "tool result",
+    input: resultText,
+    output: null,
+    ok: block.is_error === true ? false : null,
+    archetype: "tool",
+    summary: `tool result${resultText ? ` ${resultText}` : ""}`,
+  };
+}
+
+function markerBlock(event: ReplayTimelineEvent): PresentationBlock {
+  const label = event.summary.trim() || event.kind.trim() || "unknown event";
+  return { type: "marker", text: `event · ${label}` };
+}
+
+function summaryToolFromEvent(event: ReplayTimelineEvent): SessionTool | null {
+  if (!/tool_use|tool_result|commandExecution/i.test(event.summary)) return null;
+  const summary = event.summary.trim() || event.kind;
+  const [name = event.kind] = summary.split(/\s+/, 2);
+  return {
+    name,
+    input: "",
+    output: null,
+    ok: event.bookmark === "error" ? false : null,
+    archetype: archetypeForTool(name),
+    summary,
+  };
+}
+
+function replayBlocks(event: ReplayTimelineEvent, rawEvent: ReplayRawEvent | null): PresentationBlock[] {
+  const payload = rawEvent ? providerEventPayload(rawEvent) : null;
+  const item = codexItem(payload);
+  if (item) {
+    const itemType = stringValue(item.type) ?? "";
+    if (itemType === "userMessage" || itemType === "agentMessage") {
+      const role = itemType === "userMessage" ? "user" : "assistant";
+      const text = stringValue(item.text) ?? rawContentText(item.content);
+      if (text) return [{ type: "message", role, text }];
+    }
+    const tool = codexToolFromItem(item, event);
+    if (tool) return [{ type: "tool", tool }];
+  }
+
+  const message = asRecord(payload?.message);
+  const role = stringValue(message?.role);
+  const content = message?.content;
+  if (role === "user" || role === "assistant") {
+    const blocks: PresentationBlock[] = [];
+    if (Array.isArray(content)) {
+      for (const value of content) {
+        const block = asRecord(value);
+        if (!block) continue;
+        if (block.type === "text") {
+          const text = stringValue(block.text);
+          if (text) blocks.push({ type: "message", role, text });
+          continue;
+        }
+        const tool = claudeToolFromBlock(block);
+        if (tool) blocks.push({ type: "tool", tool });
+      }
+    } else {
+      const text = rawContentText(content);
+      if (text) blocks.push({ type: "message", role, text });
+    }
+    if (blocks.length) return blocks;
+  }
+
+  const summarizedTool = summaryToolFromEvent(event);
+  if (summarizedTool) return [{ type: "tool", tool: summarizedTool }];
+
+  if (["claude_user", "claude_assistant", "codex_user", "codex_assistant"].includes(event.kind)) {
+    return [{
+      type: "message",
+      role: event.kind.includes("user") ? "user" : "assistant",
+      text: event.summary,
+    }];
+  }
+  return [markerBlock(event)];
+}
+
+export function sessionEventPresentation(event: SessionEvent): SessionEventPresentation {
+  if (event.kind === "tool" && event.tool) {
+    return { category: "activity", blocks: [{ type: "tool", tool: event.tool }] };
+  }
+  if (event.kind === "thinking") {
+    return { category: "activity", blocks: [{ type: "marker", text: event.text }] };
+  }
+  if (event.kind === "user" || event.kind === "assistant") {
+    return {
+      category: "message",
+      blocks: [{
+        type: "message",
+        role: event.kind === "user" ? "user" : "assistant",
+        text: event.text,
+      }],
+    };
+  }
+  return { category: "marker", blocks: [{ type: "marker", text: event.text || event.kind }] };
+}
+
+export function providerEventPresentation(event: SessionEvent): SessionEventPresentation;
+export function providerEventPresentation(
+  event: ReplayTimelineEvent,
+  rawEvent: ReplayRawEvent | null,
+): ReplayEventPresentation;
+export function providerEventPresentation(
+  event: SessionEvent | ReplayTimelineEvent,
+  rawEvent?: ReplayRawEvent | null,
+): SessionEventPresentation | ReplayEventPresentation {
+  if ("text" in event) return sessionEventPresentation(event);
+  return replayEventPresentation(event, rawEvent ?? null);
 }
 
 export function providerToolFromEvent(
   event: ReplayTimelineEvent,
   rawEvent: ReplayRawEvent | null,
 ): SessionTool | null {
-  const payload = rawEvent ? providerEventPayload(rawEvent) : null;
-  const item = codexItem(payload);
-  if (item) {
-    const itemType = stringValue(item.type) ?? "";
-    const toolLike = ["commandExecution", "fileChange", "functionCall", "mcpToolCall", "webSearchCall"].includes(itemType);
-    if (toolLike) {
-      const name = itemType === "commandExecution"
-        ? "Bash"
-        : stringValue(item.name) ?? itemType;
-      const input = toolInputText(item.command ?? item.arguments ?? item.input ?? firstToolTarget(item));
-      const target = (stringValue(item.command) ?? firstToolTarget(item)) || input;
-      const exitCode = item.exitCode;
-      const ok = typeof exitCode === "number" ? exitCode === 0 : event.bookmark === "error" ? false : null;
-      return {
-        name,
-        input,
-        output: null,
-        ok,
-        archetype: archetypeForTool(name, itemType),
-        summary: `${name.toLowerCase()}${target ? ` ${target}` : ""}`,
-      };
-    }
-  }
-
-  const message = asRecord(payload?.message);
-  const content = message?.content;
-  if (Array.isArray(content)) {
-    for (const blockValue of content) {
-      const block = asRecord(blockValue);
-      if (!block || (block.type !== "tool_use" && block.type !== "tool_result")) continue;
-      if (block.type === "tool_use") {
-        const name = stringValue(block.name) ?? "tool";
-        const inputRecord = asRecord(block.input);
-        const target = firstToolTarget(inputRecord);
-        return {
-          name,
-          input: toolInputText(block.input),
-          output: null,
-          ok: null,
-          archetype: archetypeForTool(name),
-          summary: `${name}${target ? ` ${target}` : ""}`,
-        };
-      }
-      const resultText = rawContentText(block.content) ?? "";
-      return {
-        name: "tool result",
-        input: resultText,
-        output: null,
-        ok: block.is_error === true ? false : null,
-        archetype: "tool",
-        summary: `tool result${resultText ? ` ${resultText}` : ""}`,
-      };
-    }
-  }
-
-  if (/tool_use|tool_result|commandExecution/i.test(event.summary)) {
-    const summary = event.summary.trim() || event.kind;
-    const parts = summary.split(/\s+/, 2);
-    return {
-      name: parts[0] ?? event.kind,
-      input: "",
-      output: null,
-      ok: event.bookmark === "error" ? false : null,
-      archetype: archetypeForTool(parts[0] ?? event.kind),
-      summary,
-    };
-  }
-  return null;
+  return replayBlocks(event, rawEvent).find((block) => block.type === "tool")?.tool ?? null;
 }
 
 export function replayEventPresentation(
   event: ReplayTimelineEvent,
   rawEvent: ReplayRawEvent | null,
 ): ReplayEventPresentation {
-  const payload = rawEvent ? providerEventPayload(rawEvent) : null;
-  const message = asRecord(payload?.message);
-  const messageRole = stringValue(message?.role);
-  const item = codexItem(payload);
-  const itemType = stringValue(item?.type);
-  const isMessageKind = ["claude_user", "claude_assistant", "codex_user", "codex_assistant"].includes(event.kind);
-  const isMessageItem = itemType === "userMessage" || itemType === "agentMessage";
-  const tool = providerToolFromEvent(event, rawEvent);
-
-  let messageText: string | null = null;
-  if (messageRole === "user" || messageRole === "assistant") {
-    messageText = rawContentText(message?.content);
-  }
-  if (!messageText && isMessageItem) {
-    messageText = stringValue(item?.text) ?? rawContentText(item?.content) ?? rawContentText(item?.summary);
-  }
-  if (!messageText && isMessageKind) messageText = event.summary;
-  if (!messageText && isMessageItem) messageText = event.summary;
-
+  const blocks = replayBlocks(event, rawEvent);
+  const messageBlock = blocks.find((block) => block.type === "message");
+  const toolBlock = blocks.find((block) => block.type === "tool");
+  const hasMessage = messageBlock?.type === "message";
+  const hasTool = toolBlock?.type === "tool";
   return {
-    messageRole: itemType === "userMessage" || event.kind.includes("user") ? "user" : "assistant",
-    messageText,
-    message: (isMessageItem || isMessageKind) && tool === null,
-    tool,
+    category: hasMessage ? "message" : hasTool ? "activity" : "marker",
+    blocks,
+    messageRole: messageBlock?.type === "message" ? messageBlock.role : "assistant",
+    messageText: messageBlock?.type === "message" ? messageBlock.text : null,
+    message: hasMessage,
+    tool: toolBlock?.type === "tool" ? toolBlock.tool : null,
   };
 }

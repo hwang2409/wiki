@@ -27,7 +27,7 @@ import {
   type SessionEvent,
 } from "./api";
 import { CopyPill } from "./copy-button";
-import { replayEventPresentation } from "./replay-event-adapter";
+import { providerEventPresentation, type PresentationBlock } from "./replay-event-adapter";
 import { BoundedPreview } from "./transcript-preview";
 import { SessionMarkdown, ToolCallRow } from "./session";
 
@@ -160,13 +160,16 @@ function ReplayMessageSummary({ role, text }: { role: "user" | "assistant"; text
 
 function ReplayToolOrMarker({
   event,
+  marker,
   tool,
   ticket,
 }: {
   event: ReplayTimelineEvent;
+  marker?: string;
   tool: NonNullable<SessionEvent["tool"]> | null;
   ticket: string;
 }) {
+  if (marker) return <div className="replay-event-marker">{marker}</div>;
   if (!tool) {
     return <div className="replay-event-marker">{plainEventLabel(event)}</div>;
   }
@@ -179,6 +182,31 @@ function ReplayToolOrMarker({
     tool,
   };
   return <ToolCallRow event={toolEvent} ticket={ticket} withResult={false} />;
+}
+
+function ReplayPresentationBlocks({
+  blocks,
+  event,
+  ticket,
+}: {
+  blocks: PresentationBlock[];
+  event: ReplayTimelineEvent;
+  ticket: string;
+}) {
+  return (
+    <>
+      {blocks.map((block, index) => {
+        if (block.type === "message") {
+          return <ReplayMessageSummary key={`message:${index}`} role={block.role} text={block.text} />;
+        }
+        if (block.type === "tool") {
+          return <ReplayToolOrMarker key={`tool:${index}`} event={event} ticket={ticket} tool={block.tool} />;
+        }
+        const marker = EVENT_KIND_LABELS[event.kind] ? plainEventLabel(event) : block.text;
+        return <ReplayToolOrMarker key={`marker:${index}`} event={event} marker={marker} ticket={ticket} tool={null} />;
+      })}
+    </>
+  );
 }
 
 /**
@@ -735,7 +763,7 @@ function ReplayScrubberBody({
     ? rawEvent.event
     : null;
   const presentation = currentEvent
-    ? replayEventPresentation(currentEvent, selectedRawEvent)
+    ? providerEventPresentation(currentEvent, selectedRawEvent)
     : null;
 
   useEffect(() => {
@@ -857,18 +885,9 @@ function ReplayScrubberBody({
       {currentEvent ? (
         <article className="replay-event">
           <div className="replay-event-summary">
-            {presentation?.message ? (
-              <ReplayMessageSummary
-                role={presentation.messageRole}
-                text={presentation.messageText ?? currentEvent.summary}
-              />
-            ) : (
-              <ReplayToolOrMarker
-                event={currentEvent}
-                tool={presentation?.tool ?? null}
-                ticket={ticket}
-              />
-            )}
+            {presentation ? (
+              <ReplayPresentationBlocks blocks={presentation.blocks} event={currentEvent} ticket={ticket} />
+            ) : null}
             {rawLoading && !selectedRawEvent ? (
               <span aria-live="polite" className="replay-event-loading">loading event…</span>
             ) : null}
