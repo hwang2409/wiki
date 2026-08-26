@@ -2672,7 +2672,7 @@ export function AgentsSidebar({
           href="#/agents"
           data-testid="nav-agents-empty-secondary"
         >
-          Open Agents page
+          Open Runs page
         </a>
       </div>
     );

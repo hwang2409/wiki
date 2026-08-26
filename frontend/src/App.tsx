@@ -29,7 +29,6 @@ import {
   Search,
   Settings,
   SquarePen,
-  SquareTerminal,
   Terminal as TerminalIcon,
   Sun,
   TrendingUp,
@@ -256,6 +255,7 @@ function utilityPanePath(kind: UtilityMode): string {
 }
 
 function utilityLabel(kind: UtilityMode): string {
+  if (kind === "agents") return "Runs";
   return `${kind.slice(0, 1).toUpperCase()}${kind.slice(1)}`;
 }
 
@@ -3120,6 +3120,10 @@ export default function App() {
       const hash = window.location.hash || "#/";
       if (appliedHashRef.current === hash) return;
       appliedHashRef.current = hash;
+      if (hash === "#/agent-list") {
+        window.location.hash = "#/agents";
+        return;
+      }
       const route = parseRoute(hash);
 
       if (route.kind === "empty") {
@@ -3371,7 +3375,7 @@ export default function App() {
       : mode === "file"
         ? focusedPanePath?.split("/") ?? []
       : mode === "agent"
-        ? ["Agents", agentTicket ?? ""]
+        ? ["Runs", agentTicket ?? ""]
         : mode === "terminal"
           ? ["Terminal", terminalRouteId ?? ""]
         : utilityTitles[mode]
@@ -3729,9 +3733,8 @@ export default function App() {
   }> = [
     { key: "new-note", label: "New note", icon: SquarePen, active: false, onSelect: startNewNote },
     { key: "files", label: "Files", icon: FolderIcon, active: sidebarTab === "files", onSelect: () => setSidebarTab("files") },
-    { key: "agent-list", label: "Agent list", icon: SquareTerminal, active: sidebarTab === "agents", onSelect: () => setSidebarTab("agents") },
     { key: "new-terminal", label: "New terminal", title: "New terminal (C-a t)", icon: TerminalIcon, active: false, onSelect: createTerminalPane },
-    { key: "agents", label: "Agents", icon: Bot, active: mode === "agents", onSelect: () => openUtilityView("agents") },
+    { key: "agents", label: "Runs", icon: Bot, active: mode === "agents", onSelect: () => openUtilityView("agents") },
     { key: "activity", label: "Activity feed", icon: History, active: mode === "activity", onSelect: () => openUtilityView("activity") },
     { key: "graph", label: "Graph view", icon: Waypoints, active: mode === "graph", onSelect: () => openUtilityView("graph") },
     { key: "health", label: "Note freshness", icon: HeartPulse, active: mode === "health", onSelect: () => openUtilityView("health") },
@@ -4084,15 +4087,28 @@ export default function App() {
           </div>
           <div className="app-page-header__actions">
             {mode === "agents" ? (
-              <Button
-                className="agents-page-start-button"
-                leadingIcon={<Plus aria-hidden size={14} />}
-                ref={agentsStartRunRef}
-                type="button"
-                onClick={() => setAgentsStartRunRequest((request) => request + 1)}
-              >
-                Start run
-              </Button>
+              <>
+                <Button
+                  leadingIcon={<PanelLeft aria-hidden size={14} />}
+                  variant="secondary"
+                  type="button"
+                  onClick={() => {
+                    setSidebarTab("agents");
+                    setSidebarVisible(true);
+                  }}
+                >
+                  Show sidebar runs
+                </Button>
+                <Button
+                  className="agents-page-start-button"
+                  leadingIcon={<Plus aria-hidden size={14} />}
+                  ref={agentsStartRunRef}
+                  type="button"
+                  onClick={() => setAgentsStartRunRequest((request) => request + 1)}
+                >
+                  Start run
+                </Button>
+              </>
             ) : null}
             {mode === "view" ? (
               <button
