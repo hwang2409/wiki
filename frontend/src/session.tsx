@@ -135,6 +135,7 @@ import type { HarnessOutputSegment } from "./transcript-output";
 import { CodexStreamHighlights } from "./codex-stream-renderers";
 import { markerRule } from "./hook-message-registry";
 import type { MarkerSeverity } from "./hook-message-registry";
+import { providerEventPayload } from "./replay-event-adapter";
 import {
   activityRunStateFromProvider,
   activityStateLabel,
@@ -717,10 +718,11 @@ function modelChangedMarkers(session: TranscriptSession | null): SessionEvent[] 
   return session.providerInspector.events
     .filter((event) => event.kind === "model_changed")
     .map((event) => {
-      const toModel = typeof event.payload.to_model === "string" ? event.payload.to_model : "";
+      const payload = providerEventPayload(event);
+      const toModel = typeof payload?.to_model === "string" ? payload.to_model : "";
       const text =
-        typeof event.payload.message === "string"
-          ? event.payload.message
+        typeof payload?.message === "string"
+          ? payload.message
           : `model changed to ${toModel || "new model"}`;
       return {
         id: 1_000_000 + event.seq,
