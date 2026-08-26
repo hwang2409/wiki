@@ -67,7 +67,9 @@
     "test:wiki-386": "node tests/wiki-386-graph-density.playwright.mjs",
     "test:wiki-383": "node tests/wiki-383-video-controls.playwright.mjs",
     "pretest:wiki-389": "npm run build",
-    "test:wiki-389": "node tests/wiki-389-run-naming.playwright.mjs"
+    "test:wiki-389": "node tests/wiki-389-run-naming.playwright.mjs",
+    "pretest:wiki-387": "npm run build",
+    "test:wiki-387": "node tests/wiki-387-replay-readability.playwright.mjs"
   },
   "dependencies": {
     "@codemirror/commands": "^6.10.4",

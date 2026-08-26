@@ -12,6 +12,6 @@ export default defineConfig({
       },
     },
     setupFiles: ["./vitest.setup.ts"],
-    include: ["tests/**/*.integration.test.tsx"],
+    include: ["tests/**/*.integration.test.tsx", "tests/**/*.unit.test.ts"],
   },
 });

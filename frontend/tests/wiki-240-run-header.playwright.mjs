@@ -994,6 +994,7 @@ async function main() {
             } else if (action === "Replay") {
               const replay = panel.locator(".replay-panel");
               await replay.getByText("Header fixture started.", { exact: true }).waitFor();
+              await replay.getByText("Event details", { exact: true }).click();
               await replay.locator(".replay-event-raw").getByText("fixture started", { exact: false }).waitFor();
               await replay.getByText("loading timeline…", { exact: true }).waitFor({ state: "detached" });
               const next = replay.getByRole("button", { name: "Next event" });
@@ -1003,6 +1004,7 @@ async function main() {
               await next.click();
               await rawLoaded;
               await replay.getByText("Header fixture passed its focused checks.", { exact: true }).waitFor();
+              await replay.getByText("Event details", { exact: true }).click();
               await replay.locator(".replay-event-raw").getByText("fixture passed", { exact: false }).waitFor();
             }
             await page.screenshot({

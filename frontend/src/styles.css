@@ -14355,6 +14355,98 @@ textarea.composer-command-input {
   overflow-wrap: anywhere;
 }
 
+.replay-event-message {
+  margin: 0;
+  padding: 0;
+  background: transparent;
+}
+
+.replay-event-message .transcript-preview-body {
+  max-height: 180px;
+  padding: 0;
+  color: var(--text-normal);
+  font-family: var(--font-interface);
+  font-size: var(--font-chrome-size);
+  line-height: 1.45;
+}
+
+.replay-event-message .transcript-preview-more {
+  margin-top: 4px;
+  padding: 0;
+  color: var(--text-muted);
+  font-family: var(--font-monospace);
+  font-size: var(--font-chrome-size);
+}
+
+.replay-event-message-markdown > :first-child {
+  margin-top: 0;
+}
+
+.replay-event-message-markdown > :last-child {
+  margin-bottom: 0;
+}
+
+.replay-event-status {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+  color: var(--text-faint);
+  font-family: var(--font-monospace);
+  font-size: var(--font-chrome-size);
+}
+
+.replay-event-status span + span::before {
+  margin-right: 6px;
+  color: var(--text-faint);
+  content: "·";
+}
+
+.replay-event-marker {
+  color: var(--text-muted);
+  font-family: var(--font-monospace);
+  font-size: var(--font-chrome-size);
+}
+
+.replay-event-details {
+  margin-top: 2px;
+  border-top: 1px solid var(--background-modifier-border);
+  color: var(--text-muted);
+  font-family: var(--font-monospace);
+  font-size: var(--font-chrome-size);
+}
+
+.replay-event-details summary {
+  min-height: 40px;
+  padding: 10px 0 6px;
+  color: var(--text-faint);
+  cursor: pointer;
+  list-style-position: inside;
+}
+
+.replay-event-details summary:hover,
+.replay-event-details summary:focus-visible {
+  color: var(--text-normal);
+}
+
+.replay-event-details-body {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+
+.replay-event-details-meta {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 4px 10px;
+  color: var(--text-faint);
+  overflow-wrap: anywhere;
+}
+
+.replay-event-raw-wrap {
+  position: relative;
+  min-width: 0;
+}
+
 .replay-event-raw {
   margin: 0;
   max-height: 280px;
@@ -14369,6 +14461,12 @@ textarea.composer-command-input {
   line-height: var(--font-monospace-line-height);
   white-space: pre-wrap;
   overflow-wrap: anywhere;
+}
+
+.replay-event-copy {
+  position: absolute;
+  top: 6px;
+  right: 6px;
 }
 
 /* PDF artifact — solid framing, dense chrome, clear page rendering. */

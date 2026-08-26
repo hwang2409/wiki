@@ -24,7 +24,12 @@ import {
   type ReplayRunSummary,
   type ReplayTimeline,
   type ReplayTimelineEvent,
+  type SessionEvent,
 } from "./api";
+import { CopyPill } from "./copy-button";
+import { providerEventPayload, providerEventToBlocks, type PresentationBlock } from "./replay-event-adapter";
+import { BoundedPreview } from "./transcript-preview";
+import { SessionMarkdown, ThinkingRow, ToolCallRow } from "./session";
 
 const SPEED_OPTIONS = [0.5, 1, 2, 5, 10] as const;
 const MAX_SPEED_LABEL = "max";
@@ -82,6 +87,149 @@ function bookmarkIcon(kind: ReplayBookmarkKind) {
 function bookmarkTitle(bookmark: ReplayBookmark): string {
   const clock = formatClockTime(bookmark.ts);
   return `${bookmark.kind} @ ${clock} · ${bookmark.summary}`;
+}
+
+const DISPOSITION_LABELS: Record<string, string> = {
+  rendered: "shown",
+  summarized: "summarized",
+  ignored: "skipped",
+  intentionally_ignored: "skipped",
+  unknown: "unclassified",
+};
+
+const LIFECYCLE_LABELS: Record<string, string> = {
+  working: "working",
+  idle: "idle",
+  blocked: "blocked",
+  interrupted: "interrupted",
+  completed: "complete",
+  inProgress: "in progress",
+  in_progress: "in progress",
+};
+
+const BOOKMARK_LABELS: Record<string, string> = {
+  steer: "steer",
+  verdict: "verdict",
+  error: "error",
+};
+
+const EVENT_KIND_LABELS: Record<string, string> = {
+  claude_client_message: "client message",
+  claude_hook_response: "hook response",
+  claude_hook_started: "hook started",
+  claude_init: "session started",
+  claude_rate_limit_event: "rate limit update",
+  claude_result: "turn result",
+  claude_status: "status update",
+  claude_stream_event: "stream update",
+  codex_client_message: "client message",
+  item_completed: "item completed",
+  item_started: "item started",
+  provider_process_exit: "provider stopped",
+  provider_stderr: "provider error output",
+  turn_completed: "turn completed",
+  turn_started: "turn started",
+  warning: "warning",
+};
+
+function plainEnum(value: string | null, labels: Record<string, string>): string | null {
+  if (!value) return null;
+  return labels[value] ?? value;
+}
+
+function plainEventLabel(event: ReplayTimelineEvent): string {
+  const label = EVENT_KIND_LABELS[event.kind] ?? (event.summary || event.kind);
+  const lifecycle = plainEnum(event.lifecycle_state, LIFECYCLE_LABELS);
+  return lifecycle ? `${label} · ${lifecycle}` : label;
+}
+
+function ReplayMessageSummary({ role, text }: { role: "user" | "assistant"; text: string }) {
+  return (
+    <BoundedPreview
+      className={`replay-event-message is-${role}`}
+      previewLines={6}
+      showSummary={false}
+      text={text}
+      variant="block"
+      renderBody={({ text: previewText }) => (
+        <SessionMarkdown className="replay-event-message-markdown" text={previewText} />
+      )}
+    />
+  );
+}
+
+function ReplayToolOrMarker({
+  event,
+  marker,
+  tool,
+  ticket,
+}: {
+  event: ReplayTimelineEvent;
+  marker?: string;
+  tool: NonNullable<SessionEvent["tool"]> | null;
+  ticket: string;
+}) {
+  if (marker) return <div className="replay-event-marker" data-provider-block-type="marker" data-provider-event-seq={event.seq}>{marker}</div>;
+  if (!tool) {
+    return <div className="replay-event-marker" data-provider-block-type="marker" data-provider-event-seq={event.seq}>{plainEventLabel(event)}</div>;
+  }
+  const toolEvent: SessionEvent = {
+    id: event.seq,
+    kind: "tool",
+    ts: event.ts,
+    text: "",
+    disposition: "rendered",
+    tool,
+  };
+  return (
+    <div data-provider-block-type="tool" data-provider-event-seq={event.seq} data-tool-ok={String(tool.ok)}>
+      <ToolCallRow event={toolEvent} ticket={ticket} withResult={false} />
+    </div>
+  );
+}
+
+function ReplayPresentationBlocks({
+  blocks,
+  event,
+  ticket,
+}: {
+  blocks: PresentationBlock[];
+  event: ReplayTimelineEvent;
+  ticket: string;
+}) {
+  return (
+    <>
+      {blocks.map((block, index) => {
+        if (block.type === "message") {
+          return (
+            <div data-provider-block-type="message" data-provider-event-seq={event.seq} key={`message:${index}`}>
+              <ReplayMessageSummary role={block.role} text={block.text} />
+            </div>
+          );
+        }
+        if (block.type === "tool") {
+          return <ReplayToolOrMarker key={`tool:${index}`} event={event} ticket={ticket} tool={block.tool} />;
+        }
+        if (block.type === "thinking") {
+          const thinkingEvent: SessionEvent = {
+            id: event.seq,
+            kind: "thinking",
+            ts: event.ts,
+            text: block.text,
+            disposition: event.disposition === "rendered" ? "rendered" : "unknown",
+            encrypted: block.encrypted,
+          };
+          return (
+            <div data-provider-block-type="thinking" data-provider-event-seq={event.seq} key={`thinking:${index}`}>
+              <ThinkingRow event={thinkingEvent} />
+            </div>
+          );
+        }
+        const marker = EVENT_KIND_LABELS[event.kind] ? plainEventLabel(event) : block.text;
+        return <ReplayToolOrMarker key={`marker:${index}`} event={event} marker={marker} ticket={ticket} tool={null} />;
+      })}
+    </>
+  );
 }
 
 /**
@@ -163,7 +311,10 @@ export function ReplayScrubberPanel({ ticket }: { ticket: string }) {
   const [absoluteIndex, setAbsoluteIndex] = useState(0);
   const [playing, setPlaying] = useState(false);
   const [speed, setSpeed] = useState<SpeedChoice>(1);
-  const [rawEvent, setRawEvent] = useState<ReplayRawEvent | null>(null);
+  const [rawEvent, setRawEvent] = useState<{
+    rawSeq: number;
+    event: ReplayRawEvent;
+  } | null>(null);
   const [rawLoading, setRawLoading] = useState(false);
   const [rawError, setRawError] = useState<string | null>(null);
   const loadingRef = useRef<AbortController | null>(null);
@@ -377,6 +528,8 @@ export function ReplayScrubberPanel({ ticket }: { ticket: string }) {
     if (localIndex < 0 || localIndex >= timeline.events.length) return null;
     return timeline.events[localIndex];
   }, [absoluteIndex, timeline]);
+  const selectedRawSeqRef = useRef<number | null>(null);
+  selectedRawSeqRef.current = currentEvent?.raw_seq ?? null;
 
   useEffect(() => {
     if (!selectedRunId || !currentEvent) {
@@ -387,17 +540,19 @@ export function ReplayScrubberPanel({ ticket }: { ticket: string }) {
     }
     let ignore = false;
     const controller = new AbortController();
+    const rawSeq = currentEvent.raw_seq;
     setRawLoading(true);
     setRawError(null);
+    setRawEvent(null);
     const timer = window.setTimeout(() => {
-      getReplayRawEvent(selectedRunId, currentEvent.raw_seq, controller.signal)
+      getReplayRawEvent(selectedRunId, rawSeq, controller.signal)
         .then((result) => {
-          if (ignore || controller.signal.aborted) return;
-          setRawEvent(result);
+          if (ignore || controller.signal.aborted || selectedRawSeqRef.current !== rawSeq) return;
+          setRawEvent({ rawSeq, event: result });
           setRawLoading(false);
         })
         .catch((err) => {
-          if (ignore || controller.signal.aborted) return;
+          if (ignore || controller.signal.aborted || selectedRawSeqRef.current !== rawSeq) return;
           setRawEvent(null);
           setRawError(err instanceof Error ? err.message : "Could not load event");
           setRawLoading(false);
@@ -530,6 +685,7 @@ export function ReplayScrubberPanel({ ticket }: { ticket: string }) {
           absoluteIndex={absoluteIndex}
           bookmarks={bookmarkPositions}
           currentEvent={currentEvent}
+          ticket={ticket}
           onJump={jumpToAbsolute}
           onPlayToggle={() => setPlaying((value) => !value)}
           onSpeedChange={setSpeed}
@@ -596,6 +752,7 @@ function ReplayScrubberBody({
   absoluteIndex,
   bookmarks,
   currentEvent,
+  ticket,
   onJump,
   onPlayToggle,
   onSpeedChange,
@@ -611,34 +768,41 @@ function ReplayScrubberBody({
   absoluteIndex: number;
   bookmarks: { bookmark: ReplayBookmark; absoluteIndex: number; pct: number }[];
   currentEvent: ReplayTimelineEvent | null;
+  ticket: string;
   onJump: (absoluteIndex: number) => void;
   onPlayToggle: () => void;
   onSpeedChange: (speed: SpeedChoice) => void;
   onStepBy: (delta: number) => void;
   playing: boolean;
   rawError: string | null;
-  rawEvent: ReplayRawEvent | null;
+  rawEvent: { rawSeq: number; event: ReplayRawEvent } | null;
   rawLoading: boolean;
   speed: SpeedChoice;
   totalKnown: number;
   window: TimelineWindow;
 }) {
   const rawRef = useRef<HTMLPreElement | null>(null);
+  const selectedRawEvent = currentEvent && rawEvent?.rawSeq === currentEvent.raw_seq
+    ? rawEvent.event
+    : null;
+  const presentation = currentEvent
+    ? providerEventToBlocks(selectedRawEvent ? providerEventPayload(selectedRawEvent.raw) : null, currentEvent)
+    : null;
 
   useEffect(() => {
     if (rawRef.current) rawRef.current.scrollTop = 0;
-  }, [rawEvent]);
+  }, [selectedRawEvent]);
 
   const rawJson = useMemo(() => {
     if (rawError) return rawError;
     if (rawLoading) return "loading…";
-    if (!rawEvent) return "";
+    if (!selectedRawEvent) return "";
     try {
-      return JSON.stringify(rawEvent.raw, null, 2);
+      return JSON.stringify(selectedRawEvent.raw, null, 2);
     } catch {
       return "unrenderable payload";
     }
-  }, [rawError, rawEvent, rawLoading]);
+  }, [rawError, rawLoading, selectedRawEvent]);
 
   const sliderMax = Math.max(totalKnown - 1, 0);
   const timePct = sliderMax === 0 ? 0 : (absoluteIndex / sliderMax) * 100;
@@ -731,7 +895,9 @@ function ReplayScrubberBody({
             {formatClockTime(currentEvent?.ts ?? null)}
           </span>
           {currentEvent ? (
-            <span className="replay-frame-kind">{currentEvent.kind}</span>
+            <span className="replay-frame-kind">
+              {EVENT_KIND_LABELS[currentEvent.kind] ?? currentEvent.kind}
+            </span>
           ) : null}
           {beyondWindow && replayWindow.hasMore ? (
             <span className="replay-frame-kind">loading window…</span>
@@ -741,26 +907,49 @@ function ReplayScrubberBody({
 
       {currentEvent ? (
         <article className="replay-event">
-          <header className="replay-event-head">
-            <span className={`replay-disposition is-${currentEvent.disposition}`}>
-              {currentEvent.disposition}
-            </span>
-            <span className="replay-event-seq">seq {currentEvent.seq}</span>
+          <div className="replay-event-summary">
+            {presentation ? (
+              <ReplayPresentationBlocks blocks={presentation} event={currentEvent} ticket={ticket} />
+            ) : null}
+            {rawLoading && !selectedRawEvent ? (
+              <span aria-live="polite" className="replay-event-loading">loading event…</span>
+            ) : null}
+          </div>
+          <div className="replay-event-status" aria-label="Event status">
+            <span>{plainEnum(currentEvent.disposition, DISPOSITION_LABELS)}</span>
             {currentEvent.lifecycle_state ? (
-              <span className="replay-event-lifecycle">
-                {currentEvent.lifecycle_state}
-              </span>
+              <span>{plainEnum(currentEvent.lifecycle_state, LIFECYCLE_LABELS)}</span>
             ) : null}
             {currentEvent.bookmark ? (
-              <span className={`replay-event-bookmark is-${currentEvent.bookmark}`}>
-                {currentEvent.bookmark}
-              </span>
+              <span>{plainEnum(currentEvent.bookmark, BOOKMARK_LABELS)}</span>
             ) : null}
-          </header>
-          <p className="replay-event-summary">{currentEvent.summary}</p>
-          <pre ref={rawRef} className="replay-event-raw">
-            {rawJson}
-          </pre>
+          </div>
+          <details key={currentEvent.seq} className="replay-event-details">
+            <summary>Event details</summary>
+            <div className="replay-event-details-body">
+              <div className="replay-event-details-meta">
+                <span>seq {currentEvent.seq}</span>
+                <span>kind {currentEvent.kind}</span>
+                <span>disposition {currentEvent.disposition}</span>
+                {currentEvent.lifecycle_state ? (
+                  <span>lifecycle {currentEvent.lifecycle_state}</span>
+                ) : null}
+                {currentEvent.bookmark ? <span>bookmark {currentEvent.bookmark}</span> : null}
+              </div>
+              <div className="replay-event-raw-wrap">
+                <pre ref={rawRef} className="replay-event-raw">
+                  {rawJson}
+                </pre>
+                {selectedRawEvent && !rawLoading && !rawError ? (
+                  <CopyPill
+                    className="replay-event-copy"
+                    getText={() => rawJson}
+                    label="copy JSON"
+                  />
+                ) : null}
+              </div>
+            </div>
+          </details>
         </article>
       ) : beyondWindow ? (
         <div className="replay-empty">

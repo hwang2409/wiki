@@ -55,7 +55,9 @@ import type {
   ComposerMessage,
   ProviderEventInspector,
   ProviderPendingRequest,
+  ProviderStreamEvent,
   QueuedMessage,
+  ReplayTimelineEvent,
   SessionEvent,
   SessionInit,
   SessionPatch,
@@ -135,6 +137,7 @@ import type { HarnessOutputSegment } from "./transcript-output";
 import { CodexStreamHighlights } from "./codex-stream-renderers";
 import { markerRule } from "./hook-message-registry";
 import type { MarkerSeverity } from "./hook-message-registry";
+import { providerEventPayload, providerEventToBlocks } from "./replay-event-adapter";
 import {
   activityRunStateFromProvider,
   activityStateLabel,
@@ -717,10 +720,11 @@ function modelChangedMarkers(session: TranscriptSession | null): SessionEvent[] 
   return session.providerInspector.events
     .filter((event) => event.kind === "model_changed")
     .map((event) => {
-      const toModel = typeof event.payload.to_model === "string" ? event.payload.to_model : "";
+      const payload = providerEventPayload(event);
+      const toModel = typeof payload?.to_model === "string" ? payload.to_model : "";
       const text =
-        typeof event.payload.message === "string"
-          ? event.payload.message
+        typeof payload?.message === "string"
+          ? payload.message
           : `model changed to ${toModel || "new model"}`;
       return {
         id: 1_000_000 + event.seq,
@@ -2191,6 +2195,26 @@ const sessionMarkdownComponents = {
   table: MarkdownTable,
 };
 
+export function SessionMarkdown({
+  className = "session-assistant markdown-preview-view",
+  text,
+}: {
+  className?: string;
+  text: string;
+}) {
+  return (
+    <div className={className}>
+      <ReactMarkdown
+        components={sessionMarkdownComponents}
+        rehypePlugins={[rehypeKatex, rehypeEscapeRawHtml]}
+        remarkPlugins={[remarkGfm, [remarkMath, { singleDollarTextMath: false }]]}
+      >
+        {prepareTranscriptMarkdown(text)}
+      </ReactMarkdown>
+    </div>
+  );
+}
+
 function BashBlock({ event }: { event: SessionEvent }) {
   const bash = event.bash ?? { input: "", stdout: "", stderr: "" };
   const segments: HarnessOutputSegment[] = [
@@ -2781,6 +2805,90 @@ export function ActivityEventRow({
   return (
     <div className="session-activity">
       <TraceRowList keyBase={rowKey} onInspect={onInspect} rows={rows} ticket={ticket} />
+    </div>
+  );
+}
+
+function providerTimelineEvent(event: ProviderStreamEvent): ReplayTimelineEvent {
+  return {
+    seq: event.seq,
+    raw_seq: event.raw_seq,
+    ts: event.normalized_at,
+    kind: event.kind,
+    disposition: event.disposition,
+    lifecycle_state: event.lifecycle_state,
+    summary: event.kind,
+    bookmark: null,
+  };
+}
+
+function sessionDisposition(event: ProviderStreamEvent): SessionEvent["disposition"] {
+  return event.disposition === "ignored" ? "intentionally_ignored" : event.disposition;
+}
+
+export function ProviderEventRows({
+  events,
+  ticket,
+}: {
+  events: readonly ProviderStreamEvent[];
+  ticket: string;
+}) {
+  return (
+    <div className="session-provider-event-rows" data-testid="session-provider-event-rows">
+      {events.map((event) => {
+        const blocks = providerEventToBlocks(providerEventPayload(event), providerTimelineEvent(event));
+        return blocks.map((block, index) => {
+          const key = `${event.seq}:${block.type}:${index}`;
+          if (block.type === "message") {
+            return (
+              <div className="session-provider-event" data-provider-block-type="message" data-provider-event-seq={event.seq} key={key}>
+                <SessionMarkdown className={`session-provider-message is-${block.role}`} text={block.text} />
+              </div>
+            );
+          }
+          if (block.type === "thinking") {
+            const thinkingEvent: SessionEvent = {
+              id: event.seq,
+              kind: "thinking",
+              ts: event.normalized_at,
+              text: block.text,
+              disposition: sessionDisposition(event),
+              encrypted: block.encrypted,
+            };
+            return (
+              <div className="session-provider-event" data-provider-block-type="thinking" data-provider-event-seq={event.seq} key={key}>
+                <ThinkingRow event={thinkingEvent} />
+              </div>
+            );
+          }
+          if (block.type === "tool") {
+            const toolEvent: SessionEvent = {
+              id: event.seq,
+              kind: "tool",
+              ts: event.normalized_at,
+              text: "",
+              disposition: sessionDisposition(event),
+              tool: block.tool,
+            };
+            return (
+              <div
+                className="session-provider-event"
+                data-provider-block-type="tool"
+                data-provider-event-seq={event.seq}
+                data-tool-ok={String(block.tool.ok)}
+                key={key}
+              >
+                <ToolCallRow event={toolEvent} ticket={ticket} withResult={false} />
+              </div>
+            );
+          }
+          return (
+            <div className="session-provider-event" data-provider-block-type="marker" data-provider-event-seq={event.seq} key={key}>
+              <div className="session-provider-marker">{block.text}</div>
+            </div>
+          );
+        });
+      })}
     </div>
   );
 }
@@ -3480,6 +3588,9 @@ export function SessionTab({
     return result;
   }, [displayEvents, session?.base, session?.eventsChangedFrom]);
   const rows = rowResult.rows;
+  const providerEventRows = session?.format === "provider-events" && rows.length === 0
+    ? session.providerInspector?.events ?? []
+    : [];
   const layout = useMemo(() => {
     const changedFrom = Math.min(rowResult.changedFrom, layoutDirtyFromRef.current);
     const result = buildVirtualLayoutIncremental(
@@ -3884,7 +3995,7 @@ export function SessionTab({
               {olderError ? <span role="alert">{olderError}</span> : null}
             </div>
           ) : null}
-          {rows.length === 0 && pendingUserMessages.length === 0 ? (
+          {rows.length === 0 && providerEventRows.length === 0 && pendingUserMessages.length === 0 ? (
             <div
               className="session-zero-events"
               role="status"
@@ -3903,6 +4014,9 @@ export function SessionTab({
                       : "This session has no events."}
               </div>
             </div>
+          ) : null}
+          {providerEventRows.length > 0 ? (
+            <ProviderEventRows events={providerEventRows} ticket={ticket} />
           ) : null}
           <div className="session-virtual-list" style={{ height: layout.totalHeight }}>
             {visibleRows.map(({ row, top }) => (
