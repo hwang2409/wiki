@@ -189,7 +189,11 @@ async def run_daemon(args: argparse.Namespace) -> None:
         if fixture_dir
         else RealAdapterFactory(runtime_dir=paths.runtime_dir)
     )
-    supervisor = Supervisor(RunStore(paths), factory)
+    supervisor = Supervisor(
+        RunStore(paths),
+        factory,
+        reconcile_archive_edges=False,
+    )
     server = UnixSupervisorServer(supervisor, paths.socket_path)
     stop = asyncio.Event()
     loop = asyncio.get_running_loop()

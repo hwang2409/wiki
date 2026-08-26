@@ -562,6 +562,7 @@ class Supervisor:
         idempotency_cache_size: int = DEFAULT_IDEMPOTENCY_CACHE_SIZE,
         worker_soft_cap: int | None = None,
         archive_queue_limit: int = DEFAULT_ARCHIVE_QUEUE_LIMIT,
+        reconcile_archive_edges: bool = True,
     ):
         if idempotency_cache_size < 1:
             raise ValueError("idempotency_cache_size must be positive")
@@ -763,6 +764,16 @@ class Supervisor:
         )
         if self.worker_soft_cap < 1:
             raise ValueError("worker_soft_cap must be positive")
+        if reconcile_archive_edges:
+            try:
+                from .. import workgraph_service
+
+                workgraph_service.reconcile_archive_edges(
+                    self.store.paths.archive_dir,
+                    status_dir=self.store.paths.status_dir,
+                )
+            except Exception:
+                logger.exception("could not reconcile archived workgraph edges")
     def materializer_metrics(self) -> dict[str, Any]:
         with self._materializer_metrics_lock:
             latencies = deque(self.materializer_latency_seconds)
