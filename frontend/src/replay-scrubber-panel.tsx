@@ -24,7 +24,12 @@ import {
   type ReplayRunSummary,
   type ReplayTimeline,
   type ReplayTimelineEvent,
+  type SessionEvent,
+  type SessionTool,
 } from "./api";
+import { CopyPill } from "./copy-button";
+import { BoundedPreview } from "./transcript-preview";
+import { SessionMarkdown, ToolCallRow } from "./session";
 
 const SPEED_OPTIONS = [0.5, 1, 2, 5, 10] as const;
 const MAX_SPEED_LABEL = "max";
@@ -82,6 +87,279 @@ function bookmarkIcon(kind: ReplayBookmarkKind) {
 function bookmarkTitle(bookmark: ReplayBookmark): string {
   const clock = formatClockTime(bookmark.ts);
   return `${bookmark.kind} @ ${clock} · ${bookmark.summary}`;
+}
+
+type RawRecord = Record<string, unknown>;
+
+const DISPOSITION_LABELS: Record<string, string> = {
+  rendered: "shown",
+  summarized: "summarized",
+  ignored: "skipped",
+  intentionally_ignored: "skipped",
+  unknown: "unclassified",
+};
+
+const LIFECYCLE_LABELS: Record<string, string> = {
+  working: "working",
+  idle: "idle",
+  blocked: "blocked",
+  interrupted: "interrupted",
+  completed: "complete",
+  inProgress: "in progress",
+  in_progress: "in progress",
+};
+
+const BOOKMARK_LABELS: Record<string, string> = {
+  steer: "steer",
+  verdict: "verdict",
+  error: "error",
+};
+
+const EVENT_KIND_LABELS: Record<string, string> = {
+  claude_client_message: "client message",
+  claude_hook_response: "hook response",
+  claude_hook_started: "hook started",
+  claude_init: "session started",
+  claude_rate_limit_event: "rate limit update",
+  claude_result: "turn result",
+  claude_status: "status update",
+  claude_stream_event: "stream update",
+  codex_client_message: "client message",
+  item_completed: "item completed",
+  item_started: "item started",
+  provider_process_exit: "provider stopped",
+  provider_stderr: "provider error output",
+  turn_completed: "turn completed",
+  turn_started: "turn started",
+  warning: "warning",
+};
+
+function asRecord(value: unknown): RawRecord | null {
+  return value !== null && typeof value === "object" && !Array.isArray(value)
+    ? value as RawRecord
+    : null;
+}
+
+function stringValue(value: unknown): string | null {
+  return typeof value === "string" && value.trim() ? value.trim() : null;
+}
+
+function rawPayload(rawEvent: ReplayRawEvent | null): RawRecord | null {
+  return asRecord(rawEvent?.raw.payload);
+}
+
+function rawContentText(value: unknown): string | null {
+  const direct = stringValue(value);
+  if (direct) return direct;
+  if (!Array.isArray(value)) return null;
+  for (const blockValue of value) {
+    const block = asRecord(blockValue);
+    if (!block) continue;
+    if (block.type === "text") {
+      const text = stringValue(block.text);
+      if (text) return text;
+    }
+  }
+  return null;
+}
+
+function codexItem(payload: RawRecord | null): RawRecord | null {
+  return asRecord(asRecord(payload?.params)?.item);
+}
+
+function toolInputText(value: unknown): string {
+  const direct = stringValue(value);
+  if (direct) return direct;
+  const record = asRecord(value);
+  if (!record) return "";
+  try {
+    return JSON.stringify(record);
+  } catch {
+    return "";
+  }
+}
+
+function firstToolTarget(input: RawRecord | null): string {
+  if (!input) return "";
+  for (const key of ["command", "file_path", "filePath", "path", "pattern", "query", "url"]) {
+    const value = stringValue(input[key]);
+    if (value) return value;
+  }
+  return "";
+}
+
+function archetypeForTool(name: string, itemType = ""): string {
+  const normalized = name.toLowerCase();
+  if (itemType === "commandExecution" || ["bash", "shell", "terminal"].includes(normalized)) {
+    return "bash";
+  }
+  if (["read", "cat", "notebookread"].includes(normalized)) return "read";
+  if (["edit", "write", "apply_patch", "filechange"].includes(normalized)) return "edit";
+  if (["grep", "glob", "search"].includes(normalized)) return "search";
+  return "tool";
+}
+
+function replayToolFromEvent(
+  event: ReplayTimelineEvent,
+  rawEvent: ReplayRawEvent | null,
+): SessionTool | null {
+  const payload = rawPayload(rawEvent);
+  const item = codexItem(payload);
+  if (item) {
+    const itemType = stringValue(item.type) ?? "";
+    const toolLike = ["commandExecution", "fileChange", "functionCall", "mcpToolCall", "webSearchCall"].includes(itemType);
+    if (toolLike) {
+      const name = itemType === "commandExecution"
+        ? "Bash"
+        : stringValue(item.name) ?? itemType;
+      const input = toolInputText(item.command ?? item.arguments ?? item.input ?? firstToolTarget(item));
+      const target = (stringValue(item.command) ?? firstToolTarget(item)) || input;
+      const exitCode = item.exitCode;
+      const ok = typeof exitCode === "number" ? exitCode === 0 : event.bookmark === "error" ? false : null;
+      return {
+        name,
+        input,
+        output: null,
+        ok,
+        archetype: archetypeForTool(name, itemType),
+        summary: `${name.toLowerCase()}${target ? ` ${target}` : ""}`,
+      };
+    }
+  }
+
+  const message = asRecord(payload?.message);
+  const content = message?.content;
+  if (Array.isArray(content)) {
+    for (const blockValue of content) {
+      const block = asRecord(blockValue);
+      if (!block || (block.type !== "tool_use" && block.type !== "tool_result")) continue;
+      if (block.type === "tool_use") {
+        const name = stringValue(block.name) ?? "tool";
+        const inputRecord = asRecord(block.input);
+        const target = firstToolTarget(inputRecord);
+        return {
+          name,
+          input: toolInputText(block.input),
+          output: null,
+          ok: null,
+          archetype: archetypeForTool(name),
+          summary: `${name}${target ? ` ${target}` : ""}`,
+        };
+      }
+      const resultText = rawContentText(block.content) ?? "";
+      return {
+        name: "tool result",
+        input: resultText,
+        output: null,
+        ok: block.is_error === true ? false : null,
+        archetype: "tool",
+        summary: `tool result${resultText ? ` ${resultText}` : ""}`,
+      };
+    }
+  }
+
+  if (/tool_use|tool_result|commandExecution/i.test(event.summary)) {
+    const summary = event.summary.trim() || event.kind;
+    const parts = summary.split(/\s+/, 2);
+    return {
+      name: parts[0] ?? event.kind,
+      input: "",
+      output: null,
+      ok: event.bookmark === "error" ? false : null,
+      archetype: archetypeForTool(parts[0] ?? event.kind),
+      summary,
+    };
+  }
+  return null;
+}
+
+function messageTextFromEvent(
+  event: ReplayTimelineEvent,
+  rawEvent: ReplayRawEvent | null,
+): string | null {
+  const payload = rawPayload(rawEvent);
+  const message = asRecord(payload?.message);
+  const messageRole = stringValue(message?.role);
+  if (messageRole === "user" || messageRole === "assistant") {
+    const text = rawContentText(message?.content);
+    if (text) return text;
+  }
+  const item = codexItem(payload);
+  const itemType = stringValue(item?.type);
+  if (itemType === "userMessage" || itemType === "agentMessage") {
+    const text = stringValue(item?.text) ?? rawContentText(item?.content) ?? rawContentText(item?.summary);
+    if (text) return text;
+  }
+  if (["claude_user", "claude_assistant", "codex_user", "codex_assistant"].includes(event.kind)) {
+    return event.summary;
+  }
+  if (itemType === "userMessage" || itemType === "agentMessage") return event.summary;
+  return null;
+}
+
+function isMessageEvent(event: ReplayTimelineEvent, rawEvent: ReplayRawEvent | null): boolean {
+  const itemType = stringValue(codexItem(rawPayload(rawEvent))?.type);
+  if (itemType === "userMessage" || itemType === "agentMessage") return replayToolFromEvent(event, rawEvent) === null;
+  return ["claude_user", "claude_assistant", "codex_user", "codex_assistant"].includes(event.kind)
+    && replayToolFromEvent(event, rawEvent) === null;
+}
+
+function messageRoleFromEvent(
+  event: ReplayTimelineEvent,
+  rawEvent: ReplayRawEvent | null,
+): "user" | "assistant" {
+  const itemType = stringValue(codexItem(rawPayload(rawEvent))?.type);
+  return itemType === "userMessage" || event.kind.includes("user") ? "user" : "assistant";
+}
+
+function plainEnum(value: string | null, labels: Record<string, string>): string | null {
+  if (!value) return null;
+  return labels[value] ?? value;
+}
+
+function plainEventLabel(event: ReplayTimelineEvent): string {
+  const label = EVENT_KIND_LABELS[event.kind] ?? (event.summary || event.kind);
+  const lifecycle = plainEnum(event.lifecycle_state, LIFECYCLE_LABELS);
+  return lifecycle ? `${label} · ${lifecycle}` : label;
+}
+
+function ReplayMessageSummary({ role, text }: { role: "user" | "assistant"; text: string }) {
+  return (
+    <BoundedPreview
+      className={`replay-event-message is-${role}`}
+      previewLines={6}
+      showSummary={false}
+      text={text}
+      variant="block"
+      renderBody={({ text: previewText }) => (
+        <SessionMarkdown className="replay-event-message-markdown" text={previewText} />
+      )}
+    />
+  );
+}
+
+function ReplayToolOrMarker({
+  event,
+  rawEvent,
+  ticket,
+}: {
+  event: ReplayTimelineEvent;
+  rawEvent: ReplayRawEvent | null;
+  ticket: string;
+}) {
+  const tool = replayToolFromEvent(event, rawEvent);
+  if (!tool) {
+    return <div className="replay-event-marker">{plainEventLabel(event)}</div>;
+  }
+  const toolEvent: SessionEvent = {
+    id: event.seq,
+    kind: "tool",
+    ts: event.ts,
+    text: "",
+    disposition: "rendered",
+    tool,
+  };
+  return <ToolCallRow event={toolEvent} ticket={ticket} withResult={false} />;
 }
 
 /**
@@ -530,6 +808,7 @@ export function ReplayScrubberPanel({ ticket }: { ticket: string }) {
           absoluteIndex={absoluteIndex}
           bookmarks={bookmarkPositions}
           currentEvent={currentEvent}
+          ticket={ticket}
           onJump={jumpToAbsolute}
           onPlayToggle={() => setPlaying((value) => !value)}
           onSpeedChange={setSpeed}
@@ -596,6 +875,7 @@ function ReplayScrubberBody({
   absoluteIndex,
   bookmarks,
   currentEvent,
+  ticket,
   onJump,
   onPlayToggle,
   onSpeedChange,
@@ -611,6 +891,7 @@ function ReplayScrubberBody({
   absoluteIndex: number;
   bookmarks: { bookmark: ReplayBookmark; absoluteIndex: number; pct: number }[];
   currentEvent: ReplayTimelineEvent | null;
+  ticket: string;
   onJump: (absoluteIndex: number) => void;
   onPlayToggle: () => void;
   onSpeedChange: (speed: SpeedChoice) => void;
@@ -731,7 +1012,9 @@ function ReplayScrubberBody({
             {formatClockTime(currentEvent?.ts ?? null)}
           </span>
           {currentEvent ? (
-            <span className="replay-frame-kind">{currentEvent.kind}</span>
+            <span className="replay-frame-kind">
+              {EVENT_KIND_LABELS[currentEvent.kind] ?? "event"}
+            </span>
           ) : null}
           {beyondWindow && replayWindow.hasMore ? (
             <span className="replay-frame-kind">loading window…</span>
@@ -741,26 +1024,55 @@ function ReplayScrubberBody({
 
       {currentEvent ? (
         <article className="replay-event">
-          <header className="replay-event-head">
-            <span className={`replay-disposition is-${currentEvent.disposition}`}>
-              {currentEvent.disposition}
-            </span>
-            <span className="replay-event-seq">seq {currentEvent.seq}</span>
+          <div className="replay-event-summary">
+            {isMessageEvent(currentEvent, rawEvent) ? (
+              <ReplayMessageSummary
+                role={messageRoleFromEvent(currentEvent, rawEvent)}
+                text={messageTextFromEvent(currentEvent, rawEvent) ?? currentEvent.summary}
+              />
+            ) : (
+              <ReplayToolOrMarker
+                event={currentEvent}
+                rawEvent={rawEvent}
+                ticket={ticket}
+              />
+            )}
+          </div>
+          <div className="replay-event-status" aria-label="Event status">
+            <span>{plainEnum(currentEvent.disposition, DISPOSITION_LABELS)}</span>
             {currentEvent.lifecycle_state ? (
-              <span className="replay-event-lifecycle">
-                {currentEvent.lifecycle_state}
-              </span>
+              <span>{plainEnum(currentEvent.lifecycle_state, LIFECYCLE_LABELS)}</span>
             ) : null}
             {currentEvent.bookmark ? (
-              <span className={`replay-event-bookmark is-${currentEvent.bookmark}`}>
-                {currentEvent.bookmark}
-              </span>
+              <span>{plainEnum(currentEvent.bookmark, BOOKMARK_LABELS)}</span>
             ) : null}
-          </header>
-          <p className="replay-event-summary">{currentEvent.summary}</p>
-          <pre ref={rawRef} className="replay-event-raw">
-            {rawJson}
-          </pre>
+          </div>
+          <details key={currentEvent.seq} className="replay-event-details">
+            <summary>Event details</summary>
+            <div className="replay-event-details-body">
+              <div className="replay-event-details-meta">
+                <span>seq {currentEvent.seq}</span>
+                <span>kind {currentEvent.kind}</span>
+                <span>disposition {currentEvent.disposition}</span>
+                {currentEvent.lifecycle_state ? (
+                  <span>lifecycle {currentEvent.lifecycle_state}</span>
+                ) : null}
+                {currentEvent.bookmark ? <span>bookmark {currentEvent.bookmark}</span> : null}
+              </div>
+              <div className="replay-event-raw-wrap">
+                <pre ref={rawRef} className="replay-event-raw">
+                  {rawJson}
+                </pre>
+                {rawEvent && !rawLoading && !rawError ? (
+                  <CopyPill
+                    className="replay-event-copy"
+                    getText={() => rawJson}
+                    label="copy JSON"
+                  />
+                ) : null}
+              </div>
+            </div>
+          </details>
         </article>
       ) : beyondWindow ? (
         <div className="replay-empty">

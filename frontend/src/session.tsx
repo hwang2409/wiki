@@ -2191,6 +2191,26 @@ const sessionMarkdownComponents = {
   table: MarkdownTable,
 };
 
+export function SessionMarkdown({
+  className = "session-assistant markdown-preview-view",
+  text,
+}: {
+  className?: string;
+  text: string;
+}) {
+  return (
+    <div className={className}>
+      <ReactMarkdown
+        components={sessionMarkdownComponents}
+        rehypePlugins={[rehypeKatex, rehypeEscapeRawHtml]}
+        remarkPlugins={[remarkGfm, [remarkMath, { singleDollarTextMath: false }]]}
+      >
+        {prepareTranscriptMarkdown(text)}
+      </ReactMarkdown>
+    </div>
+  );
+}
+
 function BashBlock({ event }: { event: SessionEvent }) {
   const bash = event.bash ?? { input: "", stdout: "", stderr: "" };
   const segments: HarnessOutputSegment[] = [
