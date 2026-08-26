@@ -30,7 +30,7 @@ function runSummary() {
     state: "working",
     created_at: "2026-08-25T12:00:00Z",
     updated_at: "2026-08-25T12:01:00Z",
-    total_events: 3,
+    total_events: 4,
     initial_prompt_excerpt: "Review replay readability",
   };
 }
@@ -65,6 +65,16 @@ const events = [
     lifecycle_state: "idle",
     summary: "codex item/completed: agentMessage — replay is readable",
     bookmark: "verdict",
+  },
+  {
+    seq: 4,
+    raw_seq: 4,
+    ts: "2026-08-25T12:00:04Z",
+    kind: "unknown_provider_kind",
+    disposition: "unknown-disposition",
+    lifecycle_state: null,
+    summary: "mystery provider event",
+    bookmark: null,
   },
 ];
 
@@ -107,6 +117,13 @@ const rawEvents = {
           text: "Replay is now readable.\n\nThe raw event remains available in details.",
         },
       },
+    },
+  },
+  4: {
+    seq: 4,
+    kind: "unknown_provider_kind",
+    payload: {
+      params: { item: { type: "futureProviderItem" } },
     },
   },
 };
@@ -197,6 +214,11 @@ async function main() {
     await replay.getByRole("button", { name: "Next event" }).click();
     await replay.locator(".session-tool-target").getByText("frontend/src/replay-scrubber-panel.tsx", { exact: false }).waitFor();
     assert((await replay.locator(".session-tool").count()) === 1, "tool events must use the transcript tool row");
+    await replay.getByRole("button", { name: "Next event" }).click();
+    await replay.getByRole("button", { name: "Next event" }).click();
+    const kindLabel = replay.locator(".replay-frame-kind").first();
+    await kindLabel.waitFor();
+    assert((await kindLabel.innerText()) === "unknown_provider_kind", "unknown event kind must remain visible");
     console.log(`WIKI-387 replay readability: PASS (screenshots in ${OUT_DIR})`);
   } finally {
     if (browser) await browser.close();

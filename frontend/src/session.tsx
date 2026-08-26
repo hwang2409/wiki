@@ -135,7 +135,7 @@ import type { HarnessOutputSegment } from "./transcript-output";
 import { CodexStreamHighlights } from "./codex-stream-renderers";
 import { markerRule } from "./hook-message-registry";
 import type { MarkerSeverity } from "./hook-message-registry";
-import { providerEventPayload, providerEventPresentation } from "./replay-event-adapter";
+import { providerEventPayload, providerEventToBlocks } from "./replay-event-adapter";
 import {
   activityRunStateFromProvider,
   activityStateLabel,
@@ -2947,7 +2947,8 @@ const VirtualSessionRow = memo(function VirtualSessionRow({
   const rowRef = useMeasuredRow(row, onHeightChange);
   const style: CSSProperties = { top: `${top}px` };
   const ts = showTimestamp ? rowTimestamp(row) : null;
-  const isActivity = providerEventPresentation(row.event).category === "activity";
+  const blocks = providerEventToBlocks(row.event);
+  const isActivity = row.event.kind === "thinking" || blocks.some((block) => block.type === "tool");
   return (
     <div
       className="session-virtual-row"

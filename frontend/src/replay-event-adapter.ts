@@ -8,26 +8,18 @@ import type {
 
 type RawRecord = Record<string, unknown>;
 
-type ProviderEventInput =
+type ProviderRawEventInput =
   | Pick<ProviderStreamEvent, "payload">
   | Pick<ReplayRawEvent, "raw">;
+
+type ProviderEventInput =
+  | Pick<SessionEvent, "kind" | "text" | "tool">
+  | ProviderRawEventInput;
 
 export type PresentationBlock =
   | { type: "message"; role: "user" | "assistant"; text: string }
   | { type: "tool"; tool: SessionTool }
   | { type: "marker"; text: string };
-
-export type SessionEventPresentation = {
-  category: "message" | "activity" | "marker";
-  blocks: PresentationBlock[];
-};
-
-export type ReplayEventPresentation = SessionEventPresentation & {
-  messageRole: "user" | "assistant";
-  messageText: string | null;
-  message: boolean;
-  tool: SessionTool | null;
-};
 
 function asRecord(value: unknown): RawRecord | null {
   return value !== null && typeof value === "object" && !Array.isArray(value)
@@ -39,8 +31,9 @@ function stringValue(value: unknown): string | null {
   return typeof value === "string" && value.trim() ? value.trim() : null;
 }
 
-export function providerEventPayload(event: ProviderEventInput): RawRecord | null {
-  return "payload" in event ? asRecord(event.payload) : asRecord(event.raw.payload);
+export function providerEventPayload(event: ProviderRawEventInput): RawRecord | null {
+  if ("payload" in event) return asRecord(event.payload);
+  return "raw" in event ? asRecord(event.raw.payload) : null;
 }
 
 function rawContentText(value: unknown): string | null {
@@ -123,16 +116,19 @@ function codexToolTarget(item: RawRecord, input: unknown): string {
   );
 }
 
-function codexToolOk(item: RawRecord, event: ReplayTimelineEvent): boolean | null {
+function providerToolOk(item: RawRecord, event: ReplayTimelineEvent | null): boolean | null {
+  const result = asRecord(item.result);
+  if (typeof result?.isError === "boolean") return !result.isError;
   if (typeof item.success === "boolean") return item.success;
   if (typeof item.exitCode === "number") return item.exitCode === 0;
   if (item.error !== null && item.error !== undefined) return false;
   const status = stringValue(item.status)?.toLowerCase();
   if (status === "failed" || status === "error") return false;
-  return event.bookmark === "error" ? false : null;
+  if (["completed", "complete", "succeeded", "success", "done"].includes(status ?? "")) return true;
+  return event?.bookmark === "error" ? false : null;
 }
 
-function codexToolFromItem(item: RawRecord, event: ReplayTimelineEvent): SessionTool | null {
+function codexToolFromItem(item: RawRecord, event: ReplayTimelineEvent | null): SessionTool | null {
   const itemType = stringValue(item.type) ?? "";
   const toolTypes = [
     "commandExecution",
@@ -155,7 +151,7 @@ function codexToolFromItem(item: RawRecord, event: ReplayTimelineEvent): Session
     name,
     input,
     output: null,
-    ok: codexToolOk(item, event),
+    ok: providerToolOk(item, event),
     archetype: archetypeForTool(name, itemType),
     summary: `${name.toLowerCase()}${target ? ` ${target}` : ""}`,
   };
@@ -177,11 +173,13 @@ function claudeToolFromBlock(block: RawRecord): SessionTool | null {
   }
   if (block.type !== "tool_result") return null;
   const resultText = rawContentText(block.content) ?? toolInputText(block.content);
+  const nestedResult = asRecord(block.result);
+  const isError = block.is_error === true || nestedResult?.isError === true;
   return {
     name: "tool result",
     input: resultText,
     output: null,
-    ok: block.is_error === true ? false : null,
+    ok: isError ? false : true,
     archetype: "tool",
     summary: `tool result${resultText ? ` ${resultText}` : ""}`,
   };
@@ -206,8 +204,37 @@ function summaryToolFromEvent(event: ReplayTimelineEvent): SessionTool | null {
   };
 }
 
-function replayBlocks(event: ReplayTimelineEvent, rawEvent: ReplayRawEvent | null): PresentationBlock[] {
-  const payload = rawEvent ? providerEventPayload(rawEvent) : null;
+export function providerEventToBlocks(
+  rawEvent: ProviderEventInput | null,
+  timelineEvent: ReplayTimelineEvent | null = null,
+): PresentationBlock[] {
+  if (!rawEvent) {
+    const summarizedTool = timelineEvent ? summaryToolFromEvent(timelineEvent) : null;
+    if (summarizedTool) return [{ type: "tool", tool: summarizedTool }];
+    if (timelineEvent && ["claude_user", "claude_assistant", "codex_user", "codex_assistant"].includes(timelineEvent.kind)) {
+      return [{
+        type: "message",
+        role: timelineEvent.kind.includes("user") ? "user" : "assistant",
+        text: timelineEvent.summary,
+      }];
+    }
+    return timelineEvent ? [markerBlock(timelineEvent)] : [];
+  }
+
+  if ("text" in rawEvent) {
+    if (rawEvent.kind === "tool" && rawEvent.tool) return [{ type: "tool", tool: rawEvent.tool }];
+    if (rawEvent.kind === "thinking") return [{ type: "marker", text: rawEvent.text }];
+    if (rawEvent.kind === "user" || rawEvent.kind === "assistant") {
+      return [{
+        type: "message",
+        role: rawEvent.kind,
+        text: rawEvent.text,
+      }];
+    }
+    return [{ type: "marker", text: rawEvent.text || rawEvent.kind }];
+  }
+
+  const payload = providerEventPayload(rawEvent);
   const item = codexItem(payload);
   if (item) {
     const itemType = stringValue(item.type) ?? "";
@@ -216,7 +243,7 @@ function replayBlocks(event: ReplayTimelineEvent, rawEvent: ReplayRawEvent | nul
       const text = stringValue(item.text) ?? rawContentText(item.content);
       if (text) return [{ type: "message", role, text }];
     }
-    const tool = codexToolFromItem(item, event);
+    const tool = codexToolFromItem(item, timelineEvent);
     if (tool) return [{ type: "tool", tool }];
   }
 
@@ -244,74 +271,15 @@ function replayBlocks(event: ReplayTimelineEvent, rawEvent: ReplayRawEvent | nul
     if (blocks.length) return blocks;
   }
 
-  const summarizedTool = summaryToolFromEvent(event);
+  const summarizedTool = timelineEvent ? summaryToolFromEvent(timelineEvent) : null;
   if (summarizedTool) return [{ type: "tool", tool: summarizedTool }];
 
-  if (["claude_user", "claude_assistant", "codex_user", "codex_assistant"].includes(event.kind)) {
+  if (timelineEvent && ["claude_user", "claude_assistant", "codex_user", "codex_assistant"].includes(timelineEvent.kind)) {
     return [{
       type: "message",
-      role: event.kind.includes("user") ? "user" : "assistant",
-      text: event.summary,
+      role: timelineEvent.kind.includes("user") ? "user" : "assistant",
+      text: timelineEvent.summary,
     }];
   }
-  return [markerBlock(event)];
-}
-
-export function sessionEventPresentation(event: SessionEvent): SessionEventPresentation {
-  if (event.kind === "tool" && event.tool) {
-    return { category: "activity", blocks: [{ type: "tool", tool: event.tool }] };
-  }
-  if (event.kind === "thinking") {
-    return { category: "activity", blocks: [{ type: "marker", text: event.text }] };
-  }
-  if (event.kind === "user" || event.kind === "assistant") {
-    return {
-      category: "message",
-      blocks: [{
-        type: "message",
-        role: event.kind === "user" ? "user" : "assistant",
-        text: event.text,
-      }],
-    };
-  }
-  return { category: "marker", blocks: [{ type: "marker", text: event.text || event.kind }] };
-}
-
-export function providerEventPresentation(event: SessionEvent): SessionEventPresentation;
-export function providerEventPresentation(
-  event: ReplayTimelineEvent,
-  rawEvent: ReplayRawEvent | null,
-): ReplayEventPresentation;
-export function providerEventPresentation(
-  event: SessionEvent | ReplayTimelineEvent,
-  rawEvent?: ReplayRawEvent | null,
-): SessionEventPresentation | ReplayEventPresentation {
-  if ("text" in event) return sessionEventPresentation(event);
-  return replayEventPresentation(event, rawEvent ?? null);
-}
-
-export function providerToolFromEvent(
-  event: ReplayTimelineEvent,
-  rawEvent: ReplayRawEvent | null,
-): SessionTool | null {
-  return replayBlocks(event, rawEvent).find((block) => block.type === "tool")?.tool ?? null;
-}
-
-export function replayEventPresentation(
-  event: ReplayTimelineEvent,
-  rawEvent: ReplayRawEvent | null,
-): ReplayEventPresentation {
-  const blocks = replayBlocks(event, rawEvent);
-  const messageBlock = blocks.find((block) => block.type === "message");
-  const toolBlock = blocks.find((block) => block.type === "tool");
-  const hasMessage = messageBlock?.type === "message";
-  const hasTool = toolBlock?.type === "tool";
-  return {
-    category: hasMessage ? "message" : hasTool ? "activity" : "marker",
-    blocks,
-    messageRole: messageBlock?.type === "message" ? messageBlock.role : "assistant",
-    messageText: messageBlock?.type === "message" ? messageBlock.text : null,
-    message: hasMessage,
-    tool: toolBlock?.type === "tool" ? toolBlock.tool : null,
-  };
+  return timelineEvent ? [markerBlock(timelineEvent)] : [];
 }

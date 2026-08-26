@@ -27,7 +27,7 @@ import {
   type SessionEvent,
 } from "./api";
 import { CopyPill } from "./copy-button";
-import { providerEventPresentation, type PresentationBlock } from "./replay-event-adapter";
+import { providerEventToBlocks, type PresentationBlock } from "./replay-event-adapter";
 import { BoundedPreview } from "./transcript-preview";
 import { SessionMarkdown, ToolCallRow } from "./session";
 
@@ -763,7 +763,7 @@ function ReplayScrubberBody({
     ? rawEvent.event
     : null;
   const presentation = currentEvent
-    ? providerEventPresentation(currentEvent, selectedRawEvent)
+    ? providerEventToBlocks(selectedRawEvent, currentEvent)
     : null;
 
   useEffect(() => {
@@ -873,7 +873,7 @@ function ReplayScrubberBody({
           </span>
           {currentEvent ? (
             <span className="replay-frame-kind">
-              {EVENT_KIND_LABELS[currentEvent.kind] ?? "event"}
+              {EVENT_KIND_LABELS[currentEvent.kind] ?? currentEvent.kind}
             </span>
           ) : null}
           {beyondWindow && replayWindow.hasMore ? (
@@ -886,7 +886,7 @@ function ReplayScrubberBody({
         <article className="replay-event">
           <div className="replay-event-summary">
             {presentation ? (
-              <ReplayPresentationBlocks blocks={presentation.blocks} event={currentEvent} ticket={ticket} />
+              <ReplayPresentationBlocks blocks={presentation} event={currentEvent} ticket={ticket} />
             ) : null}
             {rawLoading && !selectedRawEvent ? (
               <span aria-live="polite" className="replay-event-loading">loading event…</span>
