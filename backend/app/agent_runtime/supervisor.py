@@ -6046,6 +6046,7 @@ Preserve the same identity, role, worktree, orchestrator grouping, PR gates, and
                     )
                 if archived is not None:
                     self.event_store.close_run(run_id)
+                    self._record_archive_edge(archived, archived.outcome)
                 return archived
 
     def _archive_finalize_sync(

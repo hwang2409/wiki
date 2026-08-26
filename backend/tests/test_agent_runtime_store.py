@@ -3,7 +3,6 @@ from __future__ import annotations
 import json
 import os
 import signal
-import shutil
 import subprocess
 import sys
 import tempfile
@@ -3360,41 +3359,165 @@ class RunStoreTests(unittest.TestCase):
                 self.assertFalse(store.run_dir(record.run_id).exists())
                 self.assertIsNone(store.current_run_id(record.agent_id))
 
-    def test_archive_manifest_retry_recovers_when_live_run_file_was_moved(self) -> None:
+    def test_archive_marker_replacement_failure_is_recoverable(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
             paths = _paths(root)
             store = RunStore(paths)
             record = store.create(_record(root))
             store.transition(record.run_id, LifecycleState.COMPLETED)
-            real_commit = store_module.commit_archive
-            session_dir: Path | None = None
 
-            def fail_before_marker(directory: Path, **kwargs: Any) -> None:
-                nonlocal session_dir
-                real_commit(directory, **kwargs)
-                session_dir = directory
-                (directory / ARCHIVE_COMPLETION_MARKER).unlink()
-                raise OSError("archive interrupted before commit marker")
+            real_replace = store_module.os.replace
+
+            def fail_marker_replace(source: Path, destination: Path) -> None:
+                if Path(destination).name == ARCHIVE_COMPLETION_MARKER:
+                    raise OSError("archive marker replacement interrupted")
+                real_replace(source, destination)
 
             with (
-                mock.patch.object(
-                    store_module, "commit_archive", side_effect=fail_before_marker
-                ),
-                self.assertRaisesRegex(OSError, "before commit marker"),
+                mock.patch.object(store_module.os, "replace", side_effect=fail_marker_replace),
+                self.assertRaisesRegex(OSError, "marker replacement interrupted"),
             ):
                 store.archive_current(record.run_id)
 
-            assert session_dir is not None
-            self.assertTrue((session_dir / ARCHIVE_MANIFEST_NAME).is_file())
-            shutil.move(store.run_path(record.run_id), session_dir / "run.json")
+            session_dir = next(paths.archive_dir.glob("*/*"))
+            manifest_path = session_dir / ARCHIVE_MANIFEST_NAME
+            manifest_before = manifest_path.read_bytes()
+            self.assertTrue(manifest_path.is_file())
+            self.assertTrue(store.run_dir(record.run_id).is_dir())
 
             archived = store.finalize_archived_run(record.run_id)
 
             self.assertIsNotNone(archived)
             self.assertTrue(archive_is_committed(session_dir))
+            self.assertEqual(manifest_path.read_bytes(), manifest_before)
             self.assertFalse(store.run_dir(record.run_id).exists())
             self.assertIsNone(store.current_run_id(record.agent_id))
+
+    def test_archive_recovery_rejects_changed_manifest_sizes(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            paths = _paths(root)
+            store = RunStore(paths)
+            record = store.create(_record(root))
+            store.transition(record.run_id, LifecycleState.COMPLETED)
+
+            real_replace = store_module.os.replace
+
+            def fail_marker_replace(source: Path, destination: Path) -> None:
+                if Path(destination).name == ARCHIVE_COMPLETION_MARKER:
+                    raise OSError("archive marker replacement interrupted")
+                real_replace(source, destination)
+
+            with (
+                mock.patch.object(store_module.os, "replace", side_effect=fail_marker_replace),
+                self.assertRaises(OSError),
+            ):
+                store.archive_current(record.run_id)
+
+            session_dir = next(paths.archive_dir.glob("*/*"))
+            manifest_path = session_dir / ARCHIVE_MANIFEST_NAME
+            manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+            manifest["files"]["raw.jsonl"] = 1
+            manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
+
+            with self.assertRaisesRegex(
+                StoreConflict, "archive manifest does not match archived files"
+            ):
+                store.finalize_archived_run(record.run_id)
+            self.assertTrue(store.run_dir(record.run_id).exists())
+            self.assertFalse((session_dir / ARCHIVE_COMPLETION_MARKER).exists())
+
+    def test_archive_recovery_collision_keeps_newer_live_incarnation(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            paths = _paths(root)
+            store = RunStore(paths)
+            record = store.create(_record(root))
+            store.transition(record.run_id, LifecycleState.COMPLETED)
+
+            real_replace = store_module.os.replace
+
+            def fail_marker_replace(source: Path, destination: Path) -> None:
+                if Path(destination).name == ARCHIVE_COMPLETION_MARKER:
+                    raise OSError("archive marker replacement interrupted")
+                real_replace(source, destination)
+
+            with (
+                mock.patch.object(store_module.os, "replace", side_effect=fail_marker_replace),
+                self.assertRaises(OSError),
+            ):
+                store.archive_current(record.run_id)
+
+            live = store.get(record.run_id)
+            live.created_at = "2999-01-01T00:00:00+00:00"
+            _atomic_write_json(store.run_path(record.run_id), live.to_dict())
+
+            with self.assertRaisesRegex(
+                StoreConflict, "older archive marker cannot remove a newer live run"
+            ):
+                store.finalize_archived_run(record.run_id)
+            self.assertEqual(store.get(record.run_id).created_at, live.created_at)
+            self.assertEqual(store.current_run_id(record.agent_id), record.run_id)
+
+    def test_archive_recovery_rebuilds_torn_manifest_and_cleans_status(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            paths = _paths(root)
+            store = RunStore(paths)
+            record = store.create(_record(root))
+            store.transition(record.run_id, LifecycleState.COMPLETED)
+            status_path = store.status_path(record.agent_id)
+            status_path.parent.mkdir(parents=True, exist_ok=True)
+            status_path.write_text(json.dumps({"state": "working"}), encoding="utf-8")
+
+            real_replace = store_module.os.replace
+
+            def fail_marker_replace(source: Path, destination: Path) -> None:
+                if Path(destination).name == ARCHIVE_COMPLETION_MARKER:
+                    raise OSError("archive marker replacement interrupted")
+                real_replace(source, destination)
+
+            with (
+                mock.patch.object(store_module.os, "replace", side_effect=fail_marker_replace),
+                self.assertRaises(OSError),
+            ):
+                store.archive_current(record.run_id)
+
+            session_dir = next(paths.archive_dir.glob("*/*"))
+            (session_dir / ARCHIVE_MANIFEST_NAME).write_bytes(b"{torn")
+
+            archived = store.finalize_archived_run(record.run_id)
+
+            self.assertIsNotNone(archived)
+            self.assertFalse(status_path.exists())
+            self.assertTrue(archive_is_committed(session_dir))
+
+    def test_partial_archive_cleanup_is_recoverable(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            paths = _paths(root)
+            store = RunStore(paths)
+            record = store.create(_record(root))
+            store.transition(record.run_id, LifecycleState.COMPLETED)
+            real_rmtree = store_module.shutil.rmtree
+
+            def partial_rmtree(path: Path, *args: Any, **kwargs: Any) -> None:
+                if Path(path) == store.run_dir(record.run_id):
+                    store.run_path(record.run_id).unlink()
+                    raise OSError("partial cleanup interruption")
+                real_rmtree(path, *args, **kwargs)
+
+            with (
+                mock.patch.object(store_module.shutil, "rmtree", side_effect=partial_rmtree),
+                self.assertRaisesRegex(OSError, "partial cleanup interruption"),
+            ):
+                store.archive_current(record.run_id)
+
+            self.assertTrue(store.run_dir(record.run_id).exists())
+            archived = store.finalize_archived_run(record.run_id)
+            self.assertIsNotNone(archived)
+            self.assertFalse(store.run_dir(record.run_id).exists())
 
     def test_archive_recovery_repairs_implicit_index_before_reuse(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

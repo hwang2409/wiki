@@ -6,7 +6,6 @@ import fcntl
 import logging
 import os
 import signal
-import threading
 import time
 import traceback
 from pathlib import Path
@@ -147,6 +146,24 @@ def reconcile_archive_edges_after_bind(supervisor: Supervisor) -> None:
         traceback.print_exc()
 
 
+async def _archive_edge_reconcile_loop(
+    supervisor: Supervisor,
+    stop: asyncio.Event,
+) -> None:
+    """Reconcile archive edges after bind without blocking the event loop."""
+
+    while not stop.is_set():
+        try:
+            await asyncio.wait_for(
+                stop.wait(), timeout=_ARCHIVE_RECONCILE_START_DELAY_SECONDS
+            )
+        except TimeoutError:
+            try:
+                await asyncio.to_thread(reconcile_archive_edges_after_bind, supervisor)
+            except Exception:
+                traceback.print_exc()
+
+
 async def _shutdown(
     server: UnixSupervisorServer,
     supervisor: Supervisor,
@@ -205,18 +222,15 @@ async def run_daemon(args: argparse.Namespace) -> None:
     startup_recovery_task: asyncio.Task[None] | None = None
     recovery_task: asyncio.Task[None] | None = None
     fleet_task: asyncio.Task[None] | None = None
+    archive_edge_task: asyncio.Task[None] | None = None
     try:
         # Register every retained run before the socket can serve a read.
         supervisor.prepare_startup_recovery()
         await server.start()
-        archive_reconcile_timer = threading.Timer(
-            _ARCHIVE_RECONCILE_START_DELAY_SECONDS,
-            reconcile_archive_edges_after_bind,
-            args=(supervisor,),
+        archive_edge_task = asyncio.create_task(
+            _archive_edge_reconcile_loop(supervisor, stop),
+            name="agent-supervisor-archive-edge-reconcile",
         )
-        archive_reconcile_timer.daemon = True
-        archive_reconcile_timer.name = "agent-supervisor-archive-edge-reconcile"
-        archive_reconcile_timer.start()
         # Bind before replaying retained event history. Recovery rebuilds one
         # run at a time in the supervisor's worker, so ping and new commands
         # remain available while cold-start projections catch up.
@@ -254,7 +268,12 @@ async def run_daemon(args: argparse.Namespace) -> None:
         await _shutdown(
             server,
             supervisor,
-            [startup_recovery_task, recovery_task, fleet_task],
+            [
+                startup_recovery_task,
+                recovery_task,
+                fleet_task,
+                archive_edge_task,
+            ],
             lock,
             paths,
         )
