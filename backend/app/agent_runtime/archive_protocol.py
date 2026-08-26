@@ -273,19 +273,55 @@ def commit_archive(
     _record_archive_in_catalog(directory, run_id, completed_at)
 
 
-def _manifest_is_verified(directory: Path, marker: dict[str, Any]) -> bool:
-    if marker.get("committed") is not True:
-        return False
-    if marker.get("manifest") != ARCHIVE_MANIFEST_NAME:
-        return False
-    manifest = _read_object(directory / ARCHIVE_MANIFEST_NAME)
-    if manifest is None:
-        return False
-    if (
-        manifest.get("run_id") != marker.get("run_id")
-        or manifest.get("completed_at") != marker.get("completed_at")
+def commit_archive_marker(
+    directory: Path,
+    *,
+    run_id: str,
+    completed_at: str,
+) -> None:
+    """Commit a verified existing manifest without rewriting it."""
+
+    directory = Path(directory)
+    if not directory.is_dir() or directory.is_symlink():
+        raise OSError(f"archive directory is not usable: {directory}")
+    if not archive_manifest_is_verified(
+        directory,
+        run_id=run_id,
+        completed_at=completed_at,
     ):
-        return False
+        raise OSError(f"archive manifest does not match archived files: {directory}")
+    marker_path = directory / ARCHIVE_COMPLETION_MARKER
+    marker_tmp: Path | None = None
+    try:
+        marker_fd, marker_raw_tmp = tempfile.mkstemp(
+            prefix=f".{ARCHIVE_COMPLETION_MARKER}.", dir=directory
+        )
+        marker_tmp = Path(marker_raw_tmp)
+        os.close(marker_fd)
+        _write_marker_temp(
+            marker_tmp,
+            {
+                "run_id": run_id,
+                "completed_at": completed_at,
+                "manifest": ARCHIVE_MANIFEST_NAME,
+                "committed": True,
+            },
+        )
+        os.replace(marker_tmp, marker_path)
+        _fsync_directory(directory)
+    except BaseException:
+        for path in (marker_tmp, marker_path):
+            if path is None:
+                continue
+            try:
+                path.unlink(missing_ok=True)
+            except OSError:
+                pass
+        raise
+    _record_archive_in_catalog(directory, run_id, completed_at)
+
+
+def _manifest_files_are_verified(directory: Path, manifest: dict[str, Any]) -> bool:
     if manifest.get("required_files") != list(REQUIRED_ARCHIVE_FILES):
         return False
     files = manifest.get("files")
@@ -332,6 +368,38 @@ def _manifest_is_verified(directory: Path, marker: dict[str, Any]) -> bool:
         if not stat.S_ISREG(path_stat.st_mode) or path_stat.st_size != files[name]:
             return False
     return _relative_file_sizes(directory) == files
+
+
+def archive_manifest_is_verified(
+    directory: Path,
+    *,
+    run_id: str,
+    completed_at: str,
+) -> bool:
+    """Verify an existing manifest without requiring its completion marker."""
+
+    manifest = _read_object(directory / ARCHIVE_MANIFEST_NAME)
+    if manifest is None:
+        return False
+    if manifest.get("run_id") != run_id or manifest.get("completed_at") != completed_at:
+        return False
+    return _manifest_files_are_verified(directory, manifest)
+
+
+def _manifest_is_verified(directory: Path, marker: dict[str, Any]) -> bool:
+    if marker.get("committed") is not True:
+        return False
+    if marker.get("manifest") != ARCHIVE_MANIFEST_NAME:
+        return False
+    run_id = marker.get("run_id")
+    completed_at = marker.get("completed_at")
+    if not isinstance(run_id, str) or not isinstance(completed_at, str):
+        return False
+    return archive_manifest_is_verified(
+        directory,
+        run_id=run_id,
+        completed_at=completed_at,
+    )
 
 
 def archive_is_committed(directory: Path) -> bool:
