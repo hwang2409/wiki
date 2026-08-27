@@ -46,7 +46,6 @@ export type TranscriptSession = {
   base: number;
   cursor: number;
   events: SessionEvent[];
-  eventsChangedFrom: number;
   hasOlder: boolean;
   composerMessages: ComposerMessage[];
   subagents: SubagentInfo[];

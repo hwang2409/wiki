@@ -112,7 +112,6 @@ export function eventRowsIncremental(
   events: SessionEvent[],
   offset: number,
   previous: EventRowsCache | null,
-  changedEventHint?: number,
 ): EventRowsResult {
   if (!previous || previous.offset !== offset) {
     const rows = eventRows(events, offset);
@@ -122,12 +121,17 @@ export function eventRowsIncremental(
     return { cache: previous, changedFrom: previous.rows.length, rows: previous.rows };
   }
 
-  const changedEvent = Math.min(
-    events.length,
-    changedEventHint === undefined
-      ? firstChangedRef(previous.events, events)
-      : Math.max(0, changedEventHint),
-  );
+  // Full prefix scan by identity. The display array interleaves transcript
+  // events with synthetic composer/pending rows spliced at timestamp/floor
+  // positions, so change indices from the session merge do not apply here —
+  // trusting them dropped freshly sent user messages until a remount rebuilt
+  // the cache. firstChangedRef's append fast path is equally unsound for this
+  // input (a mid-array splice can leave the last prefix element untouched).
+  const common = Math.min(previous.events.length, events.length);
+  let changedEvent = 0;
+  while (changedEvent < common && previous.events[changedEvent] === events[changedEvent]) {
+    changedEvent += 1;
+  }
   if (changedEvent === events.length && events.length === previous.events.length) {
     const cache = { ...previous, events };
     return { cache, changedFrom: previous.rows.length, rows: previous.rows };

@@ -24,7 +24,6 @@ export function buildSession(result: AgentSessionData): TranscriptSession {
     base: result.base,
     cursor: result.cursor,
     events: result.events,
-    eventsChangedFrom: 0,
     hasOlder: result.has_older ?? false,
     composerMessages: result.composer_messages ?? [],
     subagents: result.subagents ?? [],
@@ -87,7 +86,6 @@ function mergeSessionState(
   result: AgentSessionData,
   base: number,
   events: SessionEvent[],
-  eventsChangedFrom: number,
 ): TranscriptSession {
   const next: TranscriptSession = {
     ...current,
@@ -110,7 +108,6 @@ function mergeSessionState(
     base,
     cursor: result.cursor,
     events,
-    eventsChangedFrom,
     hasOlder: result.has_older ?? current.hasOlder,
     composerMessages: result.composer_messages ?? current.composerMessages,
     subagents: result.subagents ?? current.subagents,
@@ -156,7 +153,6 @@ export function prependOlderEvents(
     ...current,
     base: result.base,
     events: [...result.events, ...current.events],
-    eventsChangedFrom: 0,
     hasOlder: result.has_older,
   };
 }
@@ -164,12 +160,11 @@ export function prependOlderEvents(
 function applyPatches(
   events: SessionEvent[],
   patches: SessionPatch[],
-): { events: SessionEvent[]; changedFrom: number } {
-  if (patches.length === 0) return { events, changedFrom: events.length };
+): SessionEvent[] {
+  if (patches.length === 0) return events;
   const indexById = new Map<number, number>();
   events.forEach((event, index) => indexById.set(event.id, index));
   let next = events;
-  let changedFrom = events.length;
   for (const patch of patches) {
     const index = indexById.get(patch.id);
     if (index === undefined) continue;
@@ -190,7 +185,6 @@ function applyPatches(
       && sameJsonValue(event.tool.edit, patch.edit)
     ) continue;
     if (next === events) next = events.slice();
-    changedFrom = Math.min(changedFrom, index);
     next[index] = {
       ...event,
       tool: {
@@ -208,7 +202,7 @@ function applyPatches(
       },
     };
   }
-  return { events: next, changedFrom };
+  return next;
 }
 
 export function mergeSession(
@@ -227,7 +221,7 @@ export function mergeSession(
     result.base === current.base &&
     result.path === current.path
   ) {
-    return mergeSessionState(current, result, current.base, current.events, current.events.length);
+    return mergeSessionState(current, result, current.base, current.events);
   }
   if (
     result.events.length === 0 &&
@@ -242,12 +236,10 @@ export function mergeSession(
       { ...result, has_older: current.hasOlder || Boolean(result.has_older) },
       current.base,
       current.events,
-      current.events.length,
     );
   }
   let base = current.base;
   let events = current.events;
-  let changedFrom = events.length;
 
   // A full reset after change-log overflow can start inside a client prefix
   // loaded through older-page pagination. Preserve that still-contiguous
@@ -259,15 +251,7 @@ export function mergeSession(
   ) {
     const prefixLength = result.base - base;
     events = events.slice(0, prefixLength).concat(result.events);
-    changedFrom = prefixLength;
-    const patched = applyPatches(events, result.patches);
-    return mergeSessionState(
-      current,
-      result,
-      base,
-      patched.events,
-      Math.min(changedFrom, patched.changedFrom),
-    );
+    return mergeSessionState(current, result, base, applyPatches(events, result.patches));
   }
 
   if (result.base > base) {
@@ -275,7 +259,6 @@ export function mergeSession(
     if (trim >= events.length) return buildSession(result);
     events = events.slice(trim);
     base = result.base;
-    changedFrom = 0;
   }
 
   const currentEnd = base + events.length;
@@ -286,11 +269,8 @@ export function mergeSession(
   const tailIndex = result.tail_from - base;
   if (tailIndex !== events.length || result.events.length > 0) {
     events = events.slice(0, tailIndex).concat(result.events);
-    changedFrom = Math.min(changedFrom, tailIndex);
   }
-  const patched = applyPatches(events, result.patches);
-  events = patched.events;
-  changedFrom = Math.min(changedFrom, patched.changedFrom);
+  events = applyPatches(events, result.patches);
 
-  return mergeSessionState(current, result, base, events, changedFrom);
+  return mergeSessionState(current, result, base, events);
 }
