@@ -23,6 +23,7 @@ vi.mock("../src/api", async () => {
 import { SessionTab } from "../src/session";
 import {
   addPendingUserMessage,
+  replaceTranscriptQueue,
   retryTranscript,
   updatePendingUserMessage,
 } from "../src/transcript-store";
@@ -157,6 +158,82 @@ test("sent message stays rendered through ack + agent-response polls", async () 
     events: [],
     composer_messages: [
       { pending_id: PENDING_ID, text: MESSAGE, sent_at: ts(0), echoed_at: ts(2), seq: 1 },
+    ],
+    working: false,
+  }));
+  expect(view.container.textContent).toContain(MESSAGE);
+});
+
+// Pins the original defect: a queued send delivered while agent output is
+// already streaming acks on an empty-tail poll, so the composer fallback row
+// splices into the MIDDLE of the display array. The stale-hint rebuild kept a
+// prefix without the message and duplicated the boundary row; this test fails
+// on the pre-fix code.
+test("queued send delivered mid-stream splices into the middle and stays rendered", async () => {
+  const ticket = "WIKI-REPRO-2";
+  const initialEvents = [
+    assistantEvent(0, -600, "earlier answer"),
+    assistantEvent(1, -300, "another earlier answer"),
+  ];
+  getAgentSession.mockResolvedValueOnce(payload({ cursor: 1, events: initialEvents, tail_from: 0 }));
+
+  const view = render(<SessionTab showComposer={false} ticket={ticket} />);
+  await flush();
+
+  // Send lands while the agent is busy: backend queues it, the optimistic
+  // row is replaced by the queue entry (rendered as a composer chip only).
+  await act(async () => {
+    addPendingUserMessage(ticket, {
+      id: PENDING_ID,
+      requestId: "req-1",
+      text: MESSAGE,
+      mode: "now",
+    });
+    replaceTranscriptQueue(
+      ticket,
+      [{ text: MESSAGE, queued_at: ts(0), pending_id: PENDING_ID, source: "auto" }],
+      { pendingId: PENDING_ID, source: "auto", text: MESSAGE, position: 1 },
+    );
+  });
+
+  // Agent output continues streaming past the send timestamp.
+  const queueEntry = [{ text: MESSAGE, queued_at: ts(0), pending_id: PENDING_ID, source: "auto" as const }];
+  await poll(ticket, payload({
+    cursor: 2,
+    tail_from: 2,
+    events: [
+      { id: 2, kind: "thinking", ts: ts(3), text: "reasoning about testing", disposition: "rendered" } as SessionEvent,
+      assistantEvent(3, 5, "two layers, same as last time"),
+    ],
+    queue: queueEntry,
+    working: true,
+  }));
+  expect(view.container.textContent).toContain("two layers, same as last time");
+
+  // Delivery: queue drains and the ack arrives on an EMPTY tail poll. The
+  // fallback row (sent_at before the streamed events) must splice mid-array.
+  await poll(ticket, payload({
+    cursor: 3,
+    tail_from: 4,
+    events: [],
+    queue: [],
+    composer_messages: [
+      { pending_id: PENDING_ID, text: MESSAGE, sent_at: ts(0), echoed_at: null, seq: 1 },
+    ],
+    working: true,
+  }));
+  const delivered = view.container.textContent ?? "";
+  expect(delivered).toContain(MESSAGE);
+  expect(delivered.split("two layers, same as last time").length - 1).toBe(1);
+
+  // Idle flip keeps it rendered.
+  await poll(ticket, payload({
+    cursor: 4,
+    tail_from: 4,
+    events: [],
+    queue: [],
+    composer_messages: [
+      { pending_id: PENDING_ID, text: MESSAGE, sent_at: ts(0), echoed_at: null, seq: 1 },
     ],
     working: false,
   }));
