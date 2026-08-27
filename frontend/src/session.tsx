@@ -857,6 +857,34 @@ function mergeComposerEvents(events: SessionEvent[], composerEvents: SessionEven
   return merged;
 }
 
+// Synthetic rows (markers 1M+, composer fallbacks 2M+, pending sends 3M+) are
+// rebuilt as fresh objects on every displayEvents recompute. The incremental
+// row cache diffs by identity, so without reuse every poll would rebuild all
+// rows from the earliest synthetic and re-render its markdown. Reuse the
+// previous object whenever the same id carries identical flat fields.
+const SYNTHETIC_EVENT_ID_FLOOR = 1_000_000;
+
+function sameFlatEvent(left: SessionEvent, right: SessionEvent): boolean {
+  const leftRecord: Record<string, unknown> = left;
+  const rightRecord: Record<string, unknown> = right;
+  const leftKeys = Object.keys(leftRecord);
+  return leftKeys.length === Object.keys(rightRecord).length
+    && leftKeys.every((key) => Object.is(leftRecord[key], rightRecord[key]));
+}
+
+function stabilizeSyntheticEvents(previous: SessionEvent[], next: SessionEvent[]): SessionEvent[] {
+  const priorById = new Map<number, SessionEvent>();
+  for (const event of previous) {
+    if (event.id >= SYNTHETIC_EVENT_ID_FLOOR) priorById.set(event.id, event);
+  }
+  if (priorById.size === 0) return next;
+  return next.map((event) => {
+    if (event.id < SYNTHETIC_EVENT_ID_FLOOR) return event;
+    const prior = priorById.get(event.id);
+    return prior && sameFlatEvent(prior, event) ? prior : event;
+  });
+}
+
 function pendingTimelineEvent(message: PendingUserMessage, id: number): SessionEvent {
   return {
     id,
@@ -3562,6 +3590,7 @@ export function SessionTab({
     submitQuestions,
   }), [questionDrafts, questionGroups, selectOption, selectOther, setCustomReply, submitQuestions]);
 
+  const displayEventsRef = useRef<SessionEvent[]>([]);
   const displayEvents = useMemo(
     () => {
       if (!session) return [];
@@ -3569,10 +3598,13 @@ export function SessionTab({
           applyComposerSources(session.events, session.composerMessages),
           composerMessageEvents(session),
         );
-      return [
+      const merged = [
         ...mergePendingEvents(transcriptEvents, pendingUserMessages, pendingTimeline),
         ...modelChangedMarkers(session),
       ];
+      const stabilized = stabilizeSyntheticEvents(displayEventsRef.current, merged);
+      displayEventsRef.current = stabilized;
+      return stabilized;
     },
     [pendingTimeline, pendingUserMessages, session?.events, session?.providerInspector, session?.composerMessages],
   );
@@ -3582,11 +3614,10 @@ export function SessionTab({
       displayEvents,
       session?.base ?? 0,
       eventRowsCacheRef.current,
-      session?.eventsChangedFrom,
     );
     eventRowsCacheRef.current = result.cache;
     return result;
-  }, [displayEvents, session?.base, session?.eventsChangedFrom]);
+  }, [displayEvents, session?.base]);
   const rows = rowResult.rows;
   const providerEventRows = session?.format === "provider-events" && rows.length === 0
     ? session.providerInspector?.events ?? []

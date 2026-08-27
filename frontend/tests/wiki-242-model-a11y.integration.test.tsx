@@ -61,7 +61,6 @@ const session: TranscriptSession = {
   base: 0,
   cursor: 0,
   events: [],
-  eventsChangedFrom: 0,
   hasOlder: false,
   composerMessages: [],
   subagents: [],

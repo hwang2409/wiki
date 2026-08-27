@@ -82,7 +82,6 @@ test("mergeSession appends events whose tail starts at the current end", () => {
   const merged = mergeSession(current, result);
   assert.notStrictEqual(merged, current);
   assert.deepEqual(merged.events, [...current.events, appended]);
-  assert.equal(merged.eventsChangedFrom, current.events.length);
 });
 
 test("mergeSession retains a tool result completion timestamp from a patch", () => {
@@ -209,7 +208,6 @@ test("mergeSession preserves loaded older prefix across a full reset", () => {
   assert.equal(merged.base, 0);
   assert.deepEqual(merged.events.slice(0, 3), current.events.slice(0, 3));
   assert.deepEqual(merged.events.slice(3), resetEvents);
-  assert.equal(merged.eventsChangedFrom, 3);
 });
 
 test("mergeSession keeps the current tail when an empty poll moves base backward", () => {
