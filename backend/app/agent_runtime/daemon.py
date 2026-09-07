@@ -24,6 +24,9 @@ from .protocol import UnixSupervisorServer
 from .store import RunStore, RuntimePaths
 from .supervisor import Supervisor
 
+_ARCHIVE_RECONCILE_START_DELAY_SECONDS = 10.0
+
+
 def build_fleet_monitor_dispatch(supervisor: Supervisor):
     """Return the durable dispatch callable that ``FleetMonitor`` uses.
 
@@ -129,6 +132,38 @@ async def run_fleet_after_startup(
         await fleet_monitor.run(stop)
 
 
+def reconcile_archive_edges_after_bind(supervisor: Supervisor) -> None:
+    """Reconcile archive edges after the control socket becomes available."""
+
+    try:
+        from .. import workgraph_service
+
+        workgraph_service.reconcile_archive_edges(
+            supervisor.store.paths.archive_dir,
+            status_dir=supervisor.store.paths.status_dir,
+        )
+    except Exception:
+        traceback.print_exc()
+
+
+async def _archive_edge_reconcile_loop(
+    supervisor: Supervisor,
+    stop: asyncio.Event,
+) -> None:
+    """Reconcile archive edges after bind without blocking the event loop."""
+
+    while not stop.is_set():
+        try:
+            await asyncio.wait_for(
+                stop.wait(), timeout=_ARCHIVE_RECONCILE_START_DELAY_SECONDS
+            )
+        except TimeoutError:
+            try:
+                await asyncio.to_thread(reconcile_archive_edges_after_bind, supervisor)
+            except Exception:
+                traceback.print_exc()
+
+
 async def _shutdown(
     server: UnixSupervisorServer,
     supervisor: Supervisor,
@@ -171,7 +206,11 @@ async def run_daemon(args: argparse.Namespace) -> None:
         if fixture_dir
         else RealAdapterFactory(runtime_dir=paths.runtime_dir)
     )
-    supervisor = Supervisor(RunStore(paths), factory)
+    supervisor = Supervisor(
+        RunStore(paths),
+        factory,
+        reconcile_archive_edges=False,
+    )
     server = UnixSupervisorServer(supervisor, paths.socket_path)
     stop = asyncio.Event()
     loop = asyncio.get_running_loop()
@@ -183,10 +222,15 @@ async def run_daemon(args: argparse.Namespace) -> None:
     startup_recovery_task: asyncio.Task[None] | None = None
     recovery_task: asyncio.Task[None] | None = None
     fleet_task: asyncio.Task[None] | None = None
+    archive_edge_task: asyncio.Task[None] | None = None
     try:
         # Register every retained run before the socket can serve a read.
         supervisor.prepare_startup_recovery()
         await server.start()
+        archive_edge_task = asyncio.create_task(
+            _archive_edge_reconcile_loop(supervisor, stop),
+            name="agent-supervisor-archive-edge-reconcile",
+        )
         # Bind before replaying retained event history. Recovery rebuilds one
         # run at a time in the supervisor's worker, so ping and new commands
         # remain available while cold-start projections catch up.
@@ -224,7 +268,12 @@ async def run_daemon(args: argparse.Namespace) -> None:
         await _shutdown(
             server,
             supervisor,
-            [startup_recovery_task, recovery_task, fleet_task],
+            [
+                startup_recovery_task,
+                recovery_task,
+                fleet_task,
+                archive_edge_task,
+            ],
             lock,
             paths,
         )

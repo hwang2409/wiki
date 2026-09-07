@@ -18,7 +18,13 @@ from typing import Any
 from uuid import UUID
 
 from .. import knowledge
-from .archive_protocol import archive_is_committed, commit_archive
+from .archive_protocol import (
+    ARCHIVE_MANIFEST_NAME,
+    archive_is_committed,
+    archive_manifest_is_verified,
+    commit_archive,
+    commit_archive_marker,
+)
 from .command_log import CommandLog
 from .process import (
     provider_process_group_members_sync,
@@ -884,6 +890,46 @@ class RunStore:
     def archive_ticket_dir(self, agent_id: str) -> Path:
         return self.paths.archive_dir / agent_id
 
+    def _find_archive_recovery_entry(
+        self, run_id: str
+    ) -> tuple[RunRecord, Path, bool] | None:
+        """Find the newest archive snapshot for a run, including partial ones."""
+
+        session_dirs = sorted(
+            (
+                path
+                for path in self.paths.archive_dir.glob("*/*")
+                if path.is_dir() and not path.is_symlink()
+            ),
+            key=lambda path: (path.parent.name, path.parent.parent.name),
+            reverse=True,
+        )
+        for session_dir in session_dirs:
+            try:
+                value = _read_json(session_dir / "run.json")
+                if not isinstance(value, dict) or value.get("run_id") != run_id:
+                    continue
+                record = RunRecord.from_dict(value)
+            except (OSError, StoreError, TypeError, ValueError):
+                continue
+            try:
+                manifest = _read_json(session_dir / ARCHIVE_MANIFEST_NAME)
+            except (OSError, StoreError, TypeError, ValueError):
+                # A valid archived run is enough evidence to rebuild a torn
+                # manifest from the snapshot contents during finalization.
+                return record, session_dir, False
+            if not isinstance(manifest, dict) or manifest.get("run_id") != run_id:
+                return record, session_dir, False
+            return record, session_dir, archive_is_committed(session_dir)
+        return None
+
+    def find_archive_recovery_run(self, run_id: str) -> RunRecord | None:
+        """Find a run record in a committed or manifest-only archive snapshot."""
+
+        with self._lock:
+            entry = self._find_archive_recovery_entry(run_id)
+            return entry[0] if entry is not None else None
+
     def _find_archived_run_entry(self, run_id: str) -> tuple[RunRecord, Path] | None:
         """Return one archive record and its session directory."""
 
@@ -929,15 +975,48 @@ class RunStore:
         with self._lock:
             if run_id in self._archive_inflight:
                 raise StoreConflict("archive is already in progress")
-            archived_entry = self._find_archived_run_entry(run_id)
-            if archived_entry is None:
+            recovery_entry = self._find_archive_recovery_entry(run_id)
+            if recovery_entry is None:
                 return None
-            archived, session_dir = archived_entry
-            self._validate_committed_archive_locked(
-                run_id,
-                archived,
-                session_dir,
-            )
+            archived, session_dir, committed = recovery_entry
+            self._validate_archive_collision_locked(run_id, archived)
+            if committed:
+                self._validate_committed_archive_locked(run_id, archived, session_dir)
+            else:
+                try:
+                    manifest = _read_json(session_dir / ARCHIVE_MANIFEST_NAME)
+                except (OSError, StoreError, TypeError, ValueError):
+                    # Atomic archive writes can leave a snapshot without a
+                    # readable manifest. The archived run is the recovery
+                    # evidence, so rebuild the manifest from its files.
+                    commit_archive(
+                        session_dir,
+                        run_id=run_id,
+                        completed_at=archived.updated_at,
+                    )
+                else:
+                    completed_at = (
+                        manifest.get("completed_at")
+                        if isinstance(manifest, dict)
+                        else None
+                    )
+                    if not isinstance(
+                        completed_at, str
+                    ) or not archive_manifest_is_verified(
+                        session_dir,
+                        run_id=run_id,
+                        completed_at=completed_at,
+                    ):
+                        raise StoreConflict(
+                            "archive manifest does not match archived files"
+                        )
+                    commit_archive_marker(
+                        session_dir,
+                        run_id=run_id,
+                        completed_at=completed_at,
+                    )
+                if not archive_is_committed(session_dir):
+                    raise StoreConflict("archive commit failed verification")
             self._admit_archive_locked(run_id)
         try:
             self._finish_archive_cleanup(archived, session_dir)
@@ -1779,12 +1858,42 @@ class RunStore:
                 continue
             if self.run_path(run_id).is_file():
                 continue
-            # Archive finalization deletes the runtime run dir first, then
-            # drops the registry row. If the daemon stops between those steps,
-            # the missing run file is the durable signal that the current row
-            # must not survive restart.
-            registry.pop(agent_id, None)
-            changed = True
+            recovery_entry = self._find_archive_recovery_entry(run_id)
+            if recovery_entry is not None and recovery_entry[2]:
+                # Archive finalization deletes the runtime run dir first, then
+                # drops the registry row. If the daemon stops between those
+                # steps, a committed archive proves the row is safe to drop.
+                registry.pop(agent_id, None)
+                self.command_log.replace_projection(agent_id, {})
+                logger.info(
+                    "dropped registry entry after committed archive: "
+                    "agent_id=%s run_id=%s",
+                    agent_id,
+                    run_id,
+                )
+                changed = True
+                continue
+            # A missing run without a committed archive has no safe recovery
+            # source. Keep the row visible as terminal corruption for repair.
+            if (
+                current.get("state") != "corrupt"
+                or current.get("state_reason")
+                != "run directory missing without committed archive"
+            ):
+                current["state"] = "corrupt"
+                current["state_reason"] = (
+                    "run directory missing without committed archive"
+                )
+                changed = True
+            self.command_log.replace_projection(
+                agent_id, {agent_id: registry[agent_id]}
+            )
+            logger.error(
+                "registry entry has missing run directory without committed archive: "
+                "agent_id=%s run_id=%s",
+                agent_id,
+                run_id,
+            )
 
         records_by_agent: dict[str, list[RunRecord]] = {}
         for record in self.list_runs():
@@ -2081,14 +2190,14 @@ class RunStore:
                 record.outcome = outcome
             record.updated_at = ended_at
             session_dir = self._next_archive_session_dir(record.agent_id)
-            status_path = self._write_archive_files(
+            self._write_archive_files(
                 record,
                 session_dir,
                 ended_at=ended_at,
                 history=history,
                 archive_worker=archive_worker,
             )
-            self._finish_archive_cleanup(record, session_dir, status_path)
+            self._finish_archive_cleanup(record, session_dir)
             return record, session_dir
         finally:
             self._release_archive_admission(run_id)
@@ -2110,6 +2219,13 @@ class RunStore:
     ) -> None:
         if not archive_is_committed(session_dir):
             raise StoreConflict("archive is no longer committed")
+        self._validate_archive_collision_locked(run_id, archived)
+
+    def _validate_archive_collision_locked(
+        self,
+        run_id: str,
+        archived: RunRecord,
+    ) -> None:
         live_path = self.run_path(run_id)
         if live_path.is_file():
             try:
@@ -2136,7 +2252,7 @@ class RunStore:
         ended_at: str,
         history: list[dict[str, Any]],
         archive_worker: dict[str, Any],
-    ) -> Path | None:
+    ) -> None:
         run_id = record.run_id
         log_name = f"{record.provider.legacy_kind}-{record.agent_id}.log"
         prompt_name = f"{record.provider.legacy_kind}-{record.agent_id}-prompt.md"
@@ -2179,14 +2295,12 @@ class RunStore:
         if provider_log.is_file():
             expected_paths.append(session_dir / "provider.log")
         self._copy_archive_file(provider_log, session_dir / "provider.log")
-        status_path_to_remove: Path | None = None
         if record.initial_prompt:
             prompt_path = session_dir / prompt_name
             expected_paths.append(prompt_path)
             _atomic_write_bytes(prompt_path, record.initial_prompt.encode("utf-8"))
         status_path = self.status_path(record.agent_id)
         if status_path.is_file():
-            status_path_to_remove = status_path
             if record.execution_kind in {"wk-claude", "wk-codex"}:
                 status = {
                     "state": record.wk_status_state,
@@ -2219,23 +2333,25 @@ class RunStore:
         )
         if not archive_is_committed(session_dir):
             raise StoreError("archive commit failed verification")
-        return status_path_to_remove
 
     def _finish_archive_cleanup(
         self,
         record: RunRecord,
         session_dir: Path,
-        status_path: Path | None = None,
     ) -> None:
         run_dir = self.run_dir(record.run_id)
+        with self._lock:
+            self._validate_archive_collision_locked(record.run_id, record)
+            manifest = _read_json(session_dir / ARCHIVE_MANIFEST_NAME)
+            files = manifest.get("files") if isinstance(manifest, dict) else None
+            if isinstance(files, dict) and "final-status.json" in files:
+                self.status_path(record.agent_id).unlink(missing_ok=True)
         if record.start_request_id and record.implicit_start_request:
             self.command_log.archive_start_request(
                 record.start_request_id,
                 record.run_id,
                 str(session_dir),
             )
-        if status_path is not None:
-            status_path.unlink(missing_ok=True)
         if run_dir.exists():
             shutil.rmtree(run_dir)
         if run_dir.exists():

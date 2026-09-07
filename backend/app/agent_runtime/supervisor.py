@@ -562,6 +562,7 @@ class Supervisor:
         idempotency_cache_size: int = DEFAULT_IDEMPOTENCY_CACHE_SIZE,
         worker_soft_cap: int | None = None,
         archive_queue_limit: int = DEFAULT_ARCHIVE_QUEUE_LIMIT,
+        reconcile_archive_edges: bool = True,
     ):
         if idempotency_cache_size < 1:
             raise ValueError("idempotency_cache_size must be positive")
@@ -763,16 +764,16 @@ class Supervisor:
         )
         if self.worker_soft_cap < 1:
             raise ValueError("worker_soft_cap must be positive")
-        try:
-            from .. import workgraph_service
+        if reconcile_archive_edges:
+            try:
+                from .. import workgraph_service
 
-            workgraph_service.reconcile_archive_edges(
-                self.store.paths.archive_dir,
-                status_dir=self.store.paths.status_dir,
-            )
-        except Exception:
-            logger.exception("could not reconcile archived workgraph edges")
-
+                workgraph_service.reconcile_archive_edges(
+                    self.store.paths.archive_dir,
+                    status_dir=self.store.paths.status_dir,
+                )
+            except Exception:
+                logger.exception("could not reconcile archived workgraph edges")
     def materializer_metrics(self) -> dict[str, Any]:
         with self._materializer_metrics_lock:
             latencies = deque(self.materializer_latency_seconds)
@@ -1202,7 +1203,13 @@ class Supervisor:
     def _run_lock(self, run_id: str) -> asyncio.Lock:
         if run_id in self.archive_inflight:
             raise StoreConflict("archive is already in progress")
-        return self._agent_lock(self.store.get(run_id).agent_id)
+        try:
+            record = self.store.get(run_id)
+        except RunNotFound:
+            record = self.store.find_archive_recovery_run(run_id)
+            if record is None:
+                raise
+        return self._agent_lock(record.agent_id)
 
     def _reject_archive_inflight(self, params: Mapping[str, Any]) -> None:
         run_id = params.get("run_id")
@@ -5957,7 +5964,25 @@ Preserve the same identity, role, worktree, orchestrator grouping, PR gates, and
         command_hash: str | None = None,
         command_hash_payload: Mapping[str, Any] | None = None,
     ) -> RunRecord:
-        record = self.store.get(run_id)
+        try:
+            record = self.store.get(run_id)
+        except RunNotFound:
+            record = self.store.find_archive_recovery_run(run_id)
+            if record is None:
+                raise
+            async with self._archive_admission(record):
+                archived = await self._run_archive_worker(
+                    self.store.finalize_archived_run,
+                    run_id,
+                )
+            if archived is None:
+                raise RunNotFound(f"archive not found for run: {run_id}")
+            self.event_store.close_run(run_id)
+            self._forget_implicit_idempotency_for_run(run_id)
+            self._clear_adapter_loss(run_id)
+            self._clear_auth_dead_recovery_state(run_id)
+            await self._publish_agent_change(archived.agent_id)
+            return archived
         async with self._archive_admission(record):
             return await self._archive_locked(
                 run_id,
@@ -6008,7 +6033,12 @@ Preserve the same identity, role, worktree, orchestrator grouping, PR gates, and
     async def _replay_archive_cleanup(self, run_id: str) -> RunRecord | None:
         async with self._run_mutation_admission():
             async with self._run_lock(run_id):
-                record = self.store.get(run_id)
+                try:
+                    record = self.store.get(run_id)
+                except RunNotFound:
+                    record = self.store.find_archive_recovery_run(run_id)
+                    if record is None:
+                        raise
                 async with self._archive_admission(record):
                     archived = await self._run_archive_worker(
                         self.store.finalize_archived_run,
@@ -6016,6 +6046,7 @@ Preserve the same identity, role, worktree, orchestrator grouping, PR gates, and
                     )
                 if archived is not None:
                     self.event_store.close_run(run_id)
+                    self._record_archive_edge(archived, archived.outcome)
                 return archived
 
     def _archive_finalize_sync(
@@ -6736,7 +6767,15 @@ Preserve the same identity, role, worktree, orchestrator grouping, PR gates, and
                     run_id = command_params.get("run_id")
                     if not isinstance(run_id, str) or not run_id:
                         raise ValueError("agent_id or run_id is required")
-                    agent_id = self.store.get(run_id).agent_id
+                    try:
+                        agent_id = self.store.get(run_id).agent_id
+                    except RunNotFound:
+                        if method != "run/archive":
+                            raise
+                        archived = self.store.find_archive_recovery_run(run_id)
+                        if archived is None:
+                            raise
+                        agent_id = archived.agent_id
                     command_params["agent_id"] = agent_id
                 else:
                     current_run_id = self.store.current_run_id(agent_id)
@@ -7122,6 +7161,9 @@ Preserve the same identity, role, worktree, orchestrator grouping, PR gates, and
                 archived = self.store.find_latest_archived_agent(agent_id)
                 if archived is None:
                     raise
+                resumed = await self._replay_archive_cleanup(archived.run_id)
+                if resumed is not None:
+                    archived = resumed
                 return {
                     **_public_run(archived),
                     "_workgraph_archive_recorded": True,

@@ -23,7 +23,7 @@ from typing import Any, cast
 from unittest import mock
 from uuid import uuid4
 
-from backend.app import accounts, provider_health
+from backend.app import accounts, provider_health, workgraph
 from backend.app.account_notices import AccountNoticeStore
 from backend.app.agent_runtime import daemon as agent_daemon
 from backend.app.agent_runtime import store as store_module
@@ -10837,6 +10837,62 @@ class SupervisorTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(archived.run_id, record.run_id)
         self.assertFalse(self.store.run_dir(record.run_id).exists())
 
+    async def test_archive_endpoint_resumes_after_marker_replacement_failure(
+        self,
+    ) -> None:
+        record = self._create_terminal_archive_run("WIKI-ARCHIVE-MANIFEST-RETRY")
+        real_replace = store_module.os.replace
+
+        def fail_marker_replace(source: Path, destination: Path) -> None:
+            if Path(destination).name == "archive-complete.json":
+                raise OSError("archive marker replacement interrupted")
+            real_replace(source, destination)
+
+        with (
+            mock.patch.object(store_module.os, "replace", side_effect=fail_marker_replace),
+            self.assertRaisesRegex(OSError, "marker replacement interrupted"),
+        ):
+            await self.supervisor.archive(record.run_id)
+
+        result = await self.supervisor.dispatch(
+            "run/archive",
+            {"run_id": record.run_id},
+        )
+
+        self.assertEqual(result["run_id"], record.run_id)
+        self.assertFalse(self.store.run_dir(record.run_id).exists())
+        self.assertEqual(
+            len(list(self.paths.archive_dir.glob("*/*/archive-complete.json"))), 1
+        )
+
+    async def test_archive_recovery_records_workgraph_edge_without_restart(self) -> None:
+        record = self._create_terminal_archive_run("WIKI-400")
+        real_rmtree = store_module.shutil.rmtree
+
+        def fail_cleanup(path: Path, *args: Any, **kwargs: Any) -> None:
+            if Path(path) == self.store.run_dir(record.run_id):
+                raise OSError("archive cleanup interrupted")
+            real_rmtree(path, *args, **kwargs)
+
+        with (
+            mock.patch.object(store_module.shutil, "rmtree", side_effect=fail_cleanup),
+            self.assertRaisesRegex(OSError, "archive cleanup interrupted"),
+            mock.patch.object(workgraph, "SNAPSHOT_DIR", self.root / "workgraphs"),
+        ):
+            await self.supervisor.archive(record.run_id)
+
+        result = await self.supervisor.dispatch(
+            "run/archive",
+            {"run_id": record.run_id},
+        )
+
+        self.assertEqual(result["run_id"], record.run_id)
+        graph = workgraph.load_workgraph(record.agent_id, self.paths.status_dir)
+        self.assertIsNotNone(graph)
+        assert graph is not None
+        self.assertEqual(graph["edges"][-1]["kind"], "archive")
+        self.assertEqual(graph["edges"][-1]["payload"]["outcome"], "archived")
+
     async def test_archive_worker_rejects_same_run_commands_while_in_flight(self) -> None:
         record = self._create_terminal_archive_run("WIKI-ARCHIVE-EXCLUSION")
         started = threading.Event()
@@ -12673,6 +12729,68 @@ class RecoveryLoopTests(unittest.IsolatedAsyncioTestCase):
 
 
 class DaemonShutdownTests(unittest.IsolatedAsyncioTestCase):
+    async def test_archive_edge_reconcile_runs_as_tracked_thread_task(self) -> None:
+        stop = asyncio.Event()
+        started = threading.Event()
+        release = threading.Event()
+
+        def blocked_scan(_supervisor: Supervisor) -> None:
+            started.set()
+            release.wait(timeout=5)
+
+        with (
+            mock.patch.object(
+                agent_daemon,
+                "_ARCHIVE_RECONCILE_START_DELAY_SECONDS",
+                0.01,
+            ),
+            mock.patch.object(
+                agent_daemon,
+                "reconcile_archive_edges_after_bind",
+                side_effect=blocked_scan,
+            ),
+        ):
+            task = asyncio.create_task(
+                agent_daemon._archive_edge_reconcile_loop(mock.Mock(), stop)
+            )
+            try:
+                self.assertTrue(await asyncio.to_thread(started.wait, 2))
+                self.assertFalse(task.done())
+                task.cancel()
+                await asyncio.gather(task, return_exceptions=True)
+            finally:
+                release.set()
+
+    async def test_archive_edge_reconcile_task_is_cancelled_on_early_shutdown(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            paths = _paths(Path(tmp))
+            store = RunStore(paths)
+            supervisor = Supervisor(store, FixtureAdapterFactory(FIXTURES))
+            lock = agent_daemon._acquire_single_instance(paths)
+            stop = asyncio.Event()
+            scan = mock.Mock()
+
+            class ClosedServer:
+                async def close(self) -> None:
+                    pass
+
+            with mock.patch.object(
+                agent_daemon,
+                "reconcile_archive_edges_after_bind",
+                scan,
+            ):
+                task = asyncio.create_task(
+                    agent_daemon._archive_edge_reconcile_loop(supervisor, stop)
+                )
+                await agent_daemon._shutdown(
+                    ClosedServer(), supervisor, [task], lock, paths
+                )
+
+            self.assertTrue(task.done())
+            scan.assert_not_called()
+
     async def test_lock_stays_held_until_materializer_writes_finish(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
