@@ -461,7 +461,7 @@ test("Replace stays disabled with a reason when a worker has no live runtime", a
     const stop = view.getByRole("menuitem", { name: /^Stop$/ }) as HTMLButtonElement;
     expect(replace.disabled).toBe(false);
     expect(replace.getAttribute("aria-disabled")).toBe("true");
-    expect(replace.tabIndex).toBe(0);
+    expect(replace.tabIndex).toBe(-1);
     expect(replace.getAttribute("aria-describedby")).toBeTruthy();
     expect(replace.title).toBe("Legacy tmux runs must be migrated before Replace is available");
     expect(stop.getAttribute("aria-disabled")).toBe("true");
@@ -630,6 +630,31 @@ test("clicking a history row selects exactly the named archive over a live ticke
   const selectedCards = view.container.querySelectorAll(".agent-card.is-selected");
   expect(selectedCards).toHaveLength(1);
   expect(selectedCards[0]).toBe(historyCards[1]);
+});
+
+test("live removal of an open menu row clears the menu and restores focus", async () => {
+  const removed = { ...worker, ticket: "WIKI-REMOVED" };
+  const remaining = { ...worker, ticket: "WIKI-REMAINING" };
+  const view = renderView({
+    data: { workers: [removed, remaining], orchestrators: [], archived: [], error: null },
+  });
+  fireEvent.click(view.getByRole("button", { name: /More actions for WIKI-REMOVED/ }));
+  expect(view.getByRole("menu")).toBeTruthy();
+
+  view.rerender(
+    <AgentsView
+      data={{ workers: [remaining], orchestrators: [], archived: [], error: null }}
+      onOpenAgent={() => undefined}
+      refreshTick={1}
+      openTicket={null}
+      onOpenTicket={() => undefined}
+    />,
+  );
+
+  await waitFor(() => {
+    expect(view.queryByRole("menu")).toBeNull();
+    expect(document.activeElement).toBe(view.container.querySelector(".agents-view"));
+  });
 });
 
 test("history row is a quiet outcome/date summary with View transcript", async () => {
