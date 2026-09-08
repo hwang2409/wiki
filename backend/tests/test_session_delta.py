@@ -776,9 +776,11 @@ class SessionDeltaTests(unittest.TestCase):
 
         self.assertNotIn("gpt-5.6", models)
         self.assertEqual(
-            ["gpt-5.6-sol", "gpt-5.6-terra", "gpt-5.6-luna"],
-            [payload["models"][index]["id"] for index in range(3)],
+            ["gpt-6-astra", "gpt-5.6-sol", "gpt-5.6-terra", "gpt-5.6-luna"],
+            [payload["models"][index]["id"] for index in range(4)],
         )
+        self.assertEqual(models["gpt-6-astra"]["kind"], "cdx")
+        self.assertTrue(models["gpt-6-astra"]["supports_reasoning_effort"])
         self.assertEqual(models["gpt-5.6-sol"]["kind"], "cdx")
         self.assertIn("opus-4.7", models)
         self.assertEqual(models["opus-4.7"]["kind"], "cc")
