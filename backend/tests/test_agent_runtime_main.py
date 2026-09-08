@@ -2498,7 +2498,7 @@ class HeadlessMainRouteTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(self.client.calls, [])
         self.assertIn("gpt-5.6", str(blocked.exception.detail))
         self.assertIn(
-            "Allowed values: gpt-5.6-sol, gpt-5.6-terra, gpt-5.6-luna, gpt-5.5, gpt-5.4, gpt-5.4-mini, gpt-5.3-codex-spark",
+            "Allowed values: gpt-6-astra, gpt-5.6-sol, gpt-5.6-terra, gpt-5.6-luna, gpt-5.5, gpt-5.4, gpt-5.4-mini, gpt-5.3-codex-spark",
             str(blocked.exception.detail),
         )
 

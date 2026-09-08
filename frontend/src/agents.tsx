@@ -100,10 +100,7 @@ type OrchestratorSpawnNotice = {
 
 function defaultOrchestratorModel(models: AgentModelOption[], kind: SpawnWorkerKind): string {
   const byKind = modelsForKind(models, kind);
-  if (kind === "cc") {
-    return byKind.find((option) => option.default_orchestrator)?.id ?? byKind[0]?.id ?? "";
-  }
-  return byKind[0]?.id ?? "";
+  return byKind.find((option) => option.default_orchestrator)?.id ?? byKind[0]?.id ?? "";
 }
 
 function ageLabel(seconds: number | null): string {

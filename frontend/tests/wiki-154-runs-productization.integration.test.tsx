@@ -309,6 +309,19 @@ const models: AgentModelOption[] = [
   },
 ];
 
+const astraFirstModels: AgentModelOption[] = [
+  {
+    id: "gpt-6-astra",
+    label: "GPT 6 Astra",
+    kind: "cdx",
+    provider: "codex",
+    supports_reasoning_effort: true,
+    default_worker: false,
+    default_orchestrator: false,
+  },
+  ...models,
+];
+
 test("role pipeline presets pick the vault-default models with API fallback", () => {
   expect(presetWorkerModel(models, "cdx", "implement")).toBe("gpt-5.6-luna");
   expect(presetWorkerModel(models, "cdx", "review")).toBe("gpt-5.6-sol");
@@ -683,6 +696,27 @@ test("spawn orchestrator dialog leads with name and goal; provider/model live un
   const providerSelect = view.getByLabelText("Provider") as HTMLSelectElement;
   const providerOptions = Array.from(providerSelect.options).map((o) => o.text);
   expect(providerOptions).toEqual(expect.arrayContaining(["Claude", "Codex"]));
+});
+
+test("spawn orchestrator uses the flagged Codex default when Astra is listed first", async () => {
+  const view = render(
+    <SpawnOrchestratorModal
+      models={astraFirstModels}
+      workspaceRoot="/workspace/active"
+      onClose={() => undefined}
+      onSpawn={() => undefined}
+    />,
+  );
+
+  fireEvent.click(view.getByRole("button", { name: /Advanced/ }));
+  await waitFor(() => expect(view.getByLabelText("Provider")).toBeTruthy());
+  fireEvent.change(view.getByLabelText("Provider"), { target: { value: "cdx" } });
+
+  await waitFor(() => {
+    expect(view.container.querySelector<HTMLSelectElement>('select[aria-label="Model"]')?.value).toBe(
+      "gpt-5.6-sol",
+    );
+  });
 });
 
 test("spawn orchestrator default flow reaches confirmation without opening Advanced", async () => {
