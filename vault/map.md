@@ -108,6 +108,8 @@ Topic → note index. **Agents: read this file first, before grepping.** Every n
 - [[EVAL-UI-SCOUT-memo]] — scout memo: render_dynamic_ui pipeline map, failure modes, UI-eval designs (PHO-17584 input)
 - [[SIM-ORCHARD-SCOUT-memo]] — full simulator audit memo behind the orchard note
 - [[PHO-17602-SCOUT-memo]] — bash-tool eval design memo: coverage map vs Henry's question list, lineage/intent gaps, rewrite audit + preload experiment design (PHO-17602)
+- [[PHO-17602-CENSUS-memo]] — production v3 bash census: 51 runs/59 calls, python-heredoc flail (35 AST revisions in 4 runs), empty workspace-file table vs 113 write audits, 8 golden-case targets
+- [[eval-adherence-checklist]] — canonical eval checklist (howtoeval + anthropic demystifying-evals): reference solutions, negative cases, pass^k, broken-task rule, transcript reading
 
 ## Phoebe/til
 
@@ -116,6 +118,7 @@ Topic → note index. **Agents: read this file first, before grepping.** Every n
 - [[admin-call-search-hydrates-transcripts]] — Core semantic call search hydrates full transcript rows before list serialization; root cause for PHO-13225 ReadTimeouts
 - [[admin-agent-chart-message-stream]] — Chart/visualization artifacts render from assistant_text `artifact_refs`; tool cards keep raw refs only for audit/JSON inspection (PHO-13277)
 - [[buildbuddy-executeworkflow-pr-context]] — BuildBuddy ExecuteWorkflow on a PR branch runs branch-push workflow steps unless GitHub PR context is present
+- [[bash-golden-eval-trajectory]] — paired Bash golden cases require reference trajectories and transcript fairness checks
 
 ## Tools/til
 

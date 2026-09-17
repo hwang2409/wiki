@@ -9,6 +9,9 @@ updated: 2026-09-17
 
 ## 2026-09-17
 
+- **splitty** — SPLIT-1 merged (#2) — community Apollo sweep (only rehost found) + separator-diversity max-spec ensembles; SPLIT-2 merged (#1) — Splitty Lab web app (manifest catalog, inline playback, A/B deck), 4 review rounds to clean
+- phoebe #17274 org snapshot import script MERGED by orch under Henry's 09-17 grant (conflicts resolved by ORG-SNAPSHOT-CONFLICTS lane; squash 2026-09-17T20:02Z; dev-tooling only)
+- PAUS-15 merged as https://github.com/hwang2409/pausanias/pull/17 (LOCOMO cat-5 abstention eval: lexical 1.35% vs fused 100% false-injection)
 - PAUS-16 merged as https://github.com/hwang2409/pausanias/pull/16 (GitHub Actions CI: base zero-dep proof + semantic, full suite both)
 - zeta ZETA-133 D1 shared body edge + leading gutter merged (PR #178, 4 review rounds; smoke guard now scans rendered bounds; D3 deferred to ZETA-133-D3)
 - PAUS-14 merged as https://github.com/hwang2409/pausanias/pull/15 (LOCOMO retrieval-only benchmark; fused 55.5% vs lexical 0.08% recall@200)
