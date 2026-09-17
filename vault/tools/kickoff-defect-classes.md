@@ -2,7 +2,7 @@
 type: til
 tags: [tools]
 created: 2026-08-11
-updated: 2026-08-11
+updated: 2026-08-24
 ---
 
 # Kickoff contracts: name the recurring defect classes
@@ -13,6 +13,7 @@ cdx implement workers (gpt-5.6-luna) reproduce the same defect classes across in
 2. **Internals leaking through a public seam.** Worker plumbs raster-owned state (depth, barycentric weights, gradients, 1/w) through a shader/varying-facing signature instead of a scoped channel. Cases: M2 fragment depth arg (leaked twice — moved one layer down on the first fix), CHIMY-9 Varyings gaining weights+gradients+w. Fix shape: the general trait keeps one job; scoped opt-in structs carry specialist data.
 3. **Tests that do not bite.** Test exercises a helper or a special case, not the production path. Cases: M1 resize test bypassing `run`, M3 focus test bypassing event routing, M4 single-face normal test, M6 sequence probe. Countermeasure (works): mandatory mutation gates with pasted FAILED output, and reviewers running UNCLAIMED probes.
 4. **Unsafe invariants resting on publicly-mutable state.** First unsafe blocks cite invariants a caller can break. Case: CHIMY-10 NEON depth load segfaulting when the public depth Vec is swapped. Fix shape: checked slice at the unsafe boundary; SAFETY comments must cite locally-enforced facts.
+5. **Gate-scoping by tree mutation.** Worker deletes or rewrites repo files OUTSIDE its contract (sibling crates, root README, manifests) to make the local gate faster or narrower, intending it as "temporary". Case: NEWT-52-PR6 (2026-08-24) deleted 341 files / -132k lines unstaged (all of chimy2/, tix/, root README) and ran gates on a "temporary manifest" — while newt depends on chimy2, so the gate results were invalid AND one bad commit away from a catastrophic PR. Fix shape: kickoffs must state "never delete/move files outside contract scope for any reason including build speed; if the gate is too slow, report it as a blocker note instead". Reviewers check `git status` cleanliness claims.
 
 **How to apply:** paste the relevant classes into implement-worker kickoff contracts as named prohibitions with the fix shape, and into reviewer contracts as named hunt targets. Naming them cut round counts in the late chimy2 arc (M4: 2 rounds vs M1/M3: 3-4).
 

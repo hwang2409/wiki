@@ -51,11 +51,14 @@ Topic → note index. **Agents: read this file first, before grepping.** Every n
 - [[newt-arm-demo-spec]] — humanoid arm demo (newt muscles + chimy2 lit render) spec + status; queued as ARMDEMO-1
 - [[registry-wipe-cascade-rca]] — RCA: worker unassignment = registry wipe cascade (create() blind rewrite + abort unlink after file loss); repro + fingerprints + fix direction
 - [[newt-audit-2026-08-20]] — newt audit: penalty reactions and sensor-force timing risks
+- [[website-project-posts]] — website project-post editorial convention — real-type code anchors, 0->1 arc; DESIGN.md carries repo copy
+- [[pausanias]] — proposed automatic memory context design; local markdown retrieval before inference plus explicit follow-up search
 
 ## Design
 
 - [[laws-of-ux]] — Laws of UX field notes: which laws bite where in Wiki/Phoebe UI decisions
 - [[default-quiet]] — default-quiet UI doctrine: previews/diagnostics are opt-in via disclosures, never visible by default
+- [[zeta-gui-wiki-run-parity]] — Wiki agent-run UI design language extraction for the zeta GUI parity arc (ZETA-106+)
 
 ## Math
 
@@ -78,6 +81,7 @@ Topic → note index. **Agents: read this file first, before grepping.** Every n
 - [[llm-judge-auto-taggers]] — Phoebe LLM judge survey (2026-08-05): two-layer continuous reviewer (conversation judge + episode classifier), Agent Court routing; gaps: no judge goldens, fail-open edges, unredacted PII to providers.
 - [[env-vars-sync-for-credentials]] — phoebe: creds/env missing locally? env-vars sync-local first — synced .env.local files carry Modal tokens, LLM keys, etc.
 - [[debug-loop-pathologies]] — long debug loops: suspect own instrumentation first, full-bisect to last-good, verify probe channels, enumerate not pattern-match, fresh-eyes pass every ~5 rounds
+- [[data-analysis-test-queries-2026-09-08]] — production audit of realistic v3 data-analysis queries (analytics read replica, 2026-04-30..09-08)
 - [[v3-workflow-census-2026-08]] — production workflow census (7,821 runs) + 30 golden eval cases for v3; taxonomy, write-tool risk audit, replay seeds
 - [[v3-subagent-design-decisions]] — the 4 decisions unlocking org skill files (PHO-15434): subagent fate, fan-out, capability library, TTL retention
 - [[agent-write-tools-audit-2026-08-18]] — customer-facing agent write-tools audit (SMS/voice/in-app): exposure, gating, 30d usage counts
@@ -85,8 +89,23 @@ Topic → note index. **Agents: read this file first, before grepping.** Every n
 - [[write-tools-consolidation-design]] — v3 write-tools consolidation design: seven consolidation patterns, two side-effect tools, 90 migration mappings from the customer-facing audit
 - [[admin-v3-tools-plan-2026-08-19]] — PHO-15864 admin agent v3 tools rewrite plan: inventory, core query/write/bash design, compaction+artifacts rethink, revised ladder, 12 open decisions for Henry
 - [[admin-v3-rung12-family-design-2026-08-19]] — PHO-16438 rung-12 domain-family design proposal: three family builds on core v3 doors, digest-derived tool classes, no ledger edits
+- [[v3-sandbox-single-image-decision]] — v3 sandbox decision (2026-08-26): ONE image for all surfaces, packages baked + network-blocked; MINIMAL/ANALYSIS profile split removed (PHO-16987 #15357)
+- [[v3-sandbox-volume-artifacts-proposal]] — proposed sync-free workspace: ephemeral /workspace + volume-backed /workspace/artifacts; spike questions before adoption (2026-08-26)
+- [[v3-sandbox-s3-artifacts-implemented]] — implemented PR #15530: S3-mounted v3 artifacts, index integrity, quotas, rollout, and cleanup (PHO-17054)
+- [[v3-agent-modal-sandbox-design]] — customer-facing v3 Modal sandbox architecture, workspace durability, limits, and artifact delivery (PHO-16987)
+- [[v3-agent-sandbox-on-main]] — plain-language description of the merged v3 sandbox system at origin/main
 - [[admin-v3-parked-lanes-2026-08-19]] — admin-v3 lanes parked 2026-08-19 (supervisor overload): exact per-lane resume state, cleanup debt, gated rungs
 - [[deploy-lag-misdiagnosis]] — RCA gotcha: merged fix read as broken because prod had not deployed it; verify with logfire service_version + git merge-base --is-ancestor
+- [[v3-tool-efficiency-evals-design]] — eval-engine-based v3 bash tool-efficiency evals: metrics from tool_calls, judge criteria, flail cases (PHO-17482)
+- [[bazel-mcp-cache-leak]] — worktree-bazel-mcp bootstrap leaks temp build dirs; 387G in ~/.cache/phoebe
+- [[org-clone-scrub-design]] — prod org clone to local with egress scrub: design, decisions, hazards (2026-09-16)
+- [[local-db-grant-drift]] — schema.sql rebuild + stamp drops migration-only GRANTs; v3 query tool masks DB errors as 'Could not save the large query result'
+- [[render-ui-sandbox-split-brain]] — local API .env.local is stale (no MODAL_* / CORE_API_*), so API and worker attach to different Modal sandboxes; dynamic UI tables 404 locally but work in staging
+- [[orchard-sim-org-audit-2026-09-17]] — Orchard St. sim org production audit + simulator refactor catalog: conditional filter rules (not a flat blacklist), daily runs stopped 09-02, 2 critical lexical-voice defects
+- [[simulator-refactor-plan-2026-09-17]] — locked simulator refactor plan: 5 waves / 11 lanes; decisions: unify demo audience, real-Twilio SMS-only, pixel map deprioritized, boundaries locked down
+- [[EVAL-RICHARD-SCOUT-memo]] — scout memo: Richard's v3 eval PRs (#17024/#17174/#17266) and v3-evals architecture/extension points
+- [[EVAL-UI-SCOUT-memo]] — scout memo: render_dynamic_ui pipeline map, failure modes, UI-eval designs (PHO-17584 input)
+- [[SIM-ORCHARD-SCOUT-memo]] — full simulator audit memo behind the orchard note
 
 ## Phoebe/til
 
@@ -122,6 +141,7 @@ Topic → note index. **Agents: read this file first, before grepping.** Every n
 - [[agent-runtime-recovery]] — runbook for ~/.wiki/agent-runtime: 2026-08-17 SQLite-corruption RCA, park/rebuild recipes, supervisor boot-loop recovery
 - [[formatting-delta-census]] — WIKI-317 audit: why bb still looks cleaner (type rank, box noise, envelopes); WIKI-318-325 ladder + R1-R8 rulings
 - [[closing-audit-2026-08-17]] — WIKI-329 closing audit: 5-item punch list (P0 thought-group overlap, P0 destructive focus, tier stragglers, mono fallback, theme grid)
+- [[ui-census-2026-08-25]] — WIKI-385 UI/UX census (2-month sweep): top-20 ranked defects + WIKI-384..398 ticket ladder; screenshots on branch wiki-385-audit
 
 ## Mitm-inspector
 
@@ -146,6 +166,9 @@ Topic → note index. **Agents: read this file first, before grepping.** Every n
 - [[wk-owned-agent-loop-design]] — WIKI-361 design: wk owns the claude/codex agent loops; provider seams, pi prior art, migration ladder WIKI-362..371
 - [[supervisor-optimization-audit-2026-08-20]] — WIKI-361 audit: ranked supervisor/push-path optimizations post #284/#285; build-guard downtime, archive catalog, wk replay
 - [[archive-stall-recurrence-2026-08-24]] — archive-in-progress stall recurred on fresh runtime 21:58Z — live bug, not stale state; queue head-of-line evidence
+- [[transcript-row-cache-defect]] — incremental caches fed change hints from a different index space silently drop spliced rows
+- [[native-swap-handover-timeout]] — swap transaction handover times out under slow supervisor startup (archive reconcile); manual swap recipe
+- [[backend-outage-2026-09-16]] — SIGKILL+respawn at 11:51 EDT, then 3-min saturation wedge; evidence for the shared-backend P1
 
 ## Wiki/til
 
@@ -154,6 +177,28 @@ Topic → note index. **Agents: read this file first, before grepping.** Every n
 ## Wiki-app/til
 
 - [[codex-reasoning-encrypted-summaries]] — Codex app-server exposes only reasoning summaries; full reasoning is encrypted and unavailable to Wiki.app.
+- [[render-artifact-mp4-ctts-cap]] — render_artifact rejects mp4s with >4096 ctts entries (B-frames); ffmpeg -bf 0 baseline transcode fixes
+
+## Zeta
+
+- [[harness-parity-arc]] — 2026-09-14 arc: skills system, custom agents, composer ergonomics, /init, image reads (ZETA-117..121); lane specs + audit headline
+- [[rendering-philosophy]] — zeta TUI: verbatim model output + styling only, no re-layout (Henry 2026-08-25)
+- [[live-home-test-pollution]] — zeta test suite polluted live ~/.zeta/sessions via tmux env leak (2,010 debris sessions 08-20..09-01); fix in ZETA-49 PR #79
+- [[henry-daily-driver-profile]] — trace-audit profile of Henry's real harness usage (ops chore-runner, status glass, URL delegation); informs zeta daily-driver arcs
+- [[single-owner-concurrency-rule]] — zeta design rule: hand-threaded async state never survives review; concurrent subsystems get one owner (actor/queue) from the start — 3 grinds proved it
+- [[gui-audit-2026-09-16]] — hands-on GUI audit @ d21ab5a: 9-char inline-code truncation, no slash commands, invisible approval-mode state; ranked fix order
+
+## Agents
+
+- [[orch-spec-overreach-cache-bytes]] — when a lane fails N rounds on one property, audit the SPEC before blaming the worker — ZETA-39 case
+
+## Infra
+
+- [[railway-automation-server]] — Railway as the always-on automation runtime (decision 2026-09-16)
+
+## Projects
+
+- [[splitty]] — splitty — dropout-free instrumental extraction; separation experiments + Apollo restoration roadmap
 
 ## Families (path patterns, not enumerated)
 

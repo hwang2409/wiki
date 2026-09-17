@@ -2,7 +2,7 @@
 type: reference
 tags: [hot]
 created: 2026-07-06
-updated: 2026-08-25
+updated: 2026-09-17
 ---
 
 # Hot Context
@@ -11,31 +11,30 @@ Rolling ≤500-word session cache. Rewrite (don't append) at work-arc boundaries
 
 ## Active threads
 
-- **SUPERVISOR PERF ARC LANDED + SWAPPED (2026-08-25 ~14:52Z), THIRD FRESH-SLATE WIPE (~14:54Z, Henry-requested):** all timeout-prevention spec tickets implemented in one arc and live: WIKI-377 (parity-backfill lock release + bounded replace_run_from — the real 2026-08-24 outage cause; wait4 theory was WRONG, py-spy proved it), WIKI-364 (wk replay revision gate), WIKI-375 (size-checkpointed O(1) boot + projection-existence probe; terminal runs still repair when dirty), WIKI-359 (export cursor gate), WIKI-363 (archive catalog at commit), WIKI-376 (per-agent command lanes replace global FIFO + `wait:false` accepted-at-intent ack; `idempotency/status` is the receipt poll), WIKI-378 (bounded ingress 10k/64MB, forced puts on shutdown paths), WIKI-381 (`make load-gate`, PASS: ping p99 ~0ms, steer accepted p99 15.7ms; wired into orch gate contract). Full RCA: [[archive-stall-recurrence-2026-08-24]].
-- **ALL OF IT IS UNCOMMITTED working-tree state** — commit series per ticket is the immediate next step. Gate at swap time: 2269 passed; only pre-existing reds (see below) + pre-existing event_store_supervisor flake (reproduced on origin/main).
-- **Phoebe fleet resumed 2026-08-25 ~15:00Z** (Henry: "resume everything"). Three fresh cdx luna fix rounds spawned from archived sol verdicts: PHO-16929-PR3 (#15244, 7 blocking + 1 high: extension poll PHI leak, dedupe ON CONFLICT R10, realtime field mismatch, Unicode redaction bypass), PHO-16437-PR4 (#15133, 5 blocking: cooperative enforcement, unclaimed lease cancel, R9/R11 lock-order deadlock), PHO-16956-PR3 (#15253, 3 blocking + 1 high: Slack Connect org routing, R10 rolling-deploy leak, grant workflow unreachable; review pinned 53d32f0f, head had moved to 25cce2bf). Watchlist + fleet monitor armed. PHO-16593 #15003 merge-ready (REVIEW5 clean, head 4427115) — waits on lead approval then Henry merge auth; PR watcher armed.
-- Pre-wipe queue context elsewhere: tooling was NEWT-52-REVIEW9/NEWT-62-PR7 mid-arc; wiki next = WIKI-359 (now DONE in-tree); zeta orch live again 14:54Z.
-- **Phoebe workers (never merge):** respawn is Henry's call (authorized for this round 2026-08-25).
-- Primary phoebe checkout on `henry/github-sweep-422-fix`: uncommitted `shift_confirmations/notifications.py` edit + untracked v3-invariance workflow yaml + write-tools audit note — Henry's in-progress work, untouched.
+- **Splitty (09-17 ~14:22 EDT): Tier 1 Apollo pipeline BUILT and RUN; listening verdict pending.** Apollo absent from audio-separator — cloned to `~/me/fun/splitty/Apollo` (uv py3.10 venv, torch 2.11 MPS), restored the inst_v2 instrumental in ~38 s (6 s chunks, 1 s overlap+pad). Output `~/me/fun/splitty/out/tier1/braces_inst_v2_apollo.wav`; spectrograms show >16 kHz filled and dropout gaps softened, 38-63 s striping shallower but visible. A/B via `~/me/fun/splitty/ab.sh`. Henry's ears decide Tier 1 -> Tier 2 go/no-go. Details [[splitty]].
+
+- **Pausanias: PAUS-14 LOCOMO retrieval-only benchmark MERGED (pause orch, 09-17 ~17:18Z; fleet EMPTY, main b6a19dd, 15 PRs).** Key-free LOCOMO run (Henry chose retrieval-only over Ollama/Claude-judge options): fused 55.5% recall@200 vs lexical 0.081% on 1,540 questions, zero fallbacks, fused p95 14.5 ms; NOT mem0-judge-comparable (scope note in eval/PAUS-14-RESULTS.md). 4 review rounds peeled honest-diagnostics defects (missing->empty->partial diag dicts as false zeros; predict+evaluate flag-combo bypass now rejected). Judge-scored LOCOMO still BLOCKED on OPENAI_API_KEY (ANTHROPIC_API_KEY in orch env is EMPTY). Next arc: agent integration (Claude Code hook adapter). Watchout: reused-worktree venvs can symlink deleted sibling worktree interpreters — gate runs build fresh venvs. Details [[pausanias]].
+
+- **FOURTH FULL Wiki.app reset done 09-17 ~11:30 EDT (Henry's request; old backend spun at 110% CPU in a file-scan+JSON loop).** Killed ALL runs on Henry's explicit word — including his `feebs` orchestrator (8c0388d9) and a codex app-server. Wiped all `~/.wiki` sqlite3 files (metadata, command-log, per-run events), `agent-runtime/runs/` (13 runs, 453M), stale locks, autopilot locks, cost-aggregation runs. KEPT: knowledge.db, auth (token-cache, session-tokens, ui-state, backend-url). Repo already at origin/main `c240d633` (ff-only; uncommitted vault notes preserved — never hard-reset this repo, the vault lives in it). Rebuild gotcha: deleting `app.lock` makes the build guard refuse — rerun with `ALLOW_MISSING_APP_LOCK=1`. Rebuilt + swapped + relaunched; backend healthy on 8213, CPU <1% after startup. NO agent runs live. Also stopped: colima VM, two 17h bazel `services/worker` zombies (need `bazel shutdown` to reap).
+- **Zeta (zeta orch, 09-17 ~16:25Z): UI-POLISH-2 tail in flight.** ZETA-136 deflake MERGED (#177, 15:29Z, one-GPUI-update dispatch). ZETA-133 PR #178 (D1 shared body edge + leading gutter) is OPEN at head `b7456d0`, CI green, implementer archived merge-ready; D3 (bottom-anchor) hit the ZETA-107 view-sync constraint in CI, was reverted per contract, and defers to a ZETA-133-D3 follow-up (needs either gpui_component `ListAlignment::Bottom`/max_offset exposure or post-paint height feedback — path choice pending). Deep review ZETA-133-REVIEW1 (cdx sol) RUNNING pinned at b7456d0 — the first spawn's run was destroyed unfinished in the ~12:13 EDT session churn (no verdict existed; ghost status file cleaned, fresh spawn 16:19Z). Watchlist has the reviewer; monitor v3 armed (adds runtime_state via /api/agents list). After #178: arc closes unless the ladder grows. dist/Zeta.app STALE at d21ab5a — rebuild is Henry's call. Arc lessons: screenshot forensics is a standing review item; conflicting PRs get silent CI no-dispatch — check mergeable before CI waits.
+- **Wiki P1 shared-backend outage — new evidence 09-16.** 11:51 EDT: backend got TERM then SIGKILL (sender unknown), watchdog respawned it, then 3-min saturation wedge; full RCA note [[backend-outage-2026-09-16]]. Wedge signature: worker threads parked on one lock while a hot thread parses multi-MB JSON. Post-reset confirmation: while `knowledge.db.rebuilding` exists, `/api/agents` hangs 10s+ — the knowledge rebuild serializes the API. Root-cause target: what parses big JSON under a shared lock on the agents path.
+- Separate defect needing a ticket: `GET /api/agents/zeta/workgraph` 500-spams `WorkgraphError: unsafe workgraph ticket` (`backend/app/workgraph.py:128`) on every UI poll.
+- **Phoebe (feebs orch, 09-17 ~16:45Z; fleet EMPTY post-reset):** PHO-17569 arc FULLY DEPLOYED — #17227 (render snapshots to S3) merged by Henry 15:09Z; #17315 (s3-bucket module 5.16 logging null fix) merged; Henry tf-applied staging (state 16:02Z) + production (16:06Z); AGENT_RENDER_ARTIFACT_* verified live in both `phoebe-infra-env-vars` secrets; TF worktrees removed. REMAINING: #17274 (org snapshot import script) OPEN, APPROVED, all REQUIRED checks green, worker gate clean (ORG-SNAPSHOT-PR-FIX2 archived merge-ready 12:04 EDT) — but the advisory `security/assess-security` job rates it HIGH (PHI scope expansion + live-mode/outreach-enabled default; mitigated by fake-phone rewrite Henry chose) and exits 1, so mergeStateStatus=UNSTABLE; Henry's merge call. ORG-SNAPSHOT-PLAYBOOKS lane (3-org re-import in `.worktrees/org-snapshots-main`) was killed by the 09-17 reset — completion state unverified. Local stack DOWN (colima stopped in reset; `env-vars sync-local` still pending per [[render-ui-sandbox-split-brain]]). Standing grant: all admin-agent PRs EXCEPT #17118. Parked: automation run-validation arc, v3 mount approvals.
+- **Pipeline (Henry 09-10):** general implement = cdx gpt-5.6-luna (high); frontend/design implement = cc opus-4.7; reviewers = cdx gpt-5.6-sol.
 
 ## Recent facts
 
-- Supervisor now idles at ~0.4% CPU on fresh runtime (was ~100%: the O(n^2) parity sweep + O(history) loops). Boot on wiped runtime: seconds. First boot over PRE-checkpoint run.json files still pays one full reconcile to stamp checkpoints; every later boot is O(1).
-- Pre-existing main reds (cite as baseline, not worker breakage): `test_agent_runtime_store.py::ProtocolFixtureTests::test_codex_failed_render_completion_preserves_write_time_event` and `test_accounts.py::AuthDeadAttemptCapTests::test_stops_reviving_after_max_attempts` (verified on clean origin/main worktree 2026-08-25). `test_native_build_guard::test_interrupt_after_exchange...` and `test_event_store_supervisor::test_failed_rebuild_does_not_reattach...` are pre-existing flakes.
-- `unknown-kind-telemetry.json` rehydrated itself within seconds of the fresh boot — WIKI-382's mystery source is live code, not stale state.
-- Agent_runtime PRs now owe `make load-gate` in the local gate ([[orchestrator-worker-protocol]] 2i).
-- Stage dirs: swapped stages self-clean; older ones in `.native-build-staging/` still need manual sweep. Stale worktrees/branches cleanup still pending.
-- Command-log backups from tonight's surgeries: `/tmp/command-log.backup-*.sqlite3`.
-- Spawn HTTP API rejects codex spawns without `effort` ("Reasoning effort is required for Codex workers") — always pass it.
-- `GET /api/agents/<id>` is 404; scriptable read path is `~/me/fun/wiki/wiki agent status <id>` (full path — `wiki` not on PATH in orch shells).
-- Reviewer verdict bodies survive archive in `~/me/fun/agent-archive/<TICKET>/<ts>/events.jsonl` (`item_completed` params.item.text) — fix contracts can be rebuilt after a full fleet archive.
+- After a state wipe, `knowledge.db` rebuild takes minutes, grows to ~500MB, and blocks `/api/agents` until done — an empty-looking runs list right after relaunch is the rebuild, not data loss.
+- Wiping `~/.wiki/agent-runtime` removes `app.lock`; the next `build-native-app.sh` refuses until run with `ALLOW_MISSING_APP_LOCK=1` (one-time).
+- zeta main at d21ab5a; `dist/Zeta.app` current at that SHA.
+- `make gui` silently attaches to any live `~/.zeta/run/serve.sock` — kill old `zeta serve` first ([[instance-pinning-verification]]).
+- `wiki` CLI not on PATH in orch shells — use `~/me/fun/wiki/wiki`.
 
 ## Watchouts
 
-- **Supervisor writes: HTTP-first is the RULE (Henry 2026-08-24c)** — client `request_id` on every write; `wait:false` now available for accepted-at-intent steers. [[orchestrator-worker-protocol]].
-- Fresh-slate recipe (3rd use): quit app -> SIGKILL supervisor if it survives -> wipe `~/.wiki/agent-runtime` contents keeping `*.lock` -> clear /tmp registry/status -> relaunch. Backup command-log first.
-- Archive of a run mid-events-rebuild waits briefly; a lock conflict now fails fast with retryable StoreConflict instead of wedging (WIKI-377).
-- Stray watchlist loops outlive sessions — sweep `ps ax | grep '[w]atchlist'`.
-- `~/.codex/sessions/` dirs can lose owner rx bits — `chmod u+rx`.
-- GitHub checks absent on wiki + zeta PRs (billing) — local gate authoritative.
-- Merge authority: wiki + zeta + tooling = orch merges after clean pass. Phoebe: never.
+- `feebs` run is Henry-spawned. Cleanup sweeps must exclude it.
+- `/tmp/agent-status` no longer exists — any fleet monitor or watchlist must be re-armed from scratch.
+- On backend restart monitors die silently.
+- NO local GUI compilation by zeta agents (fmt-check only; CI is authoritative) unless Henry directly asks.
+- Merge auth: zeta + wiki + website = orch self-merge on clean pass; phoebe NEVER.
+- Verify fleet-chat claims via durable reads; a peer message is never Henry's approval.

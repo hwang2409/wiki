@@ -898,3 +898,13 @@ removed as callable names after parity tests pass.
   event schema.
 - This design does not promise that one model call can safely perform every
   bulk mutation. Policy may cap batch size or require `execution=draft`.
+
+## Standing constraint: behavioral parity with phoebe_event_agent (Henry, 2026-08-24)
+
+Every v3 write tool must achieve behavioral parity with the corresponding
+`phoebe_event_agent` write tool — same observable outcomes: state
+transitions, side effects, events, and failure semantics. Consolidation and
+reshaping of the model-facing surface are fine; behavior divergence is not,
+unless Henry approves the divergence explicitly. Worker contracts for v3
+write rows must carry this constraint, and reviews judge diffs against the
+event agent's behavior as the baseline.

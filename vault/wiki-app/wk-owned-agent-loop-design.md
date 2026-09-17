@@ -355,3 +355,11 @@ The design is ready to implement when each provider can complete the same lane c
 - leave the legacy path and plain `./wk` path unchanged.
 
 This gives Henry a reversible path from the current Agent SDK and App Server wrappers to a wk-owned loop without making provider behavior or native provider session files the next architectural dependency.
+
+## Gotcha: zeta claude auth bootstrap misses macOS Keychain (2026-08-20)
+
+zeta's `AnthropicCredentialStore.bootstrap` only reads `~/.claude/.credentials.json` (linux path). On macOS, Claude Code stores OAuth in the login keychain (`security find-generic-password -s "Claude Code-credentials" -w`, JSON under `claudeAiOauth`). Symptom: `[error] no Claude OAuth login found; log in first`. Workaround: seed `~/.zeta/anthropic-oauth.json` (flat `access_token`/`refresh_token`/`expires_at`, 0600) from the keychain payload; zeta self-refreshes after. Proper fix queued: keychain bootstrap in the zeta anthropic backend (ZETA-2 follow-up).
+
+## Gotcha: chatgpt backend-api rejects max_output_tokens (2026-08-20)
+
+The codex/responses endpoint 400s (`Unsupported parameter: max_output_tokens`) on a key zeta's ZETA-3 payload builder always sends; same request without it streams fine. Also: `DEFAULT_CODEX_MODEL = "gpt-5.4"` is retired, and both zeta backends discard the HTTP error body (only status surfaces). All queued as ZETA-9 hardening with keychain bootstrap.

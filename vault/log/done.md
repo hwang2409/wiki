@@ -2,10 +2,112 @@
 type: log
 tags: [log, done]
 created: 2026-07-06
-updated: 2026-08-19
+updated: 2026-09-17
 ---
 
 # Done
+
+## 2026-09-17
+
+- PAUS-14 merged as https://github.com/hwang2409/pausanias/pull/15 (LOCOMO retrieval-only benchmark; fused 55.5% vs lexical 0.08% recall@200)
+- phoebe #17315 s3-bucket module logging fix merged + Henry tf-applied staging (16:02Z) and production (16:06Z); render-artifacts env vars verified live in both infra secrets — PHO-17569 S3 snapshot arc fully deployed
+- **pausanias** — PAUS-13 fused-default flip merged (PR #14, 3 review rounds; attempt-derived diagnostics, lexical measurement paths pinned, base install byte-identical) — delegated default-on decision EXECUTED
+- **automations** — AUTO-1 merged-equivalent — hardened scheduler skeleton live on Railway genuine-integrity (tick backoff + honest healthz, streamed body limits, retention, 3 review rounds w/ injected-failure probes)
+- automations AUTO-1 scheduler skeleton live-verified on Railway (3 review rounds)
+- **zeta** — ZETA-136 deflake merged — click race window removed via one-GPUI-update dispatch; honest 200-iteration bound on the historical mechanism (PR #177, 3 review rounds)
+- zeta ZETA-136 approval click test deflaked — single-update dispatch, deterministic receive (PR #177)
+- phoebe #17227 merged by Henry (PHO-17569 render S3 snapshots; 4 review rounds, authentic-tests finale; merge 895eda0626)
+- **pausanias** — PAUS-12 arc evaluation merged (PR #13, 2 review rounds; all arc2 hypotheses met, fused 59/59, all gates ~2x headroom, fused LOCOMO mode ready) — ARC 2 COMPLETE
+- **pausanias** — PAUS-11 synonym table merged (PR #12, 3 fix rounds/3 reviews; +0.041 overall recall via real fused ablation, alias-order-neutral ranking, live config reload)
+- **pausanias** — PAUS-10 RRF fusion merged (PR #11, 5 fix rounds/4 reviews; paraphrase+held-out recall 0.0 -> 1.0 via real worker path, 11 documented policies each with ablation, verbatim guard holds 1.0)
+- zeta ZETA-135 wiki-look restyle merged (PR #176)
+- **zeta** — ZETA-135 wiki-look transcript restyle merged — kind glyphs, inset receipts, diff cards + narrow fallback, turn footers, labeled composer; 5 review rounds incl. screenshot forensics (PR #176)
+- **pausanias** — PAUS-9 persistent worker + hook gates merged (PR #10, 3 review rounds; flock-descriptor lock, tombstoned cancellation, parent-measured gates warm p95 ~80ms / cold ~260ms)
+- **pausanias** — PAUS-8 eval harness + LOCOMO runner merged (PR #9, 4 review rounds; per-category honest gates, conversation isolation, fingerprinted checkpoints, vendored mem0 parity)
+
+## 2026-09-16
+
+- **pausanias** — PAUS-7 vector store merged (PR #8, 4 review rounds; pinned-snapshot cosine scan, 73 MiB matrix at 50k, exact tokenizer port, total lexical fallback)
+- **zeta** — ZETA-134 sidebar truth + 6-finding batch merged — real A6 product fix (focus retarget), legacy-resume touch semantics, honest screenshots (PR #174, 4 review rounds, survived 2 provider deaths)
+- **zeta** — ZETA-132 Settings viewport merged — modal sizes to fit + painted scrollbar, scroll reset on open, settings-only offset token (PR #175, 3 review rounds)
+- **pausanias** — PAUS-6 schema v2 merged (PR #7, 2 review rounds; read-only search connections, v1 read safety, artifact-hash tokenizer fingerprint)
+- **pausanias** — PAUS-8 eval design amendment merged (PR #6, 4 review rounds; mem0-shape harness + LOCOMO runner spec, vendored-parity strategy)
+- **pausanias** — PAUS-5 model bundle merged (PR #5, 4 review rounds; pointer-file atomic publish, zero-dep base intact)
+- **zeta** — ZETA-131 approval UX merged — visible selection, allow indicator on effective mode, per-tool session memory (PR #173, 4 review rounds)
+- **pausanias** — PAUS-4 semantic-retrieval design merged (PR #4, 4 review rounds; ONNX+MiniLM optional extra, NumPy scan, RRF+lexical guard, persistent worker, ladder PAUS-5..12)
+- phoebe #17130 terraform applied by Henry (production + artifacts accounts); ListBucket prefix-condition drift reconciled away — accepted, no hardening wanted
+- phoebe #17233 merged (PHO-17572 snapshot egress gaps; 3 review rounds, clean sol pass; merge 66c20fd43)
+- **pausanias** — PAUS-3 performance bench merged (PR #2, 4 review rounds; warm p95 32.5 ms vs 300 ms target)
+- **pausanias** — PAUS-2 retrieval-accuracy eval harness merged (PR #3, 3 review rounds; paraphrase recall 0.0 under lexical FTS recorded honestly)
+- phoebe #17130 merged (async wiki-index promotion; codeowner approved, merge a52a618dc)
+- **pausanias** — PAUS-1 memory core merged (PR #1, 9 review rounds, 31 tests, flat src/ layout)
+- 2026-09-16 ZETA-130 merged (zeta PR #171): GUI slash commands — serve list/dispatch RPCs, composer menu, slash-never-reaches-model invariant (4 impl + 4 review rounds; LOW deferred: stale catalog flash on regeneration)
+- 2026-09-16 ZETA-129 merged (zeta PR #172): inline-code glyph drop + wrap overflow fixed (vendored gpui-base MaxContent patch, native recorder guard, mutation arm)
+- **pausanias** — created public [GitHub repository](https://github.com/hwang2409/pausanias) and pushed README.md and DESIGN.md to main
+- **pausanias** — wrote proposed automatic memory context design at ~/me/fun/pausanias/DESIGN.md; implementation not started
+- **phoebe** — PR #17118 merged (by Henry) — Phoebe PDF template enforced at attachment boundary (prompt hardening + fail-closed validator)
+- **phoebe** — PRs #17115 (render durability) and #17072 (core split) CLOSED unmerged on Henry's instruction; branches kept
+- **phoebe** — PR #17115 merge-ready for Henry — render_dynamic_ui durable inline persistence (critical frozen-envelope fix, compact feed projections, fail-closed hash, windowed backfill; PHO-17455)
+- **phoebe** — PR #17142 merged — user automations restricted to schedule triggers (PHO-17501; event removal script ID-bounded + locked type recheck; contract narrowed at request models)
+- **phoebe** — PR #17183 merged — deslop round 4: phoebe_admin_agent root barrel split (lazy exports, narrow consumer targets, audit closure cut; hottest-domain rdeps 1203->1032)
+- zeta GUI-polish arc complete 09-16: chrome/type-scale/guard/receipts/settings/feel all merged (PRs #165-#170)
+- **zeta** — ZETA-126 interaction feel merged (PR #170, 2 impl rounds + 2 reviews; hover/pressed staircase everywhere, MOTION_FAST tokenized easing, sidebar rows became real tab stops, composer Tab keyboard-trap removed [Tab moves focus, indent on cmd-]/cmd-[] — GUI-POLISH ARC COMPLETE
+
+## 2026-09-15
+
+- **zeta** — ZETA-128 Settings restructure merged (PR #169, 8 impl rounds + 8 reviews; grouped sections + compact pickers, modal focus trap with real-key cycle test, whole-row scroll boundary with on_next_frame convergence, behavior frozen throughout)
+- **phoebe** — PR #17177 merged (hwang2409, reviewed clean by sol) — build-time image venvs + worker LLM import guard, fixes httpcore2 call-analysis incident
+- **zeta** — ZETA-125 tool receipt redesign merged (PR #167, 5 impl rounds + 5 reviews; command excerpts + turn-scoped grouping + secret redaction state machine + real-Tab a11y fix; guard saga resolved scrollbar mask + receipt-edge spec)
+- **phoebe** — PR #17116 merged (by Henry) — admin v3 interactive dark bundle (PHO-16438 rung 12, import-linter-enforced darkness + mounts seam hardening)
+- **phoebe** — PR #17151 merged — coordinator automation follow-up messages fixed (plain + widget paths, PHO-17501)
+- phoebe #17126 MERGED (orch, admin-agent grant): deslop round 3 — direct admin deps everywhere, fixture speedups; barrel split deferred (PHO-DESLOP lane)
+- **zeta** — ZETA-127 native pixel-gutter wrap guard merged (PR #168, 3 rounds incl. honest-blocked round 1; guard runs in CI with achieved-viewport assertions; caught its own viewport-clamp and false-CI-claim defects in review)
+- phoebe #17107 MERGED (orch, admin-agent grant): v3 port-ledger accounting correction (PHO-16438)
+- **zeta** — ZETA-124 type scale + reading measure merged (PR #165, 3 rounds; role scale, 88ch measure, wrap fix probe-clean across 24 native cells; glyph-guard authenticity deferred to a dedicated observability ticket per Henry)
+- phoebe #17007 MERGED (Henry auth): admin v3 family-a query adapters and writes — rung-12 COMPLETE, all three families merged (PHO-16438)
+- phoebe #16926 MERGED (Henry auth): PHO-17501 v3 automation deletion with transactional fencing — 11 review rounds
+- phoebe #16926 verified merge-ready + HELD for Henry (11 review rounds total): v3 automation deletion with transactional fencing (PHO-17501)
+- **zeta** — ZETA-123 GUI chrome restructure merged (PR #166, 4 rounds; single header, responsive width behavior, left-aligned actions, hover+focus-within menus; Henry accepted with a deferred key-dispatch test conversion)
+- phoebe #17008 MERGED (orch, admin-agent grant): admin v3 family-b call and health adapters — rung-12, 5 review rounds, core split to #17072 with fail-closed Python (PHO-16438)
+
+## 2026-09-14
+
+- phoebe #17033 MERGED (orch, admin-agent grant): deslop round 2 — impl split into 11 domain libraries, round-robin shards, per-source test deps (PHO-DESLOP lane)
+- phoebe #17003 MERGED (orch, admin-agent grant): admin v3 family-c provider adapters — rung-12, 5 review rounds (PHO-16438)
+- zeta harness-parity arc complete: ZETA-112,117-122 all merged 09-14 (7 PRs incl. integration repair)
+- **zeta** — ZETA-118 custom agent definitions merged (PR #164, 3 rounds; CC-compatible agent files, shared discovery primitives, registry-enforced child allowlists) — HARNESS-PARITY ARC COMPLETE
+- **zeta** — ZETA-119 composer ergonomics merged (PR #161, 3 rounds; @file path autocomplete + zsh/bash shell completion with live PTY test matrix)
+- **zeta** — ZETA-120 /init command merged (PR #162, 2 rounds; canned-prompt slash command generates/improves AGENTS.md)
+- **zeta** — ZETA-122 main repair merged (PR #163; ZETA-117 x ZETA-121 interaction — required skill_catalog kwarg in ZETA-121 tests + 18-file module cap; skill_catalog.py moved into skills/)
+- **zeta** — ZETA-117 full skills system merged (PR #160, 4 impl rounds + 4 reviews; 3-tier CC-compatible discovery, session catalog snapshots, mandatory injection, symlink containment, automation isolation, /skill slash invocation)
+- **zeta** — ZETA-121 image-capable read tool merged (PR #159, 6 impl rounds + 6 reviews; normative 6-row decision table, single-parser-by-construction WebP, boundary parsers, image token estimates, corrupt-resume degradation)
+- phoebe #17005 MERGED (orch, admin-agent grant): deslop phoebe_admin_agent — split targets + trimmed deps, Bazel CI wall time 19.7min -> 12min (PHO-DESLOP lane)
+- **zeta** — ZETA-112 image-attachment UX merged (PR #158, 4 impl rounds + 4 reviews; per-file error chips, cache eviction, event-time drop overlay, a11y alert chips)
+- phoebe #16991 MERGED (orch, Henry grant): gate codebase wiki promotion on release construction snapshot (adopted Devin PR, PHO-ADOPT-16991)
+- phoebe rung-12 decision list APPROVED by Henry (all 15); family build lanes a/b/c spawned (PHO-16438)
+- phoebe #16950 MERGED (orch, Henry grant): v3 query surface for WellSky financial typed columns (PHO-16944)
+- **zeta** — ZETA-111 appearance settings merged (UX polish lane 1) — PR #157 -> 5958f29, 3 rounds; font size 13px default + adjustable 11-18, mono font picker, 5-theme registry (opencode/gruvbox-dark+light/nord/vscode-dark+), client gui-prefs.json, per-semantic AA foregrounds + WCAG matrix incl hover pairs
+- phoebe #16927 MERGED (orch, Henry grant): stress-validated sandbox concurrency rollout (64/16/120s) + admin /admin/flags runtime control (PHO-17400)
+
+## 2026-09-13
+
+- phoebe #16811 MERGED: v3 event-triggered automations via manage_automation (PHO-17501) — automerge fired after rebase + re-approval
+- phoebe #16933 review clean: v3 query surface for WellSky financials (PHO-16944) — merge-ready, stacked on #16597
+
+## 2026-09-12
+
+- phoebe #16811 rebase-verified clean + #16859 review clean — both merge-ready awaiting Henry
+- phoebe #16811 review clean r4: v3 event-triggered automations (PHO-17501) — merge-ready, awaiting Henry
+
+## 2026-09-11
+
+- phoebe #16716 merged: per-call run_bash output cap + unified 10k-token inline cap across v3 spill/query/bash seams (PHO-17446)
+- **zeta** — ZETA-110 GUI polish merged — PR #150 -> 0c8d70c, 3 rounds; fixed inline-code clipping + garish violet (app-wide TextViewDefaults subtle wash), run-header dedup/overflow, flat table rules, sidebar spacing
+- **phoebe** — local V3 Bash evals fully working (terra + real Modal sandbox); 1/6 pass, ~$1/run; recipe in /private/tmp/pho-17482-local3-report.md
+- **zeta** — ZETA-109 typed row-text seam + syn AST renderer-literal fence merged — PR #149 -> 5be2006, 4 rounds; closes the ZETA-107 descope tech-debt (unified transcript_render module, compiler-backed exhaustive model consumption)
+- **phoebe** — eval incident CLOSED — verification run graded (no infra errors) after 5 env layers + phoebe main import bug (#16786); root cause Railway approval gate frozen since Aug 19
+- **zeta** — ZETA-108 wiki-run parity lane 3 (sidebar+status chrome) merged — PR #148 -> b41281a, 4 rounds; completes the 3-lane parity arc (106/107/108)
+- **phoebe** — merged #16689 (actor-recovery, 5 rounds) + #16707/#16734/#16746 + eval-engine #328-#331; eval infra incident diagnosed (Railway approval freeze since Aug 19) and fixed; #16712/#16716/#16735 clean-reviewed awaiting Henry
 
 ## 2026-08-19
 

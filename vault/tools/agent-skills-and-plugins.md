@@ -2,12 +2,20 @@
 type: reference
 tags: [tools, claude, codex, skills]
 created: 2026-07-06
-updated: 2026-08-07
+updated: 2026-09-16
 ---
 
 # Agent Skills & Plugins — Current State
 
 Living inventory. **Update in place on any skill/plugin change.** Current state only, no changelog trail.
+
+## Architecture and verification (2026-09-16)
+
+- Plugins package skills, MCP servers, and optional lifecycle hooks/UI. Skills supply workflow instructions; MCP servers expose executable capabilities. Source: https://developers.openai.com/plugins/concepts/plugins
+- Scheduled tasks replay saved instructions. Standalone tasks start independent runs; in-chat schedules return to existing context. Local-file tasks need the computer on and app running. Source: https://learn.chatgpt.com/docs/automations
+- The current desktop tool contract names these modes `cron` and `heartbeat`. This identifies the API modes, not the scheduler's internal implementation.
+- Local `openai-bundled/codex-app-tools/0.1.4/.codex-plugin/plugin.json` declares `mcpServers: "./.mcp.json"` and describes one local MCP server for desktop tools.
+- Inventory warning: counts and removal claims below have not been reconciled. The 2026-09-16 session exposes caveman skills from a plugin cache despite the earlier retirement record. Availability does not change the requested prose style.
 
 ## Global Claude skills (`~/.claude/skills/`) — 15
 
