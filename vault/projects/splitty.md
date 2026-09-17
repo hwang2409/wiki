@@ -15,7 +15,13 @@ Project to extract dropout-free instrumentals from ordinary lossy songs, without
 - Four separators run (htdemucs, htdemucs_ft, BS-RoFormer ep_317, MelBand Inst V2). All leave dropouts under vocals.
 - Root cause locked: lossy encoding discards vocal-masked instrumental detail; discriminative separators cannot reconstruct it. Fix requires a generative component.
 - **Tier 1 pipeline BUILT and RUN (09-17 ~14:21 EDT).** Apollo is NOT in audio-separator (v0.47.0) — cloned github.com/JusperLee/Apollo to `~/me/fun/splitty/Apollo`, venv via uv (py3.10, `requirements-macos-arm64.txt`, torch 2.11 MPS). Official HF checkpoint auto-downloaded. Full track restored in ~38 s on MPS: 6 s chunks, 1 s overlap, 1 s edge pad. Output: `~/me/fun/splitty/out/tier1/braces_inst_v2_apollo.wav` (float32 WAV, full length, finite; RMS diff 0.0136 vs input — real change, not pass-through).
-- Spectrogram check: Apollo fills high-frequency content (>16 kHz now continuous) and softens the hard vertical dropout gaps; the 38-63 s striping remains visible but shallower. Listening verdict PENDING — Henry's ears decide Tier 1.
+- Spectrogram check: Apollo fills high-frequency content (>16 kHz now continuous) and softens the hard vertical dropout gaps; the 38-63 s striping remains visible but shallower.
+- **Henry's verdict on stem-restore chain: NOT good enough (09-17).**
+- **Tier 1.5 experiments run (09-17 ~14:27 EDT):**
+  - Restore-first chain (in-domain for Apollo — it trained on compressed MIXTURES, not stems): opus mix -> 44.1k WAV (`out/braces_mix_44k.wav`) -> Apollo 12 s chunks (~30 s) -> inst_v2 separation (~1 min). Output: `out/tier1/restore_first/braces_mix_apollo_(Instrumental)_melband_roformer_inst_v2.flac`. Spectrogram: densest mid/high band of all candidates; 38-63 s stripes narrower but still present.
+  - Stem-restore with 12 s chunks (more context): `out/tier1/braces_inst_v2_apollo_12s.wav`. Barely different from the 6 s version.
+- Listening verdict on restore-first PENDING.
+- Next lever if restore-first fails: community fine-tuned Apollo checkpoints (jarredou/Apollo-Colab-Inference ecosystem, e.g. Lew's universal fine-tune) — flagged, not run: PyTorch pickle deserialization of community files needs an explicit trust call. After that: Tier 2.
 - A/B tool: `~/me/fun/splitty/ab.sh START DUR FILE_A FILE_B` (ffplay segment compare).
 
 ## Roadmap (decision, with rationale in HANDOFF.md)
