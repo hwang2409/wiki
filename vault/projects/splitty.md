@@ -20,8 +20,22 @@ Project to extract dropout-free instrumentals from ordinary lossy songs, without
 - **Tier 1.5 experiments run (09-17 ~14:27 EDT):**
   - Restore-first chain (in-domain for Apollo — it trained on compressed MIXTURES, not stems): opus mix -> 44.1k WAV (`out/braces_mix_44k.wav`) -> Apollo 12 s chunks (~30 s) -> inst_v2 separation (~1 min). Output: `out/tier1/restore_first/braces_mix_apollo_(Instrumental)_melband_roformer_inst_v2.flac`. Spectrogram: densest mid/high band of all candidates; 38-63 s stripes narrower but still present.
   - Stem-restore with 12 s chunks (more context): `out/tier1/braces_inst_v2_apollo_12s.wav`. Barely different from the 6 s version.
-- Listening verdict on restore-first PENDING.
-- Next lever if restore-first fails: community fine-tuned Apollo checkpoints (jarredou/Apollo-Colab-Inference ecosystem, e.g. Lew's universal fine-tune) — flagged, not run: PyTorch pickle deserialization of community files needs an explicit trust call. After that: Tier 2.
+- **Henry's verdict on BOTH Tier 1 orders (official checkpoint): NOT good enough (09-17).** Community fine-tunes approved (trust call made).
+- **Lew Universal Lossy Enhancer run (09-17 ~14:37 EDT).** Checkpoint + config from deton24's GitHub release (uni tag) at `~/me/fun/splitty/models/apollo_model_uni.ckpt`. Surprise: the ckpt is ALREADY in Apollo serialized format (`model_name`/`state_dict`, no `model.` prefixes) — no base_model.py patch needed. Its embedded `model_args` is bogus (`n_sample_rate: 2`); constructor args come from the CLI. `inference.py` gained a `--feature-dim` flag (this model needs 384; official stays 256 default). Both orders run with 19 s chunks / 2 s overlap / 1 s pad on MPS (~80 s each):
+  - (a) stem-restore: `out/lew_uni/braces_inst_v2_lewuni.wav` — densest, most uniform candidate yet; band filled to 22 kHz; 38-63 s dropout columns much shallower than baseline.
+  - (b) restore-first: `out/lew_uni/restore_first/braces_mix_lewuni_(Instrumental)_melband_roformer_inst_v2.flac` — dense mids, striping still faintly visible above ~6 kHz; similar to official restore-first, slightly fuller top end.
+  - All outputs verified: 96.49 s, finite, 44.1 kHz. Spectrograms (full + 38-63 s focus) in `out/spectro/lew_uni/`.
+- **Henry's verdict on Lew Universal (09-17): BETTER than official, but dampening remains where vocals overlap densely.**
+- **Anti-dampening round (09-17 ~14:50 EDT), two new candidates:**
+  - (c) full chain: mix -> Lew -> inst_v2 -> Lew again. `out/lew_uni/braces_full_chain_lewuni.wav`.
+  - (d) max-spec ensemble of (a)+(c): per STFT bin (n_fft 4096, hop 1024), keep the louder candidate's complex value. `out/lew_uni/braces_maxspec_a_c.wav` — fullest spectrogram of all candidates; inter-transient dropout columns mostly filled. Classic UVR anti-dropout trick; risk is extra vocal bleed where one source leaks.
+  - Both verified 96.49 s, finite, 44.1 kHz. Spectrograms in `out/spectro/lew_uni/` (c_/d_ prefixes).
+- **Henry's verdict on (c)/(d) (09-17): (d) still dampens on overlaps.** Diagnosis: both ensemble sources share the inst_v2 separator, so overlap bins fail identically — ensemble diversity needs a different separator family or a generative model.
+- **Repo created (09-17 ~15:00 EDT): github.com/hwang2409/splitty (private).** `~/me/fun/splitty` is now a git repo: README (manifest schema), seeded `manifest.json` (11 entries: references/intermediates/candidates with pipeline+params+spectrogram paths), `scripts/maxspec.py` (generalized N-way max-spec ensemble), `patches/apollo-local.patch` (the --feature-dim inference patch). `out/`, `models/`, `Apollo/` gitignored — audio stays local.
+- **Two worker lanes spawned (09-17 ~15:01 EDT, orch splitty):**
+  - SPLIT-1 (cdx luna high): remaining Tier 1 lever — up to 3 more community Apollo fine-tunes (deton24 releases, jarredou, Baicai1145, HF), both orders each, PLUS the separator-diversity ensemble: Lew-restore the BS-RoFormer stem, max-spec it against the inst_v2 chains (different separator = different failure bins; the direct anti-overlap lever). Appends manifest entries + results/SPLIT-1.md via PR.
+  - SPLIT-2 (cc opus-4.7): "Splitty Lab" web app — FastAPI+uvicorn on 127.0.0.1:8321, vanilla JS dark UI, manifest-driven catalog (pipeline chips, params, spectrogram lightbox), inline playback with Range support, A/B deck (shared transport, instant X-switch preserving playhead, 38/25 s loop). PR lane.
+- After the lanes: Henry listens; if overlap dampening still stands, Tier 2 (destruction-generated training pairs target exactly this vocal-masked loss).
 - A/B tool: `~/me/fun/splitty/ab.sh START DUR FILE_A FILE_B` (ffplay segment compare).
 
 ## Roadmap (decision, with rationale in HANDOFF.md)

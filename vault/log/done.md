@@ -9,6 +9,8 @@ updated: 2026-09-17
 
 ## 2026-09-17
 
+- PAUS-16 merged as https://github.com/hwang2409/pausanias/pull/16 (GitHub Actions CI: base zero-dep proof + semantic, full suite both)
+- zeta ZETA-133 D1 shared body edge + leading gutter merged (PR #178, 4 review rounds; smoke guard now scans rendered bounds; D3 deferred to ZETA-133-D3)
 - PAUS-14 merged as https://github.com/hwang2409/pausanias/pull/15 (LOCOMO retrieval-only benchmark; fused 55.5% vs lexical 0.08% recall@200)
 - phoebe #17315 s3-bucket module logging fix merged + Henry tf-applied staging (16:02Z) and production (16:06Z); render-artifacts env vars verified live in both infra secrets — PHO-17569 S3 snapshot arc fully deployed
 - **pausanias** — PAUS-13 fused-default flip merged (PR #14, 3 review rounds; attempt-derived diagnostics, lexical measurement paths pinned, base install byte-identical) — delegated default-on decision EXECUTED

@@ -53,6 +53,7 @@ Topic → note index. **Agents: read this file first, before grepping.** Every n
 - [[newt-audit-2026-08-20]] — newt audit: penalty reactions and sensor-force timing risks
 - [[website-project-posts]] — website project-post editorial convention — real-type code anchors, 0->1 arc; DESIGN.md carries repo copy
 - [[pausanias]] — proposed automatic memory context design; local markdown retrieval before inference plus explicit follow-up search
+- [[gliner]] — GLiNER2.5 local IE model: setup in ~/me/fun/misc/gliner, install gotchas, capabilities
 
 ## Design
 
@@ -106,6 +107,7 @@ Topic → note index. **Agents: read this file first, before grepping.** Every n
 - [[EVAL-RICHARD-SCOUT-memo]] — scout memo: Richard's v3 eval PRs (#17024/#17174/#17266) and v3-evals architecture/extension points
 - [[EVAL-UI-SCOUT-memo]] — scout memo: render_dynamic_ui pipeline map, failure modes, UI-eval designs (PHO-17584 input)
 - [[SIM-ORCHARD-SCOUT-memo]] — full simulator audit memo behind the orchard note
+- [[PHO-17602-SCOUT-memo]] — bash-tool eval design memo: coverage map vs Henry's question list, lineage/intent gaps, rewrite audit + preload experiment design (PHO-17602)
 
 ## Phoebe/til
 
