@@ -36,3 +36,19 @@ Ran `v0_smoke.py` (3 cases mirroring harness usage) on M-series MPS vs real Jev 
 - **Cross-question inconsistency:** phishing email → Laya says is_phishing 0.86 but routes department=billing 0.94 (abuse option available). Jev routes abuse 0.92 / phishing 0.93, coherent.
 - **typed-decisions checkpoint was WORSE on our cases** than english: nouls collapse toward 0.5, choice confidence 0.26. The vendor's "fine-tuned fixes zero-shot" claim does not transfer to our question shapes.
 - Verdict: fast and fine on easy small-cardinality choice; not trustworthy on noul gates or risk scores. Re-eval only with domain fine-tuning + temperature fitting.
+
+## 60-case router eval (2026-09-22, `laya/run_router_eval.py`)
+
+Phase-1 evalset + exact same request builder/metrics as the Jev baseline (`router/`), backend swapped to local Laya on MPS. Results in `laya/results/laya-*.json`.
+
+| metric | Jev (phase 1) | laya english | laya typed-decisions |
+|---|---|---|---|
+| top-1 | 1.0 | 0.478 | 0.435 |
+| top-3 | 1.0 | 0.783 | 0.717 |
+| needs_tool AUC | 0.995 | 0.590 | 0.541 |
+| clarity AUC | 1.0 | 0.411 (below chance) | 0.478 |
+| p50 latency | ~1-2s API | 117ms local | 147ms local |
+
+Confusions show attractor bias (TodoWrite/LSP soak up misroutes). The "confidence<0.8 → top-3" rescue rule can't save a 0.78 top-3.
+
+**Root cause found in laya source (`common.py: build_sequence`): `head_max_len=192` tokens is a HARD budget for instructions + all option texts combined**, regardless of the checkpoint's 512/1024 context. Each option's criterion caps at 48 tokens, and with 15 options the per-option budget collapses to ~11 tokens — the router catalog's rich criteria get chopped to stubs, and instructions squeeze to as few as 8 tokens. The v0 toy case scored 0.9998 only because its criteria were ~6 words. This is the structural cause of the vendor-admitted >20-option degradation: it is an architecture limit, not a tuning gap. Jev phase-2 showed criteria tokens dominate routing accuracy — Laya cannot ingest them. **Router verdict: architecturally unfit for catalog routing.**
