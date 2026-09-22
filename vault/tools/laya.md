@@ -52,3 +52,13 @@ Phase-1 evalset + exact same request builder/metrics as the Jev baseline (`route
 Confusions show attractor bias (TodoWrite/LSP soak up misroutes). The "confidence<0.8 → top-3" rescue rule can't save a 0.78 top-3.
 
 **Root cause found in laya source (`common.py: build_sequence`): `head_max_len=192` tokens is a HARD budget for instructions + all option texts combined**, regardless of the checkpoint's 512/1024 context. Each option's criterion caps at 48 tokens, and with 15 options the per-option budget collapses to ~11 tokens — the router catalog's rich criteria get chopped to stubs, and instructions squeeze to as few as 8 tokens. The v0 toy case scored 0.9998 only because its criteria were ~6 words. This is the structural cause of the vendor-admitted >20-option degradation: it is an architecture limit, not a tuning gap. Jev phase-2 showed criteria tokens dominate routing accuracy — Laya cannot ingest them. **Router verdict: architecturally unfit for catalog routing.**
+
+## Fine-tune feasibility (2026-09-22 probes)
+
+Two no-training experiments bound the zero-shot ceiling (results in `laya/results/`):
+- **Lifting the caps at inference** (`cfg max_len=2048, head_max_len=1200` — legal, ModernBERT backbone supports 8192 positions and cfg is read per-call): top-1 DROPS to 0.304, everything collapses to one attractor option. The weights are over-fit to the 192-token trained layout; config alone cannot fix it.
+- **Compressed ~6-token criteria inside the trained layout** (instructions survive intact): top-1 only 0.500. So truncation is not the whole story — the base checkpoint is just weak on this distribution zero-shot, consistent with the card's 0.362 typed-decisions zero-shot.
+
+Fine-tuning facts: weights Apache 2.0; pip package ships NO trainer (RLAgent = predict/system_one only; `proper_reward`/`td_lambda_targets` are just helpers) — we would write our own, but the model is simple (ModernBERT-large + 2-layer head + scorer). Vendor's own fine-tune took typed-decisions 0.362 → 0.766, so big fine-tuning gains are proven on this architecture. A fine-tune at larger head budgets would also lift the 192-token layout limit. `predict_shortlist` (embed prefilter → k=20 choice) exists for high cardinality, untested by us.
+
+**Assessed path if ever pursued: distill Jev into Laya for routing** — phase-2 synthetic catalog machinery + Jev soft-target labels (~$5-10 of API for 50-100k examples), train at randomized catalogs and 2-4k ctx, eval against phase-1/2 sets. Could plausibly MATCH Jev's routing accuracy; cannot beat 1.0 — the win axes would be latency (117ms local vs 236-500ms API), zero marginal cost, offline/privacy. Weeks-scale research lane; needs a real GPU for a 421M fine-tune. Not started — Henry's call.
