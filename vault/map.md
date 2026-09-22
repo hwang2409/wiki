@@ -54,6 +54,8 @@ Topic → note index. **Agents: read this file first, before grepping.** Every n
 - [[website-project-posts]] — website project-post editorial convention — real-type code anchors, 0->1 arc; DESIGN.md carries repo copy
 - [[pausanias]] — proposed automatic memory context design; local markdown retrieval before inference plus explicit follow-up search
 - [[gliner]] — GLiNER2.5 local IE model: setup in ~/me/fun/misc/gliner, install gotchas, capabilities
+- [[typesafe-jev]] — TypeSafe's Jev — System One model for structured decisions (Choice/Score/Noul); docs.typesafe.ai
+- [[laya]] — Laya — open-weights BERT-based clone of Jev's choice/score/noul API (convaiinnovations, HF)
 
 ## Design
 

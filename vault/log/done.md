@@ -2,13 +2,59 @@
 type: log
 tags: [log, done]
 created: 2026-07-06
-updated: 2026-09-17
+updated: 2026-09-22
 ---
 
 # Done
 
+## 2026-09-22
+
+- **phoebe** — PHO-17613 wave-2 golden evals merged (#17655, squash c7342ccd; Henry authorized merge, orch feeeeb executed)
+- ZETA-141 merged as https://github.com/hwang2409/zeta/pull/184 (release-shape shim for ZETA-139 font recorder unbreaks make gui; new cargo-check CI step closes the blind spot; squash 520b3b71)
+- PHO-17659 merged: sim response reliability + outbound SMS idempotency, 4 review rounds (phoebe#17654, squash d3a95c3f; Henry merged via feebies)
+- PHO-17613 wave-2 + PHO-17659 both merge-ready: phoebe#17655 (6 review rounds) and phoebe#17654 (4 rounds) await Henry's merge
+
+## 2026-09-21
+
+- **jev** — arc-4 safety tier merged (PR #5, 40c6fc4) — default-escalate layer-0 + Jev score gate, fail-closed; 6 review rounds; 429 tests
+- PHO-17588 Galiver audience merged: seed-owned skip tombstones + non-overrideable real-caregiver safety policy — last make-it-work sim PR (phoebe#17435, squash 6b3f0041; Henry merged via feebies)
+- **jev** — retrieve-then-judge SHIPPED+MEASURED — injections fire (0.79-0.97, perfect discrimination), stock+inject = best-ever config (8/8 completed, 6/8 checks, -35% tokens), two-note-synthesis rescued; new hazard: stale-version injection on update tasks
+- **jev** — auto-injection A/B COMPLETE — decisive negative: speculative Jev gate never fired (scores 0.13-0.47 vs 0.6) across 16 runs; deltas were variance; retrieve-then-judge redesign recommended (evals/RESULTS.md @ head)
+- PHO-17627 balance pass merged: de-slopped monochrome evals UI + embed restyle + 2 review nits (phoebe#17497, squash 1ff6fa93; Henry-approved, merged post-conflict-resolution)
+- ZETA-140 merged as https://github.com/hwang2409/zeta/pull/183 (expandable thinking rows via codex provider split; raw reasoning never on the wire; 3 review rounds; squash 9b0a3baf)
+- PHO-17622 merged: workbench shows each run's rendered UI — screenshots + live harness iframe (phoebe#17461, squash 87923e37; 5 review rounds across two frontends; Henry merged)
+
+## 2026-09-18
+
+- PHO-17627 phase 1+design merged: React+FastAPI v3-evals webapp, monochrome UI (phoebe#17462, squash 051f9c5b; 3 review rounds; Henry merged; DESIGN2 balance pass continues as follow-up PR)
+- ZETA-139 merged as https://github.com/hwang2409/zeta/pull/181 (one shared content column for tool rows + composer, glyph-scale sidebar dot, uniform font size at picker base incl. vendored tooltip/menu; 5 review rounds; squash 1ac2f6bd)
+- PHO-17613 wave 1 merged: four golden workflow eval cases + harness extensions (phoebe#17432, squash bc720d3c; 3 review rounds; rubrics awaiting Henry validation; waves 2-3 remain)
+- **jev** — realistic-task eval DONE — memory+calendar tools work in all modes incl. cross-surface; multi-step memory synthesis is the weakness; v1 router best completion at half stock tokens; 3 task-calibration defects identified (evals/RESULTS.md @ 2a48b44)
+- PHO-17591 merged: daily event SMS via production sender + server-side recipient resolution (phoebe#17437; 3 review rounds incl. R9 sandbox regression; Henry merged; post-deploy provider verification pending)
+- ZETA-138 merged as https://github.com/hwang2409/zeta/pull/182 (Settings packs to content, no scroll at normal sizes, focus-scroll fallback; 4 review rounds; squash c42e78bb)
+- **jev** — Apple Calendar tools LIVE — TCC granted via Henry's terminal (launchd-parented supervisor processes can never prompt — documented gotcha for all future TCC-gated tool waves)
+- PHO-17589 PARKED at merge-ready by Henry (phoebe#17328, 5 clean review rounds; daily-run re-enable deferred until the caregiver sim works well as an LLM demo org)
+- **jev** — memory_store SHIPPED — store→reindex→recall loop live-verified from scratch (agent stored espresso prefs, recalled exact content); containment hardened via canonical config loader + dirfd/O_NOFOLLOW after reviewer reproduced two real escapes; corpus now ~/me/fun/jev/memories (fused retrieval, vault disconnected)
+- **jev** — tools arc 1 SHIPPED — pausanias memory (memory_search/read, live vault recall verified end-to-end) + Apple Calendar (events/create, approval-gated, DST-safe) merged into harness; single private repo hwang2409/jev (router+harness, full history); calendar live-read pending Henry's TCC grant
+- PR #17443 merged (adopted): account-note Slack threads read account summary, fixing timeout-lost enqueues (squash e270a870; 2 review rounds; Henry merged)
+- PHO-17601 merged: v3-evals runs workbench — history, exact reruns, inspect (phoebe#17427, squash 2592528c; 2 review rounds; Henry merged)
+- **jev** — cache arc COMPLETE — in-turn history caching lands (harness @ 78f335d8): cache reads in all modes, auto Claude cost halved to $0.103 vs stock $0.087 (stock itself 40% cheaper; upstream candidate), quality parity held
+- PHO-17621 merged: rendered-UI browser/DOM eval pass + dev-only harness route (phoebe#17430, squash b31b3e1a; 3 review rounds; route excluded from prod bundles via routeFileIgnorePattern)
+- **jev** — router v2 three-way eval DONE — quality parity (6/6 vs v1 2/6, stock 5/6), turn tax gone; cache stays cold (invoke-only prefix under 1024-token cache minimum) so stock still wins on cost at 10 tools (~/me/fun/jev/harness evals/RESULTS.md)
+- ZETA-137 merged as https://github.com/hwang2409/zeta/pull/180 (gutter thinking marker, clean bash receipts, D3 deferral record; 4 review rounds + post-#179 rebase; squash 5361188a)
+- **jev** — compaction arc COMPLETE — Jev triage + chunked summarize live in harness (~/me/fun/jev/harness @ 35eb793a); extract demo that used to die now completes; 4 review rounds
+- ZETA-133-D3 merged as https://github.com/hwang2409/zeta/pull/179 (bottom-anchor short transcripts via vendored ListAlignment::Bottom seam; fence re-armed; squash eecbfb26)
+- PHO-17590 merged: explicit simulator telephony capability, SMS-only enforcement, in-transaction pool gates (phoebe#17327, squash d22d221a; 5 review rounds; hosted SMS validation skipped on Henry's merge call — credential absent)
+- PHO-17607 merged: local web runner for v3 evals (phoebe#17375, squash fa921a14; Henry manual-tested; env-loader + process-group lifecycle fixes review-verified)
+- **jev** — jev-zeta fork WORKS — zeta with one route tool, live smoke passed (route->read->route->write, top-3 expansion fired at 0.79, 0 unrouted); local fork ~/me/fun/jev-zeta @ b8b9bbb0, 4 lanes + 3 reviews
+
 ## 2026-09-17
 
+- PHO-17614 merged: consolidated v3-evals grading findings fix (phoebe#17406, squash fb1ffe82; all 9 banked findings from #17326/#17383 reviews closed)
+- **jev** — phase-2 Jev router experiment complete — flat routing holds to 120 tools (top-1 0.975-0.993, top-3 1.0), confidence cleanly flags misses (Brier 0.0046); 7 worker lanes, 6 review rounds
+- PHO-17602 merged: hand-authored bash golden cases hardened into v3-evals/features/bash (phoebe#17383, squash 0ec8eba2; eval-engine #333 + #17369 closed as superseded)
+- **jev** — phase-1 Jev tool-router experiment complete — 60-case eval, top-1 1.0, gate AUCs 0.995/1.0 (local repo ~/me/fun/jev, 3 review rounds)
+- PHO-17584 merged: rendered-UI eval golden family phase 1 (phoebe#17326, squash b90421cb; lexical prose grading removed, receipts component-aware)
 - **splitty** — SPLIT-1 merged (#2) — community Apollo sweep (only rehost found) + separator-diversity max-spec ensembles; SPLIT-2 merged (#1) — Splitty Lab web app (manifest catalog, inline playback, A/B deck), 4 review rounds to clean
 - phoebe #17274 org snapshot import script MERGED by orch under Henry's 09-17 grant (conflicts resolved by ORG-SNAPSHOT-CONFLICTS lane; squash 2026-09-17T20:02Z; dev-tooling only)
 - PAUS-15 merged as https://github.com/hwang2409/pausanias/pull/17 (LOCOMO cat-5 abstention eval: lexical 1.35% vs fused 100% false-injection)

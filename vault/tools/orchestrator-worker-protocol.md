@@ -20,7 +20,9 @@ Unless a ticket or Henry specifies otherwise:
 | Implement worker (frontend/design) | cc | opus-4.7 |
 | Review worker | cdx | gpt-5.6-sol |
 
-**Luna restored as the general implement default (Henry 2026-09-10 ~21:05Z via phoebe orch: "Can we use gpt-5.6-luna for implementation workers actually"; ends the same-day terra trial).** Mid-run terra workers finish as-is; all new implement spawns use gpt-5.6-luna effort high. Frontend/design stays cc opus-4.7; reviewers stay cdx gpt-5.6-sol.
+**Luna for ALL implement spawns, frontend included (Henry 2026-09-18 via zeta orch: "Can we spawn gpt-5.6-luna workers instead of opus-4.7"; ends the 09-10 frontend cc-opus carve-out).** All new implement spawns — general AND frontend/design — use cdx gpt-5.6-luna effort high. Mid-run cc opus workers finish as-is (applied: ZETA-138/ZETA-139). Reviewers stay cdx gpt-5.6-sol. The three-UI-skills mandate + in-depth design handoff stay in every frontend kickoff regardless of provider (per the 2026-08-17 rule).
+
+**Superseded 2026-09-18 (kept for history): Luna restored as the general implement default (Henry 2026-09-10 ~21:05Z via phoebe orch: "Can we use gpt-5.6-luna for implementation workers actually"; ends the same-day terra trial).** Mid-run terra workers finish as-is; all new implement spawns use gpt-5.6-luna effort high. Frontend/design stays cc opus-4.7; reviewers stay cdx gpt-5.6-sol.
 
 **Superseded same-day (kept for history): TRIAL gpt-5.6-terra as the general implement default (Henry 2026-09-10 ~19:00Z via phoebe orch; superseded the same-day luna ruling for general implement).** Trial observations (phoebe fleet, ~2h, 8 terra spawns): model string accepted everywhere, no spawn failures; workers completed CI-fix and review-fix contracts competently and wrote status files correctly; no obvious quality regression vs luna in one afternoon, but review rounds still returned substantive findings at normal rates — no clear win either direction before Henry ended the trial.
 

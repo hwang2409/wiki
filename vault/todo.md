@@ -3,7 +3,7 @@ type: reference
 view: kanban
 tags: [todo]
 created: 2026-07-06
-updated: 2026-09-17
+updated: 2026-09-18
 ---
 
 Todo:
@@ -100,6 +100,9 @@ Todo:
 - [P1] wiki orch: backend full suite hangs mid-run on main 1e2bcf31 in test_agent_runtime_supervisor.py DaemonShutdownTests family (~26%, async teardown _cancel_all_tasks waits forever; 2 leaked wiki-event-writer threads; pytest-timeout thread-method kills whole run; reproduced 2x on main + astra-1 worktree under fleet load 2026-09-08; faulthandler dumps in /tmp/astra1-gate-main.log) — root-cause + deflake; full wiki gates are unrunnable until fixed
 - unknown provider event kind "item/completed" exceeded 100 events in the week of 2026-09-07
 - unknown provider event kind "item/started" exceeded 100 events in the week of 2026-09-07
+- [P2] jev harness (~/me/fun/jev/harness) arc 3: Jev-navigated browsing — Playwright toolset in the fork + element-level Jev routing (page elements as catalog), page-state gates, confidence-gated approvals, search-result triage; on v2 auto-routing architecture; starts after compaction + router-v2 land
+- [P2] jev harness: docs-sweep refactor (JEV-30) — structured criteria for routing catalog + triage, adversarial-state injection probes, per-primitive thresholds, min-confidence telemetry; ticket: ~/me/fun/jev/harness/docs/superpowers/specs/2026-09-18-jev-docs-refactor-ticket.md
+- [P2] jev harness: fix 3 realistic-eval task calibrations (corpus-relative check path, slot format tolerance, case-insensitive calendar equality) and rerun sweep
 
 Silky-smooth artifact rendering arc (Henry 2026-07-29):
 
@@ -171,7 +174,6 @@ In Progress:
 - [P2] chimy2+newt SANDBOX ARC (owner: tooling-dev): native Rust viewer. CHIMY-45 CANCELLED — interactive layer already exists in chimy2 (OrbitController, present::run_with_input, viewer bins). NEWT-36 MERGED (PR #80, 2026-08-20). NEXT: NEWT-37 mesh-mesh -> NEWT-38 SDF
 - [P2] WIKI-400 supervisor: archive is not idempotent after a mid-flight failure — a timed-out/interrupted archive moves run.json into the archive snapshot but leaves the registry entry and events.sqlite3 behind; every retry then fails (first 'Directory not empty', then a bare run.json-path error re-reading the moved file), leaving a permanent registry ghost the CLI refuses to touch ('cannot mutate supervisor-owned headless run') and only a supervisor restart clears. Two cases 2026-08-25 (phoebe fleet: PHO-16720-REVIEW3, PHO-16987-PR7; snapshots complete incl. archive-complete.json, strays hand-moved, empty dirs removed, registry entries still live). Fix: archive should resume from the manifest when run.json is already moved (treat archive-complete.json as the commit marker), and registry reconcile should drop entries whose runs dir is gone
 - [P2] WIKI-390: artifact/run menu keyboard model — initial focus, arrows, Home/End, Esc, focus return
-- PHO-17584 v3 rendered-UI evals arc P1->P2->P3 (owner cdx:PHO-17584-P1)
 - PHO-17587 caregiver sim demo-first arc: 17590 + 17589 live (owners cdx:PHO-17590, cdx:PHO-17589); 17588 queued behind 17590, 17591 behind 17589
 Backlog:
 
