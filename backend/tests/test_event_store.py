@@ -1645,5 +1645,29 @@ def test_artifact_index_refreshes_a_changed_archive_file() -> None:
         ]
 
 
+def test_artifact_index_limits_archive_bytes() -> None:
+    with TemporaryDirectory() as tmp:
+        root = Path(tmp)
+        payload = json.dumps({"id": "artifact", "kind": "artifact"}) + "\n"
+        for index in range(2):
+            session = root / "archive" / "ticket" / f"20260818-00000{index}"
+            session.mkdir(parents=True)
+            (session / "archive-complete.json").write_text("{}")
+            (session / "run.json").write_text(json.dumps({"run_id": str(index)}))
+            (session / "events.jsonl").write_text(payload)
+
+        with mock.patch(
+            "backend.app.agent_runtime.event_store_router.RECENT_ARCHIVE_ARTIFACT_BYTES",
+            len(payload),
+        ):
+            events = list(
+                RuntimeEventStore(
+                    root / "runtime", archive_dir=root / "archive"
+                ).read_artifact_events()
+            )
+
+        assert [run_id for run_id, _event in events] == ["1"]
+
+
 def _json_bytes_for_test(value: dict[str, object]) -> str:
     return json.dumps(value, separators=(",", ":"), sort_keys=True)

@@ -33,6 +33,7 @@ from .event_store_shard import (
 
 
 RECENT_ARCHIVE_ARTIFACT_SESSIONS = 40
+RECENT_ARCHIVE_ARTIFACT_BYTES = 128 * 1024 * 1024
 
 
 @lru_cache(maxsize=RECENT_ARCHIVE_ARTIFACT_SESSIONS)
@@ -189,6 +190,7 @@ class EventStoreRouter:
                 return
             sessions.sort(key=lambda path: path.name, reverse=True)
             scanned = 0
+            scanned_bytes = 0
             for session_dir in sessions:
                 if cancelled():
                     return
@@ -208,6 +210,9 @@ class EventStoreRouter:
                         break
                     scanned += 1
                     stat = events_path.stat()
+                    if stat.st_size > RECENT_ARCHIVE_ARTIFACT_BYTES - scanned_bytes:
+                        continue
+                    scanned_bytes += stat.st_size
                     for event in _archived_artifact_events(
                         events_path, stat.st_mtime_ns, stat.st_size
                     ):
