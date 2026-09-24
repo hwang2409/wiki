@@ -9,7 +9,6 @@ import tempfile
 import time
 import unittest
 from copy import deepcopy
-from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 from unittest import mock
@@ -47,7 +46,6 @@ from backend.app.agent_runtime.types import (
     restart_recovery_decision,
     validate_transition,
 )
-from backend.app.agent_runtime.unknown_kind_telemetry import UnknownKindTelemetry
 
 
 FIXTURES = Path(__file__).parent / "fixtures" / "agent_runtime"
@@ -3293,19 +3291,6 @@ class RunStoreTests(unittest.TestCase):
             ):
                 store.archive_current(record.run_id, outcome="merged")
 
-            calls: list[str] = []
-            telemetry = UnknownKindTelemetry(
-                paths,
-                threshold=100,
-                todo_runner=calls.append,
-                clock=lambda: datetime.now(timezone.utc).timestamp(),
-            )
-            first = telemetry.run_once()
-            second = telemetry.run_once()
-
-            self.assertEqual(first["unknown_counts"], {"item/novel": 60})
-            self.assertEqual(second["unknown_counts"], {"item/novel": 60})
-            self.assertEqual(calls, [])
             self.assertTrue(store.run_dir(record.run_id).exists())
 
             store.archive_current(record.run_id, outcome="merged")

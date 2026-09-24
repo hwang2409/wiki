@@ -8,14 +8,13 @@ orchestrator, the agent id itself for workers.
 
 Agent operations are primary; the graph is telemetry. Most appends are
 delivered through a bounded keyed outbox. Supervisor archive edges use the
-synchronous path and recover from committed archive sessions after restart.
+synchronous path.
 The FastAPI lifespan owns the outbox lifecycle. The CLI path (``wiki graph
 append``) stays synchronous.
 """
 
 from __future__ import annotations
 
-import json
 import logging
 import threading
 from concurrent.futures import Future
@@ -26,7 +25,6 @@ from uuid import uuid4
 
 from wiki_cli import graph_lint
 
-from .agent_runtime.archive_protocol import archive_is_committed
 from .agent_runtime.ticket import base_ticket
 from . import workgraph
 
@@ -371,57 +369,6 @@ def record_archive_sync(
         status_dir=status_dir,
         request_id=f"archive:{run_id}",
     )
-
-
-def reconcile_archive_edges(
-    archive_dir: Path,
-    *,
-    status_dir: Path | None = None,
-) -> int:
-    """Replay archive edges missing after a supervisor exit.
-
-    Archive sessions are committed before this process can lose an edge
-    write. Replaying by run id is safe because workgraph deduplicates it.
-    """
-
-    repaired = 0
-    for session_dir in sorted(archive_dir.glob("*/*")):
-        if not archive_is_committed(session_dir):
-            continue
-        try:
-            run = json.loads((session_dir / "run.json").read_text(encoding="utf-8"))
-            meta = json.loads((session_dir / "meta.json").read_text(encoding="utf-8"))
-        except (OSError, ValueError):
-            continue
-        if not isinstance(run, dict) or not isinstance(meta, dict):
-            continue
-        role = run.get("role")
-        agent_id = run.get("agent_id")
-        run_id = run.get("run_id")
-        if role not in {"plan", "implement", "review"}:
-            continue
-        if not all(isinstance(value, str) and value for value in (agent_id, run_id)):
-            continue
-        try:
-            record_archive_sync(
-                agent_id=agent_id,
-                orch=run.get("orchestrator_id")
-                if isinstance(run.get("orchestrator_id"), str)
-                else None,
-                outcome=run.get("outcome")
-                if isinstance(run.get("outcome"), str)
-                else None,
-                run_id=run_id,
-                ended_at=meta.get("ended_at")
-                if isinstance(meta.get("ended_at"), str)
-                else None,
-                status_dir=status_dir,
-            )
-        except Exception:
-            log.exception("could not reconcile archive workgraph edge for %s", agent_id)
-        else:
-            repaired += 1
-    return repaired
 
 
 def record_escalation(
