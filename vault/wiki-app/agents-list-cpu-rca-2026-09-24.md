@@ -21,3 +21,7 @@ updated: 2026-09-24
 - The merged change accepts safe lowercase workgraph IDs and stops the worker loop-state UI poll for orchestrators. This removes the `feebs` validation error loop. The live app still runs the old build.
 
 The sample and route timing show an independent high-cost agents-list path. They do not prove the exact CPU share of each substep under concurrent knowledge refresh.
+
+## Later cut
+
+- [#309](https://github.com/hwang2409/wiki/pull/309) removed archive history from `/api/agents` and the agent page. Agent polling no longer reads the archive. This is merged source; Henry has not rebuilt the installed app from it yet.

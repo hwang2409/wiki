@@ -23,3 +23,7 @@ updated: 2026-09-24
 - Local direct measurements from the branch: first bounded artifact read 0.23 seconds; second read 0.13 seconds. The full archive session list took 0.96 seconds first, then 0 seconds from the cache. The installed app has not been updated.
 - PR [#301](https://github.com/hwang2409/wiki/pull/301) merged as `63bdff19`. The installed app still runs the old build.
 - The combined #300/#301 native build is staged at `/Users/henry/me/fun/wiki-cpu-fix/.native-build-staging/20260924-145702-28486`. Henry chose to install later. The superseded #300 stage was removed.
+
+## Later cut
+
+- [#311](https://github.com/hwang2409/wiki/pull/311) replaced the full archive list and directory walk with the cached recent 40 receipt catalog. Searches read compact artifact events, with a 5 MB cap on legacy event files. [#312](https://github.com/hwang2409/wiki/pull/312) opens those results as saved artifacts only. The earlier statement that archived run history remains in the session UI is superseded. Henry will rebuild the app; these merged changes are not installed yet.
