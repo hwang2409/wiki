@@ -1606,5 +1606,44 @@ def test_artifact_index_stops_when_the_reader_is_cancelled() -> None:
         assert list(events) == []
 
 
+def test_artifact_index_limits_archives_to_recent_sessions() -> None:
+    with TemporaryDirectory() as tmp:
+        root = Path(tmp)
+        archive = root / "archive"
+        for index in range(41):
+            session = archive / f"ticket-{index}" / f"20260818-{index:06d}"
+            session.mkdir(parents=True)
+            (session / "archive-complete.json").write_text("{}")
+            (session / "run.json").write_text(json.dumps({"run_id": str(index)}))
+            (session / "events.jsonl").write_text(
+                json.dumps({"id": str(index), "kind": "artifact"}) + "\n"
+            )
+
+        events = list(RuntimeEventStore(root / "runtime", archive_dir=archive).read_artifact_events())
+
+        assert len(events) == 40
+        assert {run_id for run_id, _event in events} == {str(index) for index in range(1, 41)}
+
+
+def test_artifact_index_refreshes_a_changed_archive_file() -> None:
+    with TemporaryDirectory() as tmp:
+        root = Path(tmp)
+        session = root / "archive" / "ticket" / "20260818-000000"
+        session.mkdir(parents=True)
+        (session / "archive-complete.json").write_text("{}")
+        (session / "run.json").write_text(json.dumps({"run_id": "archived"}))
+        events_path = session / "events.jsonl"
+        events_path.write_text(json.dumps({"id": "first", "kind": "artifact"}) + "\n")
+        store = RuntimeEventStore(root / "runtime", archive_dir=root / "archive")
+
+        assert [event["id"] for _run_id, event in store.read_artifact_events()] == ["first"]
+        with events_path.open("a") as handle:
+            handle.write(json.dumps({"id": "second", "kind": "artifact"}) + "\n")
+        assert [event["id"] for _run_id, event in store.read_artifact_events()] == [
+            "first",
+            "second",
+        ]
+
+
 def _json_bytes_for_test(value: dict[str, object]) -> str:
     return json.dumps(value, separators=(",", ":"), sort_keys=True)

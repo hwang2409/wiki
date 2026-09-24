@@ -345,7 +345,7 @@ class PaletteSearchTests(unittest.TestCase):
             self.assertEqual(top["ticket"], "WIKI-99")
             url = top["url"]
             self.assertTrue(url.endswith("#/agent/WIKI-99"), url)
-            self.assertIn(f"panel=WIKI-99", url)
+            self.assertIn("panel=WIKI-99", url)
             self.assertIn(f"artifact={artifact_id}", url)
             self.assertIn(f"focus={artifact_id}", url)
             self.assertIn(f"tab={artifact_id}", url)
@@ -615,6 +615,15 @@ class PaletteSearchTests(unittest.TestCase):
         self.assertGreater(walk_polls["n"], 0, "walk should have started polling should_cancel")
         self.assertTrue(walk_cancelled["raised"], "cancellation should have propagated to the walk")
         self.assertGreaterEqual(poll_count["n"], 3, "disconnect watcher should have polled at least 3 times")
+
+    def test_palette_reuses_archive_list_during_typing(self):
+        from backend.app import main as app_main
+
+        with mock.patch.object(app_main, "_PALETTE_ARCHIVED_CACHE", None), \
+             mock.patch.object(app_main, "list_archived", return_value=[{"ticket": "WIKI-1"}]) as read:
+            self.assertEqual(app_main._palette_archived_sessions(), [{"ticket": "WIKI-1"}])
+            self.assertEqual(app_main._palette_archived_sessions(), [{"ticket": "WIKI-1"}])
+            read.assert_called_once_with(limit=None)
 
     def test_result_payload_shape(self):
         with tempfile.TemporaryDirectory() as tmp:

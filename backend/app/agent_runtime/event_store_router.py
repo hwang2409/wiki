@@ -7,6 +7,7 @@ import sqlite3
 import threading
 from collections.abc import Callable, Iterator
 from contextlib import contextmanager
+from functools import lru_cache
 from pathlib import Path
 from typing import Any
 
@@ -29,6 +30,29 @@ from .event_store_shard import (
     runtime_event_db_path,
     runtime_metadata_db_path,
 )
+
+
+RECENT_ARCHIVE_ARTIFACT_SESSIONS = 40
+
+
+@lru_cache(maxsize=RECENT_ARCHIVE_ARTIFACT_SESSIONS)
+def _archived_artifact_events(
+    events_path: Path, _mtime_ns: int, _size: int
+) -> tuple[dict[str, Any], ...]:
+    """Parse one immutable archive file once for repeated palette searches."""
+
+    events: list[dict[str, Any]] = []
+    with events_path.open("rb") as handle:
+        for line in handle:
+            if b'"artifact"' not in line:
+                continue
+            try:
+                value = json.loads(line)
+            except (TypeError, ValueError):
+                continue
+            if isinstance(value, dict) and value.get("kind") == "artifact":
+                events.append(value)
+    return tuple(events)
 
 
 class EventStoreRouter:
@@ -105,7 +129,7 @@ class EventStoreRouter:
         *,
         should_cancel: Callable[[], bool] | None = None,
     ) -> Iterator[tuple[str, dict[str, Any]]]:
-        """Stream every indexed artifact event without retaining the stream."""
+        """Stream live artifacts and artifacts from recent archived sessions."""
 
         def cancelled() -> bool:
             return should_cancel is not None and should_cancel()
@@ -140,63 +164,58 @@ class EventStoreRouter:
             except (OSError, sqlite3.DatabaseError):
                 continue
         if self.archive_dir is not None and self.archive_dir.is_dir():
+            sessions: list[Path] = []
             try:
-                ticket_dirs = self.archive_dir.iterdir()
-                for ticket_dir in ticket_dirs:
-                    if (
-                        cancelled()
-                        or not ticket_dir.is_dir()
-                        or ticket_dir.is_symlink()
-                    ):
+                for ticket_dir in self.archive_dir.iterdir():
+                    if cancelled():
+                        return
+                    if not ticket_dir.is_dir() or ticket_dir.is_symlink():
                         continue
                     try:
-                        session_dirs = ticket_dir.iterdir()
-                        for session_dir in session_dirs:
-                            if cancelled():
-                                return
-                            marker = session_dir / "archive-complete.json"
-                            events_path = session_dir / "events.jsonl"
+                        for session_dir in ticket_dir.iterdir():
+                            name = session_dir.name
                             if (
-                                not session_dir.is_dir()
-                                or session_dir.is_symlink()
-                                or not marker.is_file()
-                                or not events_path.is_file()
-                                or events_path.is_symlink()
+                                len(name) == 15
+                                and name[8] == "-"
+                                and name[:8].isdigit()
+                                and name[9:].isdigit()
+                                and session_dir.is_dir()
+                                and not session_dir.is_symlink()
                             ):
-                                continue
-                            try:
-                                run_value = json.loads(
-                                    (session_dir / "run.json").read_text(
-                                        encoding="utf-8"
-                                    )
-                                )
-                                run_id = str(run_value["run_id"])
-                                with events_path.open(encoding="utf-8") as handle:
-                                    for line in handle:
-                                        if cancelled():
-                                            return
-                                        if not line.strip():
-                                            continue
-                                        try:
-                                            value = json.loads(line)
-                                        except (
-                                            TypeError,
-                                            ValueError,
-                                            KeyError,
-                                            json.JSONDecodeError,
-                                        ):
-                                            continue
-                                        if (
-                                            isinstance(value, dict)
-                                            and value.get("kind") == "artifact"
-                                        ):
-                                            yield run_id, value
-                            except (OSError, TypeError, ValueError, KeyError):
-                                continue
+                                sessions.append(session_dir)
                     except OSError:
                         continue
             except OSError:
                 return
+            sessions.sort(key=lambda path: path.name, reverse=True)
+            scanned = 0
+            for session_dir in sessions:
+                if cancelled():
+                    return
+                events_path = session_dir / "events.jsonl"
+                if (
+                    not (session_dir / "archive-complete.json").is_file()
+                    or not events_path.is_file()
+                    or events_path.is_symlink()
+                ):
+                    continue
+                try:
+                    run_value = json.loads(
+                        (session_dir / "run.json").read_text(encoding="utf-8")
+                    )
+                    run_id = str(run_value["run_id"])
+                    if scanned >= RECENT_ARCHIVE_ARTIFACT_SESSIONS:
+                        break
+                    scanned += 1
+                    stat = events_path.stat()
+                    for event in _archived_artifact_events(
+                        events_path, stat.st_mtime_ns, stat.st_size
+                    ):
+                        if cancelled():
+                            return
+                        yield run_id, event
+                except (OSError, TypeError, ValueError, KeyError):
+                    continue
 
     def create_run(self, run_id: str, **kwargs: Any) -> None:
         self.for_run(run_id).create_run(run_id, **kwargs)

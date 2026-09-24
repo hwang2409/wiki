@@ -202,13 +202,6 @@ async def lifespan(_app: FastAPI):
         # Health is optional; a broken provider CLI or probe must not prevent
         # the backend from starting.
         pass
-    # Warm the palette artifact view off the event loop.  SQLite is the index;
-    # do not parse every events.jsonl before the first Cmd-K keystroke.
-    threading.Thread(
-        target=lambda: palette.collect_artifact_items_from_index(_sqlite_event_store()),
-        name="palette-artifact-warm",
-        daemon=True,
-    ).start()
     # Lifespan owns the workgraph outbox: accepted telemetry writes are
     # drained on shutdown instead of dying with a daemon thread.
     workgraph_service.start_outbox()
@@ -1253,6 +1246,27 @@ def _palette_artifacts_or_legacy_scan(
         if state.rebuild_state != "ready":
             return None
     return indexed_artifacts
+
+
+_PALETTE_ARCHIVED_LOCK = threading.Lock()
+_PALETTE_ARCHIVED_CACHE: tuple[float, list[dict]] | None = None
+
+
+def _palette_archived_sessions() -> list[dict]:
+    """Reuse the archive session list while one palette search is in progress."""
+
+    global _PALETTE_ARCHIVED_CACHE
+    with _PALETTE_ARCHIVED_LOCK:
+        now = time.monotonic()
+        if _PALETTE_ARCHIVED_CACHE is not None:
+            cached_at, rows = _PALETTE_ARCHIVED_CACHE
+            if now - cached_at < 5:
+                return rows
+        rows = list_archived(limit=None)
+        _PALETTE_ARCHIVED_CACHE = (time.monotonic(), rows)
+        return rows
+
+
 RUN_ID_PATTERN = re.compile(
     r"^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$"
 )
@@ -2704,7 +2718,7 @@ async def palette_search(
         }
         archive_by_run: dict[str, tuple[str, str]] = {}
         archived = agents_payload.get("archived", []) if isinstance(agents_payload, dict) else []
-        all_archived = list_archived(limit=None)
+        all_archived = _palette_archived_sessions()
         for entry in all_archived:
             if not isinstance(entry, dict):
                 continue
