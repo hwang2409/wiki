@@ -2,12 +2,29 @@
 type: reference
 tags: [phoebe, evals, memo]
 created: 2026-09-17
-updated: 2026-09-17
+updated: 2026-09-24
 ---
 
 # richard huang eval work: research memo
 
-## scope and current state
+## current-state correction (2026-09-24)
+
+The sections below record the 2026-09-17 PR state. At Phoebe
+`origin/main` `3fdcfb2275`, the v3 harness has changed:
+
+- `v3-evals/engine/grading/jev.py` adds an optional Jev backend that can
+  replace deterministic check verdicts. The tool-using diagnostic agent in
+  `engine/grading/diagnostic.py` still runs only after a failed check and
+  cannot change the verdict. The v3-evals skill's "no model-graded checks"
+  rule is now stale.
+- The golden index contains eight cases. All eight have
+  `awaiting_human_validation`; `golden_set/cases.py` checks status equality
+  with the owner, not human approval.
+- `.github/workflows/v3-golden-set.yaml` and
+  `scripts/daytona/v3_golden_set.sh` are absent from this main commit.
+  Do not infer the present hosted launch path from the older PR section.
+
+## scope and state on 2026-09-17
 
 this memo covers richard huang's eval PRs #17024, #17174, and open #17266.
 it also traces the v3 harness, the older `evals/` platform, and the planned
