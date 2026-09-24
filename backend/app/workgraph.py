@@ -81,7 +81,7 @@ EDGE_KINDS = (
 SNAPSHOT_EDGE_KINDS = {"spawn", "verdict", "archive", "escalation"}
 STALL_ALARM_SECONDS = 1800
 DEFAULT_ITERATION_CAP = 8
-WORKGRAPH_TICKET_RE = re.compile(r"^[A-Z][A-Z0-9]+-[0-9]+(?:-[A-Z0-9]+)*$")
+WORKGRAPH_TICKET_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9-]*$")
 
 # One injected clock for every stall/health computation so the renderer, the
 # health endpoint, and the CLI agree on "now" (and tests can freeze it).

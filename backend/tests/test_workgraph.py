@@ -262,9 +262,10 @@ class WorkgraphEndpointTests(unittest.TestCase):
             mock.patch.object(main, "AGENT_STATUS_DIR", self.status_dir),
             mock.patch.object(workgraph, "SNAPSHOT_DIR", self.snapshot_dir),
         ):
-            with self.assertRaises(HTTPException) as ctx:
-                main.agent_workgraph("TST-9")
-        self.assertEqual(ctx.exception.status_code, 404)
+            for ticket in ("TST-9", "feebs"):
+                with self.subTest(ticket=ticket), self.assertRaises(HTTPException) as ctx:
+                    main.agent_workgraph(ticket)
+                self.assertEqual(ctx.exception.status_code, 404)
 
     def test_lists_snapshot_metadata_and_loads_closest_older_revision(self) -> None:
         self.build_graph()
@@ -1270,6 +1271,9 @@ class CorruptHotFileTests(unittest.TestCase):
 
     def test_missing_file_loads_as_none(self) -> None:
         self.assertIsNone(workgraph.load_workgraph("TST-1", self.status_dir))
+
+    def test_safe_orchestrator_id_without_ticket_number_loads_as_none(self) -> None:
+        self.assertIsNone(workgraph.load_workgraph("feebs", self.status_dir))
 
     def test_shaped_ticket_is_rejected_before_path_access(self) -> None:
         with self.assertRaises(workgraph.WorkgraphError):

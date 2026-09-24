@@ -1007,6 +1007,25 @@ class HeadlessMainRouteTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn(uncataloged, verified)
         self.assertNotIn(cataloged, verified)
 
+    async def test_archive_list_reads_one_catalog_and_only_selected_bodies(self) -> None:
+        catalog = {}
+        for index in range(50):
+            ticket = f"WIKI-{1000 + index}"
+            session = self.archive_dir / ticket / f"20260924-00{index:02}00"
+            session.mkdir(parents=True)
+            if index >= 20:
+                catalog[f"{ticket}/{session.name}"] = {}
+        with (
+            mock.patch.object(main, "read_archive_catalog", return_value=catalog) as read_catalog,
+            mock.patch.object(main, "archive_is_committed", side_effect=AssertionError("old archive verified")),
+            mock.patch.object(main, "_read_json_object", return_value={}) as read_body,
+        ):
+            entries = main.list_archived(limit=20)
+        self.assertEqual(len(entries), 20)
+        read_catalog.assert_called_once_with(self.archive_dir)
+        self.assertEqual(read_body.call_count, 40)
+        self.assertEqual(entries[0]["ticket"], "WIKI-1049")
+
     async def test_archive_hint_selects_the_requested_archived_at_not_the_newest(
         self,
     ) -> None:

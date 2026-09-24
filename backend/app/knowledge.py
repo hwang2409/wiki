@@ -1,4 +1,4 @@
-"""Rebuildable SQLite knowledge index for vault notes and Wiki fleet runs."""
+"""Rebuildable SQLite knowledge index for vault notes."""
 
 from __future__ import annotations
 
@@ -24,12 +24,6 @@ from .knowledge_content import (
     normalize_link_target,
     resolve_wikilink_target,
     ticket_for_note,
-)
-from .knowledge_runs import (
-    is_supervisor_archive,
-    last_event_seq,
-    load_run_metadata,
-    read_run_events,
 )
 from .knowledge_schema import (
     SCHEMA_VERSION,
@@ -66,14 +60,6 @@ class KnowledgeSourceError(KnowledgeError):
     """One source file could not be ingested while the database remains usable."""
 
 
-def _archive_is_committed(path: Path) -> bool:
-    # Keep the archive protocol import lazy. knowledge loads during the agent
-    # runtime package bootstrap, so a top-level import would create a cycle.
-    from .agent_runtime.archive_protocol import archive_is_committed
-
-    return archive_is_committed(path)
-
-
 @dataclass
 class IngestStats:
     notes_scanned: int = 0
@@ -82,14 +68,6 @@ class IngestStats:
     notes_deleted: int = 0
     chunks_indexed: int = 0
     links_indexed: int = 0
-    runs_indexed: int = 0
-    runs_skipped: int = 0
-    events_indexed: int = 0
-    malformed_event_lines: int = 0
-    event_chunks_excerpted: int = 0
-    base64_blob_lines_skipped: int = 0
-    ansi_heavy_lines_skipped: int = 0
-    legacy_runs_skipped: int = 0
     embeddings_indexed: int = 0
     embeddings_skipped: int = 0
     semantic_unavailable: int = 0
@@ -103,14 +81,6 @@ class IngestStats:
             "notes_deleted",
             "chunks_indexed",
             "links_indexed",
-            "runs_indexed",
-            "runs_skipped",
-            "events_indexed",
-            "malformed_event_lines",
-            "event_chunks_excerpted",
-            "base64_blob_lines_skipped",
-            "ansi_heavy_lines_skipped",
-            "legacy_runs_skipped",
             "embeddings_indexed",
             "embeddings_skipped",
             "semantic_unavailable",
@@ -125,9 +95,6 @@ class IngestStats:
 class KnowledgePaths:
     db_path: Path
     vault_dir: Path
-    archive_dir: Path
-    runtime_dir: Path
-    include_legacy_archives: bool = False
 
     @classmethod
     def from_env(
@@ -135,7 +102,6 @@ class KnowledgePaths:
         env: Mapping[str, str] | None = None,
         *,
         runtime_dir: Path | str | None = None,
-        archive_dir: Path | str | None = None,
         vault_dir: Path | str | None = None,
     ) -> KnowledgePaths:
         values = os.environ if env is None else env
@@ -151,18 +117,9 @@ class KnowledgePaths:
             or values.get("WIKI_VAULT_DIR")
             or Path(__file__).resolve().parents[2] / "vault"
         ).expanduser()
-        archive = Path(
-            archive_dir
-            or values.get("WIKI_AGENT_ARCHIVE_DIR")
-            or home / "me" / "fun" / "agent-archive"
-        ).expanduser()
         return cls(
             db_path=database.absolute(),
             vault_dir=vault.absolute(),
-            archive_dir=archive.absolute(),
-            runtime_dir=runtime.absolute(),
-            include_legacy_archives=values.get("WIKI_KNOWLEDGE_INCLUDE_LEGACY", "").lower()
-            in {"1", "true", "yes", "on"},
         )
 
 
@@ -357,6 +314,13 @@ class KnowledgeIndex:
                     self.paths.db_path,
                 )
                 self._mark_rebuilding()
+                connection.close()
+                connection = None
+                # This database is derived from vault files. Recreate it instead
+                # of dropping millions of old FTS rows into a large freelist.
+                for suffix in ("", "-wal", "-shm"):
+                    Path(f"{self.paths.db_path}{suffix}").unlink(missing_ok=True)
+                connection = self._connect_raw()
                 reset_schema(connection)
                 return connection, True
             except sqlite3.DatabaseError as exc:
@@ -585,154 +549,7 @@ class KnowledgeIndex:
             connection.close()
             stats.elapsed_seconds = time.perf_counter() - started
 
-    def index_run_directory(self, run_dir: Path) -> IngestStats:
-        """Delta-index one live or archived run directory."""
-
-        started = time.perf_counter()
-        events_path = run_dir / "events.jsonl"
-        metadata = load_run_metadata(run_dir)
-        run_id = metadata.run_id
-        connection, _ = self._prepare()
-        stats = IngestStats(runs_indexed=1)
-        try:
-            current_row = connection.execute(
-                "SELECT COALESCE(MAX(seq), 0) AS seq FROM events WHERE run_id = ?",
-                (run_id,),
-            ).fetchone()
-            after_seq = int(current_row["seq"] if current_row else 0)
-            last_seq = last_event_seq(events_path)
-            batch = (
-                read_run_events(events_path, after_seq=after_seq)
-                if events_path.is_file() and not (last_seq > 0 and last_seq <= after_seq)
-                else None
-            )
-            with connection:
-                connection.execute(
-                    """
-                    INSERT INTO runs(run_id, ticket, provider, model, role, spawned_at, ended_at, outcome)
-                    VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-                    ON CONFLICT(run_id) DO UPDATE SET
-                        ticket=excluded.ticket,
-                        provider=excluded.provider,
-                        model=excluded.model,
-                        role=excluded.role,
-                        spawned_at=excluded.spawned_at,
-                        ended_at=COALESCE(excluded.ended_at, runs.ended_at),
-                        outcome=COALESCE(excluded.outcome, runs.outcome)
-                    """,
-                    (
-                        run_id,
-                        metadata.ticket,
-                        metadata.provider,
-                        metadata.model,
-                        metadata.role,
-                        metadata.spawned_at,
-                        metadata.ended_at,
-                        metadata.outcome,
-                    ),
-                )
-                for event in batch.events if batch else ():
-                    connection.execute(
-                        """
-                        INSERT INTO events(run_id, seq, type, ts, text_excerpt)
-                        VALUES (?, ?, ?, ?, ?)
-                        ON CONFLICT(run_id, seq) DO UPDATE SET
-                            type=excluded.type,
-                            ts=excluded.ts,
-                            text_excerpt=excluded.text_excerpt
-                        """,
-                        (
-                            run_id,
-                            event.seq,
-                            event.event_type,
-                            event.ts,
-                            event.excerpt,
-                        ),
-                    )
-                    connection.execute(
-                        "DELETE FROM chunks WHERE source_kind = 'event' AND source_id = ? AND pos = ?",
-                        (run_id, event.seq),
-                    )
-                    connection.execute(
-                        """
-                        INSERT INTO chunks(
-                            source_kind, source_id, ticket, title, heading, text, pos
-                        ) VALUES ('event', ?, ?, ?, ?, ?, ?)
-                        """,
-                        (
-                            run_id,
-                            metadata.ticket,
-                            metadata.ticket or run_id,
-                            event.event_type,
-                            event.text,
-                            event.seq,
-                        ),
-                    )
-                    stats.chunks_indexed += 1
-                    stats.events_indexed += 1
-            stats.malformed_event_lines = batch.malformed_lines if batch else 0
-            stats.event_chunks_excerpted = batch.event_chunks_excerpted if batch else 0
-            stats.base64_blob_lines_skipped = batch.base64_blob_lines_skipped if batch else 0
-            stats.ansi_heavy_lines_skipped = batch.ansi_heavy_lines_skipped if batch else 0
-            if stats.malformed_event_lines:
-                LOGGER.warning(
-                    "skipped %d malformed event lines in %s",
-                    stats.malformed_event_lines,
-                    events_path,
-                )
-            return stats
-        except sqlite3.Error as exc:
-            if _corruption_error(exc):
-                connection.close()
-                self._recover_corruption(exc)
-            raise KnowledgeUnavailable(f"run indexing failed for {run_dir}: {exc}") from exc
-        except (OSError, UnicodeError) as exc:
-            raise KnowledgeSourceError(
-                f"run source unreadable for {run_dir}: {exc}"
-            ) from exc
-        finally:
-            connection.close()
-            stats.elapsed_seconds = time.perf_counter() - started
-
-    def scan_archives(self, *, include_legacy_archives: bool | None = None) -> IngestStats:
-        stats = IngestStats()
-        started = time.perf_counter()
-        include_legacy = (
-            self.paths.include_legacy_archives
-            if include_legacy_archives is None
-            else include_legacy_archives
-        )
-        if self.paths.archive_dir.is_dir():
-            for events_path in sorted(self.paths.archive_dir.rglob("events.jsonl")):
-                if events_path.is_file() and _archive_is_committed(events_path.parent):
-                    if not include_legacy and not is_supervisor_archive(events_path.parent):
-                        stats.legacy_runs_skipped += 1
-                        continue
-                    try:
-                        stats.merge(self.index_run_directory(events_path.parent))
-                    except KnowledgeSourceError as exc:
-                        stats.runs_skipped += 1
-                        LOGGER.warning("skipping unreadable archived run: %s", exc)
-        stats.elapsed_seconds = time.perf_counter() - started
-        return stats
-
-    def index_live_runs(self) -> IngestStats:
-        stats = IngestStats()
-        started = time.perf_counter()
-        runs_dir = self.paths.runtime_dir / "runs"
-        if runs_dir.is_dir():
-            for events_path in sorted(runs_dir.glob("*/events.jsonl")):
-                if events_path.is_file():
-                    stats.merge(self.index_run_directory(events_path.parent))
-        stats.elapsed_seconds = time.perf_counter() - started
-        return stats
-
-    def rebuild(
-        self,
-        *,
-        include_legacy_archives: bool | None = None,
-        explicit: bool = True,
-    ) -> IngestStats:
+    def rebuild(self, *, explicit: bool = True) -> IngestStats:
         """Drop derived data and deterministically restore it from source files."""
 
         started = time.perf_counter()
@@ -749,7 +566,6 @@ class KnowledgeIndex:
         stats = IngestStats()
         try:
             stats.merge(self.scan_vault())
-            stats.merge(self.scan_archives(include_legacy_archives=include_legacy_archives))
             connection, _ = self._prepare()
             try:
                 self._finish_build(connection, clear_rebuild_marker=True)
@@ -777,7 +593,6 @@ class KnowledgeIndex:
         started = time.perf_counter()
         stats = IngestStats()
         stats.merge(self.scan_vault())
-        stats.merge(self.scan_archives())
         connection, _ = self._prepare()
         try:
             self._finish_build(connection, clear_rebuild_marker=False)
@@ -809,103 +624,56 @@ class KnowledgeIndex:
         *,
         ticket: str | None = None,
         kind: str | None = None,
-        event_type: str | None = None,
         since: str | None = None,
         limit: int = 20,
     ) -> dict[str, Any]:
-        if kind not in {None, "note", "run"}:
-            raise KnowledgeQueryError("kind must be note or run")
+        if kind not in {None, "note"}:
+            raise KnowledgeQueryError("kind must be note")
         if not 1 <= limit <= MAX_SEARCH_LIMIT:
             raise KnowledgeQueryError(f"limit must be between 1 and {MAX_SEARCH_LIMIT}")
         fts_query = self._fts_query(query)
         since_value = self._since_value(since)
         connection, needs_rebuild = self._prepare()
         stale = needs_rebuild or self.rebuilding
-        # Live runs are append-only and indexed on first query, delta by seq.
-        try:
-            self.index_live_runs()
-        except (KnowledgeError, OSError) as exc:
-            stale = True
-            LOGGER.warning("live run indexing failed; returning stale results: %s", exc)
         try:
             clauses = ["chunks_fts MATCH ?"]
             params: list[Any] = [fts_query]
             if ticket:
                 clauses.append("UPPER(COALESCE(c.ticket, '')) = ?")
                 params.append(ticket.upper())
-            if kind == "note":
-                clauses.append("c.source_kind = 'note'")
-            elif kind == "run":
-                clauses.append("c.source_kind = 'event'")
-            if event_type:
-                clauses.append("c.source_kind = 'event' AND e.type = ?")
-                params.append(event_type)
             if since_value:
-                clauses.append(
-                    """
-                    CASE WHEN c.source_kind = 'note'
-                         THEN COALESCE(n.updated, n.created, '')
-                         ELSE COALESCE(e.ts, r.ended_at, r.spawned_at, '')
-                    END >= ?
-                    """
-                )
+                clauses.append("COALESCE(n.updated, n.created, '') >= ?")
                 params.append(since_value)
             params.append(limit)
             rows = connection.execute(
                 f"""
                 SELECT
-                    c.source_kind,
-                    c.source_id,
+                    n.path,
                     c.ticket,
                     c.heading,
-                    n.path AS note_path,
-                    e.run_id AS run_id,
-                    e.seq AS event_seq,
-                    e.type AS event_type,
                     snippet(chunks_fts, 0, '[', ']', ' … ', 18) AS snippet,
                     bm25(chunks_fts, 1.0, 2.0, 1.5) AS rank
                 FROM chunks_fts
                 JOIN chunks c ON c.id = chunks_fts.rowid
-                LEFT JOIN notes n
-                    ON c.source_kind = 'note' AND n.path = c.source_id
-                LEFT JOIN events e
-                    ON c.source_kind = 'event'
-                    AND e.run_id = c.source_id
-                    AND e.seq = c.pos
-                LEFT JOIN runs r ON r.run_id = e.run_id
+                JOIN notes n ON n.path = c.source_id
                 WHERE {' AND '.join(clauses)}
                 ORDER BY rank, c.id
                 LIMIT ?
                 """,
                 params,
             ).fetchall()
-            results: list[dict[str, Any]] = []
-            for row in rows:
-                if row["source_kind"] == "note":
-                    citation = str(row["note_path"] or row["source_id"])
-                    result = {
-                        "kind": "note",
-                        "citation": citation,
-                        "path": citation,
-                        "ticket": row["ticket"],
-                        "heading": row["heading"],
-                        "snippet": row["snippet"] or "",
-                        "score": round(-float(row["rank"]), 8),
-                    }
-                else:
-                    run_id = str(row["run_id"] or row["source_id"])
-                    seq = int(row["event_seq"] or 0)
-                    result = {
-                        "kind": "run",
-                        "citation": f"{run_id}:{seq}",
-                        "run_id": run_id,
-                        "seq": seq,
-                        "ticket": row["ticket"],
-                        "type": row["event_type"],
-                        "snippet": row["snippet"] or "",
-                        "score": round(-float(row["rank"]), 8),
-                    }
-                results.append(result)
+            results = [
+                {
+                    "kind": "note",
+                    "citation": str(row["path"]),
+                    "path": str(row["path"]),
+                    "ticket": row["ticket"],
+                    "heading": row["heading"],
+                    "snippet": row["snippet"] or "",
+                    "score": round(-float(row["rank"]), 8),
+                }
+                for row in rows
+            ]
             return {
                 "query": query,
                 "results": results,
@@ -1021,8 +789,6 @@ class KnowledgeIndex:
                     "chunks",
                     "chunks_fts",
                     "links",
-                    "runs",
-                    "events",
                 )
             }
         finally:

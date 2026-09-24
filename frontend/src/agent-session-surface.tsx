@@ -623,7 +623,9 @@ export function AgentSessionSurface({
               {worker.kind ? <span className="agent-session-runtime-item">{worker.kind}</span> : null}
               {worker.role ? <span className="agent-session-runtime-item">{worker.role}</span> : null}
               {worker.model ? <span className="agent-session-runtime-item">{worker.model}</span> : null}
-              <LoopStateChrome ticket={worker.ticket} tick={tick} />
+              {worker.role !== "orchestrator" ? (
+                <LoopStateChrome ticket={worker.ticket} tick={tick} />
+              ) : null}
             </div>
             <div className="agent-surface-actions" aria-label="Run actions">
               {worker.canReplace && worker.kind && worker.model ? (

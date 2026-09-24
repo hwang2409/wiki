@@ -51,7 +51,6 @@ hiddenimports = (
         "backend.app.agent_runtime.daemon",
         "backend.app.knowledge",
         "backend.app.knowledge_content",
-        "backend.app.knowledge_runs",
         "backend.app.knowledge_schema",
         "backend.app.wiki_artifacts",
         "backend.app.frontend_static",
