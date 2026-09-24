@@ -3,7 +3,7 @@ import { act, cleanup, fireEvent, render, screen, within } from "@testing-librar
 import { afterEach, beforeEach, describe, expect, test, vi } from "vitest";
 
 import { AgentsSidebar } from "../src/agents";
-import type { AgentWorker, ArchivedWorker, Orchestrator } from "../src/api";
+import type { AgentWorker, Orchestrator } from "../src/api";
 
 function worker(ticket: string, state: string, orch: string | null): AgentWorker {
   return {
@@ -65,19 +65,6 @@ const workers = [
   worker("FREE-1", "working", null),
 ];
 const orchestrators = [orchestrator("wiki"), orchestrator("phoebe")];
-const archivedWorker: ArchivedWorker = {
-  ticket: "WIKI-ARCHIVED",
-  archived_at: "2026-08-01T00:00:00Z",
-  run_id: "run-WIKI-ARCHIVED",
-  kind: "cdx",
-  role: "implement",
-  model: "gpt-5.6-luna",
-  outcome: "completed",
-  state: "completed",
-  pr: null,
-  step: "done",
-};
-
 beforeEach(() => localStorage.clear());
 afterEach(() => {
   cleanup();
@@ -474,11 +461,11 @@ describe("WIKI-235 runs sidebar", () => {
     expect(screen.getByTestId("nav-orch-workers-wiki")).toBeTruthy();
   });
 
-  test("uses active-run copy when only archived runs exist", () => {
+  test("uses active-run copy when no live runs exist", () => {
     render(
       <AgentsSidebar
         activeTicket={null}
-        data={{ workers: [], orchestrators: [], archived: [archivedWorker], error: null }}
+        data={{ workers: [], orchestrators: [], error: null }}
         refreshTick={0}
         onOpen={() => {}}
       />,

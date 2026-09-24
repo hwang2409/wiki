@@ -184,19 +184,6 @@ export type AgentWorker = AgentSession & {
   last_viewed_seq: number | null;
 };
 
-export type ArchivedWorker = {
-  ticket: string;
-  archived_at: string;
-  run_id: string | null;
-  kind: string | null;
-  role: string | null;
-  model: string | null;
-  outcome: string | null;
-  state: string | null;
-  pr: string | null;
-  step: string | null;
-};
-
 export type Orchestrator = {
   id: string;
   window: string | null;
@@ -268,7 +255,6 @@ export function getAgents(includeHistory = false) {
   return request<{
     workers: AgentWorker[];
     orchestrators: Orchestrator[];
-    archived: ArchivedWorker[];
     account_notices?: AccountEvent[];
   }>(`/api/agents${query}`);
 }

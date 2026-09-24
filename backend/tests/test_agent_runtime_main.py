@@ -793,6 +793,10 @@ class HeadlessMainRouteTests(unittest.IsolatedAsyncioTestCase):
             main,
             "tmux_live_windows",
             side_effect=AssertionError("headless listing touched tmux"),
+        ), mock.patch.object(
+            main,
+            "list_archived",
+            side_effect=AssertionError("agent polling touched the archive"),
         ):
             payload = main.agents()
             log = main.agent_log("WIKI-42", lines=10)
@@ -801,6 +805,7 @@ class HeadlessMainRouteTests(unittest.IsolatedAsyncioTestCase):
         supervisor = cast(dict[str, Any], payload["supervisor"])
         worker = workers[0]
         self.assertEqual(worker["run_id"], RUN_ID)
+        self.assertNotIn("archived", payload)
         self.assertEqual(worker["runtime_state"], "working")
         self.assertTrue(worker["window_alive"])
         self.assertTrue(worker["control_attached"])

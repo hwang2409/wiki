@@ -415,28 +415,13 @@ try {
     `Retry must issue exactly ONE additional /api/files/tree — before=${callsBeforeRetry} after=${treeCalls}`,
   );
 
-  // 8. Archived-only state: no active rows render, but the copy must not say
-  // the user has never had a run. Archived sessions remain available outside
-  // this sidebar.
+  // 8. No live runs: show the active-run empty state.
   await page.route("**/api/agents", async (route) => {
     await route.fulfill({
       status: 200,
       contentType: "application/json",
       body: JSON.stringify({
         workers: [],
-        archived: [
-          {
-            ticket: "WIKI-ARCHIVED",
-            archived_at: "2026-07-20T12:00:00Z",
-            kind: "cdx",
-            role: "implement",
-            model: "sol",
-            outcome: "completed",
-            state: "completed",
-            pr: null,
-            step: "done",
-          },
-        ],
         orchestrators: [],
         deploy_timestamp: null,
       }),
