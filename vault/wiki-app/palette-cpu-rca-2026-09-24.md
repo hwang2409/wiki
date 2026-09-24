@@ -20,4 +20,4 @@ updated: 2026-09-24
 - Henry chose recent archived artifacts over a complete palette artifact history. Agent run history remains available in the agent archive and session UI.
 - Remove the startup palette scan. Search live SQLite artifacts and at most the 40 newest committed archived sessions, with a 128 MiB archive-read cap. Cache each unchanged archived file's artifact events. Reuse the full archived session list across a short typing burst.
 - Local direct measurements from the branch: first bounded artifact read 0.23 seconds; second read 0.13 seconds. The full archive session list took 0.96 seconds first, then 0 seconds from the cache. The installed app has not been updated.
-- Draft PR [#301](https://github.com/hwang2409/wiki/pull/301) contains this followup fix. It is not merged or installed.
+- PR [#301](https://github.com/hwang2409/wiki/pull/301) is ready for review. It is not merged or installed.
