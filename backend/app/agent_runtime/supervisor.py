@@ -574,8 +574,6 @@ class Supervisor:
             store.paths.runtime_dir,
             archive_dir=store.paths.archive_dir,
         )
-        self.store.set_archive_events_preparer(self._prepare_terminal_archive)
-        self.store.set_archive_events_validator(self._validate_terminal_archive)
         for run_id in self.event_store.corrupt_raw_run_ids:
             reason = "raw event log is corrupt"
             self.materializer_failed_runs[run_id] = reason
@@ -5987,7 +5985,6 @@ Preserve the same identity, role, worktree, orchestrator grouping, PR gates, and
         command_hash: str | None = None,
         command_hash_payload: Mapping[str, Any] | None = None,
     ) -> tuple[RunRecord, Path]:
-        self._prepare_terminal_archive(run_id)
         archived, session_dir = self.store.archive_current(run_id, outcome=outcome)
         if effect_id is not None:
             effect_payload: dict[str, Any] = {
@@ -6013,87 +6010,6 @@ Preserve the same identity, role, worktree, orchestrator grouping, PR gates, and
                 command_hash=command_hash,
             )
         return archived, session_dir
-
-    def _prepare_terminal_archive(self, run_id: str) -> None:
-        """Repair skipped terminal normalization before archive export."""
-
-        record = self.store.get(run_id)
-        if record.state not in TERMINAL_STATES:
-            return
-        self._validate_archive_raw_sequences(
-            run_id,
-            [
-                int(row["seq"])
-                for row in self.store._iter_json_lines(  # noqa: SLF001
-                    self.store.raw_events_path(run_id)
-                )
-            ],
-        )
-        self._repair_and_validate_projection(run_id)
-
-    @staticmethod
-    def _validate_archive_raw_sequences(run_id: str, raw_seqs: list[int]) -> None:
-        if raw_seqs != sorted(raw_seqs):
-            raise StoreError(
-                f"archive event parity failed for {run_id}: raw_seq is not ordered"
-            )
-        counts: dict[int, int] = {}
-        for seq in raw_seqs:
-            counts[seq] = counts.get(seq, 0) + 1
-        duplicates = sorted(seq for seq, count in counts.items() if count > 1)
-        if duplicates:
-            raise StoreError(
-                f"archive event parity failed for {run_id}: "
-                f"duplicate raw_seq={duplicates}"
-            )
-        if raw_seqs:
-            missing = sorted(
-                set(range(min(raw_seqs), max(raw_seqs) + 1)) - set(raw_seqs)
-            )
-            if missing:
-                raise StoreError(
-                    f"archive event parity failed for {run_id}: missing={missing}"
-                )
-
-    def _validate_terminal_archive(self, run_id: str, session_dir: Path) -> None:
-        """Reject terminal archives whose normalized rows do not cover raw rows."""
-
-        record = self.store.get(run_id)
-        if record.state not in TERMINAL_STATES:
-            return
-        raw_seqs = [
-            int(row["seq"])
-            for row in self.store._iter_json_lines(session_dir / "raw.jsonl")  # noqa: SLF001
-        ]
-        normalized_seqs: list[int] = []
-        for row in self.store._iter_json_lines(  # noqa: SLF001
-            session_dir / "events.jsonl"
-        ):
-            if not isinstance(row.get("kind"), str) or not row["kind"]:
-                raise StoreError(
-                    f"archive event parity failed for {run_id}: missing kind"
-                )
-            try:
-                raw_seq = int(row["raw_seq"])
-            except (KeyError, TypeError, ValueError) as exc:
-                raise StoreError(
-                    f"archive event parity failed for {run_id}: invalid raw_seq"
-                ) from exc
-            if raw_seq < 1:
-                raise StoreError(
-                    f"archive event parity failed for {run_id}: invalid raw_seq"
-                )
-            normalized_seqs.append(raw_seq)
-        self._validate_archive_raw_sequences(run_id, raw_seqs)
-        raw_seq_set = set(raw_seqs)
-        normalized_seq_set = set(normalized_seqs)
-        missing = raw_seq_set - normalized_seq_set
-        unknown = normalized_seq_set - raw_seq_set
-        if missing or unknown:
-            raise StoreError(
-                f"archive event parity failed for {run_id}: "
-                f"missing={sorted(missing)} unknown={sorted(unknown)}"
-            )
 
     async def _archive_locked(
         self,

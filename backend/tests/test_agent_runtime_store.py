@@ -2711,6 +2711,24 @@ class RunStoreTests(unittest.TestCase):
             outside.write_bytes(b"must-not-be-copied")
             linked_artifact = artifact_dir / "00000000-0000-4000-8000-000000000086.jpg"
             linked_artifact.symlink_to(outside)
+            raw = store.append_raw(
+                record.run_id,
+                provider="codex",
+                direction="provider",
+                payload={"method": "artifact"},
+            )
+            store.append_normalized(
+                record.run_id,
+                raw_seq=int(raw["seq"]),
+                disposition=EventDisposition.RENDERED,
+                kind="artifact",
+                payload={
+                    "kind": "artifact",
+                    "id": artifact_path.stem,
+                    "title": "saved image",
+                    "artifact": {"kind": "image", "filename": artifact_path.name},
+                },
+            )
 
             archived, session_dir = store.archive_current(
                 record.run_id,
@@ -2722,18 +2740,22 @@ class RunStoreTests(unittest.TestCase):
             self.assertEqual(store.current_run_id("WIKI-42"), None)
             self.assertFalse(status_path.exists())
             self.assertTrue((session_dir / "run.json").is_file())
-            self.assertTrue((session_dir / "raw.jsonl").is_file())
-            self.assertTrue((session_dir / "events.jsonl").is_file())
-            self.assertTrue((session_dir / "cdx-WIKI-42.log").is_file())
+            self.assertFalse((session_dir / "raw.jsonl").exists())
+            self.assertFalse((session_dir / "events.jsonl").exists())
+            self.assertFalse((session_dir / "cdx-WIKI-42.log").exists())
+            artifact_events = (session_dir / "artifact-events.jsonl").read_text(
+                encoding="utf-8"
+            )
+            self.assertIn("saved image", artifact_events)
             archived_artifact = session_dir / "artifacts" / artifact_path.name
             self.assertEqual(archived_artifact.read_bytes(), b"artifact-png")
             self.assertEqual(archived_artifact.stat().st_mode & 0o777, 0o600)
             self.assertTrue(
                 (session_dir / "artifacts" / linked_artifact.name).is_symlink()
             )
-            self.assertEqual(
-                (session_dir / "cdx-WIKI-42-prompt.md").read_text(encoding="utf-8"),
-                "Work on ticket WIKI-42",
+            self.assertNotIn(
+                "initial_prompt",
+                json.loads((session_dir / "run.json").read_text(encoding="utf-8")),
             )
             meta = json.loads((session_dir / "meta.json").read_text(encoding="utf-8"))
             self.assertEqual(meta["outcome"], "merged")
@@ -2783,6 +2805,22 @@ class RunStoreTests(unittest.TestCase):
 
             self.assertLess(events.index("file"), events.index("marker"))
             self.assertLess(events.index("marker"), events.index("delete"))
+
+    def test_archive_lookup_verifies_only_the_catalog_match(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            store = RunStore(_paths(root))
+            for agent_id in ("WIKI-LOOKUP-1", "WIKI-LOOKUP-2"):
+                record = store.create(_record(root, agent_id=agent_id))
+                store.transition(record.run_id, LifecycleState.COMPLETED)
+                store.archive_current(record.run_id)
+            with mock.patch.object(
+                store_module,
+                "archive_is_committed",
+                wraps=archive_is_committed,
+            ) as verify:
+                self.assertEqual(store.find_archived_run(record.run_id).run_id, record.run_id)
+            self.assertEqual(verify.call_count, 1)
 
     def test_fsync_helpers_surface_os_failures(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -2844,7 +2882,7 @@ class RunStoreTests(unittest.TestCase):
                 list(paths.archive_dir.glob(f"*/*/{ARCHIVE_COMPLETION_MARKER}")), []
             )
 
-    def test_missing_required_events_keeps_live_run_until_restored(self) -> None:
+    def test_missing_events_do_not_block_receipt(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
             paths = _paths(root)
@@ -2854,18 +2892,10 @@ class RunStoreTests(unittest.TestCase):
             events_path = store.normalized_events_path(record.run_id)
             events_path.unlink()
 
-            with self.assertRaisesRegex(OSError, "archive file is missing"):
-                store.archive_current(record.run_id)
-
-            self.assertTrue(store.run_dir(record.run_id).is_dir())
-            self.assertEqual(
-                list(paths.archive_dir.glob(f"*/*/{ARCHIVE_COMPLETION_MARKER}")), []
-            )
-
-            events_path.write_text("", encoding="utf-8")
-            store.archive_current(record.run_id)
+            _, session_dir = store.archive_current(record.run_id)
             self.assertFalse(store.run_dir(record.run_id).exists())
             self.assertIsNotNone(store.find_archived_run(record.run_id))
+            self.assertFalse((session_dir / "events.jsonl").exists())
 
     def test_archive_marker_fsync_failure_is_not_trusted_on_retry(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -3133,12 +3163,6 @@ class RunStoreTests(unittest.TestCase):
                     for name in (
                         "run.json",
                         "meta.json",
-                        "cdx-WIKI-CRASH-ARCHIVE.log",
-                        "raw.jsonl",
-                        "events.jsonl",
-                        "current-turn-diff.json",
-                        "provider.log",
-                        "cdx-WIKI-CRASH-ARCHIVE-prompt.md",
                         "final-status.json",
                         "artifacts/artifact.bin",
                     )
@@ -3205,12 +3229,11 @@ class RunStoreTests(unittest.TestCase):
 
                 if marker_committed:
                     archive_root = store.paths.archive_dir / record.agent_id
-                    archive_files = [
-                        path
-                        for path in archive_root.glob("*/*")
-                        if path.is_file() and path.name != ARCHIVE_COMPLETION_MARKER
-                    ]
-                    self.assertGreaterEqual(len(archive_files), 8)
+                    session_dir = next(archive_root.iterdir())
+                    if archive_is_committed(session_dir):
+                        self.assertTrue((session_dir / "artifacts" / "artifact.bin").is_file())
+                    else:
+                        self.assertTrue(all(path.is_file() for path in expected_source))
                 else:
                     self.assertTrue(all(path.is_file() for path in expected_source))
 
@@ -3239,7 +3262,7 @@ class RunStoreTests(unittest.TestCase):
             self.assertFalse(restarted.run_dir(record.run_id).exists())
             archived = restarted.find_archived_run(record.run_id)
             self.assertIsNotNone(archived)
-            sessions = list((paths.archive_dir / record.agent_id).glob("*/events.jsonl"))
+            sessions = list((paths.archive_dir / record.agent_id).glob("*/meta.json"))
             self.assertEqual(len(sessions), 1)
             self.assertEqual(restarted.list_runs(), [])
 

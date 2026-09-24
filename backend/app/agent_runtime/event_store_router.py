@@ -295,9 +295,6 @@ class EventStoreRouter:
     def replace_run_from(self, source: Path | str, run_id: str) -> None:
         self.for_run(run_id).replace_run_from(source, run_id)
 
-    def export_events_jsonl(self, run_id: str, destination: Path | str, **kwargs: Any) -> bool:
-        return self.for_run(run_id).export_events_jsonl(run_id, destination, **kwargs)
-
     def backfill_completed_run_ids(self, normalizer_version: str) -> set[str]:
         return self.metadata_store.backfill_completed_run_ids(normalizer_version)
 

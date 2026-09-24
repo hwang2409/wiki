@@ -15,7 +15,8 @@ from typing import Any
 ARCHIVE_COMPLETION_MARKER = "archive-complete.json"
 ARCHIVE_MANIFEST_NAME = "archive-manifest.json"
 ARCHIVE_CATALOG_NAME = "archive-catalog.json"
-REQUIRED_ARCHIVE_FILES = ("raw.jsonl", "events.jsonl", "run.json")
+REQUIRED_ARCHIVE_FILES = ("run.json", "meta.json")
+LEGACY_REQUIRED_ARCHIVE_FILES = ("raw.jsonl", "events.jsonl", "run.json")
 
 
 def _fsync_directory(path: Path) -> None:
@@ -286,7 +287,11 @@ def _manifest_is_verified(directory: Path, marker: dict[str, Any]) -> bool:
         or manifest.get("completed_at") != marker.get("completed_at")
     ):
         return False
-    if manifest.get("required_files") != list(REQUIRED_ARCHIVE_FILES):
+    required_files = manifest.get("required_files")
+    if required_files not in (
+        list(REQUIRED_ARCHIVE_FILES),
+        list(LEGACY_REQUIRED_ARCHIVE_FILES),
+    ):
         return False
     files = manifest.get("files")
     if not isinstance(files, dict) or not files:
@@ -295,13 +300,13 @@ def _manifest_is_verified(directory: Path, marker: dict[str, Any]) -> bool:
     if not isinstance(optional_files, list):
         return False
     if any(
-        not isinstance(path, str) or path in REQUIRED_ARCHIVE_FILES
+        not isinstance(path, str) or path in required_files
         for path in optional_files
     ):
         return False
     if len(set(optional_files)) != len(optional_files):
         return False
-    if set(files) != set(REQUIRED_ARCHIVE_FILES).union(optional_files):
+    if set(files) != set(required_files).union(optional_files):
         return False
     for relative, expected_size in files.items():
         if (
@@ -323,7 +328,7 @@ def _manifest_is_verified(directory: Path, marker: dict[str, Any]) -> bool:
             or path_stat.st_size != expected_size
         ):
             return False
-    for name in REQUIRED_ARCHIVE_FILES:
+    for name in required_files:
         path = directory / name
         try:
             path_stat = path.lstat()
