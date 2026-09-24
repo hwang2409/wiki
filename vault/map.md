@@ -112,6 +112,7 @@ Topic → note index. **Agents: read this file first, before grepping.** Every n
 - [[PHO-17602-SCOUT-memo]] — bash-tool eval design memo: coverage map vs Henry's question list, lineage/intent gaps, rewrite audit + preload experiment design (PHO-17602)
 - [[PHO-17602-CENSUS-memo]] — production v3 bash census: 51 runs/59 calls, python-heredoc flail (35 AST revisions in 4 runs), empty workspace-file table vs 113 write audits, 8 golden-case targets
 - [[eval-adherence-checklist]] — canonical eval checklist (howtoeval + anthropic demystifying-evals): reference solutions, negative cases, pass^k, broken-task rule, transcript reading
+- [[v3-evals-improvement-tasks]] — completable tasks for trusted v3 agent eval grading, branch comparison, and failure review
 
 ## Phoebe/til
 
