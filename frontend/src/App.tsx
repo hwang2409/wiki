@@ -97,7 +97,6 @@ import {
   type AgentSessionSurfaceWorker,
 } from "./agent-session-surface";
 import { LoadingPlaceholder } from "./loading";
-import { GraphView } from "./graph";
 import { HealthView } from "./health";
 import { TokensView } from "./tokens";
 import { DashboardView } from "./dashboard";
@@ -128,7 +127,6 @@ type Mode =
   | "edit"
   | "new"
   | "activity"
-  | "graph"
   | "health"
   | "agents"
   | "tokens"
@@ -136,7 +134,7 @@ type Mode =
   | "fleet-graph"
   | "agent"
   | "terminal";
-type UtilityMode = "activity" | "graph" | "health" | "agents" | "tokens" | "dashboard" | "fleet-graph";
+type UtilityMode = "activity" | "health" | "agents" | "tokens" | "dashboard" | "fleet-graph";
 type SidebarTab = "files" | "agents";
 type SplitPosition = "left" | "right" | "top" | "bottom";
 type DropZone = SplitPosition | "center";
@@ -910,7 +908,6 @@ type Route =
 
 const UTILITY_ROUTES: readonly UtilityMode[] = [
   "activity",
-  "graph",
   "health",
   "agents",
   "tokens",
@@ -1386,7 +1383,6 @@ export default function App() {
     error: null,
   });
   const [refreshTick, setRefreshTick] = useState(0);
-  const [vaultRefreshTick, setVaultRefreshTick] = useState(0);
   // WIKI-151: dedicated nonce for the file-explorer retry. This keeps a file
   // retry scoped to its fetch instead of changing unrelated refresh state.
   const [filesRetryNonce, setFilesRetryNonce] = useState(0);
@@ -1481,9 +1477,6 @@ export default function App() {
             }, 400);
           }
           return;
-        }
-        if (payload.type === "vault" || payload.type === "note") {
-          setVaultRefreshTick((tick) => tick + 1);
         }
         if (isAgentTopologyEvent(payload.type)) {
           setWorkspaceDiscoveryNonce((nonce) => nonce + 1);
@@ -3359,7 +3352,6 @@ export default function App() {
   const canSave = mode === "edit" || draft.title.trim().length > 0;
   const utilityTitles: Partial<Record<Mode, string>> = {
     activity: "Activity",
-    graph: "Graph",
     health: "Health",
     agents: "Runs",
     tokens: "Tokens",
@@ -3522,9 +3514,6 @@ export default function App() {
   function renderFocusedPaneOverlayContent(): ReactNode {
     if (mode === "activity") {
       return <ActivityFeed onOpenNote={openNote} refreshTick={refreshTick} />;
-    }
-    if (mode === "graph") {
-      return <GraphView onOpenNote={openNote} refreshTick={vaultRefreshTick} />;
     }
     if (mode === "health") {
       return <HealthView
@@ -3736,7 +3725,6 @@ export default function App() {
     { key: "new-terminal", label: "New terminal", title: "New terminal (C-a t)", icon: TerminalIcon, active: false, onSelect: createTerminalPane },
     { key: "agents", label: "Runs", icon: Bot, active: mode === "agents", onSelect: () => openUtilityView("agents") },
     { key: "activity", label: "Activity feed", icon: History, active: mode === "activity", onSelect: () => openUtilityView("activity") },
-    { key: "graph", label: "Graph view", icon: Waypoints, active: mode === "graph", onSelect: () => openUtilityView("graph") },
     { key: "health", label: "Note freshness", icon: HeartPulse, active: mode === "health", onSelect: () => openUtilityView("health") },
     { key: "tokens", label: "Token usage", icon: TrendingUp, active: mode === "tokens", onSelect: () => openUtilityView("tokens") },
     { key: "dashboard", label: "Ticket dashboard", icon: ClipboardList, active: mode === "dashboard", onSelect: () => openUtilityView("dashboard") },
@@ -4154,8 +4142,6 @@ export default function App() {
             <div className="view-content" ref={viewContentRef}>
               {mode === "activity" ? (
                 <ActivityFeed onOpenNote={openNote} refreshTick={refreshTick} />
-              ) : mode === "graph" ? (
-                <GraphView onOpenNote={openNote} refreshTick={vaultRefreshTick} />
               ) : mode === "health" ? (
                 <HealthView
                   error={notesError}

@@ -122,11 +122,10 @@ async function main() {
 
     await openSidebarPage(page, "Token usage", "tokens", 3);
     await openSidebarPage(page, "Activity feed", "activity", 4);
-    await openSidebarPage(page, "Graph view", "graph", 5);
-    await openSidebarPage(page, "Note freshness", "health", 6);
+    await openSidebarPage(page, "Note freshness", "health", 5);
 
     const allPages = await storedWorkspace(page);
-    for (const kind of ["agents", "tokens", "activity", "graph", "health"]) {
+    for (const kind of ["agents", "tokens", "activity", "health"]) {
       assert(windowForUtility(allPages, kind), `Missing dedicated ${kind} workspace window`);
     }
     assert(JSON.stringify(allPages.windows[0]) === originalWindow, "A sidebar page changed the worker window");
