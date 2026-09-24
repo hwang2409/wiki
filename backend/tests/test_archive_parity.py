@@ -310,6 +310,31 @@ def test_parity_harness_compares_raw_prefix_boundaries(tmp_path: Path) -> None:
     assert any(mismatch.raw_seq == 1 for report in reports for mismatch in report.mismatches)
 
 
+def test_parity_backfill_samples_raw_prefixes_for_long_runs(tmp_path: Path) -> None:
+    from backend.app.agent_runtime import archive_parity
+
+    store, event_store, record = _run_with_one_event(tmp_path)
+    for index in range(2, 31):
+        store.append_raw(
+            record.run_id,
+            provider="codex",
+            direction="provider",
+            payload={"method": "warning", "params": {"message": str(index)}},
+        )
+
+    reports = archive_parity._compare_raw_prefixes(
+        store,
+        event_store,
+        record.run_id,
+        record=False,
+        max_prefixes=archive_parity.BACKFILL_RAW_PREFIX_CHECKPOINTS,
+    )
+
+    assert len(reports) == archive_parity.BACKFILL_RAW_PREFIX_CHECKPOINTS
+    assert reports[0].raw_seq == 1
+    assert reports[-1].raw_seq == 30
+
+
 def test_backfill_skips_wrong_version_and_rebuild_state_and_records_both(
     tmp_path: Path,
 ) -> None:
@@ -683,17 +708,17 @@ def test_backfill_skips_live_materializer_lock_then_processes_after_release(
 
 
 def test_backfill_releases_run_lock_before_boundary_compare(tmp_path: Path) -> None:
-    # The boundary compare is O(events^2); holding the run lock across it
-    # blocks a concurrent archive of the same run for the whole sweep
-    # (2026-08-24 fleet write outage).
+    # The comparison still does substantial work. Keep the archive lock free.
     store = RunStore(_paths(tmp_path))
     event_store = SQLiteEventStore(tmp_path / "runtime" / "events.sqlite3")
     record = _add_terminal_run(store, event_store, index=1)
     from backend.app.agent_runtime import archive_parity
 
     acquired_during_compare: list[bool] = []
+    sampled_prefix_limits: list[object] = []
 
-    def probing_compare(*_args: object, **_kwargs: object) -> tuple:
+    def probing_compare(*_args: object, **kwargs: object) -> tuple:
+        sampled_prefix_limits.append(kwargs.get("max_raw_prefixes"))
         lock = event_store.run_lock(record.run_id)
         result: list[bool] = []
 
@@ -717,6 +742,7 @@ def test_backfill_releases_run_lock_before_boundary_compare(tmp_path: Path) -> N
         results = backfill_headless_runs(store, event_store, batch_size=1)
 
     assert acquired_during_compare == [True]
+    assert sampled_prefix_limits == [archive_parity.BACKFILL_RAW_PREFIX_CHECKPOINTS]
     assert results[0].status == "ready"
 
 
