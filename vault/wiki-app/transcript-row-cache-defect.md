@@ -2,7 +2,7 @@
 type: til
 tags: [wiki-app, frontend, rca]
 created: 2026-08-27
-updated: 2026-08-27
+updated: 2026-09-24
 ---
 
 # Transcript row cache: display-space vs session-space index mismatch
@@ -21,6 +21,8 @@ An incremental cache that accepts a "changed from index N" hint is only sound if
 - `stabilizeSyntheticEvents` reuses prior synthetic event objects across recomputes when flat fields are unchanged — keeps the identity diff tight and preserves `prev.row.event === next.row.event` memoization.
 
 ## Reusable lessons
+
+- 2026-09-24: Henry reports the same pane-switch symptom in long orchestrator runs. The running native bundle was built 2026-09-24 11:33; `build-native-app.sh` rebuilds the frontend, and current `main` contains PR #298. Treat this as a recurrence with an unconfirmed new mechanism; inspect the active pane before switching to distinguish a missing virtual row from a stale paint or delayed transcript fetch.
 
 - Remount-fixes-it symptoms in a polled view = component-level incremental cache staleness, not store staleness. Probe: remount a second view over the same store at failure time.
 - Identity-diff invariant: safe only while nothing mutates events in place. transcript-merge always allocates new objects on change — preserve that.
