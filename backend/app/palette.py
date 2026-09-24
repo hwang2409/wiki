@@ -760,7 +760,7 @@ def collect_artifact_items_from_index(
     limit: int = DEFAULT_LIMIT,
     should_cancel: Callable[[], bool] | None = None,
 ) -> list[PaletteItem] | None:
-    """Build palette artifacts from SQLite without walking event JSONL files.
+    """Build palette artifacts from live SQLite and recent archives.
 
     ``None`` means the index is not available yet.  Callers then retain the
     legacy scan for installations that have not materialized any runs.

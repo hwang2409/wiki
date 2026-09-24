@@ -178,6 +178,7 @@ Topic → note index. **Agents: read this file first, before grepping.** Every n
 - [[backend-outage-2026-09-16]] — SIGKILL+respawn at 11:51 EDT, then 3-min saturation wedge; evidence for the shared-backend P1
 - [[knowledge-index-cpu-rca-2026-09-24]] — notes-only knowledge DB decision and 11 GB archive-index CPU root cause
 - [[agents-list-cpu-rca-2026-09-24]] — archive-list catalog and body reads drive slow agent polls; lowercase workgraph errors add churn
+- [[palette-cpu-rca-2026-09-24]] — palette startup and search scan agent archives for artifacts; recent-session bound and cache
 
 ## Wiki/til
 

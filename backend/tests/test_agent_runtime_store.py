@@ -3116,9 +3116,6 @@ class RunStoreTests(unittest.TestCase):
                     store_module, "_atomic_write_json", side_effect=record_marker
                 ),
                 mock.patch.object(store_module.os, "replace", side_effect=replace),
-                mock.patch.object(
-                    store_module.knowledge, "enqueue_refresh", return_value=None
-                ),
             ):
                 store.archive_current(record.run_id)
             self.assertGreater(fsync_calls, 0)
@@ -3203,9 +3200,6 @@ class RunStoreTests(unittest.TestCase):
                     ),
                     mock.patch.object(
                         store_module.os, "replace", side_effect=wrapped_replace
-                    ),
-                    mock.patch.object(
-                        store_module.knowledge, "enqueue_refresh", return_value=None
                     ),
                 ):
                     with self.assertRaises(RuntimeError):
