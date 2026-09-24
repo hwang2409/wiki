@@ -69,6 +69,7 @@ from .agent_runtime.loop_state import derive_loop_state
 from .agent_runtime.archive_protocol import (
     archive_is_committed,
     read_archive_catalog,
+    recent_archive_sessions,
 )
 from .agent_runtime.event_store import RuntimeEventStore, SQLiteEventStore
 from .agent_runtime.store import RuntimePaths
@@ -1211,25 +1212,6 @@ def _palette_artifacts_or_legacy_scan(
         if state.rebuild_state != "ready":
             return None
     return indexed_artifacts
-
-
-_PALETTE_ARCHIVED_LOCK = threading.Lock()
-_PALETTE_ARCHIVED_CACHE: tuple[float, list[dict]] | None = None
-
-
-def _palette_archived_sessions() -> list[dict]:
-    """Reuse the archive session list while one palette search is in progress."""
-
-    global _PALETTE_ARCHIVED_CACHE
-    with _PALETTE_ARCHIVED_LOCK:
-        now = time.monotonic()
-        if _PALETTE_ARCHIVED_CACHE is not None:
-            cached_at, rows = _PALETTE_ARCHIVED_CACHE
-            if now - cached_at < 5:
-                return rows
-        rows = list_archived(limit=None)
-        _PALETTE_ARCHIVED_CACHE = (time.monotonic(), rows)
-        return rows
 
 
 RUN_ID_PATTERN = re.compile(
@@ -2569,28 +2551,17 @@ async def palette_search(
             and isinstance(worker.get("ticket"), str)
         }
         archive_by_run: dict[str, tuple[str, str]] = {}
-        archived = agents_payload.get("archived", []) if isinstance(agents_payload, dict) else []
-        all_archived = _palette_archived_sessions()
-        for entry in all_archived:
-            if not isinstance(entry, dict):
+        for session_dir, run_id, _completed_at in recent_archive_sessions(AGENT_ARCHIVE_DIR):
+            match = ARCHIVE_TS_PATTERN.fullmatch(session_dir.name)
+            if match is None:
                 continue
-            run_id = entry.get("run_id")
-            ticket = entry.get("ticket")
-            archived_at = entry.get("archived_at")
-            if (
-                isinstance(run_id, str)
-                and isinstance(ticket, str)
-                and isinstance(archived_at, str)
-            ):
-                ticket_by_run[run_id] = ticket
-                archive_by_run[run_id] = (ticket, archived_at)
-        for entry in archived:
-            if not isinstance(entry, dict):
+            try:
+                archived_at = datetime(*map(int, match.groups())).astimezone().isoformat()
+            except ValueError:
                 continue
-            run_id = entry.get("run_id")
-            ticket = entry.get("ticket")
-            if isinstance(run_id, str) and isinstance(ticket, str):
-                ticket_by_run[run_id] = ticket
+            ticket = session_dir.parent.name
+            ticket_by_run[run_id] = ticket
+            archive_by_run[run_id] = (ticket, archived_at)
         event_store = _sqlite_event_store()
         indexed_artifacts = palette.collect_artifact_items_from_index(
             event_store,
@@ -2605,14 +2576,10 @@ async def palette_search(
             indexed_artifacts,
             workers,
         )
-        palette_agents_payload = (
-            dict(agents_payload) if isinstance(agents_payload, dict) else {}
-        )
-        palette_agents_payload["archived"] = all_archived
         return palette.search(
             q,
             limit,
-            agents_payload=palette_agents_payload,
+            agents_payload=agents_payload,
             vault_dir=VAULT_DIR,
             runs_dir=SUPERVISOR_CLIENT.paths.runs_dir,
             archive_dir=AGENT_ARCHIVE_DIR,
@@ -3984,7 +3951,9 @@ def _archived_events_payload(
     client_path: str | None,
     fallback_kind: str | None,
 ) -> dict[str, object] | None:
-    path = archive_dir / "events.jsonl"
+    path = archive_dir / "artifact-events.jsonl"
+    if not path.is_file():
+        path = archive_dir / "events.jsonl"
     if not path.is_file():
         return None
     entry, model, kind, provider = _archive_runtime_identity(
@@ -4798,6 +4767,17 @@ def get_agent_artifact(
     else:
         canonical_ticket = ticket.upper()
 
+    for archive_dir, _run_id, _completed_at in recent_archive_sessions(AGENT_ARCHIVE_DIR):
+        if archive_dir.parent.name != canonical_ticket:
+            continue
+        archived = _artifact_file(archive_dir / "artifacts", artifact_id, variant)
+        if archived is not None:
+            target, media_type = archived
+            return FileResponse(
+                target,
+                media_type=media_type,
+                headers={"Cache-Control": "private, max-age=3600"},
+            )
     _, _, archive_dir = _archive_hint(canonical_ticket)
     if archive_dir is not None:
         archived = _artifact_file(archive_dir / "artifacts", artifact_id, variant)

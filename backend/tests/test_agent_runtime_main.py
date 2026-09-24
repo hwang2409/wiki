@@ -1118,6 +1118,41 @@ class HeadlessMainRouteTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(session["path"], str(session_dir / "events.jsonl"))
         self.assertEqual(session["provider"], "codex")
 
+    async def test_compact_archive_opens_saved_artifact_without_run_events(self) -> None:
+        self._seed_headless()
+        session_dir = self.archive_dir / "WIKI-42" / "20260731-000000"
+        session_dir.mkdir(parents=True)
+        run_id = "00000000-0000-4000-8000-000000000099"
+        (session_dir / "run.json").write_text(
+            json.dumps({"run_id": run_id, "provider": "codex", "model": "gpt-5.4"}),
+            encoding="utf-8",
+        )
+        (session_dir / "meta.json").write_text("{}", encoding="utf-8")
+        (session_dir / "artifact-events.jsonl").write_text(
+            json.dumps(
+                {
+                    "seq": 1,
+                    "kind": "artifact",
+                    "disposition": "rendered",
+                    "payload": {
+                        "kind": "artifact",
+                        "id": "saved-artifact",
+                        "title": "saved table",
+                        "artifact": {"kind": "table", "rows": [["saved"]]},
+                    },
+                }
+            )
+            + "\n",
+            encoding="utf-8",
+        )
+        commit_archive(session_dir, run_id=run_id)
+
+        archived_at = main._archive_hint("WIKI-42")[1]
+        session = main.agent_session("WIKI-42", archived_at=archived_at, run_id=run_id)
+
+        self.assertEqual(session["path"], str(session_dir / "artifact-events.jsonl"))
+        self.assertTrue(any(event.get("artifact_id") == "saved-artifact" for event in session["events"]))
+
     async def test_archived_session_identity_survives_live_replacement_and_older_page(self) -> None:
         self._seed_headless()
         archive_dir = self.archive_dir / "WIKI-42"
