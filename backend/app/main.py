@@ -42,7 +42,6 @@ from . import (
     knowledge,
     palette,
     provider_health,
-    replay,
     screencast,
     terminal,
     tokens,
@@ -4019,20 +4018,6 @@ def agent_provider_events(
     return result
 
 
-def _open_runs_root_fd_or_404() -> int:
-    try:
-        return replay.open_runs_root_fd(AGENT_RUNS_DIR)
-    except FileNotFoundError as exc:
-        raise HTTPException(status_code=404, detail="Runs root missing") from exc
-    except OSError as exc:
-        raise HTTPException(status_code=500, detail=f"Runs root unreadable: {exc}") from exc
-
-
-def _validate_run_id_or_400(run_id: str) -> None:
-    if not replay.valid_run_id(run_id):
-        raise HTTPException(status_code=400, detail="Bad run id")
-
-
 def _archive_session_for_run_id(run_id: str) -> Path | None:
     """Find the committed archive session for one exact run id."""
 
@@ -4043,149 +4028,6 @@ def _archive_session_for_run_id(run_id: str) -> Path | None:
         if run.get("run_id") == run_id:
             return session_dir
     return None
-
-
-def _open_archived_replay_run(run_id: str) -> int:
-    archive_dir = _archive_session_for_run_id(run_id)
-    if archive_dir is None:
-        raise HTTPException(status_code=404, detail="Run not found")
-    try:
-        return replay.open_run_dir_fd(archive_dir)
-    except replay.ReplayError as exc:
-        raise HTTPException(status_code=exc.status_code, detail=str(exc)) from exc
-
-
-def _archived_replay_runs(ticket: str) -> list[replay.RunSummary]:
-    ticket_dir = AGENT_ARCHIVE_DIR / ticket
-    if not ticket_dir.is_dir():
-        return []
-    summaries: list[replay.RunSummary] = []
-    for session_dir in sorted(ticket_dir.glob("*"), reverse=True):
-        if not archive_is_committed(session_dir):
-            continue
-        run_id = _read_json_object(session_dir / "run.json").get("run_id")
-        if not isinstance(run_id, str) or not replay.valid_run_id(run_id):
-            continue
-        try:
-            run_fd = replay.open_run_dir_fd(session_dir)
-            try:
-                summary = replay.build_run_summary_from_run_fd(run_fd, run_id)
-            finally:
-                os.close(run_fd)
-        except replay.ReplayError:
-            continue
-        if summary.agent_id == ticket:
-            summaries.append(summary)
-    return summaries
-
-
-@app.get("/api/agents/{ticket}/replay/runs")
-def agent_replay_runs(ticket: str) -> dict[str, object]:
-    if not TICKET_PATTERN.fullmatch(ticket):
-        raise HTTPException(status_code=400, detail="Bad ticket")
-    try:
-        runs_root_fd = _open_runs_root_fd_or_404()
-    except HTTPException:
-        listing = None
-    else:
-        try:
-            listing = replay.resolve_ticket_runs(runs_root_fd, ticket)
-        finally:
-            os.close(runs_root_fd)
-    runs = list(listing.runs) if listing is not None else []
-    seen_run_ids = {run.run_id for run in runs}
-    for archived in _archived_replay_runs(ticket):
-        if archived.run_id not in seen_run_ids:
-            runs.append(archived)
-            seen_run_ids.add(archived.run_id)
-    runs_truncated = (
-        (listing.truncated if listing is not None else False)
-        or len(runs) > replay.MAX_RUN_LIST_ENTRIES
-    )
-    runs = runs[: replay.MAX_RUN_LIST_ENTRIES]
-    return {
-        "ticket": ticket,
-        "runs": [run.as_dict() for run in runs],
-        "runs_truncated": runs_truncated,
-    }
-
-
-@app.get("/api/agent-runs/{run_id}/replay/timeline")
-def agent_run_replay_timeline(
-    run_id: str,
-    cursor: str | None = None,
-    limit: int = replay.DEFAULT_LIMIT,
-) -> dict[str, object]:
-    _validate_run_id_or_400(run_id)
-    if limit < 1 or limit > replay.MAX_LIMIT:
-        raise HTTPException(
-            status_code=400,
-            detail=f"limit must be between 1 and {replay.MAX_LIMIT}",
-        )
-    try:
-        runs_root_fd = _open_runs_root_fd_or_404()
-    except HTTPException:
-        archived_fd = _open_archived_replay_run(run_id)
-        try:
-            return replay.build_timeline_response_from_run_fd(
-                archived_fd, run_id, cursor=cursor, limit=limit
-            )
-        except replay.ReplayError as exc:
-            raise HTTPException(status_code=exc.status_code, detail=str(exc)) from exc
-        finally:
-            os.close(archived_fd)
-    try:
-        try:
-            replay.verify_run_dir_exists(runs_root_fd, run_id)
-        except replay.ReplayError:
-            os.close(runs_root_fd)
-            runs_root_fd = -1
-            runs_root_fd = _open_archived_replay_run(run_id)
-            return replay.build_timeline_response_from_run_fd(
-                runs_root_fd, run_id, cursor=cursor, limit=limit
-            )
-        return replay.build_timeline_response(
-            runs_root_fd, run_id, cursor=cursor, limit=limit
-        )
-    except replay.ReplayError as exc:
-        raise HTTPException(status_code=exc.status_code, detail=str(exc)) from exc
-    finally:
-        if runs_root_fd >= 0:
-            os.close(runs_root_fd)
-
-
-@app.get("/api/agent-runs/{run_id}/replay/events/{seq}")
-def agent_run_replay_event(run_id: str, seq: int) -> dict[str, object]:
-    if seq <= 0:
-        raise HTTPException(status_code=400, detail="Seq must be positive")
-    _validate_run_id_or_400(run_id)
-    try:
-        runs_root_fd = _open_runs_root_fd_or_404()
-    except HTTPException:
-        archived_fd = _open_archived_replay_run(run_id)
-        try:
-            entry = replay.load_raw_event_from_run_fd(archived_fd, run_id, seq)
-        finally:
-            os.close(archived_fd)
-    else:
-        try:
-            try:
-                replay.verify_run_dir_exists(runs_root_fd, run_id)
-            except replay.ReplayError:
-                os.close(runs_root_fd)
-                runs_root_fd = -1
-                runs_root_fd = _open_archived_replay_run(run_id)
-                entry = replay.load_raw_event_from_run_fd(runs_root_fd, run_id, seq)
-            else:
-                entry = replay.load_raw_event(runs_root_fd, run_id, seq)
-        except replay.ReplayError as exc:
-            raise HTTPException(status_code=exc.status_code, detail=str(exc)) from exc
-        finally:
-            if runs_root_fd >= 0:
-                os.close(runs_root_fd)
-    if entry is None:
-        raise HTTPException(status_code=404, detail="Event not found")
-    return {"run_id": run_id, "seq": seq, "raw": entry}
 
 
 def _session_delta_payload(
