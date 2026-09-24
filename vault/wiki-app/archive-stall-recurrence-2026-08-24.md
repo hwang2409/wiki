@@ -64,7 +64,7 @@ Outcomes:
 
 ## 2026-09-24 CPU followup
 
-- Current origin/main still runs `_compare_raw_prefixes` once per raw event during automatic backfill. Each check replays its whole prefix, so total work grows quadratically. The live supervisor was idle (~0.2% CPU) at inspection; this is a latent spike, not the current ~99% backend CPU.
-- The followup branch samples five evenly spaced raw prefixes during automatic backfill. Manual `compare_run_boundaries()` keeps exhaustive coverage. The final, crash, stale-cursor, older-page, and patch checks remain.
+- Before PR #302, automatic backfill ran `_compare_raw_prefixes` once per raw event. Each check replayed its whole prefix, so total work grew quadratically. The live supervisor was idle (~0.2% CPU) at inspection; this was a latent spike, not the current backend load.
+- Automatic backfill now samples five evenly spaced raw prefixes. Manual `compare_run_boundaries()` keeps exhaustive coverage. The final, crash, stale-cursor, older-page, and patch checks remain.
 - An isolated 50-event run took 0.032 seconds for five checks versus 0.28 seconds for all 50. Fifteen archive-parity tests passed. No new build includes this change yet.
-- PR [#302](https://github.com/hwang2409/wiki/pull/302) is ready for review. It is not merged or installed.
+- PR [#302](https://github.com/hwang2409/wiki/pull/302) merged as `baa0a40d`. The installed app still runs the old build.
