@@ -53,7 +53,6 @@ import {
 import {
   ApiError,
   type AgentWorker,
-  type ArchivedWorker,
   type FileSummary,
   type NoteLinks,
   type Orchestrator,
@@ -88,7 +87,7 @@ import { BbDialog } from "./dialogs";
 import type { FocusReturnRef } from "./modal-a11y";
 import { Button } from "./primitives";
 import { ActivityFeed } from "./activity";
-import { AgentsSidebar, AgentsView, type AccountEvent, type AgentOpenTarget } from "./agents";
+import { AgentsSidebar, AgentsView, type AccountEvent } from "./agents";
 import { isAgentRefreshEvent, isAgentTopologyEvent } from "./agent-events";
 import {
   AgentSessionView,
@@ -205,7 +204,6 @@ type WindowChooserKind = "agent" | "note";
 type AgentsSnapshot = {
   workers: AgentWorker[] | null;
   orchestrators: Orchestrator[];
-  archived: ArchivedWorker[];
   error: string | null;
   account_notices?: AccountEvent[];
 };
@@ -1379,7 +1377,6 @@ export default function App() {
   const [agentsState, setAgentsState] = useState<AgentsSnapshot>({
     workers: null,
     orchestrators: [],
-    archived: [],
     error: null,
   });
   const [refreshTick, setRefreshTick] = useState(0);
@@ -1418,7 +1415,7 @@ export default function App() {
   const [isLoading, setIsLoading] = useState(true);
   const [isSaving, setIsSaving] = useState(false);
   const [theme, setTheme] = useState<ThemeId>(() => getStoredTheme());
-  const [agentsOpenTicket, setAgentsOpenTicket] = useState<AgentOpenTarget | null>(null);
+  const [agentsOpenTicket, setAgentsOpenTicket] = useState<string | null>(null);
   const [agentsStartRunRequest, setAgentsStartRunRequest] = useState(0);
   const viewContentRef = useRef<HTMLDivElement | null>(null);
   const terminalControllersRef = useRef(new Map<string, TerminalPaneController>());
@@ -1597,7 +1594,6 @@ export default function App() {
         setAgentsState({
           workers: result.workers,
           orchestrators: result.orchestrators ?? [],
-          archived: result.archived ?? [],
           account_notices: result.account_notices ?? [],
           error: null,
         });
@@ -1607,7 +1603,7 @@ export default function App() {
         const message = err instanceof Error ? err.message : "Could not load agents";
         setAgentsState((current) =>
           current.workers === null
-            ? { workers: [], orchestrators: [], archived: [], error: message }
+            ? { workers: [], orchestrators: [], error: message }
             : { ...current, error: message }
         );
       });
@@ -1898,11 +1894,6 @@ export default function App() {
     for (const worker of agentsState.workers ?? []) {
       map.set(worker.ticket, buildAgentSessionWorker(worker));
     }
-    for (const worker of agentsState.archived ?? []) {
-      if (!map.has(worker.ticket)) {
-        map.set(worker.ticket, { ...buildAgentSessionWorker(worker), canReplace: false });
-      }
-    }
     for (const orch of agentsState.orchestrators) {
       map.set(orch.id, {
         ticket: orch.id,
@@ -1914,7 +1905,7 @@ export default function App() {
       });
     }
     return map;
-  }, [agentsState.archived, agentsState.orchestrators, agentsState.workers]);
+  }, [agentsState.orchestrators, agentsState.workers]);
   const quickSwitcherSessions = useMemo<QuickSwitcherSession[]>(() => {
     const sessions: QuickSwitcherSession[] = [];
     for (const orch of agentsState.orchestrators) {

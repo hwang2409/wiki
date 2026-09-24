@@ -5470,14 +5470,6 @@ body.is-resizing-panes .pane-cell {
   margin-top: 4px;
 }
 
-.agent-card.is-archived {
-  opacity: 0.75;
-}
-
-.agent-card.is-archived:hover {
-  opacity: 1;
-}
-
 .agents-section-head {
   display: flex;
   align-items: center;
@@ -16923,48 +16915,6 @@ body {
   transition-timing-function: var(--motion-easing, ease-out);
 }
 
-/* Archived runs are settled history. Keep metadata and its action on one
-   compact line; expanded technical details still earn a row. */
-.agent-activity-row.is-archived {
-  display: grid;
-  grid-template-columns: minmax(0, 1fr) auto;
-  align-items: center;
-  column-gap: 12px;
-  min-height: 32px;
-  padding: 2px 0;
-}
-
-.agent-activity-row.is-archived > .agent-card-header {
-  min-width: 0;
-  flex-wrap: nowrap;
-  overflow: hidden;
-}
-
-.agent-activity-row.is-archived .agent-ticket {
-  min-width: 0;
-  overflow: hidden;
-  text-overflow: ellipsis;
-  white-space: nowrap;
-}
-
-.agent-activity-row.is-archived .agent-state,
-.agent-activity-row.is-archived .agent-age {
-  flex-shrink: 0;
-}
-
-.agent-activity-row.is-archived > .agent-meta {
-  margin: 0;
-  justify-self: end;
-}
-
-.agent-activity-row.is-archived > .disclosure-wrap {
-  grid-column: 1 / -1;
-}
-
-.agent-activity-row.is-archived .agent-actions {
-  margin-left: 0;
-}
-
 .agent-activity-row[data-state="working"],
 .agent-activity-row[data-state="starting"],
 .agent-activity-row[data-state="waiting-approval"] {
@@ -17005,15 +16955,6 @@ body {
   width: auto;
   max-width: none;
   align-self: stretch;
-}
-
-.agents-section .agent-card.is-archived {
-  opacity: 0.68;
-}
-
-.agents-section .agent-card.is-archived:hover,
-.agents-section .agent-card.is-archived.is-selected {
-  opacity: 1;
 }
 
 /* Keep optional controls in the row's layout, but reveal them only when they

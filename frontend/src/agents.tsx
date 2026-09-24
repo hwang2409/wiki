@@ -29,7 +29,6 @@ import type {
   AgentModelOption,
   AgentControlAction,
   AgentWorker,
-  ArchivedWorker,
   Orchestrator,
   ReplaceAgentResult,
   SpawnWorkerEffort,
@@ -65,10 +64,6 @@ const ORCH_ID_PATTERN = /^[A-Za-z0-9][A-Za-z0-9_-]*$/;
 export const DEFAULT_WORKDIR = "/Users/henry/me/fun/wiki";
 const REASONING_EFFORTS: SpawnWorkerEffort[] = ["minimal", "low", "medium", "high", "xhigh"];
 const DEAD_RUN_COPY = "adapter detached — archive to reset";
-
-export type AgentOpenTarget =
-  | string
-  | { kind: "archive"; ticket: string; archivedAt: string; runId: string };
 
 type HeadlessAgentState = {
   run_id?: string | null;
@@ -189,13 +184,6 @@ function primaryActionForWorker(worker: AgentWorker, deadRun: boolean): PrimaryA
     return "resume";
   }
   return null;
-}
-
-function archivedAge(iso: string): string {
-  const seconds = Math.floor((Date.now() - new Date(iso).getTime()) / 1000);
-  if (seconds < 3600) return `${Math.max(1, Math.floor(seconds / 60))}m ago`;
-  if (seconds < 86400) return `${Math.floor(seconds / 3600)}h ago`;
-  return `${Math.floor(seconds / 86400)}d ago`;
 }
 
 const SCREENCAST_EXPANDED_KEY = "wiki-expanded-screencasts";
@@ -1220,7 +1208,6 @@ export function AgentsView({
   data?: {
     workers: AgentWorker[] | null;
     orchestrators: Orchestrator[];
-    archived: ArchivedWorker[];
     error: string | null;
     account_notices?: AccountEvent[];
   };
@@ -1228,15 +1215,14 @@ export function AgentsView({
   workspaceRootReady?: boolean;
   onOpenAgent: (ticket: string, panel?: "review") => void;
   refreshTick: number;
-  openTicket: AgentOpenTarget | null;
-  onOpenTicket: (target: AgentOpenTarget | null) => void;
+  openTicket: string | null;
+  onOpenTicket: (target: string | null) => void;
   spawnWorkerFallbackRef?: FocusReturnRef;
   startRunRequest?: number;
   onStartRunRequestHandled?: () => void;
 }) {
   const [fetchedWorkers, setFetchedWorkers] = useState<AgentWorker[] | null>(null);
   const [fetchedOrchestrators, setFetchedOrchestrators] = useState<Orchestrator[]>([]);
-  const [fetchedArchived, setFetchedArchived] = useState<ArchivedWorker[]>([]);
   const [fetchedNotices, setFetchedNotices] = useState<AccountEvent[]>([]);
   const [fetchedError, setFetchedError] = useState<string | null>(null);
   const [availableModels, setAvailableModels] = useState<AgentModelOption[]>([]);
@@ -1252,7 +1238,6 @@ export function AgentsView({
   const [overrideData, setOverrideData] = useState<{
     workers: AgentWorker[] | null;
     orchestrators: Orchestrator[];
-    archived: ArchivedWorker[];
     error: string | null;
     account_notices?: AccountEvent[];
   } | null>(null);
@@ -1336,7 +1321,6 @@ export function AgentsView({
         if (!ignore) {
           setFetchedWorkers(result.workers);
           setFetchedOrchestrators(result.orchestrators ?? []);
-          setFetchedArchived(result.archived ?? []);
           setFetchedNotices(result.account_notices ?? []);
           setFetchedError(null);
         }
@@ -1375,7 +1359,6 @@ export function AgentsView({
 
   const workers = overrideData?.workers ?? data?.workers ?? fetchedWorkers;
   const orchestrators = overrideData?.orchestrators ?? data?.orchestrators ?? fetchedOrchestrators;
-  const archived = overrideData?.archived ?? data?.archived ?? fetchedArchived;
   const accountNotices =
     overrideData?.account_notices ?? data?.account_notices ?? fetchedNotices;
   const error = overrideData?.error ?? data?.error ?? fetchedError;
@@ -1395,36 +1378,11 @@ export function AgentsView({
     }
   }, [archivePending, orchestrators, workers]);
 
-  const openTicketId = typeof openTicket === "string" ? openTicket : openTicket?.ticket ?? null;
-  const openArchiveAt = openTicket && typeof openTicket === "object" ? openTicket.archivedAt : null;
-  const openArchiveRunId = openTicket && typeof openTicket === "object" ? openTicket.runId : null;
-  const openOrch = typeof openTicket === "string"
-    ? orchestrators.find((orch) => orch.id === openTicket)
-    : undefined;
+  const openTicketId = openTicket;
+  const openOrch = orchestrators.find((orch) => orch.id === openTicket);
   const liveWorkers = workers ?? [];
-  const liveWorker = typeof openTicket === "string"
-    ? liveWorkers.find((worker) => worker.ticket === openTicket) ?? null
-    : null;
-  const archivedWorker = openArchiveAt
-    ? archived.find(
-        (entry) =>
-          entry.ticket === openTicketId &&
-          entry.archived_at === openArchiveAt &&
-          entry.run_id === openArchiveRunId,
-      ) ?? null
-    : null;
-  const openWorker: SidebarTarget | null = archivedWorker
-    ? {
-        ticket: archivedWorker.ticket,
-        kind: archivedWorker.kind,
-        role: archivedWorker.role,
-        model: archivedWorker.model,
-        pr: archivedWorker.pr,
-        canReview: Boolean(archivedWorker.pr),
-        archivedAt: archivedWorker.archived_at,
-        runId: archivedWorker.run_id ?? undefined,
-      }
-    : liveWorker
+  const liveWorker = liveWorkers.find((worker) => worker.ticket === openTicket) ?? null;
+  const openWorker: SidebarTarget | null = liveWorker
       ? {
           ticket: liveWorker.ticket,
           kind: liveWorker.kind,
@@ -1490,7 +1448,6 @@ export function AgentsView({
       setOverrideData({
         workers: result.workers,
         orchestrators: result.orchestrators ?? [],
-        archived: result.archived ?? [],
         account_notices: result.account_notices ?? [],
         error: null,
       });
@@ -1592,97 +1549,6 @@ export function AgentsView({
           {pending ? "Archiving…" : "Archive"}
         </button>
       </>
-    );
-  }
-
-  function renderHistoryRow(entry: ArchivedWorker) {
-    // History rows are a QUIET outcome/date summary (WIKI-154 finding 3 →
-    // round-5 family sweep). Ticket + outcome badge + archived age +
-    // "View transcript" are the only default surface. Kind/role/model/step
-    // and every technical field live behind the details disclosure.
-    //
-    const key = `${entry.ticket}-${entry.archived_at}`;
-    const isOpen =
-      openTicketId === entry.ticket &&
-      openArchiveAt === entry.archived_at &&
-      openArchiveRunId === entry.run_id;
-    const archiveTarget = entry.run_id
-      ? { kind: "archive" as const, ticket: entry.ticket, archivedAt: entry.archived_at, runId: entry.run_id }
-      : null;
-    const detailsOpen = expandedDetails.has(key);
-    return (
-      <article
-        className={`agent-card agent-activity-row is-archived${isOpen ? " is-selected" : ""}`}
-        data-state={entry.outcome ?? entry.state ?? "archived"}
-        key={key}
-        onClick={(event) => {
-          const target = event.target as HTMLElement;
-          if (target.closest("button, a, .agent-tech")) return;
-          onOpenTicket(
-            isOpen
-              ? null
-              : archiveTarget,
-          );
-        }}
-      >
-        <header className="agent-card-header">
-          <a
-            className="agent-ticket"
-            href={`https://linear.app/phoebework/issue/${entry.ticket}`}
-            {...externalLinkProps(`https://linear.app/phoebework/issue/${entry.ticket}`)}
-          >
-            {entry.ticket}
-          </a>
-          {entry.outcome ? (
-            <StatusBadge label={entry.outcome} state={`outcome-${entry.outcome}`} />
-          ) : entry.state ? (
-            <StatusBadge label={entry.state} state={entry.state} />
-          ) : null}
-          <span className="agent-age tabular-nums">{archivedAge(entry.archived_at)}</span>
-        </header>
-        <div className="agent-meta">
-          <span className="agent-actions">
-            <button
-              className="agent-primary-action"
-              type="button"
-              onClick={() =>
-                onOpenTicket(
-                  isOpen
-                    ? null
-                    : archiveTarget,
-                )
-              }
-            >
-              <ScrollText size={13} />
-              View transcript
-            </button>
-            <button
-              aria-expanded={detailsOpen}
-              className={`agent-log-toggle${detailsOpen ? " is-active" : ""}`}
-              type="button"
-              onClick={() => toggleDetails(key)}
-            >
-              <ChevronDown
-                className={`disclosure-chevron${detailsOpen ? "" : " is-collapsed"}`}
-                size={13}
-              />
-              details
-            </button>
-          </span>
-        </div>
-        <DisclosureContent open={detailsOpen}>
-          <TechDetails
-            rows={[
-              entry.kind ? ["provider", `${providerLabel(entry.kind)} (${entry.kind})`] : null,
-              entry.role ? ["role", entry.role] : null,
-              entry.model ? ["model", entry.model] : null,
-              entry.pr ? ["PR", entry.pr] : null,
-              entry.step ? ["last step", entry.step] : null,
-              entry.archived_at ? ["archived at", entry.archived_at] : null,
-            ]}
-          />
-        </DisclosureContent>
-      </article>
     );
   }
 
@@ -1939,7 +1805,7 @@ export function AgentsView({
     const deadRun = isDeadRun(worker);
     const flag = healthFlag(worker);
     const state = stateLabel(worker);
-    const isOpen = openTicketId === worker.ticket && openArchiveAt === null;
+    const isOpen = openTicketId === worker.ticket;
     const previewOpen = expandedScreencasts.has(worker.ticket);
     const detailsOpen = expandedDetails.has(worker.ticket);
     const menuOpen = openMenuTicket === worker.ticket;
@@ -2292,7 +2158,7 @@ export function AgentsView({
         <LoadingPlaceholder className="agents-loading" lines={[94, 88, 91, 76]} />
       </div>
     );
-  } else if (liveWorkers.length === 0 && archived.length === 0 && orchestrators.length === 0) {
+  } else if (liveWorkers.length === 0 && orchestrators.length === 0) {
     body = (
       <div className="agents-empty">
         No live workers yet. Spawn one here or register from the terminal with{" "}
@@ -2316,16 +2182,6 @@ export function AgentsView({
             {ungrouped.map(renderWorker)}
           </section>
         ) : null}
-        {archived.length > 0 ? (
-          <section className="agents-section agents-section-history" aria-labelledby="agents-section-history">
-            <div className="agents-section-head is-primary" data-testid="agents-section-history">
-              <Archive size={13} />
-              <span className="agents-section-title" id="agents-section-history">History</span>
-              <span className="agents-section-count tabular-nums">{archived.length}</span>
-            </div>
-            {archived.map(renderHistoryRow)}
-          </section>
-        ) : null}
       </div>
     );
   }
@@ -2337,8 +2193,7 @@ export function AgentsView({
         <div className="agents-page-tools">
           <span className="agents-run-count">
             {orchestrators.length} orchestrator{orchestrators.length === 1 ? "" : "s"} ·{" "}
-            {liveWorkers.length} live worker{liveWorkers.length === 1 ? "" : "s"} ·{" "}
-            {archived.length} in history
+            {liveWorkers.length} live worker{liveWorkers.length === 1 ? "" : "s"}
           </span>
           <Button
             className="agents-orchestrator-button"
@@ -2422,7 +2277,6 @@ export function AgentsSidebar({
   data?: {
     workers: AgentWorker[] | null;
     orchestrators: Orchestrator[];
-    archived?: ArchivedWorker[];
     error: string | null;
   };
   refreshTick: number;

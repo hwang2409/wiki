@@ -2524,7 +2524,6 @@ def agents(include_history: bool = False) -> dict[str, object]:
     return {
         "workers": workers,
         "orchestrators": orchestrators,
-        "archived": list_archived(),
         "supervisor": supervisor_health,
         "account_notices": ACCOUNT_NOTICES.snapshot(),
     }

@@ -44,7 +44,6 @@ const worker = {
 const data = {
   workers: [worker],
   orchestrators: [],
-  archived: [],
   error: null,
 };
 

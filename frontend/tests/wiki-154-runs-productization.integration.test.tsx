@@ -1,13 +1,12 @@
 // @vitest-environment jsdom
 import { cleanup, fireEvent, render, waitFor } from "@testing-library/react";
-import { useState } from "react";
 import { afterEach, beforeEach, expect, test, vi } from "vitest";
 
 import { AgentsView, SpawnOrchestratorModal, SpawnWorkerModal } from "../src/agents";
 import { ReplaceAgentModal } from "../src/replace-agent-modal";
 import { isAgentTopologyEvent } from "../src/agent-events";
 import { spawnAgentOrchestrator } from "../src/api";
-import type { AgentModelOption, AgentWorker, ArchivedWorker, Orchestrator } from "../src/api";
+import type { AgentModelOption, AgentWorker, Orchestrator } from "../src/api";
 import { presetWorkerModel } from "../src/role-pipeline";
 
 vi.mock("../src/api", async () => {
@@ -46,23 +45,9 @@ const worker = {
   session: null,
 } as unknown as AgentWorker;
 
-const archivedEntry = {
-  ticket: "WIKI-0",
-  archived_at: new Date(Date.now() - 60_000).toISOString(),
-  run_id: "archive-run-0",
-  kind: "cdx",
-  role: "review",
-  model: "gpt-5.6-sol",
-  outcome: "merged",
-  state: null,
-  pr: null,
-  step: "done",
-} as unknown as ArchivedWorker;
-
 const data = {
   workers: [worker],
   orchestrators: [] as Orchestrator[],
-  archived: [archivedEntry],
   error: null,
 };
 
@@ -112,14 +97,11 @@ afterEach(() => {
   vi.unstubAllGlobals();
 });
 
-test("page renders Active and History section anchors with counts", () => {
+test("page renders the Active section with a count", () => {
   const view = renderView();
   const active = view.getByTestId("agents-section-active");
   expect(active.textContent).toContain("Active");
   expect(active.textContent).toContain("1");
-  const history = view.getByTestId("agents-section-history");
-  expect(history.textContent).toContain("History");
-  expect(history.textContent).toContain("1");
 });
 
 test("run id, tmux, worktree path, and log path live behind the details disclosure", async () => {
@@ -553,7 +535,6 @@ test("orchestrator row default hides kind/model/cwd; details disclosure reveals 
     data: {
       workers: [workerUnderOrch as AgentWorker],
       orchestrators: [orch],
-      archived: [],
       error: null,
     },
   });
@@ -588,7 +569,7 @@ test("orchestrator Replace stays disabled with a reason without a live runtime",
     cwd: "/tmp/projects/legacy",
   } as unknown as Orchestrator;
   const view = renderView({
-    data: { workers: [], orchestrators: [orch], archived: [], error: null },
+    data: { workers: [], orchestrators: [orch], error: null },
   });
   fireEvent.click(view.getByRole("button", { name: /More actions for wiki-legacy/ }));
   await waitFor(() => {
@@ -603,68 +584,6 @@ test("orchestrator Replace stays disabled with a reason without a live runtime",
   fireEvent.click(view.getByRole("menuitem", { name: /^Stop$/ }));
   fireEvent.click(view.getByRole("menuitem", { name: /^Replace$/ }));
   expect(vi.mocked(globalThis.fetch)).not.toHaveBeenCalled();
-});
-
-test("clicking a history row selects exactly the named archive over a live ticket", () => {
-  const olderAt = "2026-07-01T00:00:00+00:00";
-  const newerAt = "2026-07-02T00:00:00+00:00";
-  const live = { ...worker, ticket: "WIKI-0", model: "live-model" };
-  const older = {
-    ...archivedEntry,
-    ticket: "WIKI-0",
-    archived_at: olderAt,
-    run_id: "old-archive-run",
-    model: "old-model",
-  };
-  const newer = {
-    ...archivedEntry,
-    ticket: "WIKI-0",
-    archived_at: newerAt,
-    run_id: "new-archive-run",
-    model: "new-model",
-  };
-  function SelectionHarness() {
-    const [openTicket, setOpenTicket] = useState<Parameters<typeof AgentsView>[0]["openTicket"]>(null);
-    return (
-      <AgentsView
-        data={{ workers: [live], orchestrators: [], archived: [newer, older], error: null }}
-        onOpenAgent={() => undefined}
-        refreshTick={0}
-        openTicket={openTicket}
-        onOpenTicket={setOpenTicket}
-      />
-    );
-  }
-  const view = render(<SelectionHarness />);
-  const historyCards = view.container.querySelectorAll(".agent-card.is-archived");
-  expect(historyCards).toHaveLength(2);
-  fireEvent.click(historyCards[1]);
-
-  const selectedCards = view.container.querySelectorAll(".agent-card.is-selected");
-  expect(selectedCards).toHaveLength(1);
-  expect(selectedCards[0]).toBe(historyCards[1]);
-});
-
-test("history row is a quiet outcome/date summary with View transcript", async () => {
-  const view = renderView({
-    data: { ...data, workers: [], orchestrators: [], error: null },
-  });
-  const historyRow = view.container.querySelector(".agent-card.is-archived");
-  expect(historyRow).toBeTruthy();
-  // No kind/role/model badges on the default surface.
-  expect(historyRow!.textContent).not.toContain("cdx");
-  expect(historyRow!.textContent).not.toContain("review");
-  expect(historyRow!.textContent).not.toContain("gpt-5.6-sol");
-  // Outcome + View transcript ARE surfaced.
-  expect(historyRow!.textContent).toContain("merged");
-  expect(view.getByRole("button", { name: /View transcript/ })).toBeTruthy();
-  // Details disclosure reveals the technical fields.
-  fireEvent.click(view.getByRole("button", { name: /details/ }));
-  await waitFor(() => {
-    expect(view.getByText(/Codex \(cdx\)/)).toBeTruthy();
-    expect(view.getByText("review")).toBeTruthy();
-    expect(view.getByText("gpt-5.6-sol")).toBeTruthy();
-  });
 });
 
 test("spawn orchestrator dialog leads with name and goal; provider/model live under Advanced", async () => {
