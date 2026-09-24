@@ -9,6 +9,15 @@ updated: 2026-09-24
 
 ## 2026-09-24
 
+- **wiki** — removed archived transcript browsing; saved artifact links remain ([#312](https://github.com/hwang2409/wiki/pull/312), `da3e4bf8`)
+- **wiki** — bounded palette artifact search to recent receipts ([#311](https://github.com/hwang2409/wiki/pull/311), `31559970`)
+- **wiki** — removed archive reads from the fleet graph ([#310](https://github.com/hwang2409/wiki/pull/310), `8b0a0401`)
+- **wiki** — removed archive history from agent polling and page ([#309](https://github.com/hwang2409/wiki/pull/309), `c34fc9b0`)
+- **wiki** — kept compact completion receipts and saved artifacts ([#308](https://github.com/hwang2409/wiki/pull/308), `7b4dfbe5`)
+- **wiki** — removed the run replay scrubber ([#307](https://github.com/hwang2409/wiki/pull/307), `be18593a`)
+- **wiki** — removed automatic archive scans and parity checks ([#306](https://github.com/hwang2409/wiki/pull/306), `335fb9c4`)
+- **wiki** — removed cost aggregation and dashboard ([#305](https://github.com/hwang2409/wiki/pull/305), `39105904`)
+- **wiki** — removed the note graph view ([#304](https://github.com/hwang2409/wiki/pull/304), `b79b4cac`)
 - **wiki** — bounded automatic archive parity checks for long runs ([#302](https://github.com/hwang2409/wiki/pull/302), `baa0a40d`); native app install pending
 - **wiki** — bounded palette archive reads and stopped startup artifact scan ([#301](https://github.com/hwang2409/wiki/pull/301), `63bdff19`); native app install pending
 - **wiki** — notes-only knowledge index, bounded archive list, and orchestrator workgraph CPU fixes merged ([#300](https://github.com/hwang2409/wiki/pull/300), `89cbac1e`); native app install pending

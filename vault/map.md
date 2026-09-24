@@ -161,6 +161,7 @@ Topic → note index. **Agents: read this file first, before grepping.** Every n
 
 ## Wiki-app
 
+- [[deslop-2026-09-24]] — Wiki cut list and merged PRs #304–#312; receipts and saved artifacts replace archived run browsing
 - [[supervisor-fingerprint-swap-wedge]] — dev-code clients kill the prod agent supervisor via fingerprint swap; shutdown wedges holding the lock
 - [[build-scripts-need-venv-python]] — build helper scripts must not import agent_runtime under system python3 — pydantic/PIL chain via normalizer
 - [[opencode-design-direction]] — Wiki UI adopts OpenCode TUI design language (Henry 2026-08-06) — transcript doctrine + web translation rules
