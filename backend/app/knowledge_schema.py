@@ -5,7 +5,7 @@ from __future__ import annotations
 import sqlite3
 
 
-SCHEMA_VERSION = 4
+SCHEMA_VERSION = 5
 
 
 def is_corruption_error(exc: BaseException) -> bool:
@@ -52,7 +52,7 @@ def reset_schema(connection: sqlite3.Connection) -> None:
         );
         CREATE TABLE chunks (
             id INTEGER PRIMARY KEY,
-            source_kind TEXT NOT NULL CHECK(source_kind IN ('note', 'event')),
+            source_kind TEXT NOT NULL CHECK(source_kind = 'note'),
             source_id TEXT NOT NULL,
             ticket TEXT,
             title TEXT NOT NULL DEFAULT '',
@@ -88,28 +88,9 @@ def reset_schema(connection: sqlite3.Connection) -> None:
             dst_name TEXT NOT NULL,
             resolved_path TEXT REFERENCES notes(path) ON DELETE SET NULL
         );
-        CREATE TABLE runs (
-            run_id TEXT PRIMARY KEY,
-            ticket TEXT,
-            provider TEXT,
-            model TEXT,
-            role TEXT,
-            spawned_at TEXT,
-            ended_at TEXT,
-            outcome TEXT
-        );
-        CREATE TABLE events (
-            run_id TEXT NOT NULL REFERENCES runs(run_id) ON DELETE CASCADE,
-            seq INTEGER NOT NULL,
-            type TEXT NOT NULL,
-            ts TEXT,
-            text_excerpt TEXT NOT NULL,
-            PRIMARY KEY(run_id, seq)
-        );
         CREATE INDEX chunks_source_idx ON chunks(source_kind, source_id, pos);
         CREATE INDEX chunks_ticket_idx ON chunks(ticket);
         CREATE INDEX links_dst_idx ON links(resolved_path);
-        CREATE INDEX events_type_ts_idx ON events(type, ts);
         """
     )
     connection.execute(

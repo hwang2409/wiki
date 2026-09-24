@@ -94,8 +94,6 @@ class SemanticIndexTests(unittest.TestCase):
             knowledge.KnowledgePaths(
                 db_path=self.db,
                 vault_dir=self.vault,
-                archive_dir=self.archive,
-                runtime_dir=self.runtime,
             ),
             self.provider,
         )
@@ -148,8 +146,6 @@ class SemanticIndexTests(unittest.TestCase):
             knowledge.KnowledgePaths(
                 db_path=self.db,
                 vault_dir=self.vault,
-                archive_dir=self.archive,
-                runtime_dir=self.runtime,
             ),
             None,
         )
@@ -185,8 +181,6 @@ class SemanticIndexTests(unittest.TestCase):
             knowledge.KnowledgePaths(
                 db_path=self.db,
                 vault_dir=self.vault,
-                archive_dir=self.archive,
-                runtime_dir=self.runtime,
             ),
             provider,
         )
@@ -222,8 +216,6 @@ class SemanticIndexTests(unittest.TestCase):
         ):
             index = knowledge.KnowledgeIndex.from_env(
                 vault_dir=self.vault,
-                archive_dir=self.archive,
-                runtime_dir=self.runtime,
                 env={
                     "OPENAI_API_KEY": "generic-fixture-key",
                     "WIKI_KNOWLEDGE_DB_PATH": str(self.db),
@@ -242,7 +234,7 @@ class SemanticIndexTests(unittest.TestCase):
             write_note(self.vault / f"note-{number:02}.md", body)
         provider = RejectingEmbeddingProvider()
         index = knowledge.KnowledgeIndex(
-            knowledge.KnowledgePaths(self.db, self.vault, self.archive, self.runtime),
+            knowledge.KnowledgePaths(self.db, self.vault),
             provider,
         )
         first = index.rebuild()
@@ -262,12 +254,12 @@ class SemanticIndexTests(unittest.TestCase):
         write_note(self.vault / "db.md", "sqlite database notes")
         provider = BlockingEmbeddingProvider()
         first = knowledge.KnowledgeIndex(
-            knowledge.KnowledgePaths(self.db, self.vault, self.archive, self.runtime),
+            knowledge.KnowledgePaths(self.db, self.vault),
             provider,
         )
         self.assertTrue(first.semantic_index.reset_for_explicit_rebuild())
         second = knowledge.KnowledgeIndex(
-            knowledge.KnowledgePaths(self.db, self.vault, self.archive, self.runtime),
+            knowledge.KnowledgePaths(self.db, self.vault),
             provider,
         )
         with ThreadPoolExecutor(max_workers=2) as executor:
@@ -342,7 +334,7 @@ class SemanticIndexTests(unittest.TestCase):
         write_note(self.vault / "db.md", "sqlite database notes")
         provider = FakeEmbeddingProvider()
         index = knowledge.KnowledgeIndex(
-            knowledge.KnowledgePaths(self.db, self.vault, self.archive, self.runtime),
+            knowledge.KnowledgePaths(self.db, self.vault),
             provider,
         )
         cli = runpy.run_path(
@@ -357,7 +349,6 @@ class SemanticIndexTests(unittest.TestCase):
             limit=20,
             json=True,
             kind="note",
-            event_type=None,
             since=None,
         )
         with redirect_stdout(io.StringIO()):
@@ -368,7 +359,7 @@ class SemanticIndexTests(unittest.TestCase):
         write_note(self.vault / "db.md", "sqlite database private note")
         provider = FakeEmbeddingProvider()
         index = knowledge.KnowledgeIndex(
-            knowledge.KnowledgePaths(self.db, self.vault, self.archive, self.runtime),
+            knowledge.KnowledgePaths(self.db, self.vault),
             provider,
         )
 
@@ -384,7 +375,6 @@ class SemanticIndexTests(unittest.TestCase):
             limit=20,
             json=True,
             kind="note",
-            event_type=None,
             since=None,
         )
         with redirect_stdout(io.StringIO()):

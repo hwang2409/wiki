@@ -1701,7 +1701,6 @@ def cmd_search(args: argparse.Namespace) -> None:
                 args.query,
                 ticket=args.ticket,
                 kind=args.kind,
-                event_type=args.event_type,
                 since=args.since,
                 limit=args.limit,
             )
@@ -1715,7 +1714,7 @@ def cmd_search(args: argparse.Namespace) -> None:
     if result["rebuilding"]:
         print("knowledge index is rebuilding; results may be partial", file=sys.stderr)
     if result["stale"]:
-        print("live run index is stale; returning existing results", file=sys.stderr)
+        print("knowledge index is stale; returning existing results", file=sys.stderr)
     for row in result["results"]:
         print(f"{row['citation']}  score={row['score']:.8f}")
         snippet = str(row.get("snippet") or "").strip()
@@ -1758,7 +1757,7 @@ def cmd_links_unresolved(_args: argparse.Namespace) -> None:
 
 def cmd_index_rebuild(args: argparse.Namespace) -> None:
     try:
-        stats = _knowledge_index().rebuild(include_legacy_archives=args.include_legacy)
+        stats = _knowledge_index().rebuild()
     except knowledge.KnowledgeError as exc:
         fail(f"knowledge database unavailable: {exc}")
     print(json.dumps(stats.to_dict(), sort_keys=True))
@@ -2034,11 +2033,10 @@ def main() -> None:
     lint = sub.add_parser("lint", help="validate vault conventions")
     lint.set_defaults(func=cmd_lint)
 
-    search = sub.add_parser("search", help="search indexed vault notes and fleet runs")
+    search = sub.add_parser("search", help="search indexed vault notes")
     search.add_argument("query")
     search.add_argument("--ticket")
-    search.add_argument("--kind", choices=("note", "run"))
-    search.add_argument("--type", dest="event_type", help="normalized event type")
+    search.add_argument("--kind", choices=("note",))
     search.add_argument("--since", help="YYYY-MM-DD")
     search.add_argument("--limit", type=int, default=20)
     search.add_argument("--mode", choices=("lexical", "semantic"), default="lexical")
@@ -2059,13 +2057,7 @@ def main() -> None:
     index_sub = index.add_subparsers(dest="index_command", required=True)
     rebuild = index_sub.add_parser(
         "rebuild",
-        help="drop and rebuild the index (supervisor archives only by default)",
-    )
-    rebuild.add_argument(
-        "--include-legacy",
-        action="store_true",
-        default=None,
-        help="also index pre-headless tmux archives (or set WIKI_KNOWLEDGE_INCLUDE_LEGACY=1)",
+        help="drop and rebuild the note index",
     )
     rebuild.set_defaults(func=cmd_index_rebuild)
 

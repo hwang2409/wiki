@@ -17,7 +17,6 @@ from pathlib import Path
 from typing import Any
 from uuid import UUID
 
-from .. import knowledge
 from .archive_protocol import archive_is_committed, commit_archive
 from .command_log import CommandLog
 from .process import (
@@ -1573,7 +1572,6 @@ class RunStore:
         )
         if not archive_is_committed(session_dir):
             raise StoreError("archive commit failed verification")
-        knowledge.enqueue_refresh(runtime_dir=self.paths.runtime_dir)
         with self._lock:
             registry = self._read_registry()
             entry = registry.get(record.agent_id)
@@ -2174,7 +2172,6 @@ class RunStore:
             self._copy_archive_file(source, destination)
         if self._archive_events_validator is not None:
             self._archive_events_validator(run_id, session_dir)
-        knowledge.enqueue_refresh(runtime_dir=self.paths.runtime_dir)
         provider_log = self.provider_log_path(run_id)
         if provider_log.is_file():
             expected_paths.append(session_dir / "provider.log")

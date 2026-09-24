@@ -218,7 +218,6 @@ async def lifespan(_app: FastAPI):
         knowledge.background_index_loop(
             knowledge.KnowledgePaths.from_env(
                 runtime_dir=runtime_paths.runtime_dir,
-                archive_dir=runtime_paths.archive_dir,
                 vault_dir=VAULT_DIR,
             )
         ),
@@ -1810,19 +1809,25 @@ def _archive_role(session_dir: Path) -> str | None:
     return None
 
 
-def _archive_sessions(ticket_dir: Path) -> list[tuple[datetime, Path]]:
+def _archive_sessions(
+    ticket_dir: Path,
+    catalog: dict | None = None,
+    *,
+    verify: bool = True,
+) -> list[tuple[datetime, Path]]:
     # WIKI-363: sessions in the commit-time catalog skip the per-session
     # verification walk (marker + manifest read, lstat of every file).
     # Sessions the catalog misses fall back to full verification, and a
     # missing catalog degrades to the pre-catalog behavior.
-    catalog = read_archive_catalog(ticket_dir.parent)
+    if catalog is None:
+        catalog = read_archive_catalog(ticket_dir.parent)
     sessions = []
     for session_dir in ticket_dir.iterdir():
         match = ARCHIVE_TS_PATTERN.fullmatch(session_dir.name)
         if not session_dir.is_dir() or not match:
             continue
         cataloged = f"{ticket_dir.name}/{session_dir.name}" in catalog
-        if not cataloged and not archive_is_committed(session_dir):
+        if verify and not cataloged and not archive_is_committed(session_dir):
             continue
         y, mo, d, h, mi, s = map(int, match.groups())
         sessions.append((datetime(y, mo, d, h, mi, s).astimezone(), session_dir))
@@ -1880,6 +1885,7 @@ def _bounded_archive_candidates(
     limit_per_orch: int,
     *,
     latest_per_ticket: bool,
+    catalog: dict,
 ) -> list[tuple[str, datetime, Path]]:
     """Select archive paths before reading any final-status or meta bodies."""
 
@@ -1890,9 +1896,7 @@ def _bounded_archive_candidates(
     for ticket_dir in AGENT_ARCHIVE_DIR.iterdir():
         if not ticket_dir.is_dir() or not TICKET_PATTERN.fullmatch(ticket_dir.name):
             continue
-        sessions = _archive_sessions(ticket_dir)
-        if latest_per_ticket and sessions:
-            sessions = sessions[:1]
+        sessions = _archive_sessions(ticket_dir, catalog, verify=False)
         orch = hints.get(ticket_dir.name)
         if orch is None:
             prefix = ticket_dir.name.split("-", 1)[0].lower()
@@ -1910,16 +1914,27 @@ def _bounded_archive_candidates(
                 mtime_ns = 0
             key = (mtime_ns, archived_at.timestamp(), session_dir.name)
             bucket.append((key, ticket_dir.name, archived_at, session_dir))
+    selected = []
+    for bucket in buckets.values():
         bucket.sort(key=lambda item: item[0], reverse=True)
-        del bucket[limit_per_orch:]
-
-    selected = [
-        (ticket, archived_at, session_dir)
-        for bucket in buckets.values()
-        for _key, ticket, archived_at, session_dir in bucket
-    ]
+        bucket_selected = 0
+        seen_tickets: set[str] = set()
+        for _key, ticket, archived_at, session_dir in bucket:
+            if bucket_selected >= limit_per_orch:
+                break
+            if latest_per_ticket and ticket in seen_tickets:
+                continue
+            if not _cataloged_or_committed(catalog, ticket, session_dir):
+                continue
+            selected.append((ticket, archived_at, session_dir))
+            seen_tickets.add(ticket)
+            bucket_selected += 1
     selected.sort(key=lambda item: (item[1], item[2].name), reverse=True)
     return selected
+
+
+def _cataloged_or_committed(catalog: dict, ticket: str, session_dir: Path) -> bool:
+    return f"{ticket}/{session_dir.name}" in catalog or archive_is_committed(session_dir)
 
 
 def list_archived(
@@ -1938,24 +1953,32 @@ def list_archived(
     """
     if not AGENT_ARCHIVE_DIR.is_dir():
         return []
+    if limit_per_orch is None and limit is not None and limit <= 0:
+        return []
+    catalog = read_archive_catalog(AGENT_ARCHIVE_DIR)
     entries: list[dict] = []
     if limit_per_orch is not None:
         candidates = _bounded_archive_candidates(
             limit_per_orch,
             latest_per_ticket=latest_per_ticket,
+            catalog=catalog,
         )
     else:
         candidates = [
             (ticket_dir.name, archived_at, session_dir)
             for ticket_dir in AGENT_ARCHIVE_DIR.iterdir()
             if ticket_dir.is_dir() and TICKET_PATTERN.fullmatch(ticket_dir.name)
-            for archived_at, session_dir in (
-                _archive_sessions(ticket_dir)[:1]
-                if latest_per_ticket
-                else _archive_sessions(ticket_dir)
-            )
+            for archived_at, session_dir in _archive_sessions(ticket_dir, catalog, verify=False)
         ]
+        candidates.sort(key=lambda item: item[1], reverse=True)
+    seen_tickets: set[str] = set()
     for ticket, archived_at, session_dir in candidates:
+        if limit_per_orch is None:
+            if latest_per_ticket and ticket in seen_tickets:
+                continue
+            if not _cataloged_or_committed(catalog, ticket, session_dir):
+                continue
+            seen_tickets.add(ticket)
         status = _read_json_object(session_dir / "final-status.json")
         meta = _read_json_object(session_dir / "meta.json")
         try:
@@ -1985,6 +2008,8 @@ def list_archived(
                 "step": status.get("step"),
             }
         )
+        if limit_per_orch is None and limit is not None and len(entries) >= limit:
+            break
     entries.sort(key=lambda e: e["archived_at"], reverse=True)
     if limit_per_orch is not None:
         return entries
@@ -2747,7 +2772,6 @@ async def palette_search(
     def _semantic() -> dict[str, object]:
         index = knowledge.KnowledgeIndex.from_env(
             runtime_dir=RuntimePaths.from_env().runtime_dir,
-            archive_dir=AGENT_ARCHIVE_DIR,
             vault_dir=VAULT_DIR,
         )
         try:

@@ -147,8 +147,7 @@ TOOL_SCHEMA: dict[str, Any] = {
 }
 
 SEARCH_TOOL_DESCRIPTION = (
-    "Search durable Wiki knowledge across vault notes and Wiki-managed fleet run "
-    "history. Returns ranked snippets with note-path or run-id/event-sequence citations."
+    "Search Wiki vault notes. Returns ranked snippets with note-path citations."
 )
 SEARCH_TOOL_SCHEMA: dict[str, Any] = {
     "type": "object",
@@ -157,8 +156,7 @@ SEARCH_TOOL_SCHEMA: dict[str, Any] = {
     "properties": {
         "query": {"type": "string", "minLength": 1},
         "ticket": {"type": "string"},
-        "kind": {"enum": ["note", "run"]},
-        "type": {"type": "string"},
+        "kind": {"enum": ["note"]},
         "since": {"type": "string", "format": "date"},
         "limit": {"type": "integer", "minimum": 1, "maximum": 100},
     },
@@ -908,7 +906,7 @@ def _tool_result(request_id: Any, arguments: Any) -> dict[str, Any]:
 def search_knowledge(arguments: Any) -> dict[str, Any]:
     if not isinstance(arguments, dict):
         raise knowledge.KnowledgeQueryError("tool input must be an object")
-    extra = set(arguments) - {"query", "ticket", "kind", "type", "since", "limit"}
+    extra = set(arguments) - {"query", "ticket", "kind", "since", "limit"}
     if extra:
         raise knowledge.KnowledgeQueryError(f"unknown field: {sorted(extra)[0]}")
     query = arguments.get("query")
@@ -917,14 +915,13 @@ def search_knowledge(arguments: Any) -> dict[str, Any]:
     limit = arguments.get("limit", 20)
     if isinstance(limit, bool) or not isinstance(limit, int):
         raise knowledge.KnowledgeQueryError("limit must be an integer")
-    for field in ("ticket", "kind", "type", "since"):
+    for field in ("ticket", "kind", "since"):
         if field in arguments and not isinstance(arguments[field], str):
             raise knowledge.KnowledgeQueryError(f"{field} must be a string")
     return knowledge.KnowledgeIndex.from_env().search(
         query,
         ticket=arguments.get("ticket"),
         kind=arguments.get("kind"),
-        event_type=arguments.get("type"),
         since=arguments.get("since"),
         limit=limit,
     )
