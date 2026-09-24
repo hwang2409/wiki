@@ -8,6 +8,7 @@ import stat
 import tempfile
 from collections.abc import Iterable
 from datetime import datetime, timezone
+from functools import lru_cache
 from pathlib import Path
 from typing import Any
 
@@ -186,6 +187,45 @@ def read_archive_catalog(archive_dir: Path) -> dict[str, dict[str, Any]]:
     value = _read_object(Path(archive_dir) / ARCHIVE_CATALOG_NAME)
     sessions = value.get("sessions") if value is not None else None
     return sessions if isinstance(sessions, dict) else {}
+
+
+@lru_cache(maxsize=8)
+def _recent_archive_sessions_at_mtime(
+    archive_dir: Path, _catalog_mtime_ns: int, limit: int
+) -> tuple[tuple[Path, str, str | None], ...]:
+    rows = read_archive_catalog(archive_dir)
+    recent: list[tuple[Path, str, str | None]] = []
+    for key, value in sorted(rows.items(), key=lambda row: row[0].rsplit("/", 1)[-1], reverse=True):
+        relative = Path(key)
+        parts = relative.parts
+        if relative.is_absolute() or len(parts) != 2 or any(part in {".", ".."} for part in parts):
+            continue
+        if not isinstance(value, dict) or not isinstance(value.get("run_id"), str):
+            continue
+        session = archive_dir.joinpath(*parts)
+        if session.parent.is_symlink() or not session.is_dir() or session.is_symlink():
+            continue
+        completed_at = value.get("completed_at")
+        recent.append(
+            (session, value["run_id"], completed_at if isinstance(completed_at, str) else None)
+        )
+        if len(recent) >= limit:
+            break
+    return tuple(recent)
+
+
+def recent_archive_sessions(
+    archive_dir: Path, limit: int = 40
+) -> list[tuple[Path, str, str | None]]:
+    """Return recent committed paths, run IDs, and completion times from the catalog."""
+
+    if limit <= 0:
+        return []
+    try:
+        mtime_ns = (archive_dir / ARCHIVE_CATALOG_NAME).stat().st_mtime_ns
+    except OSError:
+        return []
+    return list(_recent_archive_sessions_at_mtime(archive_dir, mtime_ns, limit))
 
 
 def _record_archive_in_catalog(

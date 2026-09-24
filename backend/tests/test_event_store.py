@@ -1447,6 +1447,17 @@ def test_legacy_migration_reopens_after_shards_before_legacy_rename() -> None:
         assert not runtime_event_db_path(runtime_path).exists()
 
 
+def _catalog_archives(archive_dir: Path) -> None:
+    sessions = {}
+    for run_path in archive_dir.glob("*/*/run.json"):
+        session = run_path.parent
+        sessions[f"{session.parent.name}/{session.name}"] = {
+            "run_id": json.loads(run_path.read_text())["run_id"],
+            "completed_at": "2026-08-18T00:00:00Z",
+        }
+    (archive_dir / "archive-catalog.json").write_text(json.dumps({"sessions": sessions}))
+
+
 def test_artifact_index_merges_archived_events_with_live_events() -> None:
     with TemporaryDirectory() as tmp:
         runtime_path = Path(tmp) / "runtime"
@@ -1480,12 +1491,32 @@ def test_artifact_index_merges_archived_events_with_live_events() -> None:
             "artifact": {"kind": "table", "filename": "archived.html"},
         }
         (session / "events.jsonl").write_text(json.dumps(archived) + "\n")
+        _catalog_archives(archive_path)
 
         events = RuntimeEventStore(runtime_path, archive_dir=archive_path).read_artifact_events()
         assert {event["id"] for _run_id, event in events} == {
             "live-artifact",
             "archived-artifact",
         }
+
+
+def test_artifact_index_reads_compact_receipt_without_run_events() -> None:
+    with TemporaryDirectory() as tmp:
+        root = Path(tmp)
+        archive = root / "archive"
+        session = archive / "WIKI-1" / "20260818-000000"
+        session.mkdir(parents=True)
+        (session / "run.json").write_text(json.dumps({"run_id": "compact-run"}))
+        (session / "artifact-events.jsonl").write_text(
+            json.dumps({"kind": "artifact", "id": "saved-artifact"}) + "\n"
+        )
+        _catalog_archives(archive)
+
+        events = list(RuntimeEventStore(root / "runtime", archive_dir=archive).read_artifact_events())
+
+        assert [(run_id, event["id"]) for run_id, event in events] == [
+            ("compact-run", "saved-artifact")
+        ]
 
 
 def test_artifact_index_streams_artifacts_past_the_old_limit() -> None:
@@ -1507,6 +1538,7 @@ def test_artifact_index_streams_artifacts_past_the_old_limit() -> None:
         (session / "events.jsonl").write_text(
             "".join(json.dumps(artifact) + "\n" for artifact in artifacts)
         )
+        _catalog_archives(archive_path)
 
         events = list(
             RuntimeEventStore(
@@ -1569,6 +1601,7 @@ def test_artifact_index_skips_malformed_shard_rows() -> None:
         (session / "events.jsonl").write_text(
             json.dumps(archived_artifact) + "\n"
         )
+        _catalog_archives(archive_path)
 
         events = RuntimeEventStore(
             runtime_path,
@@ -1597,6 +1630,7 @@ def test_artifact_index_stops_when_the_reader_is_cancelled() -> None:
             )
             + "\n"
         )
+        _catalog_archives(archive_path)
 
         events = RuntimeEventStore(
             runtime_path,
@@ -1618,6 +1652,7 @@ def test_artifact_index_limits_archives_to_recent_sessions() -> None:
             (session / "events.jsonl").write_text(
                 json.dumps({"id": str(index), "kind": "artifact"}) + "\n"
             )
+        _catalog_archives(archive)
 
         events = list(RuntimeEventStore(root / "runtime", archive_dir=archive).read_artifact_events())
 
@@ -1634,6 +1669,7 @@ def test_artifact_index_refreshes_a_changed_archive_file() -> None:
         (session / "run.json").write_text(json.dumps({"run_id": "archived"}))
         events_path = session / "events.jsonl"
         events_path.write_text(json.dumps({"id": "first", "kind": "artifact"}) + "\n")
+        _catalog_archives(root / "archive")
         store = RuntimeEventStore(root / "runtime", archive_dir=root / "archive")
 
         assert [event["id"] for _run_id, event in store.read_artifact_events()] == ["first"]
@@ -1655,6 +1691,7 @@ def test_artifact_index_limits_archive_bytes() -> None:
             (session / "archive-complete.json").write_text("{}")
             (session / "run.json").write_text(json.dumps({"run_id": str(index)}))
             (session / "events.jsonl").write_text(payload)
+        _catalog_archives(root / "archive")
 
         with mock.patch(
             "backend.app.agent_runtime.event_store_router.RECENT_ARCHIVE_ARTIFACT_BYTES",

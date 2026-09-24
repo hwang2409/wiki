@@ -11,6 +11,7 @@ from functools import lru_cache
 from pathlib import Path
 from typing import Any
 
+from .archive_protocol import recent_archive_sessions
 from .event_store_metadata import SQLiteMetadataStore
 from .event_store_migration import (
     _corrupt_raw_run_ids,
@@ -33,7 +34,8 @@ from .event_store_shard import (
 
 
 RECENT_ARCHIVE_ARTIFACT_SESSIONS = 40
-RECENT_ARCHIVE_ARTIFACT_BYTES = 128 * 1024 * 1024
+RECENT_ARCHIVE_ARTIFACT_BYTES = 16 * 1024 * 1024
+LEGACY_ARCHIVE_ARTIFACT_BYTES = 5 * 1024 * 1024
 
 
 @lru_cache(maxsize=RECENT_ARCHIVE_ARTIFACT_SESSIONS)
@@ -164,52 +166,23 @@ class EventStoreRouter:
                                 yield str(row[0]), event
             except (OSError, sqlite3.DatabaseError):
                 continue
-        if self.archive_dir is not None and self.archive_dir.is_dir():
-            sessions: list[Path] = []
-            try:
-                for ticket_dir in self.archive_dir.iterdir():
-                    if cancelled():
-                        return
-                    if not ticket_dir.is_dir() or ticket_dir.is_symlink():
-                        continue
-                    try:
-                        for session_dir in ticket_dir.iterdir():
-                            name = session_dir.name
-                            if (
-                                len(name) == 15
-                                and name[8] == "-"
-                                and name[:8].isdigit()
-                                and name[9:].isdigit()
-                                and session_dir.is_dir()
-                                and not session_dir.is_symlink()
-                            ):
-                                sessions.append(session_dir)
-                    except OSError:
-                        continue
-            except OSError:
-                return
-            sessions.sort(key=lambda path: path.name, reverse=True)
-            scanned = 0
+        if self.archive_dir is not None:
             scanned_bytes = 0
-            for session_dir in sessions:
+            for session_dir, run_id, _completed_at in recent_archive_sessions(
+                self.archive_dir, RECENT_ARCHIVE_ARTIFACT_SESSIONS
+            ):
                 if cancelled():
                     return
-                events_path = session_dir / "events.jsonl"
-                if (
-                    not (session_dir / "archive-complete.json").is_file()
-                    or not events_path.is_file()
-                    or events_path.is_symlink()
-                ):
+                events_path = session_dir / "artifact-events.jsonl"
+                legacy = not events_path.is_file()
+                if legacy:
+                    events_path = session_dir / "events.jsonl"
+                if not events_path.is_file() or events_path.is_symlink():
                     continue
                 try:
-                    run_value = json.loads(
-                        (session_dir / "run.json").read_text(encoding="utf-8")
-                    )
-                    run_id = str(run_value["run_id"])
-                    if scanned >= RECENT_ARCHIVE_ARTIFACT_SESSIONS:
-                        break
-                    scanned += 1
                     stat = events_path.stat()
+                    if legacy and stat.st_size > LEGACY_ARCHIVE_ARTIFACT_BYTES:
+                        continue
                     if stat.st_size > RECENT_ARCHIVE_ARTIFACT_BYTES - scanned_bytes:
                         continue
                     scanned_bytes += stat.st_size

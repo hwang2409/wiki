@@ -50,15 +50,6 @@ def _agents_payload(**overrides):
                 "spawned_at": "2026-07-22T08:00:00+00:00",
             }
         ],
-        "archived": [
-            {
-                "ticket": "WIKI-99",
-                "role": "implement",
-                "kind": "cc",
-                "outcome": "merged",
-                "archived_at": "2026-07-18T12:00:00+00:00",
-            }
-        ],
     }
     payload.update(overrides)
     return payload
@@ -95,6 +86,7 @@ def _write_events_jsonl(path: Path, entries: list[dict]) -> None:
         json.dumps({"run_id": path.parent.name, "agent_id": path.parent.parent.name}),
         encoding="utf-8",
     )
+    (path.parent / "meta.json").write_text("{}", encoding="utf-8")
     commit_archive(path.parent)
 
 
@@ -200,7 +192,7 @@ class PaletteSearchTests(unittest.TestCase):
             results = palette.search(
                 "PHO-14099",
                 5,
-                agents_payload=_agents_payload(workers=[], orchestrators=[], archived=[]),
+                agents_payload=_agents_payload(workers=[], orchestrators=[]),
                 vault_dir=vault,
                 runs_dir=root / "no-runs",
                 archive_dir=root / "no-archive",
@@ -219,7 +211,7 @@ class PaletteSearchTests(unittest.TestCase):
             results = palette.search(
                 "WIKI-146",
                 5,
-                agents_payload=_agents_payload(workers=[], orchestrators=[], archived=[]),
+                agents_payload=_agents_payload(workers=[], orchestrators=[]),
                 vault_dir=vault,
                 runs_dir=root / "no-runs",
                 archive_dir=root / "no-archive",
@@ -236,7 +228,7 @@ class PaletteSearchTests(unittest.TestCase):
             results = palette.search(
                 "MITMWEB-42",
                 5,
-                agents_payload=_agents_payload(workers=[], orchestrators=[], archived=[]),
+                agents_payload=_agents_payload(workers=[], orchestrators=[]),
                 vault_dir=vault,
                 runs_dir=root / "no-runs",
                 archive_dir=root / "no-archive",
@@ -350,6 +342,28 @@ class PaletteSearchTests(unittest.TestCase):
             self.assertIn(f"focus={artifact_id}", url)
             self.assertIn(f"tab={artifact_id}", url)
 
+    def test_artifacts_walked_from_compact_receipt(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            archive = root / "archive"
+            session = archive / "WIKI-99" / "20260721-120000"
+            session.mkdir(parents=True)
+            artifact_id = "0f6e3a4c-1234-4c1a-8b5e-abcdefabcdef"
+            (session / "run.json").write_text(
+                json.dumps({"run_id": "saved-run", "provider": "codex"}), encoding="utf-8"
+            )
+            (session / "meta.json").write_text("{}", encoding="utf-8")
+            (session / "artifact-events.jsonl").write_text(
+                json.dumps(_artifact_event("table", artifact_id, "saved table")) + "\n",
+                encoding="utf-8",
+            )
+            commit_archive(session, run_id="saved-run")
+
+            items = palette.collect_artifact_items(root / "no-runs", archive)
+
+            self.assertEqual([item.artifact_id for item in items], [artifact_id])
+            self.assertIn("run_id=saved-run", items[0].url)
+
     def test_committed_archive_survives_partial_directory_window(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
@@ -375,7 +389,7 @@ class PaletteSearchTests(unittest.TestCase):
                 (session_dir / "raw.jsonl").write_text("", encoding="utf-8")
                 (session_dir / "run.json").write_text("{}", encoding="utf-8")
 
-            committed_id = "20260718-committed"
+            committed_id = "20260718-120000"
             _write_events_jsonl(
                 ticket_dir / committed_id / "events.jsonl",
                 [_artifact_event("code", "older-committed", "older committed")],
@@ -616,15 +630,6 @@ class PaletteSearchTests(unittest.TestCase):
         self.assertTrue(walk_cancelled["raised"], "cancellation should have propagated to the walk")
         self.assertGreaterEqual(poll_count["n"], 3, "disconnect watcher should have polled at least 3 times")
 
-    def test_palette_reuses_archive_list_during_typing(self):
-        from backend.app import main as app_main
-
-        with mock.patch.object(app_main, "_PALETTE_ARCHIVED_CACHE", None), \
-             mock.patch.object(app_main, "list_archived", return_value=[{"ticket": "WIKI-1"}]) as read:
-            self.assertEqual(app_main._palette_archived_sessions(), [{"ticket": "WIKI-1"}])
-            self.assertEqual(app_main._palette_archived_sessions(), [{"ticket": "WIKI-1"}])
-            read.assert_called_once_with(limit=None)
-
     def test_result_payload_shape(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
@@ -644,6 +649,67 @@ class PaletteSearchTests(unittest.TestCase):
                 keys = set(row.keys())
                 self.assertTrue(base.issubset(keys), f"missing base keys in {keys}")
                 self.assertTrue(keys.issubset(allowed), f"unexpected keys in {keys}")
+
+    def test_palette_search_does_not_list_archived_runs(self):
+        from backend.app import main as app_main
+
+        class EmptyStore:
+            def read_artifact_events(self, **_kwargs):
+                return iter(())
+
+        async def receive():
+            return {"type": "http.request", "body": b"", "more_body": False}
+
+        request = Request({"type": "http", "method": "GET", "path": "/api/palette/search", "headers": []}, receive)
+
+        with mock.patch.object(app_main, "agents", return_value={"workers": [], "orchestrators": []}), \
+             mock.patch.object(app_main, "list_archived", side_effect=AssertionError("archive list")), \
+             mock.patch.object(app_main, "_sqlite_event_store", return_value=EmptyStore()), \
+             mock.patch.object(app_main, "recent_archive_sessions", return_value=[]), \
+             mock.patch.object(palette, "search", return_value=[]):
+            result = asyncio.run(app_main.palette_search(request, q="wiki"))
+
+        self.assertEqual(result, {"mode": "lexical", "results": []})
+
+    def test_palette_search_links_recent_receipt_artifact(self):
+        from backend.app import main as app_main
+
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            vault = _make_vault(root)
+            archive = root / "archive"
+            session = archive / "WIKI-99" / "20260721-120000"
+            session.mkdir(parents=True)
+            run_id = "saved-run"
+            event = _artifact_event(
+                "table", "0f6e3a4c-1234-4c1a-8b5e-abcdefabcdef", "saved table"
+            )
+            (session / "run.json").write_text(json.dumps({"run_id": run_id}))
+            (session / "meta.json").write_text("{}")
+            (session / "artifact-events.jsonl").write_text(json.dumps(event) + "\n")
+            commit_archive(session, run_id=run_id)
+
+            class ArtifactStore:
+                def read_artifact_events(self, **_kwargs):
+                    return iter(((run_id, event),))
+
+            async def receive():
+                return {"type": "http.request", "body": b"", "more_body": False}
+
+            request = Request(
+                {"type": "http", "method": "GET", "path": "/api/palette/search", "headers": []},
+                receive,
+            )
+            with mock.patch.object(app_main, "AGENT_ARCHIVE_DIR", archive), \
+                 mock.patch.object(app_main, "VAULT_DIR", vault), \
+                 mock.patch.object(app_main, "agents", return_value={"workers": [], "orchestrators": []}), \
+                 mock.patch.object(app_main, "list_archived", side_effect=AssertionError("archive list")), \
+                 mock.patch.object(app_main, "_sqlite_event_store", return_value=ArtifactStore()):
+                result = asyncio.run(app_main.palette_search(request, q="saved table"))
+
+        artifact = next(row for row in result["results"] if row["kind"] == "artifact")
+        self.assertIn("run_id=saved-run", artifact["url"])
+        self.assertIn("archived_at=", artifact["url"])
 
 
 if __name__ == "__main__":

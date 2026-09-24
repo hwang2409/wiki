@@ -3,9 +3,9 @@
 The palette walks four kinds of records and returns a single ranked list.
 It reuses upstream stores (never rebuilds them):
 
-- sessions:  live agent registry + status files + archive index
+- sessions:  live agent registry + status files
 - tickets:   vault/todo.md + vault/log/done.md ticket ID extraction
-- artifacts: normalized events.jsonl entries with `kind: "artifact"`
+- artifacts: live events and recent saved artifact receipts
 - notes:     vault/**/*.md titles and first paragraph
 
 Ranking is class-based (exact / prefix / word-boundary / substring /
@@ -32,7 +32,7 @@ from pathlib import Path
 from typing import Any
 from urllib.parse import quote
 
-from .agent_runtime.archive_protocol import archive_is_committed
+from .agent_runtime.archive_protocol import recent_archive_sessions
 
 class PaletteCancelled(Exception):
     """Raised when a caller signalled cancellation mid-walk."""
@@ -87,7 +87,6 @@ class PaletteItem:
     haystack: str
     artifact_id: str | None = None
     ticket: str | None = None
-    archived_at: str | None = None
 
     def to_payload(self, score: float) -> dict[str, Any]:
         payload: dict[str, Any] = {
@@ -366,54 +365,6 @@ def collect_session_items(agents_payload: dict[str, Any]) -> list[PaletteItem]:
                 )
             )
 
-    archived = agents_payload.get("archived")
-    if isinstance(archived, list):
-        for entry in archived:
-            if not isinstance(entry, dict):
-                continue
-            ticket = entry.get("ticket")
-            if not isinstance(ticket, str) or ticket in seen:
-                continue
-            seen.add(ticket)
-            role = entry.get("role") or "archived"
-            kind = entry.get("kind") or ""
-            outcome = entry.get("outcome") or entry.get("state") or "archived"
-            archived_at = entry.get("archived_at")
-            run_id = entry.get("run_id")
-            if isinstance(run_id, str) and isinstance(archived_at, str):
-                url = (
-                    f"?archived_at={quote(archived_at, safe='')}"
-                    f"&run_id={quote(run_id, safe='')}#/agent/{quote(ticket, safe='')}"
-                )
-            else:
-                url = f"#/agent/{ticket}"
-            subtitle = " · ".join(
-                part
-                for part in [
-                    "archived",
-                    str(role),
-                    str(kind) if kind else "",
-                    str(outcome),
-                ]
-                if part
-            )
-            items.append(
-                PaletteItem(
-                    kind="session",
-                    id=ticket,
-                    title=ticket,
-                    subtitle=subtitle,
-                    url=url,
-                    updated_at=_parse_iso(archived_at),
-                    haystack=" ".join(
-                        filter(
-                            None,
-                            [ticket, str(role), str(kind), str(outcome)],
-                        )
-                    ),
-                    ticket=ticket,
-                )
-            )
     return items
 
 
@@ -619,7 +570,6 @@ def _make_artifact_item(
         haystack=haystack,
         artifact_id=artifact_id,
         ticket=ticket,
-        archived_at=archived_at,
     )
 
 
@@ -634,8 +584,7 @@ class _ArtifactDirCacheEntry:
     items: tuple[PaletteItem, ...]
 
 
-# events.jsonl parsing dominates palette latency (multi-MB JSON per dir);
-# keyed on the file's mtime so unchanged dirs never re-parse.
+# Key parsed event files by mtime so repeated searches reuse their artifacts.
 _artifact_dir_cache: dict[str, _ArtifactDirCacheEntry] = {}
 _artifact_dir_cache_lock = threading.Lock()
 
@@ -643,13 +592,21 @@ _artifact_dir_cache_lock = threading.Lock()
 def _collect_from_run_dir(
     run_dir: Path,
     ticket: str | None,
+    *,
+    run_id: str | None = None,
+    archived_at: str | None = None,
 ) -> list[PaletteItem]:
-    events_path = run_dir / "events.jsonl"
+    events_path = run_dir / ("artifact-events.jsonl" if archived_at else "events.jsonl")
+    if archived_at and not events_path.is_file():
+        events_path = run_dir / "events.jsonl"
     if not events_path.is_file() or events_path.is_symlink():
         return []
     try:
-        mtime_ns = int(events_path.stat().st_mtime_ns)
+        file_stat = events_path.stat()
+        mtime_ns = int(file_stat.st_mtime_ns)
     except OSError:
+        return []
+    if archived_at and events_path.name == "events.jsonl" and file_stat.st_size > 5_000_000:
         return []
     cache_key = f"{events_path}|{ticket or ''}"
     with _artifact_dir_cache_lock:
@@ -672,6 +629,8 @@ def _collect_from_run_dir(
             payload,
             ticket,
             _artifact_ts(payload, dir_mtime),
+            run_id=run_id,
+            archived_at=archived_at,
         )
         if item is not None:
             items.append(item)
@@ -712,41 +671,22 @@ def collect_artifact_items(
                 dirs_seen += 1
                 items.extend(found)
 
-    if archive_dir.is_dir() and not archive_dir.is_symlink():
+    for session_dir, run_id, _completed_at in recent_archive_sessions(archive_dir, max_dirs):
+        if dirs_seen >= max_dirs:
+            break
         try:
-            ticket_dirs = list(os.scandir(archive_dir))
-        except OSError:
-            ticket_dirs = []
-        ticket_dirs.sort(key=lambda entry: entry.stat().st_mtime, reverse=True)
-        for ticket_entry in ticket_dirs:
-            if dirs_seen >= max_dirs:
-                break
-            if not ticket_entry.is_dir() or ticket_entry.is_symlink():
-                continue
-            if ticket_entry.name.startswith("_"):
-                continue
-            try:
-                session_dirs = list(os.scandir(ticket_entry.path))
-            except OSError:
-                continue
-            session_dirs.sort(key=lambda entry: entry.name, reverse=True)
-            committed_session_dirs = [
-                entry
-                for entry in session_dirs
-                if (
-                    entry.is_dir()
-                    and not entry.is_symlink()
-                    and archive_is_committed(Path(entry.path))
-                )
-            ]
-            for session_entry in committed_session_dirs:
-                session_dir = Path(session_entry.path)
-                found = _collect_from_run_dir(session_dir, ticket_entry.name)
-                if found:
-                    dirs_seen += 1
-                    items.extend(found)
-                    if dirs_seen >= max_dirs:
-                        break
+            archived_at = datetime.strptime(session_dir.name, "%Y%m%d-%H%M%S").astimezone().isoformat()
+        except ValueError:
+            continue
+        found = _collect_from_run_dir(
+            session_dir,
+            session_dir.parent.name,
+            run_id=run_id,
+            archived_at=archived_at,
+        )
+        if found:
+            dirs_seen += 1
+            items.extend(found)
 
     return items
 

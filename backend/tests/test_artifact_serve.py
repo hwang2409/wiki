@@ -65,6 +65,7 @@ class ArtifactServeTests(unittest.TestCase):
         (session_dir / "run.json").write_text(
             json.dumps({"run_id": run_id, "provider": "codex"}), encoding="utf-8"
         )
+        (session_dir / "meta.json").write_text("{}", encoding="utf-8")
         (session_dir / "raw.jsonl").write_text("raw\n", encoding="utf-8")
         (session_dir / "events.jsonl").write_text("events\n", encoding="utf-8")
         commit_archive(session_dir, run_id=run_id, completed_at="2026-08-01T00:00:00Z")
@@ -90,6 +91,20 @@ class ArtifactServeTests(unittest.TestCase):
         response = main.get_agent_artifact("WIKI-85", ARTIFACT_ID)
         self.assertEqual(Path(response.path), target)
         self.assertEqual(response.media_type, "image/webp")
+
+    def test_recent_older_receipt_artifact_is_served(self) -> None:
+        older = self.archive / "WIKI-85" / "20260712-120000" / "artifacts"
+        newest = self.archive / "WIKI-85" / "20260713-120000" / "artifacts"
+        older.mkdir(parents=True)
+        newest.mkdir(parents=True)
+        target = older / f"{ARTIFACT_ID}.png"
+        target.write_bytes(b"older saved artifact")
+        self._commit_archive(older.parent, "old-archive")
+        self._commit_archive(newest.parent, "new-archive")
+
+        response = main.get_agent_artifact("WIKI-85", ARTIFACT_ID)
+
+        self.assertEqual(Path(response.path), target)
 
     def test_visual_diff_variant_serves_paired_files(self) -> None:
         self.registry.write_text(
