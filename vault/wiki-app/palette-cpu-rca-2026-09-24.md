@@ -14,6 +14,7 @@ updated: 2026-09-24
 - The local archive held 3,681 `events.jsonl` files and used 60 GB on 2026-09-24. The recent 40 committed sessions held 128 MiB of event JSONL and no artifact events. A source inspection shows the startup thread and palette endpoint both invoke the full archive reader.
 - The palette sends a request 80 ms after each query change. Reading all archived session bodies with the PR #300 branch took 0.96 seconds on a cold call and 0.56 seconds in an earlier call. The full artifact scan would add far more work. These are local path measurements, not a measured live request latency or CPU share.
 - The active backend still runs the old app build. Its current high CPU cannot be assigned precisely to palette without a stack sample during a palette search; the startup thread is a plausible concurrent contributor.
+- At 14:59 EDT, the old backend log (`wiki-backend-1790263999.log`) contained 1,400 `GET /api/agents?` requests but no palette or dashboard requests. Palette search and dashboard polling cannot explain the current sustained CPU from request traffic.
 
 ## Decision and fix
 
