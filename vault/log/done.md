@@ -9,6 +9,7 @@ updated: 2026-09-24
 
 ## 2026-09-24
 
+- **wiki** — bounded palette archive reads and stopped startup artifact scan ([#301](https://github.com/hwang2409/wiki/pull/301), `63bdff19`); native app install pending
 - **wiki** — notes-only knowledge index, bounded archive list, and orchestrator workgraph CPU fixes merged ([#300](https://github.com/hwang2409/wiki/pull/300), `89cbac1e`); native app install pending
 
 ## 2026-09-22
