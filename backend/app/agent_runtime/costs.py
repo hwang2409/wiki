@@ -17,7 +17,7 @@ from typing import Any, Literal
 from urllib.parse import quote
 
 from ..pathwalk import open_relative_directory, open_relative_file, open_root_directory
-from .archive_protocol import archive_is_committed
+from .archive_protocol import archive_is_committed, read_archive_catalog
 from .ticket import base_ticket
 
 # USD per one million tokens. Sources:
@@ -723,20 +723,40 @@ def resolve_run_source(run_id: str) -> RunSource:
             os.close(root_fd)
 
     archive_root = _archive_root()
+    for relative, entry in read_archive_catalog(archive_root).items():
+        if (
+            not isinstance(relative, str)
+            or not isinstance(entry, dict)
+            or entry.get("run_id") != run_id
+        ):
+            continue
+        parts = relative.split("/")
+        if len(parts) != 2 or any(part in {"", ".", ".."} or "\0" in part for part in parts):
+            continue
+        source = _committed_run_source(archive_root.joinpath(*parts), run_id)
+        if source is not None:
+            return source
     try:
         session_dirs = tuple(archive_root.glob("*/*"))
     except OSError:
         session_dirs = ()
     for session_dir in session_dirs:
-        if not archive_is_committed(session_dir):
-            continue
-        try:
-            value = json.loads((session_dir / "run.json").read_text(encoding="utf-8"))
-        except (OSError, ValueError, UnicodeError):
-            continue
-        if isinstance(value, dict) and value.get("run_id") == run_id:
-            return RunSource("ARCHIVED", session_dir, committed=True)
+        source = _committed_run_source(session_dir, run_id)
+        if source is not None:
+            return source
     return RunSource("GONE")
+
+
+def _committed_run_source(session_dir: Path, run_id: str) -> RunSource | None:
+    if not archive_is_committed(session_dir):
+        return None
+    try:
+        value = json.loads((session_dir / "run.json").read_text(encoding="utf-8"))
+    except (OSError, ValueError, UnicodeError):
+        return None
+    if isinstance(value, dict) and value.get("run_id") == run_id:
+        return RunSource("ARCHIVED", session_dir, committed=True)
+    return None
 
 
 @dataclass(slots=True)
