@@ -19,7 +19,7 @@ updated: 2026-09-24
 ## Decision and fix
 
 - Henry chose a notes-only knowledge index. Agent run history stays in its source archive and agent UI. Full transcript search is no longer needed in `knowledge.db`.
-- PR [#300](https://github.com/hwang2409/wiki/pull/300) on branch `wiki-cpu-fix` removes archive and live-run ingestion, the run/event tables, archive-triggered refresh requests, and run filters from CLI and MCP search. Schema version 5 rebuilds the derived DB from notes. On version mismatch, the backend recreates the DB file to reclaim the old 11 GB file instead of dropping rows into a large freelist.
+- PR [#300](https://github.com/hwang2409/wiki/pull/300) merged as `89cbac1e`. It removes archive and live-run ingestion, the run/event tables, archive-triggered refresh requests, and run filters from CLI and MCP search. Schema version 5 rebuilds the derived DB from notes. On version mismatch, the backend recreates the DB file to reclaim the old 11 GB file instead of dropping rows into a large freelist.
 - The DB still serves note search, links, and semantic-search fallback. `knowledge.db.semantic` remains a separate note index.
 - An isolated notes-only rebuild on PR #300 indexed 165 notes and 1,556 chunks in 0.39 seconds. The derived DB was 3.8 MiB. The old live rebuild took about 85 minutes and left an 11 GB DB.
 - A native build of PR #300 staged successfully. The old backend still runs until the new app build is installed. Do not treat the branch result as live CPU proof.

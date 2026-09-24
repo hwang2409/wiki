@@ -2,10 +2,14 @@
 type: log
 tags: [log, done]
 created: 2026-07-06
-updated: 2026-09-22
+updated: 2026-09-24
 ---
 
 # Done
+
+## 2026-09-24
+
+- **wiki** — notes-only knowledge index, bounded archive list, and orchestrator workgraph CPU fixes merged ([#300](https://github.com/hwang2409/wiki/pull/300), `89cbac1e`); native app install pending
 
 ## 2026-09-22
 

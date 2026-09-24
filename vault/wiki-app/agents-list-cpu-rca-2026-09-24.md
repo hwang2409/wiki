@@ -17,7 +17,7 @@ updated: 2026-09-24
 
 ## Fix and measurement
 
-- PR [#300](https://github.com/hwang2409/wiki/pull/300) on branch `wiki-cpu-fix` reads the catalog once per archive-list call. It sorts session paths first, then verifies uncataloged sessions and opens only the requested bodies. The default 20-row call returned in 0.13 seconds against the live archive from the branch, compared with 32.46 seconds through the old route. A direct `agents(include_history=True)` call from the branch took 0.18 seconds with mutation hooks mocked. The running app still uses the old code.
-- The same branch accepts safe lowercase workgraph IDs and stops the worker loop-state UI poll for orchestrators. This removes the `feebs` validation error loop. The live app still runs the old build.
+- PR [#300](https://github.com/hwang2409/wiki/pull/300) merged as `89cbac1e`. It reads the catalog once per archive-list call. It sorts session paths first, then verifies uncataloged sessions and opens only the requested bodies. The default 20-row call returned in 0.13 seconds against the live archive from the branch, compared with 32.46 seconds through the old route. A direct `agents(include_history=True)` call from the branch took 0.18 seconds with mutation hooks mocked. The running app still uses the old code.
+- The merged change accepts safe lowercase workgraph IDs and stops the worker loop-state UI poll for orchestrators. This removes the `feebs` validation error loop. The live app still runs the old build.
 
 The sample and route timing show an independent high-cost agents-list path. They do not prove the exact CPU share of each substep under concurrent knowledge refresh.
