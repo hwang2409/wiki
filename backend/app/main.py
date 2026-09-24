@@ -1872,38 +1872,32 @@ def _archive_hint(
     archived_at: str | None = None,
     run_id: str | None = None,
 ) -> tuple[str | None, str | None, Path | None]:
-    """(kind, spawned_at iso, session dir) for a ticket's archive.
-
-    Without ``archived_at`` returns the newest archive (unchanged behavior).
-    With ``archived_at`` and ``run_id`` returns the exact committed archive,
-    or (None, None, None) for a stale or mismatched identifier.
-
-    ``archived_at`` and ``run_id`` are the archive discriminators used by the
-    session routes.
-    """
+    """Return the newest or exact committed receipt for a ticket."""
 
     ticket_dir = AGENT_ARCHIVE_DIR / ticket
-    if not ticket_dir.is_dir():
-        return (None, None, None)
-    sessions = _archive_sessions(ticket_dir)
-    if not sessions:
+    if not ticket_dir.is_dir() or ticket_dir.is_symlink():
         return (None, None, None)
     if archived_at is not None or run_id is not None:
         if archived_at is None or run_id is None:
             return (None, None, None)
-        resolved = _archive_session_for_run_id(run_id)
-        if resolved is None or resolved.parent.name != ticket:
+        try:
+            timestamp = datetime.fromisoformat(archived_at)
+        except ValueError:
             return (None, None, None)
-        for candidate_at, session_dir in sessions:
-            if candidate_at.isoformat() == archived_at and session_dir == resolved:
-                kind = (
-                    "cdx"
-                    if any(session_dir.glob("cdx-*"))
-                    else "cc"
-                    if any(session_dir.glob("cc-*"))
-                    else None
-                )
-                return (kind, candidate_at.isoformat(), session_dir)
+        session_dir = ticket_dir / timestamp.strftime("%Y%m%d-%H%M%S")
+        catalog = read_archive_catalog(AGENT_ARCHIVE_DIR)
+        if (
+            session_dir.is_symlink()
+            or not session_dir.is_dir()
+            or not _cataloged_or_committed(catalog, ticket, session_dir)
+            or _read_json_object(session_dir / "run.json").get("run_id") != run_id
+            or timestamp.astimezone().isoformat() != archived_at
+        ):
+            return (None, None, None)
+        kind = "cdx" if any(session_dir.glob("cdx-*")) else "cc" if any(session_dir.glob("cc-*")) else None
+        return (kind, archived_at, session_dir)
+    sessions = _archive_sessions(ticket_dir)
+    if not sessions:
         return (None, None, None)
     archived_at_dt, session_dir = sessions[0]
     kind = "cdx" if any(session_dir.glob("cdx-*")) else "cc" if any(session_dir.glob("cc-*")) else None
@@ -1916,21 +1910,6 @@ def _read_json_object(path: Path) -> dict[str, Any]:
     except (OSError, ValueError):
         return {}
     return value if isinstance(value, dict) else {}
-
-
-def _archive_runtime_identity(
-    archive_dir: Path,
-    *,
-    fallback_kind: str | None,
-) -> tuple[dict[str, Any], str | None, str | None, str | None]:
-    run = _read_json_object(archive_dir / "run.json")
-    meta = _read_json_object(archive_dir / "meta.json")
-    worker = meta.get("worker")
-    entry = {**run, **(worker if isinstance(worker, dict) else {})}
-    model, kind, provider = _session_identity(entry)
-    kind = kind or fallback_kind
-    provider = provider or _provider_for_kind(kind)
-    return entry, model, kind, provider
 
 
 def _supervisor_pid_is_alive() -> bool:
@@ -3838,18 +3817,6 @@ def agent_provider_events(
     return result
 
 
-def _archive_session_for_run_id(run_id: str) -> Path | None:
-    """Find the committed archive session for one exact run id."""
-
-    for session_dir in AGENT_ARCHIVE_DIR.glob("*/*"):
-        if not archive_is_committed(session_dir):
-            continue
-        run = _read_json_object(session_dir / "run.json")
-        if run.get("run_id") == run_id:
-            return session_dir
-    return None
-
-
 def _session_delta_payload(
     fmt: str,
     path: Path,
@@ -3944,7 +3911,7 @@ def _session_delta_payload(
     return payload
 
 
-def _archived_events_payload(
+def _saved_artifacts_payload(
     archive_dir: Path,
     *,
     cursor: int,
@@ -3952,44 +3919,55 @@ def _archived_events_payload(
     fallback_kind: str | None,
 ) -> dict[str, object] | None:
     path = archive_dir / "artifact-events.jsonl"
-    if not path.is_file():
+    compact = path.is_file()
+    if not compact:
         path = archive_dir / "events.jsonl"
     if not path.is_file():
         return None
-    entry, model, kind, provider = _archive_runtime_identity(
-        archive_dir,
-        fallback_kind=fallback_kind,
-    )
+    if not compact:
+        try:
+            if path.stat().st_size > 5_000_000:
+                return None
+        except OSError:
+            return None
+    run = _read_json_object(archive_dir / "run.json")
+    worker = _read_json_object(archive_dir / "meta.json").get("worker")
+    identity = {**run, **(worker if isinstance(worker, dict) else {})}
+    model, kind, provider = _session_identity(identity)
+    kind = kind or fallback_kind
+    provider = provider or _provider_for_kind(kind)
     if provider not in {"codex", "claude"}:
         return None
     source_format = f"{provider}-normalized"
-    effective_cursor = 0 if client_path is not None and client_path != str(path) else cursor
-    result = transcripts.read_session_delta(source_format, path, effective_cursor)
+    result = transcripts.read_session_delta(source_format, path, 0, tail_window=False)
+    artifact_events = [event for event in result["events"] if event.get("kind") == "artifact"]
+    artifacts = [{**event, "id": index} for index, event in enumerate(artifact_events)]
+    if not artifacts:
+        return None
+    unchanged = isinstance(cursor, int) and cursor > 0 and client_path == str(path)
     payload: dict[str, object] = {
         "version": 2,
         "format": "provider-events",
         "path": str(path),
-        "tokens": result["tokens"],
-        "tasks": result.get("tasks") or [],
-        "pr": result.get("pr"),
-        "session_meta": result.get("session_meta") or {},
-        "dispositions": result.get("dispositions")
-        or {"rendered": 0, "summarized": 0, "ignored": 0, "unknown": 0},
-        "base": result["base"],
-        "cursor": result["cursor"],
-        "tail_from": result["tail_from"],
-        "events": result["events"],
-        "patches": result.get("patches") or [],
+        "tokens": None,
+        "tasks": [],
+        "pr": None,
+        "session_meta": {},
+        "dispositions": {"rendered": len(artifacts), "summarized": 0, "ignored": 0, "unknown": 0},
+        "base": 0,
+        "cursor": 1,
+        "tail_from": len(artifacts) if unchanged else 0,
+        "events": [] if unchanged else artifacts,
+        "patches": [],
         "subagents": [],
         "queue": [],
         "working": False,
         "model": model,
-        "desired_model": entry.get("desired_model"),
+        "desired_model": None,
         "kind": kind,
         "provider": provider,
+        "has_older": False,
     }
-    if "has_older" in result:
-        payload["has_older"] = bool(result["has_older"])
     return payload
 
 
@@ -4005,19 +3983,19 @@ def _agent_session_impl(
     if not valid_agent_id(ticket):
         raise HTTPException(status_code=400, detail="Bad ticket")
 
-    requested_archive = archived_at is not None or run_id is not None
-    archive_dir: Path | None = None
-    archive_kind: str | None = None
-    spawned_at: str | None = None
-    archive_model: str | None = None
-    archive_provider: str | None = None
-    if requested_archive:
-        archive_kind, spawned_at, archive_dir = _archive_hint(ticket, archived_at, run_id)
+    if archived_at is not None or run_id is not None:
+        _kind, _timestamp, archive_dir = _archive_hint(ticket, archived_at, run_id)
         if archive_dir is None:
             raise HTTPException(status_code=404, detail="Archived session not found")
-        _archive_entry, archive_model, archive_kind, archive_provider = (
-            _archive_runtime_identity(archive_dir, fallback_kind=archive_kind)
+        saved_artifacts = _saved_artifacts_payload(
+            archive_dir,
+            cursor=cursor,
+            client_path=client_path,
+            fallback_kind=_kind,
         )
+        if saved_artifacts is None:
+            raise HTTPException(status_code=404, detail="Saved artifacts not found")
+        return saved_artifacts
 
     registry: dict = {}
     try:
@@ -4025,7 +4003,7 @@ def _agent_session_impl(
     except (OSError, ValueError):
         pass
     orch = (registry.get("_orchestrators") or {}).get(ticket)
-    if not requested_archive and orch and orch.get("transcript"):
+    if orch and orch.get("transcript"):
         found = _direct_transcript_session(Path(orch["transcript"]))
         if found is not None:
             fmt, path = found
@@ -4052,19 +4030,13 @@ def _agent_session_impl(
         raise HTTPException(status_code=404, detail="Orchestrator transcript missing")
 
     current = (registry.get(ticket) or {}).get("current") or {}
+    if not current:
+        raise HTTPException(status_code=404, detail="No active session found")
     current_model, current_kind, current_provider = _session_identity(
         current if isinstance(current, dict) else None
     )
     spawned_at = current.get("spawned_at")
     registry_session_id = current.get("session_id") if isinstance(current.get("session_id"), str) else None
-    if requested_archive:
-        current = {}
-        current_model = archive_model
-        current_kind = archive_kind
-        current_provider = archive_provider
-    elif not current:
-        archive_kind, spawned_at, archive_dir = _archive_hint(ticket, archived_at)
-        current_kind = current_kind or archive_kind
 
     current_run_id = current.get("run_id") if isinstance(current, dict) else None
     if (
@@ -4101,15 +4073,15 @@ def _agent_session_impl(
         )
         return sqlite_payload
     found = None
-    if not requested_archive and isinstance(current, dict) and _is_headless(current):
+    if isinstance(current, dict) and _is_headless(current):
         transcript_hint = current.get("transcript")
         if isinstance(transcript_hint, str):
             found = _direct_transcript_session(Path(transcript_hint))
             if found is not None:
                 _session_paths[ticket] = found
-    if not requested_archive and found is None:
+    if found is None:
         found = _session_paths.get(ticket)
-    if not requested_archive and (found is None or not found[1].is_file()):
+    if found is None or not found[1].is_file():
         found = transcripts.find_session(
             current_kind,
             ticket,
@@ -4120,10 +4092,6 @@ def _agent_session_impl(
         if found:
             _session_paths[ticket] = found
     if found is None:
-        if archive_dir is None and isinstance(current, dict):
-            current_run_id = current.get("run_id")
-            if isinstance(current_run_id, str):
-                archive_dir = _archive_session_for_run_id(current_run_id)
         if isinstance(current, dict) and _is_headless(current):
             provider_inspector = _provider_events(ticket, limit=50, use_sqlite=False)
             if allow_sqlite and _sqlite_read_enabled("session") and isinstance(current_run_id, str):
@@ -4186,48 +4154,6 @@ def _agent_session_impl(
                 ticket=ticket,
                 provider_inspector=provider_inspector,
             )
-        # Native transcript gone (cleanup) — the archive owns a durable,
-        # normalized provider stream for headless runs.
-        if archive_dir is not None:
-            archived = _archived_events_payload(
-                archive_dir,
-                cursor=cursor,
-                client_path=client_path,
-                fallback_kind=current_kind,
-            )
-            if archived is not None:
-                return archived
-            # Pre-headless tmux archives have no normalized event stream.
-            logs = sorted(archive_dir.glob("*.log"), key=lambda p: p.stat().st_size, reverse=True)
-            if logs:
-                tail = clean_pane_log(logs[0])
-                _, model, kind, provider = _archive_runtime_identity(
-                    archive_dir,
-                    fallback_kind=current_kind,
-                )
-                kind = kind or current_kind
-                provider = provider or _provider_for_kind(kind)
-                return {
-                    "version": 2,
-                    "format": "pane-log",
-                    "path": str(logs[0]),
-                    "tokens": None,
-                    "tasks": [],
-                    "pr": None,
-                    "session_meta": {},
-                    "dispositions": {"rendered": 1, "summarized": 0, "ignored": 0, "unknown": 0},
-                    "base": 0,
-                    "cursor": 1,
-                    "tail_from": 0,
-                    "events": [{"id": 0, "kind": "terminal", "ts": None, "text": tail, "disposition": "rendered"}],
-                    "patches": [],
-                    "subagents": [],
-                    "queue": [],
-                    "working": False,
-                    "model": model,
-                    "kind": kind,
-                    "provider": provider,
-                }
         raise HTTPException(status_code=404, detail="No session transcript found")
 
     fmt, path = found
@@ -4314,6 +4240,8 @@ def agent_session_older(
     archived_at: str | None = None,
     run_id: str | None = None,
 ) -> dict[str, object]:
+    if archived_at is not None:
+        raise HTTPException(status_code=409, detail="Saved artifacts have no older events")
     resolved = _registry_agent(_read_agent_registry(), ticket)
     current = resolved[2] if resolved is not None else None
     current_run_id = current.get("run_id") if isinstance(current, dict) else None

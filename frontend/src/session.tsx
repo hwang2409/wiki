@@ -3329,7 +3329,10 @@ export function SessionTab({
     [archivedAt, runId, subagent, ticket]
   ) satisfies TranscriptTarget;
   const visible = useElementVisible(containerNode);
-  const { session, pendingUserMessages, error, refreshError, loading } = useTranscriptSession(target, visible);
+  const { session, pendingUserMessages, error, refreshError, loading } = useTranscriptSession(
+    target,
+    visible && target.mode === "live",
+  );
   const pendingTimeline = useMemo(() => {
     const next = new Map(pendingTimelineRef.current);
     for (const message of pendingUserMessages) next.set(message.id, message);

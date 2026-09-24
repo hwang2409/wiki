@@ -49,6 +49,14 @@ function panelStateFromUrl(ticket: string, current: PanelState, closeWhenAbsent 
   };
 }
 
+export function receiptTargetFromUrl(ticket: string): { archivedAt: string; runId: string } | null {
+  const params = new URL(window.location.href).searchParams;
+  if (params.get("panel") !== ticket || !params.get("artifact")) return null;
+  const archivedAt = params.get("archived_at");
+  const runId = params.get("run_id");
+  return archivedAt && runId ? { archivedAt, runId } : null;
+}
+
 function writePanelUrl(ticket: string, state: PanelState, replace = false) {
   const url = new URL(window.location.href);
   if (state.open && state.tabs.length > 0) {
@@ -301,7 +309,8 @@ export function AgentSessionSurface({
   worker: AgentSessionSurfaceWorker;
 }) {
   const tick = usePollTick(refreshTick);
-  const canReview = worker.canReview ?? Boolean(worker.pr);
+  const [receiptTarget, setReceiptTarget] = useState(() => receiptTargetFromUrl(worker.ticket));
+  const canReview = !receiptTarget && (worker.canReview ?? Boolean(worker.pr));
   const rowRef = useRef<HTMLDivElement | null>(null);
   const surfaceStateKey = `${stateKey ?? worker.ticket}:${worker.ticket}`;
   const sessionPanelKey = `${worker.ticket}:main`;
@@ -432,6 +441,10 @@ export function AgentSessionSurface({
   }, [canReview, panel]);
 
   useEffect(() => {
+    if (receiptTarget) setPanel(null);
+  }, [receiptTarget]);
+
+  useEffect(() => {
     surfaceStateCache.set(surfaceStateKey, {
       panel: !canReview && panel?.kind === "review" ? null : panel,
       panelWidth,
@@ -448,6 +461,7 @@ export function AgentSessionSurface({
 
   useEffect(() => {
     const onPopState = () => {
+      setReceiptTarget(receiptTargetFromUrl(worker.ticket));
       const next = panelStateFromUrl(worker.ticket, readPanelState(sessionPanelKey));
       panelStateRef.current = next;
       setPanelState(next);
@@ -577,13 +591,13 @@ export function AgentSessionSurface({
         <header className="session-header agent-session-surface-head">
           <div className="agent-session-head-primary" data-testid="session-header-primary">
             <span className="session-ticket">{worker.ticket}</span>
-            <WorkerStatePill state={state} />
-            {blocker ? (
+            <WorkerStatePill state={receiptTarget ? null : state} />
+            {!receiptTarget && blocker ? (
               <div className="session-blocker-row" data-testid="session-blocker-row" role="alert">
                 <AlertTriangle aria-hidden size={13} />
                 <span className="session-blocker-text" title={blocker}>{blocker}</span>
               </div>
-            ) : step ? (
+            ) : !receiptTarget && step ? (
               <div className="session-step-row" data-testid="session-step-row">
                 <span className="session-step-label">now</span>
                 <span className="session-step-text" title={step}>{step}</span>
@@ -595,12 +609,13 @@ export function AgentSessionSurface({
               {worker.kind ? <span className="agent-session-runtime-item">{worker.kind}</span> : null}
               {worker.role ? <span className="agent-session-runtime-item">{worker.role}</span> : null}
               {worker.model ? <span className="agent-session-runtime-item">{worker.model}</span> : null}
-              {worker.role !== "orchestrator" ? (
+              {!receiptTarget && worker.role !== "orchestrator" ? (
                 <LoopStateChrome ticket={worker.ticket} tick={tick} />
               ) : null}
+              {receiptTarget ? <span className="agent-session-runtime-item">saved artifacts</span> : null}
             </div>
             <div className="agent-surface-actions" aria-label="Run actions">
-              {worker.canReplace && worker.kind && worker.model ? (
+              {!receiptTarget && worker.canReplace && worker.kind && worker.model ? (
                 <button
                   className="agent-surface-action"
                   type="button"
@@ -623,7 +638,7 @@ export function AgentSessionSurface({
                   Review
                 </button>
               ) : null}
-              <button
+              {!receiptTarget ? <button
                 className={`agent-surface-action${panel?.kind === "graph" ? " is-active" : ""}`}
                 type="button"
                 onClick={() => {
@@ -633,7 +648,7 @@ export function AgentSessionSurface({
               >
                 <GitBranch size={13} />
                 Graph
-              </button>
+              </button> : null}
               {onClose ? (
                 <button
                   aria-label="Close pane"
@@ -649,10 +664,13 @@ export function AgentSessionSurface({
         </header>
         <div className="agent-session-surface-main" ref={mainScopeRef}>
           <SessionTab
+            archivedAt={receiptTarget?.archivedAt}
             onArtifactsChange={handleArtifactsChange}
             onInspect={inspectSubagent}
             onInspectArtifact={openInspector}
             onOpenArtifact={openArtifact}
+            runId={receiptTarget?.runId}
+            showComposer={!receiptTarget}
             stateKey={`${surfaceStateKey}:main`}
             ticket={worker.ticket}
           />

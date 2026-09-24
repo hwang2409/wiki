@@ -367,10 +367,9 @@ async function loadTarget(target: TranscriptTarget, cursor: number, path?: strin
 }
 
 export async function loadOlderEvents(target: TranscriptTarget, before: number, count = 500): Promise<void> {
+  if (target.mode === "archive") return;
   const entry = getEntry(target);
-  const archivedAt = target.mode === "archive" ? target.archivedAt : undefined;
-  const runId = target.mode === "archive" ? target.runId : undefined;
-  const result = await getAgentOlderSession(target.ticket, before, count, archivedAt, runId);
+  const result = await getAgentOlderSession(target.ticket, before, count);
   const current = entry.snapshot.session;
   if (!current || current.path !== result.path || current.base !== before) return;
   const merged = prependOlderEvents(current, result, before);
@@ -540,7 +539,7 @@ export function pendingUserMessageIsAcknowledged(ticket: string, pendingId: stri
 
 export function refreshTranscript(ticket: string) {
   entries.forEach((entry) => {
-    if (entry.target.ticket !== ticket || entry.target.subagent) return;
+    if (entry.target.ticket !== ticket || entry.target.subagent || entry.target.mode === "archive") return;
     entry.dirty = true;
     if (entry.listeners.size > 0) void fetchEntry(entry);
   });
