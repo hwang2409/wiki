@@ -21,3 +21,4 @@ updated: 2026-09-24
 - Remove the startup palette scan. Search live SQLite artifacts and at most the 40 newest committed archived sessions, with a 128 MiB archive-read cap. Cache each unchanged archived file's artifact events. Reuse the full archived session list across a short typing burst.
 - Local direct measurements from the branch: first bounded artifact read 0.23 seconds; second read 0.13 seconds. The full archive session list took 0.96 seconds first, then 0 seconds from the cache. The installed app has not been updated.
 - PR [#301](https://github.com/hwang2409/wiki/pull/301) merged as `63bdff19`. The installed app still runs the old build.
+- The combined #300/#301 native build is staged at `/Users/henry/me/fun/wiki-cpu-fix/.native-build-staging/20260924-145702-28486`. Henry chose to install later. The superseded #300 stage was removed.
