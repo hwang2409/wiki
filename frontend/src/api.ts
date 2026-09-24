@@ -1203,8 +1203,8 @@ export type FleetGraphData = {
   updated_at_ns: number;
 };
 
-export function getFleetGraph(limit = 10) {
-  return request<FleetGraphData>(`/api/fleet/graph?limit=${limit}`);
+export function getFleetGraph() {
+  return request<FleetGraphData>("/api/fleet/graph");
 }
 
 export type ScreencastFrameKind = "assistant" | "user" | "tool" | "marker";
