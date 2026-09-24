@@ -710,8 +710,6 @@ class Supervisor:
         self.codex_rotation_task: asyncio.Task[dict[str, Any]] | None = None
         self.codex_rotation_operation_id: str | None = None
         self.recovery_scan_lock = asyncio.Lock()
-        self.archive_backfill_task: asyncio.Task[Any] | None = None
-        self.archive_backfill_worker: asyncio.Task[Any] | None = None
         self.shutdown_phase = _ShutdownPhaseOwner()
         # A supervisor boot invalidates any provider stdin write that had not
         # completed before shutdown: even if the row is at "sending", the
@@ -763,15 +761,6 @@ class Supervisor:
         )
         if self.worker_soft_cap < 1:
             raise ValueError("worker_soft_cap must be positive")
-        try:
-            from .. import workgraph_service
-
-            workgraph_service.reconcile_archive_edges(
-                self.store.paths.archive_dir,
-                status_dir=self.store.paths.status_dir,
-            )
-        except Exception:
-            logger.exception("could not reconcile archived workgraph edges")
 
     def materializer_metrics(self) -> dict[str, Any]:
         with self._materializer_metrics_lock:
@@ -3574,7 +3563,6 @@ Preserve the same identity, role, worktree, orchestrator grouping, PR gates, and
                             else:
                                 results[index] = reaped
                     results.extend(await self._auto_archive_sweep())
-                    self._schedule_archive_backfill()
             await self.command_queue.recover_pending()
             if not self.command_queue.recovery_ready():
                 return results
@@ -3760,34 +3748,6 @@ Preserve the same identity, role, worktree, orchestrator grouping, PR gates, and
                 f"event projection is still rebuilding for run {run_id}"
             )
         await self._ensure_projection_ready(run_id)
-
-    def _schedule_archive_backfill(self) -> None:
-        """Run a bounded archive parity backfill off the recovery path."""
-
-        if (
-            self.archive_backfill_task is not None
-            and not self.archive_backfill_task.done()
-        ):
-            return
-        from .archive_parity import backfill_headless_runs
-
-        async def run_backfill() -> None:
-            worker = asyncio.create_task(
-                asyncio.to_thread(
-                    backfill_headless_runs,
-                    self.store,
-                    self.event_store,
-                    batch_size=32,
-                ),
-                name="archive-parity-backfill-worker",
-            )
-            self.archive_backfill_worker = worker
-            await asyncio.shield(worker)
-
-        self.archive_backfill_task = self._spawn_monitor_task(
-            run_backfill(),
-            name="archive-parity-backfill",
-        )
 
     async def _normalize_orphan_raw_events(
         self, run_ids: Collection[str] | None = None
@@ -7471,9 +7431,6 @@ Preserve the same identity, role, worktree, orchestrator grouping, PR gates, and
                 *(asyncio.shield(task) for task in self.idempotency_tasks.values()),
                 return_exceptions=True,
             )
-        worker = self.archive_backfill_worker
-        if worker is not None and not worker.done():
-            await asyncio.gather(asyncio.shield(worker), return_exceptions=True)
         if self.archive_jobs:
             await asyncio.gather(
                 *(asyncio.shield(job) for job in tuple(self.archive_jobs)),
@@ -7512,8 +7469,6 @@ Preserve the same identity, role, worktree, orchestrator grouping, PR gates, and
             self.adapters.clear()
             self.event_routes.clear()
             self.archive_jobs.clear()
-            self.archive_backfill_worker = None
-            self.archive_backfill_task = None
             await self.persistence_writer.close()
             self.event_store.close()
             return
@@ -7551,24 +7506,6 @@ Preserve the same identity, role, worktree, orchestrator grouping, PR gates, and
                 task.cancel()
             await asyncio.gather(*self.monitor_tasks, return_exceptions=True)
         self.monitor_tasks.clear()
-        worker = self.archive_backfill_worker
-        worker_error: BaseException | None = None
-        if worker is not None:
-            try:
-                await asyncio.shield(worker)
-            except asyncio.CancelledError as exc:
-                if worker.cancelled():
-                    worker_error = None
-                else:
-                    try:
-                        await worker
-                    except BaseException as worker_exc:
-                        worker_error = worker_exc
-                    else:
-                        worker_error = exc
-            except BaseException as exc:
-                worker_error = exc
-        self.archive_backfill_worker = None
         self.event_routes.clear()
         self.event_processing_locks.clear()
         self.event_inflight_counts.clear()
@@ -7605,8 +7542,6 @@ Preserve the same identity, role, worktree, orchestrator grouping, PR gates, and
             await self.close_materializer_executor()
             self.archive_jobs.clear()
             self.event_store.close()
-        if worker_error is not None:
-            raise worker_error
 
     async def close_materializer_executor(self) -> None:
         if getattr(self, "_materializer_executor_closed", False):

@@ -205,32 +205,6 @@ class SupervisorDualWriteTests(unittest.IsolatedAsyncioTestCase):
             {"p50", "p95", "p99"},
         )
 
-    async def test_recovery_schedules_archive_backfill(self) -> None:
-        with mock.patch(
-            "backend.app.agent_runtime.archive_parity.backfill_headless_runs",
-            return_value=[],
-        ) as backfill:
-            await self.supervisor.recover_on_start()
-            task = self.supervisor.archive_backfill_task
-            self.assertIsNotNone(task)
-            await task
-
-        backfill.assert_called_once_with(
-            self.store,
-            self.supervisor.event_store,
-            batch_size=32,
-        )
-
-    async def test_close_releases_event_store_after_archive_backfill_failure(self) -> None:
-        async def fail_backfill() -> None:
-            raise RuntimeError("archive backfill failed")
-
-        shard = self.supervisor.event_store.for_run(self.record.run_id)
-        self.supervisor.archive_backfill_worker = asyncio.create_task(fail_backfill())
-        with self.assertRaisesRegex(RuntimeError, "archive backfill failed"):
-            await self.supervisor.close()
-        self.assertTrue(shard.closed)
-
     async def test_archive_closes_the_run_event_store_shard(self) -> None:
         await self._apply(
             self._event("turn/started", {"turn": {"id": "turn-1"}})
@@ -239,26 +213,6 @@ class SupervisorDualWriteTests(unittest.IsolatedAsyncioTestCase):
         await self.supervisor.archive(self.record.run_id)
         self.assertTrue(shard.closed)
         self.assertNotIn(self.record.run_id, self.supervisor.event_store._stores)  # noqa: SLF001
-
-    async def test_close_drains_archive_backfill_after_cancellation(self) -> None:
-        started = asyncio.Event()
-        release = asyncio.Event()
-
-        async def wait_backfill() -> None:
-            started.set()
-            await release.wait()
-
-        shard = self.supervisor.event_store.for_run(self.record.run_id)
-        self.supervisor.archive_backfill_worker = asyncio.create_task(wait_backfill())
-        close_task = asyncio.create_task(self.supervisor.close())
-        await started.wait()
-        close_task.cancel()
-        await asyncio.sleep(0)
-        self.assertFalse(shard.closed)
-        release.set()
-        with self.assertRaises(asyncio.CancelledError):
-            await close_task
-        self.assertTrue(shard.closed)
 
     async def test_legacy_append_survives_materializer_failure(self) -> None:
         adapter = self.factory(self.record)
