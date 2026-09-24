@@ -754,7 +754,36 @@ function correlateComposerMessages(
       byPendingId.set(pendingId, index);
     }
   });
-  for (const message of composerMessages) {
+  for (let messageIndex = 0; messageIndex < composerMessages.length; messageIndex += 1) {
+    const message = composerMessages[messageIndex];
+    let groupEnd = messageIndex + 1;
+    while (
+      groupEnd < composerMessages.length
+      && composerMessages[groupEnd].seq === message.seq
+      && composerMessages[groupEnd].echoed_at === message.echoed_at
+    ) groupEnd += 1;
+    if (groupEnd > messageIndex + 1) {
+      const group = composerMessages.slice(messageIndex, groupEnd);
+      const combinedText = group.map((item) => item.text.trim()).join("\n");
+      const sentAt = Date.parse(message.sent_at ?? "");
+      const echoedAt = Date.parse(message.echoed_at ?? message.sent_at ?? "");
+      const combinedIndex = events.findIndex((event, index) => {
+        if (claimed.has(index) || event.kind !== "user") return false;
+        if (event.pending_id && event.pending_id !== message.pending_id) return false;
+        const eventAt = Date.parse(event.ts ?? "");
+        return event.text.trim() === combinedText
+          && Number.isFinite(eventAt)
+          && eventAt >= sentAt - 2_000
+          && eventAt <= echoedAt + 60_000;
+      });
+      if (combinedIndex >= 0) {
+        const source = group.every((item) => item.source === group[0].source)
+          ? group[0].source ?? null : null;
+        claimed.set(combinedIndex, source);
+        messageIndex = groupEnd - 1;
+        continue;
+      }
+    }
     // Canonical mapping: durable pending_id is unambiguous when present.
     const durableIndex = byPendingId.get(message.pending_id);
     if (durableIndex !== undefined && !claimed.has(durableIndex)) {
@@ -902,41 +931,24 @@ function pendingTimelineEvent(message: PendingUserMessage, id: number): SessionE
 function mergePendingEvents(
   events: SessionEvent[],
   pendingMessages: readonly PendingUserMessage[],
-  pendingHistory: ReadonlyMap<string, PendingUserMessage>,
 ): SessionEvent[] {
-  if (pendingMessages.length === 0 && pendingHistory.size === 0) return events;
+  if (pendingMessages.length === 0) return events;
 
-  const echoes = new Map<string, SessionEvent>();
-  for (const event of events) {
-    if (!event.pending_id || !pendingHistory.has(event.pending_id)) continue;
-    if (!echoes.has(event.pending_id)) echoes.set(event.pending_id, event);
-  }
-
-  const activeIds = new Set(pendingMessages.map((message) => message.id));
-  const timelineMessages = [...pendingHistory.values()].filter(
-    (message) => activeIds.has(message.id) || echoes.has(message.id),
-  );
-  const knownIds = new Set(timelineMessages.map((message) => message.id));
-  for (const message of pendingMessages) {
-    if (!knownIds.has(message.id)) timelineMessages.push(message);
-  }
-
+  const echoedIds = new Set(events.map((event) => event.pending_id).filter(Boolean));
   const eventsByFloor = new Map<number, SessionEvent[]>();
   let pendingEventId = 3_000_000;
-  for (const message of timelineMessages) {
-    const event = echoes.get(message.id) ?? pendingTimelineEvent(message, pendingEventId++);
+  for (const message of pendingMessages) {
+    if (echoedIds.has(message.id)) continue;
     const floorEvents = eventsByFloor.get(message.eventIdFloor) ?? [];
-    floorEvents.push(event);
+    floorEvents.push(pendingTimelineEvent(message, pendingEventId++));
     eventsByFloor.set(message.eventIdFloor, floorEvents);
   }
   if (eventsByFloor.size === 0) return events;
 
-  const echoIds = new Set(echoes.values());
-  const serverEvents = events.filter((event) => !echoIds.has(event));
   const floors = [...eventsByFloor.keys()].sort((left, right) => left - right);
   const merged: SessionEvent[] = [];
   let floorIndex = 0;
-  for (const event of serverEvents) {
+  for (const event of events) {
     while (floorIndex < floors.length && floors[floorIndex] < event.id) {
       merged.push(...(eventsByFloor.get(floors[floorIndex]) ?? []));
       floorIndex += 1;
@@ -3292,8 +3304,6 @@ export function SessionTab({
   const layoutDirtyFromRef = useRef(Number.POSITIVE_INFINITY);
   const layoutRef = useRef<VirtualLayout | null>(null);
   const layoutResetKeyRef = useRef(resetKey);
-  const pendingTimelineKeyRef = useRef(resetKey);
-  const pendingTimelineRef = useRef(new Map<string, PendingUserMessage>());
   const [containerNode, setContainerNode] = useState<HTMLDivElement | null>(null);
   const restoreAttemptsRef = useRef(3);
   const scrollRestoreStateRef = useRef<ScrollState | null>(sessionScrollCache.get(sessionStateKey) ?? null);
@@ -3314,10 +3324,6 @@ export function SessionTab({
     layoutCacheRef.current = null;
     layoutDirtyFromRef.current = 0;
   }
-  if (pendingTimelineKeyRef.current !== resetKey) {
-    pendingTimelineKeyRef.current = resetKey;
-    pendingTimelineRef.current = new Map();
-  }
 
   const target = useMemo(
     () =>
@@ -3333,12 +3339,6 @@ export function SessionTab({
     target,
     visible && target.mode === "live",
   );
-  const pendingTimeline = useMemo(() => {
-    const next = new Map(pendingTimelineRef.current);
-    for (const message of pendingUserMessages) next.set(message.id, message);
-    pendingTimelineRef.current = next;
-    return next;
-  }, [pendingUserMessages]);
   const activePendingIds = useMemo(
     () => new Set(pendingUserMessages.map((message) => message.id)),
     [pendingUserMessages],
@@ -3601,14 +3601,14 @@ export function SessionTab({
           composerMessageEvents(session),
         );
       const merged = [
-        ...mergePendingEvents(transcriptEvents, pendingUserMessages, pendingTimeline),
+        ...mergePendingEvents(transcriptEvents, pendingUserMessages),
         ...modelChangedMarkers(session),
       ];
       const stabilized = stabilizeSyntheticEvents(displayEventsRef.current, merged);
       displayEventsRef.current = stabilized;
       return stabilized;
     },
-    [pendingTimeline, pendingUserMessages, session?.events, session?.providerInspector, session?.composerMessages],
+    [pendingUserMessages, session?.events, session?.providerInspector, session?.composerMessages],
   );
 
   const rowResult = useMemo(() => {

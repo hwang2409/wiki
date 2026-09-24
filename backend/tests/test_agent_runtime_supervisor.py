@@ -1426,6 +1426,59 @@ class SupervisorTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(composer_messages[0]["text"], "Test test test")
         self.assertEqual(self.store.get(record.run_id).pending_user_messages, [])
 
+    async def test_claude_combined_echo_acknowledges_both_sends(self) -> None:
+        record = await self.supervisor.start_run(
+            agent_id="WIKI-COMBINED-ECHO",
+            provider=ProviderKind.CLAUDE,
+            role="implement",
+            model="fixture-claude",
+            effort=None,
+            worktree=str(self.worktree),
+            prompt="combined echo fixture",
+        )
+        first = str(uuid4())
+        second = str(uuid4())
+        self.store.track_pending_user_message(
+            record.run_id, first, "[fleet] worker finished", source="fleet-monitor"
+        )
+        self.store.track_pending_user_message(
+            record.run_id, second, "how are my workers doing"
+        )
+        await self.supervisor._handle_provider_event(  # noqa: SLF001
+            record.run_id,
+            self.supervisor.adapters[record.run_id],
+            ProviderEvent(
+                ProviderKind.CLAUDE,
+                {
+                    "type": "user",
+                    "message": {
+                        "role": "user",
+                        "content": [{
+                            "type": "text",
+                            "text": "[fleet] worker finished\nhow are my workers doing",
+                        }],
+                    },
+                },
+            ),
+        )
+        saved = self.store.get(record.run_id)
+        self.assertEqual(saved.pending_user_messages, [])
+        self.assertEqual(
+            [item["pending_id"] for item in saved.composer_messages],
+            [first, second],
+        )
+        self.assertEqual(saved.composer_messages[0]["source"], "fleet-monitor")
+        normalized = self.store.read_normalized_events(record.run_id)
+        combined = [
+            item for item in normalized
+            if item.get("payload", {}).get("pending_id") == first
+        ]
+        self.assertEqual(len(combined), 1)
+        self.assertEqual(
+            [item["pending_id"] for item in combined[0]["payload"]["composer_messages"]],
+            [first, second],
+        )
+
     async def test_queued_message_keeps_pending_id_until_delivery(self) -> None:
         record = await self.supervisor.start_run(
             agent_id="WIKI-96-QUEUE",

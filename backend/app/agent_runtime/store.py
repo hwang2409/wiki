@@ -433,32 +433,38 @@ def _apply_composer_message_event(
     seq: int,
     normalized_at: str,
 ) -> None:
-    pending_id = payload.get("pending_id")
-    text = payload.get("composer_text")
-    sent_at = payload.get("composer_sent_at")
-    if not all(isinstance(value, str) for value in (pending_id, text, sent_at)):
-        return
-    source_raw = payload.get("source")
-    source = source_raw if isinstance(source_raw, str) and source_raw else None
-    record.pending_user_messages = [
-        message
-        for message in record.pending_user_messages
-        if message.get("pending_id") != pending_id
-    ]
-    if any(
-        message.get("pending_id") == pending_id for message in record.composer_messages
-    ):
-        return
-    entry: dict[str, Any] = {
-        "pending_id": pending_id,
-        "text": text,
-        "sent_at": sent_at,
-        "echoed_at": normalized_at,
-        "seq": seq,
-    }
-    if source is not None:
-        entry["source"] = source
-    record.composer_messages.append(entry)
+    entries = payload.get("composer_messages")
+    if not isinstance(entries, list):
+        entries = [payload]
+    for item in entries:
+        if not isinstance(item, dict):
+            continue
+        pending_id = item.get("pending_id")
+        text = item.get("composer_text")
+        sent_at = item.get("composer_sent_at")
+        if not all(isinstance(value, str) for value in (pending_id, text, sent_at)):
+            continue
+        source_raw = item.get("source")
+        source = source_raw if isinstance(source_raw, str) and source_raw else None
+        record.pending_user_messages = [
+            message
+            for message in record.pending_user_messages
+            if message.get("pending_id") != pending_id
+        ]
+        if any(
+            message.get("pending_id") == pending_id for message in record.composer_messages
+        ):
+            continue
+        entry: dict[str, Any] = {
+            "pending_id": pending_id,
+            "text": text,
+            "sent_at": sent_at,
+            "echoed_at": normalized_at,
+            "seq": seq,
+        }
+        if source is not None:
+            entry["source"] = source
+        record.composer_messages.append(entry)
 
 
 def _resolved_parent(path: Path) -> Path:
@@ -3127,30 +3133,36 @@ class RunStore:
             self._write_record(record)
             return record
 
-    def match_pending_user_message(
+    def match_pending_user_messages(
         self,
         run_id: str,
         echoed_text: str,
-    ) -> dict[str, str] | None:
+    ) -> list[dict[str, str]]:
         normalized_echo = echoed_text.strip()
         if not normalized_echo:
-            return None
+            return []
         with self._lock:
-            record = self.get(run_id)
-            # This list is append-ordered. Always scan from the front so one
-            # provider echo acknowledges the oldest identical send (FIFO),
-            # including the hook-wrapped fallback below.
-            exact = next(
-                (
-                    message
-                    for message in record.pending_user_messages
-                    if message.get("text", "").strip() == normalized_echo
-                ),
-                None,
-            )
-            if exact is not None:
-                return dict(exact)
-            for message in record.pending_user_messages:
+            messages = self.get(run_id).pending_user_messages
+            # An exact echo claims only the oldest identical send.
+            for message in messages:
+                if message.get("text", "").strip() == normalized_echo:
+                    return [dict(message)]
+            # Claude can echo consecutive sends as one newline-joined turn.
+            # Require the entire echo to match, so a substring in an unrelated
+            # user turn cannot acknowledge a send.
+            for start in range(len(messages) - 1):
+                parts: list[str] = []
+                for message in messages[start:]:
+                    text = message.get("text", "").strip()
+                    if not text:
+                        break
+                    parts.append(text)
+                    combined = "\n".join(parts)
+                    if len(combined) > len(normalized_echo):
+                        break
+                    if len(parts) > 1 and combined == normalized_echo:
+                        return [dict(item) for item in messages[start : start + len(parts)]]
+            for message in messages:
                 text = message.get("text", "").strip()
                 suffix = normalized_echo[len(text) :].lstrip() if text else ""
                 prefix = normalized_echo[: -len(text)].rstrip() if text else ""
@@ -3158,8 +3170,16 @@ class RunStore:
                     (normalized_echo.startswith(text) and suffix.startswith("<"))
                     or (normalized_echo.endswith(text) and prefix.endswith(">"))
                 ):
-                    return dict(message)
-            return None
+                    return [dict(message)]
+            return []
+
+    def match_pending_user_message(
+        self,
+        run_id: str,
+        echoed_text: str,
+    ) -> dict[str, str] | None:
+        matches = self.match_pending_user_messages(run_id, echoed_text)
+        return matches[0] if matches else None
 
     def steer_delivery_observed(self, run_id: str, pending_id: str) -> bool:
         """Check durable composer state before retrying an uncertain delivery."""
@@ -3177,7 +3197,13 @@ class RunStore:
                 return False
             return any(
                 isinstance(event.get("payload"), dict)
-                and event["payload"].get("pending_id") == pending_id
+                and (
+                    event["payload"].get("pending_id") == pending_id
+                    or any(
+                        isinstance(item, dict) and item.get("pending_id") == pending_id
+                        for item in event["payload"].get("composer_messages", [])
+                    )
+                )
                 for event in events
             )
 
@@ -3544,15 +3570,22 @@ class RunStore:
                     int(event.get("seq", 0)),
                 ),
             )
-            replayed_composer_ids = {
-                str(payload["pending_id"])
-                for event in normalized_events
-                for payload in [event.get("payload")]
-                if isinstance(payload, dict)
-                and isinstance(payload.get("pending_id"), str)
-                and isinstance(payload.get("composer_text"), str)
-                and isinstance(payload.get("composer_sent_at"), str)
-            }
+            replayed_composer_ids: set[str] = set()
+            for event in normalized_events:
+                payload = event.get("payload")
+                if not isinstance(payload, dict):
+                    continue
+                entries = payload.get("composer_messages")
+                if not isinstance(entries, list):
+                    entries = [payload]
+                for item in entries:
+                    if (
+                        isinstance(item, dict)
+                        and isinstance(item.get("pending_id"), str)
+                        and isinstance(item.get("composer_text"), str)
+                        and isinstance(item.get("composer_sent_at"), str)
+                    ):
+                        replayed_composer_ids.add(item["pending_id"])
             record.composer_messages = [
                 message
                 for message in record.composer_messages

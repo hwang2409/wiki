@@ -490,6 +490,29 @@ def _provider_user_text(
     return text or None
 
 
+def _composer_echo_payload(
+    payload: dict[str, Any],
+    messages: list[dict[str, str]],
+) -> dict[str, Any]:
+    entries = [
+        {
+            "pending_id": message["pending_id"],
+            "composer_text": message["text"],
+            "composer_sent_at": message["sent_at"],
+            **({"source": message["source"]} if message.get("source") else {}),
+        }
+        for message in messages
+    ]
+    # Keep the first identity for existing transcript projections. A mixed
+    # fleet/human turn must remain a human-visible user row.
+    annotated = {**payload, **entries[0]}
+    if len(entries) > 1:
+        annotated["composer_messages"] = entries
+        if any(entry.get("source") != entries[0].get("source") for entry in entries):
+            annotated.pop("source", None)
+    return annotated
+
+
 def _validated_seconds(name: str, value: float) -> float:
     if not math.isfinite(value) or value < 0:
         raise ValueError(f"{name} must be a finite, non-negative number")
@@ -1765,7 +1788,7 @@ Preserve the same identity, role, worktree, orchestrator grouping, PR gates, and
                     {"error": str(exc), "raw_payload": event.payload},
                 )
         assert normalized is not None
-        pending_message = None
+        pending_messages: list[dict[str, str]] = []
         echoed_text = _provider_user_text(
             event.provider,
             normalized.kind,
@@ -1773,39 +1796,38 @@ Preserve the same identity, role, worktree, orchestrator grouping, PR gates, and
         )
         normalized_payload = normalized.payload
         if not retired_generation and echoed_text is not None:
-            pending_message = self.store.match_pending_user_message(
+            pending_messages = self.store.match_pending_user_messages(
                 run_id,
                 echoed_text,
             )
-            if pending_message is not None:
-                attempt_key = (run_id, pending_message["pending_id"])
-                if attempt_key in self._queued_delivery_attempts:
-                    barrier = self._deferred_provider_event_barriers.get(run_id)
-                    if barrier is None or barrier.done():
-                        barrier = asyncio.get_running_loop().create_future()
-                        self._deferred_provider_event_barriers[run_id] = barrier
-                    self._deferred_provider_events.setdefault(run_id, []).append(
-                        (
-                            adapter,
-                            event,
-                            raw,
-                            normalized,
-                            prior_state,
-                        )
+            attempt_keys = [
+                (run_id, message["pending_id"])
+                for message in pending_messages
+                if (run_id, message["pending_id"]) in self._queued_delivery_attempts
+            ]
+            if attempt_keys:
+                barrier = self._deferred_provider_event_barriers.get(run_id)
+                if barrier is None or barrier.done():
+                    barrier = asyncio.get_running_loop().create_future()
+                    self._deferred_provider_event_barriers[run_id] = barrier
+                self._deferred_provider_events.setdefault(run_id, []).append(
+                    (
+                        adapter,
+                        event,
+                        raw,
+                        normalized,
+                        prior_state,
                     )
+                )
+                for attempt_key in attempt_keys:
                     boundary = self._delivery_attempt_echoes.get(attempt_key)
                     if boundary is not None and not boundary.done():
                         boundary.set_result(None)
-                    return
-                normalized_payload = {
-                    **normalized.payload,
-                    "pending_id": pending_message["pending_id"],
-                    "composer_text": pending_message["text"],
-                    "composer_sent_at": pending_message["sent_at"],
-                }
-                pending_source = pending_message.get("source")
-                if isinstance(pending_source, str) and pending_source:
-                    normalized_payload["source"] = pending_source
+                return
+            if pending_messages:
+                normalized_payload = _composer_echo_payload(
+                    normalized.payload, pending_messages
+                )
         if raw is None and persist:
             if getattr(self, "materializer_gate", None) is not None:
                 raw = await self._append_raw_event_async(
@@ -1851,17 +1873,18 @@ Preserve the same identity, role, worktree, orchestrator grouping, PR gates, and
                 await self._sync_subagent_runs_async(run_id)
             except Exception:
                 logger.exception("could not sync Claude child runs for %s", run_id)
-        if pending_message is not None:
+        if pending_messages:
             # The normalized row is the durable delivery proof. Do not make
             # the steer terminal before this append commits: a failed append
             # must remain recoverable from the already-durable raw echo
             # (REVIEW18 H1).
-            self.store.command_log.acknowledge_steer_for_pending(
-                run_id, pending_message["pending_id"]
-            )
-            self.store.discard_pending_user_message(
-                run_id, pending_message["pending_id"]
-            )
+            for pending_message in pending_messages:
+                self.store.command_log.acknowledge_steer_for_pending(
+                    run_id, pending_message["pending_id"]
+                )
+                self.store.discard_pending_user_message(
+                    run_id, pending_message["pending_id"]
+                )
 
         record = self.store.get(run_id)
         if is_wk_kind(record.execution_kind):
@@ -4013,24 +4036,14 @@ Preserve the same identity, role, worktree, orchestrator grouping, PR gates, and
                 normalized.kind,
                 normalized.payload,
             )
-        normalized_payload = normalized.payload
-        matched_pending_id: str | None = None
-        if echoed_text is not None:
-            pending_message = self.store.match_pending_user_message(
-                run_id,
-                echoed_text,
-            )
-            if pending_message is not None:
-                matched_pending_id = str(pending_message["pending_id"])
-                normalized_payload = {
-                    **normalized.payload,
-                    "pending_id": matched_pending_id,
-                    "composer_text": pending_message["text"],
-                    "composer_sent_at": pending_message["sent_at"],
-                }
-                pending_source = pending_message.get("source")
-                if isinstance(pending_source, str) and pending_source:
-                    normalized_payload["source"] = pending_source
+        pending_messages = (
+            self.store.match_pending_user_messages(run_id, echoed_text)
+            if echoed_text is not None else []
+        )
+        normalized_payload = (
+            _composer_echo_payload(normalized.payload, pending_messages)
+            if pending_messages else normalized.payload
+        )
         if materialize:
             await self._dual_write_normalized_async(
                 record,
@@ -4050,19 +4063,13 @@ Preserve the same identity, role, worktree, orchestrator grouping, PR gates, and
                 lifecycle_state=normalized.lifecycle_state,
             )
             normalized_seq = int(legacy["seq"])
-        if matched_pending_id is not None:
+        for pending_message in pending_messages:
+            pending_id = pending_message["pending_id"]
             self.store.command_log.acknowledge_steer_for_pending(
-                run_id, matched_pending_id
+                run_id, pending_id
             )
-            # The live drain path pairs its own ``mark_sent`` with a
-            # ``remove_queued_message_by_pending_id`` when the provider
-            # accepts the send. Recovery bypasses that drain — orphan
-            # normalization is the only signal we have that the send
-            # completed — so the queue removal has to happen here.
-            # Without it the queued row survives ``recover_on_start``,
-            # every later ``send_on_idle`` sees a stale head, and the
-            # queue never drains (WIKI-232 REVIEW11 M2).
-            self.store.remove_queued_message_by_pending_id(run_id, matched_pending_id)
+            # Recovery bypasses the live drain's queue removal.
+            self.store.remove_queued_message_by_pending_id(run_id, pending_id)
         return True
 
     async def _rebuild_materializer_database(self, run_id: str) -> None:
