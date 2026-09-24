@@ -57,7 +57,6 @@ import type {
   ProviderPendingRequest,
   ProviderStreamEvent,
   QueuedMessage,
-  ReplayTimelineEvent,
   SessionEvent,
   SessionInit,
   SessionPatch,
@@ -137,7 +136,7 @@ import type { HarnessOutputSegment } from "./transcript-output";
 import { CodexStreamHighlights } from "./codex-stream-renderers";
 import { markerRule } from "./hook-message-registry";
 import type { MarkerSeverity } from "./hook-message-registry";
-import { providerEventPayload, providerEventToBlocks } from "./replay-event-adapter";
+import { providerEventPayload, providerEventToBlocks, type ProviderTimelineEvent } from "./provider-event-adapter";
 import {
   activityRunStateFromProvider,
   activityStateLabel,
@@ -2837,7 +2836,7 @@ export function ActivityEventRow({
   );
 }
 
-function providerTimelineEvent(event: ProviderStreamEvent): ReplayTimelineEvent {
+function providerTimelineEvent(event: ProviderStreamEvent): ProviderTimelineEvent {
   return {
     seq: event.seq,
     raw_seq: event.raw_seq,

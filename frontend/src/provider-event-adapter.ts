@@ -1,7 +1,15 @@
-import type {
-  ReplayTimelineEvent,
-  SessionTool,
-} from "./api";
+import type { SessionTool } from "./api";
+
+export type ProviderTimelineEvent = {
+  seq: number;
+  raw_seq: number;
+  ts: string | null;
+  kind: string;
+  disposition: string;
+  lifecycle_state: string | null;
+  summary: string;
+  bookmark: "steer" | "verdict" | "error" | null;
+};
 
 type RawRecord = Record<string, unknown>;
 
@@ -105,7 +113,7 @@ function codexToolTarget(item: RawRecord, input: unknown): string {
   );
 }
 
-function providerToolOk(item: RawRecord, event: ReplayTimelineEvent | null): boolean | null {
+function providerToolOk(item: RawRecord, event: ProviderTimelineEvent | null): boolean | null {
   const result = asRecord(item.result);
   if (typeof result?.isError === "boolean") return !result.isError;
   if (typeof item.success === "boolean") return item.success;
@@ -117,7 +125,7 @@ function providerToolOk(item: RawRecord, event: ReplayTimelineEvent | null): boo
   return event?.bookmark === "error" ? false : null;
 }
 
-function codexToolFromItem(item: RawRecord, event: ReplayTimelineEvent | null): SessionTool | null {
+function codexToolFromItem(item: RawRecord, event: ProviderTimelineEvent | null): SessionTool | null {
   const itemType = stringValue(item.type) ?? "";
   const toolTypes = [
     "commandExecution",
@@ -195,12 +203,12 @@ function claudeThinkingFromBlock(block: RawRecord): PresentationBlock | null {
   return text ? { type: "thinking", text, encrypted: false } : null;
 }
 
-function markerBlock(event: ReplayTimelineEvent): PresentationBlock {
+function markerBlock(event: ProviderTimelineEvent): PresentationBlock {
   const label = event.summary.trim() || event.kind.trim() || "unknown event";
   return { type: "marker", text: `event · ${label}` };
 }
 
-function summaryToolFromEvent(event: ReplayTimelineEvent): SessionTool | null {
+function summaryToolFromEvent(event: ProviderTimelineEvent): SessionTool | null {
   if (!/tool_use|tool_result|commandExecution/i.test(event.summary)) return null;
   const summary = event.summary.trim() || event.kind;
   const [name = event.kind] = summary.split(/\s+/, 2);
@@ -216,7 +224,7 @@ function summaryToolFromEvent(event: ReplayTimelineEvent): SessionTool | null {
 
 export function providerEventToBlocks(
   payload: RawRecord | null,
-  timelineEvent: ReplayTimelineEvent | null = null,
+  timelineEvent: ProviderTimelineEvent | null = null,
 ): PresentationBlock[] {
   if (!payload) {
     const summarizedTool = timelineEvent ? summaryToolFromEvent(timelineEvent) : null;

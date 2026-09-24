@@ -1,17 +1,14 @@
 import { describe, expect, test } from "vitest";
 
-import type {
-  ProviderStreamEvent,
-  ReplayRawEvent,
-  ReplayTimelineEvent,
-} from "../src/api";
+import type { ProviderStreamEvent } from "../src/api";
 import {
   providerEventPayload,
   providerEventToBlocks,
   type PresentationBlock,
-} from "../src/replay-event-adapter";
+  type ProviderTimelineEvent,
+} from "../src/provider-event-adapter";
 
-function timelineEvent(overrides: Partial<ReplayTimelineEvent> = {}): ReplayTimelineEvent {
+function timelineEvent(overrides: Partial<ProviderTimelineEvent> = {}): ProviderTimelineEvent {
   return {
     seq: 1,
     raw_seq: 1,
@@ -37,14 +34,6 @@ function providerEvent(payload: Record<string, unknown>): ProviderStreamEvent {
   };
 }
 
-function replayEvent(payload: Record<string, unknown>): ReplayRawEvent {
-  return {
-    run_id: "run-1",
-    seq: 1,
-    raw: { payload },
-  };
-}
-
 function toolBlock(blocks: PresentationBlock[]): PresentationBlock & { type: "tool" } {
   const block = blocks.find((candidate) => candidate.type === "tool");
   expect(block?.type).toBe("tool");
@@ -52,10 +41,9 @@ function toolBlock(blocks: PresentationBlock[]): PresentationBlock & { type: "to
 }
 
 describe("provider event adapter", () => {
-  test("reads the same payload shape from transcript and replay events", () => {
+  test("reads provider event payloads", () => {
     const payload = { message: "model changed" };
     expect(providerEventPayload(providerEvent(payload))).toEqual(payload);
-    expect(providerEventPayload(replayEvent(payload).raw)).toEqual(payload);
   });
 
   test.each([
@@ -123,16 +111,14 @@ describe("provider event adapter", () => {
       },
       expected: null,
     },
-  ])("uses terminal status for the same $label fixture on both paths", ({ payload, expected }) => {
+  ])("uses terminal status for $label", ({ payload, expected }) => {
     const event = timelineEvent({ summary: "tool event" });
-    const transcriptBlocks = providerEventToBlocks(providerEventPayload(providerEvent(payload)), event);
-    const replayBlocks = providerEventToBlocks(providerEventPayload(replayEvent(payload).raw), event);
+    const blocks = providerEventToBlocks(providerEventPayload(providerEvent(payload)), event);
 
-    expect(replayBlocks).toEqual(transcriptBlocks);
-    expect(toolBlock(transcriptBlocks).tool.ok).toBe(expected);
+    expect(toolBlock(blocks).tool.ok).toBe(expected);
   });
 
-  test("keeps mixed Claude text and tools in provider order on both paths", () => {
+  test("keeps mixed Claude text and tools in provider order", () => {
     const payload = {
       message: {
         role: "assistant",
@@ -144,14 +130,12 @@ describe("provider event adapter", () => {
       },
     };
     const event = timelineEvent({ kind: "claude_assistant", summary: "text and tool" });
-    const transcriptBlocks = providerEventToBlocks(providerEventPayload(providerEvent(payload)), event);
-    const replayBlocks = providerEventToBlocks(providerEventPayload(replayEvent(payload).raw), event);
+    const blocks = providerEventToBlocks(providerEventPayload(providerEvent(payload)), event);
 
-    expect(replayBlocks).toEqual(transcriptBlocks);
-    expect(transcriptBlocks.map((block) => block.type)).toEqual(["message", "tool", "message"]);
+    expect(blocks.map((block) => block.type)).toEqual(["message", "tool", "message"]);
   });
 
-  test("marks a Claude result with nested result.isError as failed on both paths", () => {
+  test("marks a Claude result with nested result.isError as failed", () => {
     const payload = {
       message: {
         role: "user",
@@ -163,33 +147,27 @@ describe("provider event adapter", () => {
       },
     };
     const event = timelineEvent({ kind: "claude_user", summary: "tool result" });
-    const transcriptBlocks = providerEventToBlocks(providerEventPayload(providerEvent(payload)), event);
-    const replayBlocks = providerEventToBlocks(providerEventPayload(replayEvent(payload).raw), event);
+    const blocks = providerEventToBlocks(providerEventPayload(providerEvent(payload)), event);
 
-    expect(replayBlocks).toEqual(transcriptBlocks);
-    expect(toolBlock(transcriptBlocks).tool.ok).toBe(false);
+    expect(toolBlock(blocks).tool.ok).toBe(false);
   });
 
-  test("classifies Codex reasoning as thinking on both paths", () => {
+  test("classifies Codex reasoning as thinking", () => {
     const payload = {
       method: "item/completed",
       params: { item: { type: "reasoning", summary: [{ text: "check the evidence" }] } },
     };
     const event = timelineEvent({ kind: "item_completed", summary: "thinking" });
-    const transcriptBlocks = providerEventToBlocks(providerEventPayload(providerEvent(payload)), event);
-    const replayBlocks = providerEventToBlocks(providerEventPayload(replayEvent(payload).raw), event);
+    const blocks = providerEventToBlocks(providerEventPayload(providerEvent(payload)), event);
 
-    expect(replayBlocks).toEqual(transcriptBlocks);
-    expect(transcriptBlocks).toEqual([{ type: "thinking", text: "check the evidence", encrypted: false }]);
+    expect(blocks).toEqual([{ type: "thinking", text: "check the evidence", encrypted: false }]);
   });
 
-  test("keeps an unknown provider item visible as the same marker on both paths", () => {
+  test("keeps an unknown provider item visible as the same marker", () => {
     const payload = { params: { item: { type: "futureProviderItem" } } };
     const event = timelineEvent({ kind: "future_kind", summary: "mystery item" });
-    const transcriptBlocks = providerEventToBlocks(providerEventPayload(providerEvent(payload)), event);
-    const replayBlocks = providerEventToBlocks(providerEventPayload(replayEvent(payload).raw), event);
+    const blocks = providerEventToBlocks(providerEventPayload(providerEvent(payload)), event);
 
-    expect(replayBlocks).toEqual(transcriptBlocks);
-    expect(transcriptBlocks).toEqual([{ type: "marker", text: "event · mystery item" }]);
+    expect(blocks).toEqual([{ type: "marker", text: "event · mystery item" }]);
   });
 });

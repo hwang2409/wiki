@@ -315,20 +315,6 @@ async function main() {
   const { backend, page } = fixture;
   try {
     let replaceRequests = 0;
-    const replayRun = {
-      run_id: "fixture-replay-run",
-      agent_id: TICKET,
-      orch_id: "wiki",
-      role: "implement",
-      provider: "codex",
-      model: "gpt-5.6-sol",
-      outcome: "merge-ready",
-      state: "completed",
-      created_at: "2026-08-02T12:00:00Z",
-      updated_at: "2026-08-02T12:15:00Z",
-      total_events: 2,
-      initial_prompt_excerpt: "Rebuild the run header hierarchy.",
-    };
     const workgraph = () => ({
       ticket: TICKET,
       orch: "wiki",
@@ -485,68 +471,6 @@ async function main() {
         }),
       });
     });
-    await page.route(`**/api/agents/${TICKET}/replay/runs`, async (route) => {
-      await route.fulfill({
-        status: 200,
-        contentType: "application/json",
-        body: JSON.stringify({ ticket: TICKET, runs: [replayRun], runs_truncated: false }),
-      });
-    });
-    await page.route("**/api/agent-runs/fixture-replay-run/replay/timeline?*", async (route) => {
-      await route.fulfill({
-        status: 200,
-        contentType: "application/json",
-        body: JSON.stringify({
-          run: replayRun,
-          events: [
-            {
-              seq: 1,
-              raw_seq: 1,
-              ts: "2026-08-02T12:00:00Z",
-              kind: "codex_assistant",
-              disposition: "rendered",
-              lifecycle_state: "working",
-              summary: "Header fixture started.",
-              bookmark: null,
-            },
-            {
-              seq: 2,
-              raw_seq: 2,
-              ts: "2026-08-02T12:00:05Z",
-              kind: "codex_assistant",
-              disposition: "rendered",
-              lifecycle_state: "merge-ready",
-              summary: "Header fixture passed its focused checks.",
-              bookmark: "verdict",
-            },
-          ],
-          next_cursor: null,
-          has_more: false,
-          bookmarks: [{
-            seq: 2,
-            kind: "verdict",
-            ts: "2026-08-02T12:00:05Z",
-            summary: "Header fixture passed its focused checks.",
-            event_kind: "codex_assistant",
-          }],
-          bookmarks_truncated: false,
-          warnings: [],
-        }),
-      });
-    });
-    await page.route("**/api/agent-runs/fixture-replay-run/replay/events/*", async (route) => {
-      const seq = Number(route.request().url().split("/").at(-1));
-      await route.fulfill({
-        status: 200,
-        contentType: "application/json",
-        body: JSON.stringify({
-          run_id: replayRun.run_id,
-          seq,
-          raw: { seq, message: seq === 1 ? "fixture started" : "fixture passed" },
-        }),
-      });
-    });
-
     await page.route("**/api/agents", async (route) => {
       const response = await route.fetch();
       const body = await response.json();
@@ -742,7 +666,7 @@ async function main() {
           throw new Error(`${fixture.name}/${viewport.name}: secondary level must contain autopilot`);
         }
         const actions = secondary.locator(".agent-surface-actions");
-        for (const action of ["Replace", "Review", "Graph", "Replay"]) {
+        for (const action of ["Replace", "Review", "Graph"]) {
           if ((await actions.getByRole("button", { name: action, exact: true }).count()) !== 1) {
             throw new Error(`${fixture.name}/${viewport.name}: secondary level must contain ${action}`);
           }
@@ -890,7 +814,7 @@ async function main() {
     currentStatus = states[0].status;
     currentLoop = states[0].loop;
     await writeStatus(fixtures, currentStatus);
-    const actionCases = ["Replace", "Review", "Graph", "Replay", "Close"];
+    const actionCases = ["Replace", "Review", "Graph", "Close"];
     for (const split of [
       { name: "split-35", ratio: 0.35 },
       { name: "split-15", ratio: 0.15 },
@@ -991,21 +915,6 @@ async function main() {
               await graph.getByText(/r2 of 2/).waitFor();
               await graph.locator(".workgraph-dag").waitFor({ state: "visible" });
               await graph.getByText("Loading revision r2…", { exact: true }).waitFor({ state: "detached" });
-            } else if (action === "Replay") {
-              const replay = panel.locator(".replay-panel");
-              await replay.getByText("Header fixture started.", { exact: true }).waitFor();
-              await replay.getByText("Event details", { exact: true }).click();
-              await replay.locator(".replay-event-raw").getByText("fixture started", { exact: false }).waitFor();
-              await replay.getByText("loading timeline…", { exact: true }).waitFor({ state: "detached" });
-              const next = replay.getByRole("button", { name: "Next event" });
-              await assertControlFitsVisiblePane(next, `${label}/next-event`);
-              const rawLoaded = page.waitForResponse((response) =>
-                response.url().endsWith("/replay/events/2") && response.ok());
-              await next.click();
-              await rawLoaded;
-              await replay.getByText("Header fixture passed its focused checks.", { exact: true }).waitFor();
-              await replay.getByText("Event details", { exact: true }).click();
-              await replay.locator(".replay-event-raw").getByText("fixture passed", { exact: false }).waitFor();
             }
             await page.screenshot({
               path: path.join(OUT_DIR, `action-${action.toLowerCase()}-${split.name}.png`),
@@ -1032,15 +941,15 @@ async function main() {
           "over-cap-dialog-split-15.png",
           "over-cap-dialog-log-split-15.png",
           ...["split-35", "split-15"].flatMap((split) =>
-            ["replace", "review", "graph", "replay", "close"].map((action) =>
+            ["replace", "review", "graph", "close"].map((action) =>
               `action-${action}-${split}.png`)),
         ]),
         audit: [
           "two clear header levels at normal width and in real 35% and 15% split panes",
           "current step remains readable without horizontal clipping",
-          "Replace, Review, Graph, Replay, Close, and autopilot remain discoverable",
-          "Replace, Review, Graph, Replay, and Close complete safe interactions in isolated 35% and 15% split states",
-          "Review, Graph, and Replay show final fixture content with useful controls inside the visible pane",
+          "Replace, Review, Graph, Close, and autopilot remain discoverable",
+          "Replace, Review, Graph, and Close complete safe interactions in isolated 35% and 15% split states",
+          "Review and Graph show final fixture content with useful controls inside the visible pane",
           "Close keeps the split fixture peer visible with its content intact",
           "the visible composer and footer stay inside every split pane",
           "open loop history, findings, plateau state, and autopilot log stay inside narrow panes",
