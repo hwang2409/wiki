@@ -1,13 +1,13 @@
 import { useEffect, useMemo, useRef, useState } from "react";
 import type { KeyboardEvent, ReactNode } from "react";
-import { Bot, FileCode2, FileText, HeartPulse, History, Waypoints } from "lucide-react";
+import { Bot, FileCode2, FileText, HeartPulse, History } from "lucide-react";
 import type { NoteSummary } from "./types";
 import { workspaceFileSearchPath } from "./file-workspaces";
 import type { RecentResource } from "./file-workspaces";
 
 export type RecentSwitcherItem = RecentResource;
 
-export type SwitcherPage = "graph" | "activity" | "health" | "agents";
+export type SwitcherPage = "activity" | "health" | "agents";
 
 export type QuickSwitcherSession = {
   id: string;
@@ -51,14 +51,12 @@ type SwitcherGroup = {
 };
 
 const PAGES: Array<{ page: SwitcherPage; label: string; aliases?: string[] }> = [
-  { page: "graph", label: "Graph" },
   { page: "activity", label: "Activity" },
   { page: "health", label: "Health" },
   { page: "agents", label: "Runs", aliases: ["agents", "agent list"] }
 ];
 
 const PAGE_ICONS = {
-  graph: Waypoints,
   activity: History,
   health: HeartPulse,
   agents: Bot

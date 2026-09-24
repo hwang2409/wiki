@@ -203,7 +203,6 @@ try {
     "New terminal",
     "Agents",
     "Activity feed",
-    "Graph view",
     "Note freshness",
     "Token usage",
     "Ticket dashboard",

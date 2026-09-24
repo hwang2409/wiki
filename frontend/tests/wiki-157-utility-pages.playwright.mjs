@@ -111,7 +111,6 @@ async function main() {
 
     for (const [hash, label, name, extra] of [
       ["#/activity", "Activity feed", "activity"],
-      ["#/graph", "Graph view", "graph"],
       ["#/health", "Note freshness", "health"],
       ["#/tokens", "Token usage", "tokens"],
     ]) {
@@ -132,10 +131,10 @@ async function main() {
       );
     }
 
-    // Regression: no primary "git" / "commit" / "wiki lint" copy in the four
+    // Regression: no primary "git" / "commit" / "wiki lint" copy in the three
     // utility-page bodies (secondary sha rendering is fine, that's tested via
     // vitest).
-    for (const hash of ["#/activity", "#/graph", "#/health", "#/tokens"]) {
+    for (const hash of ["#/activity", "#/health", "#/tokens"]) {
       await page.goto(`${backend.baseUrl}/${hash}`, { waitUntil: "domcontentloaded" });
       await page.waitForTimeout(200);
       const forbidden = ["wiki lint", "git commit", " commit ", "run the CLI"];
@@ -146,12 +145,6 @@ async function main() {
         }
       }
     }
-
-    // Graph list-mode screenshot.
-    await page.goto(`${backend.baseUrl}/#/graph`, { waitUntil: "domcontentloaded" });
-    await page.getByRole("button", { name: /^List$/i }).click();
-    await page.waitForTimeout(200);
-    await page.screenshot({ path: path.join(OUT_DIR, "graph-list.png"), fullPage: false });
 
     // Tokens error-state screenshot: retry surface visible.
     const errorContext = await browser.newContext({ viewport: { width: 1500, height: 940 } });
