@@ -24,13 +24,41 @@ class ArchiveProtocolTests(unittest.TestCase):
         directory.mkdir(parents=True)
         files = [
             directory / "run.json",
-            directory / "raw.jsonl",
-            directory / "events.jsonl",
+            directory / "meta.json",
         ]
         files[0].write_text(json.dumps({"run_id": "run-1"}), encoding="utf-8")
-        files[1].write_text("raw\n", encoding="utf-8")
-        files[2].write_text("events\n", encoding="utf-8")
+        files[1].write_text(json.dumps({"outcome": "merged"}), encoding="utf-8")
         return directory, files
+
+    def test_existing_full_archive_marker_remains_valid(self) -> None:
+        with tempfile.TemporaryDirectory() as raw_root:
+            directory, files = self._archive_fixture(Path(raw_root))
+            for name in ("raw.jsonl", "events.jsonl"):
+                (directory / name).write_text("event\n", encoding="utf-8")
+            sizes = {
+                path.name: path.stat().st_size
+                for path in (*files, directory / "raw.jsonl", directory / "events.jsonl")
+            }
+            (directory / ARCHIVE_MANIFEST_NAME).write_text(
+                json.dumps({
+                    "run_id": "run-1",
+                    "completed_at": "2026-08-01T00:00:00Z",
+                    "required_files": ["raw.jsonl", "events.jsonl", "run.json"],
+                    "optional_files": ["meta.json"],
+                    "files": sizes,
+                }),
+                encoding="utf-8",
+            )
+            (directory / ARCHIVE_COMPLETION_MARKER).write_text(
+                json.dumps({
+                    "run_id": "run-1",
+                    "completed_at": "2026-08-01T00:00:00Z",
+                    "manifest": ARCHIVE_MANIFEST_NAME,
+                    "committed": True,
+                }),
+                encoding="utf-8",
+            )
+            self.assertTrue(archive_is_committed(directory))
 
     def test_commit_archive_crash_matrix_retries_without_source_loss(self) -> None:
         static_steps = (
@@ -190,7 +218,7 @@ class ArchiveProtocolTests(unittest.TestCase):
                 (probe / ARCHIVE_MANIFEST_NAME).read_text(encoding="utf-8")
             )
             self.assertEqual(
-                manifest["required_files"], ["raw.jsonl", "events.jsonl", "run.json"]
+                manifest["required_files"], ["run.json", "meta.json"]
             )
             self.assertEqual(manifest["optional_files"], [])
 

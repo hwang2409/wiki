@@ -203,8 +203,6 @@ class AutoArchiveTests(unittest.IsolatedAsyncioTestCase):
 
         await self.supervisor.recover_on_start()
         self.assertTrue(self.store.run_dir(record.run_id).is_dir())
-        raw_before = self.store.raw_events_path(record.run_id).read_bytes()
-        events_before = self.store.normalized_events_path(record.run_id).read_bytes()
 
         candidate = self.store.get(record.run_id)
         candidate.auto_archive_terminal_at = "2000-01-01T00:00:00+00:00"
@@ -221,10 +219,9 @@ class AutoArchiveTests(unittest.IsolatedAsyncioTestCase):
         self.assertFalse(self.store.run_dir(record.run_id).exists())
         archived = list((self.paths.archive_dir / record.agent_id).glob("*"))
         self.assertEqual(len(archived), 1)
-        self.assertTrue((archived[0] / "raw.jsonl").is_file())
-        self.assertTrue((archived[0] / "events.jsonl").is_file())
-        self.assertEqual((archived[0] / "raw.jsonl").read_bytes(), raw_before)
-        self.assertEqual((archived[0] / "events.jsonl").read_bytes(), events_before)
+        self.assertFalse((archived[0] / "raw.jsonl").exists())
+        self.assertFalse((archived[0] / "events.jsonl").exists())
+        self.assertTrue((archived[0] / "meta.json").is_file())
         notification = await asyncio.wait_for(events.get(), timeout=1)
         while notification.get("type") != "notification":
             notification = await asyncio.wait_for(events.get(), timeout=1)
@@ -419,7 +416,7 @@ class AutoArchiveTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual(comparable_edges(manual_graph), comparable_edges(auto_graph))
 
-    async def test_archive_edge_recovers_after_supervisor_exit(self) -> None:
+    async def test_supervisor_restart_does_not_scan_archive_for_graph_edges(self) -> None:
         root = Path(self.tmp.name) / "recovery"
         worktree = root / "worktree"
         worktree.mkdir(parents=True)
@@ -447,8 +444,8 @@ class AutoArchiveTests(unittest.IsolatedAsyncioTestCase):
             )
             record.state = LifecycleState.COMPLETED
             store.create(record)
-            # Model a process exit after the durable archive commit and before
-            # the synchronous edge write. No delivery path is mocked.
+            # Model a process exit after the receipt commit and before
+            # the synchronous edge write.
             store.archive_current(record.run_id, outcome="closed")
             self.assertIsNone(
                 workgraph.load_workgraph("WIKI-275-RECOVER", paths.status_dir)
@@ -461,8 +458,7 @@ class AutoArchiveTests(unittest.IsolatedAsyncioTestCase):
                 FixtureAdapterFactory(FIXTURES, pid=os.getpid()),
             )
             graph = workgraph.load_workgraph("WIKI-275-RECOVER", paths.status_dir)
-            self.assertIsNotNone(graph)
-            self.assertEqual(graph["edges"][-1]["kind"], "archive")
+            self.assertIsNone(graph)
             self.assertFalse(restarted_store.run_dir(record.run_id).exists())
             await restarted.close()
 

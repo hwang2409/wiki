@@ -61,7 +61,6 @@ from backend.app.agent_runtime.store import (
     RunNotFound,
     RunStore,
     RuntimePaths,
-    StoreError,
     StoreConflict,
 )
 from backend.app.agent_runtime.supervisor import Supervisor, resolve_safe_worktree
@@ -488,88 +487,6 @@ class SupervisorTests(unittest.IsolatedAsyncioTestCase):
             ).read_text().splitlines()
         ]
         self.assertEqual([item["raw_seq"] for item in normalized], [1])
-
-    async def test_large_terminal_orphan_archive_preserves_every_raw_event(self) -> None:
-        record = self.store.create(
-            RunRecord.new(
-                agent_id="WIKI-LARGE-TERMINAL-ORPHAN",
-                provider=ProviderKind.CODEX,
-                role="implement",
-                model="fixture-codex",
-                worktree=str(self.worktree),
-                prompt="large terminal orphan fixture",
-            )
-        )
-        raw_rows: list[dict[str, Any]] = []
-        for event_index in range(300):
-            raw = self.store.append_raw(
-                record.run_id,
-                provider=ProviderKind.CODEX.value,
-                direction="provider",
-                payload={
-                    "method": "turn/diff/updated",
-                    "params": {"diff": str(event_index)},
-                },
-            )
-            raw_rows.append(raw)
-            if event_index < 260:
-                await self.supervisor._recover_orphan_raw_event(  # noqa: SLF001
-                    record.run_id,
-                    raw,
-                    materialize=False,
-                )
-        record = self.store.transition(record.run_id, LifecycleState.COMPLETED)
-
-        await self.supervisor.archive(record.run_id, outcome="closed")
-
-        sessions = sorted(
-            (self.paths.archive_dir / record.agent_id).iterdir()
-        )
-        archived_events = [
-            json.loads(line)
-            for line in (sessions[-1] / "events.jsonl").read_text().splitlines()
-        ]
-        self.assertEqual(
-            {int(event["raw_seq"]) for event in archived_events},
-            {int(raw["seq"]) for raw in raw_rows},
-        )
-
-    async def test_archive_allows_multiple_normalized_rows_for_one_raw_seq(self) -> None:
-        record = self.store.create(
-            RunRecord.new(
-                agent_id="WIKI-ARCHIVE-MULTI-ROW",
-                provider=ProviderKind.CODEX,
-                role="implement",
-                model="fixture-codex",
-                worktree=str(self.worktree),
-                prompt="multi-row archive fixture",
-            )
-        )
-        raw = self.store.append_raw(
-            record.run_id,
-            provider=ProviderKind.CODEX.value,
-            direction="provider",
-            payload={"method": "item/completed", "params": {"index": 1}},
-        )
-        for index in range(3):
-            self.store.append_normalized(
-                record.run_id,
-                raw_seq=int(raw["seq"]),
-                disposition=EventDisposition.RENDERED,
-                kind="artifact",
-                payload={"index": index},
-            )
-        self.store.transition(record.run_id, LifecycleState.COMPLETED)
-
-        await self.supervisor.archive(record.run_id, outcome="closed")
-
-        sessions = sorted((self.paths.archive_dir / record.agent_id).iterdir())
-        archived_events = [
-            json.loads(line)
-            for line in (sessions[-1] / "events.jsonl").read_text().splitlines()
-        ]
-        self.assertEqual(len(archived_events), 3)
-        self.assertEqual({int(event["raw_seq"]) for event in archived_events}, {1})
 
     async def test_terminal_recovery_uses_raw_coverage_at_256_row_boundary(self) -> None:
         cases = (
@@ -10442,20 +10359,20 @@ class SupervisorTests(unittest.IsolatedAsyncioTestCase):
         )
         started = threading.Event()
         release = threading.Event()
-        real_copy = self.store._copy_archive_file
+        real_write = self.store._write_archive_files
 
-        def paused_copy(source: Path, destination: Path) -> None:
+        def paused_write(*args, **kwargs):
             started.set()
             if not release.wait(timeout=5):
                 raise AssertionError("recovery archive was not released")
-            real_copy(source, destination)
+            return real_write(*args, **kwargs)
 
         recovery_task: asyncio.Task[list[dict[str, str]]] | None = None
         try:
             with mock.patch.object(
                 self.store,
-                "_copy_archive_file",
-                side_effect=paused_copy,
+                "_write_archive_files",
+                side_effect=paused_write,
             ), mock.patch.object(
                 self.supervisor,
                 "_normalize_orphan_raw_events",
@@ -10496,18 +10413,18 @@ class SupervisorTests(unittest.IsolatedAsyncioTestCase):
 
         started = threading.Event()
         release = threading.Event()
-        real_copy = self.store._copy_archive_file
+        real_write = self.store._write_archive_files
 
-        def paused_copy(source: Path, destination: Path) -> None:
+        def paused_write(*args, **kwargs):
             started.set()
             if not release.wait(timeout=5):
                 raise AssertionError("archive close worker was not released")
-            real_copy(source, destination)
+            return real_write(*args, **kwargs)
 
         with mock.patch.object(
             self.store,
-            "_copy_archive_file",
-            side_effect=paused_copy,
+            "_write_archive_files",
+            side_effect=paused_write,
         ):
             archive_task = asyncio.create_task(
                 self.supervisor.dispatch("run/archive", {"run_id": record.run_id})
@@ -10580,13 +10497,13 @@ class SupervisorTests(unittest.IsolatedAsyncioTestCase):
         started = threading.Event()
         release = threading.Event()
         store_request_done = threading.Event()
-        real_copy = self.store._copy_archive_file
+        real_write = self.store._write_archive_files
 
-        def paused_copy(source: Path, destination: Path) -> None:
+        def paused_write(*args, **kwargs):
             started.set()
             if not release.wait(timeout=5):
                 raise AssertionError("archive copy was not released")
-            real_copy(source, destination)
+            return real_write(*args, **kwargs)
 
         def store_request() -> None:
             try:
@@ -10599,8 +10516,8 @@ class SupervisorTests(unittest.IsolatedAsyncioTestCase):
         try:
             with mock.patch.object(
                 self.store,
-                "_copy_archive_file",
-                side_effect=paused_copy,
+                "_write_archive_files",
+                side_effect=paused_write,
             ):
                 archive_task = asyncio.create_task(self.supervisor.archive(record.run_id))
                 self.assertTrue(await asyncio.to_thread(started.wait, 2))
@@ -10642,21 +10559,21 @@ class SupervisorTests(unittest.IsolatedAsyncioTestCase):
 
         started = threading.Event()
         release = threading.Event()
-        real_copy = self.store._copy_archive_file
+        real_write = self.store._write_archive_files
 
-        def paused_copy(source: Path, destination: Path) -> None:
+        def paused_write(*args, **kwargs):
             started.set()
             if not release.wait(timeout=5):
                 raise AssertionError("archive copy was not released")
-            real_copy(source, destination)
+            return real_write(*args, **kwargs)
 
         tasks: list[asyncio.Task[RunRecord]] = []
         results: list[object] = []
         try:
             with mock.patch.object(
                 self.store,
-                "_copy_archive_file",
-                side_effect=paused_copy,
+                "_write_archive_files",
+                side_effect=paused_write,
             ):
                 tasks = [
                     asyncio.create_task(self.supervisor.archive(record.run_id))
@@ -10822,7 +10739,7 @@ class SupervisorTests(unittest.IsolatedAsyncioTestCase):
         with (
             mock.patch.object(
                 self.store,
-                "_copy_archive_file",
+                "_write_archive_files",
                 side_effect=OSError("fixture archive copy failure"),
             ),
             self.assertRaisesRegex(OSError, "fixture archive copy failure"),
@@ -10913,14 +10830,10 @@ class SupervisorTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(len(session_dirs), 1)
         session_dir = session_dirs[0]
         self.assertTrue((session_dir / "run.json").is_file())
-        self.assertTrue((session_dir / "raw.jsonl").is_file())
-        self.assertTrue((session_dir / "events.jsonl").is_file())
-        self.assertTrue((session_dir / "cdx-WIKI-ARCHIVE.log").is_file())
-        archived_prompt = (session_dir / "cdx-WIKI-ARCHIVE-prompt.md").read_text(
-            encoding="utf-8"
-        )
-        self.assertIn(f"run_id={record.run_id}", archived_prompt)
-        self.assertTrue(archived_prompt.endswith("fixture prompt"))
+        self.assertFalse((session_dir / "raw.jsonl").exists())
+        self.assertFalse((session_dir / "events.jsonl").exists())
+        self.assertFalse((session_dir / "cdx-WIKI-ARCHIVE.log").exists())
+        self.assertFalse((session_dir / "cdx-WIKI-ARCHIVE-prompt.md").exists())
         meta = json.loads((session_dir / "meta.json").read_text(encoding="utf-8"))
         self.assertEqual(meta["worker"]["run_id"], record.run_id)
         final_status = json.loads(
@@ -10929,98 +10842,6 @@ class SupervisorTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(final_status["state"], "merge-ready")
         self.assertNotIn(record.run_id, self.supervisor.adapters)
         self.assertNotIn(record.run_id, self.supervisor.detached_at_monotonic)
-
-    async def test_archive_rejects_raw_sequence_gaps_and_duplicates(self) -> None:
-        def seed(
-            agent_id: str,
-            raw_seqs: list[int],
-            normalized: list[tuple[int, str]],
-        ) -> RunRecord:
-            record = self.store.create(
-                RunRecord.new(
-                    agent_id=agent_id,
-                    provider=ProviderKind.CODEX,
-                    role="implement",
-                    model="fixture-codex",
-                    worktree=str(self.worktree),
-                    prompt="archive parity fixture",
-                )
-            )
-            raw_rows = [
-                {
-                    "seq": seq,
-                    "received_at": "2026-08-20T00:00:00+00:00",
-                    "provider": "codex",
-                    "direction": "provider",
-                    "generation": 1,
-                    "payload": {"method": "item/completed", "params": {}},
-                }
-                for seq in raw_seqs
-            ]
-            normalized_rows = [
-                {
-                    "seq": index,
-                    "raw_seq": raw_seq,
-                    "normalized_at": "2026-08-20T00:00:00+00:00",
-                    "disposition": EventDisposition.RENDERED.value,
-                    "kind": kind,
-                    "payload": {},
-                    "lifecycle_state": None,
-                }
-                for index, (raw_seq, kind) in enumerate(normalized, start=1)
-            ]
-            self.store.raw_events_path(record.run_id).write_text(
-                "".join(json.dumps(row) + "\n" for row in raw_rows),
-                encoding="utf-8",
-            )
-            self.store.normalized_events_path(record.run_id).write_text(
-                "".join(json.dumps(row) + "\n" for row in normalized_rows),
-                encoding="utf-8",
-            )
-            record.raw_event_count = max(raw_seqs, default=0)
-            record.normalized_event_count = len(normalized_rows)
-            record = self.store.transition(record.run_id, LifecycleState.COMPLETED)
-            return record
-
-        gap = seed(
-            "WIKI-ARCHIVE-GAP",
-            [1, 2, 4],
-            [(1, "a"), (2, "b"), (4, "c")],
-        )
-        with self.assertRaisesRegex(StoreError, r"missing=\[3\]"):
-            await self.supervisor.archive(gap.run_id)
-
-        duplicate = seed(
-            "WIKI-ARCHIVE-DUPLICATE",
-            [1, 1, 2],
-            [(1, "a"), (1, "b"), (2, "c")],
-        )
-        with self.assertRaisesRegex(StoreError, r"duplicate raw_seq=\[1\]"):
-            await self.supervisor.archive(duplicate.run_id)
-
-        baseline = seed(
-            "WIKI-ARCHIVE-BASELINE",
-            [5, 6, 7],
-            [(5, "a"), (6, "b"), (7, "c")],
-        )
-        archived = await self.supervisor.archive(baseline.run_id)
-        self.assertEqual(archived.run_id, baseline.run_id)
-
-        shifted_gap = seed(
-            "WIKI-ARCHIVE-SHIFTED-GAP",
-            [5, 6, 8],
-            [(5, "a"), (6, "b"), (8, "c")],
-        )
-        with self.assertRaisesRegex(StoreError, r"missing=\[7\]"):
-            await self.supervisor.archive(shifted_gap.run_id)
-
-        fanout = seed(
-            "WIKI-ARCHIVE-FANOUT",
-            [1, 2],
-            [(1, "a"), (1, "b"), (2, "x")],
-        )
-        archived = await self.supervisor.archive(fanout.run_id)
-        self.assertEqual(archived.run_id, fanout.run_id)
 
     async def test_archive_allows_detached_dead_run(self) -> None:
         record = await self.supervisor.start_run(
