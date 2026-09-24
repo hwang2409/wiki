@@ -2,10 +2,8 @@ import { useCallback, useEffect, useId, useMemo, useRef, useState } from "react"
 import { ArrowDown, ArrowUp, ChevronDown, RefreshCw, X } from "lucide-react";
 import {
   getAutopilotFleetStatus,
-  getCosts,
   getDashboardTickets,
   type AutopilotFleetStatus,
-  type CostResponse,
   type DashboardTicket,
 } from "./api";
 import {
@@ -79,17 +77,11 @@ export type DashboardTicketsPayload = {
 
 export type DashboardViewProps = {
   fetchTickets?: (signal: AbortSignal) => Promise<DashboardTicketsPayload>;
-  fetchCosts?: (signal: AbortSignal) => Promise<CostResponse>;
   pollMs?: number;
 };
 
-function fetchDefaultCosts(signal: AbortSignal): Promise<CostResponse> {
-  return getCosts({}, signal);
-}
-
 export function DashboardView({
   fetchTickets = getDashboardTickets,
-  fetchCosts = fetchDefaultCosts,
   pollMs = REFRESH_INTERVAL_MS,
 }: DashboardViewProps = {}) {
   const [tickets, setTickets] = useState<DashboardTicket[] | null>(null);
@@ -98,16 +90,12 @@ export function DashboardView({
   const [sortKey, setSortKey] = useState<SortKey>("date");
   const [sortAsc, setSortAsc] = useState(false);
   const [nowMs, setNowMs] = useState(() => Date.now());
-  const [costs, setCosts] = useState<CostResponse | null>(null);
-  const [costError, setCostError] = useState<string | null>(null);
-  const [retryingCosts, setRetryingCosts] = useState(false);
   const [filters, setFilters] = useState<DashboardFilters>(() =>
     typeof localStorage === "undefined"
       ? emptyFilters()
       : parseStoredFilters(localStorage.getItem(FILTERS_STORAGE_KEY))
   );
   const ticketsHandleRef = useRef<{ refresh: () => Promise<void> } | null>(null);
-  const costsHandleRef = useRef<{ refresh: () => Promise<void> } | null>(null);
 
   useEffect(() => {
     const handle = startDashboardPolling({
@@ -127,35 +115,11 @@ export function DashboardView({
     };
   }, [fetchTickets, pollMs]);
 
-  useEffect(() => {
-    const handle = startDashboardPolling({
-      fetch: fetchCosts,
-      onData: (payload) => {
-        setCosts(payload);
-        setCostError(null);
-      },
-      onError: (message) => setCostError(message),
-      intervalMs: pollMs,
-    });
-    costsHandleRef.current = handle;
-    return () => {
-      costsHandleRef.current = null;
-      handle.stop();
-    };
-  }, [fetchCosts, pollMs]);
-
   const retryTickets = useCallback(() => {
     const handle = ticketsHandleRef.current;
     if (!handle) return;
     setRetryingTickets(true);
     handle.refresh().finally(() => setRetryingTickets(false));
-  }, []);
-
-  const retryCosts = useCallback(() => {
-    const handle = costsHandleRef.current;
-    if (!handle) return;
-    setRetryingCosts(true);
-    handle.refresh().finally(() => setRetryingCosts(false));
   }, []);
 
   useEffect(() => {
@@ -341,40 +305,6 @@ export function DashboardView({
           </table>
         </div>
       ) : null}
-      {costError && costs ? (
-        <div className="dashboard-stale" role="status">
-          {!error || !tickets ? <span className="dashboard-stale-label">stale</span> : null}
-          <span className="dashboard-stale-body">Cost data: {costError}</span>
-          <Button
-            type="button"
-            variant="outline"
-            size="sm"
-            className="dashboard-retry"
-            leadingIcon={<RefreshCw size={12} />}
-            onClick={retryCosts}
-            disabled={retryingCosts}
-          >
-            {retryingCosts ? "Retrying…" : "Retry"}
-          </Button>
-        </div>
-      ) : null}
-      {costError && !costs ? (
-        <div className="dashboard-error" role="alert">
-          <div className="dashboard-error-body">Could not load cost data: {costError}</div>
-          <Button
-            type="button"
-            variant="outline"
-            size="sm"
-            className="dashboard-retry"
-            leadingIcon={<RefreshCw size={12} />}
-            onClick={retryCosts}
-            disabled={retryingCosts}
-          >
-            {retryingCosts ? "Retrying…" : "Try again"}
-          </Button>
-        </div>
-      ) : null}
-      {costs ? <CostDashboard costs={costs} /> : null}
     </div>
   );
 }
@@ -420,70 +350,6 @@ function DashboardTableSkeleton() {
         </tbody>
       </table>
     </div>
-  );
-}
-
-function costLabel(row: { cost_usd: number | null; pricing: string; unpriced_tokens: number }): string {
-  if (row.cost_usd === null) return `unpriced · ${row.unpriced_tokens.toLocaleString()} tokens`;
-  if (row.pricing === "mixed") return `$${row.cost_usd.toFixed(4)} + unpriced`;
-  return `$${row.cost_usd.toFixed(4)}`;
-}
-
-function CostTable({ title, rows }: { title: string; rows: CostResponse["top"]["worker"] }) {
-  return (
-    <section className="cost-panel-section">
-      <div className="cost-panel-section-title">{title}</div>
-      {rows.length === 0 ? <div className="dashboard-muted">no usage</div> : null}
-      {rows.slice(0, 6).map((row) => (
-        <div className="cost-row" key={`${title}-${row.label}`}>
-          <span className="cost-row-label" title={row.models.join(", ")}>{row.label}</span>
-          <span className="cost-row-tokens tabular-nums">{row.total_tokens.toLocaleString()}</span>
-          <span className={`cost-row-price is-${row.pricing}`}>{costLabel(row)}</span>
-        </div>
-      ))}
-    </section>
-  );
-}
-
-function CostDashboard({ costs }: { costs: CostResponse }) {
-  const total = costs.totals;
-  const maxPromptRuns = Math.max(1, ...costs.prompt_size_distribution.map((item) => item.runs));
-  return (
-    <section className="cost-dashboard" aria-label="Agent costs">
-      <div className="cost-dashboard-header">
-        <div>
-          <h2>Costs</h2>
-          <span className="dashboard-count">{costs.runs_scanned} runs scanned</span>
-        </div>
-        {costs.refreshing ? <span className="tokens-refreshing">refreshing...</span> : null}
-      </div>
-      <div className="cost-summary">
-        <div><span>spend</span><strong className={`is-${total.pricing}`}>{costLabel(total)}</strong></div>
-        <div><span>tokens</span><strong>{total.total_tokens.toLocaleString()}</strong></div>
-        <div><span>velocity</span><strong>{costs.velocity.tokens_per_minute.toLocaleString()} / min</strong></div>
-      </div>
-      <div className="cost-panel-grid">
-        <CostTable title="top workers" rows={costs.top.worker} />
-        <CostTable title="top tickets" rows={costs.top.ticket} />
-        <CostTable title="top orchestrators" rows={costs.top.orchestrator} />
-        <CostTable title="by day" rows={costs.top.day} />
-      </div>
-      <div className="cost-prompt-panel">
-        <div className="cost-panel-section-title">prompt size</div>
-        <div className="cost-prompt-bars">
-          {costs.prompt_size_distribution.map((item) => (
-            <div className="cost-prompt-bar" key={item.bucket}>
-              <div
-                className="cost-prompt-bar-fill"
-                style={{ height: `${item.runs > 0 ? Math.min(40, Math.max(4, Math.round((item.runs / maxPromptRuns) * 40))) : 0}px` }}
-              />
-              <span>{item.bucket}</span>
-              <strong>{item.runs}</strong>
-            </div>
-          ))}
-        </div>
-      </div>
-    </section>
   );
 }
 

@@ -65,7 +65,6 @@ from .agent_runtime.client import (
     replacement_prompt,
 )
 from .agent_runtime.command_log import AgentCommand
-from .agent_runtime import costs
 from .agent_runtime import graph_health
 from .agent_runtime.loop_state import derive_loop_state
 from .agent_runtime.archive_protocol import (
@@ -206,7 +205,6 @@ async def lifespan(_app: FastAPI):
     # drained on shutdown instead of dying with a daemon thread.
     workgraph_service.start_outbox()
     dispatcher_task, watchdog_task, token_task = await _start_dispatcher()
-    cost_task = asyncio.create_task(costs.background_loop(), name="wiki-cost-aggregator")
     knowledge_task = asyncio.create_task(
         knowledge.background_index_loop(
             knowledge.KnowledgePaths.from_env(
@@ -232,7 +230,6 @@ async def lifespan(_app: FastAPI):
         dispatcher_task.cancel()
         watchdog_task.cancel()
         token_task.cancel()
-        cost_task.cancel()
         knowledge_task.cancel()
         provider_health_task.cancel()
         unknown_kind_telemetry_task.cancel()
@@ -240,7 +237,6 @@ async def lifespan(_app: FastAPI):
             dispatcher_task,
             watchdog_task,
             token_task,
-            cost_task,
             knowledge_task,
             provider_health_task,
             unknown_kind_telemetry_task,
@@ -5257,22 +5253,6 @@ async def get_tokens(
         bucket=bucket,
         cli=cli,
         model=model,
-    )
-
-
-@app.get("/api/costs")
-async def get_costs(
-    from_ts: str | None = Query(default=None, alias="from"),
-    to_ts: str | None = Query(default=None, alias="to"),
-    ticket: str | None = None,
-) -> dict[str, object]:
-    """Incremental USD cost data from headless runtime raw event logs."""
-
-    return await asyncio.to_thread(
-        costs.query,
-        from_ts=from_ts,
-        to_ts=to_ts,
-        ticket=ticket,
     )
 
 
