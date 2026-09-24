@@ -19,8 +19,8 @@ updated: 2026-09-24
 ## Decision and fix
 
 - Henry chose a notes-only knowledge index. Agent run history stays in its source archive and agent UI. Full transcript search is no longer needed in `knowledge.db`.
-- Branch `wiki-cpu-fix` removes archive and live-run ingestion, the run/event tables, archive-triggered refresh requests, and run filters from CLI and MCP search. Schema version 5 rebuilds the derived DB from notes. On version mismatch, the backend recreates the DB file to reclaim the old 11 GB file instead of dropping rows into a large freelist.
+- PR [#300](https://github.com/hwang2409/wiki/pull/300) on branch `wiki-cpu-fix` removes archive and live-run ingestion, the run/event tables, archive-triggered refresh requests, and run filters from CLI and MCP search. Schema version 5 rebuilds the derived DB from notes. On version mismatch, the backend recreates the DB file to reclaim the old 11 GB file instead of dropping rows into a large freelist.
 - The DB still serves note search, links, and semantic-search fallback. `knowledge.db.semantic` remains a separate note index.
-- The old backend still runs until the new app build is installed. Do not treat the branch result as live CPU proof.
+- A native build of PR #300 staged successfully. The old backend still runs until the new app build is installed. Do not treat the branch result as live CPU proof.
 
 The sample identifies archive scans as an active CPU path. An independent agents-list bottleneck appears in [[agents-list-cpu-rca-2026-09-24]]. The samples do not apportion every CPU cycle between those paths.
