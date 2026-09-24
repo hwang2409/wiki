@@ -333,6 +333,10 @@ def test_parity_backfill_samples_raw_prefixes_for_long_runs(tmp_path: Path) -> N
     assert len(reports) == archive_parity.BACKFILL_RAW_PREFIX_CHECKPOINTS
     assert reports[0].raw_seq == 1
     assert reports[-1].raw_seq == 30
+    exhaustive = archive_parity._compare_raw_prefixes(
+        store, event_store, record.run_id, record=False
+    )
+    assert len(exhaustive) == 30
 
 
 def test_backfill_skips_wrong_version_and_rebuild_state_and_records_both(
