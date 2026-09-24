@@ -901,6 +901,67 @@ class RunStoreTests(unittest.TestCase):
             )
             self.assertEqual(reloaded.get(record.run_id).composer_messages[0]["seq"], 1)
 
+    def test_combined_echo_records_each_send_and_rebuilds_receipts(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            store = RunStore(_paths(root))
+            record = store.create(_record(root))
+            first = str(uuid4())
+            second = str(uuid4())
+            store.track_pending_user_message(
+                record.run_id, first, "[fleet] worker finished", source="fleet-monitor"
+            )
+            store.track_pending_user_message(
+                record.run_id, second, "how are my workers doing"
+            )
+            matches = store.match_pending_user_messages(
+                record.run_id,
+                "[fleet] worker finished\nhow are my workers doing",
+            )
+            self.assertEqual([item["pending_id"] for item in matches], [first, second])
+            self.assertEqual(
+                store.match_pending_user_messages(
+                    record.run_id, "unrelated prefix\nhow are my workers doing"
+                ),
+                [],
+            )
+            raw = store.append_raw(
+                record.run_id,
+                provider="claude",
+                direction="inbound",
+                payload={"type": "user"},
+            )
+            store.append_normalized(
+                record.run_id,
+                raw_seq=raw["seq"],
+                disposition=EventDisposition.RENDERED,
+                kind="claude_user",
+                payload={
+                    "pending_id": first,
+                    "composer_messages": [
+                        {
+                            "pending_id": item["pending_id"],
+                            "composer_text": item["text"],
+                            "composer_sent_at": item["sent_at"],
+                            **({"source": item["source"]} if item.get("source") else {}),
+                        }
+                        for item in matches
+                    ],
+                },
+            )
+            saved = store.get(record.run_id)
+            self.assertEqual(saved.pending_user_messages, [])
+            self.assertEqual(
+                [item["pending_id"] for item in saved.composer_messages],
+                [first, second],
+            )
+            self.assertTrue(store.steer_delivery_observed(record.run_id, second))
+            rebuilt = store.rebuild_projections_from_normalized(record.run_id)
+            self.assertEqual(
+                [item["pending_id"] for item in rebuilt.composer_messages],
+                [first, second],
+            )
+
     def test_pending_user_message_store_rejects_overbound_append(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)

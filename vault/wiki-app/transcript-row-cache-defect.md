@@ -22,7 +22,8 @@ An incremental cache that accepts a "changed from index N" hint is only sound if
 
 ## Reusable lessons
 
-- 2026-09-24: Henry reports the same pane-switch symptom in long orchestrator runs. The running native bundle was built 2026-09-24 11:33; `build-native-app.sh` rebuilds the frontend, and current `main` contains PR #298. Treat this as a recurrence with an unconfirmed new mechanism; inspect the active pane before switching to distinguish a missing virtual row from a stale paint or delayed transcript fetch.
+- 2026-09-24 recurrence on `feebonator`: the live API had user event 585, but the open pane omitted it while showing later events. Switching panes made it appear. `pendingTimelineRef` kept acknowledged sends and `mergePendingEvents` moved their real echoes back to the send floor. A regression test proves that this changes provider order; a remount clears the old history. The fix leaves acknowledged echoes at their provider position. The exact prior viewport state was not captured, so this is the confirmed pane defect path, not proof that every missing row had this cause.
+- At 22:09:19Z a fleet notice and Henry's message arrived 226 ms apart. Claude echoed them as one newline-joined user event 554. The old exact/hook matcher recorded neither send. The fix matches the complete joined text, records one receipt per pending ID, and correlates both receipts with the one visible event. Unmatched provider echoes still do not create receipts.
 
 - Remount-fixes-it symptoms in a polled view = component-level incremental cache staleness, not store staleness. Probe: remount a second view over the same store at failure time.
 - Identity-diff invariant: safe only while nothing mutates events in place. transcript-merge always allocates new objects on change — preserve that.

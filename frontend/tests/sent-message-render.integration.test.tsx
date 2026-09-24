@@ -239,3 +239,55 @@ test("queued send delivered mid-stream splices into the middle and stays rendere
   }));
   expect(view.container.textContent).toContain(MESSAGE);
 });
+
+test("acknowledged echo keeps its provider position after background events", async () => {
+  const ticket = "WIKI-REPRO-ECHO-ORDER";
+  getAgentSession.mockResolvedValueOnce(payload({
+    cursor: 1,
+    events: [assistantEvent(0, -10, "before send")],
+  }));
+  const view = render(<SessionTab showComposer={false} ticket={ticket} />);
+  await flush();
+  await act(async () => {
+    addPendingUserMessage(ticket, {
+      id: PENDING_ID, requestId: "order-1", text: MESSAGE, mode: "now",
+    });
+    updatePendingUserMessage(ticket, PENDING_ID, { status: "sent" });
+  });
+  await poll(ticket, payload({
+    cursor: 2,
+    tail_from: 1,
+    events: [
+      assistantEvent(1, 1, "background event one"),
+      assistantEvent(2, 2, "background event two"),
+      { id: 3, kind: "user", ts: ts(3), text: MESSAGE, disposition: "rendered", pending_id: PENDING_ID } as SessionEvent,
+    ],
+    composer_messages: [
+      { pending_id: PENDING_ID, text: MESSAGE, sent_at: ts(0), echoed_at: ts(3), seq: 1 },
+    ],
+  }));
+  const text = view.container.textContent ?? "";
+  expect(text.indexOf(MESSAGE)).toBeGreaterThan(text.indexOf("background event two"));
+  expect(text.split(MESSAGE).length - 1).toBe(1);
+});
+
+test("combined provider echo does not duplicate either composer send", async () => {
+  const ticket = "WIKI-REPRO-COMBINED-ECHO";
+  const fleet = "[fleet] worker finished";
+  const human = "how are my workers doing";
+  getAgentSession.mockResolvedValueOnce(payload({
+    cursor: 1,
+    events: [
+      { id: 0, kind: "user", ts: ts(1), text: `${fleet}\n${human}`, disposition: "rendered", pending_id: PENDING_ID } as SessionEvent,
+    ],
+    composer_messages: [
+      { pending_id: PENDING_ID, text: fleet, sent_at: ts(0), echoed_at: ts(1), seq: 1, source: "fleet-monitor" },
+      { pending_id: "22222222-2222-4222-8222-222222222222", text: human, sent_at: ts(0), echoed_at: ts(1), seq: 1 },
+    ],
+  }));
+  const view = render(<SessionTab showComposer={false} ticket={ticket} />);
+  await flush();
+  const text = view.container.textContent ?? "";
+  expect(text.split(fleet).length - 1).toBe(1);
+  expect(text.split(human).length - 1).toBe(1);
+});
