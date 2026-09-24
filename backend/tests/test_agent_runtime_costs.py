@@ -11,7 +11,10 @@ from pathlib import Path
 from unittest import mock
 
 from backend.app.agent_runtime import costs
-from backend.app.agent_runtime.archive_protocol import commit_archive
+from backend.app.agent_runtime.archive_protocol import (
+    ARCHIVE_CATALOG_NAME,
+    commit_archive,
+)
 
 FIXTURE_ROOT = Path(__file__).parent / "fixtures" / "agent_runtime"
 
@@ -601,6 +604,52 @@ class CostAggregatorTests(unittest.TestCase):
         self.assertIn("HOT", resolved_kinds)
         self.assertIn("ARCHIVED", resolved_kinds)
         self.assertNotIn("GONE", resolved_kinds)
+
+    def test_cataloged_archive_lookup_skips_walk_with_uncataloged_fallback(self) -> None:
+        raw = self._run("run-cataloged")
+        raw.write_text("", encoding="utf-8")
+        (raw.parent / "events.jsonl").write_text("", encoding="utf-8")
+        archive_dir = self.archive / "WIKI-178" / "20260730-150000"
+        archive_dir.parent.mkdir(parents=True)
+        shutil.move(str(raw.parent), archive_dir)
+        commit_archive(archive_dir)
+
+        real_glob = Path.glob
+
+        def reject_full_walk(path: Path, pattern: str, **kwargs):
+            if path == self.archive and pattern == "*/*":
+                raise AssertionError("full archive walk")
+            return real_glob(path, pattern, **kwargs)
+
+        with mock.patch.object(Path, "glob", autospec=True, side_effect=reject_full_walk):
+            source = costs.resolve_run_source("run-cataloged")
+        self.assertEqual(source, costs.RunSource("ARCHIVED", archive_dir, committed=True))
+
+        (self.archive / ARCHIVE_CATALOG_NAME).unlink()
+        self.assertEqual(
+            costs.resolve_run_source("run-cataloged"),
+            costs.RunSource("ARCHIVED", archive_dir, committed=True),
+        )
+
+    def test_catalog_row_must_match_committed_run_identity(self) -> None:
+        raw = self._run("run-real")
+        raw.write_text("", encoding="utf-8")
+        (raw.parent / "events.jsonl").write_text("", encoding="utf-8")
+        archive_dir = self.archive / "WIKI-178" / "20260730-160000"
+        archive_dir.parent.mkdir(parents=True)
+        shutil.move(str(raw.parent), archive_dir)
+        commit_archive(archive_dir)
+
+        catalog = self.archive / ARCHIVE_CATALOG_NAME
+        value = json.loads(catalog.read_text(encoding="utf-8"))
+        value["sessions"]["WIKI-178/20260730-160000"]["run_id"] = "run-wrong"
+        catalog.write_text(json.dumps(value), encoding="utf-8")
+
+        self.assertEqual(costs.resolve_run_source("run-wrong").kind, "GONE")
+        self.assertEqual(
+            costs.resolve_run_source("run-real"),
+            costs.RunSource("ARCHIVED", archive_dir, committed=True),
+        )
 
     def test_save_checkpoints_unchanged_runs_with_cursors(self) -> None:
         first_raw = self._run("run-first")
