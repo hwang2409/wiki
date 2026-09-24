@@ -20,6 +20,7 @@ _IGNORED_PARITY_KEYS = frozenset(
 )
 
 _LOG = logging.getLogger(__name__)
+BACKFILL_RAW_PREFIX_CHECKPOINTS = 5
 
 
 def harness_error_fallback_path(event_store: SQLiteEventStore) -> Path:
@@ -355,14 +356,24 @@ def _compare_raw_prefixes(
     run_id: str,
     *,
     record: bool,
+    max_prefixes: int | None = None,
 ) -> tuple[ParityReport, ...]:
     record_data = store.get(run_id)
     raw_rows = sorted(store.read_raw_events(run_id), key=lambda row: int(row["seq"]))
     normalized_rows = list(store.iter_normalized_events(run_id))
+    if max_prefixes is not None and len(raw_rows) > max_prefixes:
+        if max_prefixes < 2:
+            raise ValueError("max_prefixes must be at least 2")
+        checkpoints = [
+            raw_rows[round(index * (len(raw_rows) - 1) / (max_prefixes - 1))]
+            for index in range(max_prefixes)
+        ]
+    else:
+        checkpoints = raw_rows
     reports: list[ParityReport] = []
     with tempfile.TemporaryDirectory(prefix="wiki-282-parity-") as directory:
         directory_path = Path(directory)
-        for raw_row in raw_rows:
+        for raw_row in checkpoints:
             prefix_seq = int(raw_row["seq"])
             raw_path = directory_path / f"raw-{prefix_seq}.jsonl"
             normalized_path = directory_path / f"normalized-{prefix_seq}.jsonl"
@@ -531,10 +542,19 @@ def compare_run_boundaries(
     run_id: str,
     *,
     record: bool = True,
+    max_raw_prefixes: int | None = None,
 ) -> tuple[ParityReport, ...]:
-    """Compare raw prefixes and each cursor boundary independently."""
+    """Compare cursor boundaries and raw prefixes, sampled when requested."""
 
-    reports = list(_compare_raw_prefixes(store, event_store, run_id, record=record))
+    reports = list(
+        _compare_raw_prefixes(
+            store,
+            event_store,
+            run_id,
+            record=record,
+            max_prefixes=max_raw_prefixes,
+        )
+    )
     reports.extend(
         (
             _compare_crash_boundary(store, event_store, run_id, record=record),
@@ -738,14 +758,17 @@ def backfill_headless_runs(
                         f"backfill replay failed validation for {record.run_id}"
                     )
                 event_store.replace_run_from(temporary_path, record.run_id)
-            # The boundary compare replays every raw prefix — O(events^2).
-            # Holding the run lock across it starves a concurrent archive of
-            # the same run for the whole sweep (2026-08-24 write outage), so
-            # release now; a compare racing an archive fails into the
-            # harness_error path below, which is safe to retry.
+            # Release the run lock before the boundary compare so a concurrent
+            # archive can proceed. Bound automatic prefix checks so backfill
+            # work grows linearly with run length.
             lock.release()
             lock_held = False
-            reports = compare_run_boundaries(store, event_store, record.run_id)
+            reports = compare_run_boundaries(
+                store,
+                event_store,
+                record.run_id,
+                max_raw_prefixes=BACKFILL_RAW_PREFIX_CHECKPOINTS,
+            )
             mismatches = tuple(
                 mismatch for report in reports for mismatch in report.mismatches
             )
