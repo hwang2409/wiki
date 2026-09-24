@@ -10,7 +10,8 @@ updated: 2026-09-24
 Each checkbox is a reviewable change. Keep the existing isolated trial runner and
 persisted-state checks. This list is based on Phoebe `origin/main`
 `3fdcfb22759c352a13604b66511adbf682bd41d4`, Henry's requested target,
-[[EVAL-RICHARD-SCOUT-memo]], and the [Anthropic](https://www.anthropic.com/engineering/demystifying-evals-for-ai-agents)
+[[EVAL-RICHARD-SCOUT-memo]], [[eval-adherence-checklist]],
+[[llm-judge-auto-taggers]], and the [Anthropic](https://www.anthropic.com/engineering/demystifying-evals-for-ai-agents)
 and [LangChain](https://www.langchain.com/blog/how-we-build-evals-for-deep-agents)
 eval guides.
 
@@ -29,22 +30,24 @@ eval guides.
   version, and dataset/rubric hashes. Compare the running services with the
   requested ref before a trial starts. Done when a mismatched local stack
   fails preflight and a result identifies every tested version.
-- [ ] **E04 — Correct the authoring contract.** Update the v3-evals skill and
-  README to describe deterministic gates, optional model scores, unavailable
-  grades, and the real run commands. Done when examples match the CLI and
-  offline contract tests.
+- [ ] **E04 — Correct the authoring contract.** Update the v3-evals skill,
+  README, and [[eval-adherence-checklist]] to describe deterministic gates,
+  calibrated model scores, unavailable grades, and the real run commands.
+  Done when the documents agree with each other and the CLI contract tests.
 
 ## Establish reviewed tasks and labels
 
 - [ ] **E05 — Review the golden answer keys.** Ask a Phoebe domain reviewer to
   confirm, revise, or remove each of the eight `awaiting_human_validation`
-  cases. Record the evidence and reviewer decision with each case. Done when
-  no unreviewed key is treated as a trusted regression gate.
+  cases. Record the evidence, reviewer decision, and a known-good reference
+  solution for each retained case. Done when each retained case passes its
+  reference solution and no unreviewed key is a trusted regression gate.
 - [ ] **E06 — Define two pilot task rubrics.** Select one state-changing
   outreach task and one multi-turn conversation task. Specify outcomes,
-  prohibited actions, acceptable variation, and required evidence. Done when
-  two reviewers can apply each rubric to the same saved runs and resolve any
-  disagreement.
+  prohibited actions, acceptable variation, and required evidence. Include
+  positive and negative task variants; mark capability versus regression.
+  Done when two reviewers can apply each rubric to the same saved runs and
+  resolve any disagreement.
 - [ ] **E07 — Build a grader reference set.** Save human labels and evidence
   references for passing, failing, and ambiguous pilot runs. Keep a holdout
   portion separate from grader development. Redact customer data before
