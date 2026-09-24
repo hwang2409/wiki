@@ -1097,9 +1097,13 @@ class HeadlessMainRouteTests(unittest.IsolatedAsyncioTestCase):
             json.dumps(
                 {
                     "seq": 1,
-                    "kind": "assistant",
+                    "kind": "artifact",
                     "disposition": "rendered",
-                    "payload": {"message": "archived"},
+                    "payload": {
+                        "kind": "artifact",
+                        "id": "saved-artifact",
+                        "artifact": {"kind": "table", "rows": [["saved"]]},
+                    },
                 }
             )
             + "\n",
@@ -1117,6 +1121,7 @@ class HeadlessMainRouteTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual(session["path"], str(session_dir / "events.jsonl"))
         self.assertEqual(session["provider"], "codex")
+        self.assertEqual([event["artifact_id"] for event in session["events"]], ["saved-artifact"])
 
     async def test_compact_archive_opens_saved_artifact_without_run_events(self) -> None:
         self._seed_headless()
@@ -1152,8 +1157,13 @@ class HeadlessMainRouteTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual(session["path"], str(session_dir / "artifact-events.jsonl"))
         self.assertTrue(any(event.get("artifact_id") == "saved-artifact" for event in session["events"]))
+        self.registry.write_text("{}", encoding="utf-8")
+        with mock.patch.object(main, "_archive_hint", side_effect=AssertionError("implicit archive read")):
+            with self.assertRaises(HTTPException) as missing_live:
+                main.agent_session("WIKI-42")
+        self.assertEqual(missing_live.exception.status_code, 404)
 
-    async def test_archived_session_identity_survives_live_replacement_and_older_page(self) -> None:
+    async def test_legacy_archive_returns_only_saved_artifacts(self) -> None:
         self._seed_headless()
         archive_dir = self.archive_dir / "WIKI-42"
         older = archive_dir / "20260729-000000"
@@ -1188,7 +1198,33 @@ class HeadlessMainRouteTests(unittest.IsolatedAsyncioTestCase):
                     )
                     + "\n"
                     for index in range(1, 4)
-                ),
+                )
+                + json.dumps(
+                    {
+                        "seq": 4,
+                        "kind": "artifact",
+                        "disposition": "rendered",
+                        "payload": {
+                            "kind": "artifact",
+                            "id": f"{run_id}-artifact",
+                            "artifact": {"kind": "table", "rows": [[text]]},
+                        },
+                    }
+                )
+                + "\n"
+                + json.dumps(
+                    {
+                        "seq": 5,
+                        "kind": "artifact",
+                        "disposition": "rendered",
+                        "payload": {
+                            "kind": "artifact",
+                            "id": f"{run_id}-second-artifact",
+                            "artifact": {"kind": "table", "rows": [["second"]]},
+                        },
+                    }
+                )
+                + "\n",
                 encoding="utf-8",
             )
             (session_dir / "raw.jsonl").write_text("raw\n", encoding="utf-8")
@@ -1205,16 +1241,16 @@ class HeadlessMainRouteTests(unittest.IsolatedAsyncioTestCase):
         self.assertIsNotNone(older_at)
         newest_transcript = self.root / "newest-live.jsonl"
         newest_transcript.write_text("newest live transcript\n", encoding="utf-8")
-        with mock.patch.object(main.transcripts, "TAIL_WINDOW_EVENTS", 2):
-            with mock.patch.dict(
-                main._session_paths,
-                {"WIKI-42": ("codex", newest_transcript)},
-                clear=True,
-            ):
-                session = main.agent_session(
-                    "WIKI-42", archived_at=older_at, run_id=older_run_id
-                )
-                older_page = main.agent_session_older(
+        with mock.patch.dict(
+            main._session_paths,
+            {"WIKI-42": ("codex", newest_transcript)},
+            clear=True,
+        ):
+            session = main.agent_session(
+                "WIKI-42", archived_at=older_at, run_id=older_run_id
+            )
+            with self.assertRaises(HTTPException) as older_page:
+                main.agent_session_older(
                     "WIKI-42",
                     before=session["base"],
                     count=500,
@@ -1223,9 +1259,13 @@ class HeadlessMainRouteTests(unittest.IsolatedAsyncioTestCase):
                 )
 
         self.assertEqual(session["path"], str(older / "events.jsonl"))
-        self.assertEqual([event["text"] for event in session["events"]], ["older archive 2", "older archive 3"])
-        self.assertEqual(older_page["path"], str(older / "events.jsonl"))
-        self.assertEqual([event["text"] for event in older_page["events"]], ["older archive 1"])
+        self.assertEqual(
+            [event["artifact_id"] for event in session["events"]],
+            ["old-run-artifact", "old-run-second-artifact"],
+        )
+        self.assertEqual([event["id"] for event in session["events"]], [0, 1])
+        self.assertFalse(session["has_older"])
+        self.assertEqual(older_page.exception.status_code, 409)
 
         with self.assertRaises(HTTPException) as missing:
             main.agent_session(

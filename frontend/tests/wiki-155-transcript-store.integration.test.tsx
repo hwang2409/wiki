@@ -70,6 +70,15 @@ function Probe({ ticket }: { ticket: string }) {
   return null;
 }
 
+function ArchiveProbe() {
+  const target = useMemo(
+    () => ({ mode: "archive" as const, ticket: "WIKI-RECEIPT", archivedAt: "2026-08-18T00:00:00+00:00", runId: "saved-run" }),
+    [],
+  );
+  useTranscriptSession(target, false);
+  return null;
+}
+
 beforeEach(() => {
   latest = null;
   getAgentSession.mockReset();
@@ -78,6 +87,24 @@ beforeEach(() => {
 afterEach(() => {
   cleanup();
   vi.useRealTimers();
+});
+
+test("saved artifact target requests the exact receipt", async () => {
+  getAgentSession.mockResolvedValueOnce(baseSession({ events: [] }));
+
+  render(<ArchiveProbe />);
+  await act(async () => {
+    await Promise.resolve();
+    await Promise.resolve();
+  });
+
+  expect(getAgentSession).toHaveBeenCalledWith(
+    "WIKI-RECEIPT",
+    0,
+    undefined,
+    "2026-08-18T00:00:00+00:00",
+    "saved-run",
+  );
 });
 
 test("initial-load failure sets `error`; last-good session absent so `refreshError` stays null", async () => {

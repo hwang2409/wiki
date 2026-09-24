@@ -906,12 +906,8 @@ export function getAgentOlderSession(
   ticket: string,
   before: number,
   count = 500,
-  archivedAt?: string,
-  runId?: string,
 ) {
   const params = new URLSearchParams({ before: String(before), count: String(count) });
-  if (archivedAt) params.set("archived_at", archivedAt);
-  if (runId) params.set("run_id", runId);
   return request<AgentOlderSessionData>(
     `/api/agents/${encodeURIComponent(ticket)}/session/older?${params.toString()}`
   );
