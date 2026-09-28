@@ -200,6 +200,7 @@ Topic → note index. **Agents: read this file first, before grepping.** Every n
 - [[henry-daily-driver-profile]] — trace-audit profile of Henry's real harness usage (ops chore-runner, status glass, URL delegation); informs zeta daily-driver arcs
 - [[single-owner-concurrency-rule]] — zeta design rule: hand-threaded async state never survives review; concurrent subsystems get one owner (actor/queue) from the start — 3 grinds proved it
 - [[gui-audit-2026-09-16]] — hands-on GUI audit @ d21ab5a: 9-char inline-code truncation, no slash commands, invisible approval-mode state; ranked fix order
+- [[pi-port-log]] — pi cache benchmark and verified zeta port candidates; update after each pi evaluation
 
 ## Agents
 
