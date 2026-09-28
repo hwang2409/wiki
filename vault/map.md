@@ -141,6 +141,7 @@ Topic → note index. **Agents: read this file first, before grepping.** Every n
 ## Phoebe/features
 
 - [[meeting-booking-onboarding]] — Phoebe meeting booking: customer onboarding and Core/admin-agent seams
+- [[caregiver-sms-agent-mode]] — caregiver SMS agent mode: production rollout state, defaults, and control paths
 
 ## Wiki
 
