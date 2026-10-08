@@ -2,14 +2,14 @@
 type: reference
 tags: [tools, cloud, agents]
 created: 2026-07-06
-updated: 2026-07-14
+updated: 2026-10-08
 ---
 
 # exe.dev
 
 **Status: BACK IN USE 2026-07-13** — woodbridge's #11104 shipped `scripts/preview.sh`: shareable multi-day branch preview environments on exe.dev VMs (team plan active — the 2026-07-06 pilot-canceled state is obsolete). Stable `https://preview-<slug>.exe.xyz` URLs behind team login, same-origin Caddy proxy (`/api/*`→API, `/kratos/*`→Kratos, rest→Vite), warm quiesced `preview-template` VM disk-cloned in ~3s (118s warm `up` vs ~10min cold), 48h TTL + hourly sweep workflow, nightly template refresh. Small team plan pools 2 vCPU/8GB → ~one running full-stack preview at a time. Docs: `docs/development_guides/branch_previews.md`, execplan `docs/notes/plans/exe_preview_envs_execplan.md`, skill `.claude/skills/exe-preview/`. Complements Modal PR previews (24h cap, random URLs, ~$18/day idle) rather than replacing them. Prior history: PHO-12930 pilot canceled 2026-07-06; substrate-agnostic sandbox tool surface (PHO-13073/#10608) still the seam for any admin-agent sandbox backend.
 
-External cloud/tool. Current as of 2026-07-06; verify pricing/security
+External cloud/tool. Current as of 2026-10-08; verify pricing/security
 before operational decisions.
 
 - **What:** Bold Software's SSH-first cloud for persistent Linux VMs.
@@ -24,10 +24,15 @@ before operational decisions.
   command-scoped SSH-signed API tokens, and HTTP integrations that keep
   secrets in exe.dev's proxy rather than on the VM.
 - **API shapes (captured live 2026-07-06):** `ssh exe.dev billing plan --json` → `{"plan":"Basic","plan_id":"basic:monthly:20260106","pooled_disk_gb":25,"default_disk_gb":25,"bandwidth_gb":100,"max_vms":0,"paid":false,"shelley_credits_max":20,...}`. `ssh exe.dev ls --json` → `{"vms":[]}`. Henry's free Basic tier: 25 GB pooled disk — likely too small for a phoebe-base box with warm Bazel caches; PHO-12930 clone test probably needs the $20 Personal tier (100 GB) first.
-- **Pricing snapshot:** Personal $20/mo for 2 vCPU / 8 GB RAM pool,
-  50 VMs, 100 GB pooled disk, 200 GB transfer. Team $25/user/mo. Usage
-  pricing advertised at $0.05/core-hour CPU, $0.016/GiB-hour active
-  memory, $0.08/GiB-month disk. Source: https://exe.dev/pricing.
+- **Pricing snapshot:** Personal starts at $15/mo for a shared 2 vCPU / 4
+  GiB RAM pool, 50 VMs, 100 GiB disk, and 200 GiB transfer. Extra disk is
+  $0.08/GiB-month. Work starts at $75/mo and includes the same base pool
+  and disk. Source: https://exe.dev/pricing.
+- **Disk behavior:** VM files stay on a normal local-NVMe block device.
+  exe.dev continuously streams disk changes to another machine in the
+  region. This keeps the filesystem hydrated while giving regional
+  recovery with a lag of a few seconds. Sources:
+  https://exe.dev/docs/what-is-exe and https://exe.dev/docs/all.
 - **Credibility:** Founders include David Crawshaw (Tailscale co-founder,
   CTO 2019-2024), Josh Bleecher Snyder (card.io/Canopy Climate co-founder,
   early Tailscale, Go runtime/compiler contributor), and Philip Zeyliger
